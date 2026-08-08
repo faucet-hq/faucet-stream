@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.7.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-core-v1.7.1...faucet-core-v1.7.2) - 2026-08-08
+
+### Bug Fixes
+
+- Second-pass audit — wide-integer corruption in the Arrow/SQL shim and SQL binds, backfill DST windows (#460, #461, #462) ([#463](https://github.com/faucet-hq/faucet-stream/pull/463))
+- Resolve the fourth hardening audit — topology governance bypass, SQS at-most-once, control-plane secret leaks ([#456](https://github.com/faucet-hq/faucet-stream/pull/456)) ([#457](https://github.com/faucet-hq/faucet-stream/pull/457))
+
 ## [1.7.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-core-v1.6.0...faucet-core-v1.7.0) - 2026-07-31
 
 ### Bug Fixes

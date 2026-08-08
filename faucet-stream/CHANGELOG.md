@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.7.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.7.1...faucet-stream-v1.7.2) - 2026-08-08
+
+### Miscellaneous
+
+- Updated the following local packages: faucet-core, faucet-transform-sql, faucet-transform-wasm, faucet-source-postgres, faucet-source-redshift, faucet-source-sqlite, faucet-sink-mysql, faucet-sink-mssql, faucet-sink-redshift, faucet-sink-duckdb, faucet-source-sqs, faucet-auth, faucet-lineage, faucet-common-bigquery, faucet-common-gcs, faucet-common-kafka, faucet-common-snowflake, faucet-common-kinesis, faucet-common-spanner, faucet-common-redshift, faucet-common-pubsub, faucet-common-clickhouse, faucet-common-azure, faucet-source-rest, faucet-source-singer, faucet-source-graphql, faucet-source-xml, faucet-source-grpc, faucet-source-kafka, faucet-source-kinesis, faucet-source-mysql, faucet-source-mssql, faucet-source-gcs, faucet-source-s3, faucet-source-mongodb, faucet-source-mongodb-cdc, faucet-source-mysql-cdc, faucet-source-mssql-cdc, faucet-source-pubsub, faucet-source-clickhouse, faucet-source-azure-blob, faucet-source-redis, faucet-source-webhook, faucet-source-websocket, faucet-source-csv, faucet-source-elasticsearch, faucet-source-parquet, faucet-source-postgres-cdc, faucet-source-bigquery, faucet-source-snowflake, faucet-source-spanner, faucet-source-delta, faucet-source-databricks, faucet-sink-bigquery, faucet-sink-postgres, faucet-sink-jsonl, faucet-sink-snowflake, faucet-sink-sqlite, faucet-sink-gcs, faucet-sink-s3, faucet-sink-mongodb, faucet-sink-redis, faucet-sink-csv, faucet-sink-elasticsearch, faucet-sink-http, faucet-sink-kafka, faucet-sink-kinesis, faucet-sink-stdout, faucet-sink-parquet, faucet-sink-iceberg, faucet-sink-delta, faucet-sink-spanner, faucet-sink-pubsub, faucet-sink-clickhouse, faucet-sink-azure-blob, faucet-source-duckdb, faucet-common-sqs, faucet-sink-sqs, faucet-common-nats, faucet-source-nats, faucet-sink-nats, faucet-common-sftp, faucet-source-sftp, faucet-sink-sftp, faucet-state-redis, faucet-state-postgres
+
 ## [1.7.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.6.0...faucet-stream-v1.7.0) - 2026-08-01
 
 ### Features

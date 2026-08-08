@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.7.1...faucet-cli-v1.8.0) - 2026-08-08
+
+### Bug Fixes
+
+- Second-pass audit — wide-integer corruption in the Arrow/SQL shim and SQL binds, backfill DST windows (#460, #461, #462) ([#463](https://github.com/faucet-hq/faucet-stream/pull/463))
+- Resolve the fourth hardening audit — topology governance bypass, SQS at-most-once, control-plane secret leaks ([#456](https://github.com/faucet-hq/faucet-stream/pull/456)) ([#457](https://github.com/faucet-hq/faucet-stream/pull/457))
+
+### Features
+
+- *(templates)* Release lifecycle (launch/rollback/deprecate) + console versions page ([#455](https://github.com/faucet-hq/faucet-stream/pull/455))
+- *(serve)* Pipeline template registry + parameterized trigger API ([#452](https://github.com/faucet-hq/faucet-stream/pull/452))
+
 ## [1.7.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.6.0...faucet-cli-v1.7.0) - 2026-07-31
 
 ### Bug Fixes
