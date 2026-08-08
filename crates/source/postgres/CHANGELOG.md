@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-v1.5.2...faucet-source-postgres-v1.5.3) - 2026-08-08
+
+### Bug Fixes
+
+- Second-pass audit — wide-integer corruption in the Arrow/SQL shim and SQL binds, backfill DST windows (#460, #461, #462) ([#463](https://github.com/faucet-hq/faucet-stream/pull/463))
+
 ## [1.5.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-v1.5.0...faucet-source-postgres-v1.5.1) - 2026-07-24
 
 ### Miscellaneous
