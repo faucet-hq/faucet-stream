@@ -322,32 +322,39 @@ with `matrix:` — both non-empty is a load-time error. `faucet run` / `validate
 [Topology mode](../cookbook/topology.md) for the full grammar, the `join:`
 node, state semantics, and runnable examples.
 
-**What applies in topology mode.** The per-page governance passes behave exactly
-as they do for a matrix pipeline — `pipeline.masking`, `pipeline.quality`,
-`pipeline.contract`, and `schema:` are enforced per sink node, and `resilience:`
-applies to sink-side writes. So do `--dry-run` / `--limit`, `${now.*}` /
-`--clock`, `state:`, and `dlq:`.
+**What applies in topology mode.** Every top-level block does, each scoped to the
+node where it makes sense. The per-page governance passes — `pipeline.masking`,
+`pipeline.quality`, `pipeline.contract`, `schema:` — are enforced per sink node,
+and `resilience:` applies to its writes. `sla:` keeps per-sink-node history under
+`{pipeline}::{node_id}`; `notifications:` reports per sink node; `lineage:` emits
+one job per sink node (`{pipeline}.{node_id}`) whose inputs are every source that
+reaches it; `catalog:` records a dataset per source and per sink plus an edge for
+each pair the graph connects. So do `--dry-run` / `--limit`, `${now.*}` /
+`--clock`, `state:`, and `dlq:`. See the
+[applies-per-node table](../cookbook/topology.md#observability) for the detail.
 
-Two things differ, and both are reported rather than silent:
+Column lineage is the one thing deliberately withheld: with several inputs
+feeding a sink, the per-column derivation is not knowable from the graph, so the
+facet is omitted for a multi-input sink rather than guessed. Single-input sinks
+emit it as usual.
 
-- **`delivery: exactly_once` is rejected.** A node graph has no per-sink
-  atomic commit-token path, so the config is refused at load time instead of
-  running at-least-once under an exactly-once label. Use the matrix form, or make
-  the sinks idempotent with `write_mode: upsert`.
-- **`notifications:`, `lineage:`, `catalog:`, and `sla:` are not applied.**
-  `faucet validate` prints a `WARNING:` line naming each one it finds, and the run
-  logs the same, so a declared-but-inert block is never silent.
+**`delivery: exactly_once` is supported**, with five requirements checked at load
+time: exactly one source node, a replayable source, **every** sink idempotent, a
+durable `state:`, and no `dlq:`. Each sink node carries its own commit watermark
+and a restart resumes from the lowest committed sequence, so no sink is resumed
+past its own progress. See
+[Exactly-once delivery](../cookbook/topology.md#exactly-once-delivery).
 
-**Resume semantics are deliberately conservative.** Each sink node owns a
-bookmark under `{pipeline}::{node_id}`. The source resumes from a stored position
-only when the graph has **exactly one source node** and **every sink's bookmark is
-identical**; otherwise it replays in full (with a warning). Bookmarks are compared
-for equality, never ordered — a resume position is often structured (a CDC LSN
-map, a Kafka offset map), and an ordered "minimum" over those can sit *ahead* of
-the true minimum and skip the lagging sink's records. Replaying costs duplicates
-on a non-idempotent sink; skipping would lose data, so the trade is made in that
-direction. Use `write_mode: upsert` on the sinks when a graph is resumed
-routinely.
+**At-least-once resume is deliberately conservative.** Each sink node owns a
+bookmark under `{pipeline}::{node_id}`. Without exactly-once the source resumes
+from a stored position only when the graph has **exactly one source node** and
+**every sink's bookmark is identical**; otherwise it replays in full (with a
+warning). Bookmarks are compared for equality, never ordered — a resume position
+is often structured (a CDC LSN map, a Kafka offset map), and an ordered "minimum"
+over those can sit *ahead* of the true minimum and skip the lagging sink's
+records. Replaying costs duplicates on a non-idempotent sink; skipping would lose
+data, so the trade is made in that direction. Use `write_mode: upsert` on the
+sinks — or `delivery: exactly_once` — when a graph is resumed routinely.
 
 ## Row selection
 

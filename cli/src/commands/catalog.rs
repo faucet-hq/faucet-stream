@@ -312,13 +312,13 @@ mod tests {
             pipeline: "p".into(),
             row: "default".into(),
             recorded_at: chrono::Utc::now(),
-            source: DatasetObservation {
+            sources: vec![DatasetObservation {
                 uri: "csv://./in.csv".into(),
                 kind: "csv".into(),
                 role: DatasetRole::Source,
                 schema: None,
                 records: 4,
-            },
+            }],
             sink: DatasetObservation {
                 uri: "jsonl://./out.jsonl".into(),
                 kind: "jsonl".into(),
@@ -328,7 +328,7 @@ mod tests {
             },
             column_lineage: Some(serde_json::json!({"fields": {}})),
         };
-        let edge = apply_edge(None, &update);
+        let edge = apply_edge(None, &update, &update.sources[0]);
         let text = render_edges(&[edge]);
         assert!(
             text.contains("csv://./in.csv  →  jsonl://./out.jsonl"),

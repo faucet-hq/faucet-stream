@@ -269,7 +269,7 @@ impl RunHistory for MemoryHistory {
     async fn catalog_record(&self, update: &CatalogUpdate) -> Result<(), HistoryError> {
         let lock_err = |_| HistoryError::Backend("catalog lock poisoned".into());
         let mut cat = self.catalog.lock().map_err(lock_err)?;
-        for obs in [&update.source, &update.sink] {
+        for obs in update.sources.iter().chain(std::iter::once(&update.sink)) {
             let id = catalog::dataset_id(&obs.uri);
             let (ds, new_version) = catalog::apply_observation(
                 cat.datasets.get(&id),
@@ -294,12 +294,15 @@ impl RunHistory for MemoryHistory {
             }
             cat.datasets.insert(id, ds);
         }
-        let key = (
-            catalog::dataset_id(&update.source.uri),
-            catalog::dataset_id(&update.sink.uri),
-        );
-        let edge = catalog::apply_edge(cat.edges.get(&key), update);
-        cat.edges.insert(key, edge);
+        // One edge per input dataset — a merge/join sink has several (#459).
+        for source in &update.sources {
+            let key = (
+                catalog::dataset_id(&source.uri),
+                catalog::dataset_id(&update.sink.uri),
+            );
+            let edge = catalog::apply_edge(cat.edges.get(&key), update, source);
+            cat.edges.insert(key, edge);
+        }
         Ok(())
     }
 
@@ -964,13 +967,13 @@ mod tests {
             pipeline: "p".into(),
             row: "default".into(),
             recorded_at: Utc::now(),
-            source: DatasetObservation {
+            sources: vec![DatasetObservation {
                 uri: src.into(),
                 kind: "csv".into(),
                 role: DatasetRole::Source,
                 schema: schema.clone(),
                 records: 10,
-            },
+            }],
             sink: DatasetObservation {
                 uri: dst.into(),
                 kind: "jsonl".into(),

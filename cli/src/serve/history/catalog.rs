@@ -73,7 +73,11 @@ pub struct CatalogUpdate {
     /// Matrix row id (`"default"` for non-matrix runs).
     pub row: String,
     pub recorded_at: DateTime<Utc>,
-    pub source: DatasetObservation,
+    /// Input datasets. A single-source pipeline has one; a topology sink fed by a
+    /// merge or join has one per source that reaches it (#459). Each carries its
+    /// own record count, so per-dataset volume stays accurate instead of the sink
+    /// total being repeated across edges.
+    pub sources: Vec<DatasetObservation>,
     pub sink: DatasetObservation,
     /// Column-lineage facet derived by `faucet-lineage` for the edge, when the
     /// transform chain is expressible (`None` when opaque).
@@ -417,13 +421,14 @@ pub fn apply_observation(
 pub fn apply_edge(
     existing: Option<&CatalogLineageEdge>,
     update: &CatalogUpdate,
+    source: &DatasetObservation,
 ) -> CatalogLineageEdge {
     let mut edge = match existing {
         Some(prev) => prev.clone(),
         None => CatalogLineageEdge {
-            src_id: dataset_id(&update.source.uri),
+            src_id: dataset_id(&source.uri),
             dst_id: dataset_id(&update.sink.uri),
-            src_uri: update.source.uri.clone(),
+            src_uri: source.uri.clone(),
             dst_uri: update.sink.uri.clone(),
             pipeline: update.pipeline.clone(),
             row: update.row.clone(),
@@ -440,7 +445,15 @@ pub fn apply_edge(
     edge.last_seen = update.recorded_at;
     edge.last_run_id = update.run_id.clone();
     edge.runs = edge.runs.saturating_add(1);
-    edge.last_records = update.sink.records;
+    // The records this edge carried. For a single-source pipeline the source read
+    // count and the sink write count coincide; for a merge, attributing the sink
+    // total to every edge would over-count, so each edge reports its own source's
+    // contribution (#459).
+    edge.last_records = if update.sources.len() == 1 {
+        update.sink.records
+    } else {
+        source.records
+    };
     if update.column_lineage.is_some() {
         edge.column_lineage = update.column_lineage.clone();
     }
@@ -691,7 +704,7 @@ mod tests {
             pipeline: "p".into(),
             row: "default".into(),
             recorded_at: Utc::now(),
-            source: obs(src, DatasetRole::Source, None, records),
+            sources: vec![obs(src, DatasetRole::Source, None, records)],
             sink: obs(dst, DatasetRole::Sink, None, records),
             column_lineage: None,
         }
@@ -701,7 +714,7 @@ mod tests {
     fn edge_accumulates_and_keeps_last_column_lineage() {
         let mut u = update("a://1", "b://2", 5);
         u.column_lineage = Some(json!({"fields": {"x": {}}}));
-        let e = apply_edge(None, &u);
+        let e = apply_edge(None, &u, &u.sources[0]);
         assert_eq!(e.runs, 1);
         assert_eq!(e.last_records, 5);
         assert!(e.column_lineage.is_some());
@@ -709,7 +722,7 @@ mod tests {
         // A later opaque run keeps the previous column lineage.
         let mut u2 = update("a://1", "b://2", 9);
         u2.run_id = "r2".into();
-        let e2 = apply_edge(Some(&e), &u2);
+        let e2 = apply_edge(Some(&e), &u2, &u2.sources[0]);
         assert_eq!(e2.runs, 2);
         assert_eq!(e2.last_records, 9);
         assert_eq!(e2.last_run_id, "r2");
@@ -792,7 +805,11 @@ mod tests {
     }
 
     fn edge(src: &str, dst: &str) -> CatalogLineageEdge {
-        apply_edge(None, &update(src, dst, 1))
+        {
+            let u = update(src, dst, 1);
+            let src_obs = u.sources[0].clone();
+            apply_edge(None, &u, &src_obs)
+        }
     }
 
     #[test]
@@ -817,5 +834,66 @@ mod tests {
         assert!(d2.iter().all(|e| e.src_uri != "x"));
         // Unknown root: nothing.
         assert!(lineage_slice(edges, Some("nope"), 3).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod multi_source_tests {
+    use super::*;
+
+    fn obs2(uri: &str, role: DatasetRole, records: u64) -> DatasetObservation {
+        DatasetObservation {
+            uri: uri.into(),
+            kind: "csv".into(),
+            role,
+            schema: None,
+            records,
+        }
+    }
+
+    /// #459: a topology sink fed by a merge has several inputs. Each gets its own
+    /// edge, and each edge reports **its own** source's contribution — repeating
+    /// the sink total across edges would over-count the volume.
+    #[test]
+    fn a_merge_sink_yields_one_edge_per_input_with_its_own_volume() {
+        let update = CatalogUpdate {
+            run_id: "r1".into(),
+            pipeline: "p".into(),
+            row: "w".into(),
+            recorded_at: Utc::now(),
+            sources: vec![
+                obs2("csv://a.csv", DatasetRole::Source, 4),
+                obs2("csv://b.csv", DatasetRole::Source, 3),
+            ],
+            sink: obs2("jsonl://out.jsonl", DatasetRole::Sink, 7),
+            column_lineage: None,
+        };
+
+        let a = apply_edge(None, &update, &update.sources[0]);
+        let b = apply_edge(None, &update, &update.sources[1]);
+        assert_eq!(a.src_uri, "csv://a.csv");
+        assert_eq!(b.src_uri, "csv://b.csv");
+        assert_eq!(a.dst_uri, "jsonl://out.jsonl");
+        assert_eq!(a.dst_id, b.dst_id, "both edges land on the same sink");
+        // Per-source volume, so a.last + b.last == the sink's 7 rather than 7 each.
+        assert_eq!((a.last_records, b.last_records), (4, 3));
+        assert_eq!(a.last_records + b.last_records, update.sink.records);
+    }
+
+    /// The single-source case is unchanged: the edge reports the sink's count,
+    /// which is what every matrix pipeline records.
+    #[test]
+    fn a_single_source_edge_still_reports_the_sink_count() {
+        let update = CatalogUpdate {
+            run_id: "r1".into(),
+            pipeline: "p".into(),
+            row: "default".into(),
+            recorded_at: Utc::now(),
+            sources: vec![obs2("csv://a.csv", DatasetRole::Source, 9)],
+            sink: obs2("jsonl://out.jsonl", DatasetRole::Sink, 9),
+            column_lineage: None,
+        };
+        let e = apply_edge(None, &update, &update.sources[0]);
+        assert_eq!(e.last_records, 9);
     }
 }

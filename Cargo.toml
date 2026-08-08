@@ -118,7 +118,7 @@ categories = ["database", "asynchronous"]
 # Internal crates
 faucet-core = { path = "crates/core", version = "1.7.1" }
 faucet-auth = { path = "crates/auth", version = "1.0.7" }
-faucet-lineage = { path = "crates/lineage", version = "1.2.3" }
+faucet-lineage = { path = "crates/lineage", version = "2.0.0" }
 faucet-common-bigquery = { path = "crates/common/bigquery", version = "1.0.7" }
 faucet-common-elasticsearch = { path = "crates/common/elasticsearch", version = "1.0.7" }
 faucet-common-gcs = { path = "crates/common/gcs", version = "1.0.7" }

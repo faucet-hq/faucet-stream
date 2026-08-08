@@ -121,14 +121,24 @@ impl LineageEmitter {
             source_code: src.clone(),
         });
 
-        // Input dataset (+ schema on terminal events).
-        let mut input = Dataset::new(ctx.input.namespace.clone(), ctx.input.name.clone());
-        if terminal
-            && self.cfg.include_schema_facet
-            && let Some(s) = &ctx.input_schema
-        {
-            input.facets.schema = Some(schema_facet(s));
-        }
+        // Input datasets (+ schema on terminal events). Several when a topology
+        // sink is fed by a merge or join (#459); `input_schemas` aligns
+        // positionally and may be shorter than `inputs`.
+        let inputs: Vec<Dataset> = ctx
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut ds = Dataset::new(r.namespace.clone(), r.name.clone());
+                if terminal
+                    && self.cfg.include_schema_facet
+                    && let Some(Some(s)) = ctx.input_schemas.get(i)
+                {
+                    ds.facets.schema = Some(schema_facet(s));
+                }
+                ds
+            })
+            .collect();
 
         // Output dataset (+ schema + column lineage on terminal events).
         let mut output = Dataset::new(ctx.output.namespace.clone(), ctx.output.name.clone());
@@ -138,12 +148,17 @@ impl LineageEmitter {
         {
             output.facets.schema = Some(schema_facet(s));
         }
+        // Column lineage references a single input's fields, and the derivation
+        // models one transform chain — so emit it only when there is exactly one
+        // input. A merge/join is opaque to it, and inventing an input to point at
+        // would be worse than omitting the facet (the same "never fabricate"
+        // rule the opaque-transform list follows).
         if terminal
             && self.cfg.include_column_lineage
             && let Some(cl) = &ctx.column_lineage
+            && let [only] = ctx.inputs.as_slice()
         {
-            output.facets.column_lineage =
-                Some(column_facet(cl, &ctx.input.namespace, &ctx.input.name));
+            output.facets.column_lineage = Some(column_facet(cl, &only.namespace, &only.name));
         }
 
         RunEvent {
@@ -161,7 +176,7 @@ impl LineageEmitter {
                 name: ctx.job_name.clone(),
                 facets: JobFacets { source_code },
             },
-            inputs: vec![input],
+            inputs,
             outputs: vec![output],
             producer: PRODUCER.into(),
             schema_url: OL_SCHEMA_URL.into(),
@@ -249,10 +264,10 @@ mod tests {
             job_name: "j".into(),
             run_id: "r1".into(),
             parent: None,
-            input: DatasetRef {
+            inputs: vec![DatasetRef {
                 namespace: "ns".into(),
                 name: "postgres://h/db".into(),
-            },
+            }],
             output: DatasetRef {
                 namespace: "ns".into(),
                 name: "bigquery://p.d.t".into(),
@@ -261,7 +276,7 @@ mod tests {
             finished_at: None,
             records: 0,
             error: None,
-            input_schema: None,
+            input_schemas: Vec::new(),
             output_schema: None,
             column_lineage: None,
             source_code: None,

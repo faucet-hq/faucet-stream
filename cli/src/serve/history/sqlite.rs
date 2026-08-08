@@ -350,13 +350,13 @@ mod shard_tests {
             pipeline: "p".into(),
             row: "default".into(),
             recorded_at: chrono::Utc::now(),
-            source: DatasetObservation {
+            sources: vec![DatasetObservation {
                 uri: "csv://./in.csv".into(),
                 kind: "csv".into(),
                 role: DatasetRole::Source,
                 schema: Some(schema.clone()),
                 records,
-            },
+            }],
             sink: DatasetObservation {
                 uri: "jsonl://./out.jsonl".into(),
                 kind: "jsonl".into(),

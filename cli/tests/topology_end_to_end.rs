@@ -764,8 +764,10 @@ pipeline:
     );
 }
 
-/// #456 H2: `delivery: exactly_once` has no watermark path in a node graph, so
-/// it must be rejected rather than silently downgraded to at-least-once.
+/// #456 H2: an exactly-once config that cannot be honoured must be rejected
+/// rather than silently downgraded to at-least-once. (Since #458 topology mode
+/// *does* support exactly-once — this asserts the refusal path still holds when a
+/// requirement is unmet.)
 #[tokio::test]
 async fn rejects_exactly_once_in_topology_mode() {
     let cfg = parse(
@@ -787,8 +789,12 @@ pipeline:
     let auth = build_auth_catalog(None).unwrap();
     let err = build_topology(&cfg, &auth).await.unwrap_err();
     let msg = err.to_string();
+    // The invariant #456 H2 is about: an unsupportable exactly-once config is
+    // *refused*, never silently downgraded to at-least-once. Since #458 the
+    // refusal is per-node and names the limiting side (here the csv source)
+    // instead of rejecting topology mode wholesale.
     assert!(msg.contains("exactly_once"), "{msg}");
-    assert!(msg.contains("topology mode"), "{msg}");
+    assert!(msg.contains("csv"), "names what is limiting: {msg}");
 }
 
 /// #456 H4: `${now.*}` was never resolved in topology mode, so the literal token
@@ -839,10 +845,12 @@ pipeline:
     );
 }
 
-/// #456 M2: blocks topology mode does not act on must be called out, not
-/// silently swallowed behind a "valid" line.
+/// #456 M2 + #459: `validate` must never print a clean bill of health for a
+/// block it does not enforce. Every top-level block is applied per sink node
+/// now, so the assertion inverts: none of them may be reported as ignored.
 #[test]
-fn validate_warns_about_blocks_topology_ignores() {
+#[cfg(feature = "lineage")]
+fn validate_reports_no_ignored_blocks() {
     let dir = TempDir::new().unwrap();
     let csv = orders_csv(dir.path());
     let cfg_path = dir.path().join("faucet.yaml");
@@ -853,6 +861,140 @@ fn validate_warns_about_blocks_topology_ignores() {
 name: inert
 sla:
   max_staleness_secs: 3600
+lineage:
+  namespace: test
+  transport: {{ type: file, config: {{ path: {ln} }} }}
+pipeline:
+  state: {{ type: file, config: {{ path: {st} }} }}
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: stdout, config: {{}} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+            csv = csv.display(),
+            ln = dir.path().join("lineage.jsonl").display(),
+            st = dir.path().join("state").display()
+        ),
+    );
+    let out = Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["validate", cfg_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !stdout.contains("is ignored"),
+        "no block may be reported inert: {stdout}"
+    );
+}
+
+// ── #458 / #459: exactly-once + per-sink-node observability ─────────────────
+
+/// #458: the four atomic-watermark requirements are checked per node at
+/// config-load time. The message must name the *limiting* side.
+#[tokio::test]
+async fn exactly_once_gate_names_the_limiting_side() {
+    // A non-deterministic source: csv cannot replay positionally.
+    let cfg = parse(
+        r#"version: 1
+name: eo
+delivery: exactly_once
+pipeline:
+  state: { type: file, config: { path: ./st } }
+  sources:
+    o: { type: csv, config: { path: /tmp/x.csv } }
+  sinks:
+    out: { type: sqlite, config: { connection_url: "sqlite::memory:", table: t } }
+  nodes:
+    s: { kind: source, ref: o }
+    w: { kind: sink, ref: out }
+  edges:
+    - { from: s, to: w }
+"#,
+    );
+    let auth = build_auth_catalog(None).unwrap();
+    let err = build_topology(&cfg, &auth).await.unwrap_err().to_string();
+    assert!(err.contains("csv"), "names the source: {err}");
+    assert!(err.contains("deterministic-replay"), "{err}");
+}
+
+/// A memory state store cannot carry a commit sequence across a restart.
+#[tokio::test]
+async fn exactly_once_requires_durable_state() {
+    let cfg = parse(
+        r#"version: 1
+name: eo
+delivery: exactly_once
+pipeline:
+  state: { type: memory, config: {} }
+  sources:
+    o: { type: postgres-cdc, config: { connection_url: "postgres://x/y", slot: s, publication: p } }
+  sinks:
+    out: { type: sqlite, config: { connection_url: "sqlite::memory:", table: t } }
+  nodes:
+    s: { kind: source, ref: o }
+    w: { kind: sink, ref: out }
+  edges:
+    - { from: s, to: w }
+"#,
+    );
+    let auth = build_auth_catalog(None).unwrap();
+    let err = build_topology(&cfg, &auth).await.unwrap_err().to_string();
+    assert!(err.contains("memory"), "{err}");
+    assert!(err.contains("durable"), "{err}");
+}
+
+/// Several sources means no sound resume anchor for a watermark, so the gate
+/// refuses and points at the keyed-upsert alternative.
+#[tokio::test]
+async fn exactly_once_refuses_a_multi_source_graph() {
+    let cfg = parse(
+        r#"version: 1
+name: eo
+delivery: exactly_once
+pipeline:
+  state: { type: file, config: { path: ./st } }
+  sources:
+    a: { type: postgres-cdc, config: { connection_url: "postgres://x/y", slot: s1, publication: p } }
+    b: { type: postgres-cdc, config: { connection_url: "postgres://x/y", slot: s2, publication: p } }
+  sinks:
+    out: { type: sqlite, config: { connection_url: "sqlite::memory:", table: t } }
+  nodes:
+    sa: { kind: source, ref: a }
+    sb: { kind: source, ref: b }
+    m: { kind: merge }
+    w: { kind: sink, ref: out }
+  edges:
+    - { from: sa, to: m }
+    - { from: sb, to: m }
+    - { from: m, to: w }
+"#,
+    );
+    let auth = build_auth_catalog(None).unwrap();
+    let err = build_topology(&cfg, &auth).await.unwrap_err().to_string();
+    assert!(err.contains("exactly one source node"), "{err}");
+    assert!(err.contains("upsert"), "offers the alternative: {err}");
+}
+
+/// #459: `resilience:` IS applied in topology mode (it rides the governance set),
+/// so it must not be listed as ignored — the earlier warning was wrong.
+#[test]
+fn validate_does_not_claim_resilience_is_ignored() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let cfg_path = dir.path().join("faucet.yaml");
+    write(
+        &cfg_path,
+        &format!(
+            r#"version: 1
+name: resil
+resilience:
+  retry: {{ max_attempts: 3 }}
 pipeline:
   sources:
     o: {{ type: csv, config: {{ path: {csv} }} }}
@@ -867,11 +1009,390 @@ pipeline:
             csv = csv.display()
         ),
     );
-    Command::cargo_bin("faucet")
+    let out = Command::cargo_bin("faucet")
         .unwrap()
         .args(["validate", cfg_path.to_str().unwrap()])
         .assert()
-        .success()
-        .stdout(contains("WARNING"))
-        .stdout(contains("sla"));
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !stdout.contains("`resilience:` is ignored"),
+        "resilience is wired; must not be reported as ignored: {stdout}"
+    );
+}
+
+/// #459: a sink's inputs are every source that reaches it — one for a linear or
+/// tee graph, several for a merge/join. This is what lineage and the catalog now
+/// model, so the traversal is asserted directly.
+#[test]
+fn reaching_sources_maps_each_sink_to_its_inputs() {
+    let cfg = parse(
+        r#"version: 1
+name: reach
+pipeline:
+  sources:
+    a: { type: csv, config: { path: /tmp/a.csv } }
+    b: { type: csv, config: { path: /tmp/b.csv } }
+  sinks:
+    one: { type: jsonl, config: { path: /tmp/1.jsonl } }
+    two: { type: jsonl, config: { path: /tmp/2.jsonl } }
+  nodes:
+    sa: { kind: source, ref: a }
+    sb: { kind: source, ref: b }
+    m: { kind: merge }
+    fan: { kind: tee, fanout: 2 }
+    w1: { kind: sink, ref: one }
+    w2: { kind: sink, ref: two }
+  edges:
+    - { from: sa, to: m }
+    - { from: sb, to: m }
+    - { from: m, to: fan }
+    - { from: fan, to: w1 }
+    - { from: fan, to: w2 }
+"#,
+    );
+    let reaching = faucet_cli::topology::reaching_sources(&cfg);
+    // Both sinks sit downstream of the merge, so both have two inputs.
+    assert_eq!(reaching["w1"], vec!["sa".to_string(), "sb".to_string()]);
+    assert_eq!(reaching["w2"], vec!["sa".to_string(), "sb".to_string()]);
+    // Only sink nodes are keyed.
+    assert!(!reaching.contains_key("m"));
+    assert!(!reaching.contains_key("sa"));
+}
+
+/// A linear graph gives exactly one input per sink — the shape every matrix
+/// pipeline has, and the one where column lineage stays expressible.
+#[test]
+fn reaching_sources_is_one_input_for_a_linear_graph() {
+    let cfg = parse(
+        r#"version: 1
+name: linear
+pipeline:
+  sources:
+    a: { type: csv, config: { path: /tmp/a.csv } }
+  sinks:
+    one: { type: jsonl, config: { path: /tmp/1.jsonl } }
+  nodes:
+    s: { kind: source, ref: a }
+    t: { kind: transform, transforms: [ { type: keys_case, config: { mode: snake } } ] }
+    w: { kind: sink, ref: one }
+  edges:
+    - { from: s, to: t }
+    - { from: t, to: w }
+"#,
+    );
+    let reaching = faucet_cli::topology::reaching_sources(&cfg);
+    assert_eq!(reaching["w"], vec!["s".to_string()]);
+}
+
+/// #459: with catalog and SLA wired, `validate` must no longer report them as
+/// ignored — only genuinely-unwired blocks may appear.
+#[test]
+fn validate_no_longer_claims_sla_is_ignored() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let cfg_path = dir.path().join("faucet.yaml");
+    write(
+        &cfg_path,
+        &format!(
+            r#"version: 1
+name: inert2
+sla:
+  max_staleness_secs: 3600
+pipeline:
+  state: {{ type: file, config: {{ path: {st} }} }}
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: stdout, config: {{}} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+            csv = csv.display(),
+            st = dir.path().join("state").display()
+        ),
+    );
+    let out = Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["validate", cfg_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !stdout.contains("`sla:` is ignored"),
+        "sla is wired per sink node now: {stdout}"
+    );
+}
+
+/// #459: a merge sink's OpenLineage job must name **both** sources as inputs.
+///
+/// This is the end-to-end proof, not a unit check of the context builder: it runs
+/// a real two-source graph with a file transport and reads the emitted events
+/// back. An earlier revision threaded node identities through the builder but
+/// never populated them, so every event was silently suppressed — a test that
+/// only asserted "the run succeeded" could not tell the difference.
+#[test]
+#[cfg(feature = "lineage")]
+fn lineage_emits_a_job_per_sink_node_with_every_reaching_source() {
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.csv");
+    let b = dir.path().join("b.csv");
+    write(&a, "id,v\n1,x\n2,y\n");
+    write(&b, "id,v\n3,z\n");
+    let out = dir.path().join("out.jsonl");
+    let events = dir.path().join("lineage.jsonl");
+    let cfg_path = dir.path().join("faucet.yaml");
+    write(
+        &cfg_path,
+        &format!(
+            r#"version: 1
+name: merged
+lineage:
+  namespace: test-ns
+  transport: {{ type: file, config: {{ path: {ev} }} }}
+pipeline:
+  sources:
+    a: {{ type: csv, config: {{ path: {a} }} }}
+    b: {{ type: csv, config: {{ path: {b} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out} }} }}
+  nodes:
+    sa: {{ kind: source, ref: a }}
+    sb: {{ kind: source, ref: b }}
+    m: {{ kind: merge }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: sa, to: m }}
+    - {{ from: sb, to: m }}
+    - {{ from: m, to: w }}
+"#,
+            a = a.display(),
+            b = b.display(),
+            out = out.display(),
+            ev = events.display()
+        ),
+    );
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["run", cfg_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let body = fs::read_to_string(&events).expect("lineage transport wrote events");
+    let evs: Vec<serde_json::Value> = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each line is one RunEvent"))
+        .collect();
+    assert!(!evs.is_empty(), "at least one event: {body}");
+
+    // One job per sink node, named `{pipeline}.{node_id}`.
+    for e in &evs {
+        assert_eq!(e["job"]["name"], "merged.w", "job per sink node: {e}");
+        assert_eq!(e["job"]["namespace"], "test-ns");
+    }
+    let kinds: Vec<&str> = evs
+        .iter()
+        .map(|e| e["eventType"].as_str().unwrap_or_default())
+        .collect();
+    assert!(kinds.contains(&"START"), "START emitted: {kinds:?}");
+    assert!(kinds.contains(&"COMPLETE"), "COMPLETE emitted: {kinds:?}");
+
+    // The terminal event names both sources as inputs and carries no column
+    // lineage (not derivable across a merge).
+    let done = evs
+        .iter()
+        .find(|e| e["eventType"] == "COMPLETE")
+        .expect("terminal event");
+    let inputs = done["inputs"].as_array().expect("inputs array");
+    assert_eq!(inputs.len(), 2, "both sources are inputs: {done}");
+    let mut names: Vec<String> = inputs
+        .iter()
+        .map(|d| d["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    names.sort();
+    assert!(
+        names[0].ends_with("a.csv") && names[1].ends_with("b.csv"),
+        "inputs name the real files: {names:?}"
+    );
+    assert_eq!(done["outputs"].as_array().map(Vec::len), Some(1));
+    let facets = &done["outputs"][0]["facets"];
+    assert!(
+        facets.get("columnLineage").is_none(),
+        "column lineage is not fabricated for a multi-input sink: {facets}"
+    );
+}
+
+/// A single-source graph is the shape where column lineage stays expressible, so
+/// the linear case must keep exactly one input — the check that the N-input
+/// change did not turn every job into a fan-in.
+#[test]
+#[cfg(feature = "lineage")]
+fn lineage_keeps_one_input_for_a_linear_graph() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let out = dir.path().join("out.jsonl");
+    let events = dir.path().join("lineage.jsonl");
+    let cfg_path = dir.path().join("faucet.yaml");
+    write(
+        &cfg_path,
+        &format!(
+            r#"version: 1
+name: linear
+lineage:
+  namespace: ns
+  transport: {{ type: file, config: {{ path: {ev} }} }}
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out} }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+            csv = csv.display(),
+            out = out.display(),
+            ev = events.display()
+        ),
+    );
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["run", cfg_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let body = fs::read_to_string(&events).unwrap();
+    let done: serde_json::Value = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["eventType"] == "COMPLETE")
+        .expect("terminal event");
+    assert_eq!(done["inputs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(done["job"]["name"], "linear.w");
+}
+
+/// #459: the catalog records a dataset per source and per sink, plus one edge per
+/// (source, sink) pair the graph actually connects — so a merge produces two
+/// edges into the same sink, each carrying its own source's volume.
+///
+/// Read back through `faucet catalog`, which is the surface an operator uses, so
+/// the test fails if either the write path or the read path regresses.
+#[test]
+#[cfg(all(feature = "catalog", feature = "serve-history-sqlite"))]
+fn catalog_records_a_dataset_per_node_and_an_edge_per_pair() {
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.csv");
+    let b = dir.path().join("b.csv");
+    write(&a, "id,v\n1,x\n2,y\n");
+    write(&b, "id,v\n3,z\n");
+    let out = dir.path().join("out.jsonl");
+    let store = dir.path().join("catalog.db");
+    let cfg_path = dir.path().join("faucet.yaml");
+    write(
+        &cfg_path,
+        &format!(
+            r#"version: 1
+name: cat-merge
+catalog:
+  url: sqlite:{store}
+pipeline:
+  sources:
+    a: {{ type: csv, config: {{ path: {a} }} }}
+    b: {{ type: csv, config: {{ path: {b} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out} }} }}
+  nodes:
+    sa: {{ kind: source, ref: a }}
+    sb: {{ kind: source, ref: b }}
+    m: {{ kind: merge }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: sa, to: m }}
+    - {{ from: sb, to: m }}
+    - {{ from: m, to: w }}
+"#,
+            a = a.display(),
+            b = b.display(),
+            out = out.display(),
+            store = store.display()
+        ),
+    );
+    Command::cargo_bin("faucet")
+        .unwrap()
+        .args(["run", cfg_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let listed = Command::cargo_bin("faucet")
+        .unwrap()
+        .args([
+            "catalog",
+            "datasets",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+    let body = String::from_utf8_lossy(&listed.get_output().stdout).to_string();
+    let json: serde_json::Value = serde_json::from_str(&body).expect("--json emits JSON");
+    let rows = json
+        .get("datasets")
+        .and_then(|d| d.as_array())
+        .or_else(|| json.as_array())
+        .expect("a dataset list");
+    let uris: Vec<String> = rows
+        .iter()
+        .map(|d| d["uri"].as_str().unwrap_or_default().to_string())
+        .collect();
+    // Both sources and the sink, not just the sink.
+    for want in ["a.csv", "b.csv", "out.jsonl"] {
+        assert!(
+            uris.iter().any(|u| u.ends_with(want)),
+            "{want} recorded: {uris:?}"
+        );
+    }
+
+    // The lineage graph carries one edge per contributing source, and the volumes
+    // are per-source (2 + 1) rather than the sink total repeated.
+    let shown = Command::cargo_bin("faucet")
+        .unwrap()
+        .args([
+            "catalog",
+            "lineage",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+    let detail: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&shown.get_output().stdout)).unwrap();
+    let edges = detail["edges"].as_array().expect("edges array");
+    assert_eq!(edges.len(), 2, "one edge per contributing source: {detail}");
+    for e in edges {
+        assert!(
+            e["dst_uri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("out.jsonl"),
+            "both edges land on the sink: {e}"
+        );
+    }
+    let mut vols: Vec<u64> = edges
+        .iter()
+        .map(|e| e["last_records"].as_u64().unwrap_or_default())
+        .collect();
+    vols.sort_unstable();
+    assert_eq!(
+        vols,
+        vec![1, 2],
+        "per-source volume, not the sink total: {edges:?}"
+    );
 }

@@ -32,10 +32,10 @@ async fn emits_to_marquez() {
         job_name: "it-job".into(),
         run_id: uuid::Uuid::now_v7().to_string(),
         parent: None,
-        input: DatasetRef {
+        inputs: vec![DatasetRef {
             namespace: "faucet-it".into(),
             name: "postgres://h/db?table=t".into(),
-        },
+        }],
         output: DatasetRef {
             namespace: "faucet-it".into(),
             name: "bigquery://p.d.t".into(),
@@ -44,7 +44,7 @@ async fn emits_to_marquez() {
         finished_at: None,
         records: 0,
         error: None,
-        input_schema: None,
+        input_schemas: Vec::new(),
         output_schema: None,
         column_lineage: None,
         source_code: None,

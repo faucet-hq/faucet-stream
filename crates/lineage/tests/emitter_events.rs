@@ -32,10 +32,10 @@ fn lifecycle() -> RunLifecycle {
         job_name: "j".into(),
         run_id: "r1".into(),
         parent: None,
-        input: DatasetRef {
+        inputs: vec![DatasetRef {
             namespace: "ns".into(),
             name: "postgres://h/db".into(),
-        },
+        }],
         output: DatasetRef {
             namespace: "ns".into(),
             name: "bigquery://p.d.t".into(),
@@ -44,7 +44,7 @@ fn lifecycle() -> RunLifecycle {
         finished_at: None,
         records: 0,
         error: None,
-        input_schema: None,
+        input_schemas: Vec::new(),
         output_schema: None,
         column_lineage: None,
         source_code: None,
@@ -121,12 +121,12 @@ async fn schema_facet_emitted_on_terminal_event_when_enabled() {
     let em = LineageEmitter::new(cfg).unwrap();
     let mut done = lifecycle();
     done.finished_at = Some(chrono::Utc::now());
-    done.input_schema = Some(InferredSchema {
+    done.input_schemas = vec![Some(InferredSchema {
         fields: vec![
             ("id".into(), "integer".into()),
             ("name".into(), "string".into()),
         ],
-    });
+    })];
     done.output_schema = Some(InferredSchema {
         fields: vec![("id".into(), "integer".into())],
     });
@@ -150,9 +150,9 @@ async fn schema_facet_suppressed_on_start_even_when_enabled() {
     cfg.include_schema_facet = true;
     let em = LineageEmitter::new(cfg).unwrap();
     let mut start = lifecycle();
-    start.input_schema = Some(InferredSchema {
+    start.input_schemas = vec![Some(InferredSchema {
         fields: vec![("id".into(), "integer".into())],
-    });
+    })];
     em.emit(EventType::Start, &start).await;
     let events = read_lines(&path);
     assert_eq!(events[0]["eventType"], "START");

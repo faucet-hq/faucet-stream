@@ -208,6 +208,19 @@ pub struct TopologyGovernance {
     /// Resilience policy (retry / circuit breaker / poison) for sink-side
     /// writes, flushes, and state puts.
     pub resilience: Option<crate::resilience::ResiliencePolicy>,
+    /// Delivery guarantee for every sink node (#458).
+    ///
+    /// `ExactlyOnce` gives each sink node its own commit-token scope — its state
+    /// key, `{pipeline}::{node_id}` — so a sink that durably committed a page
+    /// skips it on resume independently of its siblings. Lives here rather than on
+    /// [`TopologyOptions`] because that struct is exhaustively constructible
+    /// through the public API, so a new field there is a major break; this one is
+    /// `#[non_exhaustive]`. It is a per-sink write policy either way.
+    ///
+    /// The caller is responsible for the gate (deterministic-replay source,
+    /// idempotent sinks, durable state, no DLQ) — `run_stream` re-checks the sink
+    /// side and downgrades with a warning rather than pretending.
+    pub delivery: crate::idempotency::DeliveryMode,
 }
 
 impl TopologyGovernance {
@@ -302,6 +315,41 @@ impl TopologyOptions {
     }
 }
 
+/// What one node did, for callers that need per-node attribution (the CLI emits
+/// notifications and evaluates SLAs per **sink node**, which needs to know which
+/// node failed — [`TopologyResult::errors`] is a flat list of messages).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct NodeReport {
+    /// Node id.
+    pub node_id: String,
+    /// Node kind (`"source"`, `"sink"`, …).
+    pub kind: &'static str,
+    /// Records written (sink nodes only; 0 elsewhere).
+    pub records: usize,
+    /// Final bookmark (sink nodes only).
+    pub bookmark: Option<Value>,
+    /// The node's failure, if it failed.
+    pub error: Option<String>,
+}
+
+/// A topology run with per-node attribution.
+///
+/// `#[non_exhaustive]`: this is an output callers read, never construct, so
+/// keeping it open means a future per-node field is a minor release rather than
+/// a breaking one — the mistake [`TopologyResult`] cannot now undo.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct TopologyRun {
+    /// The aggregate result, identical to what [`Topology::run`] returns.
+    pub result: TopologyResult,
+    /// One entry per node, in the graph's deterministic (sorted-id) order.
+    pub nodes: Vec<NodeReport>,
+    /// Records emitted per **source** node, keyed by node id (#459). Lives here
+    /// rather than on [`TopologyResult`] so adding it stays a minor change.
+    pub per_source: HashMap<String, usize>,
+}
+
 /// Outcome of a topology run.
 #[derive(Debug, Clone, Default)]
 pub struct TopologyResult {
@@ -341,6 +389,13 @@ enum NodeOutcome {
         node_id: String,
         records: usize,
         bookmark: Option<Value>,
+    },
+    /// A source node and how many records it emitted. Needed so a lineage /
+    /// catalog edge can report the volume *that input* contributed rather than
+    /// the sink's total, which would over-count a merge (#459).
+    Source {
+        node_id: String,
+        records: usize,
     },
     Other,
 }
@@ -586,6 +641,20 @@ impl Topology {
         opts: TopologyOptions,
         governance: TopologyGovernance,
     ) -> Result<TopologyResult, FaucetError> {
+        self.run_reported(opts, governance).await.map(|r| r.result)
+    }
+
+    /// [`Topology::run_with`] with **per-node attribution**.
+    ///
+    /// The CLI emits notifications and evaluates SLAs per *sink node*, which needs
+    /// to know which node failed; [`TopologyResult::errors`] is only a flat list
+    /// of messages. Additive rather than a change to `run_with`'s return type,
+    /// which would break every caller (#459).
+    pub async fn run_reported(
+        self,
+        opts: TopologyOptions,
+        governance: TopologyGovernance,
+    ) -> Result<TopologyRun, FaucetError> {
         self.validate()?;
         let Topology { nodes, edges } = self;
 
@@ -607,7 +676,19 @@ impl Topology {
             .map(|n| n.id.clone())
             .collect();
         let source_count = nodes.iter().filter(|n| n.kind.is_source()).count();
-        let start_bookmark = compute_start_bookmark(&opts, &sink_ids, source_count).await;
+        // The graph's source replay capability, captured before the sources are
+        // moved into their futures. Only meaningful with exactly one source —
+        // which is also the only shape exactly-once is allowed in (#458).
+        let source_replay = if source_count == 1 {
+            nodes.iter().find_map(|n| match &n.kind {
+                NodeKind::Source(src) => Some(src.replay_guarantee()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let start_bookmark =
+            compute_start_bookmark(&opts, &sink_ids, source_count, governance.delivery).await;
 
         // Build channels.
         let mut outs: HashMap<String, Vec<mpsc::Sender<StreamPage>>> = HashMap::new();
@@ -630,6 +711,8 @@ impl Topology {
         // task (see the spawn below).
         type NodeFut = Pin<Box<dyn Future<Output = Result<NodeOutcome, FaucetError>> + Send>>;
         let mut futs: Vec<NodeFut> = Vec::with_capacity(nodes.len());
+        // Parallel to `futs`, so a failure can be attributed to its node.
+        let mut order: Vec<(String, &'static str)> = Vec::with_capacity(nodes.len());
 
         for node in nodes {
             let node_outs = outs.remove(&node.id).unwrap_or_default();
@@ -637,12 +720,13 @@ impl Topology {
             let pipeline = opts.pipeline_name.clone();
             let cancel = opts.cancel.clone();
             let Node { id, kind } = node;
+            order.push((id.clone(), kind.kind_str()));
 
             let fut: NodeFut = match kind {
                 NodeKind::Source(source) => {
                     let sb = start_bookmark.clone();
                     let bs = opts.batch_size;
-                    Box::pin(run_source_node(source, sb, bs, node_outs, cancel))
+                    Box::pin(run_source_node(id, source, sb, bs, node_outs, cancel))
                 }
                 NodeKind::Transform(stages) => {
                     let rx = take_single(node_ins)
@@ -694,6 +778,8 @@ impl Topology {
                         contract: governance.contract.clone(),
                         schema_drift: governance.schema_drift,
                         resilience: governance.resilience.clone(),
+                        delivery: governance.delivery,
+                        replay: source_replay,
                     };
                     Box::pin(run_sink_node(id, sink, rx, sopts))
                 }
@@ -746,13 +832,20 @@ impl Topology {
                 let coop = opts.cancel.clone().unwrap_or_default().child_token();
                 let first_err: Arc<std::sync::Mutex<Option<FaucetError>>> =
                     Arc::new(std::sync::Mutex::new(None));
-                let wrapped = joined.map(|f| {
+                let failures: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
+                let wrapped = joined.zip(order.clone()).map(|(f, (node_id, _))| {
                     let coop = coop.clone();
                     let slot = Arc::clone(&first_err);
+                    let failed = Arc::clone(&failures);
                     async move {
                         match f.await {
                             Ok(o) => Some(o),
                             Err(e) => {
+                                failed
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .push((node_id, e.to_string()));
                                 tracing::error!(
                                     error = %e,
                                     "topology node failed; cancelling siblings so they flush"
@@ -794,45 +887,97 @@ impl Topology {
                 if let Some(e) = first_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
                     return Err(e);
                 }
-                Ok(aggregate(outcomes.into_iter().flatten().collect()))
+                let (result, per_source) = aggregate(outcomes.into_iter().flatten().collect());
+                let failed = failures.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let nodes = reports(&order, &result, &per_source, &failed);
+                Ok(TopologyRun {
+                    result,
+                    nodes,
+                    per_source,
+                })
             }
             TopologyOnError::Continue => {
                 let results = futures::future::join_all(joined).await;
                 let mut ok = Vec::new();
                 let mut errs = Vec::new();
-                for r in results {
+                let mut failed: Vec<(String, String)> = Vec::new();
+                for (r, (node_id, _)) in results.into_iter().zip(order.clone()) {
                     match r {
                         Ok(o) => ok.push(o),
                         Err(e) => {
-                            tracing::error!(error = %e, "topology node failed (on_error: continue)");
+                            tracing::error!(
+                                node = %node_id,
+                                error = %e,
+                                "topology node failed (on_error: continue)"
+                            );
                             errs.push(e.to_string());
+                            failed.push((node_id, e.to_string()));
                         }
                     }
                 }
-                let mut result = aggregate(ok);
+                let (mut result, per_source) = aggregate(ok);
                 result.errors = errs;
-                Ok(result)
+                let nodes = reports(&order, &result, &per_source, &failed);
+                Ok(TopologyRun {
+                    result,
+                    nodes,
+                    per_source,
+                })
             }
         }
     }
 }
 
-/// Aggregate node outcomes into a [`TopologyResult`].
-fn aggregate(outcomes: Vec<NodeOutcome>) -> TopologyResult {
+/// Build the per-node report list from the node ids/kinds and their outcomes.
+fn reports(
+    order: &[(String, &'static str)],
+    sinks: &TopologyResult,
+    per_source: &HashMap<String, usize>,
+    errors: &[(String, String)],
+) -> Vec<NodeReport> {
+    order
+        .iter()
+        .map(|(id, kind)| NodeReport {
+            node_id: id.clone(),
+            kind,
+            records: sinks
+                .per_sink
+                .get(id)
+                .or_else(|| per_source.get(id))
+                .copied()
+                .unwrap_or(0),
+            bookmark: sinks.bookmarks.get(id).cloned().flatten(),
+            error: errors
+                .iter()
+                .find(|(nid, _)| nid == id)
+                .map(|(_, e)| e.clone()),
+        })
+        .collect()
+}
+
+/// Aggregate node outcomes into a [`TopologyResult`] plus the per-source counts
+/// (which live on [`TopologyRun`], not the result).
+fn aggregate(outcomes: Vec<NodeOutcome>) -> (TopologyResult, HashMap<String, usize>) {
     let mut result = TopologyResult::default();
+    let mut per_source = HashMap::new();
     for o in outcomes {
-        if let NodeOutcome::Sink {
-            node_id,
-            records,
-            bookmark,
-        } = o
-        {
-            result.records_written += records;
-            result.per_sink.insert(node_id.clone(), records);
-            result.bookmarks.insert(node_id, bookmark);
+        match o {
+            NodeOutcome::Sink {
+                node_id,
+                records,
+                bookmark,
+            } => {
+                result.records_written += records;
+                result.per_sink.insert(node_id.clone(), records);
+                result.bookmarks.insert(node_id, bookmark);
+            }
+            NodeOutcome::Source { node_id, records } => {
+                per_source.insert(node_id, records);
+            }
+            NodeOutcome::Other => {}
         }
     }
-    result
+    (result, per_source)
 }
 
 fn cfg(msg: impl Into<String>) -> FaucetError {
@@ -881,6 +1026,7 @@ async fn compute_start_bookmark(
     opts: &TopologyOptions,
     sink_ids: &[String],
     source_count: usize,
+    delivery: crate::idempotency::DeliveryMode,
 ) -> Option<Value> {
     let store = opts.state_store.as_ref()?;
     if sink_ids.is_empty() {
@@ -894,7 +1040,48 @@ async fn compute_start_bookmark(
             _ => return None, // a sink with no bookmark → full replay.
         }
     }
+    if delivery == crate::idempotency::DeliveryMode::ExactlyOnce {
+        // Exactly-once stores `(bookmark, seq)`, and `seq` is a monotonic page
+        // counter — a real total order, so the sinks can be ranked exactly
+        // instead of guessed at. Resume from the *furthest behind* sink; every
+        // sink ahead of it skips the pages it already committed, which is
+        // precisely what the commit token is for. (#458)
+        let ranked: Vec<(u64, Option<Value>)> = values
+            .iter()
+            .map(|v| {
+                let (bm, seq) = crate::idempotency::unwrap_state(v);
+                (seq, bm)
+            })
+            .collect();
+        return eo_start_bookmark(&ranked, source_count);
+    }
     start_bookmark(&values, source_count)
+}
+
+/// Exactly-once resume point: the bookmark of the lowest-`seq` sink.
+///
+/// Unlike the at-least-once path this *can* order the sinks, because `seq` is a
+/// monotonic counter rather than an opaque position — so a diverged set resumes
+/// from the laggard instead of replaying from scratch, and the sinks that are
+/// ahead skip their already-committed pages via their commit tokens.
+///
+/// The single-source restriction still applies: nothing records which source a
+/// sink's bookmark came from.
+pub fn eo_start_bookmark(ranked: &[(u64, Option<Value>)], source_count: usize) -> Option<Value> {
+    if ranked.is_empty() || source_count != 1 {
+        if source_count > 1 && !ranked.is_empty() {
+            tracing::warn!(
+                sources = source_count,
+                "topology: multi-source graph cannot attribute a sink bookmark to a source; \
+                 replaying every source in full"
+            );
+        }
+        return None;
+    }
+    ranked
+        .iter()
+        .min_by_key(|(seq, _)| *seq)
+        .and_then(|(_, bm)| bm.clone())
 }
 
 /// Pure resume-point decision: the bookmark every source node is started from,
@@ -966,6 +1153,7 @@ fn cancelled(cancel: &Option<CancellationToken>) -> bool {
 }
 
 async fn run_source_node(
+    node_id: String,
     source: Box<dyn Source>,
     start_bookmark: Option<Value>,
     batch_size: usize,
@@ -977,16 +1165,18 @@ async fn run_source_node(
     }
     let ctx = std::collections::HashMap::new();
     let mut pages = source.stream_pages(&ctx, batch_size);
+    let mut records = 0usize;
     while let Some(item) = pages.next().await {
         if cancelled(&cancel) {
             break;
         }
         let page = item?;
+        records += page.records.len();
         if !broadcast(page, &mut outs).await {
             break;
         }
     }
-    Ok(NodeOutcome::Other)
+    Ok(NodeOutcome::Source { node_id, records })
 }
 
 async fn run_transform_node(
@@ -1138,6 +1328,12 @@ struct SinkNodeOpts {
     contract: Option<Arc<crate::contract::CompiledContract>>,
     schema_drift: Option<crate::drift::SchemaDriftPolicy>,
     resilience: Option<crate::resilience::ResiliencePolicy>,
+    /// Delivery guarantee for this sink node.
+    delivery: crate::idempotency::DeliveryMode,
+    /// The replay capability of the graph's source, so `run_stream` can tell an
+    /// atomic-watermark run from a keyed-upsert one. `None` when there is not
+    /// exactly one source (in which case exactly-once is gated off anyway).
+    replay: Option<crate::idempotency::ReplayGuarantee>,
 }
 
 async fn run_sink_node(
@@ -1158,6 +1354,20 @@ async fn run_sink_node(
         .with_run_id(opts.run_id.clone());
     if let Some(store) = opts.state_store {
         let key = format!("{}::{}", opts.pipeline_name, node_id);
+        // Exactly-once: this node's state holds `(bookmark, seq)`, and `seq` is
+        // where its commit-token sequence resumes. Read it before handing the
+        // store to `run_stream`, which owns the writes from here (#458).
+        if opts.delivery == crate::idempotency::DeliveryMode::ExactlyOnce {
+            let seq = match store.get(&key).await {
+                Ok(Some(prior)) => crate::idempotency::unwrap_state(&prior).1,
+                Ok(None) => 0,
+                Err(e) => return Err(e),
+            };
+            run_opts = run_opts.with_delivery(opts.delivery).with_start_seq(seq);
+            if let Some(replay) = opts.replay {
+                run_opts = run_opts.with_replay_guarantee(replay);
+            }
+        }
         run_opts = run_opts.with_state(store, key);
     }
     if let Some(dlq) = opts.dlq {
@@ -1292,12 +1502,12 @@ mod tests {
 
     // ── Mock connectors ───────────────────────────────────────────────────────
 
-    struct VecSource {
+    pub(super) struct VecSource {
         records: Vec<Value>,
         bookmark: Option<Value>,
     }
     impl VecSource {
-        fn boxed(records: Vec<Value>) -> Box<dyn Source> {
+        pub(super) fn boxed(records: Vec<Value>) -> Box<dyn Source> {
             Box::new(VecSource {
                 records,
                 bookmark: None,
@@ -1357,11 +1567,11 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct CollectSink {
+    pub(super) struct CollectSink {
         store: Arc<Mutex<Vec<Value>>>,
     }
     impl CollectSink {
-        fn new() -> (Self, Arc<Mutex<Vec<Value>>>) {
+        pub(super) fn new() -> (Self, Arc<Mutex<Vec<Value>>>) {
             let store = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
@@ -1379,7 +1589,7 @@ mod tests {
         }
     }
 
-    struct FailingSink;
+    pub(super) struct FailingSink;
     #[async_trait]
     impl Sink for FailingSink {
         async fn write_batch(&self, _records: &[Value]) -> Result<usize, FaucetError> {
@@ -1403,7 +1613,7 @@ mod tests {
         }
     }
 
-    fn recs(n: usize) -> Vec<Value> {
+    pub(super) fn recs(n: usize) -> Vec<Value> {
         (0..n).map(|i| json!({ "i": i })).collect()
     }
 
@@ -2075,5 +2285,179 @@ mod tests {
         topo.run(TopologyOptions::new("p")).await.unwrap();
         let w = store.lock().unwrap();
         assert!(w[0].get("foo_bar").is_some());
+    }
+}
+
+#[cfg(test)]
+mod delivery_and_report_tests {
+    use super::tests::{CollectSink, FailingSink, VecSource, recs};
+    use super::*;
+    use crate::Stream;
+    use crate::idempotency::{DeliveryMode, format_token_with_bookmark, wrap_state};
+    use crate::state::{MemoryStateStore, StateStore};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// A sink that records a commit token per scope, like the SQL sinks do.
+    struct TokenSink {
+        rows: Arc<Mutex<Vec<Value>>>,
+        tokens: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    }
+    #[async_trait]
+    impl Sink for TokenSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.rows.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn supports_idempotent_writes(&self) -> bool {
+            true
+        }
+        async fn write_batch_idempotent(
+            &self,
+            records: &[Value],
+            scope: &str,
+            token: &str,
+        ) -> Result<usize, FaucetError> {
+            self.rows.lock().unwrap().extend_from_slice(records);
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(scope.to_string(), token.to_string());
+            Ok(records.len())
+        }
+        async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
+            Ok(self.tokens.lock().unwrap().get(scope).cloned())
+        }
+    }
+
+    /// #458: a sink node under `delivery: exactly_once` must commit through the
+    /// idempotent write path, under **its own** scope (its state key), so each
+    /// sink's watermark is independent of its siblings'.
+    #[tokio::test]
+    async fn exactly_once_commits_a_token_per_sink_node_scope() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let tokens = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let sink = TokenSink {
+            rows: rows.clone(),
+            tokens: tokens.clone(),
+        };
+        let store = Arc::new(MemoryStateStore::new());
+        let topo = Topology::builder()
+            .source("s", Box::new(EoSource(recs(3))))
+            .sink("k", Box::new(sink))
+            .edge("s", "k")
+            .build()
+            .unwrap();
+
+        let mut gov = TopologyGovernance::new();
+        gov.delivery = DeliveryMode::ExactlyOnce;
+        let opts = TopologyOptions::new("p").with_state_store(store.clone());
+        topo.run_with(opts, gov).await.unwrap();
+
+        assert_eq!(rows.lock().unwrap().len(), 3);
+        let committed = tokens.lock().unwrap();
+        assert!(
+            committed.contains_key("p::k"),
+            "token must be scoped to the sink node's own state key, got {:?}",
+            committed.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A source that reports deterministic replay and emits a bookmark per page,
+    /// which is what the atomic-watermark mechanism requires.
+    struct EoSource(Vec<Value>);
+    #[async_trait]
+    impl Source for EoSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(self.0.clone())
+        }
+        fn stream_pages<'a>(
+            &'a self,
+            _ctx: &'a std::collections::HashMap<String, Value>,
+            _batch: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+            let rows = self.0.clone();
+            Box::pin(async_stream::try_stream! {
+                yield StreamPage { records: rows, bookmark: Some(json!({"pos": 1})) };
+            })
+        }
+        fn replay_guarantee(&self) -> crate::idempotency::ReplayGuarantee {
+            crate::idempotency::ReplayGuarantee::Deterministic
+        }
+        fn supports_exactly_once(&self) -> bool {
+            true
+        }
+    }
+
+    /// #458: exactly-once *can* order sinks, because `seq` is a monotonic counter.
+    /// Resume from the furthest-behind sink; the ones ahead skip via their tokens.
+    #[test]
+    fn eo_resume_picks_the_lowest_sequence() {
+        let a = (7u64, Some(json!({"pos": 7})));
+        let b = (4u64, Some(json!({"pos": 4})));
+        let c = (9u64, Some(json!({"pos": 9})));
+        assert_eq!(
+            eo_start_bookmark(&[a.clone(), b.clone(), c.clone()], 1),
+            Some(json!({"pos": 4})),
+            "resume from the laggard, not the leader"
+        );
+        // Still never cross-applies in a multi-source graph.
+        assert_eq!(eo_start_bookmark(&[a, b, c], 2), None);
+        assert_eq!(eo_start_bookmark(&[], 1), None);
+    }
+
+    /// The EO envelope must be unwrapped on read — a raw `get` would hand the
+    /// source `{"__faucet_eo": …}` instead of its bookmark.
+    #[tokio::test]
+    async fn eo_resume_unwraps_the_state_envelope() {
+        let store = Arc::new(MemoryStateStore::new());
+        store
+            .put("p::k", &wrap_state(Some(&json!({"pos": 5})), 5))
+            .await
+            .unwrap();
+        let opts = TopologyOptions::new("p").with_state_store(store.clone());
+        let bm =
+            compute_start_bookmark(&opts, &["k".to_string()], 1, DeliveryMode::ExactlyOnce).await;
+        assert_eq!(bm, Some(json!({"pos": 5})), "envelope must be unwrapped");
+        // A bare token round-trips through parse_token_parts the same way.
+        let t = format_token_with_bookmark(5, Some(&json!({"pos": 5})));
+        assert!(t.contains('#'), "token embeds the bookmark: {t}");
+    }
+
+    /// #459: the CLI needs to know *which* sink node failed to notify per node.
+    #[tokio::test]
+    async fn run_reported_attributes_failures_to_their_node() {
+        let (good, _) = CollectSink::new();
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(4)))
+            .tee("t", 4, Some(2))
+            .sink("bad", Box::new(FailingSink))
+            .sink("good", Box::new(good))
+            .edge("s", "t")
+            .edge("t", "bad")
+            .edge("t", "good")
+            .build()
+            .unwrap();
+        let run = topo
+            .run_reported(
+                TopologyOptions::new("p").with_on_error(TopologyOnError::Continue),
+                TopologyGovernance::new(),
+            )
+            .await
+            .unwrap();
+
+        let bad = run.nodes.iter().find(|n| n.node_id == "bad").unwrap();
+        assert!(bad.error.is_some(), "the failing sink is attributed");
+        let good = run.nodes.iter().find(|n| n.node_id == "good").unwrap();
+        assert!(good.error.is_none(), "the healthy sink is not");
+        assert_eq!(good.records, 4);
+        // Every node appears, with its kind.
+        assert_eq!(run.nodes.len(), 4);
+        assert!(run.nodes.iter().any(|n| n.kind == "source"));
+        assert!(run.nodes.iter().any(|n| n.kind == "tee"));
     }
 }

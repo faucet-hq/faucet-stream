@@ -2150,7 +2150,7 @@ macro_rules! impl_sql_history {
                 let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
                 let now_s = sql::fmt_ts(update.recorded_at);
 
-                for obs in [&update.source, &update.sink] {
+                for obs in update.sources.iter().chain(std::iter::once(&update.sink)) {
                     let id = catalog::dataset_id(&obs.uri);
                     // Read-merge-write; last-write-wins under cluster concurrency
                     // (counters may undercount on a race — acceptable for
@@ -2211,21 +2211,25 @@ macro_rules! impl_sql_history {
                         .map_err(backend)?;
                 }
 
-                let src_id = catalog::dataset_id(&update.source.uri);
+                // One edge per input dataset — a merge/join sink has several
+                // (#459). Fetched once and reused across the inputs.
                 let dst_id = catalog::dataset_id(&update.sink.uri);
                 let existing_edges = self.catalog_all_edges().await?;
-                let existing = existing_edges
-                    .iter()
-                    .find(|e| e.src_id == src_id && e.dst_id == dst_id);
-                let edge = catalog::apply_edge(existing, update);
-                sqlx::query(&self.stmts.catalog_upsert_edge)
-                    .bind(&edge.src_id)
-                    .bind(&edge.dst_id)
-                    .bind(&now_s)
-                    .bind(sql::encode_json(&edge, "catalog edge")?)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(backend)?;
+                for source in &update.sources {
+                    let src_id = catalog::dataset_id(&source.uri);
+                    let existing = existing_edges
+                        .iter()
+                        .find(|e| e.src_id == src_id && e.dst_id == dst_id);
+                    let edge = catalog::apply_edge(existing, update, source);
+                    sqlx::query(&self.stmts.catalog_upsert_edge)
+                        .bind(&edge.src_id)
+                        .bind(&edge.dst_id)
+                        .bind(&now_s)
+                        .bind(sql::encode_json(&edge, "catalog edge")?)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(backend)?;
+                }
                 Ok(())
             }
 
