@@ -28,10 +28,7 @@ through the tap, and out into the **sink**. faucet-stream is the tap — you say
 where the data comes from and where it goes, and it moves the data reliably,
 without losing or scrambling it.
 
-```mermaid
-flowchart LR
-    S["Source"] -->|records| P["faucet pipeline"] -->|records| K["Sink"]
-```
+<div class="fs-flow" data-flow="Source|faucet pipeline|Sink">Source → faucet pipeline → Sink</div>
 
 Everything else — pages, bookmarks, retries, exactly-once — exists to keep that
 one sentence true *even when things go wrong*. We'll add those ideas one at a
@@ -58,10 +55,7 @@ records, write them"). That's a working connector; everything else is optional.
 Connect a Source to a Sink and you have a **pipeline**: read everything, write
 everything.
 
-```mermaid
-flowchart LR
-    A["source.fetch<br/>read all"] --> B["sink.write"] --> C["done — wrote N records"]
-```
+<div class="fs-flow" data-flow="source.fetch::read all|sink.write|done::wrote N records">source.fetch → sink.write → done</div>
 
 For a one-time copy, this is all you need. Two real-world problems push us
 further: you don't want to re-copy everything every run (Chapter 3), and your
@@ -90,10 +84,7 @@ Reading a billion rows into memory won't work. So instead of "all the data," the
 Source produces a stream of **pages** — chunks of, say, 1,000 records at a time —
 and the pipeline handles one page at a time:
 
-```mermaid
-flowchart LR
-    P1["page 1"] --> W1["write"] --> P2["page 2"] --> W2["write"] --> P3["page 3<br/>+ bookmark"] --> W3["write"] --> F["flush"] --> CK["save bookmark"]
-```
+<div class="fs-flow" data-flow="page 1|write|page 2|write|page 3::+ bookmark|write|flush|save bookmark">page 1 → write → page 2 → write → page 3 (+ bookmark) → write → flush → save bookmark</div>
 
 Only one page is ever in memory, so a thousand rows or a billion, memory stays
 flat. The bookmark rides along on the pages, and it's still saved *after* the
@@ -167,10 +158,7 @@ When several of the *data-guarding* tools are on, each page runs them in a fixed
 *safe* order — mask first (so PII can't leak), then validate (so bad data never
 lands), then write, then save the bookmark last:
 
-```mermaid
-flowchart LR
-    PAGE["page"] --> M["mask"] --> Q["quality"] --> C["contract"] --> D["drift"] --> W["write"] --> FL["flush"] --> CK["save bookmark"]
-```
+<div class="fs-flow" data-flow="page|mask|quality|contract|drift|write|flush|save bookmark">page → mask → quality → contract → drift → write → flush → save bookmark</div>
 
 The golden rule never bends, no matter how many tools you add.
 
@@ -202,10 +190,7 @@ repository under [`docs/architecture/`](https://github.com/faucet-hq/faucet-stre
 
 ### How a run is assembled
 
-```mermaid
-flowchart LR
-    cfg["config"] --> comp["compose"] --> interp["interpolate"] --> sec["secrets"] --> parse["parse"] --> exp["expand"] --> exe["executor"] --> pipe["Pipeline"] --> rs["run_stream"]
-```
+<div class="fs-flow" data-flow="config|compose|interpolate|secrets|parse|expand|executor|Pipeline|run_stream">config → compose → interpolate → secrets → parse → expand → executor → Pipeline → run_stream</div>
 
 `expand` is where a config becomes runnable and where the **load-time gates** run
 (exactly-once, write-mode × sink, quarantine-requires-DLQ) — an impossible
@@ -217,10 +202,7 @@ topology fails `faucet validate` before any record moves. Deep dive:
 `run_stream` consumes one `StreamPage { records, bookmark }` at a time and, per
 page, runs the fixed-order passes then one of three write paths:
 
-```mermaid
-flowchart LR
-    PAGE["page"] --> M["mask"] --> Q["quality"] --> C["contract"] --> D["drift"] --> WR["write path"] --> FL["flush"] --> CK["checkpoint"]
-```
+<div class="fs-flow" data-flow="page|mask|quality|contract|drift|write path|flush|checkpoint">page → mask → quality → contract → drift → write path → flush → checkpoint</div>
 
 - **Default (at-least-once):** `write_batch` → flush → persist bookmark.
 - **Exactly-once (atomic watermark):** `write_batch_idempotent(scope, token)` → flush → persist `(bookmark, seq)`; a replayed token-stamped write is a no-op.

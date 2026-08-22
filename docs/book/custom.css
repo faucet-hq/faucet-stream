@@ -1,9 +1,9 @@
 /* ── faucet-stream documentation theme ──────────────────────────────────────
-   Warm, restrained identity: a greige paper background with black text as the
-   default, and a single dark-green accent used only for emphasis — links,
-   the active nav item, buttons, callouts. The rule is strict: wherever a
-   dark-green fill appears, its text is white. No teal, no gradients, no noise.
-   Light/rust = warm paper; navy/coal/ayu = warm charcoal. Loaded via
+   Matches the marketing site (faucet-hq.github.io): a cool near-white paper
+   with slate ink in light, a deep teal-charcoal in dark, and the brand teal as
+   the single accent — links, the active nav item, callouts. The rule is strict:
+   wherever a teal fill appears, its text is white. No gradients, no noise.
+   Light/rust = cool paper; navy/coal/ayu = teal-charcoal. Loaded via
    `additional-css` after mdBook's own CSS, so these rules win.
    ──────────────────────────────────────────────────────────────────────── */
 
@@ -31,10 +31,12 @@
 }
 
 :root {
-  --fs-green: #247368; /* the accent — dark pine green (fills; white text on it) */
-  --fs-green-deep: #17544a; /* hover / link text where more contrast is needed */
-  --fs-green-bright: #57a894; /* accent on dark grounds */
-  --fs-ink: #1b1b18; /* near-black, warm */
+  /* Brand teal, matching the marketing site. --fs-green is the token name kept
+     for stability across the stylesheet, but the value is now the site's teal. */
+  --fs-green: #0d9488; /* the accent — teal (fills, active nav; white text on it) */
+  --fs-green-deep: #0f766e; /* hover / link text where more contrast is needed */
+  --fs-green-bright: #2dd4bf; /* bright teal accent on dark grounds */
+  --fs-ink: #0f172a; /* slate ink (site --ink) */
   /* Font stacks — Geist first, then the native UI font so text renders instantly
      before the webfont loads and if it ever fails. */
   --fs-sans: "Geist", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -56,51 +58,51 @@ kbd {
   font-family: var(--fs-mono);
 }
 
-/* ── Light / rust: warm greige paper, black text ──────────────────────────── */
+/* ── Light / rust: cool near-white paper, slate ink (matches the site) ──────── */
 .light,
 .rust {
-  --bg: #dcdcd6; /* warm greige paper */
+  --bg: #fbfdfc; /* site paper — cool near-white */
   --fg: var(--fs-ink);
-  --sidebar-bg: #c6c6ba; /* deeper warm greige for clearer separation from the paper */
+  --sidebar-bg: #f4f8f7; /* site surface-2 — gentle separation from the paper */
   --sidebar-fg: var(--fs-ink);
-  --sidebar-non-existant: #8a8a7e;
+  --sidebar-non-existant: #94a3b8;
   --sidebar-active: #ffffff;
-  --sidebar-spacer: rgba(27, 27, 24, 0.14);
-  --scrollbar: rgba(27, 27, 24, 0.3);
+  --sidebar-spacer: rgba(15, 23, 42, 0.1);
+  --scrollbar: rgba(15, 23, 42, 0.28);
   --sidebar-header-border-color: var(--fs-green);
-  --links: #1e6055; /* dark green, readable on warm paper */
-  --inline-code-color: #17544a;
-  --quote-bg: #e4e4dd;
-  --quote-border: #c9c9bf;
-  --table-border-color: #c6c6bc;
-  --table-header-bg: #d3d3ca;
-  --table-alternate-bg: #d7d7cf;
-  --theme-popup-bg: #e2e2db;
-  --theme-popup-border: #c6c6bc;
-  --theme-hover: rgba(27, 27, 24, 0.08);
+  --links: #0f766e; /* deep teal, readable (AA) on cool white */
+  --inline-code-color: #0f766e;
+  --quote-bg: #f0fdfa; /* teal-50 wash */
+  --quote-border: #cbe9e3;
+  --table-border-color: #e2e8f0; /* site hairline */
+  --table-header-bg: #f4f8f7;
+  --table-alternate-bg: #f8fafc;
+  --theme-popup-bg: #ffffff;
+  --theme-popup-border: #e2e8f0;
+  --theme-hover: rgba(15, 23, 42, 0.06);
 }
 
-/* ── Navy / coal / ayu: warm charcoal, off-white text ─────────────────────── */
+/* ── Navy / coal / ayu: deep teal-charcoal, off-white text (site dark band) ── */
 .navy,
 .coal,
 .ayu {
-  --bg: #201f1b;
-  --fg: #e8e6dd;
-  --sidebar-bg: #1a1a16;
-  --sidebar-fg: #e8e6dd;
-  --sidebar-non-existant: #8f8d82;
+  --bg: #0a1f1b; /* deep teal-charcoal (near the site --night #08201c) */
+  --fg: #dbeee9; /* off-white, teal-tinted (site --night-ink) */
+  --sidebar-bg: #071915;
+  --sidebar-fg: #dbeee9;
+  --sidebar-non-existant: #6f958c;
   --sidebar-active: #ffffff;
-  --sidebar-spacer: rgba(255, 255, 255, 0.09);
-  --scrollbar: rgba(255, 255, 255, 0.26);
+  --sidebar-spacer: rgba(255, 255, 255, 0.08);
+  --scrollbar: rgba(255, 255, 255, 0.24);
   --sidebar-header-border-color: var(--fs-green-bright);
   --links: var(--fs-green-bright);
   --inline-code-color: var(--fs-green-bright);
-  --quote-bg: #2a2924;
-  --quote-border: #3a3931;
-  --table-border-color: #38372f;
-  --table-header-bg: #26251f;
-  --table-alternate-bg: #232219;
-  --theme-hover: rgba(255, 255, 255, 0.08);
+  --quote-bg: #0e2a24;
+  --quote-border: #16403a; /* site --night-line */
+  --table-border-color: #16403a;
+  --table-header-bg: #0c2620;
+  --table-alternate-bg: #0b2019;
+  --theme-hover: rgba(255, 255, 255, 0.07);
 }
 
 /* ── Sidebar TOC: black text; the active item is a green pill with white text ─ */
@@ -497,6 +499,107 @@ mark {
      thin, unreadable strip. */
   max-width: none;
   height: auto;
+}
+
+/* ── "Live" flow diagrams (fs-flow.js) ─────────────────────────────────────────
+   Animated pipelines matching the marketing site's hero card: teal node-chips
+   connected by flowing packets (the packets are the records moving through).
+   Theme-aware via tokens; motion honors prefers-reduced-motion.
+   ──────────────────────────────────────────────────────────────────────────── */
+.content .fs-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem 0;
+  margin: 1.8rem 0;
+}
+.fs-flow-node {
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid var(--table-border-color);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fs-green) 6%, var(--bg));
+  min-width: 0;
+}
+.fs-flow-name {
+  font-weight: 600;
+  font-size: 0.92em;
+  line-height: 1.2;
+}
+.fs-flow-sub {
+  font-family: var(--fs-mono);
+  font-size: 0.74em;
+  color: color-mix(in srgb, var(--fg) 58%, transparent);
+}
+.fs-flow-edge {
+  position: relative;
+  flex: 0 0 2.1rem;
+  height: 2px;
+  margin: 0 0.1rem;
+  align-self: center;
+  background: color-mix(in srgb, var(--fg) 14%, transparent);
+}
+/* arrowhead at the tip of each connector */
+.fs-flow-edge::after {
+  content: "";
+  position: absolute;
+  right: -1px;
+  top: 50%;
+  transform: translateY(-50%);
+  border-left: 5px solid color-mix(in srgb, var(--fg) 32%, transparent);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+.fs-flow-edge i {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  margin-left: -3px;
+  border-radius: 50%;
+  background: var(--fs-green);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--fs-green) 70%, transparent);
+  animation: fs-flow-move 1.8s linear infinite;
+}
+.fs-flow-edge i:nth-child(2) {
+  animation-delay: 0.6s;
+}
+.fs-flow-edge i:nth-child(3) {
+  animation-delay: 1.2s;
+}
+@keyframes fs-flow-move {
+  0% {
+    left: 0;
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    left: 100%;
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fs-flow-edge i {
+    animation: none;
+  }
+  .fs-flow-edge i:nth-child(1) {
+    left: 22%;
+  }
+  .fs-flow-edge i:nth-child(2) {
+    left: 50%;
+  }
+  .fs-flow-edge i:nth-child(3) {
+    left: 78%;
+  }
 }
 
 /* ── "On this page" — right-hand per-page TOC (page-toc.js) ─────────────────────
