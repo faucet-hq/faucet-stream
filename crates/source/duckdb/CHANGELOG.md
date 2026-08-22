@@ -7,6 +7,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.1.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-duckdb-v1.1.0...faucet-source-duckdb-v1.1.1) - 2026-08-22
+
+### Miscellaneous
+
+- Updated the following local packages: faucet-core
+
 ## [1.1.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-duckdb-v1.0.3...faucet-source-duckdb-v1.1.0) - 2026-08-16
 
 ### Features

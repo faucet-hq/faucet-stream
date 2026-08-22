@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.1.10](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-webhook-v1.1.9...faucet-source-webhook-v1.1.10) - 2026-08-22
+
+### Miscellaneous
+
+- Updated the following local packages: faucet-core
+
 ## [1.1.9](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-webhook-v1.1.8...faucet-source-webhook-v1.1.9) - 2026-08-16
 
 ### Miscellaneous

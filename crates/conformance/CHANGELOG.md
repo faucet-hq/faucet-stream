@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-conformance-v1.3.2...faucet-conformance-v1.3.3) - 2026-08-22
+
+### Miscellaneous
+
+- Updated the following local packages: faucet-core
+
 ## [1.3.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-conformance-v1.3.1...faucet-conformance-v1.3.2) - 2026-08-16
 
 ### Miscellaneous

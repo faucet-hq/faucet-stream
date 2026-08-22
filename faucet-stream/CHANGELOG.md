@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.7.5...faucet-stream-v1.8.0) - 2026-08-22
+
+### Features
+
+- Config-driven parity — REST headers/async-url, XML decode/paging, flow-auth sign/capture (#539–#544) ([#545](https://github.com/faucet-hq/faucet-stream/pull/545))
+- Rest partitions fan-out + repeated query params, cross_join transform, ClickHouse staged load (#535/#536/#534/#528) ([#537](https://github.com/faucet-hq/faucet-stream/pull/537))
+- Datetime window slicing, tree_flatten, staged-load foundation, persistent run logs, chained discovery (#527–#531) ([#532](https://github.com/faucet-hq/faucet-stream/pull/532))
+- *(transforms)* Inbuilt reshape transforms — json_encode, unpivot, lookup ([#520](https://github.com/faucet-hq/faucet-stream/pull/520))
+- *(source-rest)* Add response_format json|csv|excel for authed file bodies ([#508](https://github.com/faucet-hq/faucet-stream/pull/508))
+- MTLS, ES overwrite, OAuth1, and completeness reconciliation ([#506](https://github.com/faucet-hq/faucet-stream/pull/506))
+
 ## [1.7.5](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.7.4...faucet-stream-v1.7.5) - 2026-08-16
 
 ### Miscellaneous

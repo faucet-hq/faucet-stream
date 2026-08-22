@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.1.5](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-delta-v1.1.4...faucet-source-delta-v1.1.5) - 2026-08-22
+
+### Miscellaneous
+
+- Updated the following local packages: faucet-core, faucet-common-delta
+
 ## [1.1.4](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-delta-v1.1.3...faucet-source-delta-v1.1.4) - 2026-08-16
 
 ### Miscellaneous
