@@ -1,6 +1,6 @@
 [package]
 name = "faucet-state-redis"
-version = "1.0.11"
+version = "1.0.12"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.6.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-bigquery-v1.5.1...faucet-sink-bigquery-v1.6.0) - 2026-08-22
+
+### Features
+
+- Datetime window slicing, tree_flatten, staged-load foundation, persistent run logs, chained discovery (#527–#531) ([#532](https://github.com/faucet-hq/faucet-stream/pull/532))
+- Response-decode + async-job (rest), scoped overwrite, run/lineage metadata columns ([#526](https://github.com/faucet-hq/faucet-stream/pull/526))
+- *(sinks)* Add write_mode: overwrite (full-refresh) across data-storage sinks ([#493](https://github.com/faucet-hq/faucet-stream/pull/493))
+
 ## [1.5.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-bigquery-v1.5.0...faucet-sink-bigquery-v1.5.1) - 2026-08-16
 
 ### Miscellaneous

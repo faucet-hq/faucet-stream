@@ -7,6 +7,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.0.5](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-nats-v1.0.4...faucet-common-nats-v1.0.5) - 2026-08-22
+
+### Miscellaneous
+
+- Updated the following local packages: faucet-core
+
 ## [1.0.4](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-nats-v1.0.3...faucet-common-nats-v1.0.4) - 2026-08-16
 
 ### Miscellaneous

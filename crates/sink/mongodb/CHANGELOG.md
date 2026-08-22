@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.6.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-mongodb-v1.5.0...faucet-sink-mongodb-v1.6.0) - 2026-08-22
+
+### Features
+
+- *(sinks)* Add write_mode: overwrite (full-refresh) across data-storage sinks ([#493](https://github.com/faucet-hq/faucet-stream/pull/493))
+
 ## [1.5.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-mongodb-v1.4.0...faucet-sink-mongodb-v1.5.0) - 2026-08-16
 
 ### Features

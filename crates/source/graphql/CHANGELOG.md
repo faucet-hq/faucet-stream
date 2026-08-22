@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-graphql-v1.3.0...faucet-source-graphql-v1.4.0) - 2026-08-22
+
+### Features
+
+- MTLS, ES overwrite, OAuth1, and completeness reconciliation ([#506](https://github.com/faucet-hq/faucet-stream/pull/506))
+
 ## [1.3.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-graphql-v1.2.7...faucet-source-graphql-v1.3.0) - 2026-08-16
 
 ### Features

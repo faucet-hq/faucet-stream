@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.11.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.10.0...faucet-cli-v1.11.0) - 2026-08-22
+
+### Features
+
+- Config-driven parity — REST headers/async-url, XML decode/paging, flow-auth sign/capture (#539–#544) ([#545](https://github.com/faucet-hq/faucet-stream/pull/545))
+- Rest partitions fan-out + repeated query params, cross_join transform, ClickHouse staged load (#535/#536/#534/#528) ([#537](https://github.com/faucet-hq/faucet-stream/pull/537))
+- Datetime window slicing, tree_flatten, staged-load foundation, persistent run logs, chained discovery (#527–#531) ([#532](https://github.com/faucet-hq/faucet-stream/pull/532))
+- Response-decode + async-job (rest), scoped overwrite, run/lineage metadata columns ([#526](https://github.com/faucet-hq/faucet-stream/pull/526))
+- *(source)* Composable auth flows, OData mode + $metadata discovery, server-side incremental push-down ([#524](https://github.com/faucet-hq/faucet-stream/pull/524))
+- *(transforms)* Inbuilt reshape transforms — json_encode, unpivot, lookup ([#520](https://github.com/faucet-hq/faucet-stream/pull/520))
+- *(cli)* Discovery-driven request matrix (discover + for_each cross-product) ([#509](https://github.com/faucet-hq/faucet-stream/pull/509))
+- *(source-rest)* Add response_format json|csv|excel for authed file bodies ([#508](https://github.com/faucet-hq/faucet-stream/pull/508))
+- MTLS, ES overwrite, OAuth1, and completeness reconciliation ([#506](https://github.com/faucet-hq/faucet-stream/pull/506))
+- *(sinks)* Add write_mode: overwrite (full-refresh) across data-storage sinks ([#493](https://github.com/faucet-hq/faucet-stream/pull/493))
+
 ## [1.10.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.9.0...faucet-cli-v1.10.0) - 2026-08-16
 
 ### Features
