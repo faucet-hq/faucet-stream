@@ -95,3 +95,7 @@ Can you update the test template and then run it? Run a full sync.
 ---
 
 Go with 8 concurrent and see how much time it takes.
+
+---
+
+if a run has been done using a template, should be it shown in the run details along with what numeric version was used for it?
