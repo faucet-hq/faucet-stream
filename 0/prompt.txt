@@ -73,3 +73,7 @@ rather have pages, like page 1 2 and so on
 ---
 
 is salesforce template can we do select * from "object" right?
+
+---
+
+how can i do this automatically rather than hardcoding?
