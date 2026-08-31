@@ -1,0 +1,157 @@
+{
+  "cli_version": "0.10.2",
+  "checkpoint_id": "01M1C78KYVZRXSNYKZBSZFC7C8",
+  "session_id": "55398c64-7c65-40db-9b68-886111a86d7f",
+  "strategy": "manual-commit",
+  "created_at": "2026-08-31T15:33:55.880773Z",
+  "branch": "feat/native-byte-passthrough-633",
+  "checkpoints_count": 2,
+  "save_step_count": 3,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-8",
+  "turn_id": "23fc53602b0d",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 11252,
+    "cache_creation_tokens": 34493343,
+    "cache_read_tokens": 3167706963,
+    "output_tokens": 6613959,
+    "api_call_count": 5649,
+    "subagent_tokens": {
+      "input_tokens": 0,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "output_tokens": 0,
+      "api_call_count": 0
+    }
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_017ZfRgSytScg56gq1T9UQPE",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "23fc53602b0d",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 7917,
+        "end": 7918,
+        "entry_ids": [
+          "77fc9a79-96ea-4356-a27c-a75ba0299ea3"
+        ],
+        "tool_use_id": "toolu_017ZfRgSytScg56gq1T9UQPE"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017ZfRgSytScg56gq1T9UQPE"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01MJQ8Y6HmbmGqKCCexDcdHR",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "23fc53602b0d",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 21427,
+        "end": 21428,
+        "entry_ids": [
+          "71548694-66ab-42a0-9606-4771e135588e"
+        ],
+        "tool_use_id": "toolu_01MJQ8Y6HmbmGqKCCexDcdHR"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01MJQ8Y6HmbmGqKCCexDcdHR"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_017asfQCcZaMKX3JWdwmjpEh",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "code-review"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "23fc53602b0d",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 31762,
+        "end": 31763,
+        "entry_ids": [
+          "f5c37f7a-f2a5-45b4-847f-82e5a1eea868"
+        ],
+        "tool_use_id": "toolu_017asfQCcZaMKX3JWdwmjpEh"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017asfQCcZaMKX3JWdwmjpEh"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: code-review",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 520
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 1,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claire/worktrees/serve-http-control-plane/cli/src/serve/auth.rs": 1
+      }
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 1,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claire/worktrees/serve-http-control-plane/cli/src/serve/auth.rs": 1
+      }
+    }
+  ]
+}
