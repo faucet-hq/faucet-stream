@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.10.2",
+  "checkpoint_id": "01M1C9CGVSH9QBAJV154ZE44ES",
+  "strategy": "manual-commit",
+  "branch": "feat/native-byte-passthrough-633",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "crates/source/rest/README.md",
+    "crates/source/rest/src/config.rs",
+    "crates/source/rest/src/stream.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 11414,
+    "cache_creation_tokens": 34591307,
+    "cache_read_tokens": 3220032242,
+    "output_tokens": 6681871,
+    "api_call_count": 5730
+  }
+}

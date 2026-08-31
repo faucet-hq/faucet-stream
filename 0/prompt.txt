@@ -1,0 +1,79 @@
+[Image #67]
+
+this is still not getting fixed. one of the row is showing above headers
+man wtf is this
+
+---
+
+Delayed incremental-sync verification (#630). Run the preserved-bookmark incremental sync now and report whether real changed records were fetched over the ~5h window.
+
+Steps:
+1. Read the current bookmark BEFORE the run: cat /Users/c-sikawats/Documents/GitHub/Personal/faucet-stream/faucet-local-demo/inc639/state/*.json
+2. Run it, capturing wall time, to a log:
+   cd /Users/c-sikawats/Documents/GitHub/Personal/faucet-stream
+   S=$(date +%s); ./target/debug/faucet run faucet-local-demo/inc639/inc.yaml > /tmp/inc639_delayed.log 2>&1; echo "wall=$(($(date +%s)-S))s exit=$?"
+3. From /tmp/inc639_delayed.log report: records_written (this is the delta — the key number: >0 means incremental fetched changed rows over the 5h window; 0 means nothing changed), whether "native byte-passthrough fast path selected" appears, peak process RSS, and wall time.
+4. Read the bookmark AFTER the run (same path) — it should have advanced to this run's start time.
+5. Give the user a short verdict: did the incremental sync fetch changed records incrementally? Compare records_written vs the earlier delta run (which fetched 0 after only ~90s). Do NOT re-bootstrap or reset state; the preserved bookmark must be used. Creds are baked into the config as param defaults (credits are approved for this one delayed run since the user explicitly requested it).
+
+---
+
+[Image #72]
+
+The box in the table should not be scrollable. I should be able to scroll left and right in the box itself to see the full name. Are you getting my point?
+
+---
+
+[Image #73]
+
+There's a lot of space left on the right side. Come on, you needed to check this on your own. You needed to evaluate this on your own by launching a live UI and checking it. I shouldn't have to tell it to you.
+
+---
+
+load more button should go away as well once its completely over
+
+---
+
+greyyed out and non greyed out is not looking very diff
+
+---
+
+can the load more be just removed once it reaches end?
+
+---
+
+lineage page is too wide, decrease it please
+
+---
+
+whats the branch name
+
+---
+
+we completed memory profiling right?
+
+---
+
+[Image #74]
+
+the time can be formatted in hms format?
+
+also the record count can be B,M,K
+
+---
+
+should we have a test suite kind of combination of values for input parameter for our templates? think this feature thoroughly and only file a guthub ussue for now
+
+---
+
+[Image #75]
+
+rather have pages, like page 1 2 and so on
+
+---
+
+is salesforce template can we do select * from "object" right?
+
+---
+
+how can i do this automatically rather than hardcoding?
