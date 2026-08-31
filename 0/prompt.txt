@@ -39,3 +39,7 @@ greyyed out and non greyed out is not looking very diff
 ---
 
 can the load more be just removed once it reaches end?
+
+---
+
+lineage page is too wide, decrease it please
