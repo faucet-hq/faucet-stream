@@ -35,3 +35,7 @@ load more button should go away as well once its completely over
 ---
 
 greyyed out and non greyed out is not looking very diff
+
+---
+
+can the load more be just removed once it reaches end?
