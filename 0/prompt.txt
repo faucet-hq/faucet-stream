@@ -21,3 +21,9 @@ Steps:
 [Image #72]
 
 The box in the table should not be scrollable. I should be able to scroll left and right in the box itself to see the full name. Are you getting my point?
+
+---
+
+[Image #73]
+
+There's a lot of space left on the right side. Come on, you needed to check this on your own. You needed to evaluate this on your own by launching a live UI and checking it. I shouldn't have to tell it to you.
