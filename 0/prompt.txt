@@ -31,3 +31,7 @@ There's a lot of space left on the right side. Come on, you needed to check this
 ---
 
 load more button should go away as well once its completely over
+
+---
+
+greyyed out and non greyed out is not looking very diff
