@@ -63,3 +63,9 @@ also the record count can be B,M,K
 ---
 
 should we have a test suite kind of combination of values for input parameter for our templates? think this feature thoroughly and only file a guthub ussue for now
+
+---
+
+[Image #75]
+
+rather have pages, like page 1 2 and so on
