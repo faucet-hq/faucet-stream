@@ -51,3 +51,11 @@ whats the branch name
 ---
 
 we completed memory profiling right?
+
+---
+
+[Image #74]
+
+the time can be formatted in hms format?
+
+also the record count can be B,M,K
