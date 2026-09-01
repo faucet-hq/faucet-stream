@@ -118,3 +118,7 @@ if a run has been done using a template, should be it shown in the run details a
 
 
 go with 2 and complete it
+
+---
+
+run a full sync on all 21 objects
