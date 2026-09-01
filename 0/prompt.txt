@@ -109,3 +109,12 @@ if a run has been done using a template, should be it shown in the run details a
 <status>completed</status>
 <summary>Background command "Tracked monitor: poll serve run until terminal" completed (exit code 0)</summary>
 </task-notification>
+
+---
+
+(2) is clearly what you're describing, and it's the right end-state. It's a substantial build (runtime discovery + dynamic matrix expansion + a list-typed param), so before I spend
+  on it I want to make sure I build the right shape: do you want me to go straight for (2) — the generic template where objects is a trigger param and fields auto-discover at run time
+  — or wire up (1) now as an interim while (2) lands? I'd default to building (2).
+
+
+go with 2 and complete it
