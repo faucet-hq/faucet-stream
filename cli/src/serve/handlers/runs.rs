@@ -178,7 +178,9 @@ impl<'de> Deserialize<'de> for DateTimeUtcParam {
 /// `GET /v1/runs` query string.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
-    pub status: Option<RunStatus>,
+    /// Comma-separated status names to include (e.g. `running,completed`); empty
+    /// / absent = every status. Unknown tokens are ignored.
+    pub status: Option<String>,
     pub name: Option<String>,
     pub(crate) since: Option<DateTimeUtcParam>,
     pub(crate) until: Option<DateTimeUtcParam>,
@@ -200,7 +202,11 @@ const MAX_LIMIT: usize = 500;
 impl ListQuery {
     fn into_filter(self) -> ListFilter {
         ListFilter {
-            status: self.status,
+            status: self
+                .status
+                .as_deref()
+                .map(|s| s.split(',').filter_map(RunStatus::parse).collect())
+                .unwrap_or_default(),
             name: self.name,
             since: self.since.map(|p| p.0),
             until: self.until.map(|p| p.0),
@@ -267,7 +273,7 @@ mod tests {
         };
         assert_eq!(q.into_filter().limit, MAX_LIMIT);
         let q = ListQuery {
-            status: Some(RunStatus::Failed),
+            status: Some("failed,completed".to_string()),
             name: None,
             since: None,
             until: None,
@@ -276,7 +282,7 @@ mod tests {
         };
         let f = q.into_filter();
         assert_eq!(f.limit, DEFAULT_LIMIT);
-        assert_eq!(f.status, Some(RunStatus::Failed));
+        assert_eq!(f.status, vec![RunStatus::Failed, RunStatus::Completed]);
     }
 
     #[tokio::test]

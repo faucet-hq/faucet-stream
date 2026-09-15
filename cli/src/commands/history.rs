@@ -168,6 +168,7 @@ mod tests {
                 row_id: "us".into(),
                 parent_record_key: None,
                 records_written: rows as usize,
+                duration_ms: 0,
                 error: None,
             }],
             error: (status == RunStatus::Failed).then(|| "boom".to_string()),

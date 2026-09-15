@@ -501,6 +501,10 @@ select {
   -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
   mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
 }
+/* The fade signals "more to the right" — but at the end of the scroll (or when
+   the text fits with no scroll) it would blur the last characters. `at-end` (set
+   by JS on scroll) drops the mask so the tail is always crisp. */
+.ds-uri-in.at-end { -webkit-mask-image: none; mask-image: none; }
 .ds-uri-in::-webkit-scrollbar { display: none; }
 .ds-meta { font-family: var(--font-mono); font-size: 0.8rem; color: var(--ink-dim); white-space: nowrap; }
 .ds-num { text-align: right; }

@@ -697,6 +697,15 @@ function row(d) {
     <td class="ds-meta ds-num">${fmtInt(d.runs)}</td>
     <td class="ds-meta ds-num" title="${fmtInt(d.last_records)}">${fmtCompact(d.last_records)}</td>
     <td class="ds-meta ds-time" title="last success">${fmtTime(d.last_success)}</td>`;
+  // Drop the right-edge fade once the URI is scrolled to its end (or doesn't
+  // scroll at all), so the last characters render crisp instead of faded.
+  const uri = el.querySelector(".ds-uri-in");
+  if (uri) {
+    const syncFade = () =>
+      uri.classList.toggle("at-end", uri.scrollLeft + uri.clientWidth >= uri.scrollWidth - 1);
+    uri.addEventListener("scroll", syncFade, { passive: true });
+    requestAnimationFrame(syncFade); // initial state, after layout
+  }
   return el;
 }
 

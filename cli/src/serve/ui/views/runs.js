@@ -4,11 +4,12 @@ import { escapeHtml, fmtInt, fmtDuration, fmtCompact } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { formatTs } from "../tz.js";
 
-const STATUSES = ["", "queued", "running", "completed", "failed", "cancelled"];
+const STATUSES = ["queued", "running", "completed", "failed", "cancelled"];
 
 export async function renderRuns(container) {
   let cursor = null;
   let filters = { status: "", name: "", since: "", until: "" };
+  const statusSel = new Set(); // selected statuses (empty = all)
   let pollTimer = null;
 
   container.innerHTML = `
@@ -18,7 +19,12 @@ export async function renderRuns(container) {
         <button class="btn-primary" id="r-submit">+ Submit run</button>
       </div>
       <div class="filters">
-        <select id="f-status">${STATUSES.map((s) => `<option value="${s}">${s || "all statuses"}</option>`).join("")}</select>
+        <details class="dd" id="f-status-dd">
+          <summary id="f-status-sum">status ▾</summary>
+          <div class="dd-menu">
+            ${STATUSES.map((s) => `<label class="dd-opt"><input type="checkbox" value="${s}" /> ${s}</label>`).join("")}
+          </div>
+        </details>
         <input id="f-name" placeholder="name" />
         <input id="f-since" class="date-input" type="text" readonly placeholder="from…" />
         <input id="f-until" class="date-input" type="text" readonly placeholder="to…" />
@@ -38,6 +44,21 @@ export async function renderRuns(container) {
   container.querySelector("#r-submit").onclick = () => navigate("#/submit");
   attachDatePicker(container.querySelector("#f-since"));
   attachDatePicker(container.querySelector("#f-until"));
+
+  // Multi-select status filter: check any combination (empty = all). Applied on
+  // the Apply button, alongside name/date, so one round-trip covers every filter.
+  const statusDd = container.querySelector("#f-status-dd");
+  const statusSum = container.querySelector("#f-status-sum");
+  statusDd.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+    cb.onchange = () => {
+      if (cb.checked) statusSel.add(cb.value);
+      else statusSel.delete(cb.value);
+      statusSum.textContent = statusSel.size ? `status (${statusSel.size}) ▾` : "status ▾";
+    };
+  });
+  document.addEventListener("click", (e) => {
+    if (statusDd.open && !statusDd.contains(e.target)) statusDd.open = false;
+  });
 
   function query(reset) {
     if (reset) cursor = null;
@@ -75,7 +96,7 @@ export async function renderRuns(container) {
 
   container.querySelector("#f-apply").onclick = () => {
     filters = {
-      status: container.querySelector("#f-status").value,
+      status: [...statusSel].join(","),
       name: container.querySelector("#f-name").value.trim(),
       since: container.querySelector("#f-since").dataset.value || "",
       until: container.querySelector("#f-until").dataset.value || "",

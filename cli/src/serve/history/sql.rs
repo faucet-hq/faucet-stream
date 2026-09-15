@@ -497,7 +497,7 @@ impl Stmts {
             // Casts make the parameter types explicit so `$n IS NULL` cannot trip
             // Postgres' "could not determine data type of parameter" check.
             list: "SELECT body FROM faucet_serve_runs \
-                WHERE ($1::text IS NULL OR status = $2::text) \
+                WHERE ($1::text IS NULL OR position(',' || status || ',' in $2::text) > 0) \
                 AND ($3::text IS NULL OR name = $4::text) \
                 AND ($5::text IS NULL OR submitted_at >= $6::text) \
                 AND ($7::text IS NULL OR submitted_at <= $8::text) \
@@ -790,7 +790,7 @@ impl Stmts {
             select_submitted: "SELECT submitted_at FROM faucet_serve_runs WHERE run_id=?".into(),
             delete: "DELETE FROM faucet_serve_runs WHERE run_id=?".into(),
             list: "SELECT body FROM faucet_serve_runs \
-                WHERE (? IS NULL OR status = ?) \
+                WHERE (? IS NULL OR instr(?, ',' || status || ',') > 0) \
                 AND (? IS NULL OR name = ?) \
                 AND (? IS NULL OR submitted_at >= ?) \
                 AND (? IS NULL OR submitted_at <= ?) \
@@ -1387,7 +1387,23 @@ macro_rules! impl_sql_history {
                     None
                 };
 
-                let status_s = filter.status.map(|s| s.as_str());
+                // Multi-status via a comma-wrapped membership test: bind
+                // `,completed,failed,` and match `,<status>,` as a substring (the
+                // clause is `position`/`instr` per dialect). None = every status.
+                let status_s: Option<String> = if filter.status.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        ",{},",
+                        filter
+                            .status
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ))
+                };
+                let status_s = status_s.as_deref();
                 let name_s = filter.name.as_deref();
                 let since_s = filter.since.map(sql::fmt_ts);
                 let until_s = filter.until.map(sql::fmt_ts);

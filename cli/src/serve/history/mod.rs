@@ -59,6 +59,19 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
         }
     }
+    /// Parse a lowercase status name (inverse of [`as_str`](Self::as_str)).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "queued" => Self::Queued,
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "sharded" => Self::Sharded,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
 }
 
 /// Serializable mirror of one pipeline invocation's outcome.
@@ -220,7 +233,8 @@ pub struct InstanceRecord {
 /// Filter + pagination for `list`. `limit`/`cursor` are resolved by the handler.
 #[derive(Debug, Default, Clone)]
 pub struct ListFilter {
-    pub status: Option<RunStatus>,
+    /// Statuses to include (OR-ed). Empty = every status.
+    pub status: Vec<RunStatus>,
     pub name: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
