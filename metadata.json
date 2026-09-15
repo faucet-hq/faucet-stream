@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.10.2",
+  "checkpoint_id": "01M2JMR8GACD8YAWX0HM3XT3AH",
+  "strategy": "manual-commit",
+  "branch": "feat/native-byte-passthrough-633",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "crates/sink/bigquery/src/config.rs",
+    "crates/sink/bigquery/src/idempotent.rs",
+    "crates/sink/bigquery/src/sink.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 13346,
+    "cache_creation_tokens": 45626559,
+    "cache_read_tokens": 3809883136,
+    "output_tokens": 8120922,
+    "api_call_count": 6700
+  }
+}
