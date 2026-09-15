@@ -221,6 +221,20 @@ fn default_concurrency() -> usize {
         .clamp(1, 8)
 }
 
+/// Resolve `execution.max_concurrent` into semaphore permits.
+///
+/// - `Some(0)` — **no limit**: every invocation runs in parallel. This is the
+///   intuitive complement of `1` (serial): the user opts fully out of the cap.
+/// - `Some(n)` — exactly `n` in flight.
+/// - `None` — the CPU-scaled default ([`default_concurrency`]).
+fn concurrency_permits(configured: Option<usize>) -> usize {
+    match configured {
+        Some(0) => Semaphore::MAX_PERMITS,
+        Some(n) => n,
+        None => default_concurrency(),
+    }
+}
+
 /// Execute every node in `nodes`. `nodes` must be in BFS order (roots first
 /// then children) — that's what [`crate::expand::expand`] returns.
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
@@ -229,12 +243,8 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         .as_ref()
         .map(|e| e.on_error)
         .unwrap_or_default();
-    let max_concurrent = opts
-        .execution
-        .as_ref()
-        .and_then(|e| e.max_concurrent)
-        .unwrap_or_else(default_concurrency)
-        .max(1);
+    let max_concurrent =
+        concurrency_permits(opts.execution.as_ref().and_then(|e| e.max_concurrent));
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
     // A `local_outputs:` block with nowhere to record to is inert (#587). Say so
@@ -2503,7 +2513,11 @@ impl Source for StateKeyOverride {
         format: faucet_core::NativeFormat,
         batch_size: usize,
     ) -> std::pin::Pin<
-        Box<dyn faucet_core::Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>,
+        Box<
+            dyn faucet_core::Stream<Item = Result<faucet_core::NativeBatch, FaucetError>>
+                + Send
+                + 'a,
+        >,
     > {
         self.inner.stream_native(ctx, format, batch_size)
     }
@@ -2702,6 +2716,16 @@ mod tests {
     use crate::config::{ConnectorSpec, PipelineConfig, PipelineSpec};
     use crate::expand::expand;
     use serde_json::json;
+
+    #[test]
+    fn concurrency_permits_semantics() {
+        // 0 = unlimited (all in parallel); 1 = serial; n = n; None = default cap.
+        assert_eq!(concurrency_permits(Some(0)), Semaphore::MAX_PERMITS);
+        assert_eq!(concurrency_permits(Some(1)), 1);
+        assert_eq!(concurrency_permits(Some(12)), 12);
+        let d = concurrency_permits(None);
+        assert!((1..=8).contains(&d), "default cap in 1..=8, got {d}");
+    }
 
     #[tokio::test]
     async fn resolve_product_dims_skips_unavailable_and_rejects_oversized() {
