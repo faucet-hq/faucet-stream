@@ -342,9 +342,15 @@ mod tests {
         assert_eq!(edm_type_to_json("Edm.Int64"), json!({"type": "integer"}));
         assert_eq!(edm_type_to_json("Edm.Decimal"), json!({"type": "number"}));
         assert_eq!(edm_type_to_json("Edm.String"), json!({"type": "string"}));
+        // Temporal EDM types carry a format hint so typed sinks declare
+        // TIMESTAMP/DATE instead of STRING.
         assert_eq!(
             edm_type_to_json("Edm.DateTimeOffset"),
-            json!({"type": "string"})
+            json!({"type": "string", "format": "date-time"})
+        );
+        assert_eq!(
+            edm_type_to_json("Edm.Date"),
+            json!({"type": "string", "format": "date"})
         );
         assert_eq!(
             edm_type_to_json("Something.Custom"),
@@ -415,18 +421,21 @@ mod tests {
     }
 
     #[test]
-    fn edmx_for_objects_attaches_snaked_typed_schema() {
+    fn edmx_for_objects_attaches_verbatim_typed_schema() {
         let ds =
             descriptors_from_edmx_for_objects(SAMPLE, &["Orders".to_string()], "fno_").unwrap();
         assert_eq!(ds.len(), 1);
         let patch = ds[0].sink_patch.as_ref().unwrap();
         assert_eq!(patch["table_id"], "fno_orders");
         let schema = &patch["schema"];
-        // Column names snake-cased to match keys_case:snake; EDM types mapped.
-        assert_eq!(schema["properties"]["doc_entry"]["type"], "integer"); // non-null Int32
-        assert_eq!(schema["properties"]["total"]["type"], "number"); // non-null Decimal
-        assert_eq!(schema["properties"]["doc_date"]["type"][0], "string"); // nullable DateTimeOffset
-        assert_eq!(schema["properties"]["posted"]["type"][0], "boolean"); // nullable Boolean
+        // Column names kept verbatim (raw EDM PascalCase) so the declared schema
+        // matches the untransformed record keys; EDM types mapped, temporal
+        // types tagged with a format hint.
+        assert_eq!(schema["properties"]["DocEntry"]["type"], "integer"); // non-null Int32
+        assert_eq!(schema["properties"]["Total"]["type"], "number"); // non-null Decimal
+        assert_eq!(schema["properties"]["DocDate"]["type"][0], "string"); // nullable DateTimeOffset
+        assert_eq!(schema["properties"]["DocDate"]["format"], "date-time");
+        assert_eq!(schema["properties"]["Posted"]["type"][0], "boolean"); // nullable Boolean
     }
 
     #[test]

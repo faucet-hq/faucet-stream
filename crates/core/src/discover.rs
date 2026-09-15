@@ -127,11 +127,17 @@ pub fn sql_type_to_json_schema(data_type: &str) -> Value {
 
 /// Wrap a type fragment as nullable (`{"type": ["T", "null"]}`), matching the
 /// nullable shape [`infer_schema`](crate::schema::infer_schema) emits.
-pub fn nullable_type(fragment: Value) -> Value {
-    match fragment.get("type") {
-        Some(Value::String(t)) => json!({ "type": [t, "null"] }),
-        _ => fragment,
+pub fn nullable_type(mut fragment: Value) -> Value {
+    let single = match fragment.get("type") {
+        Some(Value::String(t)) => t.clone(),
+        _ => return fragment,
+    };
+    // Wrap only the `type` in place so sibling keys (e.g. a `format: date-time`
+    // hint a typed sink maps to TIMESTAMP/DATE) survive the nullability wrap.
+    if let Some(obj) = fragment.as_object_mut() {
+        obj.insert("type".into(), json!([single, "null"]));
     }
+    fragment
 }
 
 /// Assemble an `infer_schema`-shaped object schema from
@@ -217,6 +223,12 @@ mod tests {
         // Already-complex fragments pass through untouched.
         let complex = json!({"type": ["string", "null"]});
         assert_eq!(nullable_type(complex.clone()), complex);
+        // Sibling keys survive the wrap — a temporal `format` hint must not be
+        // lost when the column is nullable (a typed sink maps it to TIMESTAMP).
+        assert_eq!(
+            nullable_type(json!({"type": "string", "format": "date-time"})),
+            json!({"type": ["string", "null"], "format": "date-time"})
+        );
     }
 
     #[test]

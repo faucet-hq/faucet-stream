@@ -305,7 +305,7 @@ pub fn build_descriptor(
     let config_patch = render_value(&spec.emit.config, name, &field_names);
     let mut d = DatasetDescriptor::new(name.to_string(), "dataset", config_patch);
     if !cols.is_empty() {
-        d = d.with_schema(columns_to_schema(cols.into_iter()));
+        d = d.with_schema(columns_to_schema(cols));
     }
     if let Some(tid) = &spec.emit.table_id {
         d = d.with_sink_patch(json!({ "table_id": render_template(tid, name, &field_names) }));

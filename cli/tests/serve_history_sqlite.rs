@@ -153,7 +153,7 @@ async fn list_orders_desc_filters_and_paginates() {
     .unwrap();
     let failed = h
         .list(&ListFilter {
-            status: Some(RunStatus::Failed),
+            status: vec![RunStatus::Failed],
             limit: 50,
             ..Default::default()
         })

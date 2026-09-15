@@ -31,7 +31,7 @@ use std::pin::Pin;
 /// let inner: Box<dyn Source> = build_inner();
 /// let wrapped = TransformingSource::new(
 ///     inner,
-///     vec![TransformStage::Map(RecordTransform::KeysCase { mode: KeyCaseMode::Snake })],
+///     vec![TransformStage::Map(RecordTransform::KeysCase { mode: KeyCaseMode::Snake, on_collision: Default::default() })],
 ///     Labels::for_named("rest"),
 /// ).unwrap();
 /// ```
