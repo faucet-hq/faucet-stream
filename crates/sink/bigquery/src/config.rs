@@ -3,6 +3,7 @@
 use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // Re-export the shared credentials type so end-user imports remain stable
 // (`use faucet_sink_bigquery::BigQueryCredentials;` keeps working).
@@ -65,6 +66,18 @@ pub struct BigQuerySinkConfig {
     /// schema is managed externally and a missing table signals a typo).
     #[serde(default = "default_create_table")]
     pub create_table: bool,
+    /// Explicit column schema, in the `infer_schema` JSON-Schema shape
+    /// (`{"type":"object","properties":{"col":{"type":"integer"}, …}}`). When
+    /// set it is used **verbatim** for the `media_load` load job (so BigQuery
+    /// types columns from this instead of `autodetect`) and for `create_table`.
+    /// This is the escape hatch for typed sources whose JSON is heterogeneous
+    /// enough that `autodetect` mis-types a column and then fails the whole load
+    /// on one non-conforming row (e.g. an OData feed — the OData `$metadata`
+    /// document is the authoritative source of these types). Absent ⇒ the prior
+    /// behaviour (autodetect on `media_load`, first-page inference on
+    /// `create_table`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
     /// Location (region or multi-region, e.g. `US`, `EU`, `us-central1`) used only
     /// when `create_table` has to create the dataset. `None` uses the BigQuery
     /// job's default location. Ignored once the dataset exists.
@@ -191,6 +204,7 @@ impl BigQuerySinkConfig {
             create_table: default_create_table(),
             location: None,
             media_load: false,
+            schema: None,
             overwrite_staging: false,
             upload_base_url: None,
             resumable_chunk: None,

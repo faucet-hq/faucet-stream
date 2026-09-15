@@ -48,6 +48,54 @@ fn is_table_not_found(err: &BQError) -> bool {
     matches!(err, BQError::ResponseError { error } if error.error.code == 404)
 }
 
+/// Max attempts (including the first) for a transient BigQuery control-plane call.
+const BQ_CP_ATTEMPTS: u32 = 4;
+
+/// A transient BigQuery control-plane failure worth retrying: connection-level
+/// blips (the client surfaces these as `Hyper Connect`/`SendRequest` /
+/// "Connection failure" / "error decoding response body") and 5xx. `tables.get`
+/// and the DDL/`jobs.query` calls are idempotent, so a blind retry is safe.
+fn is_transient_bq_error(err: &BQError) -> bool {
+    if let BQError::ResponseError { error } = err {
+        return matches!(error.error.code, 500 | 502 | 503 | 504);
+    }
+    let s = err.to_string();
+    s.contains("Connection failure")
+        || s.contains("SendRequest")
+        || s.contains("Connect")
+        || s.contains("error decoding response body")
+        || s.contains("connection closed")
+        || s.contains("timed out")
+        || s.contains("timeout")
+}
+
+/// Retry a BigQuery control-plane call on [`is_transient_bq_error`], with
+/// exponential backoff (500ms → 8s cap). Without this a transient connection
+/// blip fails the whole object — or, for the pre-write overwrite DDL, aborts the
+/// entire run.
+async fn retry_control_plane<F, Fut, T>(what: &str, mut call: F) -> Result<T, BQError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, BQError>>,
+{
+    let mut delay = Duration::from_millis(500);
+    for attempt in 1..=BQ_CP_ATTEMPTS {
+        match call().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < BQ_CP_ATTEMPTS && is_transient_bq_error(&e) => {
+                tracing::warn!(
+                    what, attempt, error = %e,
+                    "BigQuery control-plane transient error; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(8));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop returns on the final attempt")
+}
+
 /// Rows a completed DML job reported as affected
 /// (`statistics.query.numDmlAffectedRows`, which BigQuery sends as a string).
 ///
@@ -241,6 +289,40 @@ fn all_string_schema<I: IntoIterator<Item = String>>(columns: I) -> Option<Value
     }
 }
 
+/// Convert an `infer_schema`-shaped JSON Schema (`{"type":"object","properties":
+/// {"col":{"type":…}}}`) into a BigQuery load-job schema
+/// (`{"fields":[{"name","type","mode":"NULLABLE"}]}`). Field types map via the
+/// same rules as [`idempotent::bq_column_type`] but rendered with the load-API
+/// type keywords. All columns are `NULLABLE` (a page need not carry every field).
+/// Returns `None` when no columns can be derived, so the caller falls back to
+/// the prior autodetect/inference behaviour.
+fn json_schema_to_load_schema(schema: &Value) -> Option<Value> {
+    let props = schema.get("properties")?.as_object()?;
+    if props.is_empty() {
+        return None;
+    }
+    let mut names: Vec<&String> = props.keys().collect();
+    names.sort();
+    let fields: Vec<Value> = names
+        .iter()
+        .map(|n| {
+            // `bq_column_type` returns GoogleSQL names (INT64/FLOAT64/BOOL); the
+            // load API's `type` field wants the legacy keywords.
+            let ty = match crate::idempotent::bq_column_type(&props[*n]) {
+                "INT64" => "INTEGER",
+                "FLOAT64" => "FLOAT",
+                "BOOL" => "BOOLEAN",
+                "JSON" => "JSON",
+                "TIMESTAMP" => "TIMESTAMP",
+                "DATE" => "DATE",
+                _ => "STRING",
+            };
+            serde_json::json!({ "name": n, "type": ty, "mode": "NULLABLE" })
+        })
+        .collect();
+    Some(serde_json::json!({ "fields": fields }))
+}
+
 /// Column names in first-appearance order from the first record of a native batch:
 /// the keys of the first NDJSON object, or the header cells of the first CSV line.
 /// Cheap — reads only up to the first newline. Returns `None` if none can be read.
@@ -330,7 +412,10 @@ fn is_direct_overwrite(config: &BigQuerySinkConfig) -> bool {
 fn gzip(data: &[u8]) -> Result<Vec<u8>, FaucetError> {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::with_capacity(data.len() / 4 + 64), Compression::default());
+    let mut enc = GzEncoder::new(
+        Vec::with_capacity(data.len() / 4 + 64),
+        Compression::default(),
+    );
     enc.write_all(data)
         .map_err(|e| FaucetError::Sink(format!("gzip NDJSON media: {e}")))?;
     enc.finish()
@@ -399,7 +484,13 @@ impl UploadSession {
                 break;
             }
             let n = (avail / align) * align;
-            let chunk: Vec<u8> = self.encoder.as_mut().unwrap().get_mut().drain(..n).collect();
+            let chunk: Vec<u8> = self
+                .encoder
+                .as_mut()
+                .unwrap()
+                .get_mut()
+                .drain(..n)
+                .collect();
             let end = self.offset + chunk.len() as u64 - 1;
             let range = format!("bytes {}-{}/*", self.offset, end);
             let resp = self
@@ -626,16 +717,15 @@ impl BigQuerySink {
     /// caching. Returns the raw [`idempotent::FieldSpec`]s (possibly empty for a
     /// schemaless table); a missing table surfaces as the client's `BQError`.
     async fn fetch_schema_fields(&self) -> Result<Vec<idempotent::FieldSpec>, BQError> {
-        let table = self
-            .client
-            .table()
-            .get(
+        let table = retry_control_plane("tables.get (schema)", || {
+            self.client.table().get(
                 &self.config.project_id,
                 &self.config.dataset_id,
                 &self.config.table_id,
                 None,
             )
-            .await?;
+        })
+        .await?;
         // Table.schema is TableSchema (not Option); TableSchema.fields is Option<Vec<...>>.
         Ok(table
             .schema
@@ -827,9 +917,8 @@ impl BigQuerySink {
         let scopes = [BQ_OAUTH_SCOPE];
         let token = match &self.config.auth {
             BigQueryCredentials::ServiceAccountKey { json } => {
-                let key = yup_oauth2::parse_service_account_key(json).map_err(|e| {
-                    FaucetError::Auth(format!("invalid service account JSON: {e}"))
-                })?;
+                let key = yup_oauth2::parse_service_account_key(json)
+                    .map_err(|e| FaucetError::Auth(format!("invalid service account JSON: {e}")))?;
                 let auth = ServiceAccountAuthenticator::builder(key)
                     .build()
                     .await
@@ -1094,7 +1183,25 @@ impl BigQuerySink {
             guard.as_ref().is_none_or(|s| s.finalized)
         };
         if need_open {
-            let sess = self.initiate_session(table_id, write_disposition, None).await?;
+            let schema = self
+                .config
+                .schema
+                .as_ref()
+                .and_then(json_schema_to_load_schema)
+                .or_else(|| {
+                    // WRITE_TRUNCATE with autodetect keeps an *existing* table's
+                    // schema (BigQuery ignores autodetect on an existing target),
+                    // so a renamed/changed column would leave the old schema in
+                    // place. An explicit schema forces the replace overwrite means.
+                    (write_disposition == "WRITE_TRUNCATE")
+                        .then(|| {
+                            json_schema_to_load_schema(&faucet_core::schema::infer_schema(records))
+                        })
+                        .flatten()
+                });
+            let sess = self
+                .initiate_session(table_id, write_disposition, schema)
+                .await?;
             let mut guard = self.upload_session.lock().await;
             *guard = Some(sess);
         }
@@ -1220,15 +1327,14 @@ impl BigQuerySink {
     /// failure to [`FaucetError::Sink`]. The configured `location` (if any) is
     /// applied so dataset/table creation lands in the intended region.
     async fn run_ddl(&self, sql: String) -> Result<(), FaucetError> {
-        let mut req = QueryRequest::new(sql);
-        req.use_legacy_sql = false;
-        req.location = self.config.location.clone();
-        let resp = self
-            .client
-            .job()
-            .query(&self.config.project_id, req)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("BigQuery schema-evolution DDL failed: {e}")))?;
+        let resp = retry_control_plane("jobs.query (DDL)", || {
+            let mut req = QueryRequest::new(sql.clone());
+            req.use_legacy_sql = false;
+            req.location = self.config.location.clone();
+            self.client.job().query(&self.config.project_id, req)
+        })
+        .await
+        .map_err(|e| FaucetError::Sink(format!("BigQuery schema-evolution DDL failed: {e}")))?;
         self.await_query_complete(resp).await
     }
 
@@ -1256,16 +1362,15 @@ impl BigQuerySink {
         // Request the `schema` field (as `fetch_schema_fields` does): the client's
         // `Table` type has a non-optional `schema`, so a narrower field mask would
         // yield a response it can't deserialize.
-        match self
-            .client
-            .table()
-            .get(
+        match retry_control_plane("tables.get (exists)", || {
+            self.client.table().get(
                 &self.config.project_id,
                 &self.config.dataset_id,
                 table_id,
                 None,
             )
-            .await
+        })
+        .await
         {
             Ok(_) => Ok(true),
             Err(e) if is_table_not_found(&e) => Ok(false),
@@ -1290,12 +1395,22 @@ impl BigQuerySink {
     /// schema from `sample`. Invalidates the schema cache so the freshly-created
     /// schema is fetched on the next read.
     async fn create_target_from_sample(&self, sample: &[Value]) -> Result<(), FaucetError> {
-        let ddl = idempotent::build_create_table_ddl(
-            &self.config.project_id,
-            &self.config.dataset_id,
-            &self.config.table_id,
-            sample,
-        )
+        // Prefer an explicit configured schema (authoritative column types, e.g.
+        // from OData `$metadata`) over inferring from the first page.
+        let ddl = match &self.config.schema {
+            Some(schema) => idempotent::build_create_table_ddl_from_schema(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                &self.config.table_id,
+                schema,
+            ),
+            None => idempotent::build_create_table_ddl(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                &self.config.table_id,
+                sample,
+            ),
+        }
         .ok_or_else(|| {
             FaucetError::Sink(format!(
                 "BigQuery create_table: cannot infer a schema for {}.{}.{} from the first page \
@@ -1933,13 +2048,12 @@ impl faucet_core::Sink for BigQuerySink {
         // thereafter. Because every page of an object feeds ONE resumable session
         // finalized in `flush`, this is one atomic WRITE_TRUNCATE load per object —
         // not a truncate-then-append across pages.
-        let write_disposition = if ctx.write_mode == faucet_core::WriteMode::Overwrite
-            && ctx.first_batch
-        {
-            "WRITE_TRUNCATE"
-        } else {
-            "WRITE_APPEND"
-        };
+        let write_disposition =
+            if ctx.write_mode == faucet_core::WriteMode::Overwrite && ctx.first_batch {
+                "WRITE_TRUNCATE"
+            } else {
+                "WRITE_APPEND"
+            };
         let table = self.config.table_id.clone();
         let csv = batch.csv;
 
@@ -1996,8 +2110,9 @@ impl faucet_core::Sink for BigQuerySink {
                 }
                 let rows = batch.records.unwrap_or(0) as usize;
                 let skip_rows = if csv.has_header { Some(1) } else { None };
-                let schema = native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter)
-                    .and_then(all_string_schema);
+                let schema =
+                    native_batch_columns(&raw, faucet_core::NativeFormat::Csv, csv.delimiter)
+                        .and_then(all_string_schema);
                 let autodetect_fallback = schema.is_none();
                 let media = gzip(&raw)?;
                 let job_json = build_load_job_json_full(
@@ -2136,7 +2251,9 @@ impl faucet_core::Sink for BigQuerySink {
             // dangling upload (BigQuery also GCs incomplete sessions). No staging
             // table exists in direct mode.
             self.cancel_session().await;
-            tracing::debug!("BigQuery direct overwrite abort: cancelled resumable session (if any)");
+            tracing::debug!(
+                "BigQuery direct overwrite abort: cancelled resumable session (if any)"
+            );
             return Ok(());
         }
         self.run_ddl(format!(
@@ -2386,13 +2503,50 @@ impl faucet_core::Sink for BigQuerySink {
 #[cfg(test)]
 mod tests {
     use super::{
-        Job, BigQueryCredentials, BigQuerySinkConfig, all_string_schema, build_load_job_json,
+        BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, build_load_job_json,
         build_load_job_json_fmt, build_load_job_json_full, build_multipart_related,
-        deletes_to_payload, dml_affected_rows, gzip, is_direct_overwrite, media_boundary,
-        multipart_boundary, native_batch_columns, records_to_ndjson, scope_to_payload,
+        deletes_to_payload, dml_affected_rows, gzip, is_direct_overwrite,
+        json_schema_to_load_schema, media_boundary, multipart_boundary, native_batch_columns,
+        records_to_ndjson, scope_to_payload,
     };
     use faucet_core::{FaucetError, KeyTuple};
     use serde_json::json;
+
+    #[test]
+    fn json_schema_to_load_schema_maps_types_and_nullability() {
+        // `infer_schema`-shaped input, including a nullable `[T,null]` fragment.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "rec_id": { "type": "integer" },
+                "amount": { "type": "number" },
+                "posted": { "type": ["boolean", "null"] },
+                "name":   { "type": "string" },
+                "blob":   { "type": "object" },
+            }
+        });
+        let out = json_schema_to_load_schema(&schema).unwrap();
+        let fields = out["fields"].as_array().unwrap();
+        // Sorted by name for determinism.
+        let by: std::collections::HashMap<&str, &str> = fields
+            .iter()
+            .map(|f| (f["name"].as_str().unwrap(), f["type"].as_str().unwrap()))
+            .collect();
+        assert_eq!(by["rec_id"], "INTEGER");
+        assert_eq!(by["amount"], "FLOAT");
+        assert_eq!(by["posted"], "BOOLEAN"); // non-null token picked from [T,null]
+        assert_eq!(by["name"], "STRING");
+        assert_eq!(by["blob"], "JSON");
+        assert!(fields.iter().all(|f| f["mode"] == "NULLABLE"));
+    }
+
+    #[test]
+    fn json_schema_to_load_schema_none_when_no_columns() {
+        assert!(
+            json_schema_to_load_schema(&json!({ "type": "object", "properties": {} })).is_none()
+        );
+        assert!(json_schema_to_load_schema(&json!({ "type": "object" })).is_none());
+    }
 
     // dataset_uri test is skipped: BigQuerySink::new() requires GCP credentials
     // (build_client fetches auth in new()), and from_parts() requires a
@@ -2530,7 +2684,14 @@ mod tests {
     #[test]
     fn build_load_job_json_fmt_ndjson_no_skip_rows_key() {
         let job = build_load_job_json_fmt(
-            "p", "d", "t", "WRITE_APPEND", None, "NEWLINE_DELIMITED_JSON", None, true,
+            "p",
+            "d",
+            "t",
+            "WRITE_APPEND",
+            None,
+            "NEWLINE_DELIMITED_JSON",
+            None,
+            true,
         );
         let load = &job["configuration"]["load"];
         assert_eq!(load["sourceFormat"], "NEWLINE_DELIMITED_JSON");
@@ -2625,12 +2786,8 @@ mod tests {
     #[test]
     fn is_direct_overwrite_matrix() {
         let base = || {
-            let mut c = BigQuerySinkConfig::new(
-                "p",
-                "d",
-                "t",
-                BigQueryCredentials::ApplicationDefault,
-            );
+            let mut c =
+                BigQuerySinkConfig::new("p", "d", "t", BigQueryCredentials::ApplicationDefault);
             c.write.write_mode = faucet_core::WriteMode::Overwrite;
             c
         };
