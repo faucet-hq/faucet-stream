@@ -61,7 +61,9 @@ async fn mount_token_endpoint(server: &MockServer) {
 async fn mount_resumable(server: &MockServer, session_path: &str, job_id: &str) {
     let session_uri = format!("{}{session_path}", server.uri());
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "resumable"))
         .respond_with(ResponseTemplate::new(200).insert_header("location", session_uri.as_str()))
         .mount(server)
@@ -147,18 +149,27 @@ async fn load_native_ndjson_streams_session_with_explicit_string_schema() {
     };
     // The batch feeds the resumable session; the count is the source's row count
     // (the single load job completes at flush, like the Value media-load path).
-    let n = sink.load_native(batch, "p::row", ctx).await.expect("feed ok");
+    let n = sink
+        .load_native(batch, "p::row", ctx)
+        .await
+        .expect("feed ok");
     assert_eq!(n, 2);
     sink.flush().await.expect("flush finalizes the load");
 
     // The initiate POST body is the load-job JSON (schema + disposition).
     let body = upload_bodies(&server).await.join("\n");
     assert!(body.contains("NEWLINE_DELIMITED_JSON"), "{body:.400}");
-    assert!(body.contains("\"autodetect\":false"), "autodetect must be off");
+    assert!(
+        body.contains("\"autodetect\":false"),
+        "autodetect must be off"
+    );
     assert!(body.contains("\"WRITE_APPEND\""));
     // Explicit all-STRING schema for the payload's columns — stops autodetect from
     // mis-inferring a type and failing a later row.
-    assert!(body.contains("\"name\":\"Id\",\"type\":\"STRING\""), "{body:.400}");
+    assert!(
+        body.contains("\"name\":\"Id\",\"type\":\"STRING\""),
+        "{body:.400}"
+    );
     assert!(body.contains("\"name\":\"Amount\",\"type\":\"STRING\""));
 }
 
@@ -174,16 +185,24 @@ async fn load_native_overwrite_first_batch_truncates_once_per_object() {
     // First batch opens the session WRITE_TRUNCATE; a second batch appends into the
     // SAME session — so the whole object is one atomic truncating load.
     sink.load_native(
-        NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec()).with_records(Some(1)),
+        NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"1\"}\n".to_vec())
+            .with_records(Some(1)),
         "p::row",
-        NativeLoadContext { write_mode: WriteMode::Overwrite, first_batch: true },
+        NativeLoadContext {
+            write_mode: WriteMode::Overwrite,
+            first_batch: true,
+        },
     )
     .await
     .expect("feed 1");
     sink.load_native(
-        NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"2\"}\n".to_vec()).with_records(Some(1)),
+        NativeBatch::bytes(NativeFormat::NdJson, b"{\"Id\":\"2\"}\n".to_vec())
+            .with_records(Some(1)),
         "p::row",
-        NativeLoadContext { write_mode: WriteMode::Overwrite, first_batch: false },
+        NativeLoadContext {
+            write_mode: WriteMode::Overwrite,
+            first_batch: false,
+        },
     )
     .await
     .expect("feed 2");
@@ -214,15 +233,24 @@ async fn load_native_streaming_payload_feeds_session_chunk_by_chunk() {
         records: None,
         bookmark: None,
     };
-    let ctx = NativeLoadContext { write_mode: WriteMode::Append, first_batch: true };
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Append,
+        first_batch: true,
+    };
     // Row count is the NDJSON line count across all chunks.
-    let n = sink.load_native(batch, "p::row", ctx).await.expect("stream feed ok");
+    let n = sink
+        .load_native(batch, "p::row", ctx)
+        .await
+        .expect("stream feed ok");
     assert_eq!(n, 3);
     sink.flush().await.expect("flush finalizes");
 
     let body = upload_bodies(&server).await.join("\n");
     // One session opened, schema derived from the first chunk's first line.
-    assert!(body.contains("\"name\":\"Id\",\"type\":\"STRING\""), "{body:.400}");
+    assert!(
+        body.contains("\"name\":\"Id\",\"type\":\"STRING\""),
+        "{body:.400}"
+    );
     assert!(body.contains("\"autodetect\":false"));
 }
 
@@ -237,7 +265,11 @@ async fn load_native_empty_payload_is_a_noop() {
         first_batch: true,
     };
     let n = sink
-        .load_native(NativeBatch::bytes(NativeFormat::NdJson, Vec::new()), "s", ctx)
+        .load_native(
+            NativeBatch::bytes(NativeFormat::NdJson, Vec::new()),
+            "s",
+            ctx,
+        )
         .await
         .expect("empty ok");
     assert_eq!(n, 0);

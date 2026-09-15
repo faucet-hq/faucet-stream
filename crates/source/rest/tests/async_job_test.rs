@@ -284,10 +284,22 @@ async fn async_job_bulk_streams_one_page_per_locator() {
     }
 
     // Two distinct pages, one per locator — NOT one concatenated page.
-    assert_eq!(collected.len(), 2, "expected one StreamPage per locator page");
-    assert_eq!(collected[0].records.len(), 1, "page 1 holds only its own rows");
+    assert_eq!(
+        collected.len(),
+        2,
+        "expected one StreamPage per locator page"
+    );
+    assert_eq!(
+        collected[0].records.len(),
+        1,
+        "page 1 holds only its own rows"
+    );
     assert_eq!(collected[0].records[0]["name"], "alice");
-    assert_eq!(collected[1].records.len(), 1, "page 2 holds only its own rows");
+    assert_eq!(
+        collected[1].records.len(),
+        1,
+        "page 2 holds only its own rows"
+    );
     assert_eq!(collected[1].records[0]["name"], "bob");
     // Async-job sources carry no incremental bookmark.
     assert!(collected.iter().all(|p| p.bookmark.is_none()));

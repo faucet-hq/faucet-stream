@@ -638,9 +638,15 @@ async fn direct_overwrite_begin_and_commit_skip_staging() {
     config.create_table = false; // solo, media load, no `_overwrite_staging`
     let (sink, _sa) = build_sink(&server, config).await;
 
-    sink.begin_overwrite().await.expect("direct begin is a no-op");
-    sink.commit_overwrite().await.expect("direct commit is a no-op");
-    sink.abort_overwrite().await.expect("direct abort is a no-op");
+    sink.begin_overwrite()
+        .await
+        .expect("direct begin is a no-op");
+    sink.commit_overwrite()
+        .await
+        .expect("direct commit is a no-op");
+    sink.abort_overwrite()
+        .await
+        .expect("direct abort is a no-op");
 
     let qs = queries(&server).await;
     assert!(
@@ -684,7 +690,9 @@ async fn grouped_overwrite_still_stages_under_media_load() {
 async fn mount_resumable(server: &MockServer, session_path: &str, job_id: &str) {
     let session_uri = format!("{}{session_path}", server.uri());
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "resumable"))
         .respond_with(ResponseTemplate::new(200).insert_header("location", session_uri.as_str()))
         .mount(server)
@@ -768,10 +776,17 @@ async fn direct_overwrite_streams_one_load_across_pages() {
         .await
         .expect("page 2");
     sink.flush().await.expect("flush finalizes the load");
-    sink.commit_overwrite().await.expect("direct commit is a no-op");
+    sink.commit_overwrite()
+        .await
+        .expect("direct commit is a no-op");
 
     let puts = session_puts(&server, "/resumable/ovw-1").await;
-    assert_eq!(puts.len(), 1, "one finalize PUT for the whole stream, got {}", puts.len());
+    assert_eq!(
+        puts.len(),
+        1,
+        "one finalize PUT for the whole stream, got {}",
+        puts.len()
+    );
     let body = gunzip(&puts[0]);
     assert!(
         body.contains("\"id\":1") && body.contains("\"id\":2"),
@@ -810,7 +825,10 @@ async fn append_media_load_streams_one_load_on_flush() {
     let puts = session_puts(&server, "/resumable/app-1").await;
     assert_eq!(puts.len(), 1, "one finalize PUT for the appended stream");
     let body = gunzip(&puts[0]);
-    assert!(body.contains("\"id\":1") && body.contains("\"id\":2"), "got: {body}");
+    assert!(
+        body.contains("\"id\":1") && body.contains("\"id\":2"),
+        "got: {body}"
+    );
 }
 
 /// An empty overwrite source opens no session and finalizes cleanly — no upload
@@ -828,7 +846,9 @@ async fn empty_media_load_stream_finalizes_cleanly() {
     let (sink, _sa) = build_sink(&server, config).await;
 
     sink.begin_overwrite().await.expect("begin");
-    sink.flush().await.expect("flush on an empty stream is a no-op");
+    sink.flush()
+        .await
+        .expect("flush on an empty stream is a no-op");
     sink.commit_overwrite().await.expect("commit no-op");
 
     let reqs = server.received_requests().await.expect("recording");
@@ -863,7 +883,9 @@ async fn direct_overwrite_abort_cancels_session() {
     sink.write_batch(&[json!({"id": 1, "name": "a"})])
         .await
         .expect("page opens the session");
-    sink.abort_overwrite().await.expect("abort cancels the session");
+    sink.abort_overwrite()
+        .await
+        .expect("abort cancels the session");
 
     let reqs = server.received_requests().await.expect("recording");
     let deletes = reqs
@@ -923,7 +945,9 @@ fn done_job(job_id: &str) -> serde_json::Value {
 async fn mount_init(server: &MockServer, session_path: &str) {
     let session_uri = format!("{}{session_path}", server.uri());
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "resumable"))
         .respond_with(ResponseTemplate::new(200).insert_header("location", session_uri.as_str()))
         .mount(server)
@@ -954,12 +978,18 @@ async fn resumable_multi_chunk_streams_and_reassembles() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/mc").await;
-    Mock::given(method("PUT")).and(path("/rz/mc")).and(MidChunk)
+    Mock::given(method("PUT"))
+        .and(path("/rz/mc"))
+        .and(MidChunk)
         .respond_with(ResponseTemplate::new(308))
-        .mount(&server).await;
-    Mock::given(method("PUT")).and(path("/rz/mc")).and(FinalChunk)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/mc"))
+        .and(FinalChunk)
         .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-mc")))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     mount_jobs_get_done(&server, "load-mc").await;
 
     let mut config = direct_media_config(&server);
@@ -972,10 +1002,17 @@ async fn resumable_multi_chunk_streams_and_reassembles() {
     sink.flush().await.expect("flush");
 
     let puts = session_puts(&server, "/rz/mc").await;
-    assert!(puts.len() >= 2, "expected >=1 mid chunk + finalize, got {}", puts.len());
+    assert!(
+        puts.len() >= 2,
+        "expected >=1 mid chunk + finalize, got {}",
+        puts.len()
+    );
     let all: Vec<u8> = puts.concat();
     let body = gunzip(&all);
-    assert!(body.contains("\"id\":0") && body.contains("\"id\":19999"), "reassembled stream missing rows");
+    assert!(
+        body.contains("\"id\":0") && body.contains("\"id\":19999"),
+        "reassembled stream missing rows"
+    );
 }
 
 /// A mid-stream chunk PUT that returns something other than 308 surfaces the
@@ -986,16 +1023,22 @@ async fn resumable_chunk_non_308_errors() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/bad").await;
-    Mock::given(method("PUT")).and(path("/rz/bad")).and(MidChunk)
+    Mock::given(method("PUT"))
+        .and(path("/rz/bad"))
+        .and(MidChunk)
         .respond_with(ResponseTemplate::new(400).set_body_string("nope"))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
 
     let mut config = direct_media_config(&server);
     config.resumable_chunk = Some(512);
     let (sink, _sa) = build_sink(&server, config).await;
     sink.begin_overwrite().await.expect("begin");
     let rows = bulky_rows(20_000);
-    let err = sink.write_batch(&rows).await.expect_err("non-308 must error");
+    let err = sink
+        .write_batch(&rows)
+        .await
+        .expect_err("non-308 must error");
     assert!(err.to_string().contains("expected 308"), "got: {err}");
 }
 
@@ -1005,14 +1048,23 @@ async fn resumable_init_http_error_surfaces() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "resumable"))
         .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("init 500 must error");
-    assert!(err.to_string().contains("resumable init returned HTTP"), "got: {err}");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("init 500 must error");
+    assert!(
+        err.to_string().contains("resumable init returned HTTP"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1021,13 +1073,19 @@ async fn resumable_init_missing_location_errors() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "resumable"))
         .respond_with(ResponseTemplate::new(200)) // no Location header
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("missing Location must error");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("missing Location must error");
     assert!(err.to_string().contains("no Location header"), "got: {err}");
 }
 
@@ -1037,14 +1095,21 @@ async fn resumable_finalize_http_error_surfaces() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/ff").await;
-    Mock::given(method("PUT")).and(path("/rz/ff"))
+    Mock::given(method("PUT"))
+        .and(path("/rz/ff"))
         .respond_with(ResponseTemplate::new(500).set_body_string("bad finalize"))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    sink.write_batch(&[json!({"id": 1})]).await.expect("write buffers");
+    sink.write_batch(&[json!({"id": 1})])
+        .await
+        .expect("write buffers");
     let err = sink.flush().await.expect_err("finalize 500 must error");
-    assert!(err.to_string().contains("resumable finalize returned HTTP"), "got: {err}");
+    assert!(
+        err.to_string().contains("resumable finalize returned HTTP"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1053,14 +1118,24 @@ async fn resumable_finalize_missing_job_ref_errors() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/nj").await;
-    Mock::given(method("PUT")).and(path("/rz/nj"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": {"state": "DONE"}})))
-        .mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/rz/nj"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"status": {"state": "DONE"}})),
+        )
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
     sink.write_batch(&[json!({"id": 1})]).await.expect("write");
-    let err = sink.flush().await.expect_err("missing jobReference must error");
-    assert!(err.to_string().contains("missing jobReference"), "got: {err}");
+    let err = sink
+        .flush()
+        .await
+        .expect_err("missing jobReference must error");
+    assert!(
+        err.to_string().contains("missing jobReference"),
+        "got: {err}"
+    );
 }
 
 /// A second `flush` (or `commit`) after the load is finalized is a no-op — one
@@ -1076,7 +1151,11 @@ async fn flush_twice_finalizes_once() {
     sink.write_batch(&[json!({"id": 1})]).await.expect("write");
     sink.flush().await.expect("flush 1 finalizes");
     sink.flush().await.expect("flush 2 is a no-op");
-    assert_eq!(session_puts(&server, "/rz/once").await.len(), 1, "one finalize PUT");
+    assert_eq!(
+        session_puts(&server, "/rz/once").await.len(),
+        1,
+        "one finalize PUT"
+    );
 }
 
 /// `await_load_job` maps a DONE job carrying an `errorResult` to an error.
@@ -1086,19 +1165,26 @@ async fn await_load_job_reports_job_error() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/je").await;
-    Mock::given(method("PUT")).and(path("/rz/je"))
+    Mock::given(method("PUT"))
+        .and(path("/rz/je"))
         .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-je")))
-        .mount(&server).await;
-    Mock::given(method("GET")).and(path(format!("/projects/{PROJECT_ID}/jobs/load-je")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/load-je")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobReference": {"projectId": PROJECT_ID, "jobId": "load-je"},
             "status": {"state": "DONE", "errorResult": {"reason": "invalid", "message": "bad load"}}
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
     sink.write_batch(&[json!({"id": 1})]).await.expect("write");
-    let err = sink.flush().await.expect_err("job errorResult must surface");
+    let err = sink
+        .flush()
+        .await
+        .expect_err("job errorResult must surface");
     assert!(err.to_string().contains("failed"), "got: {err}");
 }
 
@@ -1109,14 +1195,18 @@ async fn await_load_job_missing_status_errors() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/ns").await;
-    Mock::given(method("PUT")).and(path("/rz/ns"))
+    Mock::given(method("PUT"))
+        .and(path("/rz/ns"))
         .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-ns")))
-        .mount(&server).await;
-    Mock::given(method("GET")).and(path(format!("/projects/{PROJECT_ID}/jobs/load-ns")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/load-ns")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobReference": {"projectId": PROJECT_ID, "jobId": "load-ns"}
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
     sink.write_batch(&[json!({"id": 1})]).await.expect("write");
@@ -1131,16 +1221,21 @@ async fn await_load_job_polls_until_done() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/poll").await;
-    Mock::given(method("PUT")).and(path("/rz/poll"))
+    Mock::given(method("PUT"))
+        .and(path("/rz/poll"))
         .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-poll")))
-        .mount(&server).await;
-    Mock::given(method("GET")).and(path(format!("/projects/{PROJECT_ID}/jobs/load-poll")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/projects/{PROJECT_ID}/jobs/load-poll")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobReference": {"projectId": PROJECT_ID, "jobId": "load-poll"},
             "status": {"state": "RUNNING"}
         })))
-        .up_to_n_times(1).with_priority(1)
-        .mount(&server).await;
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
     mount_jobs_get_done(&server, "load-poll").await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
@@ -1158,10 +1253,13 @@ async fn grouped_media_load_write_uses_multipart_load() {
     mount_query_and_job(&server, "job-grp").await;
     mount_staging_present(&server).await;
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "multipart"))
         .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-grp")))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     mount_jobs_get_done(&server, "load-grp").await;
 
     let mut config = config_overwrite();
@@ -1171,7 +1269,10 @@ async fn grouped_media_load_write_uses_multipart_load() {
     let config = with_sa_auth(config, &server);
     let (sink, _sa) = build_sink(&server, config).await;
     sink.begin_overwrite().await.expect("begin stages");
-    let n = sink.write_batch(&[json!({"id": 1, "name": "a"})]).await.expect("staged load");
+    let n = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("staged load");
     assert_eq!(n, 1);
     let reqs = server.received_requests().await.expect("recording");
     assert!(
@@ -1190,10 +1291,13 @@ async fn multipart_load_http_error_surfaces() {
     mount_table_schema(&server).await;
     mount_query_and_job(&server, "job-grp2").await;
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "multipart"))
         .respond_with(ResponseTemplate::new(500).set_body_string("upload boom"))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
 
     let mut config = config_overwrite();
     config.media_load = true;
@@ -1202,8 +1306,14 @@ async fn multipart_load_http_error_surfaces() {
     let config = with_sa_auth(config, &server);
     let (sink, _sa) = build_sink(&server, config).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("upload 500 must error");
-    assert!(err.to_string().contains("media load upload returned HTTP"), "got: {err}");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("upload 500 must error");
+    assert!(
+        err.to_string().contains("media load upload returned HTTP"),
+        "got: {err}"
+    );
 }
 
 /// Direct overwrite with a missing target + create_table on: creates the target
@@ -1223,13 +1333,22 @@ async fn direct_overwrite_creates_missing_target_then_streams() {
     let config = with_sa_auth(config, &server);
     let (sink, _sa) = build_sink(&server, config).await;
     sink.begin_overwrite().await.expect("begin");
-    sink.write_batch(&[json!({"id": 1, "name": "a"})]).await.expect("write creates + streams");
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("write creates + streams");
     sink.flush().await.expect("flush");
 
     let qs = queries(&server).await;
-    assert!(qs.iter().any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
-        "direct overwrite must create the missing target: {qs:?}");
-    assert_eq!(session_puts(&server, "/rz/dc").await.len(), 1, "one finalize PUT");
+    assert!(
+        qs.iter()
+            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
+        "direct overwrite must create the missing target: {qs:?}"
+    );
+    assert_eq!(
+        session_puts(&server, "/rz/dc").await.len(),
+        1,
+        "one finalize PUT"
+    );
 }
 
 /// Direct overwrite, missing target, create_table disabled → typed error.
@@ -1240,8 +1359,14 @@ async fn direct_overwrite_missing_target_create_disabled_errors() {
     mount_table_missing(&server, None).await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("missing + create off must error");
-    assert!(err.to_string().contains("create_table` is disabled"), "got: {err}");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("missing + create off must error");
+    assert!(
+        err.to_string().contains("create_table` is disabled"),
+        "got: {err}"
+    );
 }
 
 /// Grouped staging overwrite, missing target, create_table disabled → typed error.
@@ -1260,8 +1385,14 @@ async fn staging_overwrite_missing_target_create_disabled_errors() {
     // begin_overwrite on a grouped staging sink with a missing target + create
     // off errors at the staging create; drive the write path's staging branch
     // directly by skipping begin.
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("staging missing + create off must error");
-    assert!(err.to_string().contains("create_table` is disabled"), "got: {err}");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("staging missing + create off must error");
+    assert!(
+        err.to_string().contains("create_table` is disabled"),
+        "got: {err}"
+    );
 }
 
 /// `access_token` on a malformed service-account JSON surfaces an Auth error.
@@ -1272,13 +1403,25 @@ async fn access_token_invalid_json_errors() {
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/bt").await;
     let mut config = BigQuerySinkConfig::new(
-        PROJECT_ID, DATASET_ID, TABLE_ID, BigQueryCredentials::ApplicationDefault);
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ApplicationDefault,
+    );
     config.media_load = true;
     config.upload_base_url = Some(server.uri());
-    config.auth = BigQueryCredentials::ServiceAccountKey { json: "{ not valid json".into() };
+    config.auth = BigQueryCredentials::ServiceAccountKey {
+        json: "{ not valid json".into(),
+    };
     let (sink, _sa) = build_sink(&server, config).await;
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("bad SA json must error");
-    assert!(err.to_string().contains("invalid service account JSON"), "got: {err}");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("bad SA json must error");
+    assert!(
+        err.to_string().contains("invalid service account JSON"),
+        "got: {err}"
+    );
 }
 
 /// `access_token` via the `ServiceAccountKeyPath` credential variant mints
@@ -1295,16 +1438,26 @@ async fn access_token_service_account_key_path_streams() {
     std::fs::write(sa_file.path(), serde_json::to_string(&sa_json).unwrap()).expect("write sa");
 
     let mut config = BigQuerySinkConfig::new(
-        PROJECT_ID, DATASET_ID, TABLE_ID, BigQueryCredentials::ApplicationDefault);
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ApplicationDefault,
+    );
     config.media_load = true;
     config.upload_base_url = Some(server.uri());
     config.auth = BigQueryCredentials::ServiceAccountKeyPath {
         path: sa_file.path().to_str().unwrap().to_string(),
     };
     let (sink, _sa) = build_sink(&server, config).await;
-    sink.write_batch(&[json!({"id": 1, "name": "a"})]).await.expect("write");
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("write");
     sink.flush().await.expect("flush");
-    assert_eq!(session_puts(&server, "/rz/kp").await.len(), 1, "one finalize PUT");
+    assert_eq!(
+        session_puts(&server, "/rz/kp").await.len(),
+        1,
+        "one finalize PUT"
+    );
 }
 
 /// Append via `write_batch_partial` + `media_load` streams and returns one `Ok`
@@ -1316,7 +1469,11 @@ async fn write_batch_partial_media_append_streams() {
     mount_table_schema(&server).await;
     mount_resumable(&server, "/rz/pa", "load-pa").await;
     let mut config = BigQuerySinkConfig::new(
-        PROJECT_ID, DATASET_ID, TABLE_ID, BigQueryCredentials::ApplicationDefault);
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ApplicationDefault,
+    );
     config.media_load = true;
     config.upload_base_url = Some(server.uri());
     let config = with_sa_auth(config, &server);
@@ -1349,14 +1506,25 @@ async fn grouped_multipart_missing_job_ref_errors() {
     mount_table_schema(&server).await;
     mount_query_and_job(&server, "job-mjr").await;
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "multipart"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": {"state": "DONE"}})))
-        .mount(&server).await;
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"status": {"state": "DONE"}})),
+        )
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, grouped_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("missing jobReference");
-    assert!(err.to_string().contains("missing jobReference"), "got: {err}");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("missing jobReference");
+    assert!(
+        err.to_string().contains("missing jobReference"),
+        "got: {err}"
+    );
 }
 
 /// Grouped staging multipart load whose response is not valid JSON.
@@ -1367,13 +1535,19 @@ async fn grouped_multipart_invalid_json_errors() {
     mount_table_schema(&server).await;
     mount_query_and_job(&server, "job-mij").await;
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "multipart"))
         .respond_with(ResponseTemplate::new(200).set_body_string("<<<not json>>>"))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, grouped_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("bad json");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("bad json");
     assert!(err.to_string().contains("parse job response"), "got: {err}");
 }
 
@@ -1385,15 +1559,21 @@ async fn grouped_multipart_missing_job_id_errors() {
     mount_table_schema(&server).await;
     mount_query_and_job(&server, "job-mid2").await;
     Mock::given(method("POST"))
-        .and(path(format!("/upload/bigquery/v2/projects/{PROJECT_ID}/jobs")))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
         .and(query_param("uploadType", "multipart"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobReference": {"projectId": PROJECT_ID}, "status": {"state": "DONE"}
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, grouped_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("missing jobId");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("missing jobId");
     assert!(err.to_string().contains("missing jobId"), "got: {err}");
 }
 
@@ -1404,9 +1584,11 @@ async fn resumable_finalize_invalid_json_errors() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/fj").await;
-    Mock::given(method("PUT")).and(path("/rz/fj"))
+    Mock::given(method("PUT"))
+        .and(path("/rz/fj"))
         .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
     sink.write_batch(&[json!({"id": 1})]).await.expect("write");
@@ -1421,11 +1603,13 @@ async fn resumable_finalize_missing_job_id_errors() {
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
     mount_init(&server, "/rz/fi").await;
-    Mock::given(method("PUT")).and(path("/rz/fi"))
+    Mock::given(method("PUT"))
+        .and(path("/rz/fi"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobReference": {"projectId": PROJECT_ID}, "status": {"state": "DONE"}
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
     sink.write_batch(&[json!({"id": 1})]).await.expect("write");
@@ -1440,13 +1624,19 @@ async fn overwrite_target_probe_non_404_errors() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
     Mock::given(method("GET"))
-        .and(path(format!("/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}")))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}"
+        )))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {"code": 500, "message": "backend error"}
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
     sink.begin_overwrite().await.expect("begin");
-    let err = sink.write_batch(&[json!({"id": 1})]).await.expect_err("non-404 probe must surface");
+    let err = sink
+        .write_batch(&[json!({"id": 1})])
+        .await
+        .expect_err("non-404 probe must surface");
     assert!(err.to_string().contains("schema probe"), "got: {err}");
 }

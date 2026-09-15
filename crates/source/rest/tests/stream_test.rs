@@ -1192,7 +1192,7 @@ async fn test_chained_transforms_keys_case_then_flatten() {
         vec![
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
-            on_collision: KeyCollision::Error,
+                on_collision: KeyCollision::Error,
             }),
             TransformStage::Map(RecordTransform::Flatten {
                 separator: "_".into(),
