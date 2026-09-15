@@ -46,15 +46,18 @@ pub struct EdmEntitySet {
 /// Map an EDM primitive type to a JSON-Schema type fragment.
 pub fn edm_type_to_json(edm_type: &str) -> Value {
     let t = edm_type.strip_prefix("Edm.").unwrap_or(edm_type);
-    let ty = match t {
-        "Boolean" => "boolean",
-        "Byte" | "SByte" | "Int16" | "Int32" | "Int64" => "integer",
-        "Decimal" | "Double" | "Single" => "number",
-        // String, Guid, DateTimeOffset, Date, TimeOfDay, Duration, Binary,
-        // Stream, Geography*, … all serialize as JSON strings.
-        _ => "string",
-    };
-    json!({ "type": ty })
+    match t {
+        "Boolean" => json!({ "type": "boolean" }),
+        "Byte" | "SByte" | "Int16" | "Int32" | "Int64" => json!({ "type": "integer" }),
+        "Decimal" | "Double" | "Single" => json!({ "type": "number" }),
+        // Temporal EDM types serialize as RFC3339 JSON strings but carry a real
+        // date/time type — tag the format so a typed sink (BigQuery) declares
+        // TIMESTAMP/DATE and coerces the string on load, rather than STRING.
+        "DateTimeOffset" => json!({ "type": "string", "format": "date-time" }),
+        "Date" => json!({ "type": "string", "format": "date" }),
+        // Guid, TimeOfDay, Duration, Binary, Stream, Geography*, … stay strings.
+        _ => json!({ "type": "string" }),
+    }
 }
 
 /// Namespace-strip a possibly-prefixed XML name (`edm:Property` → `Property`).
@@ -188,6 +191,129 @@ pub fn descriptors_from_edmx(xml: &str) -> Result<Vec<DatasetDescriptor>, Faucet
     Ok(out)
 }
 
+/// Build one [`DatasetDescriptor`] per entity set from an **explicit** object
+/// list (the run-time fan-out path, #647-family). Unlike
+/// [`descriptors_from_edmx`], this needs no `$metadata` round-trip — OData
+/// `/data/<EntitySet>` returns every column by default, so there is no field
+/// list to discover. Each descriptor selects the entity and routes the sink to
+/// `<table_prefix><snake(entity)>` (e.g. `fno_main_account_bi_entities`).
+pub fn descriptors_from_objects(objects: &[String], table_prefix: &str) -> Vec<DatasetDescriptor> {
+    objects
+        .iter()
+        .map(|entity| {
+            let table_id = format!("{table_prefix}{}", faucet_core::util::snake_case(entity));
+            DatasetDescriptor::new(
+                entity.clone(),
+                "entity",
+                json!({ "odata": { "entity": entity } }),
+            )
+            .with_sink_patch(json!({ "table_id": table_id }))
+        })
+        .collect()
+}
+
+/// Like [`descriptors_from_objects`] but **typed**: parse `$metadata` and attach
+/// each requested entity's column schema (from its EDM entity type) to the sink
+/// patch as `schema`, so a table-based sink (BigQuery) can declare authoritative
+/// column types instead of autodetecting them — the fix for a load job that
+/// autodetects a column and then fails on one non-conforming row.
+///
+/// **Schema property names are kept verbatim** (raw EDM PascalCase) so the declared
+/// schema lines up with the untransformed record keys that reach the sink, and with
+/// the temporal `format` hints so a typed sink declares TIMESTAMP/DATE. An entity
+/// absent from `$metadata` (or with no declared type) still gets a `table_id`-only
+/// patch (autodetect fallback for that one).
+pub fn descriptors_from_edmx_for_objects(
+    xml: &str,
+    objects: &[String],
+    table_prefix: &str,
+) -> Result<Vec<DatasetDescriptor>, FaucetError> {
+    let (types, sets) = parse_edmx(xml)?;
+    let set_by_name: HashMap<&str, &EdmEntitySet> =
+        sets.iter().map(|s| (s.name.as_str(), s)).collect();
+    let type_by_name: HashMap<&str, &EdmEntityType> =
+        types.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    let mut out = Vec::with_capacity(objects.len());
+    for obj in objects {
+        let table_id = format!("{table_prefix}{}", faucet_core::util::snake_case(obj));
+        let mut sink_patch = json!({ "table_id": table_id });
+        if let Some(set) = set_by_name.get(obj.as_str())
+            && let Some(t) = type_by_name.get(set.type_name.as_str())
+            && !t.properties.is_empty()
+        {
+            let cols = t.properties.iter().map(|p| {
+                let frag = edm_type_to_json(&p.edm_type);
+                let frag = if p.nullable {
+                    nullable_type(frag)
+                } else {
+                    frag
+                };
+                // Raw EDM property name (PascalCase) — the records reach the sink
+                // untransformed, so the declared schema keys must match verbatim.
+                (p.name.clone(), frag)
+            });
+            sink_patch["schema"] = columns_to_schema(cols);
+        }
+        out.push(
+            DatasetDescriptor::new(obj.clone(), "entity", json!({ "odata": { "entity": obj } }))
+                .with_sink_patch(sink_patch),
+        );
+    }
+    Ok(out)
+}
+
+/// The single **integer** primary key of an entity set (for key-range
+/// partitioning), or `None` if `$metadata` lacks the set, the type has no single
+/// key, or that key is not an integer EDM type. Mirrors the reference tap's rule:
+/// exactly one integer key to range-split on; anything else extracts sequentially.
+pub fn single_int_key_from_edmx(xml: &str, entity: &str) -> Option<String> {
+    let (types, sets) = parse_edmx(xml).ok()?;
+    let set = sets.iter().find(|s| s.name == entity)?;
+    let ty = types.iter().find(|t| t.name == set.type_name)?;
+    if ty.keys.len() != 1 {
+        return None;
+    }
+    let key = &ty.keys[0];
+    let is_int = ty
+        .properties
+        .iter()
+        .find(|p| &p.name == key)
+        .is_some_and(|p| {
+            matches!(
+                p.edm_type.strip_prefix("Edm.").unwrap_or(&p.edm_type),
+                "Byte" | "SByte" | "Int16" | "Int32" | "Int64"
+            )
+        });
+    is_int.then(|| key.clone())
+}
+
+/// Tile the half-open key window `[low, high_exclusive)` into `count` contiguous
+/// integer ranges (no gap, no overlap; the remainder spread across the leading
+/// tiles). Returns empty for an empty window. Matches the tap's `build_key_ranges`.
+pub fn build_key_ranges(low: i64, high_exclusive: i64, count: usize) -> Vec<(i64, i64)> {
+    if high_exclusive <= low {
+        return Vec::new();
+    }
+    let span = high_exclusive - low;
+    let count = (count.max(1) as i64).min(span);
+    let width = span / count;
+    let remainder = span % count;
+    let mut ranges = Vec::with_capacity(count as usize);
+    let mut cursor = low;
+    for index in 0..count {
+        let step = width + if index < remainder { 1 } else { 0 };
+        ranges.push((cursor, cursor + step));
+        cursor += step;
+    }
+    ranges
+}
+
+/// The half-open `$filter` clause for one key range: `{key} ge {lo} and {key} lt {hi}`.
+pub fn key_range_filter(key: &str, lo: i64, hi: i64) -> String {
+    format!("{key} ge {lo} and {key} lt {hi}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +381,62 @@ mod tests {
         assert_eq!(schema["properties"]["Total"]["type"], "number");
         assert_eq!(schema["properties"]["Posted"]["type"][0], "boolean");
         assert_eq!(schema["properties"]["Posted"]["type"][1], "null");
+    }
+
+    #[test]
+    fn descriptors_from_objects_select_entity_and_route_sink() {
+        let objs = vec![
+            "MainAccountBiEntities".to_string(),
+            "CustomersV3".to_string(),
+        ];
+        let ds = descriptors_from_objects(&objs, "fno_");
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds[0].name, "MainAccountBiEntities");
+        assert_eq!(ds[0].kind, "entity");
+        assert_eq!(
+            ds[0].config_patch,
+            json!({ "odata": { "entity": "MainAccountBiEntities" } })
+        );
+        assert_eq!(
+            ds[0].sink_patch,
+            Some(json!({ "table_id": "fno_main_account_bi_entities" }))
+        );
+        // Prefix applies to every entity; CamelCase+digit snake-cases correctly.
+        assert_eq!(
+            ds[1].sink_patch,
+            Some(json!({ "table_id": "fno_customers_v3" }))
+        );
+    }
+
+    #[test]
+    fn descriptors_from_objects_empty_prefix_is_bare_snake() {
+        let ds = descriptors_from_objects(&["Departments".to_string()], "");
+        assert_eq!(ds[0].sink_patch, Some(json!({ "table_id": "departments" })));
+    }
+
+    #[test]
+    fn edmx_for_objects_attaches_snaked_typed_schema() {
+        let ds =
+            descriptors_from_edmx_for_objects(SAMPLE, &["Orders".to_string()], "fno_").unwrap();
+        assert_eq!(ds.len(), 1);
+        let patch = ds[0].sink_patch.as_ref().unwrap();
+        assert_eq!(patch["table_id"], "fno_orders");
+        let schema = &patch["schema"];
+        // Column names snake-cased to match keys_case:snake; EDM types mapped.
+        assert_eq!(schema["properties"]["doc_entry"]["type"], "integer"); // non-null Int32
+        assert_eq!(schema["properties"]["total"]["type"], "number"); // non-null Decimal
+        assert_eq!(schema["properties"]["doc_date"]["type"][0], "string"); // nullable DateTimeOffset
+        assert_eq!(schema["properties"]["posted"]["type"][0], "boolean"); // nullable Boolean
+    }
+
+    #[test]
+    fn edmx_for_objects_unknown_entity_gets_table_id_only() {
+        let ds = descriptors_from_edmx_for_objects(SAMPLE, &["NotInMetadata".to_string()], "fno_")
+            .unwrap();
+        assert_eq!(
+            ds[0].sink_patch,
+            Some(json!({ "table_id": "fno_not_in_metadata" }))
+        );
     }
 
     #[test]

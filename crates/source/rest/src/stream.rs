@@ -24,6 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
+/// Reserved partition-context key carrying one key-range's OData `$filter` clause
+/// (#479). Injected per range by `stream_pages` and ANDed into the first request's
+/// `$filter`; `@odata.nextLink` preserves it on subsequent pages.
+const KEY_RANGE_FILTER_CTX: &str = "__odata_key_filter";
+
 /// A configured REST API stream that handles pagination, auth, and extraction.
 pub struct RestStream {
     config: RestStreamConfig,
@@ -398,6 +403,11 @@ impl RestStream {
         }
 
         let mut builder = Client::builder();
+        // Transparently request + decode gzip/brotli/deflate so large JSON APIs
+        // (e.g. D365 F&O OData, which compresses ~5-10x) ship compressed bytes
+        // instead of raw JSON. reqwest sets the `Accept-Encoding` header and
+        // decompresses the body automatically.
+        builder = builder.gzip(true).brotli(true).deflate(true);
         if let Some(t) = config.timeout {
             builder = builder.timeout(t);
         }
@@ -627,13 +637,24 @@ impl RestStream {
     /// fan-out), `record_ancestors` (#549, nested path with lifted ancestor
     /// fields), or the classic single `records_path`.
     fn extract_page(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
-        extract::extract_configured(
+        let mut records = extract::extract_configured(
             body,
             self.config.records_path.as_deref(),
             self.config.record_ancestors.as_ref(),
             &self.config.records_multi,
             self.config.op_field.as_deref().unwrap_or("_op"),
-        )
+        )?;
+        // OData responses stamp per-record protocol control fields (`@odata.etag`,
+        // `@odata.editLink`, …) that are metadata, not data, and are invalid column
+        // names downstream. Drop them so records carry only the entity's own fields.
+        if self.config.odata.is_some() {
+            for rec in &mut records {
+                if let Value::Object(map) = rec {
+                    map.retain(|k, _| !k.starts_with("@odata."));
+                }
+            }
+        }
+        Ok(records)
     }
 
     /// Core pagination loop shared by [`Source::stream_pages`] and
@@ -819,6 +840,23 @@ impl RestStream {
 
                     let mut params = self.config.query_params.clone();
                     self.config.pagination.apply_params(&mut params, &state);
+
+                    // Key-range partition filter (#479): the first request of a
+                    // range carries the half-open PK `$filter`; `@odata.nextLink`
+                    // preserves it on every subsequent page, so it is applied once.
+                    if let Some(ctx) = owned_context.as_ref()
+                        && let Some(range_filter) = ctx
+                            .get(KEY_RANGE_FILTER_CTX)
+                            .and_then(|v| v.as_str())
+                    {
+                        let combined = match params.get("$filter") {
+                            Some(existing) if !existing.is_empty() => {
+                                format!("({existing}) and {range_filter}")
+                            }
+                            _ => range_filter.to_string(),
+                        };
+                        params.insert("$filter".to_string(), combined);
+                    }
 
                     let url_override = match &self.config.pagination {
                         PaginationStyle::LinkHeader | PaginationStyle::NextLinkInBody { .. } => {
@@ -1337,8 +1375,10 @@ impl RestStream {
         // the ceiling, not a fixed wait — a fixed 15s made an instant job take
         // ~15s of dead poll-wait.
         let poll_cap = std::time::Duration::from_secs(job.poll.interval_secs);
-        let mut poll_delay =
-            std::cmp::min(std::time::Duration::from_secs(POLL_BACKOFF_BASE_SECS), poll_cap);
+        let mut poll_delay = std::cmp::min(
+            std::time::Duration::from_secs(POLL_BACKOFF_BASE_SECS),
+            poll_cap,
+        );
         // Retain the last poll response so `fetch.url_from` (#543) can source the
         // download URL from the terminal (success) poll body.
         let last_poll_body: Value = loop {
@@ -2140,6 +2180,17 @@ impl faucet_core::Source for RestStream {
         // in-memory `batch_size` knob. The arg is accepted for trait
         // conformance and reserved for a future `page_size` mapping.
         //
+        // Key-range partitioning (#479): when an integer PK is configured, tile the
+        // key space and stream the tiles concurrently (the fix for a huge OData
+        // entity whose sequential `@odata.nextLink` paging dominates the run).
+        if let Some(key) = self
+            .config
+            .odata
+            .as_ref()
+            .and_then(|o| o.partition_key.clone())
+        {
+            return self.stream_key_range_partitions(context, key);
+        }
         // Partition fan-out (#535): when `partitions` are configured the stream
         // must run once per partition — mirroring `fetch_all` / `fetch_with_context`
         // — or every partition's records are silently dropped under `faucet run`
@@ -2216,9 +2267,8 @@ impl faucet_core::Source for RestStream {
         _context: &'a HashMap<String, Value>,
         format: faucet_core::NativeFormat,
         _batch_size: usize,
-    ) -> Pin<
-        Box<dyn Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>,
-    > {
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>>
+    {
         Box::pin(async_stream::try_stream! {
             let job = self.config.async_job.as_ref().ok_or_else(|| {
                 FaucetError::Source(
@@ -2297,21 +2347,89 @@ impl faucet_core::Source for RestStream {
     }
 
     fn supports_discover(&self) -> bool {
-        // OData exposes a machine-readable `$metadata` catalog and Salesforce a
-        // `/sobjects` describe API; a plain REST API has neither.
-        self.config.odata.is_some() || self.config.salesforce.is_some()
+        // A generic `discovery:` recipe or an OData `$metadata` catalog. A plain
+        // REST API has neither.
+        self.config.discovery.is_some() || self.config.odata.is_some()
     }
 
     async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
-        if let Some(sf) = self.config.salesforce.clone() {
-            return self.discover_salesforce(&sf).await;
+        if let Some(spec) = &self.config.discovery {
+            return self.discover_via_recipe(spec).await;
         }
-        if self.config.odata.is_none() {
+        let Some(odata) = self.config.odata.as_ref() else {
             return Err(FaucetError::Source(
-                "rest: discovery needs an `odata:` block (OData `$metadata`) or a `salesforce:` \
-                 block (Salesforce `/sobjects`)"
+                "rest: discovery needs a `discovery:` recipe (config-driven API calls) or an \
+                 `odata:` block (OData `$metadata`)"
                     .into(),
             ));
+        };
+        // Explicit object list (run-time fan-out): one descriptor per entity, one
+        // sink table `{table_prefix}{snake(entity)}`. Type each entity's columns
+        // from the service `$metadata` (authoritative EDM types → the sink declares
+        // the real column types instead of autodetecting and rejecting a row that
+        // doesn't fit the guessed type). `$metadata` is a single monolithic CSDL
+        // for the whole service, so it cannot be scoped to the synced entities and
+        // some services (D365 F&O) regenerate ~50 MB on every call — hence it is
+        // fetched once and cached per base URL (see `cached_metadata_xml`); we
+        // still parse out only the requested entities. On any `$metadata` failure,
+        // fall back to untyped descriptors (sink autodetect) so the run proceeds.
+        if !odata.objects.is_empty() {
+            let prefix = odata.table_prefix.as_deref().unwrap_or("");
+            let xml = match self.cached_metadata_xml().await {
+                Ok(xml) => xml,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "OData $metadata unavailable; fanning out untyped (sink autodetect)"
+                    );
+                    return Ok(crate::odata::descriptors_from_objects(
+                        &odata.objects,
+                        prefix,
+                    ));
+                }
+            };
+            let mut descs =
+                crate::odata::descriptors_from_edmx_for_objects(&xml, &odata.objects, prefix)?;
+            // Key-range partitioning opt-in (#479): for each entity in
+            // `partitioned_objects` whose `$metadata` declares a single integer key,
+            // stamp the partition config onto its source `config_patch` so the run
+            // tiles it concurrently. Entities without a single int key (or absent
+            // from `$metadata`) are left to extract sequentially.
+            if !odata.partitioned_objects.is_empty() {
+                let targets: std::collections::HashSet<&str> = odata
+                    .partitioned_objects
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                for d in &mut descs {
+                    if !targets.contains(d.name.as_str()) {
+                        continue;
+                    }
+                    match crate::odata::single_int_key_from_edmx(&xml, &d.name) {
+                        Some(key) => {
+                            if let Some(o) = d
+                                .config_patch
+                                .get_mut("odata")
+                                .and_then(Value::as_object_mut)
+                            {
+                                o.insert("partition_key".into(), Value::String(key));
+                                if let Some(w) = odata.partition_workers {
+                                    o.insert("partition_workers".into(), serde_json::json!(w));
+                                }
+                                if let Some(c) = odata.partition_count {
+                                    o.insert("partition_count".into(), serde_json::json!(c));
+                                }
+                            }
+                        }
+                        None => tracing::warn!(
+                            entity = %d.name,
+                            "partitioned_objects entity has no single integer key; \
+                             extracting sequentially"
+                        ),
+                    }
+                }
+            }
+            return Ok(descs);
         }
         let url = format!("{}/$metadata", self.config.base_url.trim_end_matches('/'));
         let xml = self.discover_get_text(&url, "OData $metadata").await?;
@@ -2347,47 +2465,184 @@ impl RestStream {
             .map_err(|e| FaucetError::Source(format!("rest: reading {what} failed: {e}")))
     }
 
-    /// Salesforce discovery (#647): global describe → per-object describe → one
-    /// [`DatasetDescriptor`](faucet_core::DatasetDescriptor) per queryable object.
-    async fn discover_salesforce(
+    /// Authed GET returning a parsed JSON body (discovery probes).
+    async fn discover_get_json(
         &self,
-        sf: &crate::config::SalesforceDiscovery,
+        url: &str,
+        what: &str,
+    ) -> Result<serde_json::Value, FaucetError> {
+        let txt = self.discover_get_text(url, what).await?;
+        serde_json::from_str(&txt)
+            .map_err(|e| FaucetError::Source(format!("rest: {what} returned invalid JSON: {e}")))
+    }
+
+    /// The service `$metadata` CSDL for this source's `base_url`, fetched once and
+    /// cached process-wide. D365 F&O regenerates a ~50 MB document (~3.5 min) on
+    /// every call and it cannot be scoped to a subset of entities, so caching turns
+    /// a per-submit cost into a one-time-per-process cost; the schema is stable
+    /// across a run's lifetime. Keyed by `base_url` so distinct services don't
+    /// collide. The lock is never held across the network await.
+    async fn cached_metadata_xml(&self) -> Result<std::sync::Arc<String>, FaucetError> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<String>>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let base = self.config.base_url.trim_end_matches('/').to_string();
+        if let Some(hit) = cache.lock().unwrap().get(&base).cloned() {
+            return Ok(hit);
+        }
+        let url = format!("{base}/$metadata");
+        let xml = std::sync::Arc::new(self.discover_get_text(&url, "OData $metadata").await?);
+        cache.lock().unwrap().insert(base, xml.clone());
+        Ok(xml)
+    }
+
+    /// Discover the inclusive `(min, max)` of an integer primary key for key-range
+    /// partitioning — two cheap requests (`$orderby {key} asc|desc, $top=1,
+    /// $select={key}`). Returns `None` when the entity is empty (nothing to
+    /// partition). Mirrors the reference tap's `discover_key_bounds`.
+    async fn discover_key_bounds(
+        &self,
+        entity: &str,
+        key: &str,
+    ) -> Result<Option<(i64, i64)>, FaucetError> {
+        fn coerce_i64(v: &serde_json::Value) -> Option<i64> {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        }
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = format!("{base}/{entity}");
+        let mut bounds = [0i64; 2];
+        for (i, dir) in ["asc", "desc"].into_iter().enumerate() {
+            let mut headers = self.static_headers.clone();
+            for (k, v) in self.metadata_headers(&url).await?.iter() {
+                headers.insert(k.clone(), v.clone());
+            }
+            let resp = self
+                .client
+                .get(&url)
+                .headers(headers)
+                .query(&[
+                    ("cross-company", "true"),
+                    ("$orderby", &format!("{key} {dir}")),
+                    ("$top", "1"),
+                    ("$select", key),
+                    ("$format", "json"),
+                ])
+                .send()
+                .await
+                .map_err(|e| {
+                    FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+                })?;
+            if !resp.status().is_success() {
+                return Err(FaucetError::Source(format!(
+                    "rest: OData key-bounds returned HTTP {}",
+                    resp.status().as_u16()
+                )));
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))?;
+            let Some(row) = body
+                .get("value")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+            else {
+                return Ok(None); // empty entity
+            };
+            bounds[i] = row.get(key).and_then(coerce_i64).ok_or_else(|| {
+                FaucetError::Source(format!("rest: OData key '{key}' is not an integer"))
+            })?;
+        }
+        Ok(Some((bounds[0], bounds[1])))
+    }
+
+    /// Stream an OData entity as concurrent key-range tiles (#479): discover the
+    /// PK's min/max, tile `[min, max]` into `partition_count` half-open ranges, and
+    /// page each range's `$filter` concurrently (bounded by `partition_workers`).
+    /// Ranges are intra-run only — never bookmarked; every run re-tiles. An empty
+    /// entity yields nothing.
+    fn stream_key_range_partitions<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+        key: String,
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
+        use futures::StreamExt as _;
+        let odata = self.config.odata.as_ref().expect("odata configured");
+        let entity = odata.entity.clone().unwrap_or_default();
+        let workers = odata.resolved_partition_workers();
+        let count = odata.resolved_partition_count();
+        let parent = context.clone();
+        Box::pin(async_stream::try_stream! {
+            let Some((low, high)) = self.discover_key_bounds(&entity, &key).await? else {
+                return; // empty entity → no rows
+            };
+            let ranges = crate::odata::build_key_ranges(low, high + 1, count);
+            tracing::info!(
+                entity = %entity, key = %key, low, high,
+                ranges = ranges.len(), workers,
+                "OData key-range partitioned extraction"
+            );
+            // One filtered page-stream per range; poll up to `workers` concurrently.
+            // `stream_pages_inner` clones the context, so each returned stream
+            // borrows only `self` — the per-range `ctx` may drop immediately.
+            let streams: Vec<_> = ranges
+                .into_iter()
+                .map(|(lo, hi)| {
+                    let mut ctx = parent.clone();
+                    ctx.insert(
+                        KEY_RANGE_FILTER_CTX.to_string(),
+                        Value::String(crate::odata::key_range_filter(&key, lo, hi)),
+                    );
+                    self.stream_pages_inner(Some(&ctx))
+                })
+                .collect();
+            let mut merged = futures::stream::iter(streams).flatten_unordered(workers);
+            while let Some(page) = merged.next().await {
+                // Partitioning is a full-table intra-run read: suppress per-range
+                // bookmarks so no partial high-water mark is persisted.
+                let page = page?;
+                yield faucet_core::StreamPage { records: page.records, bookmark: None };
+            }
+        })
+    }
+
+    /// Generic, config-driven discovery (#647): run the [`DiscoverySpec`]
+    /// recipe — enumerate datasets (a `list` request or an explicit `objects`
+    /// list), optionally `describe` each, and emit one
+    /// [`DatasetDescriptor`](faucet_core::DatasetDescriptor) per dataset. All
+    /// requests reuse this source's authenticated client; nothing here is
+    /// connector-specific.
+    async fn discover_via_recipe(
+        &self,
+        spec: &crate::discovery::DiscoverySpec,
     ) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
         let base = self.config.base_url.trim_end_matches('/');
-        let ver = sf.api_version.trim_matches('/');
-        // Explicit `objects:` list skips the global-describe scan entirely; else
-        // scan `/sobjects` and take every queryable object.
-        let objects = if sf.objects.is_empty() {
-            let global_url = format!("{base}/services/data/{ver}/sobjects");
-            let global_txt = self
-                .discover_get_text(&global_url, "Salesforce /sobjects")
-                .await?;
-            let global: serde_json::Value = serde_json::from_str(&global_txt).map_err(|e| {
-                FaucetError::Source(format!(
-                    "rest: Salesforce /sobjects returned invalid JSON: {e}"
-                ))
-            })?;
-            crate::salesforce::queryable_objects(&global)
+        // Dataset names: an explicit `objects:` list wins; else run the `list`
+        // request and extract/filter names from it.
+        let names = if !spec.objects.is_empty() {
+            spec.objects.clone()
+        } else if let Some(list) = &spec.list {
+            let url = format!("{base}{}", list.get);
+            let resp = self.discover_get_json(&url, "discovery list").await?;
+            crate::discovery::dataset_names(&resp, list)
         } else {
-            sf.objects.clone()
+            return Err(FaucetError::Source(
+                "rest discovery: neither `list` nor `objects` produced any datasets".into(),
+            ));
         };
-        let mut out = Vec::with_capacity(objects.len());
-        for obj in objects {
-            let url = format!("{base}/services/data/{ver}/sobjects/{obj}/describe");
-            let txt = self
-                .discover_get_text(&url, "Salesforce object describe")
-                .await?;
-            let describe: serde_json::Value = serde_json::from_str(&txt).map_err(|e| {
-                FaucetError::Source(format!(
-                    "rest: Salesforce describe for {obj} returned invalid JSON: {e}"
-                ))
-            })?;
-            if let Some(d) = crate::salesforce::descriptor_for_object(
-                &obj,
-                &describe,
-                &sf.operation,
-                sf.route_by_table_id,
-            ) {
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let describe_resp = match &spec.describe {
+                Some(desc) => {
+                    let url = format!("{base}{}", desc.get.replace("${name}", &name));
+                    Some(self.discover_get_json(&url, "discovery describe").await?)
+                }
+                None => None,
+            };
+            if let Some(d) = crate::discovery::build_descriptor(&name, describe_resp.as_ref(), spec)
+            {
                 out.push(d);
             }
         }
@@ -2404,14 +2659,26 @@ mod tests {
     fn next_poll_delay_doubles_then_caps() {
         let cap = Duration::from_secs(15);
         // Exponential doubling below the cap.
-        assert_eq!(next_poll_delay(Duration::from_secs(1), cap), Duration::from_secs(2));
-        assert_eq!(next_poll_delay(Duration::from_secs(2), cap), Duration::from_secs(4));
-        assert_eq!(next_poll_delay(Duration::from_secs(4), cap), Duration::from_secs(8));
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(1), cap),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(2), cap),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(4), cap),
+            Duration::from_secs(8)
+        );
         // Doubling past the cap clamps to the cap.
         assert_eq!(next_poll_delay(Duration::from_secs(8), cap), cap);
         assert_eq!(next_poll_delay(cap, cap), cap);
         // A zero cap (interval_secs: 0) keeps the delay at zero (poll as fast as possible).
-        assert_eq!(next_poll_delay(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            next_poll_delay(Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
         // Saturating: a huge current delay never overflows.
         assert_eq!(next_poll_delay(Duration::from_secs(u64::MAX), cap), cap);
     }
@@ -2740,7 +3007,10 @@ mod tests {
     fn inject_soql_predicate_adds_or_wraps_where() {
         // No WHERE, no trailing clause → append WHERE.
         assert_eq!(
-            inject_soql_predicate("SELECT Id FROM Account", "SystemModstamp > 2026-01-01T00:00:00Z"),
+            inject_soql_predicate(
+                "SELECT Id FROM Account",
+                "SystemModstamp > 2026-01-01T00:00:00Z"
+            ),
             "SELECT Id FROM Account WHERE SystemModstamp > 2026-01-01T00:00:00Z"
         );
         // Existing WHERE → wrap in parens + AND (keeps OR precedence correct).
@@ -2787,7 +3057,10 @@ mod tests {
     fn soql_literal_quotes_by_type() {
         use serde_json::json;
         // Datetime / date → unquoted (SOQL datetime literal).
-        assert_eq!(soql_literal(&json!("2026-08-28T12:00:00Z")), "2026-08-28T12:00:00Z");
+        assert_eq!(
+            soql_literal(&json!("2026-08-28T12:00:00Z")),
+            "2026-08-28T12:00:00Z"
+        );
         assert_eq!(soql_literal(&json!("2026-08-28")), "2026-08-28");
         // Plain string → single-quoted.
         assert_eq!(soql_literal(&json!("Hot")), "'Hot'");

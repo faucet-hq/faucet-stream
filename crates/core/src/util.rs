@@ -383,6 +383,77 @@ pub fn extract_context(
     Ok(context)
 }
 
+/// Split an identifier into word tokens. Boundaries: whitespace, `_`, `-`, any
+/// other non-alphanumeric char, and lower→upper transitions (so `firstName` →
+/// `["first", "Name"]`). A multi-char uppercase run stays one token
+/// (`"XMLParser"` → `["XMLParser"]`). This is the single source of truth for the
+/// `keys_case` transform's word-splitting and for connector code (e.g. the OData
+/// fan-out) that must snake_case column names **identically** to that transform —
+/// a divergence would land a schema column name that never matches the record
+/// key it describes, silently dropping that column's data.
+pub fn tokenize_identifier(key: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut prev_was_lower = false;
+    for ch in key.chars() {
+        if ch.is_alphanumeric() {
+            if prev_was_lower && ch.is_uppercase() && !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            current.push(ch);
+            prev_was_lower = ch.is_lowercase();
+        } else {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            prev_was_lower = false;
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// `snake_case` an identifier using [`tokenize_identifier`] (lowercase tokens
+/// joined by `_`). Matches the `keys_case: snake` transform exactly. An
+/// all-symbol key (no tokens) is returned unchanged.
+pub fn snake_case(key: &str) -> String {
+    let tokens = tokenize_identifier(key);
+    if tokens.is_empty() {
+        return key.to_string();
+    }
+    tokens
+        .iter()
+        .map(|t| t.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+#[cfg(test)]
+mod snake_tests {
+    use super::snake_case;
+
+    #[test]
+    fn snake_case_matches_keys_case_transform_rules() {
+        // Lower→upper boundaries split; digits stay with their word.
+        assert_eq!(snake_case("CustomersV3"), "customers_v3");
+        assert_eq!(snake_case("RecId"), "rec_id");
+        assert_eq!(
+            snake_case("MainAccountBiEntities"),
+            "main_account_bi_entities"
+        );
+        assert_eq!(snake_case("DataAreaId"), "data_area_id");
+        // A multi-char uppercase run stays ONE token (the load-bearing case the
+        // per-char snake got wrong: "i_s_o..." would never match the record key).
+        assert_eq!(snake_case("ISOCurrencyCode"), "isocurrency_code");
+        assert_eq!(snake_case("XMLParser"), "xmlparser");
+        // Separators + all-symbol keys.
+        assert_eq!(snake_case("already_snake"), "already_snake");
+        assert_eq!(snake_case("__"), "__");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

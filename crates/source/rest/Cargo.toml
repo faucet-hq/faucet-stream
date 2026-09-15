@@ -48,7 +48,7 @@ faucet-core.workspace = true
 # `stream` for `Response::bytes_stream()` — the native byte-passthrough path (#633)
 # streams the async-job CSV response body straight into the CSV→NDJSON converter
 # without buffering the whole page.
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["stream", "gzip", "brotli", "deflate"] }
 # `StreamReader` bridges reqwest's byte stream to the tokio `AsyncRead` that
 # `csv-async` (tokio flavor) consumes for streaming CSV→NDJSON (#633).
 tokio-util = { workspace = true }

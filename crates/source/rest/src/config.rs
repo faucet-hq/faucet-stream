@@ -281,17 +281,14 @@ pub struct RestStreamConfig {
     #[serde(default)]
     pub persist_cursor: bool,
 
-    // ── Salesforce object discovery (#647) ──────────────────────────────────────
-    /// Enable `faucet discover` for a Salesforce org: introspect `/sobjects`
-    /// (global describe) + per-object describe and emit one dataset per queryable
-    /// object, each with a **field-complete** `SELECT … FROM <Object>` (built from
-    /// the object's describe, excluding compound/non-queryable types) — so you
-    /// declare the connection once instead of hand-listing every object's fields.
-    /// `base_url` must be the Salesforce instance URL and `auth` must resolve.
-    /// Only affects discovery; a normal run still uses the `async_job` (Bulk API)
-    /// config. See [`SalesforceDiscovery`].
+    // ── Config-driven discovery (#647) ──────────────────────────────────────────
+    /// Generic, vendor-neutral discovery recipe: declare which API calls to make
+    /// and how to extract datasets from their JSON responses (reusing this
+    /// source's `auth` / `base_url` / `headers`). Powers `faucet discover` and
+    /// run-time fan-out for any REST API with a listing / describe shape, with no
+    /// connector-specific code. See [`DiscoverySpec`](crate::discovery::DiscoverySpec).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub salesforce: Option<SalesforceDiscovery>,
+    pub discovery: Option<crate::discovery::DiscoverySpec>,
 }
 
 /// One entry in a [`RestStreamConfig::records_multi`] fan-out (#548): a JSONPath
@@ -360,53 +357,89 @@ pub struct ODataConfig {
     /// Server page size, sent as `Prefer: odata.maxpagesize=<n>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
-}
 
-/// Salesforce object-discovery options (#647). Presence on
-/// [`RestStreamConfig::salesforce`] opts the source into `faucet discover`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SalesforceDiscovery {
-    /// Objects to discover — a YAML list (`[Account, Contact, Churn__c]`) **or** a
-    /// comma-separated string (`"Account,Contact"`), so it can be driven by a
-    /// single string run-param: `objects: "${param.objects}"`. Empty (the
-    /// default), or the sentinel `"all"`, scans the global describe (`/sobjects`)
-    /// and takes every *queryable* object (still narrowable with `faucet discover
-    /// --include/--exclude`).
-    #[serde(default, deserialize_with = "de_objects", skip_serializing_if = "Vec::is_empty")]
-    pub objects: Vec<String>,
-    /// Fan out **at run time** (#647): when `true`, `faucet run` / `faucet serve`
-    /// discovers the objects' fields and generates the matrix on the fly — so one
-    /// generic template with `objects: "${param.objects}"` syncs any object set
-    /// passed at trigger, with no pre-generated matrix. Default `false` (the block
-    /// then only affects `faucet discover`).
+    // ── Run-time fan-out over entity sets (#647-family, OData) ───────────────────
+    /// Fan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the
+    /// [`objects`](Self::objects) list into one matrix row per entity set (each with
+    /// its `odata.entity` selected and a `fno_`-style sink `table_id`), so one
+    /// generic template with `objects: "${param.objects}"` syncs any entity set
+    /// passed at trigger — no pre-generated matrix, no field discovery needed
+    /// (OData returns every column by default). Default `false` (the block then
+    /// only affects a single-entity run / `faucet discover`).
     #[serde(default)]
     pub fan_out: bool,
-    /// Sink template (an entry under `pipeline.sinks`) each fanned-out object
-    /// routes to. Only used with `fan_out: true`; defaults to `default`.
+    /// Entity sets to fan out over — a YAML list **or** a comma-separated string
+    /// (so it can be driven by a single string run-param: `objects:
+    /// "${param.objects}"`). Empty means fall back to `$metadata` discovery of
+    /// every declared entity set (`faucet discover`).
+    #[serde(
+        default,
+        deserialize_with = "de_objects",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub objects: Vec<String>,
+    /// Sink template (an entry under `pipeline.sinks`) each fanned-out entity
+    /// routes to. Only used with `fan_out: true`; when unset each entity routes to
+    /// the default (singular `pipeline.sink`) template with its `table_id` merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_ref: Option<String>,
-    /// Salesforce REST API version used for the describe calls and baked into the
-    /// generated Bulk-query path. Default `v60.0`.
-    #[serde(default = "default_sf_api_version")]
-    pub api_version: String,
-    /// Bulk-query operation baked into each generated object's SOQL job:
-    /// `queryAll` (includes soft-deleted/archived rows) or `query`. Default
-    /// `queryAll`.
-    #[serde(default = "default_sf_operation")]
-    pub operation: String,
-    /// Also emit a per-object sink override (`{ table_id: <snake object> }`) so a
-    /// fan-out lands one table per object on a table-based sink (BigQuery,
-    /// Snowflake, the SQL sinks). Default `true`. Set `false` when the sink is
-    /// file-based (it would reject an unknown `table_id`).
-    #[serde(default = "default_true")]
-    pub route_by_table_id: bool,
+    /// Prefix prepended to each fanned-out entity's snake_cased sink `table_id`
+    /// (e.g. `"fno_"` → `MainAccountBiEntities` → `fno_main_account_bi_entities`).
+    /// Default empty (bare snake_case name). Only used with `fan_out: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_prefix: Option<String>,
+
+    // ── Key-range partitioned extraction (#479, OData) ───────────────────────────
+    /// Entity sets to extract **concurrently across primary-key ranges** instead of
+    /// sequentially — the fix for a huge entity whose `@odata.nextLink` paging is one
+    /// slow request after another. Only meaningful with `fan_out: true`; at fan-out
+    /// each listed entity whose `$metadata` declares a **single integer** key gets
+    /// its [`partition_key`](Self::partition_key) set (others fall back to sequential).
+    /// Accepts a YAML sequence or a comma-separated string (run-param friendly).
+    #[serde(
+        default,
+        deserialize_with = "de_objects",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub partitioned_objects: Vec<String>,
+    /// Integer primary-key column this entity is range-split on. Normally derived
+    /// from `$metadata` at fan-out for a [`partitioned_objects`](Self::partitioned_objects)
+    /// entity; may be set explicitly for a single-entity run. When set, the source
+    /// discovers the key's min/max, tiles the range, and fetches the tiles concurrently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<String>,
+    /// Concurrent range readers per partitioned entity. Default 4; capped at 64.
+    /// Readers share the source's D365 throttling quota and OData scales sublinearly
+    /// with concurrency, but measurably past the reference tap's self-imposed cap of
+    /// 8 (≈1.67× the throughput at 16) — so faucet lets you exceed it. The cap keeps
+    /// a typo from spawning thousands of tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_workers: Option<usize>,
+    /// Number of key ranges to tile the key space into. Default is `partition_workers × 4`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_count: Option<usize>,
+}
+
+impl ODataConfig {
+    /// Concurrent range readers, clamped to `1..=64`. The reference tap self-caps at
+    /// 8; D365 keeps scaling (sublinearly) beyond that, so faucet allows more.
+    pub fn resolved_partition_workers(&self) -> usize {
+        self.partition_workers.unwrap_or(4).clamp(1, 64)
+    }
+
+    /// Number of key ranges to tile into (default `workers × 4`, capped at 256).
+    pub fn resolved_partition_count(&self) -> usize {
+        self.partition_count
+            .filter(|&n| n > 0)
+            .unwrap_or(self.resolved_partition_workers() * 4)
+            .min(256)
+    }
 }
 
 /// Deserialize `objects` from either a YAML sequence or a comma-separated string
 /// (so a single string run-param can drive it). `"all"` (any case) → empty
 /// (= discover every queryable object). Blanks are trimmed and dropped.
-fn de_objects<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+pub(crate) fn de_objects<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -420,35 +453,15 @@ where
         if s.trim().eq_ignore_ascii_case("all") {
             return Vec::new();
         }
-        s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
     };
     Ok(match StrOrSeq::deserialize(d)? {
         StrOrSeq::Str(s) => split(&s),
         StrOrSeq::Seq(v) => v.into_iter().flat_map(|s| split(&s)).collect(),
     })
-}
-
-impl Default for SalesforceDiscovery {
-    fn default() -> Self {
-        Self {
-            objects: Vec::new(),
-            fan_out: false,
-            sink_ref: None,
-            api_version: default_sf_api_version(),
-            operation: default_sf_operation(),
-            route_by_table_id: true,
-        }
-    }
-}
-
-fn default_sf_api_version() -> String {
-    "v60.0".to_string()
-}
-fn default_sf_operation() -> String {
-    "queryAll".to_string()
-}
-fn default_true() -> bool {
-    true
 }
 
 pub use faucet_core::TlsClientConfig;
@@ -522,7 +535,7 @@ impl Default for RestStreamConfig {
             records_multi: Vec::new(),
             op_field: None,
             persist_cursor: false,
-            salesforce: None,
+            discovery: None,
         }
     }
 }
@@ -717,6 +730,9 @@ impl RestStreamConfig {
                     "rest: `persist_cursor` and `window` slicing are mutually exclusive".into(),
                 ));
             }
+        }
+        if let Some(discovery) = &self.discovery {
+            discovery.validate()?;
         }
         Ok(())
     }
@@ -1059,6 +1075,7 @@ mod tests {
             filter: Some("A gt 1".to_owned()),
             orderby: Some("A desc".to_owned()),
             page_size: Some(250),
+            ..Default::default()
         });
         c.apply_odata_defaults();
 

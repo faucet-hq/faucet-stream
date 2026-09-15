@@ -153,7 +153,14 @@ pub enum KeyCaseMode {
 /// as Salesforce, e.g. `AccountId__c` + `Account_Id__c` → `account_id_c`).
 #[cfg(feature = "transform-keys-case")]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Deserialize,
+    serde::Serialize,
     schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
@@ -1656,27 +1663,9 @@ fn keys_case(
 /// limitation in the cookbook rather than complicating the tokeniser.
 #[cfg(feature = "transform-keys-case")]
 fn tokenize_key(key: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut prev_was_lower = false;
-    for ch in key.chars() {
-        if ch.is_alphanumeric() {
-            if prev_was_lower && ch.is_uppercase() && !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            current.push(ch);
-            prev_was_lower = ch.is_lowercase();
-        } else {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            prev_was_lower = false;
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+    // Single source of truth (shared with connector code that must snake_case
+    // column names identically — see `crate::util::tokenize_identifier`).
+    crate::util::tokenize_identifier(key)
 }
 
 #[cfg(feature = "transform-keys-case")]
@@ -3426,7 +3415,10 @@ mod tests {
 
     #[cfg(feature = "transform-keys-case")]
     fn keys_case_specs(mode: KeyCaseMode) -> Vec<RecordTransform> {
-        vec![RecordTransform::KeysCase { mode, on_collision: KeyCollision::Error }]
+        vec![RecordTransform::KeysCase {
+            mode,
+            on_collision: KeyCollision::Error,
+        }]
     }
 
     #[cfg(feature = "transform-keys-case")]

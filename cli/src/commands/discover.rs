@@ -42,8 +42,8 @@ pub async fn run(args: DiscoverArgs) -> CliResult<()> {
         return Err(CliError::Config(format!(
             "source '{}' does not support dataset discovery — discovery is available for \
              catalog-backed sources (postgres, mysql, mssql, sqlite, mongodb, elasticsearch, \
-             bigquery, snowflake, spanner, s3, gcs) and for `rest` sources with an `odata:` \
-             block (via OData `$metadata`) or a `salesforce:` block (via Salesforce `/sobjects`)",
+             bigquery, snowflake, spanner, s3, gcs) and for `rest` sources with a `discovery:` \
+             recipe (config-driven API calls) or an `odata:` block (via OData `$metadata`)",
             spec.kind
         )));
     }
@@ -324,7 +324,7 @@ fn render_discovered_config(
         }
         // Per-dataset sink routing: a `--sink` template ref and/or the
         // descriptor's own `sink_patch` (e.g. `{table_id: account}` so a
-        // Salesforce fan-out lands one table per object).
+        // fan-out lands one table per dataset).
         if sink_template.is_some() || d.sink_patch.is_some() {
             let mut sink = json!({});
             if let Some(s) = sink_template {
@@ -512,8 +512,12 @@ pipeline:
       config: { path: ./out.jsonl }
 "#;
         let datasets = vec![
-            DatasetDescriptor::new("Account", "sobject", json!({"async_job": {"submit": {"json": {"query": "SELECT Id FROM Account"}}}}))
-                .with_sink_patch(json!({ "table_id": "account" })),
+            DatasetDescriptor::new(
+                "Account",
+                "sobject",
+                json!({"async_job": {"submit": {"json": {"query": "SELECT Id FROM Account"}}}}),
+            )
+            .with_sink_patch(json!({ "table_id": "account" })),
         ];
         let doc = render_discovered_config(raw, "default", Some("bigquery"), &datasets).unwrap();
         assert!(doc.contains("ref: bigquery"), "{doc}");

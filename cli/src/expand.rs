@@ -1494,6 +1494,12 @@ fn check_refs(value: &Value, id_set: &HashSet<&str>, owner: &str) -> CliResult<(
                 && id != "bookmark"
                 && id != "job_id"
                 && id != "window"
+                // `discovery:` recipe tokens, resolved by the source's discovery
+                // engine at `discover()` time (before the executor sees them).
+                && id != "name"
+                && id != "name_snake"
+                && id != "name_lower"
+                && id != "field_names"
                 && !id_set.contains(id)
             {
                 return Err(CliError::UnknownInterpolationId {

@@ -1,11 +1,11 @@
 //! Run-time discovery-driven matrix fan-out (#647).
 //!
-//! A generic template can declare `salesforce: { fan_out: true, objects:
-//! "${param.objects}" }` on its source and **no** `matrix:`. At run time — in
-//! both `faucet run` and `faucet serve` — [`resolve_dynamic_fanout`] builds that
-//! source, calls [`Source::discover`](faucet_core::Source::discover), and
-//! generates one matrix row per discovered object (each with its field-complete
-//! `SELECT` + a per-object sink `table_id`), *before* [`expand`](crate::expand).
+//! A generic template can declare a discovery block with `fan_out: true` on its
+//! source (a `discovery:` recipe or an `odata:` block) and **no** `matrix:`. At
+//! run time — in both `faucet run` and `faucet serve` — [`resolve_dynamic_fanout`]
+//! builds that source, calls [`Source::discover`](faucet_core::Source::discover),
+//! and generates one matrix row per discovered dataset (each with its config
+//! patch + a per-dataset sink `table_id`), *before* [`expand`](crate::expand).
 //! So the object list is a trigger-time parameter and every object's fields are
 //! resolved live — no pre-generated matrix, new fields picked up automatically.
 //!
@@ -18,8 +18,8 @@ use crate::config::{ConnectorSpec, MatrixRow, PipelineConfig};
 use crate::error::{CliError, CliResult};
 use serde_json::{Value, json};
 
-/// If a source template declares `salesforce.fan_out: true`, discover its
-/// objects and replace `cfg.matrix` with one row per object. No-op otherwise.
+/// If a source template declares a discovery block with `fan_out: true`, discover
+/// its datasets and replace `cfg.matrix` with one row per dataset. No-op otherwise.
 pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog) -> CliResult<()> {
     let Some((src_ref, spec)) = find_fanout_source(cfg) else {
         return Ok(());
@@ -32,7 +32,7 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
     if !source.supports_discover() {
         return Err(CliError::Config(format!(
             "dynamic fan-out: source '{src_ref}' (kind '{}') does not support discovery — \
-             remove `salesforce.fan_out` or point it at a discoverable source",
+             remove `fan_out` or point it at a discoverable source",
             spec.kind
         )));
     }
@@ -42,13 +42,12 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
         .map_err(|e| CliError::Config(format!("dynamic fan-out: discovery failed: {e}")))?;
     if descriptors.is_empty() {
         return Err(CliError::Config(
-            "dynamic fan-out: discovery returned no objects (check `salesforce.objects`)".into(),
+            "dynamic fan-out: discovery returned no datasets (check the `discovery`/`odata` block)"
+                .into(),
         ));
     }
-    let sink_ref = spec
-        .config
-        .get("salesforce")
-        .and_then(|s| s.get("sink_ref"))
+    let sink_ref = fanout_block(&spec)
+        .and_then(|b| b.get("sink_ref"))
         .and_then(Value::as_str)
         .map(str::to_string);
     cfg.matrix = descriptors_to_rows(&descriptors, &src_ref, sink_ref.as_deref())?;
@@ -60,24 +59,32 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
     Ok(())
 }
 
+/// The block driving fan-out — a `discovery:` recipe or an `odata:` block —
+/// whichever carries `fan_out: true`. Returned so the caller can read `sink_ref`
+/// from the same block that opted in.
+fn fanout_block(spec: &ConnectorSpec) -> Option<&Value> {
+    for key in ["discovery", "odata"] {
+        if let Some(block) = spec.config.get(key)
+            && block.get("fan_out").and_then(Value::as_bool) == Some(true)
+        {
+            return Some(block);
+        }
+    }
+    None
+}
+
 /// Find a source template (named `sources.*`, or the singular `source`
-/// registered as `default`) whose config carries `salesforce.fan_out == true`.
+/// registered as `default`) whose config opts into fan-out via
+/// `salesforce.fan_out` or `odata.fan_out`.
 fn find_fanout_source(cfg: &PipelineConfig) -> Option<(String, ConnectorSpec)> {
-    let is_fanout = |spec: &ConnectorSpec| -> bool {
-        spec.config
-            .get("salesforce")
-            .and_then(|s| s.get("fan_out"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    };
     // Prefer a named template; fall back to the singular default source.
     for (name, spec) in &cfg.pipeline.sources {
-        if is_fanout(spec) {
+        if fanout_block(spec).is_some() {
             return Some((name.clone(), spec.clone()));
         }
     }
     if let Some(spec) = &cfg.pipeline.source
-        && is_fanout(spec)
+        && fanout_block(spec).is_some()
     {
         return Some(("default".to_string(), spec.clone()));
     }
@@ -110,7 +117,9 @@ fn descriptors_to_rows(
             row["sink"] = sink;
         }
         rows.push(serde_json::from_value::<MatrixRow>(row).map_err(|e| {
-            CliError::Config(format!("dynamic fan-out: could not build matrix row '{id}': {e}"))
+            CliError::Config(format!(
+                "dynamic fan-out: could not build matrix row '{id}': {e}"
+            ))
         })?);
     }
     Ok(rows)
@@ -149,10 +158,43 @@ mod tests {
     }
 
     #[test]
+    fn fanout_block_detects_discovery_and_odata() {
+        let rec: ConnectorSpec = serde_json::from_value(json!({
+            "type": "rest",
+            "config": { "discovery": { "fan_out": true, "sink_ref": "bq" } }
+        }))
+        .unwrap();
+        assert_eq!(
+            fanout_block(&rec)
+                .and_then(|b| b.get("sink_ref"))
+                .and_then(Value::as_str),
+            Some("bq")
+        );
+
+        let od: ConnectorSpec = serde_json::from_value(json!({
+            "type": "rest",
+            "config": { "odata": { "fan_out": true, "objects": "A,B", "table_prefix": "fno_" } }
+        }))
+        .unwrap();
+        assert!(fanout_block(&od).is_some());
+
+        // fan_out absent / false → not a fan-out source.
+        let plain: ConnectorSpec = serde_json::from_value(json!({
+            "type": "rest",
+            "config": { "odata": { "entity": "Orders" } }
+        }))
+        .unwrap();
+        assert!(fanout_block(&plain).is_none());
+    }
+
+    #[test]
     fn named_source_ref_is_set() {
-        let ds = vec![DatasetDescriptor::new("Lead", "sobject", json!({}))];
-        let rows = descriptors_to_rows(&ds, "salesforce", None).unwrap();
-        assert_eq!(rows[0].source.as_ref().unwrap().r#ref.as_deref(), Some("salesforce"));
+        let ds = vec![DatasetDescriptor::new("Lead", "dataset", json!({}))];
+        let rows = descriptors_to_rows(&ds, "api", None).unwrap();
+        assert_eq!(
+            rows[0].source.as_ref().unwrap().r#ref.as_deref(),
+            Some("api")
+        );
         assert!(rows[0].sink.is_none()); // no sink_ref, no sink_patch
     }
 }
