@@ -1,0 +1,232 @@
+{
+  "cli_version": "0.10.2",
+  "checkpoint_id": "01M2JMPFEN7TVNKN68ZTFXYFRA",
+  "session_id": "55398c64-7c65-40db-9b68-886111a86d7f",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-15T13:40:03.565475Z",
+  "branch": "feat/native-byte-passthrough-633",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "Cargo.lock",
+    "cli/src/commands/discover.rs",
+    "cli/src/commands/run.rs",
+    "cli/src/dynamic_fanout.rs",
+    "cli/src/expand.rs",
+    "crates/core/src/transform.rs",
+    "crates/core/src/util.rs",
+    "crates/source/rest/Cargo.toml",
+    "crates/source/rest/src/config.rs",
+    "crates/source/rest/src/discovery.rs",
+    "crates/source/rest/src/lib.rs",
+    "crates/source/rest/src/odata.rs",
+    "crates/source/rest/src/salesforce.rs",
+    "crates/source/rest/src/stream.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-fable-5",
+  "turn_id": "d1fe40e3b73f",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 13346,
+    "cache_creation_tokens": 45626559,
+    "cache_read_tokens": 3809883136,
+    "output_tokens": 8120922,
+    "api_call_count": 6700
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_017ZfRgSytScg56gq1T9UQPE",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "d1fe40e3b73f",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 7917,
+        "end": 7918,
+        "entry_ids": [
+          "77fc9a79-96ea-4356-a27c-a75ba0299ea3"
+        ],
+        "tool_use_id": "toolu_017ZfRgSytScg56gq1T9UQPE"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017ZfRgSytScg56gq1T9UQPE"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01MJQ8Y6HmbmGqKCCexDcdHR",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "d1fe40e3b73f",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 21427,
+        "end": 21428,
+        "entry_ids": [
+          "71548694-66ab-42a0-9606-4771e135588e"
+        ],
+        "tool_use_id": "toolu_01MJQ8Y6HmbmGqKCCexDcdHR"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01MJQ8Y6HmbmGqKCCexDcdHR"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_017asfQCcZaMKX3JWdwmjpEh",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "code-review"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "d1fe40e3b73f",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 31762,
+        "end": 31763,
+        "entry_ids": [
+          "f5c37f7a-f2a5-45b4-847f-82e5a1eea868"
+        ],
+        "tool_use_id": "toolu_017asfQCcZaMKX3JWdwmjpEh"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017asfQCcZaMKX3JWdwmjpEh"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: code-review",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_013Vxbfp1Mk6xDvLzCsLvWns",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "d1fe40e3b73f",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 57107,
+        "end": 57108,
+        "entry_ids": [
+          "7b013d9f-a9bf-4b28-b81e-5634986b1e82"
+        ],
+        "tool_use_id": "toolu_013Vxbfp1Mk6xDvLzCsLvWns"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_013Vxbfp1Mk6xDvLzCsLvWns"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "initial_attribution": {
+    "calculated_at": "2026-09-15T13:39:56.417001Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 129,
+    "human_removed": 321,
+    "total_committed": 0,
+    "total_lines_changed": 450,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1413,
+      "user_lines_removed": 455,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claire/worktrees/serve-http-control-plane/cli/src/serve/auth.rs": 1,
+        "Cargo.lock": 1,
+        "cli/src/commands/discover.rs": 3,
+        "cli/src/commands/history.rs": 1,
+        "cli/src/commands/run.rs": 3,
+        "cli/src/dynamic_fanout.rs": 62,
+        "cli/src/executor.rs": 25,
+        "cli/src/expand.rs": 6,
+        "cli/src/serve/handlers/runs.rs": 10,
+        "cli/src/serve/history/memory.rs": 2,
+        "cli/src/serve/history/mod.rs": 15,
+        "cli/src/serve/history/sql.rs": 19,
+        "cli/src/serve/ui/styles.css": 4,
+        "cli/src/serve/ui/views/datasets.js": 9,
+        "cli/src/serve/ui/views/runs.js": 24,
+        "crates/core/src/transform.rs": 3,
+        "crates/core/src/util.rs": 68,
+        "crates/sink/bigquery/src/config.rs": 14,
+        "crates/sink/bigquery/src/idempotent.rs": 21,
+        "crates/sink/bigquery/src/sink.rs": 168,
+        "crates/source/rest/Cargo.toml": 1,
+        "crates/source/rest/src/config.rs": 77,
+        "crates/source/rest/src/discovery.rs": 402,
+        "crates/source/rest/src/lib.rs": 2,
+        "crates/source/rest/src/odata.rs": 185,
+        "crates/source/rest/src/stream.rs": 287
+      },
+      "user_removed_per_file": {
+        "cli/src/commands/discover.rs": 3,
+        "cli/src/commands/run.rs": 2,
+        "cli/src/dynamic_fanout.rs": 27,
+        "cli/src/executor.rs": 6,
+        "cli/src/serve/handlers/runs.rs": 4,
+        "cli/src/serve/history/memory.rs": 2,
+        "cli/src/serve/history/mod.rs": 1,
+        "cli/src/serve/history/sql.rs": 3,
+        "cli/src/serve/ui/views/runs.js": 3,
+        "crates/core/src/transform.rs": 21,
+        "crates/sink/bigquery/src/idempotent.rs": 1,
+        "crates/sink/bigquery/src/sink.rs": 28,
+        "crates/source/rest/Cargo.toml": 1,
+        "crates/source/rest/src/config.rs": 71,
+        "crates/source/rest/src/lib.rs": 3,
+        "crates/source/rest/src/odata.rs": 9,
+        "crates/source/rest/src/salesforce.rs": 224,
+        "crates/source/rest/src/stream.rs": 46
+      }
+    }
+  ]
+}
