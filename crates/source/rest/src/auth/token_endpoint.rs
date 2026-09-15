@@ -277,9 +277,7 @@ async fn token_backoff(attempt: u32) {
 /// rejected — form encoding has no representation for them.
 fn form_pairs(body: &Value) -> Result<Vec<(String, String)>, FaucetError> {
     let obj = body.as_object().ok_or_else(|| {
-        FaucetError::Config(
-            "token_endpoint: `encoding: form` requires a JSON object body".into(),
-        )
+        FaucetError::Config("token_endpoint: `encoding: form` requires a JSON object body".into())
     })?;
     let mut pairs = Vec::with_capacity(obj.len());
     for (k, v) in obj {
@@ -483,7 +481,10 @@ mod tests {
         ));
         assert!(is_transient_token_status(400, "Please RETRY YOUR REQUEST"));
         // A permanent 400 (real misconfig) is NOT retried — fail fast.
-        assert!(!is_transient_token_status(400, r#"{"error":"invalid_grant"}"#));
+        assert!(!is_transient_token_status(
+            400,
+            r#"{"error":"invalid_grant"}"#
+        ));
         assert!(!is_transient_token_status(
             400,
             r#"{"error":"unsupported_grant_type"}"#

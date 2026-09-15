@@ -488,7 +488,12 @@ where
         // see `line`, so the timestamp must live in the line text itself; the separate
         // `ts` field is still carried for the structured jsonl persisted-log API.
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let line = format!("{ts} {} {}: {}", meta.level(), meta.target(), visitor.finish());
+        let line = format!(
+            "{ts} {} {}: {}",
+            meta.level(),
+            meta.target(),
+            visitor.finish()
+        );
         let line = crate::secrets::registry::redact(&line).into_owned();
         self.hub.capture(&run_id, meta.level().as_str(), ts, line);
     }

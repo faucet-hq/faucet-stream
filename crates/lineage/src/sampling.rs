@@ -415,7 +415,8 @@ impl Source for SamplingSource {
         context: &'a HashMap<String, Value>,
         format: faucet_core::NativeFormat,
         batch_size: usize,
-    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>>
+    {
         let state = std::sync::Arc::clone(&self.state);
         let inner = self.inner.stream_native(context, format, batch_size);
         Box::pin(faucet_core::async_stream::try_stream! {
@@ -443,7 +444,9 @@ impl Source for SamplingSource {
         context: &'a HashMap<String, Value>,
         batch_size: usize,
     ) -> Pin<
-        Box<dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a>,
+        Box<
+            dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a,
+        >,
     > {
         let state = std::sync::Arc::clone(&self.state);
         let inner = self.inner.stream_batches(context, batch_size);
@@ -738,14 +741,22 @@ mod tests {
         ) -> Result<usize, FaucetError> {
             use futures::StreamExt as _;
             match batch.payload {
-                faucet_core::NativePayload::Bytes(b) => self.0.lock().unwrap().extend_from_slice(&b),
+                faucet_core::NativePayload::Bytes(b) => {
+                    self.0.lock().unwrap().extend_from_slice(&b)
+                }
                 faucet_core::NativePayload::Stream(mut st) => {
                     while let Some(c) = st.next().await {
                         self.0.lock().unwrap().extend_from_slice(&c?);
                     }
                 }
             }
-            Ok(self.0.lock().unwrap().iter().filter(|&&x| x == b'\n').count())
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == b'\n')
+                .count())
         }
     }
 
@@ -762,7 +773,8 @@ mod tests {
         assert_eq!(caps[0].mechanism, "test-native");
 
         let bytes = b"{\"id\":1,\"name\":\"a\"}\n{\"id\":2}\n{\"id\":3}\n".to_vec();
-        let batch = faucet_core::NativeBatch::bytes(faucet_core::NativeFormat::NdJson, bytes.clone());
+        let batch =
+            faucet_core::NativeBatch::bytes(faucet_core::NativeFormat::NdJson, bytes.clone());
         let ctx = faucet_core::NativeLoadContext {
             write_mode: faucet_core::WriteMode::Append,
             first_batch: true,

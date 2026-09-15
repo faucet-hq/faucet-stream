@@ -488,17 +488,18 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     } else {
                         crate::write_mode::WriteMode::Append
                     };
-                    let plan = crate::native::plan_native_transfer(&crate::native::NativePlanInputs {
-                        source_formats,
-                        sink_caps: &sink_caps,
-                        // Transforms are enforced by the wrapper not advertising
-                        // native formats; the pipeline itself holds no transforms.
-                        has_transforms: false,
-                        has_governance,
-                        delivery: self.delivery,
-                        write_mode,
-                        has_dlq: self.dlq.is_some(),
-                    });
+                    let plan =
+                        crate::native::plan_native_transfer(&crate::native::NativePlanInputs {
+                            source_formats,
+                            sink_caps: &sink_caps,
+                            // Transforms are enforced by the wrapper not advertising
+                            // native formats; the pipeline itself holds no transforms.
+                            has_transforms: false,
+                            has_governance,
+                            delivery: self.delivery,
+                            write_mode,
+                            has_dlq: self.dlq.is_some(),
+                        });
                     if let Some(plan) = plan {
                         let state = match (wrapped_state_store.clone(), state_key.clone()) {
                             (Some(store), Some(key)) => Some((store, key)),
@@ -6424,9 +6425,8 @@ mod cleanup_tests {
             _context: &'a std::collections::HashMap<String, Value>,
             format: crate::native::NativeFormat,
             _batch_size: usize,
-        ) -> Pin<
-            Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'a>,
-        > {
+        ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'a>>
+        {
             assert_eq!(format, crate::native::NativeFormat::Csv);
             let n = self.batches;
             Box::pin(async_stream::stream! {
@@ -6465,7 +6465,10 @@ mod cleanup_tests {
     #[async_trait]
     impl Sink for NativeRecordingSink {
         async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-            self.events.lock().unwrap().push(format!("write:{}", records.len()));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("write:{}", records.len()));
             Ok(records.len())
         }
         fn native_load_capabilities(&self) -> Vec<crate::native::NativeLoadCapability> {
@@ -6540,7 +6543,10 @@ mod cleanup_tests {
         assert_eq!(result.records_written, 2);
         assert_eq!(result.bookmark, Some(json!({"page": 1})));
         // The `Value` write path was never used.
-        assert!(events.lock().unwrap().is_empty(), "no Value writes: {events:?}");
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no Value writes: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -6582,7 +6588,10 @@ mod cleanup_tests {
         );
         assert_eq!(*loads.lock().unwrap(), vec![(1, true), (1, false)]);
         // The generic overwrite lifecycle was never invoked.
-        assert!(events.lock().unwrap().is_empty(), "no begin/commit: {events:?}");
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no begin/commit: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -6606,7 +6615,11 @@ mod cleanup_tests {
             .unwrap();
         assert!(loads.lock().unwrap().is_empty(), "native path must not run");
         assert!(
-            events.lock().unwrap().iter().any(|e| e.starts_with("write:")),
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("write:")),
             "Value path must run: {events:?}"
         );
     }
