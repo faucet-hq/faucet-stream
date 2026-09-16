@@ -818,3 +818,7 @@ CIs have failed. Can you please keep on checking and reviewing it, and if there 
 <status>killed</status>
 <summary>Background command "Watch run + auto-rerun failed flakes" was stopped</summary>
 </task-notification>
+
+---
+
+Yes, let's do that.
