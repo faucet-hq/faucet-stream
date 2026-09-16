@@ -52,6 +52,14 @@ edit to an exhaustive surface.
   evolution is a **minor** version, always.
 - A genuine signature change keeps a delegating compatibility wrapper for the
   published name. Removals require an explicit, human-approved major.
+- **Stability tiers.** Not everything a 1.x release ships is equally frozen.
+  A young surface (a config block or feature still finding its shape) is marked
+  **Experimental** in its doc comment — the marker flows into `faucet schema`
+  output and docs.rs — meaning: *its shape may change in a minor release, with
+  the change called out in the changelog.* Everything unmarked is stable under
+  the full contract above. Graduation (removing the marker) is a deliberate,
+  reviewed act once the shape has survived real use; an experimental marker is
+  never a license for sloppiness — the block still meets every other principle.
 
 ## 4. Config is an API — design the YAML like one
 

@@ -20,6 +20,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// A generic discovery recipe on a REST source.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoverySpec {

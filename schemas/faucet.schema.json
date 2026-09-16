@@ -14553,7 +14553,7 @@
                       "default": true
                     },
                     "schema": {
-                      "description": "Explicit column schema, in the `infer_schema` JSON-Schema shape\n(`{\"type\":\"object\",\"properties\":{\"col\":{\"type\":\"integer\"}, …}}`). When\nset it is used **verbatim** for the `media_load` load job (so BigQuery\ntypes columns from this instead of `autodetect`) and for `create_table`.\nThis is the escape hatch for typed sources whose JSON is heterogeneous\nenough that `autodetect` mis-types a column and then fails the whole load\non one non-conforming row (e.g. an OData feed — the OData `$metadata`\ndocument is the authoritative source of these types). Absent ⇒ the prior\nbehaviour (autodetect on `media_load`, first-page inference on\n`create_table`)."
+                      "description": "**Experimental** (PRINCIPLES.md §3): this field may change shape in a\nminor release; changes are called out in the changelog.\n\nExplicit column schema, in the `infer_schema` JSON-Schema shape\n(`{\"type\":\"object\",\"properties\":{\"col\":{\"type\":\"integer\"}, …}}`). When\nset it is used **verbatim** for the `media_load` load job (so BigQuery\ntypes columns from this instead of `autodetect`) and for `create_table`.\nThis is the escape hatch for typed sources whose JSON is heterogeneous\nenough that `autodetect` mis-types a column and then fails the whole load\non one non-conforming row (e.g. an OData feed — the OData `$metadata`\ndocument is the authoritative source of these types). Absent ⇒ the prior\nbehaviour (autodetect on `media_load`, first-page inference on\n`create_table`)."
                     },
                     "location": {
                       "description": "Location (region or multi-region, e.g. `US`, `EU`, `us-central1`) used only\nwhen `create_table` has to create the dataset. `None` uses the BigQuery\njob's default location. Ignored once the dataset exists.",
@@ -17636,7 +17636,7 @@
           "minimum": 0
         },
         "fan_out": {
-          "description": "Fan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the\n[`objects`](Self::objects) list into one matrix row per entity set (each\nwith its `odata.entity` selected and its sink `table_id` rendered from\n[`emit`](Self::emit)), so one generic template with\n`objects: \"${param.objects}\"` syncs any entity set passed at trigger — no\npre-generated matrix, no field discovery needed (OData returns every column\nby default). Default `false` (the block then only affects a single-entity\nrun / `faucet discover`). Same key and semantics as `discovery.fan_out`.",
+          "description": "**Experimental** (PRINCIPLES.md §3): the fan-out key group may change\nshape in a minor release; changes are called out in the changelog.\n\nFan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the\n[`objects`](Self::objects) list into one matrix row per entity set (each\nwith its `odata.entity` selected and its sink `table_id` rendered from\n[`emit`](Self::emit)), so one generic template with\n`objects: \"${param.objects}\"` syncs any entity set passed at trigger — no\npre-generated matrix, no field discovery needed (OData returns every column\nby default). Default `false` (the block then only affects a single-entity\nrun / `faucet discover`). Same key and semantics as `discovery.fan_out`.",
           "type": [
             "boolean",
             "string"
@@ -18748,7 +18748,7 @@
       ]
     },
     "source_rest__EmitSpec": {
-      "description": "What each discovered dataset **emits** — shared by every discovery mechanism\n(`discovery.emit` and `odata.emit`), so the vocabulary is identical wherever\ndatasets fan out. All string leaves are templates over the dataset:\n`${name}` (verbatim), `${name_snake}`, `${name_lower}`, and (where a\n`describe` step ran) `${field_names}`.",
+      "description": "**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.\n\nWhat each discovered dataset **emits** — shared by every discovery mechanism\n(`discovery.emit` and `odata.emit`), so the vocabulary is identical wherever\ndatasets fan out. All string leaves are templates over the dataset:\n`${name}` (verbatim), `${name_snake}`, `${name_lower}`, and (where a\n`describe` step ran) `${field_names}`.",
       "type": "object",
       "properties": {
         "config": {
@@ -18772,7 +18772,7 @@
       "additionalProperties": true
     },
     "source_rest__PartitionSpec": {
-      "description": "Key-range partitioned extraction of a paged dataset (`odata.partition`):\ntile the dataset's integer primary-key space into contiguous ranges and\nfetch them concurrently. Range planning is\n[`faucet_core::shard::plan_pk_shards`] — the same primitive the SQL sources\nshard with, including its unbounded first/last ranges (rows inserted below\nMIN / above MAX during the run are still read).",
+      "description": "**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.\n\nKey-range partitioned extraction of a paged dataset (`odata.partition`):\ntile the dataset's integer primary-key space into contiguous ranges and\nfetch them concurrently. Range planning is\n[`faucet_core::shard::plan_pk_shards`] — the same primitive the SQL sources\nshard with, including its unbounded first/last ranges (rows inserted below\nMIN / above MAX during the run are still read).",
       "type": "object",
       "properties": {
         "objects": {
@@ -18813,7 +18813,7 @@
       "additionalProperties": true
     },
     "source_rest__DiscoverySpec": {
-      "description": "A generic discovery recipe on a REST source.",
+      "description": "A generic discovery recipe on a REST source.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
       "type": "object",
       "properties": {
         "list": {

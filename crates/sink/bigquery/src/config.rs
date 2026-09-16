@@ -66,6 +66,9 @@ pub struct BigQuerySinkConfig {
     /// schema is managed externally and a missing table signals a typo).
     #[serde(default = "default_create_table")]
     pub create_table: bool,
+    /// **Experimental** (PRINCIPLES.md §3): this field may change shape in a
+    /// minor release; changes are called out in the changelog.
+    ///
     /// Explicit column schema, in the `infer_schema` JSON-Schema shape
     /// (`{"type":"object","properties":{"col":{"type":"integer"}, …}}`). When
     /// set it is used **verbatim** for the `media_load` load job (so BigQuery

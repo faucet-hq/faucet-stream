@@ -359,6 +359,9 @@ pub struct ODataConfig {
     pub page_size: Option<usize>,
 
     // ── Run-time fan-out over entity sets ─────────────────────────────────────────
+    /// **Experimental** (PRINCIPLES.md §3): the fan-out key group may change
+    /// shape in a minor release; changes are called out in the changelog.
+    ///
     /// Fan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the
     /// [`objects`](Self::objects) list into one matrix row per entity set (each
     /// with its `odata.entity` selected and its sink `table_id` rendered from
@@ -391,6 +394,9 @@ pub struct ODataConfig {
     pub partition: Option<PartitionSpec>,
 }
 
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
+///
 /// What each discovered dataset **emits** — shared by every discovery mechanism
 /// (`discovery.emit` and `odata.emit`), so the vocabulary is identical wherever
 /// datasets fan out. All string leaves are templates over the dataset:
@@ -429,6 +435,9 @@ pub const RANGES_PER_WORKER: usize = 4;
 /// requests outweigh the skew benefit.
 pub const MAX_PARTITION_COUNT: usize = 256;
 
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
+///
 /// Key-range partitioned extraction of a paged dataset (`odata.partition`):
 /// tile the dataset's integer primary-key space into contiguous ranges and
 /// fetch them concurrently. Range planning is
