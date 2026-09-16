@@ -573,9 +573,13 @@ jobs:
   # trait surface would silently break every external `faucet-source-*` /
   # `faucet-sink-*`. cargo-semver-checks compares this revision's public API
   # against the version last published to crates.io and fails on any breaking
-  # change; the only sanctioned way past it is bumping the crate's major version
-  # (which moves the baseline). Additive changes (new defaulted trait methods,
-  # new items) are a minor bump and pass. See CONTRIBUTING.md.
+  # change. Two sanctioned ways past it: bump the crate's major version (moves
+  # the baseline), or — for additive evolution of config/data types — the
+  # declared contract in `[package.metadata.cargo-semver-checks.lints]`
+  # (struct-literal construction / exhaustive matching are not part of the
+  # stability surface; construct via serde, `new()`/`Default`, or builders).
+  # Additive changes (new defaulted trait methods, new items) are a minor bump
+  # and pass. See CONTRIBUTING.md.
   semver-checks:
     name: API stability (cargo-semver-checks)
     runs-on: ubuntu-latest

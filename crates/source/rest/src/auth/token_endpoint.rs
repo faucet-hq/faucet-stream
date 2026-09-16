@@ -91,9 +91,43 @@ impl TokenEndpointCache {
         *self.0.lock().await = None;
     }
 
-    /// Return a valid cached token or fetch a new one from the endpoint.
+    /// Return a valid cached token or fetch a new one from the endpoint, with a
+    /// JSON request body (the pre-`encoding` behavior). Kept signature-stable for
+    /// existing callers; use
+    /// [`get_or_refresh_with_encoding`](Self::get_or_refresh_with_encoding) to
+    /// pick the body encoding.
     #[allow(clippy::too_many_arguments)]
     pub async fn get_or_refresh(
+        &self,
+        client: &Client,
+        url: &str,
+        method: &reqwest::Method,
+        headers: &HeaderMap,
+        body: Option<&Value>,
+        token_path: &str,
+        expiry_path: Option<&str>,
+        expiry_ratio: f64,
+        response_validator: Option<&ResponseValidator>,
+    ) -> Result<String, FaucetError> {
+        self.get_or_refresh_with_encoding(
+            client,
+            url,
+            method,
+            headers,
+            body,
+            token_path,
+            expiry_path,
+            expiry_ratio,
+            TokenBodyEncoding::Json,
+            response_validator,
+        )
+        .await
+    }
+
+    /// Return a valid cached token or fetch a new one from the endpoint, using
+    /// the given request-body [`TokenBodyEncoding`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_or_refresh_with_encoding(
         &self,
         client: &Client,
         url: &str,
@@ -518,7 +552,7 @@ mod tests {
             "grant_type": "refresh_token", "client_id": "abc", "refresh_token": "r"
         });
         let token = cache
-            .get_or_refresh(
+            .get_or_refresh_with_encoding(
                 &client,
                 &format!("{}/token", server.uri()),
                 &reqwest::Method::POST,
@@ -550,7 +584,7 @@ mod tests {
         let client = Client::new();
         let body = json!({"grant_type": "refresh_token"});
         let token = cache
-            .get_or_refresh(
+            .get_or_refresh_with_encoding(
                 &client,
                 &format!("{}/token", server.uri()),
                 &reqwest::Method::POST,

@@ -1,6 +1,6 @@
 [package]
 name = "faucet-source-rest"
-version = "2.0.0"
+version = "1.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -84,3 +84,14 @@ faucet-conformance.workspace = true
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+# ── API-evolution contract ────────────────────────────────────────────────────
+# Additive evolution is a MINOR bump by policy: struct-literal construction and
+# exhaustive matching of config/data types are NOT part of this crate's
+# stability surface — construct via serde deserialization, `new()`/`Default`,
+# or builders, and match with a `_` arm. cargo-semver-checks honors this
+# declared contract below, so adding an optional field never forces a major.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

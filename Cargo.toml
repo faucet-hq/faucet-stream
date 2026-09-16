@@ -116,7 +116,7 @@ categories = ["database", "asynchronous"]
 
 [workspace.dependencies]
 # Internal crates
-faucet-core = { path = "crates/core", version = "2" }
+faucet-core = { path = "crates/core", version = "1" }
 faucet-auth = { path = "crates/auth", version = "1" }
 faucet-lineage = { path = "crates/lineage", version = "2" }
 faucet-common-bigquery = { path = "crates/common/bigquery", version = "1" }
@@ -128,7 +128,7 @@ faucet-common-snowflake = { path = "crates/common/snowflake", version = "1" }
 faucet-common-spanner = { path = "crates/common/spanner", version = "1" }
 faucet-common-mssql = { path = "crates/common/mssql", version = "1" }
 faucet-common-delta = { path = "crates/common/delta", version = "1" }
-faucet-source-rest = { path = "crates/source/rest", version = "2" }
+faucet-source-rest = { path = "crates/source/rest", version = "1" }
 faucet-source-singer = { path = "crates/source/singer", version = "1" }
 # Path-only on purpose: faucet-conformance is a test battery consumed only as
 # a dev-dependency; a versioned entry would make dependents' `cargo publish`
@@ -139,7 +139,7 @@ faucet-source-xml = { path = "crates/source/xml", version = "1" }
 faucet-source-grpc = { path = "crates/source/grpc", version = "1" }
 faucet-source-kafka = { path = "crates/source/kafka", version = "1" }
 faucet-source-kinesis = { path = "crates/source/kinesis", version = "1" }
-faucet-sink-bigquery = { path = "crates/sink/bigquery", version = "2" }
+faucet-sink-bigquery = { path = "crates/sink/bigquery", version = "1" }
 faucet-sink-postgres = { path = "crates/sink/postgres", version = "1" }
 faucet-sink-jsonl = { path = "crates/sink/jsonl", version = "1" }
 faucet-sink-snowflake = { path = "crates/sink/snowflake", version = "1" }

@@ -1540,7 +1540,7 @@ impl RestStream {
                 }) => {
                     let token = self
                         .token_endpoint_cache
-                        .get_or_refresh(
+                        .get_or_refresh_with_encoding(
                             &self.client,
                             token_url,
                             token_method,
@@ -1704,7 +1704,7 @@ impl RestStream {
                 }) => {
                     let token = self
                         .token_endpoint_cache
-                        .get_or_refresh(
+                        .get_or_refresh_with_encoding(
                             &self.client,
                             token_url,
                             token_method,

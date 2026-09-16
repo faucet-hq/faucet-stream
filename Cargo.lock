@@ -4550,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-core"
-version = "2.0.0"
+version = "1.13.0"
 dependencies = [
  "aes-gcm 0.11.0",
  "arrow",
@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-bigquery"
-version = "2.0.0"
+version = "1.8.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5784,7 +5784,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-rest"
-version = "2.0.0"
+version = "1.7.0"
 dependencies = [
  "async-stream",
  "async-trait",
