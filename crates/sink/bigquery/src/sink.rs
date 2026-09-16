@@ -51,28 +51,39 @@ fn is_table_not_found(err: &BQError) -> bool {
 /// Max attempts (including the first) for a transient BigQuery control-plane call.
 const BQ_CP_ATTEMPTS: u32 = 4;
 
-/// A transient BigQuery control-plane failure worth retrying: connection-level
-/// blips (the client surfaces these as `Hyper Connect`/`SendRequest` /
-/// "Connection failure" / "error decoding response body") and 5xx. `tables.get`
-/// and the DDL/`jobs.query` calls are idempotent, so a blind retry is safe.
+/// A transient BigQuery control-plane failure worth retrying, classified
+/// **typed-only** (never by matching error-message text — messages are not API
+/// and change under dependency bumps): a 429/5xx response status, or a
+/// transport-level `reqwest` failure (connect / timeout / mid-body drop).
+/// `tables.get` and the DDL/`jobs.query` calls are idempotent, so a blind retry
+/// is safe.
 fn is_transient_bq_error(err: &BQError) -> bool {
-    if let BQError::ResponseError { error } = err {
-        return matches!(error.error.code, 500 | 502 | 503 | 504);
+    match err {
+        BQError::ResponseError { error } => {
+            matches!(error.error.code, 429 | 500 | 502 | 503 | 504)
+        }
+        BQError::RequestError(e) => match e.status() {
+            // A status error that leaked through as a reqwest error.
+            Some(s) => s.is_server_error() || s.as_u16() == 429,
+            // No status ⇒ transport-level: connection, timeout, send/receive,
+            // or a response body cut off mid-decode.
+            None => {
+                e.is_connect() || e.is_timeout() || e.is_request() || e.is_body() || e.is_decode()
+            }
+        },
+        _ => false,
     }
-    let s = err.to_string();
-    s.contains("Connection failure")
-        || s.contains("SendRequest")
-        || s.contains("Connect")
-        || s.contains("error decoding response body")
-        || s.contains("connection closed")
-        || s.contains("timed out")
-        || s.contains("timeout")
 }
 
 /// Retry a BigQuery control-plane call on [`is_transient_bq_error`], with
 /// exponential backoff (500ms → 8s cap). Without this a transient connection
 /// blip fails the whole object — or, for the pre-write overwrite DDL, aborts the
 /// entire run.
+///
+/// Deliberately a local runner rather than `faucet_core::retry`: the core runner
+/// is typed over `FaucetError`, and these call sites need the **typed
+/// `BQError`** after retrying (e.g. `tables.get` 404 → "table absent", a
+/// legitimate `Ok(None)` outcome, not a failure).
 async fn retry_control_plane<F, Fut, T>(what: &str, mut call: F) -> Result<T, BQError>
 where
     F: FnMut() -> Fut,

@@ -24,11 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
-/// Reserved partition-context key carrying one key-range's OData `$filter` clause
-/// (#479). Injected per range by `stream_pages` and ANDed into the first request's
-/// `$filter`; `@odata.nextLink` preserves it on subsequent pages.
-const KEY_RANGE_FILTER_CTX: &str = "__odata_key_filter";
-
 /// A configured REST API stream that handles pagination, auth, and extraction.
 pub struct RestStream {
     config: RestStreamConfig,
@@ -71,6 +66,10 @@ pub struct RestStream {
     /// (data pages, async-job requests, `$metadata` probes) *before* the auth
     /// provider's placements — so an auth header of the same name wins.
     static_headers: HeaderMap,
+    /// The service `$metadata` CSDL, fetched lazily at most once per instance
+    /// (see [`metadata_xml`](Self::metadata_xml)). Instance-owned by design —
+    /// no process-global cache state.
+    metadata_xml_cache: tokio::sync::OnceCell<Arc<String>>,
 }
 
 /// Default value of [`RestStreamConfig::max_retries`]. When the user leaves this
@@ -442,6 +441,7 @@ impl RestStream {
             now_override: None,
             retry_policy,
             static_headers,
+            metadata_xml_cache: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -617,7 +617,7 @@ impl RestStream {
     pub fn stream_pages(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + '_>> {
-        let mut inner = self.stream_pages_inner(None);
+        let mut inner = self.stream_pages_inner(None, None);
         Box::pin(async_stream::try_stream! {
             loop {
                 let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
@@ -667,6 +667,7 @@ impl RestStream {
     fn stream_pages_inner(
         &self,
         context: Option<&HashMap<String, Value>>,
+        range_filter: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
         // Clone the context into an owned map so it can live inside the
         // `async_stream` generator without borrowing from the caller.
@@ -841,14 +842,10 @@ impl RestStream {
                     let mut params = self.config.query_params.clone();
                     self.config.pagination.apply_params(&mut params, &state);
 
-                    // Key-range partition filter (#479): the first request of a
-                    // range carries the half-open PK `$filter`; `@odata.nextLink`
+                    // Key-range partition filter: the first request of a range
+                    // carries the half-open PK `$filter`; `@odata.nextLink`
                     // preserves it on every subsequent page, so it is applied once.
-                    if let Some(ctx) = owned_context.as_ref()
-                        && let Some(range_filter) = ctx
-                            .get(KEY_RANGE_FILTER_CTX)
-                            .and_then(|v| v.as_str())
-                    {
+                    if let Some(range_filter) = range_filter.as_deref() {
                         let combined = match params.get("$filter") {
                             Some(existing) if !existing.is_empty() => {
                                 format!("({existing}) and {range_filter}")
@@ -1044,7 +1041,7 @@ impl RestStream {
     ) -> Result<Vec<Value>, FaucetError> {
         let mut all_records = Vec::new();
         let mut pages_fetched = 0usize;
-        let mut pages = self.stream_pages_inner(context);
+        let mut pages = self.stream_pages_inner(context, None);
 
         // Poll the stream without requiring StreamExt (avoids extra dependency).
         loop {
@@ -2187,7 +2184,8 @@ impl faucet_core::Source for RestStream {
             .config
             .odata
             .as_ref()
-            .and_then(|o| o.partition_key.clone())
+            .and_then(|o| o.partition.as_ref())
+            .and_then(|p| p.key.clone())
         {
             return self.stream_key_range_partitions(context, key);
         }
@@ -2197,7 +2195,7 @@ impl faucet_core::Source for RestStream {
         // (the pipeline drives this method). Any parent `context` is merged into
         // each partition context, exactly as `fetch_with_context` does.
         if self.config.partitions.is_empty() {
-            return self.stream_pages_inner(Some(context));
+            return self.stream_pages_inner(Some(context), None);
         }
         let contexts: Vec<HashMap<String, Value>> = self
             .config
@@ -2216,7 +2214,7 @@ impl faucet_core::Source for RestStream {
             // mark rather than whichever partition happened to finish last.
             let mut max_bookmark: Option<Value> = None;
             for ctx in &contexts {
-                let mut inner = self.stream_pages_inner(Some(ctx));
+                let mut inner = self.stream_pages_inner(Some(ctx), None);
                 loop {
                     let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
                     match page {
@@ -2363,19 +2361,24 @@ impl faucet_core::Source for RestStream {
                     .into(),
             ));
         };
-        // Explicit object list (run-time fan-out): one descriptor per entity, one
-        // sink table `{table_prefix}{snake(entity)}`. Type each entity's columns
-        // from the service `$metadata` (authoritative EDM types → the sink declares
-        // the real column types instead of autodetecting and rejecting a row that
-        // doesn't fit the guessed type). `$metadata` is a single monolithic CSDL
-        // for the whole service, so it cannot be scoped to the synced entities and
-        // some services (D365 F&O) regenerate ~50 MB on every call — hence it is
-        // fetched once and cached per base URL (see `cached_metadata_xml`); we
-        // still parse out only the requested entities. On any `$metadata` failure,
-        // fall back to untyped descriptors (sink autodetect) so the run proceeds.
+        // Explicit object list (run-time fan-out): one descriptor per entity, its
+        // sink `table_id` rendered from `emit.table_id` (default `${name_snake}`).
+        // Type each entity's columns from the service `$metadata` (authoritative
+        // EDM types → the sink declares the real column types instead of
+        // autodetecting and rejecting a row that doesn't fit the guessed type).
+        // `$metadata` is a single monolithic CSDL for the whole service, so it
+        // cannot be scoped to the synced entities and some services regenerate
+        // tens of MB on every call — hence it is fetched once per source instance
+        // (see `metadata_xml`); only the requested entities are parsed out. On any
+        // `$metadata` failure, fall back to untyped descriptors (sink autodetect)
+        // so the run proceeds.
         if !odata.objects.is_empty() {
-            let prefix = odata.table_prefix.as_deref().unwrap_or("");
-            let xml = match self.cached_metadata_xml().await {
+            let table_template = odata
+                .emit
+                .as_ref()
+                .and_then(|e| e.table_id.as_deref())
+                .unwrap_or("${name_snake}");
+            let xml = match self.metadata_xml().await {
                 Ok(xml) => xml,
                 Err(e) => {
                     tracing::warn!(
@@ -2384,23 +2387,23 @@ impl faucet_core::Source for RestStream {
                     );
                     return Ok(crate::odata::descriptors_from_objects(
                         &odata.objects,
-                        prefix,
+                        table_template,
                     ));
                 }
             };
-            let mut descs =
-                crate::odata::descriptors_from_edmx_for_objects(&xml, &odata.objects, prefix)?;
-            // Key-range partitioning opt-in (#479): for each entity in
-            // `partitioned_objects` whose `$metadata` declares a single integer key,
-            // stamp the partition config onto its source `config_patch` so the run
-            // tiles it concurrently. Entities without a single int key (or absent
-            // from `$metadata`) are left to extract sequentially.
-            if !odata.partitioned_objects.is_empty() {
-                let targets: std::collections::HashSet<&str> = odata
-                    .partitioned_objects
-                    .iter()
-                    .map(String::as_str)
-                    .collect();
+            let mut descs = crate::odata::descriptors_from_edmx_for_objects(
+                &xml,
+                &odata.objects,
+                table_template,
+            )?;
+            // Key-range partitioning opt-in: for each entity in `partition.objects`
+            // whose `$metadata` declares a single integer key, stamp a resolved
+            // `partition` block onto its source `config_patch` so the run tiles it
+            // concurrently. Entities without a single int key (or absent from
+            // `$metadata`) are left to extract sequentially.
+            if let Some(partition) = odata.partition.as_ref().filter(|p| !p.objects.is_empty()) {
+                let targets: std::collections::HashSet<&str> =
+                    partition.objects.iter().map(String::as_str).collect();
                 for d in &mut descs {
                     if !targets.contains(d.name.as_str()) {
                         continue;
@@ -2412,18 +2415,23 @@ impl faucet_core::Source for RestStream {
                                 .get_mut("odata")
                                 .and_then(Value::as_object_mut)
                             {
-                                o.insert("partition_key".into(), Value::String(key));
-                                if let Some(w) = odata.partition_workers {
-                                    o.insert("partition_workers".into(), serde_json::json!(w));
+                                // Per-entity resolved block: the key is concrete;
+                                // workers/count carry over only when set (the
+                                // row's `PartitionSpec` applies the defaults).
+                                let mut block = serde_json::Map::new();
+                                block.insert("key".into(), Value::String(key));
+                                if let Some(w) = partition.workers {
+                                    block.insert("workers".into(), serde_json::json!(w));
                                 }
-                                if let Some(c) = odata.partition_count {
-                                    o.insert("partition_count".into(), serde_json::json!(c));
+                                if let Some(c) = partition.count {
+                                    block.insert("count".into(), serde_json::json!(c));
                                 }
+                                o.insert("partition".into(), Value::Object(block));
                             }
                         }
                         None => tracing::warn!(
                             entity = %d.name,
-                            "partitioned_objects entity has no single integer key; \
+                            "partition.objects entity has no single integer key; \
                              extracting sequentially"
                         ),
                     }
@@ -2476,25 +2484,22 @@ impl RestStream {
             .map_err(|e| FaucetError::Source(format!("rest: {what} returned invalid JSON: {e}")))
     }
 
-    /// The service `$metadata` CSDL for this source's `base_url`, fetched once and
-    /// cached process-wide. D365 F&O regenerates a ~50 MB document (~3.5 min) on
-    /// every call and it cannot be scoped to a subset of entities, so caching turns
-    /// a per-submit cost into a one-time-per-process cost; the schema is stable
-    /// across a run's lifetime. Keyed by `base_url` so distinct services don't
-    /// collide. The lock is never held across the network await.
-    async fn cached_metadata_xml(&self) -> Result<std::sync::Arc<String>, FaucetError> {
-        static CACHE: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<String>>>,
-        > = std::sync::OnceLock::new();
-        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let base = self.config.base_url.trim_end_matches('/').to_string();
-        if let Some(hit) = cache.lock().unwrap().get(&base).cloned() {
-            return Ok(hit);
-        }
-        let url = format!("{base}/$metadata");
-        let xml = std::sync::Arc::new(self.discover_get_text(&url, "OData $metadata").await?);
-        cache.lock().unwrap().insert(base, xml.clone());
-        Ok(xml)
+    /// The service `$metadata` CSDL, fetched at most once **per source instance**
+    /// (an instance serves one `base_url`). Some services regenerate a very large
+    /// CSDL on every call and it cannot be scoped to a subset of entities, so one
+    /// fan-out/discover shares a single fetch. Deliberately instance-owned rather
+    /// than process-global: no hidden cross-pipeline state, testable, and dropped
+    /// with the source.
+    async fn metadata_xml(&self) -> Result<Arc<String>, FaucetError> {
+        self.metadata_xml_cache
+            .get_or_try_init(|| async {
+                let url = format!("{}/$metadata", self.config.base_url.trim_end_matches('/'));
+                Ok(Arc::new(
+                    self.discover_get_text(&url, "OData $metadata").await?,
+                ))
+            })
+            .await
+            .cloned()
     }
 
     /// Discover the inclusive `(min, max)` of an integer primary key for key-range
@@ -2558,11 +2563,14 @@ impl RestStream {
         Ok(Some((bounds[0], bounds[1])))
     }
 
-    /// Stream an OData entity as concurrent key-range tiles (#479): discover the
-    /// PK's min/max, tile `[min, max]` into `partition_count` half-open ranges, and
-    /// page each range's `$filter` concurrently (bounded by `partition_workers`).
-    /// Ranges are intra-run only — never bookmarked; every run re-tiles. An empty
-    /// entity yields nothing.
+    /// Stream an OData entity as concurrent key-range tiles: discover the key's
+    /// min/max, plan contiguous ranges with the shared
+    /// [`faucet_core::shard::plan_pk_shards`] primitive (i128-width math — a
+    /// full-range i64 key cannot overflow — and unbounded first/last ranges so
+    /// rows inserted outside `[MIN, MAX]` mid-run are still read), and page each
+    /// range's `$filter` concurrently, bounded by `partition.workers`. Ranges are
+    /// intra-run only — never bookmarked; every run re-tiles. An empty entity
+    /// yields nothing.
     fn stream_key_range_partitions<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
@@ -2570,32 +2578,28 @@ impl RestStream {
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
         use futures::StreamExt as _;
         let odata = self.config.odata.as_ref().expect("odata configured");
+        let partition = odata.partition.as_ref().expect("partition configured");
         let entity = odata.entity.clone().unwrap_or_default();
-        let workers = odata.resolved_partition_workers();
-        let count = odata.resolved_partition_count();
+        let workers = partition.resolved_workers();
+        let count = partition.resolved_count();
         let parent = context.clone();
         Box::pin(async_stream::try_stream! {
             let Some((low, high)) = self.discover_key_bounds(&entity, &key).await? else {
                 return; // empty entity → no rows
             };
-            let ranges = crate::odata::build_key_ranges(low, high + 1, count);
+            let shards = faucet_core::shard::plan_pk_shards(&key, low, high, count);
             tracing::info!(
                 entity = %entity, key = %key, low, high,
-                ranges = ranges.len(), workers,
+                ranges = shards.len(), workers,
                 "OData key-range partitioned extraction"
             );
             // One filtered page-stream per range; poll up to `workers` concurrently.
-            // `stream_pages_inner` clones the context, so each returned stream
-            // borrows only `self` — the per-range `ctx` may drop immediately.
-            let streams: Vec<_> = ranges
-                .into_iter()
-                .map(|(lo, hi)| {
-                    let mut ctx = parent.clone();
-                    ctx.insert(
-                        KEY_RANGE_FILTER_CTX.to_string(),
-                        Value::String(crate::odata::key_range_filter(&key, lo, hi)),
-                    );
-                    self.stream_pages_inner(Some(&ctx))
+            let streams: Vec<_> = shards
+                .iter()
+                .filter_map(faucet_core::shard::PkShardBounds::from_spec)
+                .map(|bounds| {
+                    let filter = crate::odata::key_range_filter(&bounds);
+                    self.stream_pages_inner(Some(&parent), filter)
                 })
                 .collect();
             let mut merged = futures::stream::iter(streams).flatten_unordered(workers);

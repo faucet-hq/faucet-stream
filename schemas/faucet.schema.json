@@ -18807,7 +18807,7 @@
           "minimum": 0
         },
         "fan_out": {
-          "description": "Fan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the\n[`objects`](Self::objects) list into one matrix row per entity set (each with\nits `odata.entity` selected and a `fno_`-style sink `table_id`), so one\ngeneric template with `objects: \"${param.objects}\"` syncs any entity set\npassed at trigger — no pre-generated matrix, no field discovery needed\n(OData returns every column by default). Default `false` (the block then\nonly affects a single-entity run / `faucet discover`).",
+          "description": "Fan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the\n[`objects`](Self::objects) list into one matrix row per entity set (each\nwith its `odata.entity` selected and its sink `table_id` rendered from\n[`emit`](Self::emit)), so one generic template with\n`objects: \"${param.objects}\"` syncs any entity set passed at trigger — no\npre-generated matrix, no field discovery needed (OData returns every column\nby default). Default `false` (the block then only affects a single-entity\nrun / `faucet discover`). Same key and semantics as `discovery.fan_out`.",
           "type": [
             "boolean",
             "string"
@@ -18815,59 +18815,33 @@
           "default": false
         },
         "objects": {
-          "description": "Entity sets to fan out over — a YAML list **or** a comma-separated string\n(so it can be driven by a single string run-param: `objects:\n\"${param.objects}\"`). Empty means fall back to `$metadata` discovery of\nevery declared entity set (`faucet discover`).",
+          "description": "Entity sets to select — a YAML list **or** a comma-separated string (so a\nsingle string run-param can drive it: `objects: \"${param.objects}\"`).\nEmpty means fall back to `$metadata` discovery of every declared entity\nset (`faucet discover`). Same key and semantics as `discovery.objects`.",
           "type": "array",
           "items": {
             "type": "string"
           }
         },
-        "sink_ref": {
-          "description": "Sink template (an entry under `pipeline.sinks`) each fanned-out entity\nroutes to. Only used with `fan_out: true`; when unset each entity routes to\nthe default (singular `pipeline.sink`) template with its `table_id` merged.",
-          "type": [
-            "string",
-            "null"
+        "emit": {
+          "description": "What each discovered/fanned-out entity emits (sink `table_id` template,\nsink routing, extra per-entity config). Same shape as `discovery.emit`.\nUnset ⇒ defaults (`table_id: \"${name_snake}\"`, the default sink).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__EmitSpec"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
-        "table_prefix": {
-          "description": "Prefix prepended to each fanned-out entity's snake_cased sink `table_id`\n(e.g. `\"fno_\"` → `MainAccountBiEntities` → `fno_main_account_bi_entities`).\nDefault empty (bare snake_case name). Only used with `fan_out: true`.",
-          "type": [
-            "string",
-            "null"
+        "partition": {
+          "description": "Key-range partitioned extraction: split large entities into contiguous\nprimary-key ranges fetched concurrently, instead of one sequential\n`@odata.nextLink` page walk. See [`PartitionSpec`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__PartitionSpec"
+            },
+            {
+              "type": "null"
+            }
           ]
-        },
-        "partitioned_objects": {
-          "description": "Entity sets to extract **concurrently across primary-key ranges** instead of\nsequentially — the fix for a huge entity whose `@odata.nextLink` paging is one\nslow request after another. Only meaningful with `fan_out: true`; at fan-out\neach listed entity whose `$metadata` declares a **single integer** key gets\nits [`partition_key`](Self::partition_key) set (others fall back to sequential).\nAccepts a YAML sequence or a comma-separated string (run-param friendly).",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "partition_key": {
-          "description": "Integer primary-key column this entity is range-split on. Normally derived\nfrom `$metadata` at fan-out for a [`partitioned_objects`](Self::partitioned_objects)\nentity; may be set explicitly for a single-entity run. When set, the source\ndiscovers the key's min/max, tiles the range, and fetches the tiles concurrently.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "partition_workers": {
-          "description": "Concurrent range readers per partitioned entity. Default 4; capped at 64.\nReaders share the source's D365 throttling quota and OData scales sublinearly\nwith concurrency, but measurably past the reference tap's self-imposed cap of\n8 (≈1.67× the throughput at 16) — so faucet lets you exceed it. The cap keeps\na typo from spawning thousands of tasks.",
-          "type": [
-            "integer",
-            "null",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "partition_count": {
-          "description": "Number of key ranges to tile the key space into. Default is `partition_workers × 4`.",
-          "type": [
-            "integer",
-            "null",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0
         }
       },
       "additionalProperties": true
@@ -19978,23 +19952,16 @@
           ]
         },
         "emit": {
-          "description": "Step 3 — what each discovered dataset emits (the source `config_patch`\nthat selects it, and an optional sink `table_id`). Templated.",
-          "$ref": "#/$defs/source_rest__DiscoveryEmit"
+          "description": "Step 3 — what each discovered dataset emits (the source `config_patch`\nthat selects it, an optional sink `table_id` template, and sink routing).\nShared shape with `odata.emit` ([`EmitSpec`](crate::config::EmitSpec));\n`emit.config` is required here — it is what selects the dataset.",
+          "$ref": "#/$defs/source_rest__EmitSpec"
         },
         "fan_out": {
-          "description": "Fan out **at run time**: `faucet run` / `serve` turn the discovered\ndatasets into one matrix row each, before `expand`. Default `false`\n(the block then only powers `faucet discover`).",
+          "description": "Fan out **at run time**: `faucet run` / `serve` turn the discovered\ndatasets into one matrix row each, before `expand`. Default `false`\n(the block then only powers `faucet discover`). Same key and semantics\nas `odata.fan_out`.",
           "type": [
             "boolean",
             "string"
           ],
           "default": false
-        },
-        "sink_ref": {
-          "description": "Sink template each fanned-out dataset routes to (an entry under\n`pipeline.sinks`). Unset ⇒ the default (singular) sink, with `table_id`\nmerged in.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "additionalProperties": true
@@ -20097,19 +20064,67 @@
       },
       "additionalProperties": true
     },
-    "source_rest__DiscoveryEmit": {
-      "description": "Step 3 — per-dataset output, templated with `${name}`, `${name_snake}`, and\n`${field_names}` (the comma-joined selectable field list).",
+    "source_rest__EmitSpec": {
+      "description": "What each discovered dataset **emits** — shared by every discovery mechanism\n(`discovery.emit` and `odata.emit`), so the vocabulary is identical wherever\ndatasets fan out. All string leaves are templates over the dataset:\n`${name}` (verbatim), `${name_snake}`, `${name_lower}`, and (where a\n`describe` step ran) `${field_names}`.",
       "type": "object",
       "properties": {
         "config": {
-          "description": "A JSON object deep-merged into the dataset's source config (e.g. the\n`async_job` query, or an `odata.entity`). Every string leaf is templated."
+          "description": "A JSON object deep-merged into the dataset's source config (e.g. an\n`async_job` query, or extra per-entity overrides). Every string leaf is\ntemplated. Optional for mechanisms whose selection patch is implicit\n(OData sets `odata.entity` itself)."
         },
         "table_id": {
-          "description": "Optional sink `table_id` template (e.g. `${name_snake}`).",
+          "description": "Sink `table_id` template (e.g. `\"raw_${name_snake}\"`). Rendered per\ndataset into the descriptor's `sink_patch`.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "sink_ref": {
+          "description": "Sink template (an entry under `pipeline.sinks`) each fanned-out dataset\nroutes to. Unset ⇒ the default (singular `pipeline.sink`) template, with\nthe rendered `table_id` merged in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__PartitionSpec": {
+      "description": "Key-range partitioned extraction of a paged dataset (`odata.partition`):\ntile the dataset's integer primary-key space into contiguous ranges and\nfetch them concurrently. Range planning is\n[`faucet_core::shard::plan_pk_shards`] — the same primitive the SQL sources\nshard with, including its unbounded first/last ranges (rows inserted below\nMIN / above MAX during the run are still read).",
+      "type": "object",
+      "properties": {
+        "objects": {
+          "description": "With `fan_out`: which datasets to partition (a YAML list or a\ncomma-separated string). Each listed dataset whose `$metadata` declares a\n**single integer** key partitions on it; others fall back to sequential\npaging. Empty on a single-entity run (where [`key`](Self::key) applies\ndirectly).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "key": {
+          "description": "Integer key column to range-split on. On the fan-out path this is derived\nfrom `$metadata` per dataset; set it explicitly for a single-entity run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workers": {
+          "description": "Concurrent range readers (default [`DEFAULT_PARTITION_WORKERS`], clamped\nto [`MAX_PARTITION_WORKERS`]).",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "count": {
+          "description": "Number of ranges to tile into (default `workers ×`\n[`RANGES_PER_WORKER`], clamped to [`MAX_PARTITION_COUNT`]).",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       },
       "additionalProperties": true

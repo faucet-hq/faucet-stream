@@ -62,7 +62,7 @@ zip = { workspace = true }  # unzip decode step (#515)
 csv-async = { workspace = true }
 calamine = { workspace = true, optional = true }
 chrono = { workspace = true }  # datetime window slicing (#527): now-clock + RFC3339 boundaries
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "sync"] }
 base64 = "0.22"
 httpdate = "1"
 tracing.workspace = true

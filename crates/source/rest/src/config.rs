@@ -358,81 +358,126 @@ pub struct ODataConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
 
-    // ── Run-time fan-out over entity sets (#647-family, OData) ───────────────────
+    // ── Run-time fan-out over entity sets ─────────────────────────────────────────
     /// Fan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the
-    /// [`objects`](Self::objects) list into one matrix row per entity set (each with
-    /// its `odata.entity` selected and a `fno_`-style sink `table_id`), so one
-    /// generic template with `objects: "${param.objects}"` syncs any entity set
-    /// passed at trigger — no pre-generated matrix, no field discovery needed
-    /// (OData returns every column by default). Default `false` (the block then
-    /// only affects a single-entity run / `faucet discover`).
+    /// [`objects`](Self::objects) list into one matrix row per entity set (each
+    /// with its `odata.entity` selected and its sink `table_id` rendered from
+    /// [`emit`](Self::emit)), so one generic template with
+    /// `objects: "${param.objects}"` syncs any entity set passed at trigger — no
+    /// pre-generated matrix, no field discovery needed (OData returns every column
+    /// by default). Default `false` (the block then only affects a single-entity
+    /// run / `faucet discover`). Same key and semantics as `discovery.fan_out`.
     #[serde(default)]
     pub fan_out: bool,
-    /// Entity sets to fan out over — a YAML list **or** a comma-separated string
-    /// (so it can be driven by a single string run-param: `objects:
-    /// "${param.objects}"`). Empty means fall back to `$metadata` discovery of
-    /// every declared entity set (`faucet discover`).
+    /// Entity sets to select — a YAML list **or** a comma-separated string (so a
+    /// single string run-param can drive it: `objects: "${param.objects}"`).
+    /// Empty means fall back to `$metadata` discovery of every declared entity
+    /// set (`faucet discover`). Same key and semantics as `discovery.objects`.
     #[serde(
         default,
         deserialize_with = "de_objects",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub objects: Vec<String>,
-    /// Sink template (an entry under `pipeline.sinks`) each fanned-out entity
-    /// routes to. Only used with `fan_out: true`; when unset each entity routes to
-    /// the default (singular `pipeline.sink`) template with its `table_id` merged.
+    /// What each discovered/fanned-out entity emits (sink `table_id` template,
+    /// sink routing, extra per-entity config). Same shape as `discovery.emit`.
+    /// Unset ⇒ defaults (`table_id: "${name_snake}"`, the default sink).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emit: Option<EmitSpec>,
+    /// Key-range partitioned extraction: split large entities into contiguous
+    /// primary-key ranges fetched concurrently, instead of one sequential
+    /// `@odata.nextLink` page walk. See [`PartitionSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<PartitionSpec>,
+}
+
+/// What each discovered dataset **emits** — shared by every discovery mechanism
+/// (`discovery.emit` and `odata.emit`), so the vocabulary is identical wherever
+/// datasets fan out. All string leaves are templates over the dataset:
+/// `${name}` (verbatim), `${name_snake}`, `${name_lower}`, and (where a
+/// `describe` step ran) `${field_names}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EmitSpec {
+    /// A JSON object deep-merged into the dataset's source config (e.g. an
+    /// `async_job` query, or extra per-entity overrides). Every string leaf is
+    /// templated. Optional for mechanisms whose selection patch is implicit
+    /// (OData sets `odata.entity` itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+    /// Sink `table_id` template (e.g. `"raw_${name_snake}"`). Rendered per
+    /// dataset into the descriptor's `sink_patch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_id: Option<String>,
+    /// Sink template (an entry under `pipeline.sinks`) each fanned-out dataset
+    /// routes to. Unset ⇒ the default (singular `pipeline.sink`) template, with
+    /// the rendered `table_id` merged in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_ref: Option<String>,
-    /// Prefix prepended to each fanned-out entity's snake_cased sink `table_id`
-    /// (e.g. `"fno_"` → `MainAccountBiEntities` → `fno_main_account_bi_entities`).
-    /// Default empty (bare snake_case name). Only used with `fan_out: true`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub table_prefix: Option<String>,
+}
 
-    // ── Key-range partitioned extraction (#479, OData) ───────────────────────────
-    /// Entity sets to extract **concurrently across primary-key ranges** instead of
-    /// sequentially — the fix for a huge entity whose `@odata.nextLink` paging is one
-    /// slow request after another. Only meaningful with `fan_out: true`; at fan-out
-    /// each listed entity whose `$metadata` declares a **single integer** key gets
-    /// its [`partition_key`](Self::partition_key) set (others fall back to sequential).
-    /// Accepts a YAML sequence or a comma-separated string (run-param friendly).
+/// Default concurrent range readers per partitioned dataset — conservative
+/// because all readers share the source's request quota.
+pub const DEFAULT_PARTITION_WORKERS: usize = 4;
+/// Upper clamp on range readers: concurrency gains are sublinear and a typo
+/// (`workers: 6400`) must not spawn thousands of tasks against one API.
+pub const MAX_PARTITION_WORKERS: usize = 64;
+/// Default ranges per worker: over-tiling (×4) gives early-finishing workers
+/// more ranges to pick up, smoothing key-space skew.
+pub const RANGES_PER_WORKER: usize = 4;
+/// Upper clamp on the number of ranges — beyond this the per-range bound
+/// requests outweigh the skew benefit.
+pub const MAX_PARTITION_COUNT: usize = 256;
+
+/// Key-range partitioned extraction of a paged dataset (`odata.partition`):
+/// tile the dataset's integer primary-key space into contiguous ranges and
+/// fetch them concurrently. Range planning is
+/// [`faucet_core::shard::plan_pk_shards`] — the same primitive the SQL sources
+/// shard with, including its unbounded first/last ranges (rows inserted below
+/// MIN / above MAX during the run are still read).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionSpec {
+    /// With `fan_out`: which datasets to partition (a YAML list or a
+    /// comma-separated string). Each listed dataset whose `$metadata` declares a
+    /// **single integer** key partitions on it; others fall back to sequential
+    /// paging. Empty on a single-entity run (where [`key`](Self::key) applies
+    /// directly).
     #[serde(
         default,
         deserialize_with = "de_objects",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub partitioned_objects: Vec<String>,
-    /// Integer primary-key column this entity is range-split on. Normally derived
-    /// from `$metadata` at fan-out for a [`partitioned_objects`](Self::partitioned_objects)
-    /// entity; may be set explicitly for a single-entity run. When set, the source
-    /// discovers the key's min/max, tiles the range, and fetches the tiles concurrently.
+    pub objects: Vec<String>,
+    /// Integer key column to range-split on. On the fan-out path this is derived
+    /// from `$metadata` per dataset; set it explicitly for a single-entity run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_key: Option<String>,
-    /// Concurrent range readers per partitioned entity. Default 4; capped at 64.
-    /// Readers share the source's D365 throttling quota and OData scales sublinearly
-    /// with concurrency, but measurably past the reference tap's self-imposed cap of
-    /// 8 (≈1.67× the throughput at 16) — so faucet lets you exceed it. The cap keeps
-    /// a typo from spawning thousands of tasks.
+    pub key: Option<String>,
+    /// Concurrent range readers (default [`DEFAULT_PARTITION_WORKERS`], clamped
+    /// to [`MAX_PARTITION_WORKERS`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_workers: Option<usize>,
-    /// Number of key ranges to tile the key space into. Default is `partition_workers × 4`.
+    pub workers: Option<usize>,
+    /// Number of ranges to tile into (default `workers ×`
+    /// [`RANGES_PER_WORKER`], clamped to [`MAX_PARTITION_COUNT`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_count: Option<usize>,
+    pub count: Option<usize>,
 }
 
-impl ODataConfig {
-    /// Concurrent range readers, clamped to `1..=64`. The reference tap self-caps at
-    /// 8; D365 keeps scaling (sublinearly) beyond that, so faucet allows more.
-    pub fn resolved_partition_workers(&self) -> usize {
-        self.partition_workers.unwrap_or(4).clamp(1, 64)
+impl PartitionSpec {
+    /// Concurrent range readers, clamped to `1..=`[`MAX_PARTITION_WORKERS`].
+    pub fn resolved_workers(&self) -> usize {
+        self.workers
+            .unwrap_or(DEFAULT_PARTITION_WORKERS)
+            .clamp(1, MAX_PARTITION_WORKERS)
     }
 
-    /// Number of key ranges to tile into (default `workers × 4`, capped at 256).
-    pub fn resolved_partition_count(&self) -> usize {
-        self.partition_count
+    /// Ranges to tile into (default `workers × `[`RANGES_PER_WORKER`], clamped
+    /// to [`MAX_PARTITION_COUNT`]).
+    pub fn resolved_count(&self) -> usize {
+        self.count
             .filter(|&n| n > 0)
-            .unwrap_or(self.resolved_partition_workers() * 4)
-            .min(256)
+            .unwrap_or(self.resolved_workers() * RANGES_PER_WORKER)
+            .min(MAX_PARTITION_COUNT)
     }
 }
 
@@ -1255,5 +1300,62 @@ mod tests {
             body_cursor_field: "after".into(),
         };
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn odata_fan_out_and_partition_blocks_deserialize_grouped() {
+        // The config surface is grouped by concept: `emit` (what each dataset
+        // produces) and `partition` (how a large dataset is range-split) are
+        // blocks, not flat sibling keys.
+        let raw = serde_json::json!({
+            "version": "v4",
+            "fan_out": true,
+            "objects": "Alpha,BetaV2",
+            "emit": { "table_id": "raw_${name_snake}", "sink_ref": "warehouse" },
+            "partition": { "objects": ["Alpha"], "workers": 24, "count": 96 }
+        });
+        let c: ODataConfig = serde_json::from_value(raw).unwrap();
+        assert!(c.fan_out);
+        assert_eq!(c.objects, vec!["Alpha".to_string(), "BetaV2".to_string()]);
+        let emit = c.emit.unwrap();
+        assert_eq!(emit.table_id.as_deref(), Some("raw_${name_snake}"));
+        assert_eq!(emit.sink_ref.as_deref(), Some("warehouse"));
+        let p = c.partition.unwrap();
+        assert_eq!(p.objects, vec!["Alpha".to_string()]);
+        assert_eq!(p.resolved_workers(), 24);
+        assert_eq!(p.resolved_count(), 96);
+    }
+
+    #[test]
+    fn partition_spec_defaults_and_clamps() {
+        let p = PartitionSpec::default();
+        assert_eq!(p.resolved_workers(), DEFAULT_PARTITION_WORKERS);
+        assert_eq!(
+            p.resolved_count(),
+            DEFAULT_PARTITION_WORKERS * RANGES_PER_WORKER
+        );
+        // A typo cannot spawn thousands of tasks: workers clamp to the cap and
+        // the range count clamps too.
+        let p = PartitionSpec {
+            workers: Some(6400),
+            count: Some(100_000),
+            ..Default::default()
+        };
+        assert_eq!(p.resolved_workers(), MAX_PARTITION_WORKERS);
+        assert_eq!(p.resolved_count(), MAX_PARTITION_COUNT);
+        // `count: 0` falls back to the derived default rather than zero ranges.
+        let p = PartitionSpec {
+            workers: Some(2),
+            count: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(p.resolved_count(), 2 * RANGES_PER_WORKER);
+    }
+
+    #[test]
+    fn odata_rejects_ungrouped_flat_partition_keys() {
+        // The old flat spelling must not silently deserialize.
+        let raw = serde_json::json!({ "partition_key": "SourceKey" });
+        assert!(serde_json::from_value::<ODataConfig>(raw).is_err());
     }
 }

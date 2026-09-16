@@ -47,7 +47,8 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
         ));
     }
     let sink_ref = fanout_block(&spec)
-        .and_then(|b| b.get("sink_ref"))
+        .and_then(|b| b.get("emit"))
+        .and_then(|e| e.get("sink_ref"))
         .and_then(Value::as_str)
         .map(str::to_string);
     cfg.matrix = descriptors_to_rows(&descriptors, &src_ref, sink_ref.as_deref())?;
@@ -60,7 +61,7 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
 }
 
 /// The block driving fan-out — a `discovery:` recipe or an `odata:` block —
-/// whichever carries `fan_out: true`. Returned so the caller can read `sink_ref`
+/// whichever carries `fan_out: true`. Returned so the caller can read `emit.sink_ref`
 /// from the same block that opted in.
 fn fanout_block(spec: &ConnectorSpec) -> Option<&Value> {
     for key in ["discovery", "odata"] {

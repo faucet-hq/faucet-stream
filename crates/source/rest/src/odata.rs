@@ -195,13 +195,17 @@ pub fn descriptors_from_edmx(xml: &str) -> Result<Vec<DatasetDescriptor>, Faucet
 /// list (the run-time fan-out path, #647-family). Unlike
 /// [`descriptors_from_edmx`], this needs no `$metadata` round-trip — OData
 /// `/data/<EntitySet>` returns every column by default, so there is no field
-/// list to discover. Each descriptor selects the entity and routes the sink to
-/// `<table_prefix><snake(entity)>` (e.g. `fno_main_account_bi_entities`).
-pub fn descriptors_from_objects(objects: &[String], table_prefix: &str) -> Vec<DatasetDescriptor> {
+/// list to discover. Each descriptor selects the entity and renders its sink
+/// `table_id` from `table_template` (`${name}`/`${name_snake}`/`${name_lower}`,
+/// e.g. `"raw_${name_snake}"`).
+pub fn descriptors_from_objects(
+    objects: &[String],
+    table_template: &str,
+) -> Vec<DatasetDescriptor> {
     objects
         .iter()
         .map(|entity| {
-            let table_id = format!("{table_prefix}{}", faucet_core::util::snake_case(entity));
+            let table_id = crate::discovery::render_template(table_template, entity, &[]);
             DatasetDescriptor::new(
                 entity.clone(),
                 "entity",
@@ -226,7 +230,7 @@ pub fn descriptors_from_objects(objects: &[String], table_prefix: &str) -> Vec<D
 pub fn descriptors_from_edmx_for_objects(
     xml: &str,
     objects: &[String],
-    table_prefix: &str,
+    table_template: &str,
 ) -> Result<Vec<DatasetDescriptor>, FaucetError> {
     let (types, sets) = parse_edmx(xml)?;
     let set_by_name: HashMap<&str, &EdmEntitySet> =
@@ -236,7 +240,7 @@ pub fn descriptors_from_edmx_for_objects(
 
     let mut out = Vec::with_capacity(objects.len());
     for obj in objects {
-        let table_id = format!("{table_prefix}{}", faucet_core::util::snake_case(obj));
+        let table_id = crate::discovery::render_template(table_template, obj, &[]);
         let mut sink_patch = json!({ "table_id": table_id });
         if let Some(set) = set_by_name.get(obj.as_str())
             && let Some(t) = type_by_name.get(set.type_name.as_str())
@@ -288,30 +292,21 @@ pub fn single_int_key_from_edmx(xml: &str, entity: &str) -> Option<String> {
     is_int.then(|| key.clone())
 }
 
-/// Tile the half-open key window `[low, high_exclusive)` into `count` contiguous
-/// integer ranges (no gap, no overlap; the remainder spread across the leading
-/// tiles). Returns empty for an empty window. Matches the tap's `build_key_ranges`.
-pub fn build_key_ranges(low: i64, high_exclusive: i64, count: usize) -> Vec<(i64, i64)> {
-    if high_exclusive <= low {
-        return Vec::new();
+/// Render one planned key range as an OData `$filter` clause. Range planning is
+/// [`faucet_core::shard::plan_pk_shards`] (the same primitive the SQL sources
+/// shard with — i128 width math, so full-range i64 keys cannot overflow); this
+/// renders its [`PkShardBounds`](faucet_core::shard::PkShardBounds) in OData
+/// syntax. The first/last ranges are **unbounded** on their outer edge, so rows
+/// inserted below MIN / above MAX while the run is in flight are still read.
+/// Returns `None` for a single whole-range shard (no filter needed).
+pub fn key_range_filter(bounds: &faucet_core::shard::PkShardBounds) -> Option<String> {
+    let key = &bounds.key;
+    match (bounds.lo_unbounded, bounds.hi_unbounded) {
+        (true, true) => None,
+        (true, false) => Some(format!("{key} lt {}", bounds.hi)),
+        (false, true) => Some(format!("{key} ge {}", bounds.lo)),
+        (false, false) => Some(format!("{key} ge {} and {key} lt {}", bounds.lo, bounds.hi)),
     }
-    let span = high_exclusive - low;
-    let count = (count.max(1) as i64).min(span);
-    let width = span / count;
-    let remainder = span % count;
-    let mut ranges = Vec::with_capacity(count as usize);
-    let mut cursor = low;
-    for index in 0..count {
-        let step = width + if index < remainder { 1 } else { 0 };
-        ranges.push((cursor, cursor + step));
-        cursor += step;
-    }
-    ranges
-}
-
-/// The half-open `$filter` clause for one key range: `{key} ge {lo} and {key} lt {hi}`.
-pub fn key_range_filter(key: &str, lo: i64, hi: i64) -> String {
-    format!("{key} ge {lo} and {key} lt {hi}")
 }
 
 #[cfg(test)]
@@ -395,7 +390,7 @@ mod tests {
             "MainAccountBiEntities".to_string(),
             "CustomersV3".to_string(),
         ];
-        let ds = descriptors_from_objects(&objs, "fno_");
+        let ds = descriptors_from_objects(&objs, "fno_${name_snake}");
         assert_eq!(ds.len(), 2);
         assert_eq!(ds[0].name, "MainAccountBiEntities");
         assert_eq!(ds[0].kind, "entity");
@@ -407,7 +402,7 @@ mod tests {
             ds[0].sink_patch,
             Some(json!({ "table_id": "fno_main_account_bi_entities" }))
         );
-        // Prefix applies to every entity; CamelCase+digit snake-cases correctly.
+        // The template applies to every entity; CamelCase+digit snake-cases correctly.
         assert_eq!(
             ds[1].sink_patch,
             Some(json!({ "table_id": "fno_customers_v3" }))
@@ -415,15 +410,22 @@ mod tests {
     }
 
     #[test]
-    fn descriptors_from_objects_empty_prefix_is_bare_snake() {
-        let ds = descriptors_from_objects(&["Departments".to_string()], "");
+    fn descriptors_from_objects_default_template_is_bare_snake() {
+        let ds = descriptors_from_objects(&["Departments".to_string()], "${name_snake}");
         assert_eq!(ds[0].sink_patch, Some(json!({ "table_id": "departments" })));
+        // Verbatim and lowercase template variables render too.
+        let ds = descriptors_from_objects(&["CustomersV3".to_string()], "raw_${name_lower}");
+        assert_eq!(
+            ds[0].sink_patch,
+            Some(json!({ "table_id": "raw_customersv3" }))
+        );
     }
 
     #[test]
     fn edmx_for_objects_attaches_verbatim_typed_schema() {
         let ds =
-            descriptors_from_edmx_for_objects(SAMPLE, &["Orders".to_string()], "fno_").unwrap();
+            descriptors_from_edmx_for_objects(SAMPLE, &["Orders".to_string()], "fno_${name_snake}")
+                .unwrap();
         assert_eq!(ds.len(), 1);
         let patch = ds[0].sink_patch.as_ref().unwrap();
         assert_eq!(patch["table_id"], "fno_orders");
@@ -440,8 +442,12 @@ mod tests {
 
     #[test]
     fn edmx_for_objects_unknown_entity_gets_table_id_only() {
-        let ds = descriptors_from_edmx_for_objects(SAMPLE, &["NotInMetadata".to_string()], "fno_")
-            .unwrap();
+        let ds = descriptors_from_edmx_for_objects(
+            SAMPLE,
+            &["NotInMetadata".to_string()],
+            "fno_${name_snake}",
+        )
+        .unwrap();
         assert_eq!(
             ds[0].sink_patch,
             Some(json!({ "table_id": "fno_not_in_metadata" }))
@@ -480,5 +486,87 @@ mod tests {
         assert_eq!(types[0].properties.len(), 1);
         assert_eq!(types[0].properties[0].name, "ok");
         assert!(types[0].properties[0].nullable);
+    }
+
+    #[test]
+    fn key_range_filter_renders_all_bound_combinations() {
+        use faucet_core::shard::PkShardBounds;
+        let b = |lo, hi, lo_u, hi_u| PkShardBounds {
+            key: "SourceKey".into(),
+            lo,
+            hi,
+            lo_unbounded: lo_u,
+            hi_unbounded: hi_u,
+            // Irrelevant for OData: an EDM entity key is non-nullable by
+            // definition, so there are no NULL-key rows to include.
+            include_null: false,
+        };
+        // Middle range: half-open [lo, hi).
+        assert_eq!(
+            key_range_filter(&b(10, 20, false, false)).as_deref(),
+            Some("SourceKey ge 10 and SourceKey lt 20")
+        );
+        // First range: no lower bound — rows below the enumerated MIN are read.
+        assert_eq!(
+            key_range_filter(&b(0, 20, true, false)).as_deref(),
+            Some("SourceKey lt 20")
+        );
+        // Last range: no upper bound — rows above the enumerated MAX are read.
+        assert_eq!(
+            key_range_filter(&b(10, 0, false, true)).as_deref(),
+            Some("SourceKey ge 10")
+        );
+        // Single whole-range shard: no filter at all.
+        assert_eq!(key_range_filter(&b(0, 0, true, true)), None);
+    }
+
+    #[test]
+    fn range_planning_delegates_to_core_and_survives_extreme_keys() {
+        use faucet_core::shard::{PkShardBounds, plan_pk_shards};
+        // The very case a hand-rolled `hi - lo` i64 subtraction overflows on:
+        // a full-range 64-bit key. Planning + rendering must not panic.
+        let shards = plan_pk_shards("k", i64::MIN, i64::MAX, 8);
+        assert!(!shards.is_empty());
+        let bounds: Vec<_> = shards.iter().filter_map(PkShardBounds::from_spec).collect();
+        assert_eq!(bounds.len(), shards.len());
+        // Outer edges are unbounded; every range renders (only a single
+        // whole-range shard would render None).
+        assert!(bounds.first().unwrap().lo_unbounded);
+        assert!(bounds.last().unwrap().hi_unbounded);
+        assert!(
+            bounds
+                .iter()
+                .all(|b| key_range_filter(b).is_some() || bounds.len() == 1)
+        );
+    }
+
+    #[test]
+    fn single_int_key_detection() {
+        // SAMPLE's Order has a single Int32 key (DocEntry) → partitionable.
+        assert_eq!(
+            single_int_key_from_edmx(SAMPLE, "Orders").as_deref(),
+            Some("DocEntry")
+        );
+        // Unknown entity set → None.
+        assert_eq!(single_int_key_from_edmx(SAMPLE, "Nope"), None);
+        // Composite key → None (range-splitting needs exactly one column).
+        let composite = r#"<Schema>
+            <EntityType Name="Pair">
+              <Key><PropertyRef Name="A"/><PropertyRef Name="B"/></Key>
+              <Property Name="A" Type="Edm.Int64" Nullable="false"/>
+              <Property Name="B" Type="Edm.Int64" Nullable="false"/>
+            </EntityType>
+            <EntityContainer Name="C"><EntitySet Name="Pairs" EntityType="ns.Pair"/></EntityContainer>
+        </Schema>"#;
+        assert_eq!(single_int_key_from_edmx(composite, "Pairs"), None);
+        // Single but non-integer key → None (a string key cannot range-split).
+        let strkey = r#"<Schema>
+            <EntityType Name="Doc">
+              <Key><PropertyRef Name="Id"/></Key>
+              <Property Name="Id" Type="Edm.String" Nullable="false"/>
+            </EntityType>
+            <EntityContainer Name="C"><EntitySet Name="Docs" EntityType="ns.Doc"/></EntityContainer>
+        </Schema>"#;
+        assert_eq!(single_int_key_from_edmx(strkey, "Docs"), None);
     }
 }

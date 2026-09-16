@@ -298,56 +298,89 @@ source:
     odata: { version: v4, entity: Orders, select: [DocEntry, DocDate], page_size: 500 }
 ```
 
-### Salesforce object discovery (`salesforce`)
+### Config-driven discovery (`discovery`)
 
-`faucet discover` for a Salesforce org, so you never hand-list a SObject's
-fields. It introspects `/sobjects` (global describe) + per-object describe and
-emits one dataset per **queryable** object, each with a **field-complete**
-`SELECT … FROM <Object>` — compound/blob types (`address`, `location`,
-`base64`) excluded so the SOQL is valid — a typed schema, and (by default) a
-per-object sink `table_id`. It stays a `rest` source (no new crate); a normal
-run still uses the `async_job` (Bulk API 2.0) config. SOQL has no `SELECT *`
-and Bulk API 2.0 forbids `FIELDS()`, so describe-built field lists are the only
-way to select every field at bulk volume.
+A generic, vendor-neutral discovery recipe: enumerate datasets from a listing
+endpoint (or an explicit `objects` list), optionally *describe* each one to
+build a typed schema + field list, and *emit* one dataset descriptor per object
+— all with plain, templated HTTP calls, so any provider (a CRM's describe API,
+a catalog endpoint, a REST admin API) is pure YAML, never a code path.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `objects` | array<string> **or** string | `[]` | Objects to discover — a list (`[Account, Contact]`) or a comma-separated string (`"Account,Contact"`) so a single run-param can drive it (`objects: "${param.objects}"`). Empty, or `"all"`, ⇒ every queryable object. |
-| `fan_out` | bool | `false` | **Run-time** fan-out: when `true`, `faucet run` / `faucet serve` discovers the objects' fields and generates the matrix *at run time* — so one generic template (`objects: "${param.objects}"`, no `matrix:`) syncs any object set passed at trigger, fields resolved live. When `false`, the block only affects `faucet discover`. |
-| `sink_ref` | string / null | `default` | With `fan_out`, the sink template (under `pipeline.sinks`) each object routes to. |
-| `api_version` | string | `v60.0` | REST API version for the describe calls. |
-| `operation` | `queryAll \| query` | `queryAll` | Bulk-query operation baked into each object's SOQL (`queryAll` includes soft-deleted rows). |
-| `route_by_table_id` | bool | `true` | Also emit `sink: { config: { table_id: <snake object> } }` per row so a fan-out lands one table per object (table-based sinks). Set `false` for file sinks. |
+| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`. Omit when `objects` is supplied directly. |
+| `objects` | array<string> **or** string | `[]` | Datasets supplied directly — a list or a comma-separated string, so one run-param can drive it (`objects: "${param.objects}"`). |
+| `describe` | object / null | — | Step 2: per-dataset field discovery — `get` (templated path), `fields`/`field_name`/`field_type`/`field_nullable` JSONPaths, a `type_map`, and `skip_types`. Omit when the source returns every column by default. |
+| `emit.config` | object | — | Step 3: JSON deep-merged into the dataset's source config (e.g. a query built from `${field_names}`). Every string leaf is templated. |
+| `emit.table_id` | string / null | — | Sink `table_id` template (e.g. `"raw_${name_snake}"`). |
+| `emit.sink_ref` | string / null | `default` | With `fan_out`, the sink template (under `pipeline.sinks`) each dataset routes to. |
+| `fan_out` | bool | `false` | **Run-time** fan-out: `faucet run` / `faucet serve` discover the datasets and generate the matrix at trigger time — one generic template syncs any object set passed as a param. `false` ⇒ the block only powers `faucet discover`. |
 
-**Two ways to use it.** *Generate-time* (`faucet discover`, `fan_out: false`) writes a static matrix you review/commit. *Run-time* (`fan_out: true`) skips the generate step — register one generic template with `objects` as a param and it discovers + fans out on every trigger, picking up new fields automatically:
+Template variables available in every emitted string: `${name}` (verbatim),
+`${name_snake}`, `${name_lower}`, and — when a `describe` step ran —
+`${field_names}` (comma-joined field list).
+
+**Two ways to use it.** *Generate-time* (`faucet discover`, `fan_out: false`)
+writes a static matrix you review/commit. *Run-time* (`fan_out: true`) skips
+the generate step — register one generic template with `objects` as a param
+and it discovers + fans out on every trigger, picking up new fields
+automatically:
 
 ```yaml
 source:
   type: rest
   config:
-    base_url: "https://acme.my.salesforce.com"
+    base_url: "https://api.example.com"
     auth: { type: token_endpoint, config: { … } }
-    salesforce: { fan_out: true, objects: "${param.objects}", sink_ref: bigquery }
+    async_job:
+      submit: { method: POST, url: "/jobs/query", json: { query: "placeholder" } }
+      # … poll/fetch …
+    discovery:
+      fan_out: true
+      objects: "${param.objects}"
+      describe:
+        get: "/objects/${name}/describe"
+        fields: "$.fields[*]"
+        field_name: "$.name"
+        field_type: "$.type"
+        field_nullable: "$.nullable"
+        type_map: { int: integer, double: number, "*": string }
+      emit:
+        config:
+          async_job: { submit: { json: { query: "SELECT ${field_names} FROM ${name}" } } }
+        table_id: "${name_lower}"
+        sink_ref: warehouse
 # no matrix: — generated live from `objects` at run time
 ```
 ```console
-$ faucet run salesforce.yaml --param objects="Account,Contact,Lead"   # or "all"
+$ faucet run pipeline.yaml --param objects="Account,Contact,Lead"   # or "all"
 ```
+
+The OData block composes with the same fan-out vocabulary (`objects`,
+`fan_out`, `emit`) plus a `partition` block for key-range parallel extraction
+of large entities:
 
 ```yaml
 source:
   type: rest
   config:
-    base_url: "https://acme.my.salesforce.com"
-    auth: { type: token_endpoint, config: { … } }
-    salesforce: { objects: [Account, Contact, Opportunity] }
+    base_url: "https://host/data"
+    odata:
+      version: v4
+      fan_out: true
+      objects: "${param.objects}"
+      emit: { table_id: "raw_${name_snake}", sink_ref: warehouse }
+      partition:               # split huge entities into concurrent key ranges
+        objects: [LedgerEntries, Transactions]
+        workers: 16            # concurrent range readers (default 4, max 64)
+        count: 64              # ranges to tile into (default workers × 4)
 ```
 
-```console
-$ faucet discover salesforce.yaml --sink bigquery -o generated.yaml
-# → one matrix row per object, each with its full SELECT and table_id.
-$ faucet run generated.yaml
-```
+Each `partition.objects` entity whose `$metadata` declares a single **integer**
+key is tiled with `faucet_core::shard::plan_pk_shards` (the same primitive the
+SQL sources shard with) and fetched as concurrent `$filter` ranges; entities
+without such a key fall back to sequential paging. Ranges are planned per run —
+never bookmarked.
 
 ### Response-decode pipeline (`decode`)
 

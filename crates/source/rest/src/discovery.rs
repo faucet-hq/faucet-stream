@@ -42,18 +42,16 @@ pub struct DiscoverySpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub describe: Option<DiscoveryDescribe>,
     /// Step 3 — what each discovered dataset emits (the source `config_patch`
-    /// that selects it, and an optional sink `table_id`). Templated.
-    pub emit: DiscoveryEmit,
+    /// that selects it, an optional sink `table_id` template, and sink routing).
+    /// Shared shape with `odata.emit` ([`EmitSpec`](crate::config::EmitSpec));
+    /// `emit.config` is required here — it is what selects the dataset.
+    pub emit: crate::config::EmitSpec,
     /// Fan out **at run time**: `faucet run` / `serve` turn the discovered
     /// datasets into one matrix row each, before `expand`. Default `false`
-    /// (the block then only powers `faucet discover`).
+    /// (the block then only powers `faucet discover`). Same key and semantics
+    /// as `odata.fan_out`.
     #[serde(default)]
     pub fan_out: bool,
-    /// Sink template each fanned-out dataset routes to (an entry under
-    /// `pipeline.sinks`). Unset ⇒ the default (singular) sink, with `table_id`
-    /// merged in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sink_ref: Option<String>,
 }
 
 /// Step 1 — the listing request + how to read dataset names out of its response.
@@ -116,19 +114,6 @@ pub struct DiscoveryDescribe {
     pub skip_types: Vec<String>,
 }
 
-/// Step 3 — per-dataset output, templated with `${name}`, `${name_snake}`, and
-/// `${field_names}` (the comma-joined selectable field list).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DiscoveryEmit {
-    /// A JSON object deep-merged into the dataset's source config (e.g. the
-    /// `async_job` query, or an `odata.entity`). Every string leaf is templated.
-    pub config: Value,
-    /// Optional sink `table_id` template (e.g. `${name_snake}`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub table_id: Option<String>,
-}
-
 impl DiscoverySpec {
     /// Fail-fast validation (paths non-empty, an `emit.config` object, at least
     /// one of `list` / `objects`).
@@ -162,7 +147,7 @@ impl DiscoverySpec {
                 }
             }
         }
-        if !self.emit.config.is_object() {
+        if !self.emit.config.as_ref().is_some_and(Value::is_object) {
             return Err(FaucetError::Config(
                 "rest discovery: `emit.config` must be a JSON object".into(),
             ));
@@ -233,7 +218,7 @@ pub fn dataset_names(list_response: &Value, list: &DiscoveryList) -> Vec<String>
 /// Render `${name}`, `${name_lower}`, `${name_snake}`, and `${field_names}` in a
 /// template string. `${name_lower}` is a plain lowercase (underscores preserved),
 /// distinct from `${name_snake}` (word-split snake_case).
-fn render_template(tmpl: &str, name: &str, field_names: &[String]) -> String {
+pub(crate) fn render_template(tmpl: &str, name: &str, field_names: &[String]) -> String {
     tmpl.replace("${name_lower}", &name.to_lowercase())
         .replace("${name_snake}", &snake_case(name))
         .replace("${name}", name)
@@ -302,7 +287,8 @@ pub fn build_descriptor(
         }
     }
 
-    let config_patch = render_value(&spec.emit.config, name, &field_names);
+    let emit_config = spec.emit.config.as_ref().cloned().unwrap_or(Value::Null);
+    let config_patch = render_value(&emit_config, name, &field_names);
     let mut d = DatasetDescriptor::new(name.to_string(), "dataset", config_patch);
     if !cols.is_empty() {
         d = d.with_schema(columns_to_schema(cols));
