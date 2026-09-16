@@ -760,3 +760,7 @@ you can get a little technical
 ---
 
 Can you create a PR for the existing changes that we did? Push whatever local changes are there, then create a PR.
+
+---
+
+This has added a breaking version, making it bump to 2.0.0. I don't want to do that. Adding an API should not bump the version. It's not at all the proper way to build software. Addition of something should not bump the version. That's 100% for sure. What do you think?
