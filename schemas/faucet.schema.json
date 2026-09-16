@@ -206,6 +206,13 @@
         }
       ]
     },
+    "notifications": {
+      "description": "Optional notification / incident-routing rules (#280). Fan pipeline\nlifecycle and health events (run failure/success, SLA breach, circuit\nopen, contract abort, DLQ threshold, scheduler stuck) out to Slack /\nPagerDuty / a signed webhook. Consumed by every runtime\n(`run`/`schedule`/`serve`/`replicate`); delivery never fails a run.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NotificationSpec"
+      }
+    },
     "metadata_columns": {
       "description": "Optional `_faucet_*` run/lineage metadata columns (#510) stamped onto\nevery row by a connector-agnostic sink decorator (works for any sink).\nOff unless present.",
       "anyOf": [
