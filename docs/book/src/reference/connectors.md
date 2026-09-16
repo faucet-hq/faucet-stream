@@ -65,9 +65,10 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 [`faucet discover`](../cookbook/discover.md) (tables / collections / indices /
 prefixes with schemas + row estimates where the catalog provides them).
 ᵒ REST supports discovery with an `odata:` block (via the OData `$metadata`
-(EDMX) catalog — one dataset per entity set) **or** a `salesforce:` block (via
-Salesforce `/sobjects` describe — one dataset per queryable object with a
-field-complete `SELECT`, typed schema, and per-object sink `table_id`).
+(EDMX) catalog — one dataset per entity set) **or** a generic `discovery:`
+recipe (a config-driven list → describe → emit pipeline — one dataset per
+listed object, with a templated source config, typed schema, and optional
+per-object sink `table_id`).
 ¹ **Streams** = yields records in bounded-memory batches rather than buffering the
 whole result. ² **Resumable** = persists a bookmark to a [state store](../cookbook/state.md)
 so re-runs continue where they left off (incremental replication / CDC / Kafka

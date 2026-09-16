@@ -466,11 +466,19 @@ pub trait Sink: Send + Sync {
     /// number of rows written.
     ///
     /// Only invoked when the pipeline negotiated one of this sink's
-    /// [`native_load_capabilities`](Self::native_load_capabilities) and all
-    /// prerequisites hold. `ctx.first_batch` lets an overwrite sink truncate on
-    /// the first load and append thereafter. The default returns a typed
-    /// "unsupported" error so a sink that advertises a capability but forgets to
-    /// override this fails loudly.
+    /// [`native_load_capabilities`](Self::native_load_capabilities) and the
+    /// pipeline-owned gates passed. `ctx.first_batch` lets an overwrite sink
+    /// truncate on the first load and append thereafter. The default returns a
+    /// typed "unsupported" error so a sink that advertises a capability but
+    /// forgets to override this fails loudly.
+    ///
+    /// **Contract:** an **empty payload must be a successful no-op** returning
+    /// `Ok(0)` — sources emit a trailing empty batch to carry the final
+    /// bookmark, and an error here would break bookmark persistence. Under
+    /// `Overwrite`, nothing may become visible in the destination until the
+    /// terminal [`flush`](Self::flush) — the pipeline flushes exactly once, on
+    /// success only, so a mechanism that commits per batch must omit
+    /// `Overwrite` from its capability's `write_modes`.
     async fn load_native(
         &self,
         batch: crate::native::NativeBatch,
