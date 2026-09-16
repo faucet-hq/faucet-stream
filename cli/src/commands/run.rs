@@ -350,6 +350,11 @@ pub(crate) async fn execute(
     // printed after the summary for text output.
     let peak_rss = crate::memstat::process_peak_rss_bytes();
     if let Some(bytes) = peak_rss {
+        metrics::describe_gauge!(
+            "faucet_process_peak_rss_bytes",
+            "Peak resident set size of the faucet process (getrusage high-water mark, bytes). \
+             Process-scoped: equals the run's peak only for one-shot `faucet run`."
+        );
         metrics::gauge!("faucet_process_peak_rss_bytes").set(bytes as f64);
     }
     // End-of-run summary. `text` is the human line (default); `json` / `ndjson`

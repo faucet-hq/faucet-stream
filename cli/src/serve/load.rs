@@ -10,6 +10,11 @@ use crate::serve::error::ServeError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Ceiling on the discovery fan-out's describe call during submission — long
+/// enough for a slow metadata endpoint, short enough that a hung upstream
+/// can't tie up submit handlers indefinitely.
+const SUBMIT_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Wire format of a submitted config body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -93,18 +98,31 @@ pub async fn load_submission(
         .await
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
 
-    // 5b. Discovery-driven matrix fan-out (#647): a source with
-    // `salesforce.fan_out` discovers its objects live and generates the matrix
-    // before expansion, so a generic template's `objects` param materializes into
-    // one row per object at trigger time.
+    // 5b. Discovery-driven matrix fan-out (#647): a source whose `discovery:` /
+    // `odata:` block sets `fan_out` discovers its objects live and generates
+    // the matrix before expansion, so a generic template's `objects` param
+    // materializes into one row per object at trigger time. This is the one
+    // network call in the submit path, so it runs under a hard timeout — a
+    // hung upstream describe endpoint must not wedge `POST /v1/runs`.
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
-    crate::dynamic_fanout::resolve_dynamic_fanout(&mut cfg, &auth)
-        .await
-        .map_err(|e| ServeError::Unprocessable {
-            message: e.to_string(),
-            details: None,
-        })?;
+    tokio::time::timeout(
+        SUBMIT_DISCOVERY_TIMEOUT,
+        crate::dynamic_fanout::resolve_dynamic_fanout(&mut cfg, &auth),
+    )
+    .await
+    .map_err(|_| ServeError::Unprocessable {
+        message: format!(
+            "discovery fan-out did not complete within {}s — the source's describe \
+             endpoint is slow or unreachable",
+            SUBMIT_DISCOVERY_TIMEOUT.as_secs()
+        ),
+        details: None,
+    })?
+    .map_err(|e| ServeError::Unprocessable {
+        message: e.to_string(),
+        details: None,
+    })?;
 
     // 6. Expand the matrix.
     let nodes = expand(&cfg).map_err(|e| ServeError::Unprocessable {

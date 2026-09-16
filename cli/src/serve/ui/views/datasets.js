@@ -12,7 +12,7 @@
 // as `expired`, never as a broken row.
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { escapeHtml, fmtCompact } from "../utils.js";
+import { escapeHtml, fmtCompact, fmtInt } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { fmtTime } from "./runs.js";
 
@@ -220,13 +220,20 @@ export async function renderDatasets(container) {
       refilter();
     };
   });
-  // Collapse the kind dropdown when clicking anywhere outside it.
+  // Collapse the kind dropdown when clicking anywhere outside it. Named so the
+  // teardown can remove it — a per-render anonymous listener would accumulate
+  // on `document` across navigations, each closure pinning its detached DOM.
   const kindDd = container.querySelector("#f-kind-dd");
-  document.addEventListener("click", (e) => {
+  const closeKindDd = (e) => {
     if (kindDd.open && !kindDd.contains(e.target)) kindDd.open = false;
-  });
+  };
+  document.addEventListener("click", closeKindDd);
   await loadAll();
-  await renderLocalOutputs(container.querySelector("#lo-section"), {});
+  const loCleanup = await renderLocalOutputs(container.querySelector("#lo-section"), {});
+  return () => {
+    document.removeEventListener("click", closeKindDd);
+    if (loCleanup) loCleanup();
+  };
 }
 
 // ── Local outputs (#587/#588) ───────────────────────────────────────────────
@@ -258,8 +265,18 @@ const STATE_HINT = {
  * buttons, rather than buttons that can only 403.
  */
 export async function renderLocalOutputs(host, scope = {}) {
-  if (!host) return;
+  if (!host) return null;
   const datasetId = scope.datasetId || null;
+  // Collapse the Manage disclosure when clicking anywhere outside it. One
+  // delegated document listener per panel render — installed here (not inside
+  // `load()`, which re-runs on every refresh/toggle and would accumulate one
+  // listener per click) and removed by the returned cleanup.
+  const collapseManage = (e) => {
+    const manage = host.querySelector(".lo-manage");
+    if (manage && manage.open && !manage.contains(e.target)) manage.open = false;
+  };
+  document.addEventListener("click", collapseManage);
+  const cleanup = () => document.removeEventListener("click", collapseManage);
   let showExpired = false;
 
   host.innerHTML = `
@@ -337,13 +354,7 @@ export async function renderLocalOutputs(host, scope = {}) {
     };
     body.querySelector("#lo-refresh").onclick = () => load();
 
-    // Collapse the Manage disclosure when clicking anywhere outside it.
-    const manage = body.querySelector(".lo-manage");
-    if (manage) {
-      document.addEventListener("click", (e) => {
-        if (manage.open && !manage.contains(e.target)) manage.open = false;
-      });
-    }
+
 
     body.querySelectorAll(".lo-preview-btn").forEach((btn) => {
       btn.onclick = () => togglePreview(btn, caps);
@@ -432,6 +443,7 @@ export async function renderLocalOutputs(host, scope = {}) {
   }
 
   await load();
+  return cleanup;
 }
 
 function outputRow(o, canManage, canPreview) {
@@ -605,11 +617,6 @@ function previewStatus(d, caps) {
     : `${fmtInt(n)} row${n === 1 ? "" : "s"} · ${ms} · whole dataset`;
 }
 
-function fmtInt(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n.toLocaleString("en-US") : String(v);
-}
-
 function previewTable(d) {
   if (!d.row_count) return `<div class="empty">This output has no rows.</div>`;
   const cols = d.columns.length ? d.columns : null;
@@ -778,7 +785,7 @@ export async function renderDatasetDetail(container, params) {
 
   container.querySelector("#d-graph").onclick = () => navigate(`#/lineage/${d.id}`);
   // This dataset's own local files, with the same controls scoped to it.
-  await renderLocalOutputs(container.querySelector("#lo-section"), {
+  const loCleanup = await renderLocalOutputs(container.querySelector("#lo-section"), {
     datasetId: d.id,
     totalRecords: d.total_records,
   });
@@ -793,6 +800,9 @@ export async function renderDatasetDetail(container, params) {
   for (const v of d.schema_timeline.slice().reverse()) {
     timeline.appendChild(versionCard(v));
   }
+  return () => {
+    if (loCleanup) loCleanup();
+  };
 }
 
 function edgeList(edges, idOf, uriOf) {

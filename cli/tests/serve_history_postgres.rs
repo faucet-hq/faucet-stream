@@ -96,6 +96,43 @@ async fn postgres_backend_full_lifecycle() {
         .unwrap();
     assert!(page.runs.iter().any(|r| r.run_id == id("1")));
 
+    // Multi-status membership on the Postgres dialect (the comma-wrapped
+    // `position(… in $n)` clause): exact-token matching, no substring
+    // false-positives, single-status and empty-vec (= all) both correct.
+    h.upsert(&rec(&id("f1"), RunStatus::Failed)).await.unwrap();
+    let both = h
+        .list(&ListFilter {
+            name: Some("pg-test".into()),
+            status: vec![RunStatus::Running, RunStatus::Failed],
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(both.runs.iter().any(|r| r.run_id == id("1")));
+    assert!(both.runs.iter().any(|r| r.run_id == id("f1")));
+    let only_failed = h
+        .list(&ListFilter {
+            name: Some("pg-test".into()),
+            status: vec![RunStatus::Failed],
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(only_failed.runs.iter().all(|r| r.run_id != id("1")));
+    assert!(only_failed.runs.iter().any(|r| r.run_id == id("f1")));
+    let unfiltered = h
+        .list(&ListFilter {
+            name: Some("pg-test".into()),
+            status: Vec::new(),
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(unfiltered.runs.len() >= both.runs.len());
+
     // delete: running → 409-equivalent; terminal → deleted
     assert_eq!(
         h.delete(&id("1")).await.unwrap(),

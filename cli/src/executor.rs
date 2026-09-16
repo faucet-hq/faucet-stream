@@ -1046,6 +1046,7 @@ async fn run_unit(
         &row_id,
         &unit.node.source.kind,
         &unit.node.sink.kind,
+        result.is_ok(),
         duration_ms,
     );
     let base_metrics = || InvocationMetrics {

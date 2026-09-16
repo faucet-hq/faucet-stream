@@ -4,7 +4,8 @@ import { escapeHtml, fmtInt, fmtDuration, fmtCompact } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { formatTs } from "../tz.js";
 
-const STATUSES = ["queued", "running", "completed", "failed", "cancelled"];
+// Every RunStatus the API accepts — pending/sharded appear in cluster mode.
+const STATUSES = ["queued", "pending", "running", "sharded", "completed", "failed", "cancelled"];
 
 export async function renderRuns(container) {
   let cursor = null;
@@ -56,9 +57,12 @@ export async function renderRuns(container) {
       statusSum.textContent = statusSel.size ? `status (${statusSel.size}) ▾` : "status ▾";
     };
   });
-  document.addEventListener("click", (e) => {
+  // Named handler so the view teardown can remove it — a per-render anonymous
+  // listener would accumulate on `document` across navigations.
+  const closeStatusDd = (e) => {
     if (statusDd.open && !statusDd.contains(e.target)) statusDd.open = false;
-  });
+  };
+  document.addEventListener("click", closeStatusDd);
 
   function query(reset) {
     if (reset) cursor = null;
@@ -107,7 +111,10 @@ export async function renderRuns(container) {
   container.querySelector("#r-more").onclick = () => load(false);
 
   await load(true);
-  return () => clearTimeout(pollTimer); // teardown
+  return () => {
+    clearTimeout(pollTimer);
+    document.removeEventListener("click", closeStatusDd);
+  }; // teardown
 }
 
 function row(r) {

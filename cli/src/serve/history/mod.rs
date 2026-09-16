@@ -1105,6 +1105,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_status_parse_round_trips_every_variant() {
+        // The match forces this list to grow with the enum at compile time —
+        // `parse`'s `_ => None` catch-all would otherwise let a future variant
+        // compile cleanly while silently becoming unfilterable over the API.
+        fn all_variants() -> Vec<RunStatus> {
+            [
+                RunStatus::Queued,
+                RunStatus::Pending,
+                RunStatus::Running,
+                RunStatus::Sharded,
+                RunStatus::Completed,
+                RunStatus::Failed,
+                RunStatus::Cancelled,
+            ]
+            .into_iter()
+            .inspect(|s| match s {
+                RunStatus::Queued
+                | RunStatus::Pending
+                | RunStatus::Running
+                | RunStatus::Sharded
+                | RunStatus::Completed
+                | RunStatus::Failed
+                | RunStatus::Cancelled => {}
+            })
+            .collect()
+        }
+        for s in all_variants() {
+            assert_eq!(RunStatus::parse(s.as_str()), Some(s), "{}", s.as_str());
+        }
+        assert_eq!(RunStatus::parse("faild"), None);
+        assert_eq!(RunStatus::parse(" failed "), Some(RunStatus::Failed));
+    }
+
+    #[test]
     fn terminal_classification() {
         assert!(!RunStatus::Queued.is_terminal());
         assert!(!RunStatus::Pending.is_terminal());

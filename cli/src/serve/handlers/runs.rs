@@ -179,7 +179,8 @@ impl<'de> Deserialize<'de> for DateTimeUtcParam {
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     /// Comma-separated status names to include (e.g. `running,completed`); empty
-    /// / absent = every status. Unknown tokens are ignored.
+    /// / absent = every status. An unknown token is a 400 — silently ignoring it
+    /// would return *unfiltered* results to a caller who typo'd `failed`.
     pub status: Option<String>,
     pub name: Option<String>,
     pub(crate) since: Option<DateTimeUtcParam>,
@@ -200,19 +201,35 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
 
 impl ListQuery {
-    fn into_filter(self) -> ListFilter {
-        ListFilter {
-            status: self
-                .status
-                .as_deref()
-                .map(|s| s.split(',').filter_map(RunStatus::parse).collect())
-                .unwrap_or_default(),
+    fn into_filter(self) -> Result<ListFilter, ServeError> {
+        // Reject unknown status tokens instead of dropping them: a dropped
+        // token leaves the vec empty, and an empty vec means "every status" —
+        // a monitoring script that typo'd `?status=faild` would silently
+        // receive ALL runs instead of an error.
+        let status = match self.status.as_deref() {
+            None => Vec::new(),
+            Some(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    RunStatus::parse(t).ok_or_else(|| {
+                        ServeError::BadConfig(format!(
+                            "unknown status '{t}' — valid values: queued, pending, running, \
+                             sharded, completed, failed, cancelled"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(ListFilter {
+            status,
             name: self.name,
             since: self.since.map(|p| p.0),
             until: self.until.map(|p| p.0),
             limit: self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
             cursor: self.cursor,
-        }
+        })
     }
 }
 
@@ -223,7 +240,7 @@ pub async fn list_runs(
 ) -> Result<Json<ListResponse>, ServeError> {
     let page = state
         .history()
-        .list(&query.into_filter())
+        .list(&query.into_filter()?)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
     let mut runs = page.runs;
@@ -271,18 +288,54 @@ mod tests {
             limit: Some(99999),
             cursor: None,
         };
-        assert_eq!(q.into_filter().limit, MAX_LIMIT);
+        assert_eq!(q.into_filter().unwrap().limit, MAX_LIMIT);
         let q = ListQuery {
-            status: Some("failed,completed".to_string()),
+            status: Some("failed, completed".to_string()),
             name: None,
             since: None,
             until: None,
             limit: None,
             cursor: None,
         };
-        let f = q.into_filter();
+        let f = q.into_filter().unwrap();
         assert_eq!(f.limit, DEFAULT_LIMIT);
         assert_eq!(f.status, vec![RunStatus::Failed, RunStatus::Completed]);
+    }
+
+    #[test]
+    fn list_query_rejects_unknown_status_token() {
+        // A typo must be a 400, not a silently-unfiltered result: dropping the
+        // token would leave the vec empty, and empty means "every status".
+        let q = ListQuery {
+            status: Some("faild".to_string()),
+            name: None,
+            since: None,
+            until: None,
+            limit: None,
+            cursor: None,
+        };
+        let err = q.into_filter().unwrap_err();
+        assert!(matches!(err, ServeError::BadConfig(ref m) if m.contains("faild")));
+        // …and one bad token among good ones still rejects the request.
+        let q = ListQuery {
+            status: Some("failed,Completed".to_string()),
+            name: None,
+            since: None,
+            until: None,
+            limit: None,
+            cursor: None,
+        };
+        assert!(q.into_filter().is_err(), "case-sensitive tokens");
+        // A trailing comma (empty token) is tolerated.
+        let q = ListQuery {
+            status: Some("failed,".to_string()),
+            name: None,
+            since: None,
+            until: None,
+            limit: None,
+            cursor: None,
+        };
+        assert_eq!(q.into_filter().unwrap().status, vec![RunStatus::Failed]);
     }
 
     #[tokio::test]

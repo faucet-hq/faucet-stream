@@ -555,37 +555,71 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
     // 3) Validate `${id.path}` references — each `id` must be a known row.
     // We scan the *raw* (pre-merge) row configs because interpolation lives in
     // strings that survive merging unchanged.
+    //
+    // Discovery-recipe naming tokens (`${name}` etc.) are legal only when some
+    // source in the config actually carries a discovery recipe to resolve them
+    // — scoping the exemption keeps `${name}` a hard validation error in every
+    // ordinary config, where it is almost always a typo'd `${vars.name}`.
+    let any_source_recipe = cfg
+        .pipeline
+        .source
+        .as_ref()
+        .map(|s| has_discovery_recipe(&s.config))
+        .unwrap_or(false)
+        || cfg
+            .pipeline
+            .sources
+            .values()
+            .any(|s| has_discovery_recipe(&s.config))
+        || rows.iter().any(|row| {
+            row.discover.is_some()
+                || row
+                    .source
+                    .as_ref()
+                    .and_then(|p| p.config.as_ref())
+                    .is_some_and(has_discovery_recipe)
+        });
     for (i, row) in rows.iter().enumerate() {
         let id = ids[i].as_str();
         if let Some(p) = &row.source
             && let Some(c) = &p.config
         {
-            check_refs(c, &id_set, id)?;
+            check_refs(c, &id_set, id, any_source_recipe)?;
         }
         if let Some(p) = &row.sink
             && let Some(c) = &p.config
         {
-            check_refs(c, &id_set, id)?;
+            check_refs(c, &id_set, id, any_source_recipe)?;
         }
         // A chained `discover:` row's source config (#531) references its upstream
         // dimension (`${types.name}`); validate those refs too.
         if let Some(disc) = &row.discover
             && let Some(c) = &disc.source.config
         {
-            check_refs(c, &id_set, id)?;
+            check_refs(c, &id_set, id, true)?;
         }
     }
     if let Some(s) = &cfg.pipeline.source {
-        check_refs(&s.config, &id_set, "pipeline.source")?;
+        check_refs(&s.config, &id_set, "pipeline.source", any_source_recipe)?;
     }
     if let Some(s) = &cfg.pipeline.sink {
-        check_refs(&s.config, &id_set, "pipeline.sink")?;
+        check_refs(&s.config, &id_set, "pipeline.sink", any_source_recipe)?;
     }
     for (name, s) in &cfg.pipeline.sources {
-        check_refs(&s.config, &id_set, &format!("pipeline.sources.{name}"))?;
+        check_refs(
+            &s.config,
+            &id_set,
+            &format!("pipeline.sources.{name}"),
+            any_source_recipe,
+        )?;
     }
     for (name, s) in &cfg.pipeline.sinks {
-        check_refs(&s.config, &id_set, &format!("pipeline.sinks.{name}"))?;
+        check_refs(
+            &s.config,
+            &id_set,
+            &format!("pipeline.sinks.{name}"),
+            any_source_recipe,
+        )?;
     }
 
     // 4) Build template registry — validates duplicate default conflicts.
@@ -783,10 +817,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         // blanket-rejecting every runtime token. State / dlq configs have no
         // such runtime resolution, so they keep the stricter rejection below.
         for (ti, t) in transforms.iter().enumerate() {
+            // Transforms never carry discovery recipes, so the naming tokens
+            // stay hard errors here.
             check_refs(
                 &t.config,
                 &id_set,
                 &format!("row `{row_id}` transform[{ti}] (`{}`)", t.kind),
+                false,
             )?;
         }
         if let Some(ref st) = state {
@@ -1464,7 +1501,28 @@ fn collect_flow_capture_names(cfg: &PipelineConfig) -> Vec<String> {
     names
 }
 
-fn check_refs(value: &Value, id_set: &HashSet<&str>, owner: &str) -> CliResult<()> {
+/// Whether a source config carries a discovery recipe whose naming-template
+/// tokens (`${name}` / `${name_snake}` / `${name_lower}` / `${field_names}`)
+/// are resolved by the source's discovery engine at `discover()` time: a
+/// `discovery:` block, or an `odata:` block using fan-out / emit templating.
+fn has_discovery_recipe(config: &Value) -> bool {
+    if config.get("discovery").is_some() {
+        return true;
+    }
+    config
+        .get("odata")
+        .and_then(Value::as_object)
+        .is_some_and(|o| {
+            o.contains_key("fan_out") || o.contains_key("emit") || o.contains_key("objects")
+        })
+}
+
+fn check_refs(
+    value: &Value,
+    id_set: &HashSet<&str>,
+    owner: &str,
+    allow_recipe_tokens: bool,
+) -> CliResult<()> {
     walk_strings(value, &mut |s| {
         for (token, dir) in iter_directives(s) {
             // Load-time / template directives (`${env:..}`, `${vars.X}`, …) are
@@ -1494,12 +1552,13 @@ fn check_refs(value: &Value, id_set: &HashSet<&str>, owner: &str) -> CliResult<(
                 && id != "bookmark"
                 && id != "job_id"
                 && id != "window"
-                // `discovery:` recipe tokens, resolved by the source's discovery
-                // engine at `discover()` time (before the executor sees them).
-                && id != "name"
-                && id != "name_snake"
-                && id != "name_lower"
-                && id != "field_names"
+                // Discovery-recipe naming tokens, resolved by the source's
+                // discovery engine at `discover()` time (before the executor
+                // sees them) — allowed only when the config actually carries a
+                // recipe, so a bare `${name}` in an ordinary config stays a
+                // hard error (it is almost always a typo'd `${vars.name}`).
+                && !(allow_recipe_tokens
+                    && matches!(id, "name" | "name_snake" | "name_lower" | "field_names"))
                 && !id_set.contains(id)
             {
                 return Err(CliError::UnknownInterpolationId {

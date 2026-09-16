@@ -2264,7 +2264,7 @@
       "type": "object",
       "properties": {
         "max_concurrent": {
-          "description": "Maximum concurrent pipeline invocations (root + per-parent-record\nchild invocations all share this budget). Defaults to\n`num_cpus::get().min(4)` at runtime when `None`.",
+          "description": "Maximum concurrent pipeline invocations (root + per-parent-record\nchild invocations all share this budget). Defaults to\n`num_cpus::get().min(4)` at runtime when `None`. `0` = **no limit**\n(the house `0`-sentinel, like `batch_size: 0`) — every invocation runs\nin parallel; before 1.7 a `0` here clamped to fully-serial instead, so\naudit any config that relied on that.",
           "type": [
             "integer",
             "null"
@@ -3223,6 +3223,35 @@
               },
               "required": [
                 "path"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "config"
+          ]
+        },
+        {
+          "description": "Produce each event as a JSON message to a Kafka topic.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "kafka"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "brokers": {
+                  "type": "string"
+                },
+                "topic": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "brokers",
+                "topic"
               ]
             }
           },
@@ -17862,6 +17891,13 @@
         "fetch": {
           "description": "Result-download request.",
           "$ref": "#/$defs/source_rest__JobRequest"
+        },
+        "lookback": {
+          "description": "Incremental replication only: re-read margin subtracted from the\npersisted bookmark, same grammar as `window.lookback` (`45s` / `30m` /\n`6h` / `30d`; default `5m`). The bookmark is the client's run-start\nclock, so without a margin a client clock running *ahead* of the server\nwould permanently skip records stamped in the gap; the margin turns\nthat loss into a bounded re-read (deduped by an upsert sink).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": true
@@ -18108,7 +18144,7 @@
           }
         },
         "interval_secs": {
-          "description": "Seconds between polls (default `5`).",
+          "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait.",
           "type": [
             "integer",
             "string"

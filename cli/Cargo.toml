@@ -514,8 +514,6 @@ chrono = { workspace = true }
 # Base dep (not optional): `faucet backfill` (#282) computes window boundaries
 # timezone-correctly in every build; `faucet schedule` reuses it.
 chrono-tz = { workspace = true }
-# Process peak-RSS reporting (#631) via getrusage — reliable process-level memory.
-libc = "0.2"
 croner = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
@@ -542,6 +540,11 @@ rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 object_store = { workspace = true, optional = true, features = ["aws", "gcp"] }
 redis = { workspace = true, optional = true }
 rdkafka = { workspace = true, optional = true }
+
+# Process peak-RSS reporting (#631) via getrusage — unix-only (memstat.rs falls
+# back to `None` elsewhere), so the dep is target-gated to keep Windows building.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

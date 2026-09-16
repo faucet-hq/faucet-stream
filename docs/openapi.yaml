@@ -47,7 +47,13 @@ paths:
       summary: List runs
       operationId: listRuns
       parameters:
-        - { name: status, in: query, schema: { $ref: "#/components/schemas/RunStatus" } }
+        - name: status
+          in: query
+          schema: { type: string }
+          description: >-
+            Comma-separated status names to include (e.g. `running,failed`);
+            absent = every status. Any unknown token is a 400. Valid names are
+            the RunStatus values.
         - { name: name, in: query, schema: { type: string } }
         - { name: since, in: query, schema: { type: string, format: date-time } }
         - { name: until, in: query, schema: { type: string, format: date-time } }

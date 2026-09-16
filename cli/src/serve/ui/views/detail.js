@@ -2,6 +2,7 @@ import { api, toast } from "../api.js";
 import { streamLogs } from "../sse.js";
 import { navigate } from "../router.js";
 import { fmtTime } from "./runs.js";
+import { escapeHtml, fmtInt, fmtCompact } from "../utils.js";
 
 /** Human duration between two RFC3339 timestamps; "—" if either is missing. */
 function fmtDur(fromISO, toISO) {
@@ -24,7 +25,6 @@ function fmtMs(ms) {
   const m = Math.floor(s / 60);
   return `${m}m ${Math.round(s % 60)}s`;
 }
-import { escapeHtml, fmtInt, fmtCompact } from "../utils.js";
 
 const TERMINAL = ["completed", "failed", "cancelled"];
 
@@ -238,7 +238,7 @@ export async function renderDetail(container, { id }) {
           // uses a translucent neutral so it works on light+dark.
           const fill =
             `<div style="height:100%;width:${pct}%;min-width:3px;border-radius:4px;` +
-            `background:linear-gradient(to bottom, #3bb5a3, #26907f);` +
+            `background:linear-gradient(to bottom, var(--brand-strong), var(--brand));` +
             `box-shadow:inset 0 1px 0 rgba(255,255,255,0.25), 0 1px 1px rgba(0,0,0,0.12)"></div>`;
           const bar =
             `<div style="height:9px;width:100%;max-width:180px;border-radius:4px;background:rgba(120,120,120,0.14);` +

@@ -7,11 +7,29 @@
 //! it is process-lifetime and must be treated as process-scoped, not attributed
 //! to a single run. It is NOT an in-flight/serialized proxy — it is the real RSS.
 
-/// Peak resident set size of the current process since start, in **bytes**, or
-/// `None` if the platform call fails.
+/// Normalize a raw `ru_maxrss` reading to bytes, or `None` when the reading is
+/// unusable (`<= 0`).
 ///
 /// `getrusage`'s `ru_maxrss` unit differs by OS — **bytes on macOS/iOS**,
-/// **kibibytes on Linux and the BSDs** — so it is normalized to bytes here.
+/// **kibibytes on Linux and the BSDs** — the exact 1024× ambiguity this pure
+/// function exists to pin under test on *both* branches (the I/O caller passes
+/// its platform's flag, so a double-scaling bug can never hide behind `cfg!`).
+fn normalize_maxrss(raw: i64, unit_is_bytes: bool) -> Option<u64> {
+    if raw <= 0 {
+        return None;
+    }
+    let raw = raw as u64;
+    Some(if unit_is_bytes {
+        raw
+    } else {
+        raw.saturating_mul(1024)
+    })
+}
+
+/// Peak resident set size of the current process since start, in **bytes**, or
+/// `None` if the platform call fails. Unix-only; on other platforms it reports
+/// `None` and callers simply omit the figure.
+#[cfg(unix)]
 pub fn process_peak_rss_bytes() -> Option<u64> {
     // SAFETY: `getrusage` fills a caller-owned `rusage`; we zero-init it and only
     // read the scalar `ru_maxrss` field afterwards. No aliasing or lifetime risk.
@@ -20,17 +38,16 @@ pub fn process_peak_rss_bytes() -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    let maxrss = usage.ru_maxrss;
-    if maxrss <= 0 {
-        return None;
-    }
-    let maxrss = maxrss as u64;
-    let bytes = if cfg!(any(target_os = "macos", target_os = "ios")) {
-        maxrss // already bytes
-    } else {
-        maxrss.saturating_mul(1024) // KiB → bytes (Linux, *BSD)
-    };
-    Some(bytes)
+    normalize_maxrss(
+        usage.ru_maxrss as i64,
+        cfg!(any(target_os = "macos", target_os = "ios")),
+    )
+}
+
+/// Non-unix fallback: no `getrusage`; the peak-RSS figure is simply omitted.
+#[cfg(not(unix))]
+pub fn process_peak_rss_bytes() -> Option<u64> {
+    None
 }
 
 /// Format a byte count as a human `"~N MB"` string for run summaries.
@@ -42,6 +59,20 @@ pub fn fmt_mb(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn normalize_maxrss_handles_both_platform_units() {
+        // macOS/iOS report bytes: no scaling.
+        assert_eq!(normalize_maxrss(150 * 1_048_576, true), Some(157_286_400));
+        // Linux/BSD report KiB: exactly one 1024× scaling.
+        assert_eq!(normalize_maxrss(150 * 1024, false), Some(157_286_400));
+        // Unusable readings.
+        assert_eq!(normalize_maxrss(0, true), None);
+        assert_eq!(normalize_maxrss(-1, false), None);
+        // KiB scaling saturates instead of overflowing.
+        assert_eq!(normalize_maxrss(i64::MAX, false), Some(u64::MAX));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn peak_rss_is_reported_and_nonzero() {
         // Any live process has a non-trivial resident set; the call must succeed
