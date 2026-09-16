@@ -109,7 +109,7 @@ pub use metadata::{
 };
 pub use native::{
     CsvDialect, NativeBatch, NativeFormat, NativeLoadCapability, NativeLoadContext, NativePayload,
-    NativePlan, NativePlanInputs, NativePrerequisites, plan_native_transfer,
+    NativePlan, NativePlanInputs, plan_native_transfer,
 };
 #[cfg(feature = "contract")]
 pub use observability::instrumented_apply_contract;

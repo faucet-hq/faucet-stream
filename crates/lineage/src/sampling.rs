@@ -128,14 +128,21 @@ fn ol_type_of(v: &Value) -> &'static str {
 /// (streaming preserved) while counting records by newline and sampling a bounded
 /// prefix into `state`. This lets lineage/catalog sampling coexist with the native
 /// byte-passthrough fast path (#633) instead of forcing the `Value` path (which
-/// ballooned memory ~35×). Non-NDJSON payloads pass through untapped (no sample).
+/// ballooned memory ~35×). Non-NDJSON payloads pass through untapped (no schema
+/// sample), but the batch's declared row count — when the source knows it — still
+/// feeds the volume counters so catalog/lineage never report zero for a
+/// successful CSV/Parquet native run.
 fn tap_native_payload(
     payload: faucet_core::NativePayload,
     format: faucet_core::NativeFormat,
+    records: Option<u64>,
     state: std::sync::Arc<SampleState>,
 ) -> faucet_core::NativePayload {
     use faucet_core::{NativeFormat, NativePayload};
     if format != NativeFormat::NdJson {
+        if let Some(n) = records {
+            state.add_count(n);
+        }
         return payload;
     }
     match payload {
@@ -160,9 +167,17 @@ fn tap_native_payload(
                 let mut inner = inner;
                 let mut buf: Vec<u8> = Vec::new();
                 let mut sampling = !state.sample_full();
+                // Track whether the payload's final byte is a newline: a last
+                // line without a trailing `\n` is a real record the per-chunk
+                // newline count misses (the `Bytes` arm counts it via `split`),
+                // so it is counted — and sampled — at stream end.
+                let mut last_byte: Option<u8> = None;
                 while let Some(chunk) = inner.next().await {
                     let chunk = chunk?;
                     state.add_count(chunk.iter().filter(|&&b| b == b'\n').count() as u64);
+                    if let Some(&b) = chunk.last() {
+                        last_byte = Some(b);
+                    }
                     if sampling {
                         buf.extend_from_slice(&chunk);
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -181,6 +196,15 @@ fn tap_native_payload(
                         }
                     }
                     yield chunk;
+                }
+                if last_byte.is_some_and(|b| b != b'\n') {
+                    state.add_count(1);
+                    if sampling
+                        && !buf.is_empty()
+                        && let Ok(v) = serde_json::from_slice::<Value>(&buf)
+                    {
+                        state.sample_record(v);
+                    }
                 }
             };
             NativePayload::Stream(Box::pin(tapped))
@@ -304,7 +328,12 @@ impl Sink for SamplingSink {
         } = batch;
         let tapped = faucet_core::NativeBatch {
             format,
-            payload: tap_native_payload(payload, format, std::sync::Arc::clone(&self.state)),
+            payload: tap_native_payload(
+                payload,
+                format,
+                records,
+                std::sync::Arc::clone(&self.state),
+            ),
             csv,
             records,
             bookmark,
@@ -425,7 +454,7 @@ impl Source for SamplingSource {
                 let faucet_core::NativeBatch { format, payload, csv, records, bookmark } = batch?;
                 yield faucet_core::NativeBatch {
                     format,
-                    payload: tap_native_payload(payload, format, std::sync::Arc::clone(&state)),
+                    payload: tap_native_payload(payload, format, records, std::sync::Arc::clone(&state)),
                     csv,
                     records,
                     bookmark,
@@ -725,12 +754,7 @@ mod tests {
             vec![faucet_core::NativeLoadCapability {
                 format: faucet_core::NativeFormat::NdJson,
                 mechanism: "test-native",
-                prerequisites: faucet_core::NativePrerequisites {
-                    requires_passthrough: true,
-                    delivery: &[faucet_core::DeliveryMode::AtLeastOnce],
-                    write_modes: &[faucet_core::WriteMode::Append],
-                    forbids_dlq: true,
-                },
+                write_modes: &[faucet_core::WriteMode::Append],
             }]
         }
         async fn load_native(
@@ -876,6 +900,59 @@ mod tests {
             .map(|(n, _)| n.clone())
             .collect();
         assert!(names.contains(&"id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_tap_counts_and_samples_a_final_line_without_trailing_newline() {
+        // `…{"id":2}` (no trailing `\n`) is a real record: the `Bytes` arm
+        // counts it via `split`, so the `Stream` arm must agree — same bytes,
+        // same count, regardless of payload variant.
+        use futures::StreamExt as _;
+        let shared = Arc::new(SampleState::new(10));
+        let chunks: Vec<Vec<u8>> = vec![b"{\"id\":1}\n{\"i".to_vec(), b"d\":2}".to_vec()];
+        let payload =
+            faucet_core::NativePayload::Stream(Box::pin(faucet_core::async_stream::try_stream! {
+                for c in chunks { yield c; }
+            }));
+        let tapped = tap_native_payload(
+            payload,
+            faucet_core::NativeFormat::NdJson,
+            None,
+            Arc::clone(&shared),
+        );
+        let mut collected: Vec<u8> = Vec::new();
+        match tapped {
+            faucet_core::NativePayload::Stream(mut st) => {
+                while let Some(c) = st.next().await {
+                    collected.extend_from_slice(&c.unwrap());
+                }
+            }
+            faucet_core::NativePayload::Bytes(_) => panic!("stream stays a stream"),
+        }
+        assert_eq!(collected, b"{\"id\":1}\n{\"id\":2}");
+        assert_eq!(shared.count(), 2, "trailing line must be counted");
+        assert_eq!(shared.samples().len(), 2, "trailing line must be sampled");
+    }
+
+    #[tokio::test]
+    async fn non_ndjson_tap_passes_through_but_still_counts_declared_records() {
+        // CSV/Parquet payloads carry no per-line structure the tap can parse,
+        // but a declared row count must still feed the volume counters so a
+        // successful native CSV run never shows zero rows in catalog/lineage.
+        let shared = Arc::new(SampleState::new(10));
+        let payload = faucet_core::NativePayload::Bytes(b"h\na,b\nc,d\n".to_vec());
+        let tapped = tap_native_payload(
+            payload,
+            faucet_core::NativeFormat::Csv,
+            Some(2),
+            Arc::clone(&shared),
+        );
+        match tapped {
+            faucet_core::NativePayload::Bytes(b) => assert_eq!(b, b"h\na,b\nc,d\n".to_vec()),
+            faucet_core::NativePayload::Stream(_) => panic!("bytes stay bytes"),
+        }
+        assert_eq!(shared.count(), 2, "declared count feeds the counter");
+        assert!(shared.samples().is_empty(), "no schema sample for CSV");
     }
 
     #[cfg(feature = "arrow")]

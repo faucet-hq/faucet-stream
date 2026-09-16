@@ -463,9 +463,21 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     && self.schema_drift.is_none()
                     && self.adaptive.is_none()
                     && self.resilience.is_none()
-                    && self.cleanup.is_none();
-                // Governance passes need `Value`; the planner's `requires_passthrough`
-                // prerequisite rejects them, so surface them as `has_governance`.
+                    && self.cleanup.is_none()
+                    // Upsert/Delete need per-row keys, which bytes never carry.
+                    // Without this gate an upsert-configured sink would be
+                    // misreported to the planner as `Append` and raw bytes
+                    // appended as duplicates — core owns this invariant, not
+                    // each connector's `load_native`.
+                    && !wrapped_sink.dedups_by_key()
+                    // Grouped fan-out overwrite (#552): the executor drives one
+                    // staging begin/commit per shared destination and suppresses
+                    // the per-invocation lifecycle. A native truncate-load would
+                    // bypass the staging table and truncate the live one, so
+                    // fall through to the `Value` path, which honors staging.
+                    && !(wrapped_sink.is_overwrite() && self.suppress_overwrite_lifecycle);
+                // Governance passes need `Value`; the planner rejects them
+                // unconditionally, so surface them as `has_governance`.
                 // `mut` is used only when a governance feature is enabled.
                 #[allow(unused_mut)]
                 let mut has_governance = false;
@@ -505,12 +517,16 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             (Some(store), Some(key)) => Some((store, key)),
                             _ => None,
                         };
+                        // Same scope derivation as the `Value` path: the state
+                        // key (empty when none) — one meaning across paths.
+                        let scope = state_key.clone().unwrap_or_default();
                         return run_stream_native(
                             &wrapped_source,
                             &wrapped_sink,
                             plan,
                             write_mode,
                             state,
+                            scope,
                             self.cancel.clone(),
                             &name,
                             &row,
@@ -830,15 +846,20 @@ where
 /// (flush → persist bookmark, ADR 0002; cooperative cancel at the batch
 /// boundary, ADR 0011).
 ///
-/// **Overwrite is owned by the mechanism**, not the generic
-/// `begin`/`commit`/`abort` lifecycle: a sink whose native capability lists
-/// [`WriteMode::Overwrite`](crate::write_mode::WriteMode::Overwrite) in its
-/// prerequisites truncates on the first batch and appends thereafter, driven by
-/// [`NativeLoadContext::first_batch`](crate::native::NativeLoadContext::first_batch).
-/// The `Value`-based staging swap (#492) cannot apply here — `load_native`
-/// carries bytes, not `Value` rows — so a sink that cannot own overwrite simply
-/// omits `Overwrite` from `write_modes`, and the negotiation falls through to the
-/// `Value` path.
+/// **Overwrite keeps the #492 atomicity guarantee.** The `Value`-based staging
+/// swap cannot apply here — `load_native` carries bytes, not `Value` rows — so
+/// the mechanism itself must be all-or-nothing: batches accumulate in the
+/// sink's load session (truncate semantics keyed off
+/// [`NativeLoadContext::first_batch`](crate::native::NativeLoadContext::first_batch))
+/// and the session is finalized by exactly **one** terminal `flush`, issued
+/// only after the stream completed successfully. Under overwrite this loop
+/// therefore never flushes mid-run (a mid-run flush would commit the
+/// truncate-load and turn the full refresh into truncate + partial appends),
+/// holds any bookmark until after the terminal flush, and on cancellation or
+/// error returns **without flushing** — nothing was finalized, so the prior
+/// destination is untouched, matching the value path's `abort_overwrite`.
+/// A sink whose native mechanism cannot satisfy "nothing is visible until the
+/// terminal flush" must omit `Overwrite` from its capability `write_modes`.
 #[allow(clippy::too_many_arguments)]
 async fn run_stream_native<S, Si>(
     source: &S,
@@ -846,6 +867,7 @@ async fn run_stream_native<S, Si>(
     plan: crate::native::NativePlan,
     write_mode: crate::write_mode::WriteMode,
     state: Option<(Arc<dyn StateStore>, String)>,
+    scope: String,
     cancel: Option<tokio_util::sync::CancellationToken>,
     pipeline: &str,
     row: &str,
@@ -866,11 +888,7 @@ where
     };
     let src_labels = labels(source.connector_name());
     let sink_labels = labels(sink.connector_name());
-    let scope = if row.is_empty() {
-        pipeline.to_string()
-    } else {
-        format!("{pipeline}::{row}")
-    };
+    let overwrite = write_mode == crate::write_mode::WriteMode::Overwrite;
 
     tracing::info!(
         pipeline = %pipeline,
@@ -883,14 +901,19 @@ where
     let mut batches = source.stream_native(&ctx, plan.format, DEFAULT_BATCH_SIZE);
     let mut records_written = 0usize;
     let mut last_bookmark: Option<Value> = None;
+    // Under overwrite, bookmarks are held until the terminal flush — persisting
+    // one before the load is finalized would let a resume skip past records
+    // the (re-)truncate then wipes.
+    let mut pending_bookmark: Option<Value> = None;
     let mut first_batch = true;
+    let mut cancelled = false;
 
     loop {
         let next = match &cancel {
             Some(token) => {
                 tokio::select! {
                     biased;
-                    _ = token.cancelled() => break,
+                    _ = token.cancelled() => { cancelled = true; break },
                     p = batches.next() => p,
                 }
             }
@@ -914,15 +937,37 @@ where
 
         // Checkpoint: flush then persist the bookmark (ADR 0002).
         if let Some(bm) = bookmark {
-            sink.flush().await?;
-            if let Some((store, key)) = state.as_ref() {
-                store.put(key, &bm).await?;
+            if overwrite {
+                pending_bookmark = Some(bm);
+            } else {
+                sink.flush().await?;
+                if let Some((store, key)) = state.as_ref() {
+                    store.put(key, &bm).await?;
+                }
+                last_bookmark = Some(bm);
             }
-            last_bookmark = Some(bm);
         }
     }
-    // Final flush (mirrors the end-of-stream / on-cancel flush).
+    if cancelled && overwrite {
+        // Nothing was finalized — the prior destination is untouched (the
+        // native analogue of the value path's `abort_overwrite`). Report the
+        // partial count with no bookmark; the caller classifies the run.
+        return Ok(PipelineResult {
+            records_written,
+            bookmark: None,
+            dlq: None,
+        });
+    }
+    // Terminal flush: end-of-stream (or cancel under append, where committing
+    // the partial batch is at-least-once-safe). For overwrite this is the
+    // single point where the destination becomes visible.
     sink.flush().await?;
+    if let Some(bm) = pending_bookmark {
+        if let Some((store, key)) = state.as_ref() {
+            store.put(key, &bm).await?;
+        }
+        last_bookmark = Some(bm);
+    }
 
     Ok(PipelineResult {
         records_written,
@@ -2029,13 +2074,25 @@ where
             FaucetError::Sink(format!("DLQ sink flush failed: {e}"))
         })?;
     }
-    sink.flush().await?;
-
-    if cancelled {
+    if cancelled && sink.is_overwrite() {
+        // A cancelled overwrite must NOT finalize: for a direct (non-staged)
+        // overwrite the flush would commit a partial truncate-load as if it
+        // were the full refresh; for a staged one the staging table is
+        // discarded by `abort_overwrite` anyway, so skipping the flush loses
+        // nothing. The prior destination stays untouched either way.
         tracing::info!(
             records_written,
-            "pipeline run cancelled cooperatively; sink flushed (partial output is durable)"
+            "pipeline run cancelled during overwrite; terminal flush skipped so the \
+             destination is unchanged"
         );
+    } else {
+        sink.flush().await?;
+        if cancelled {
+            tracing::info!(
+                records_written,
+                "pipeline run cancelled cooperatively; sink flushed (partial output is durable)"
+            );
+        }
     }
 
     tracing::info!(
@@ -6407,6 +6464,20 @@ mod cleanup_tests {
     /// path (so a fallback test can exercise both).
     struct NativeCsvSource {
         batches: usize,
+        /// Emit a bookmark on every batch (CDC-style) instead of only the last.
+        bookmark_every: bool,
+        /// Natural state key, when resumability should be exercised.
+        key: Option<&'static str>,
+    }
+
+    impl NativeCsvSource {
+        fn new(batches: usize) -> Self {
+            Self {
+                batches,
+                bookmark_every: false,
+                key: None,
+            }
+        }
     }
 
     #[async_trait]
@@ -6416,6 +6487,9 @@ mod cleanup_tests {
             _context: &std::collections::HashMap<String, Value>,
         ) -> Result<Vec<Value>, FaucetError> {
             Ok(vec![json!({"a": 1})])
+        }
+        fn state_key(&self) -> Option<String> {
+            self.key.map(str::to_string)
         }
         fn native_output_formats(&self) -> &'static [crate::native::NativeFormat] {
             &[crate::native::NativeFormat::Csv]
@@ -6429,11 +6503,12 @@ mod cleanup_tests {
         {
             assert_eq!(format, crate::native::NativeFormat::Csv);
             let n = self.batches;
+            let every = self.bookmark_every;
             Box::pin(async_stream::stream! {
                 for i in 0..n {
                     let last = i + 1 == n;
                     let bytes = format!("h\nrow{i}\n").into_bytes();
-                    let bm = if last { Some(json!({"page": i})) } else { None };
+                    let bm = if every || last { Some(json!({"page": i})) } else { None };
                     yield Ok(crate::native::NativeBatch::bytes(
                         crate::native::NativeFormat::Csv, bytes,
                     ).with_records(Some(1)).with_bookmark(bm));
@@ -6443,12 +6518,13 @@ mod cleanup_tests {
     }
 
     /// A sink advertising a BigQuery-like native CSV load capability, recording
-    /// every `load_native` call plus the overwrite lifecycle.
+    /// every `load_native` call, flushes, and the overwrite lifecycle.
     struct NativeRecordingSink {
         loads: Arc<std::sync::Mutex<Vec<(usize, bool)>>>, // (rows, first_batch)
         modes: Arc<std::sync::Mutex<Vec<crate::write_mode::WriteMode>>>,
         events: Arc<std::sync::Mutex<Vec<String>>>,
         overwrite: bool,
+        dedups: bool,
     }
 
     impl NativeRecordingSink {
@@ -6458,6 +6534,15 @@ mod cleanup_tests {
                 modes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 events: Arc::new(std::sync::Mutex::new(Vec::new())),
                 overwrite,
+                dedups: false,
+            }
+        }
+
+        /// An upsert-configured sink (`write_mode: upsert` + key).
+        fn upserting() -> Self {
+            Self {
+                dedups: true,
+                ..Self::new(false)
             }
         }
     }
@@ -6475,15 +6560,10 @@ mod cleanup_tests {
             vec![crate::native::NativeLoadCapability {
                 format: crate::native::NativeFormat::Csv,
                 mechanism: "mock-load",
-                prerequisites: crate::native::NativePrerequisites {
-                    requires_passthrough: true,
-                    delivery: &[crate::idempotency::DeliveryMode::AtLeastOnce],
-                    write_modes: &[
-                        crate::write_mode::WriteMode::Append,
-                        crate::write_mode::WriteMode::Overwrite,
-                    ],
-                    forbids_dlq: true,
-                },
+                write_modes: &[
+                    crate::write_mode::WriteMode::Append,
+                    crate::write_mode::WriteMode::Overwrite,
+                ],
             }]
         }
         async fn load_native(
@@ -6513,8 +6593,15 @@ mod cleanup_tests {
             self.modes.lock().unwrap().push(ctx.write_mode);
             Ok(rows)
         }
+        async fn flush(&self) -> Result<(), FaucetError> {
+            self.events.lock().unwrap().push("flush".into());
+            Ok(())
+        }
         fn is_overwrite(&self) -> bool {
             self.overwrite
+        }
+        fn dedups_by_key(&self) -> bool {
+            self.dedups
         }
         async fn begin_overwrite(&self) -> Result<(), FaucetError> {
             self.events.lock().unwrap().push("begin".into());
@@ -6530,9 +6617,31 @@ mod cleanup_tests {
         }
     }
 
+    /// Events that indicate the `Value` write path or the generic overwrite
+    /// lifecycle ran (flushes are recorded too but are legitimate on the
+    /// native path).
+    fn value_path_events(events: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e != "flush")
+            .cloned()
+            .collect()
+    }
+
+    fn flush_count(events: &std::sync::Mutex<Vec<String>>) -> usize {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "flush")
+            .count()
+    }
+
     #[tokio::test]
     async fn native_path_selected_and_appends() {
-        let source = NativeCsvSource { batches: 2 };
+        let source = NativeCsvSource::new(2);
         let sink = NativeRecordingSink::new(false);
         let loads = sink.loads.clone();
         let events = sink.events.clone();
@@ -6544,25 +6653,31 @@ mod cleanup_tests {
         assert_eq!(result.bookmark, Some(json!({"page": 1})));
         // The `Value` write path was never used.
         assert!(
-            events.lock().unwrap().is_empty(),
+            value_path_events(&events).is_empty(),
             "no Value writes: {events:?}"
         );
     }
 
     #[tokio::test]
     async fn native_path_persists_bookmark() {
-        let source = NativeCsvSource { batches: 1 };
+        let source = NativeCsvSource {
+            key: Some("native-test"),
+            ..NativeCsvSource::new(1)
+        };
         let sink = NativeRecordingSink::new(false);
         let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
         Pipeline::new(&source, &sink)
             .with_state_store(Arc::clone(&store))
-            // A state key is needed for persistence; MemoryStateStore accepts any.
             .run()
             .await
             .unwrap();
-        // NativeCsvSource has no state_key(), so nothing is persisted — assert the
-        // run still succeeds via the native path (load happened).
         assert_eq!(sink.loads.lock().unwrap().len(), 1);
+        // The final batch's bookmark landed in the state store under the
+        // source's natural key.
+        assert_eq!(
+            store.get("native-test").await.unwrap(),
+            Some(json!({"page": 0}))
+        );
     }
 
     #[tokio::test]
@@ -6571,7 +6686,7 @@ mod cleanup_tests {
         // truncate/append itself via `NativeLoadContext` — the pipeline does NOT
         // drive the generic begin/commit staging lifecycle (that path is
         // `Value`-based and can't apply to byte loads).
-        let source = NativeCsvSource { batches: 2 };
+        let source = NativeCsvSource::new(2);
         let sink = NativeRecordingSink::new(true);
         let modes = sink.modes.clone();
         let loads = sink.loads.clone();
@@ -6589,17 +6704,125 @@ mod cleanup_tests {
         assert_eq!(*loads.lock().unwrap(), vec![(1, true), (1, false)]);
         // The generic overwrite lifecycle was never invoked.
         assert!(
-            events.lock().unwrap().is_empty(),
+            value_path_events(&events).is_empty(),
             "no begin/commit: {events:?}"
         );
     }
 
     #[tokio::test]
+    async fn native_overwrite_flushes_exactly_once_despite_midrun_bookmarks() {
+        // A checkpointing source under overwrite must NOT trigger a mid-run
+        // flush — that would finalize the truncate-load and turn the full
+        // refresh into truncate + partial appends. One terminal flush only,
+        // and the bookmark is persisted only after it.
+        let source = NativeCsvSource {
+            bookmark_every: true,
+            key: Some("ovw-key"),
+            ..NativeCsvSource::new(3)
+        };
+        let sink = NativeRecordingSink::new(true);
+        let events = sink.events.clone();
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let result = Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(flush_count(&events), 1, "one terminal flush: {events:?}");
+        assert_eq!(result.bookmark, Some(json!({"page": 2})));
+        assert_eq!(
+            store.get("ovw-key").await.unwrap(),
+            Some(json!({"page": 2})),
+            "bookmark persisted after the terminal flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_overwrite_cancel_commits_nothing() {
+        // Cancellation under overwrite must return WITHOUT flushing — nothing
+        // is finalized, so the prior destination stays untouched (the native
+        // analogue of abort_overwrite). A cancelled flush here would commit a
+        // partial truncate-load as if it were the full refresh.
+        let source = NativeCsvSource::new(2);
+        let sink = NativeRecordingSink::new(true);
+        let events = sink.events.clone();
+        let token = crate::CancellationToken::new();
+        token.cancel(); // cancelled before the first batch is polled
+        let result = Pipeline::new(&source, &sink)
+            .with_cancel(token)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(flush_count(&events), 0, "no flush on cancel: {events:?}");
+        assert_eq!(result.records_written, 0);
+        assert_eq!(result.bookmark, None);
+    }
+
+    #[tokio::test]
+    async fn native_append_cancel_still_flushes() {
+        // Under append, committing the partial batch on cancel is
+        // at-least-once-safe and mirrors the Value path's flush-on-cancel.
+        let source = NativeCsvSource::new(2);
+        let sink = NativeRecordingSink::new(false);
+        let events = sink.events.clone();
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        Pipeline::new(&source, &sink)
+            .with_cancel(token)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(flush_count(&events), 1, "terminal flush: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn native_path_falls_back_to_value_for_upsert_sink() {
+        // An upsert-configured sink (dedups_by_key) needs per-row keys, which
+        // bytes never carry — core must fall back to the Value path rather
+        // than misreport the mode as Append and append duplicates.
+        let source = NativeCsvSource::new(1);
+        let sink = NativeRecordingSink::upserting();
+        let loads = sink.loads.clone();
+        let events = sink.events.clone();
+        Pipeline::new(&source, &sink).run().await.unwrap();
+        assert!(loads.lock().unwrap().is_empty(), "native path must not run");
+        assert!(
+            value_path_events(&events)
+                .iter()
+                .any(|e| e.starts_with("write:")),
+            "Value path must run: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_path_falls_back_when_overwrite_lifecycle_suppressed() {
+        // Grouped fan-out overwrite (#552): the executor owns one staging
+        // begin/commit per destination — a native truncate-load would bypass
+        // the staging table and truncate the live one.
+        let source = NativeCsvSource::new(1);
+        let sink = NativeRecordingSink::new(true);
+        let loads = sink.loads.clone();
+        let events = sink.events.clone();
+        Pipeline::new(&source, &sink)
+            .with_suppress_overwrite(true)
+            .run()
+            .await
+            .unwrap();
+        assert!(loads.lock().unwrap().is_empty(), "native path must not run");
+        assert!(
+            value_path_events(&events)
+                .iter()
+                .any(|e| e.starts_with("write:")),
+            "Value path must run: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn native_path_falls_back_to_value_when_dlq_present() {
-        // A DLQ trips the `forbids_dlq` prerequisite → the planner returns None →
+        // A DLQ trips the pipeline-owned gate → the planner returns None →
         // the pipeline uses the `Value` write path, never `load_native`.
         use crate::dlq::OnBatchError;
-        let source = NativeCsvSource { batches: 1 };
+        let source = NativeCsvSource::new(1);
         let sink = NativeRecordingSink::new(false);
         let loads = sink.loads.clone();
         let events = sink.events.clone();
@@ -6615,9 +6838,7 @@ mod cleanup_tests {
             .unwrap();
         assert!(loads.lock().unwrap().is_empty(), "native path must not run");
         assert!(
-            events
-                .lock()
-                .unwrap()
+            value_path_events(&events)
                 .iter()
                 .any(|e| e.starts_with("write:")),
             "Value path must run: {events:?}"

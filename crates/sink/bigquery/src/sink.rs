@@ -2014,36 +2014,39 @@ impl faucet_core::Sink for BigQuerySink {
 
     /// Native byte-passthrough load (#633): BigQuery can bulk-load NDJSON or CSV
     /// bytes directly via a load job, so a source that emits either format
-    /// streams straight in without ever building `Value` rows. Passthrough-only
-    /// (no transforms/governance), at-least-once, append or overwrite, no DLQ.
+    /// streams straight in without ever building `Value` rows. The pipeline's
+    /// own gates already exclude transforms/governance/DLQ/exactly-once and
+    /// upsert/delete write modes (defense in depth: the upsert check below
+    /// stays so this sink never advertises a path it can't honor even if
+    /// called outside the pipeline).
     fn native_load_capabilities(&self) -> Vec<faucet_core::NativeLoadCapability> {
-        // Upsert/delete need per-row keys, so they are not passthrough-eligible;
-        // advertise only when the configured write mode is append or overwrite.
+        // Upsert/delete need per-row keys, so they are not passthrough-eligible.
         if matches!(
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
         ) {
             return Vec::new();
         }
-        let prerequisites = faucet_core::NativePrerequisites {
-            requires_passthrough: true,
-            delivery: &[faucet_core::DeliveryMode::AtLeastOnce],
-            write_modes: &[
-                faucet_core::WriteMode::Append,
-                faucet_core::WriteMode::Overwrite,
-            ],
-            forbids_dlq: true,
-        };
         vec![
+            // NDJSON feeds one resumable session finalized only by the terminal
+            // `flush`, so it satisfies the all-or-nothing overwrite contract:
+            // nothing is visible until the single WRITE_TRUNCATE load commits.
             faucet_core::NativeLoadCapability {
                 format: faucet_core::NativeFormat::NdJson,
                 mechanism: "bigquery-load-job",
-                prerequisites: prerequisites.clone(),
+                write_modes: &[
+                    faucet_core::WriteMode::Append,
+                    faucet_core::WriteMode::Overwrite,
+                ],
             },
+            // CSV runs a discrete load job per batch, each committing on its
+            // own — a multi-batch overwrite would be truncate + partial appends
+            // rather than one atomic replace, so CSV is append-only here.
+            // (CSV + overwrite falls through to the Value path's staging swap.)
             faucet_core::NativeLoadCapability {
                 format: faucet_core::NativeFormat::Csv,
                 mechanism: "bigquery-load-job",
-                prerequisites,
+                write_modes: &[faucet_core::WriteMode::Append],
             },
         ]
     }

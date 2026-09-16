@@ -19,10 +19,11 @@
 //! and a sink advertises mechanisms via
 //! [`Sink::native_load_capabilities`](crate::Sink::native_load_capabilities). The
 //! pipeline uses the path only when [`plan_native_transfer`] finds a sink
-//! capability whose format the source offers *and* whose [`NativePrerequisites`]
-//! all hold. The "no transformation between" prerequisite is enforced the same
-//! way the columnar path does it — a
-//! [`TransformingSource`](crate::TransformingSource) does not override
+//! capability whose format the source offers and whose write modes cover the
+//! run — after the planner's own unconditional gates (no transforms, no
+//! quality/contract/masking pass, no DLQ, at-least-once only) have passed.
+//! The "no transformation between" gate is additionally enforced structurally —
+//! a [`TransformingSource`](crate::TransformingSource) does not override
 //! `native_output_formats`, so any attached transform makes the wrapped source
 //! advertise no formats and the fast path falls through to the `Value` path.
 //!
@@ -163,40 +164,28 @@ impl NativeBatch {
     }
 }
 
-/// An efficient native-load mechanism a sink offers, plus the prerequisites the
-/// pipeline must satisfy to use it. A sink returns one of these per mechanism it
-/// supports from [`Sink::native_load_capabilities`](crate::Sink::native_load_capabilities).
+/// An efficient native-load mechanism a sink offers. A sink returns one of
+/// these per mechanism it supports from
+/// [`Sink::native_load_capabilities`](crate::Sink::native_load_capabilities).
+///
+/// A capability declares only what genuinely varies per mechanism: the format
+/// and the write modes it can honor. Everything a byte passthrough can never
+/// support — transforms, the quality/contract/masking governance passes,
+/// per-row DLQ routing, exactly-once delivery — is gated **unconditionally by
+/// the pipeline** ([`plan_native_transfer`] rejects those runs outright). No
+/// capability can waive those gates: they need `Value` access or a commit-token
+/// protocol the byte path structurally does not have, so a declarative opt-out
+/// could only ship silently-unenforced governance.
 #[derive(Clone, Debug)]
 pub struct NativeLoadCapability {
     /// The wire format this mechanism consumes.
     pub format: NativeFormat,
     /// A short, stable label for logs / metrics (e.g. `"bigquery-load-job"`).
     pub mechanism: &'static str,
-    /// What must hold for the pipeline to select this mechanism.
-    pub prerequisites: NativePrerequisites,
-}
-
-/// The declarative preconditions for a [`NativeLoadCapability`]. The pipeline
-/// checks every one against the run's actual configuration; all must hold.
-#[derive(Clone, Debug)]
-pub struct NativePrerequisites {
-    /// The pipeline must have **no per-record processing** between source and
-    /// sink — no transforms and no quality / contract / masking / schema-drift
-    /// passes. Those need `Value` access, which a byte passthrough never
-    /// produces. (Transforms are enforced implicitly: a
-    /// [`TransformingSource`](crate::TransformingSource) advertises no native
-    /// formats. `has_governance` covers the rest.)
-    pub requires_passthrough: bool,
-    /// Delivery modes this mechanism can honor. v1 mechanisms list only
-    /// [`DeliveryMode::AtLeastOnce`], mirroring the columnar path.
-    pub delivery: &'static [DeliveryMode],
     /// Write modes this mechanism can honor (typically `Append` and/or
-    /// `Overwrite`; `Upsert`/`Delete` need per-row keys and so are not
-    /// passthrough-eligible).
+    /// `Overwrite`; `Upsert`/`Delete` need per-row keys and so are never
+    /// passthrough-eligible — the pipeline rejects them before matching).
     pub write_modes: &'static [WriteMode],
-    /// Whether a DLQ makes this mechanism ineligible — a single byte batch
-    /// cannot be split into per-row successes/failures.
-    pub forbids_dlq: bool,
 }
 
 /// Per-call context the pipeline hands each
@@ -242,18 +231,36 @@ pub struct NativePlan {
 
 /// Decide whether a native byte-passthrough fast path applies, and which.
 ///
-/// Deterministic and pure: walks the source's formats **in preference order** and
-/// returns the first one for which some sink capability matches and every
-/// [`NativePrerequisites`] holds. Source preference order therefore breaks ties
-/// when the sink offers several matching formats. Returns `None` when no
-/// mechanism qualifies — the caller then falls through to the columnar or `Value`
-/// path unchanged.
+/// Deterministic and pure. First the **pipeline-owned gates** run — these are
+/// unconditional and no capability can waive them:
+///
+/// - transforms or any quality/contract/masking pass (`has_transforms` /
+///   `has_governance`): those need per-record `Value` access, which a byte
+///   passthrough never produces — running them would silently skip governance;
+/// - a configured DLQ (`has_dlq`): a byte batch cannot be split into per-row
+///   successes/failures, so the DLQ would be silently inert;
+/// - any delivery other than [`DeliveryMode::AtLeastOnce`]: the native runner
+///   implements no commit-token protocol, so exactly-once is rejected
+///   structurally rather than sold as a capability flag.
+///
+/// Then it walks the source's formats **in preference order** and returns the
+/// first one for which some sink capability matches on format and lists the
+/// run's write mode. Source preference order therefore breaks ties when the
+/// sink offers several matching formats. Returns `None` when no mechanism
+/// qualifies — the caller then falls through to the columnar or `Value` path
+/// unchanged.
 pub fn plan_native_transfer(inputs: &NativePlanInputs<'_>) -> Option<NativePlan> {
+    if inputs.has_transforms || inputs.has_governance || inputs.has_dlq {
+        return None;
+    }
+    if inputs.delivery != DeliveryMode::AtLeastOnce {
+        return None;
+    }
     for &format in inputs.source_formats {
         if let Some(cap) = inputs
             .sink_caps
             .iter()
-            .find(|cap| cap.format == format && prerequisites_hold(&cap.prerequisites, inputs))
+            .find(|cap| cap.format == format && cap.write_modes.contains(&inputs.write_mode))
         {
             return Some(NativePlan {
                 format: cap.format,
@@ -264,46 +271,22 @@ pub fn plan_native_transfer(inputs: &NativePlanInputs<'_>) -> Option<NativePlan>
     None
 }
 
-/// Whether every prerequisite of a capability holds for the given run inputs.
-fn prerequisites_hold(p: &NativePrerequisites, inputs: &NativePlanInputs<'_>) -> bool {
-    if p.requires_passthrough && (inputs.has_transforms || inputs.has_governance) {
-        return false;
-    }
-    if !p.delivery.contains(&inputs.delivery) {
-        return false;
-    }
-    if !p.write_modes.contains(&inputs.write_mode) {
-        return false;
-    }
-    if p.forbids_dlq && inputs.has_dlq {
-        return false;
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A BigQuery-like capability: NDJSON + CSV, passthrough-only, at-least-once,
-    /// append or overwrite, no DLQ.
+    /// A BigQuery-like capability: NDJSON + CSV, append or overwrite.
     fn bq_caps() -> Vec<NativeLoadCapability> {
-        let prereq = NativePrerequisites {
-            requires_passthrough: true,
-            delivery: &[DeliveryMode::AtLeastOnce],
-            write_modes: &[WriteMode::Append, WriteMode::Overwrite],
-            forbids_dlq: true,
-        };
         vec![
             NativeLoadCapability {
                 format: NativeFormat::NdJson,
                 mechanism: "bigquery-load-job",
-                prerequisites: prereq.clone(),
+                write_modes: &[WriteMode::Append, WriteMode::Overwrite],
             },
             NativeLoadCapability {
                 format: NativeFormat::Csv,
                 mechanism: "bigquery-load-job",
-                prerequisites: prereq,
+                write_modes: &[WriteMode::Append, WriteMode::Overwrite],
             },
         ]
     }
@@ -370,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_prereq_blocks_transforms_and_governance() {
+    fn transforms_and_governance_gates_block_unconditionally() {
         let caps = bq_caps();
         let src = [NativeFormat::Csv];
         let mut inp = base(&src, &caps);
@@ -382,27 +365,36 @@ mod tests {
     }
 
     #[test]
-    fn non_passthrough_capability_allows_transforms() {
-        // A hypothetical mechanism that does not require passthrough.
+    fn governance_and_dlq_gates_are_not_capability_waivable() {
+        // Even the most permissive capability shape cannot opt out of the
+        // pipeline-owned governance/DLQ gates — those need `Value` access, so
+        // a waiver could only ship silently-unenforced governance.
         let caps = vec![NativeLoadCapability {
             format: NativeFormat::Csv,
             mechanism: "tolerant",
-            prerequisites: NativePrerequisites {
-                requires_passthrough: false,
-                delivery: &[DeliveryMode::AtLeastOnce],
-                write_modes: &[WriteMode::Append],
-                forbids_dlq: false,
-            },
+            write_modes: &[
+                WriteMode::Append,
+                WriteMode::Overwrite,
+                WriteMode::Upsert,
+                WriteMode::Delete,
+            ],
         }];
         let src = [NativeFormat::Csv];
         let mut inp = base(&src, &caps);
         inp.has_transforms = true;
+        assert_eq!(plan_native_transfer(&inp), None, "transforms must block");
+        let mut inp = base(&src, &caps);
         inp.has_governance = true;
-        assert!(plan_native_transfer(&inp).is_some());
+        assert_eq!(plan_native_transfer(&inp), None, "governance must block");
+        let mut inp = base(&src, &caps);
+        inp.has_dlq = true;
+        assert_eq!(plan_native_transfer(&inp), None, "DLQ must block");
     }
 
     #[test]
-    fn delivery_prereq_blocks_exactly_once() {
+    fn exactly_once_is_rejected_structurally() {
+        // The native runner implements no commit-token protocol, so no
+        // capability can declare exactly-once support.
         let caps = bq_caps();
         let src = [NativeFormat::Csv];
         let mut inp = base(&src, &caps);
@@ -411,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn write_mode_prereq_blocks_upsert() {
+    fn write_mode_gate_blocks_unlisted_modes() {
         let caps = bq_caps();
         let src = [NativeFormat::Csv];
         let mut inp = base(&src, &caps);
@@ -424,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn dlq_prereq_blocks_when_forbidden() {
+    fn dlq_gate_blocks_unconditionally() {
         let caps = bq_caps();
         let src = [NativeFormat::Csv];
         let mut inp = base(&src, &caps);

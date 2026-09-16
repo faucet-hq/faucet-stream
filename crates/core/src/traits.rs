@@ -447,13 +447,17 @@ pub trait Sink: Send + Sync {
         self.write_batch(&rows).await
     }
 
-    /// Native byte-passthrough load mechanisms this sink offers, each with the
-    /// prerequisites the pipeline must satisfy to use it (#633). Default:
+    /// Native byte-passthrough load mechanisms this sink offers, each naming
+    /// the wire format and the write modes it can honor (#633). Default:
     /// `vec![]` (no fast path; use [`write_batch`](Self::write_batch)).
     ///
-    /// The pipeline takes the native path only when a source advertises a format
-    /// this returns and every [`NativePrerequisites`](crate::NativePrerequisites)
-    /// holds — see [`plan_native_transfer`](crate::plan_native_transfer).
+    /// The pipeline takes the native path only when a source advertises a
+    /// format this returns and the run passes the pipeline-owned gates — no
+    /// transforms, no quality/contract/masking pass, no DLQ, at-least-once
+    /// delivery, no upsert/delete `write_mode`, and (for overwrite) an
+    /// all-or-nothing load session finalized by a single terminal `flush` —
+    /// see [`plan_native_transfer`](crate::plan_native_transfer). A capability
+    /// cannot waive those gates.
     fn native_load_capabilities(&self) -> Vec<crate::native::NativeLoadCapability> {
         Vec::new()
     }
