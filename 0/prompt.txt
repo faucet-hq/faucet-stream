@@ -776,3 +776,11 @@ Now, you do one thing: see what changes we have made in this PR. The idea of thi
 Now look at the PR, review the whole PR thoroughly, and review it very critically. See if there is anything that you feel doesn't match 100% to the standard that we are trying to follow. Add this as a principle.md on how the coding standard of this repo should be. We should be making this repo very generic, very extensible, very easy to read, and it should follow all the best coding practises so that we can easily expand it into the future. We can easily change it, tweak it, and the verbs and everything used are very generic.
 
 The structuring of the keys and the input YAML should also be very thoughtful. Rather than putting keys all together, there should be good grouping and sub-grouping of the keys, and a good hierarchy should be followed, rather than just creating a flat list of input.
+
+---
+
+Let's fix all these issues in the same PR itself. I don't want to ship a PR then fix it later. That's not what our principle should be. If you identified an issue in an existing PR, we ship it right now before it goes to the main branch. We don't do offloading for a later fix when an issue is already identified. Also, make that in principle.md as well. Secondly I think one of the important things that we are missing right now is the lack of integration tests. Analyse it, think it through, know the product inside and out, and see what all kinds of integration tests we should add so that we can always, always rely on whatever we are shipping working fine.
+
+Currently, add that as a GitHub issue with the full description. Be as descriptive as possible so that the next session can pick it up clearly.
+
+Think about the product, think about what we are building, understand the concept behind it, and then think about what kinds of integration tests should definitely be covered. Categorise those integration tests and see in what cases what kinds of integration tests should definitely be added so that when we ship something, we ship it reliably.
