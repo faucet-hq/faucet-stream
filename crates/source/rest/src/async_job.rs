@@ -192,10 +192,9 @@ impl AsyncJobConfig {
             .is_some_and(serde_json::Value::is_string)
     }
 
-    /// The parsed `lookback` margin (default
-    /// [`DEFAULT_BOOKMARK_LOOKBACK_SECS`] — see the field docs). A malformed
-    /// value is rejected by `validate()`; this falls back to the default
-    /// rather than panicking for callers that skipped validation.
+    /// The parsed `lookback` margin (default 5 minutes — see the field docs).
+    /// A malformed value is rejected by `validate()`; this falls back to the
+    /// default rather than panicking for callers that skipped validation.
     pub fn lookback_duration(&self) -> chrono::Duration {
         self.lookback
             .as_deref()

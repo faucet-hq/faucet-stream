@@ -270,13 +270,14 @@ export async function renderLocalOutputs(host, scope = {}) {
   // Collapse the Manage disclosure when clicking anywhere outside it. One
   // delegated document listener per panel render — installed here (not inside
   // `load()`, which re-runs on every refresh/toggle and would accumulate one
-  // listener per click) and removed by the returned cleanup.
+  // listener per click) and removed by the returned teardown. (Named
+  // `removeListeners` — `cleanup` is already the local-outputs sweep helper.)
   const collapseManage = (e) => {
     const manage = host.querySelector(".lo-manage");
     if (manage && manage.open && !manage.contains(e.target)) manage.open = false;
   };
   document.addEventListener("click", collapseManage);
-  const cleanup = () => document.removeEventListener("click", collapseManage);
+  const removeListeners = () => document.removeEventListener("click", collapseManage);
   let showExpired = false;
 
   host.innerHTML = `
@@ -443,7 +444,7 @@ export async function renderLocalOutputs(host, scope = {}) {
   }
 
   await load();
-  return cleanup;
+  return removeListeners;
 }
 
 function outputRow(o, canManage, canPreview) {
