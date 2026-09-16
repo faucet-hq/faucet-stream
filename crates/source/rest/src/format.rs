@@ -32,17 +32,39 @@ pub async fn parse_csv(
             headers = Some(rec.iter().map(str::to_string).collect());
             continue;
         }
-        let mut obj = Map::new();
-        for (i, field) in rec.iter().enumerate() {
-            let key = headers
-                .as_ref()
-                .and_then(|h| h.get(i).cloned())
-                .unwrap_or_else(|| format!("column_{i}"));
-            obj.insert(key, Value::String(field.to_string()));
-        }
-        out.push(Value::Object(obj));
+        out.push(Value::Object(csv_record_to_object(
+            &rec,
+            headers.as_deref(),
+        )));
     }
     Ok(out)
+}
+
+/// The single definition of how a CSV record becomes a JSON object — header-
+/// derived keys with the `column_<i>` fallback, all-`String` values. Shared by
+/// the `Value` path ([`parse_csv`]) and both NDJSON converters so the encodings
+/// can never drift apart (the parity tests additionally pin them byte-identical).
+fn csv_record_to_object(
+    rec: &csv_async::StringRecord,
+    headers: Option<&[String]>,
+) -> Map<String, Value> {
+    let mut obj = Map::new();
+    for (i, field) in rec.iter().enumerate() {
+        let key = headers
+            .and_then(|h| h.get(i).cloned())
+            .unwrap_or_else(|| format!("column_{i}"));
+        obj.insert(key, Value::String(field.to_string()));
+    }
+    obj
+}
+
+/// [`csv_record_to_object`] serialized as one NDJSON line (no trailing newline).
+fn csv_record_to_ndjson_line(
+    rec: &csv_async::StringRecord,
+    headers: Option<&[String]>,
+) -> Result<String, FaucetError> {
+    serde_json::to_string(&Value::Object(csv_record_to_object(rec, headers)))
+        .map_err(|e| FaucetError::Source(format!("rest: CSV→NDJSON encode error: {e}")))
 }
 
 /// Stream CSV bytes straight to newline-delimited JSON **without materializing a
@@ -76,16 +98,7 @@ pub async fn csv_to_ndjson(
             headers = Some(rec.iter().map(str::to_string).collect());
             continue;
         }
-        let mut obj = Map::new();
-        for (i, field) in rec.iter().enumerate() {
-            let key = headers
-                .as_ref()
-                .and_then(|h| h.get(i).cloned())
-                .unwrap_or_else(|| format!("column_{i}"));
-            obj.insert(key, Value::String(field.to_string()));
-        }
-        let line = serde_json::to_string(&Value::Object(obj))
-            .map_err(|e| FaucetError::Source(format!("rest: CSV→NDJSON encode error: {e}")))?;
+        let line = csv_record_to_ndjson_line(&rec, headers.as_deref())?;
         out.extend_from_slice(line.as_bytes());
         out.push(b'\n');
         count += 1;
@@ -128,17 +141,7 @@ where
                 headers = Some(rec.iter().map(str::to_string).collect());
                 continue;
             }
-            let mut obj = Map::new();
-            for (i, field) in rec.iter().enumerate() {
-                let key = headers
-                    .as_ref()
-                    .and_then(|h| h.get(i).cloned())
-                    .unwrap_or_else(|| format!("column_{i}"));
-                obj.insert(key, Value::String(field.to_string()));
-            }
-            let line = serde_json::to_string(&Value::Object(obj)).map_err(|e| {
-                FaucetError::Source(format!("rest: CSV→NDJSON encode error: {e}"))
-            })?;
+            let line = csv_record_to_ndjson_line(&rec, headers.as_deref())?;
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
             if buf.len() >= NDJSON_STREAM_CHUNK {

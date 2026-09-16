@@ -99,7 +99,11 @@ pub struct PollSpec {
     /// Extra query params.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub query: HashMap<String, String>,
-    /// Seconds between polls (default `5`).
+    /// Ceiling on the poll cadence in seconds (default `5`). Polling starts at
+    /// 1s and doubles up to this cap, so a job that finishes seconds after
+    /// submit is noticed quickly while a long-running one isn't hammered. Set
+    /// it to the slowest acceptable poll rate — it is the maximum gap between
+    /// polls, not a fixed wait.
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
     /// Give up after this many seconds (default `1800`).
@@ -158,9 +162,47 @@ pub struct AsyncJobConfig {
     pub status: JobStatus,
     /// Result-download request.
     pub fetch: JobRequest,
+    /// Incremental replication only: re-read margin subtracted from the
+    /// persisted bookmark, same grammar as `window.lookback` (`45s` / `30m` /
+    /// `6h` / `30d`; default `5m`). The bookmark is the client's run-start
+    /// clock, so without a margin a client clock running *ahead* of the server
+    /// would permanently skip records stamped in the gap; the margin turns
+    /// that loss into a bounded re-read (deduped by an upsert sink).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<String>,
 }
 
+/// Default bookmark re-read margin (seconds) when `lookback` is unset: wide
+/// enough to absorb realistic client-clock skew ahead of the server (NTP drift
+/// plus modest misconfiguration), small enough that the per-run re-read stays
+/// cheap.
+const DEFAULT_BOOKMARK_LOOKBACK_SECS: i64 = 300;
+
 impl AsyncJobConfig {
+    /// Whether the submit body carries a top-level string `query` the
+    /// incremental predicate can be injected into (#630). Without one every
+    /// run is a full export, so the source config's `validate()` rejects
+    /// `replication_method: incremental` in that shape — otherwise a bookmark
+    /// would advance while the export silently stays full-table.
+    pub fn supports_incremental_query(&self) -> bool {
+        self.submit
+            .json
+            .as_ref()
+            .and_then(|j| j.get("query"))
+            .is_some_and(serde_json::Value::is_string)
+    }
+
+    /// The parsed `lookback` margin (default
+    /// [`DEFAULT_BOOKMARK_LOOKBACK_SECS`] — see the field docs). A malformed
+    /// value is rejected by `validate()`; this falls back to the default
+    /// rather than panicking for callers that skipped validation.
+    pub fn lookback_duration(&self) -> chrono::Duration {
+        self.lookback
+            .as_deref()
+            .and_then(|s| faucet_core::parse_step(s).ok())
+            .unwrap_or_else(|| chrono::Duration::seconds(DEFAULT_BOOKMARK_LOOKBACK_SECS))
+    }
+
     /// Validate the block at config-load time.
     pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
         // `submit` needs a fixed `url`; `url_from` is meaningless there (no poll
@@ -220,6 +262,13 @@ impl AsyncJobConfig {
             return Err(faucet_core::FaucetError::Config(
                 "async_job: `poll.timeout_secs` must be > 0".into(),
             ));
+        }
+        if let Some(lb) = &self.lookback {
+            faucet_core::parse_step(lb).map_err(|_| {
+                faucet_core::FaucetError::Config(format!(
+                    "async_job: `lookback` '{lb}' is not a valid duration — use e.g. 45s, 30m, 6h"
+                ))
+            })?;
         }
         // #557: result-set continuation (locator paging) is a `fetch`-only
         // feature and needs a `locator_param` to request the next page.

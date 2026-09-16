@@ -208,21 +208,31 @@ const TOKEN_MAX_ATTEMPTS: u32 = 4;
 /// Base backoff before the first retry; doubled each subsequent attempt.
 const TOKEN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Transient OAuth token-error codes — the typed `error` member of an RFC 6749
+/// §5.2 error response. `server_error` and `temporarily_unavailable` are the
+/// standard transient codes; `unknown_error` is a widely-seen extension code
+/// some identity providers emit for transient token-service hiccups. Every
+/// other code (`invalid_grant`, `unsupported_grant_type`, `invalid_client`, …)
+/// is a permanent misconfiguration and must fail fast.
+const TRANSIENT_OAUTH_ERROR_CODES: &[&str] =
+    &["server_error", "temporarily_unavailable", "unknown_error"];
+
 /// Whether a non-success token response is transient and worth retrying.
 ///
-/// `429` and `5xx` are the standard transient statuses. **`400` is included only
-/// when the body signals a retryable condition** — notably Salesforce, which
-/// returns `HTTP 400 {"error":"unknown_error","error_description":"retry your
-/// request"}` on transient token-service hiccups (a permanent `invalid_grant` /
-/// `unsupported_grant_type` 400 is *not* retried, so a real misconfig still fails
-/// fast).
+/// `429` and `5xx` are the standard transient statuses. A `400` is transient
+/// only when the body's **typed** RFC 6749 `error` code is one of
+/// [`TRANSIENT_OAUTH_ERROR_CODES`] — classification never greps
+/// `error_description` text, which is not API and can mention an error code
+/// without meaning it.
 fn is_transient_token_status(code: u16, body: &str) -> bool {
     if code == 429 || (500..600).contains(&code) {
         return true;
     }
-    if code == 400 {
-        let b = body.to_ascii_lowercase();
-        return b.contains("retry your request") || b.contains("unknown_error");
+    if code == 400
+        && let Ok(v) = serde_json::from_str::<Value>(body)
+        && let Some(err) = v.get("error").and_then(Value::as_str)
+    {
+        return TRANSIENT_OAUTH_ERROR_CODES.contains(&err);
     }
     false
 }
@@ -299,9 +309,16 @@ async fn fetch_token(
     }
 }
 
-/// Exponential backoff before token-endpoint retry `attempt` (1-based).
+/// Jittered exponential backoff before token-endpoint retry `attempt`
+/// (1-based). Delegates to core's shared computation so the jitter/cap
+/// behavior (and any fix to it) can never diverge in a local copy — many
+/// pipelines share one IdP, so an unjittered token retry would thundering-herd
+/// it. The retry *loop* stays local to `fetch_token` (rather than core's
+/// `execute_with_retry`) because transience here is classified from the typed
+/// OAuth error code in the response body, which core's `FaucetError`-shaped
+/// runner cannot observe.
 async fn token_backoff(attempt: u32) {
-    let delay = TOKEN_RETRY_BASE * 2u32.saturating_pow(attempt.saturating_sub(1));
+    let delay = faucet_core::retry::backoff_with_jitter(TOKEN_RETRY_BASE, attempt);
     tokio::time::sleep(delay).await;
 }
 
@@ -508,12 +525,29 @@ mod tests {
         assert!(is_transient_token_status(429, ""));
         assert!(is_transient_token_status(500, ""));
         assert!(is_transient_token_status(503, "gateway"));
-        // Salesforce's retryable 400 (case-insensitive, either marker).
+        // A 400 whose typed OAuth `error` code is transient IS retried.
         assert!(is_transient_token_status(
             400,
             r#"{"error":"unknown_error","error_description":"retry your request"}"#
         ));
-        assert!(is_transient_token_status(400, "Please RETRY YOUR REQUEST"));
+        assert!(is_transient_token_status(
+            400,
+            r#"{"error":"server_error"}"#
+        ));
+        assert!(is_transient_token_status(
+            400,
+            r#"{"error":"temporarily_unavailable"}"#
+        ));
+        // Classification reads only the typed `error` member — a description
+        // that merely *mentions* a transient phrase or code must not retry.
+        assert!(!is_transient_token_status(400, "Please RETRY YOUR REQUEST"));
+        assert!(!is_transient_token_status(
+            400,
+            r#"{"error":"invalid_request","error_description":"unknown_error responses should be reported"}"#
+        ));
+        // A non-JSON or shapeless body is not retried.
+        assert!(!is_transient_token_status(400, "bad request"));
+        assert!(!is_transient_token_status(400, r#"{"message":"oops"}"#));
         // A permanent 400 (real misconfig) is NOT retried — fail fast.
         assert!(!is_transient_token_status(
             400,

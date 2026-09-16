@@ -216,18 +216,18 @@ fn is_terminal_locator(value: &str) -> bool {
 /// (the caller then falls back to a hash of the submit body).
 fn async_job_object(submit_json: Option<&Value>) -> Option<String> {
     let query = submit_json?.get("query")?.as_str()?;
-    soql_from_object(query)
+    sql_from_object(query)
 }
 
-/// Extract the driving object from a SOQL/SQL query: the token after the first
-/// top-level `FROM`. Case-insensitive on the keyword; preserves the object's own
-/// casing. Returns `None` if there's no `FROM` or the following token is empty.
-fn soql_from_object(query: &str) -> Option<String> {
-    // Tokenize on any whitespace (spaces, newlines, tabs) so `SELECT …\nFROM X`
-    // parses as well as `SELECT … FROM X`; return the token right after the first
-    // `FROM`, stripped of trailing punctuation (commas, parens).
+/// Extract the driving object from a bulk-query SQL statement: the token after
+/// the first **top-level** `FROM` (a subquery's `FROM` — e.g. a parent-child
+/// relationship query in the SELECT list — is never mistaken for it).
+/// Case-insensitive on the keyword; preserves the object's own casing. Returns
+/// `None` if there's no top-level `FROM` or the following token is empty.
+fn sql_from_object(query: &str) -> Option<String> {
+    let toks = top_level_tokens(query);
     let mut after_from = false;
-    for tok in query.split_whitespace() {
+    for (_, tok) in toks {
         if after_from {
             let obj = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
             return if obj.is_empty() {
@@ -243,37 +243,85 @@ fn soql_from_object(query: &str) -> Option<String> {
     None
 }
 
-/// Whitespace-split tokens of a query with their byte offsets — used by the SOQL
-/// predicate injector to locate clause keywords regardless of spacing/newlines.
-fn tokens_with_pos(s: &str) -> Vec<(usize, &str)> {
+/// Whitespace-split tokens of a query with their byte offsets, **restricted to
+/// tokens that sit entirely at paren depth 0 and outside single-quoted string
+/// literals**. This is what makes clause detection safe for the mainstream
+/// query shapes: a subquery's `WHERE`/`FROM` (inside parens) and a keyword that
+/// merely appears inside a quoted value (`WHERE name = 'a limit b'`) are never
+/// mistaken for the outer statement's own clauses. Quote handling honors
+/// backslash escapes (the escaping convention of the bulk-query grammars this
+/// path targets).
+fn top_level_tokens(s: &str) -> Vec<(usize, &str)> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
+    let mut depth: i64 = 0;
+    let mut in_quote = false;
+    let mut tok_start: Option<usize> = None;
+    let mut tok_clean = true;
     let mut i = 0;
     while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() && !in_quote {
+            if let Some(start) = tok_start.take()
+                && tok_clean
+            {
+                out.push((start, &s[start..i]));
+            }
+            tok_clean = true;
             i += 1;
+            continue;
         }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            i += 1;
+        if tok_start.is_none() {
+            tok_start = Some(i);
+            tok_clean = depth == 0 && !in_quote;
         }
-        if i > start {
-            out.push((start, &s[start..i]));
+        if in_quote {
+            match b {
+                b'\\' => i += 1, // skip the escaped byte below
+                b'\'' => in_quote = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'\'' => {
+                    in_quote = true;
+                    tok_clean = false;
+                }
+                b'(' => {
+                    depth += 1;
+                    tok_clean = false;
+                }
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    tok_clean = false;
+                }
+                _ => {}
+            }
         }
+        i += 1;
+    }
+    if let Some(start) = tok_start
+        && tok_clean
+        && !in_quote
+    {
+        out.push((start, &s[start..]));
     }
     out
 }
 
-/// Inject an incremental-replication predicate into a SOQL/SQL query (#630).
+/// Inject an incremental-replication predicate into a bulk-query SQL statement
+/// (#630).
 ///
-/// Adds `WHERE <predicate>` when there is no existing `WHERE`, or wraps the
-/// existing condition as `WHERE (<existing>) AND (<predicate>)` — the parens keep
-/// operator precedence correct when the existing filter contains `OR`. The
-/// predicate is placed *before* any trailing clause (`GROUP BY` / `HAVING` /
-/// `ORDER BY` / `LIMIT` / `OFFSET` / `WITH` / `FOR`), which is where a SOQL/SQL
-/// `WHERE` must sit. Clause detection is whitespace-tolerant (handles newlines).
-fn inject_soql_predicate(query: &str, predicate: &str) -> String {
-    let toks = tokens_with_pos(query);
+/// Adds `WHERE <predicate>` when there is no existing top-level `WHERE`, or
+/// wraps the existing condition as `WHERE (<existing>) AND (<predicate>)` — the
+/// parens keep operator precedence correct when the existing filter contains
+/// `OR`. The predicate is placed *before* any trailing top-level clause
+/// (`GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET` / `WITH` / `FOR`),
+/// which is where a `WHERE` must sit. Clause detection is whitespace-tolerant
+/// (handles newlines) and, via [`top_level_tokens`], ignores keywords inside
+/// subqueries and quoted literals.
+fn inject_sql_predicate(query: &str, predicate: &str) -> String {
+    let toks = top_level_tokens(query);
     let kw = |t: &str, k: &str| t.eq_ignore_ascii_case(k);
     let mut where_at: Option<usize> = None;
     let mut boundary: Option<usize> = None;
@@ -314,13 +362,15 @@ fn inject_soql_predicate(query: &str, predicate: &str) -> String {
     }
 }
 
-/// Render a bookmark value as a SOQL literal for the incremental predicate:
-/// datetime/date values are **unquoted** (SOQL datetime literals), everything
-/// else is single-quoted (with `'` escaped). Salesforce replication keys
-/// (`SystemModstamp`/`LastModifiedDate`) are datetimes → unquoted.
-fn soql_literal(v: &Value) -> String {
+/// Render a bookmark value as a literal for the incremental predicate:
+/// datetime/date values are **unquoted** (the datetime-literal convention of
+/// the bulk-query grammars this path targets — replication keys are datetimes),
+/// everything else is single-quoted with `'` backslash-escaped (same grammar
+/// convention; standard-SQL `''` doubling can become a dialect knob if a second
+/// grammar ever needs it).
+fn sql_literal(v: &Value) -> String {
     match v {
-        Value::String(s) if is_soql_datetime(s) => s.clone(),
+        Value::String(s) if is_sql_datetime(s) => s.clone(),
         Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
@@ -328,19 +378,10 @@ fn soql_literal(v: &Value) -> String {
     }
 }
 
-/// Whether a string is a SOQL datetime/date literal (RFC3339 or `YYYY-MM-DD`).
-fn is_soql_datetime(s: &str) -> bool {
+/// Whether a string is a datetime/date literal (RFC3339 or `YYYY-MM-DD`).
+fn is_sql_datetime(s: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(s).is_ok()
         || chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
-}
-
-/// A short, stable hex hash — used to give distinct async-job queries distinct
-/// dataset URIs when the object name can't be parsed. Deterministic across runs.
-fn stable_short_hash(s: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
 }
 
 /// Read the next result-set locator (#557) from the fetch response header or
@@ -1207,19 +1248,53 @@ impl RestStream {
         query: &HashMap<String, String>,
         json: Option<&Value>,
     ) -> Result<(Vec<u8>, HeaderMap), FaucetError> {
-        let resp = self
-            .job_request_response(method, url, headers, query, json)
-            .await?;
-        let resp_headers = resp.headers().clone();
-        Ok((resp.bytes().await?.to_vec(), resp_headers))
+        // Retry the request *and* the body read as one unit — a transient 502
+        // on poll #40 of a 30-minute bulk job must not discard the whole
+        // submitted job, and a connection dropped mid-body is retried the same
+        // way the pagination path retries a page. Same policy knobs as the
+        // pagination runner.
+        retry::execute_with_retry(
+            self.retry_policy.max_attempts.saturating_sub(1),
+            self.retry_policy.base,
+            || async {
+                let resp = self
+                    .job_request_response_once(method, url, headers, query, json)
+                    .await?;
+                let resp_headers = resp.headers().clone();
+                let bytes = resp.bytes().await.map_err(FaucetError::Http)?;
+                Ok((bytes.to_vec(), resp_headers))
+            },
+        )
+        .await
     }
 
     /// Send a fetch request and return the raw [`reqwest::Response`] with its body
-    /// **unconsumed** — the caller reads headers (e.g. the `Sforce-Locator`) and
-    /// then streams the body. The shared request-building core of
-    /// [`job_request_bytes`](Self::job_request_bytes) and the native streaming path
-    /// (#633).
+    /// **unconsumed** — the caller reads headers (e.g. the locator header) and
+    /// then streams the body. Retries the request itself under the shared
+    /// policy; a failure *while streaming the body* is not retried here (the
+    /// caller owns what has already been consumed downstream). Note a retried
+    /// submit may orphan a job the server created before the failure — harmless
+    /// (never fetched, expires server-side) and at-least-once-consistent.
     async fn job_request_response(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        query: &HashMap<String, String>,
+        json: Option<&Value>,
+    ) -> Result<reqwest::Response, FaucetError> {
+        retry::execute_with_retry(
+            self.retry_policy.max_attempts.saturating_sub(1),
+            self.retry_policy.base,
+            || self.job_request_response_once(method, url, headers, query, json),
+        )
+        .await
+    }
+
+    /// One unretried attempt — the shared request-building core of
+    /// [`job_request_bytes`](Self::job_request_bytes) /
+    /// [`job_request_response`](Self::job_request_response).
+    async fn job_request_response_once(
         &self,
         method: &str,
         url: &str,
@@ -1250,10 +1325,11 @@ impl RestStream {
         if let Some(j) = json {
             req = req.json(j);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| FaucetError::Source(format!("async_job: request to {url} failed: {e}")))?;
+        // Transport errors stay typed (`FaucetError::Http`) so the shared retry
+        // runner's `is_retriable` classification sees connect/timeout failures —
+        // stringifying them into `Source(...)` would silently make every
+        // transient network blip fatal to a 30-minute bulk job.
+        let resp = req.send().await.map_err(FaucetError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(FaucetError::HttpStatus {
@@ -1307,24 +1383,35 @@ impl RestStream {
         }?;
         let submit = job.submit.json.as_ref()?;
         let query = submit.get("query")?.as_str()?;
-        let predicate = format!("{key} > {}", soql_literal(&start));
+        let predicate = format!("{key} > {}", sql_literal(&start));
         let mut cloned = submit.clone();
-        cloned["query"] = Value::String(inject_soql_predicate(query, &predicate));
+        cloned["query"] = Value::String(inject_sql_predicate(query, &predicate));
         Some(cloned)
     }
 
-    /// The bookmark to persist after an incremental async-job run: the run's start
-    /// time (RFC3339). Using the *start* time (not `max(replication_key)` scraped
-    /// from the rows) keeps this native/streaming-compatible — no row parsing —
-    /// and is conservative (a small re-read overlap on the next run, deduped by an
-    /// upsert sink). `None` for full-table replication.
+    /// The bookmark to persist after an incremental async-job run: the run's
+    /// start time (RFC3339) **minus the `lookback` margin**. Using the start
+    /// time (not `max(replication_key)` scraped from the rows) keeps this
+    /// native/streaming-compatible — no row parsing; the subtracted margin
+    /// makes it safe against a client clock running ahead of the server, which
+    /// would otherwise permanently exclude records stamped in the skew gap
+    /// from every future `key > bookmark` predicate. The cost is a bounded
+    /// re-read overlap next run (deduped by an upsert sink). `None` for
+    /// full-table replication, and `None` when the submit body has no
+    /// amendable `query` — a bookmark that advances while every run stays a
+    /// full export would be a lie (`validate()` rejects that config shape;
+    /// this is the backstop for callers that skipped validation).
     fn async_job_new_bookmark(&self) -> Option<Value> {
         if self.config.replication_method != ReplicationMethod::Incremental
             || self.config.replication_key.is_none()
         {
             return None;
         }
-        let now = self.now_override.unwrap_or_else(chrono::Utc::now);
+        let job = self.config.async_job.as_ref()?;
+        if !job.supports_incremental_query() {
+            return None;
+        }
+        let now = self.now_override.unwrap_or_else(chrono::Utc::now) - job.lookback_duration();
         Some(Value::String(
             now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         ))
@@ -2144,10 +2231,16 @@ impl faucet_core::Source for RestStream {
         if let Some(job) = &self.config.async_job {
             let sep = if base.ends_with('/') { "" } else { "/" };
             if let Some(obj) = async_job_object(job.submit.json.as_ref()) {
-                return format!("{base}{sep}sobjects/{obj}");
+                return format!("{base}{sep}objects/{obj}");
             }
             if let Some(j) = &job.submit.json {
-                return format!("{base}{sep}job/{}", stable_short_hash(&j.to_string()));
+                // FNV-1a from core (stable across Rust releases — this feeds persisted
+                // catalog/lineage identity, so `DefaultHasher` would re-key it on a
+                // toolchain bump).
+                return format!(
+                    "{base}{sep}job/{:016x}",
+                    faucet_core::shard::shard_hash(&j.to_string())
+                );
             }
         }
         base
@@ -2158,13 +2251,22 @@ impl faucet_core::Source for RestStream {
         // bookmark) when it reports a state key. Incremental replication (#630)
         // is meaningless without persistence, so opt in automatically when
         // replicating incrementally — otherwise `replication_method: incremental`
-        // + a `state:` block would silently full-refresh every run. The concrete
-        // key is assigned per-invocation by the executor (StateKeyOverride), so
-        // this placeholder only needs to be `Some`.
+        // + a `state:` block would silently full-refresh every run. The CLI
+        // executor overrides the concrete key per invocation (StateKeyOverride);
+        // the fallback below matters for library callers driving `Pipeline`
+        // directly, so it derives from the dataset identity — two REST sources
+        // sharing one StateStore must never collide on a fixed literal and
+        // resume from each other's bookmark. FNV-1a from core keeps the derived
+        // key stable across Rust releases.
         self.config.state_key.clone().or_else(|| {
             (self.config.replication_method == ReplicationMethod::Incremental
                 && self.config.replication_key.is_some())
-            .then(|| "rest-incremental".to_string())
+            .then(|| {
+                format!(
+                    "rest:{:016x}",
+                    faucet_core::shard::shard_hash(&faucet_core::Source::dataset_uri(self))
+                )
+            })
         })
     }
 
@@ -2967,27 +3069,44 @@ mod tests {
     }
 
     #[test]
-    fn soql_from_object_parses_the_driving_object() {
+    fn sql_from_object_parses_the_driving_object() {
         // Common shapes: with WHERE, with a leading newline/whitespace, lowercase
         // keyword, trailing clause, and a field literally containing "from".
         assert_eq!(
-            soql_from_object("SELECT Id, Name FROM Account WHERE IsDeleted = false"),
+            sql_from_object("SELECT Id, Name FROM Account WHERE IsDeleted = false"),
             Some("Account".to_string())
         );
         assert_eq!(
-            soql_from_object("SELECT Id\nFROM SBQQ__Quote__c\nORDER BY Id"),
+            sql_from_object("SELECT Id\nFROM SBQQ__Quote__c\nORDER BY Id"),
             Some("SBQQ__Quote__c".to_string())
         );
         assert_eq!(
-            soql_from_object("select id from contact"),
+            sql_from_object("select id from contact"),
             Some("contact".to_string())
         );
         assert_eq!(
-            soql_from_object("SELECT Id FROM Opportunity_Line_Item"),
+            sql_from_object("SELECT Id FROM Opportunity_Line_Item"),
             Some("Opportunity_Line_Item".to_string())
         );
         // No FROM → None (caller falls back to a hash).
-        assert_eq!(soql_from_object("SELECT 1"), None);
+        assert_eq!(sql_from_object("SELECT 1"), None);
+    }
+
+    #[test]
+    fn sql_from_object_ignores_subquery_and_quoted_from() {
+        // A parent-child relationship subquery in the SELECT list: its FROM is
+        // inside parens and must not be mistaken for the driving object.
+        assert_eq!(
+            sql_from_object(
+                "SELECT Id, (SELECT Id FROM Contacts WHERE IsDeleted = false) FROM Account"
+            ),
+            Some("Account".to_string())
+        );
+        // "from" inside a quoted literal is not a clause keyword.
+        assert_eq!(
+            sql_from_object("SELECT Id FROM Lead WHERE Source = 'from web'"),
+            Some("Lead".to_string())
+        );
     }
 
     #[test]
@@ -3008,10 +3127,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_soql_predicate_adds_or_wraps_where() {
+    fn inject_sql_predicate_adds_or_wraps_where() {
         // No WHERE, no trailing clause → append WHERE.
         assert_eq!(
-            inject_soql_predicate(
+            inject_sql_predicate(
                 "SELECT Id FROM Account",
                 "SystemModstamp > 2026-01-01T00:00:00Z"
             ),
@@ -3019,7 +3138,7 @@ mod tests {
         );
         // Existing WHERE → wrap in parens + AND (keeps OR precedence correct).
         assert_eq!(
-            inject_soql_predicate(
+            inject_sql_predicate(
                 "SELECT Id FROM Account WHERE IsActive = true OR Rating = 'Hot'",
                 "SystemModstamp > 2026-01-01T00:00:00Z"
             ),
@@ -3027,13 +3146,39 @@ mod tests {
         );
         // Trailing ORDER BY → predicate goes before it.
         assert_eq!(
-            inject_soql_predicate("SELECT Id FROM Account ORDER BY Id", "X > 1"),
+            inject_sql_predicate("SELECT Id FROM Account ORDER BY Id", "X > 1"),
             "SELECT Id FROM Account WHERE X > 1 ORDER BY Id"
         );
         // WHERE + trailing LIMIT (newline-tolerant).
         assert_eq!(
-            inject_soql_predicate("SELECT Id\nFROM Account\nWHERE A = 1\nLIMIT 10", "X > 1"),
+            inject_sql_predicate("SELECT Id\nFROM Account\nWHERE A = 1\nLIMIT 10", "X > 1"),
             "SELECT Id\nFROM Account\nWHERE (A = 1) AND (X > 1) LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn inject_sql_predicate_ignores_subquery_and_quoted_keywords() {
+        // A subquery's WHERE (inside parens) is not the outer statement's WHERE:
+        // the predicate must attach at the top level, after the subquery.
+        assert_eq!(
+            inject_sql_predicate(
+                "SELECT Id, (SELECT Id FROM Contacts WHERE IsDeleted = false) FROM Account",
+                "X > 1"
+            ),
+            "SELECT Id, (SELECT Id FROM Contacts WHERE IsDeleted = false) FROM Account WHERE X > 1"
+        );
+        // Outer WHERE + subquery WHERE: only the outer one is wrapped.
+        assert_eq!(
+            inject_sql_predicate(
+                "SELECT Id, (SELECT Id FROM Contacts WHERE A = 1) FROM Account WHERE B = 2",
+                "X > 1"
+            ),
+            "SELECT Id, (SELECT Id FROM Contacts WHERE A = 1) FROM Account WHERE (B = 2) AND (X > 1)"
+        );
+        // A clause keyword inside a quoted literal is data, not a boundary.
+        assert_eq!(
+            inject_sql_predicate("SELECT Id FROM A WHERE Name = 'a limit b'", "X > 1"),
+            "SELECT Id FROM A WHERE (Name = 'a limit b') AND (X > 1)"
         );
     }
 
@@ -3058,28 +3203,20 @@ mod tests {
     }
 
     #[test]
-    fn soql_literal_quotes_by_type() {
+    fn sql_literal_quotes_by_type() {
         use serde_json::json;
-        // Datetime / date → unquoted (SOQL datetime literal).
+        // Datetime / date → unquoted (datetime literal).
         assert_eq!(
-            soql_literal(&json!("2026-08-28T12:00:00Z")),
+            sql_literal(&json!("2026-08-28T12:00:00Z")),
             "2026-08-28T12:00:00Z"
         );
-        assert_eq!(soql_literal(&json!("2026-08-28")), "2026-08-28");
+        assert_eq!(sql_literal(&json!("2026-08-28")), "2026-08-28");
         // Plain string → single-quoted.
-        assert_eq!(soql_literal(&json!("Hot")), "'Hot'");
+        assert_eq!(sql_literal(&json!("Hot")), "'Hot'");
         // Number → bare.
-        assert_eq!(soql_literal(&json!(42)), "42");
-        assert!(is_soql_datetime("2026-08-28T00:00:00+05:30"));
-        assert!(!is_soql_datetime("not-a-date"));
-    }
-
-    #[test]
-    fn stable_short_hash_is_deterministic_and_distinct() {
-        let a = stable_short_hash("SELECT Id FROM Account");
-        assert_eq!(a, stable_short_hash("SELECT Id FROM Account"));
-        assert_ne!(a, stable_short_hash("SELECT Id FROM Contact"));
-        assert_eq!(a.len(), 16);
+        assert_eq!(sql_literal(&json!(42)), "42");
+        assert!(is_sql_datetime("2026-08-28T00:00:00+05:30"));
+        assert!(!is_sql_datetime("not-a-date"));
     }
 
     #[test]

@@ -665,6 +665,37 @@ impl RestStreamConfig {
                         .into(),
                 ));
             }
+            if matches!(self.replication_method, ReplicationMethod::Incremental) {
+                // The async-job incremental predicate (#630) is injected into
+                // the submit body's top-level string `query`. Without one the
+                // predicate can never apply: every run would silently stay a
+                // full export while the bookmark advances — a lying high-water
+                // mark. Fail before the first byte moves instead.
+                if self.replication_key.is_none() {
+                    return Err(faucet_core::FaucetError::Config(
+                        "rest: `replication_method: incremental` with `async_job` requires \
+                         `replication_key` (the field the submit query is filtered on)"
+                            .into(),
+                    ));
+                }
+                if !job.supports_incremental_query() {
+                    return Err(faucet_core::FaucetError::Config(
+                        "rest: `replication_method: incremental` with `async_job` requires a \
+                         top-level string `query` in `async_job.submit.json` — that is where the \
+                         `WHERE <replication_key> > <bookmark>` predicate is injected. Without \
+                         one every run is a full export, so use `replication_method: full_table`"
+                            .into(),
+                    ));
+                }
+            }
+            if self.replication_bind.is_some() {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `replication_bind` and `async_job` are mutually exclusive — the \
+                     async-job path pushes the bookmark down by injecting a predicate into \
+                     `async_job.submit.json.query`, not via a request bind"
+                        .into(),
+                ));
+            }
         }
         if let Some(window) = &self.window {
             window.validate()?;
