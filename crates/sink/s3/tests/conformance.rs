@@ -14,8 +14,15 @@ use aws_sdk_s3::{Client, Config as S3Config};
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Sink;
 use faucet_sink_s3::{S3Sink, S3SinkConfig};
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::minio::MinIO;
+
+/// MinIO's Docker Hub repository was withdrawn (September 2026): pulling
+/// `minio/minio` fails with "repository does not exist / access denied". The
+/// identical pinned release remains published on Quay, so only the module's
+/// default image *name* is overridden — tag, cmd, and wait behavior stay
+/// those of `testcontainers_modules::minio`.
+const MINIO_IMAGE_NAME: &str = "quay.io/minio/minio";
 
 const ACCESS_KEY: &str = "minioadmin";
 const SECRET_KEY: &str = "minioadmin";
@@ -25,6 +32,7 @@ const PREFIX: &str = "conformance/";
 
 async fn start_minio() -> (ContainerAsync<MinIO>, String) {
     let container: ContainerAsync<MinIO> = MinIO::default()
+        .with_name(MINIO_IMAGE_NAME)
         .start()
         .await
         .expect("minio container start");
