@@ -17,6 +17,10 @@ async-trait.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 futures-core.workspace = true
+# `scripted::ScriptedSink` can inject a latency into each write (the slow-sink /
+# backpressure arm of the reliability suites), which needs an async sleep in
+# non-test code. `time` only — this crate spawns no runtime of its own.
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
