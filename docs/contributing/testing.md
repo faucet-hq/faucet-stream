@@ -1,6 +1,6 @@
 # Testing
 
-*What to test, where it lives, and why the 90% patch-coverage gate is a floor, not a target.*
+*What to test, where it lives, and why the 95% patch-coverage gate is a floor, not a target.*
 
 Untested public API surface is a liability. This page covers the philosophy and
 the practical techniques; the repository-wide conventions are in
@@ -20,8 +20,16 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ## The coverage gate
 
-`codecov/patch` is a **required** merge check at **90%** — a PR whose changed
-lines are under 90% covered *cannot merge*. Treat 90% as the floor.
+Changed lines must be **≥95% covered**. The gate that enforces it is the
+`patch-coverage` step inside the **required `Coverage` job**, which computes the
+number deterministically from the run's own lcov (`scripts/patch-coverage.py
+--min 95`) and prints the uncovered lines when it fails. Treat 95% as the
+floor, not a target.
+
+(`codecov/patch` reports the same number but is **not** a required check and
+posts unreliably — it cannot be the gate, which is why the check lives in the
+job itself. Measure locally before pushing; nothing else will catch a
+sub-95% patch for you.)
 
 The critical subtlety: **Docker-backed integration tests do not count toward
 patch coverage.** The coverage run is not instrumented with the containers, so
