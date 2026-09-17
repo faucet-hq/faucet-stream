@@ -150,6 +150,41 @@ pub trait Source: Send + Sync {
         Box::pin(futures::stream::once(async move { err }))
     }
 
+    /// Wire formats this source can emit as raw bytes for the **native
+    /// byte-passthrough** fast path (#633), in preference order (first = best).
+    /// Default: `&[]` (no native fast path).
+    ///
+    /// The pipeline uses the path only when this returns a non-empty slice, a
+    /// sink advertises a matching [`NativeLoadCapability`](crate::NativeLoadCapability),
+    /// and every prerequisite holds (see [`plan_native_transfer`](crate::plan_native_transfer)).
+    /// A [`TransformingSource`](crate::TransformingSource) deliberately does not
+    /// override this, so any attached transform disables the fast path.
+    fn native_output_formats(&self) -> &'static [crate::native::NativeFormat] {
+        &[]
+    }
+
+    /// Stream the source natively as byte batches in `format` (#633).
+    ///
+    /// Only invoked after the pipeline negotiated `format` — one this source
+    /// advertised via [`native_output_formats`](Self::native_output_formats). The
+    /// default yields a single typed "unsupported" error so a source that
+    /// advertises support but forgets to override this fails loudly. Each batch's
+    /// `bookmark` carries the same checkpoint semantics as [`StreamPage`].
+    fn stream_native<'a>(
+        &'a self,
+        context: &'a std::collections::HashMap<String, Value>,
+        format: crate::native::NativeFormat,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'a>>
+    {
+        let _ = (context, batch_size, format);
+        let name = self.connector_name();
+        let err: Result<crate::native::NativeBatch, FaucetError> = Err(FaucetError::Source(
+            format!("source '{name}' does not support native byte streaming (stream_native)"),
+        ));
+        Box::pin(futures::stream::once(async move { err }))
+    }
+
     /// Return a JSON Schema describing the configuration this source accepts.
     fn config_schema(&self) -> Value {
         serde_json::json!({"type": "object", "properties": {}})
@@ -410,6 +445,51 @@ pub trait Sink: Send + Sync {
     ) -> Result<usize, FaucetError> {
         let rows = crate::columnar::record_batch_to_values(batch)?;
         self.write_batch(&rows).await
+    }
+
+    /// Native byte-passthrough load mechanisms this sink offers, each naming
+    /// the wire format and the write modes it can honor (#633). Default:
+    /// `vec![]` (no fast path; use [`write_batch`](Self::write_batch)).
+    ///
+    /// The pipeline takes the native path only when a source advertises a
+    /// format this returns and the run passes the pipeline-owned gates — no
+    /// transforms, no quality/contract/masking pass, no DLQ, at-least-once
+    /// delivery, no upsert/delete `write_mode`, and (for overwrite) an
+    /// all-or-nothing load session finalized by a single terminal `flush` —
+    /// see [`plan_native_transfer`](crate::plan_native_transfer). A capability
+    /// cannot waive those gates.
+    fn native_load_capabilities(&self) -> Vec<crate::native::NativeLoadCapability> {
+        Vec::new()
+    }
+
+    /// Bulk-load one native-format byte batch directly (#633), returning the
+    /// number of rows written.
+    ///
+    /// Only invoked when the pipeline negotiated one of this sink's
+    /// [`native_load_capabilities`](Self::native_load_capabilities) and the
+    /// pipeline-owned gates passed. `ctx.first_batch` lets an overwrite sink
+    /// truncate on the first load and append thereafter. The default returns a
+    /// typed "unsupported" error so a sink that advertises a capability but
+    /// forgets to override this fails loudly.
+    ///
+    /// **Contract:** an **empty payload must be a successful no-op** returning
+    /// `Ok(0)` — sources emit a trailing empty batch to carry the final
+    /// bookmark, and an error here would break bookmark persistence. Under
+    /// `Overwrite`, nothing may become visible in the destination until the
+    /// terminal [`flush`](Self::flush) — the pipeline flushes exactly once, on
+    /// success only, so a mechanism that commits per batch must omit
+    /// `Overwrite` from its capability's `write_modes`.
+    async fn load_native(
+        &self,
+        batch: crate::native::NativeBatch,
+        scope: &str,
+        ctx: crate::native::NativeLoadContext,
+    ) -> Result<usize, FaucetError> {
+        let _ = (batch, scope, ctx);
+        Err(FaucetError::Sink(format!(
+            "sink '{}' does not support native byte loading (load_native)",
+            self.connector_name()
+        )))
     }
 
     /// Whether this sink can durably commit a page's rows **and** a commit token
@@ -786,6 +866,68 @@ mod tests {
         async fn write_batch(&self, _records: &[Value]) -> Result<usize, FaucetError> {
             Err(FaucetError::Sink("write failed".into()))
         }
+    }
+
+    // ── Native byte-passthrough defaults (#633) ──────────────────────────────
+
+    /// A source/sink pair that advertises nothing native, so the defaulted
+    /// trait methods are what answer.
+    struct PlainSink;
+
+    #[async_trait]
+    impl Sink for PlainSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_defaults_advertise_nothing_and_fail_loudly() {
+        use futures::StreamExt as _;
+
+        // A source that never overrides the native methods advertises no
+        // formats, so the pipeline can never negotiate the byte path…
+        let src = MockSource { records: vec![] };
+        assert!(src.native_output_formats().is_empty());
+        // …and calling it anyway yields one typed error rather than silently
+        // producing an empty stream (which would look like "no rows").
+        let ctx = std::collections::HashMap::new();
+        let mut batches = src.stream_native(&ctx, crate::native::NativeFormat::NdJson, 10);
+        let err = batches
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("default must error");
+        assert!(
+            err.to_string()
+                .contains("does not support native byte streaming"),
+            "{err}"
+        );
+        assert!(batches.next().await.is_none(), "exactly one item");
+
+        // Same on the sink side: no capabilities, and `load_native` is a typed
+        // error so a sink that advertises but forgets to implement is obvious.
+        let sink = PlainSink;
+        assert!(sink.native_load_capabilities().is_empty());
+        let err = sink
+            .load_native(
+                crate::native::NativeBatch::bytes(
+                    crate::native::NativeFormat::NdJson,
+                    b"{}\n".to_vec(),
+                ),
+                "scope",
+                crate::native::NativeLoadContext {
+                    write_mode: crate::write_mode::WriteMode::Append,
+                    first_batch: true,
+                },
+            )
+            .await
+            .expect_err("default must error");
+        assert!(
+            err.to_string()
+                .contains("does not support native byte loading"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

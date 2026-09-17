@@ -120,7 +120,13 @@
 *::before,
 *::after { box-sizing: border-box; }
 
-html, body { height: 100%; }
+/* `min-height` (not `height`) on body: `height: 100%` caps <body>'s box at one
+   viewport, and a `position: sticky` element's containing block is its parent —
+   so the sticky topbar could only stick within that one-viewport-tall box and
+   scrolled away once the page grew past a screen. `min-height` lets <body> grow
+   to the full content height, so the topbar sticks the whole way down. */
+html { height: 100%; }
+body { min-height: 100%; }
 
 body {
   margin: 0;
@@ -167,8 +173,9 @@ button { font-family: inherit; }
   gap: 18px;
   height: 56px;
   padding: 0 20px;
-  background: color-mix(in srgb, var(--surface) 80%, transparent);
-  backdrop-filter: saturate(140%) blur(10px);
+  /* Opaque so content scrolling underneath never bleeds through the bar (which
+     otherwise reads as a stray row floating above a sticky table header). */
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 /* a thin "flow" line of brand color under the bar */
@@ -233,7 +240,14 @@ button { font-family: inherit; }
   padding: 28px 24px 64px;
   animation: rise 0.28s ease both;
 }
-@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+/* The lineage graph uses a little more width than the standard reading-width
+   page, but not the full screen — 1280 keeps the two columns comfortable. */
+.page-wide { max-width: 1280px; }
+/* Opacity-only — animating `transform` here (even ending at none) makes `.page`
+   a containing block for the whole fill, which breaks `position: sticky` on any
+   descendant table header (it would stick to `.page` and scroll away, not to the
+   viewport). */
+@keyframes rise { from { opacity: 0; } to { opacity: 1; } }
 
 .page-head {
   display: flex;
@@ -257,7 +271,7 @@ button { font-family: inherit; }
 /* ============================================================================
    buttons
    ========================================================================== */
-.btn-primary, .btn-ghost, .btn-danger {
+.btn-primary, .btn-ghost, .btn-danger, .btn-warn {
   appearance: none;
   font-size: 0.88rem;
   font-weight: 600;
@@ -271,9 +285,12 @@ button { font-family: inherit; }
 .btn-primary {
   background: var(--brand);
   color: #fff;
-  box-shadow: 0 1px 0 rgba(0,0,0,0.05), 0 6px 18px var(--brand-tint);
+  /* Subtle lift only — the previous `0 6px 18px` glow extended well below the
+     button, making it read as taller than the flat ghost/warn buttons beside it
+     even though all three are the same height. */
+  box-shadow: 0 1px 2px rgba(0,0,0,0.08);
 }
-.btn-primary:hover { background: var(--brand-strong); box-shadow: 0 0 0 4px var(--brand-tint); }
+.btn-primary:hover { background: var(--brand-strong); box-shadow: 0 0 0 3px var(--brand-tint); }
 .btn-primary:active { transform: translateY(1px); }
 
 .btn-ghost {
@@ -292,7 +309,19 @@ button { font-family: inherit; }
 }
 .btn-danger:hover { background: var(--fail); color: #fff; }
 
-.btn-primary:disabled, .btn-ghost:disabled, .btn-danger:disabled {
+/* Warning: recoverable-but-disruptive actions (cancel a run, discard DLQ,
+   deprecate a template) — amber outline that fills on hover. Sits between the
+   neutral ghost and the destructive (red) danger button so consequential
+   actions read as "careful" without implying irreversible data loss. */
+.btn-warn {
+  background: transparent;
+  color: var(--queued);
+  border-color: color-mix(in srgb, var(--queued) 45%, transparent);
+}
+.btn-warn:hover { background: var(--queued); color: #fff; }
+.btn-warn:active { transform: translateY(1px); }
+
+.btn-primary:disabled, .btn-ghost:disabled, .btn-danger:disabled, .btn-warn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
   transform: none;
@@ -334,7 +363,10 @@ input:focus, select:focus, textarea:focus {
 input::placeholder, textarea::placeholder { color: var(--ink-faint); }
 
 /* Timezone selector in the topbar — compact; inherits the themed chevron below. */
-.tz-select { font-size: 0.8rem; max-width: 190px; padding-top: 5px; padding-bottom: 5px; background: transparent; }
+/* `background-color` (not the `background` shorthand) so it never resets
+   background-repeat/position — otherwise the dark-mode chevron image re-added by
+   `[data-theme=dark] select` tiles into a row of overlapping chevrons. */
+.tz-select { font-size: 0.8rem; max-width: 190px; padding-top: 5px; padding-bottom: 5px; background-color: transparent; }
 
 /* Themed select: drop the native arrow for a custom chevron with real breathing
    room on the right, so it stops crowding the border. */
@@ -444,6 +476,89 @@ select {
   text-align: right;
 }
 .run-time { color: var(--ink-faint); min-width: 150px; }
+/* Datasets list as one aligned ("invisible") table — every column shares a
+   width across all rows via table-layout:fixed, so roles/rows/time line up and
+   the URI truncates at the same x on every row (#646). */
+.ds-table { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+/* Sticky header so the column labels stay visible while scrolling the list. */
+.ds-table thead th {
+  position: sticky; top: 56px; z-index: 15; background: var(--surface);
+  text-align: left; font-size: 0.68rem; letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--ink-faint); font-weight: 600; padding: 10px 18px; border-bottom: 1px solid var(--border);
+}
+/* Airier rows + generous column padding so nothing looks clumped. */
+.ds-table tbody td { padding: 15px 18px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.ds-table tbody tr:last-child td { border-bottom: none; }
+.ds-tr { cursor: pointer; }
+.ds-tr:hover td { background: color-mix(in srgb, var(--ink-faint) 8%, transparent); }
+/* URI cell scrolls horizontally to reveal the full path. The scrollbar is hidden
+   (scroll still works via trackpad / shift-wheel; full value is in the tooltip)
+   so it never overlaps the single line of text, and a right-edge fade signals
+   there is more to the right. */
+.ds-uri-in {
+  overflow-x: auto; white-space: nowrap; font-weight: 600;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+}
+/* The fade signals "more to the right" — but at the end of the scroll (or when
+   the text fits with no scroll) it would blur the last characters. `at-end` (set
+   by JS on scroll) drops the mask so the tail is always crisp. */
+.ds-uri-in.at-end { -webkit-mask-image: none; mask-image: none; }
+.ds-uri-in::-webkit-scrollbar { display: none; }
+.ds-meta { font-family: var(--font-mono); font-size: 0.8rem; color: var(--ink-dim); white-space: nowrap; }
+.ds-num { text-align: right; }
+.ds-time { color: var(--ink-faint); }
+/* Fixed widths; column 2 (URI) takes the rest and ellipsises uniformly. */
+/* KIND column: extra right padding guarantees a clear gap before DATASET. */
+.ds-table th:nth-child(1), .ds-table td:nth-child(1) { width: 124px; padding-right: 28px; }
+.ds-table th:nth-child(3), .ds-table td:nth-child(3) { width: 96px; }
+.ds-table th:nth-child(4), .ds-table td:nth-child(4) { width: 78px; text-align: right; }
+.ds-table th:nth-child(5), .ds-table td:nth-child(5) { width: 124px; text-align: right; }
+.ds-table th:nth-child(6), .ds-table td:nth-child(6) { width: 224px; }
+/* Guarantee the last column's content clears the right border. */
+.ds-table td:last-child, .ds-table th:last-child { padding-right: 22px; }
+
+/* Filter bar: keep it on one line; the URI search flexes to fill the gap. */
+.filters-1line { display: flex; flex-wrap: nowrap; align-items: center; gap: 10px; }
+.filters-1line #f-q { flex: 1 1 auto; min-width: 90px; }
+.filters-1line .date-input { width: 120px; flex: 0 0 auto; }
+
+/* Kind multi-select dropdown (native <details> — no extra open/close JS). */
+.dd { position: relative; flex: 0 0 auto; }
+.dd > summary {
+  list-style: none; cursor: pointer; user-select: none; white-space: nowrap;
+  font-size: 0.85rem; padding: 7px 12px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink-dim);
+}
+.dd > summary::-webkit-details-marker { display: none; }
+.dd[open] > summary { border-color: var(--brand-strong); color: var(--brand-strong); }
+.dd-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; min-width: 150px;
+  display: flex; flex-direction: column; gap: 2px; padding: 6px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow-1);
+}
+.dd-opt { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; font-size: 0.85rem; cursor: pointer; }
+.dd-opt:hover { background: color-mix(in srgb, var(--ink-faint) 10%, transparent); }
+.dd-empty { color: var(--ink-faint); font-size: 0.8rem; padding: 4px 8px; }
+
+/* Filter chips (role). */
+.filter-chips { display: inline-flex; gap: 6px; flex: 0 0 auto; }
+.chip {
+  font-size: 0.8rem; padding: 5px 12px; border-radius: 999px; cursor: pointer; white-space: nowrap;
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink-dim);
+}
+.chip-on { border-color: var(--brand-strong); color: var(--brand-strong); font-weight: 600; }
+
+/* Runs list reuses the shared table; its columns differ from datasets. */
+.ds-table.runs-table th:nth-child(1), .ds-table.runs-table td:nth-child(1) { width: 132px; padding-right: 16px; }
+.ds-table.runs-table th:nth-child(3), .ds-table.runs-table td:nth-child(3) { width: 92px; }
+.ds-table.runs-table th:nth-child(4), .ds-table.runs-table td:nth-child(4) { width: 118px; text-align: right; }
+.ds-table.runs-table th:nth-child(5), .ds-table.runs-table td:nth-child(5) { width: 224px; text-align: left; }
+.ds-table.runs-table td:nth-child(6), .ds-table.runs-table th:nth-child(6) { display: none; }
+
+/* Preview toggle: fixed width so switching Preview↔Hide never shifts the row. */
+.lo-preview-btn { min-width: 68px; }
 
 #r-more { align-self: center; margin: 16px auto 0; }
 
@@ -888,6 +1003,16 @@ select {
 .dataset-title { font-size: 1.05rem; word-break: break-all; }
 .detail-grid label { display: block; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted, #888); margin-bottom: 2px; }
 .volume-bars { display: flex; align-items: flex-end; gap: 4px; min-height: 68px; padding: 8px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); }
+/* Sparse (<3 runs): a text summary instead of a lone bar in an empty box. */
+.volume-summary { padding: 12px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); color: var(--ink-dim); font-size: 0.9rem; }
+.volume-hint { color: var(--ink-faint); }
+
+/* Local-outputs "Manage" disclosure — tuck the destructive controls away. */
+.lo-manage { position: relative; }
+.lo-manage > summary { list-style: none; cursor: pointer; user-select: none; font-size: 0.85rem; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--ink-dim); white-space: nowrap; }
+.lo-manage > summary::-webkit-details-marker { display: none; }
+.lo-manage[open] > summary { border-color: var(--brand-strong); color: var(--brand-strong); }
+.lo-manage-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px; min-width: 320px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-1); }
 .volume-bar { width: 14px; border-radius: 3px 3px 0 0; background: var(--running, #4a9eda); opacity: 0.85; }
 .volume-bar:hover { opacity: 1; }
 .schema-version { border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); margin-bottom: 8px; }
@@ -899,29 +1024,155 @@ select {
 .diff-removed { color: var(--cancelled); border-color: color-mix(in srgb, var(--cancelled) 40%, transparent); }
 .edge-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 12px; }
 .edge-lists h3 { margin: 4px 0; font-size: 0.85rem; color: var(--ink-dim); }
-.lineage-graph { overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); padding: 8px; }
-.lineage-svg { min-width: 640px; width: 100%; height: auto; }
-.lineage-edge { fill: none; stroke: var(--border); stroke-width: 2; }
-.lineage-edge:hover { stroke: var(--running, #4a9eda); }
-.lineage-node rect { fill: var(--bg, #fff); stroke: var(--border); stroke-width: 1.5; }
-.lineage-node text { fill: var(--ink); font-family: var(--font-mono); font-size: 12px; }
-.lineage-node:hover rect { stroke: var(--running, #4a9eda); }
+/* The graph scrolls both ways inside its card. The SVG keeps its natural pixel
+   size (set as width/height attributes) rather than stretching to 100% — that
+   is what lets wide labels overflow and scroll left/right instead of squashing. */
+.lineage-graph { overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); padding: 8px; max-height: 78vh; }
+.lineage-svg { display: block; margin: 0 auto; }
+.lineage-hint { margin: -4px 0 12px; font-size: 0.8rem; color: var(--ink-faint); }
+
+/* "Load more" — a centred, intentional affordance rather than a stray ghost
+   button pinned to the left edge under the last row. */
+.load-more {
+  display: block;
+  margin: 16px auto 4px;
+  min-width: 220px;
+  padding: 10px 22px;
+  font-weight: 550;
+  color: var(--ink-dim);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+.load-more:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+  border-color: var(--brand-strong);
+  box-shadow: var(--shadow-1);
+}
+/* `display:block` above outranks the UA `[hidden]{display:none}` (same
+   specificity, author wins), so the button stayed visible even when hidden was
+   set. This restores it: at the end of the list the button truly disappears. */
+.load-more[hidden] { display: none; }
+
+/* Numbered pager (datasets): « ‹ 1 … 4 [5] 6 … 20 › » + a count summary. */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 16px 0 4px;
+}
+.pager:empty { display: none; }
+.pager-btn {
+  min-width: 34px;
+  padding: 6px 10px;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-dim);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.pager-btn:hover:not(:disabled):not(.is-current) {
+  background: var(--surface-2);
+  color: var(--ink);
+  border-color: var(--brand-strong);
+}
+.pager-btn.is-current {
+  background: var(--brand-strong);
+  border-color: var(--brand-strong);
+  color: #fff;
+  font-weight: 600;
+  cursor: default;
+}
+.pager-btn:disabled { opacity: 0.4; cursor: default; }
+.pager-gap { color: var(--ink-faint); padding: 0 2px; }
+.pager-info {
+  margin-left: 10px;
+  font-size: 0.78rem;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+.lineage-edge { fill: none; stroke: var(--border); stroke-width: 2; transition: stroke 0.15s, opacity 0.15s; }
+.lineage-edge:hover { stroke: var(--brand-strong); }
+.lineage-node rect { fill: var(--surface-2, #f4f6f8); stroke: var(--border); stroke-width: 1; transition: stroke 0.15s, fill 0.15s, opacity 0.15s; }
+.lineage-node text { fill: var(--ink-dim); font-family: var(--font-mono); font-size: 11px; transition: fill 0.15s; }
+/* Label lives in a foreignObject and scrolls horizontally *inside* the box, so
+   the full path is reachable by scrolling the box itself (like .ds-uri-in). The
+   scrollbar is hidden (trackpad / shift-wheel still scroll) with a right-edge
+   fade hinting there is more to the right. */
+.lnode-label {
+  height: 100%;
+  line-height: 30px; /* NODE_H (32) − 2 border */
+  padding: 0 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  cursor: pointer;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
+}
+.lnode-label::-webkit-scrollbar { display: none; }
+.lineage-node:hover rect { stroke: var(--brand-strong); }
 .lineage-root rect { stroke: var(--ok); stroke-width: 2.5; }
+/* Click-to-highlight: the selected node, its neighbours, and their edges stay
+   bright while everything else dims, so a dataset's connections read at a glance.
+   Selected = solid brand; neighbour = brand tint; active edge = brand line. */
+.lineage-node.is-selected rect { fill: var(--brand-strong); stroke: var(--brand-strong); stroke-width: 2.5; }
+.lineage-node.is-selected text { fill: #fff; }
+.lineage-node.is-selected .lnode-label { color: #fff; font-weight: 600; }
+.lineage-node.is-neighbour rect { fill: color-mix(in srgb, var(--brand-strong) 34%, var(--surface)); stroke: var(--brand-strong); stroke-width: 2; }
+.lineage-node.is-neighbour .lnode-label { color: var(--ink); }
+.lineage-edge.is-active { stroke: var(--brand-strong); stroke-width: 3; }
+/* Non-highlighted nodes clearly recede: opacity alone barely fades an already
+   pale box on a pale ground, so also wash the fill toward the background and
+   grey the text — the highlighted set then reads unmistakably. */
+.lineage-svg.has-selection .lineage-node:not(.is-selected):not(.is-neighbour) rect {
+  fill: color-mix(in srgb, var(--border) 22%, var(--surface));
+  stroke: color-mix(in srgb, var(--border) 55%, transparent);
+}
+.lineage-svg.has-selection .lineage-node:not(.is-selected):not(.is-neighbour) .lnode-label { color: var(--ink-faint); opacity: 0.55; }
+.lineage-svg.has-selection .lineage-edge:not(.is-active) { opacity: 0.12; }
 
 /* ============================================================================
    pipeline templates (#444)
    ========================================================================== */
 /* status · name · updated · live · newest · params — fixed meta widths so the
    column header (a separate grid) lines up with the rows below it. */
-.tpl-row { grid-template-columns: 120px 1fr 205px 56px 64px 60px; }
+/* Borderless rows with a bottom separator so Templates reads as the same table
+   as Runs/Datasets (its columns are fixed-width, so they already align). */
+.tpl-row {
+  grid-template-columns: 120px 1fr 205px 56px 64px 60px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  box-shadow: none;
+  padding: 14px 16px;
+}
+.tpl-row:hover { background: color-mix(in srgb, var(--ink-faint) 8%, transparent); border-left: none; box-shadow: none; transform: none; }
 .tpl-row .run-meta { white-space: nowrap; } /* keep the timestamp (incl. AM/PM) on one line */
 .tpl-list-head {
   display: grid;
   grid-template-columns: 120px 1fr 205px 56px 64px 60px;
   align-items: center;
   gap: 14px;
+  position: sticky;
+  top: 56px;
+  z-index: 15;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
   /* match .run-row content inset: 16px padding + 3px transparent left border */
-  padding: 2px 16px 6px;
+  padding: 10px 16px;
   border-left: 3px solid transparent;
   font-family: var(--font-mono);
   font-size: 0.7rem;
@@ -1085,12 +1336,15 @@ select {
 .lo-list { display: flex; flex-direction: column; gap: 6px; }
 .lo-row {
   display: grid;
-  /* kind · path · state · age · last-written · preview · delete */
-  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto auto;
+  /* kind · path · state · age · last-written · preview · delete — FIXED widths so
+     every independent row grid lines up (badge/age/time/buttons align). */
+  grid-template-columns: 84px minmax(0, 1fr) 92px 72px 190px 82px 96px;
   align-items: center;
   gap: 10px;
   cursor: default;
 }
+.lo-row .lo-state, .lo-row .run-meta { justify-self: start; }
+.lo-row .lo-preview-btn, .lo-row .btn-danger { justify-self: stretch; text-align: center; }
 .lo-row .run-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lo-row .btn-danger { padding: 5px 11px; font-size: 0.8rem; }
 /* An expired output is a normal, expected end state — dimmed, never an error. */
@@ -1167,8 +1421,12 @@ select {
   font-family: var(--font-mono);
   color: var(--ink-dim);
   vertical-align: top;
+  /* Keep each value on one line — the table scrolls horizontally for wide
+     column sets; a single oversized value is ellipsised, not wrapped. */
+  white-space: nowrap;
   max-width: 320px;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .dp-table tbody tr:last-child td { border-bottom: 0; }
 .dp-table tbody tr:hover td { background: var(--surface-2); }

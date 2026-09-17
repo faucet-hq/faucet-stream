@@ -298,6 +298,90 @@ source:
     odata: { version: v4, entity: Orders, select: [DocEntry, DocDate], page_size: 500 }
 ```
 
+### Config-driven discovery (`discovery`)
+
+A generic, vendor-neutral discovery recipe: enumerate datasets from a listing
+endpoint (or an explicit `objects` list), optionally *describe* each one to
+build a typed schema + field list, and *emit* one dataset descriptor per object
+— all with plain, templated HTTP calls, so any provider (a CRM's describe API,
+a catalog endpoint, a REST admin API) is pure YAML, never a code path.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`. Omit when `objects` is supplied directly. |
+| `objects` | array<string> **or** string | `[]` | Datasets supplied directly — a list or a comma-separated string, so one run-param can drive it (`objects: "${param.objects}"`). |
+| `describe` | object / null | — | Step 2: per-dataset field discovery — `get` (templated path), `fields`/`field_name`/`field_type`/`field_nullable` JSONPaths, a `type_map`, and `skip_types`. Omit when the source returns every column by default. |
+| `emit.config` | object | — | Step 3: JSON deep-merged into the dataset's source config (e.g. a query built from `${field_names}`). Every string leaf is templated. |
+| `emit.table_id` | string / null | — | Sink `table_id` template (e.g. `"raw_${name_snake}"`). |
+| `emit.sink_ref` | string / null | `default` | With `fan_out`, the sink template (under `pipeline.sinks`) each dataset routes to. |
+| `fan_out` | bool | `false` | **Run-time** fan-out: `faucet run` / `faucet serve` discover the datasets and generate the matrix at trigger time — one generic template syncs any object set passed as a param. `false` ⇒ the block only powers `faucet discover`. |
+
+Template variables available in every emitted string: `${name}` (verbatim),
+`${name_snake}`, `${name_lower}`, and — when a `describe` step ran —
+`${field_names}` (comma-joined field list).
+
+**Two ways to use it.** *Generate-time* (`faucet discover`, `fan_out: false`)
+writes a static matrix you review/commit. *Run-time* (`fan_out: true`) skips
+the generate step — register one generic template with `objects` as a param
+and it discovers + fans out on every trigger, picking up new fields
+automatically:
+
+```yaml
+source:
+  type: rest
+  config:
+    base_url: "https://api.example.com"
+    auth: { type: token_endpoint, config: { … } }
+    async_job:
+      submit: { method: POST, url: "/jobs/query", json: { query: "placeholder" } }
+      # … poll/fetch …
+    discovery:
+      fan_out: true
+      objects: "${param.objects}"
+      describe:
+        get: "/objects/${name}/describe"
+        fields: "$.fields[*]"
+        field_name: "$.name"
+        field_type: "$.type"
+        field_nullable: "$.nullable"
+        type_map: { int: integer, double: number, "*": string }
+      emit:
+        config:
+          async_job: { submit: { json: { query: "SELECT ${field_names} FROM ${name}" } } }
+        table_id: "${name_lower}"
+        sink_ref: warehouse
+# no matrix: — generated live from `objects` at run time
+```
+```console
+$ faucet run pipeline.yaml --param objects="Account,Contact,Lead"   # or "all"
+```
+
+The OData block composes with the same fan-out vocabulary (`objects`,
+`fan_out`, `emit`) plus a `partition` block for key-range parallel extraction
+of large entities:
+
+```yaml
+source:
+  type: rest
+  config:
+    base_url: "https://host/data"
+    odata:
+      version: v4
+      fan_out: true
+      objects: "${param.objects}"
+      emit: { table_id: "raw_${name_snake}", sink_ref: warehouse }
+      partition:               # split huge entities into concurrent key ranges
+        objects: [LedgerEntries, Transactions]
+        workers: 16            # concurrent range readers (default 4, max 64)
+        count: 64              # ranges to tile into (default workers × 4)
+```
+
+Each `partition.objects` entity whose `$metadata` declares a single **integer**
+key is tiled with `faucet_core::shard::plan_pk_shards` (the same primitive the
+SQL sources shard with) and fetched as concurrent `$filter` ranges; entities
+without such a key fall back to sequential paging. Ranges are planned per run —
+never bookmarked.
+
 ### Response-decode pipeline (`decode`)
 
 Consume payloads that aren't plain JSON — including files embedded in a JSON/SOAP
@@ -329,7 +413,8 @@ job → poll a status endpoint until terminal → fetch the result → hand it t
 |-------|-------------|
 | `submit` | `{ method, url, headers, query, json }` — job-creation request. |
 | `job_id` | JSONPath to the job id in the submit response. |
-| `poll` | `{ url, method, interval_secs (5), timeout_secs (1800) }` — `${job_id}` substituted. |
+| `poll` | `{ url, method, interval_secs (5), timeout_secs (1800) }` — `${job_id}` substituted. `interval_secs` is the **ceiling** on the poll cadence, not a fixed wait: polling starts at 1s and doubles up to the cap, so a fast job is noticed in ~1s while a long one isn't hammered. |
+| `lookback` | Incremental only: re-read margin subtracted from the persisted bookmark (`45s` / `30m` / `6h`, default `5m`) — see below. |
 | `status` | `{ path, success: [...], failure: [...] }` — classify the poll response. |
 | `fetch` | `{ method, url \| url_from, headers, query, json }` — result download; body flows through `decode:`. Set **exactly one** of `url` (a `${job_id}`-templated path) or `url_from` (a JSONPath into the last poll body — see below). |
 
@@ -384,6 +469,45 @@ async_job:
 
 Records are appended across pages; the loop stops when the locator header/body is missing, empty, or `"null"`.
 
+#### Incremental replication with `async_job`
+
+Set `replication_method: { type: Incremental }` + `replication_key` and the
+source pushes the bookmark down into the job itself: the resumed bookmark is
+injected as `WHERE <replication_key> > <bookmark>` into the **top-level string
+`query` of `submit.json`** (wrapping any existing `WHERE`, before trailing
+clauses; subqueries and quoted literals are left alone). That `query` field is
+**required** for this mode — without one the predicate could never apply, so
+the config is rejected at validate time rather than silently exporting
+full-table on every run. `replication_bind` is mutually exclusive with
+`async_job` (the submit query *is* the bind).
+
+The persisted bookmark is the run's **start time minus `lookback`** (default
+5m): using the start time keeps the path streaming-native (no row parsing),
+and the margin makes it safe against a client clock running ahead of the
+server — the cost is a bounded re-read overlap each run, which an upsert sink
+dedups. First run (no bookmark) = full export, as expected. The source
+auto-opts into resumability in this mode, so add a `state:` block to persist
+the bookmark across runs.
+
+```yaml
+replication_method: { type: Incremental }
+replication_key: SystemModstamp
+async_job:
+  submit: { method: POST, url: /jobs, json: { operation: query, query: "SELECT Id FROM Lead" } }
+  # …job_id / poll / status / fetch…
+  lookback: 15m        # optional; default 5m
+```
+
+#### Native byte passthrough (#633)
+
+When the job's result is CSV, the `decode:` pipeline is exactly one
+`parse: { format: csv }` step, and the sink can bulk-load NDJSON natively
+(e.g. BigQuery with `media_load: true`), the pipeline streams the fetched
+bytes straight into the sink as NDJSON — no `Vec<serde_json::Value>` is ever
+built, so peak memory stays flat regardless of row count. Negotiated
+automatically; any transform, quality/contract/masking pass, DLQ, or
+exactly-once delivery falls back to the ordinary record path.
+
 ### Singer / Meltano metadata
 
 | Field | Type | Default | Description |
@@ -412,7 +536,7 @@ The `auth` field accepts the project-wide adjacently-tagged `{ type, config }` s
 | `api_key` | `header`, `value` | API key sent in a custom request header. |
 | `api_key_query` | `param`, `value` | API key sent as a query parameter (e.g. `?api_key=secret`). |
 | `oauth2` | `token_url`, `client_id`, `client_secret`, `scopes`, `expiry_ratio` | OAuth2 client-credentials flow with token caching. |
-| `token_endpoint` | `url`, `method`, `body`, `token_path`, `expiry_path`, `expiry_ratio` | Fetch a token from an arbitrary HTTP endpoint (JSONPath-extracted). |
+| `token_endpoint` | `url`, `method`, `body`, `encoding` (`json` default / `form`), `token_path`, `expiry_path`, `expiry_ratio` | Fetch a token from an arbitrary HTTP endpoint (JSONPath-extracted). `encoding: form` sends the body `application/x-www-form-urlencoded` — what RFC 6749 token endpoints require. |
 | `custom` | `headers` (map<string,string>) | Arbitrary headers attached to every request. |
 
 **`oauth2` / `token_endpoint` notes:** `expiry_ratio` is the fraction of the token lifetime after which the cached token is proactively refreshed — must be in `(0.0, 1.0]`, defaults to `0.9`. For `token_endpoint`, `token_path` is the JSONPath to the token string and `expiry_path` (optional) is the JSONPath to the expiry in seconds; when absent the token is cached indefinitely. A cached token that the API later rejects with **401 Unauthorized** (a server-side expiry the time-based cache can't see, including the cached-indefinitely case) is invalidated and the request is retried once with a freshly-fetched token, so a long run doesn't abort mid-way.

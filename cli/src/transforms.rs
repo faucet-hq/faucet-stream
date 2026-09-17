@@ -10,7 +10,7 @@ use faucet_core::ZipColumnsSpec;
 #[cfg(feature = "transforms")]
 use faucet_core::{
     CastOnError, CastType, CrossJoinSpec, HashAlgorithm, HashEncoding, JsonParseOnError,
-    KeyCaseMode, LookupOnMissing, TreeFlattenSpec, UnpivotSpec, ValueCaseMode,
+    KeyCaseMode, KeyCollision, LookupOnMissing, TreeFlattenSpec, UnpivotSpec, ValueCaseMode,
 };
 #[cfg(any(feature = "transforms", feature = "transform-cdc-unwrap"))]
 use faucet_core::{JsonSchema, schema_for};
@@ -121,6 +121,10 @@ fn default_spell_separator() -> String {
 struct KeysCaseConfig {
     /// Output convention for every key in the record.
     mode: KeyCaseMode,
+    /// What to do when two distinct keys re-case to the same name:
+    /// `error` (default — fail loudly) or `suffix` (append `_2`, `_3`, …).
+    #[serde(default)]
+    on_collision: KeyCollision,
 }
 
 #[cfg(feature = "transforms")]
@@ -435,6 +439,7 @@ fn registry() -> Vec<TransformDef> {
                     let cfg = decode::<KeysCaseConfig>(kind, config)?;
                     Ok(TransformStage::Map(RecordTransform::KeysCase {
                         mode: cfg.mode,
+                        on_collision: cfg.on_collision,
                     }))
                 },
             },

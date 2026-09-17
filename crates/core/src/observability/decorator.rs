@@ -144,6 +144,22 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         self.inner.stream_batches(context, batch_size)
     }
 
+    // Native byte-passthrough capability (#633) forwards to the inner source; the
+    // native streaming loop in `pipeline.rs` emits the source metrics itself.
+    fn native_output_formats(&self) -> &'static [crate::native::NativeFormat] {
+        self.inner.native_output_formats()
+    }
+
+    fn stream_native<'b>(
+        &'b self,
+        context: &'b HashMap<String, Value>,
+        format: crate::native::NativeFormat,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<crate::native::NativeBatch, FaucetError>> + Send + 'b>>
+    {
+        self.inner.stream_native(context, format, batch_size)
+    }
+
     fn stream_pages<'b>(
         &'b self,
         context: &'b HashMap<String, Value>,
@@ -333,6 +349,21 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
         self.inner.write_batch_columnar(batch).await
+    }
+
+    // Native byte-passthrough load (#633): forward to the inner sink; the native
+    // loop in `pipeline.rs` emits the sink metrics.
+    fn native_load_capabilities(&self) -> Vec<crate::native::NativeLoadCapability> {
+        self.inner.native_load_capabilities()
+    }
+
+    async fn load_native(
+        &self,
+        batch: crate::native::NativeBatch,
+        scope: &str,
+        ctx: crate::native::NativeLoadContext,
+    ) -> Result<usize, FaucetError> {
+        self.inner.load_native(batch, scope, ctx).await
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {

@@ -1100,7 +1100,7 @@ async fn test_flatten_transform_applied_to_records() {
 #[cfg(feature = "transform-keys-case")]
 #[tokio::test]
 async fn test_keys_case_snake_transform() {
-    use faucet_core::KeyCaseMode;
+    use faucet_core::{KeyCaseMode, KeyCollision};
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -1121,6 +1121,7 @@ async fn test_keys_case_snake_transform() {
         inner,
         vec![TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Error,
         })],
         Labels::for_named("rest"),
     )
@@ -1169,7 +1170,7 @@ async fn test_rename_keys_transform() {
 #[cfg(all(feature = "transform-keys-case", feature = "transform-flatten"))]
 #[tokio::test]
 async fn test_chained_transforms_keys_case_then_flatten() {
-    use faucet_core::KeyCaseMode;
+    use faucet_core::{KeyCaseMode, KeyCollision};
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -1191,6 +1192,7 @@ async fn test_chained_transforms_keys_case_then_flatten() {
         vec![
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: KeyCollision::Error,
             }),
             TransformStage::Map(RecordTransform::Flatten {
                 separator: "_".into(),
@@ -1445,6 +1447,7 @@ async fn test_token_endpoint_auth_fetches_and_uses_token() {
 
     let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/api/data").auth(
         Auth::TokenEndpoint {
+            encoding: Default::default(),
             url: format!("{}/auth/token", server.uri()),
             method: reqwest::Method::POST,
             headers: HeaderMap::new(),
@@ -1499,6 +1502,7 @@ async fn test_token_endpoint_auth_with_custom_headers_and_body() {
 
     let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/api/items").auth(
         Auth::TokenEndpoint {
+            encoding: Default::default(),
             url: format!("{}/auth/login", server.uri()),
             method: reqwest::Method::POST,
             headers: token_headers,
@@ -1566,6 +1570,7 @@ async fn test_token_endpoint_auth_caches_token_across_pages() {
                 param_name: "cursor".into(),
             })
             .auth(Auth::TokenEndpoint {
+                encoding: Default::default(),
                 url: format!("{}/auth/token", server.uri()),
                 method: reqwest::Method::POST,
                 headers: HeaderMap::new(),
@@ -1597,6 +1602,7 @@ async fn test_token_endpoint_auth_error_on_failed_fetch() {
 
     let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/api/data").auth(
         Auth::TokenEndpoint {
+            encoding: Default::default(),
             url: format!("{}/auth/token", server.uri()),
             method: reqwest::Method::POST,
             headers: HeaderMap::new(),
@@ -1644,6 +1650,7 @@ async fn test_token_endpoint_custom_response_validator() {
 
     let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/api/data").auth(
         Auth::TokenEndpoint {
+            encoding: Default::default(),
             url: format!("{}/auth/token", server.uri()),
             method: reqwest::Method::POST,
             headers: HeaderMap::new(),
@@ -1677,6 +1684,7 @@ async fn test_token_endpoint_custom_validator_rejects_response() {
 
     let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/api/data").auth(
         Auth::TokenEndpoint {
+            encoding: Default::default(),
             url: format!("{}/auth/token", server.uri()),
             method: reqwest::Method::POST,
             headers: HeaderMap::new(),

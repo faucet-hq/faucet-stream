@@ -65,6 +65,7 @@ mod tests {
         let labels = Labels::new("p", "r", "rid");
         let stage = compile_stage(&TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
+            on_collision: Default::default(),
         }))
         .expect("Map(KeysCase) compiles");
         let result = instrumented_apply_stages(

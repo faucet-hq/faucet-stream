@@ -2495,6 +2495,7 @@ version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
 dependencies = [
+ "brotli",
  "compression-core",
  "flate2",
  "memchr",
@@ -4269,6 +4270,7 @@ dependencies = [
  "indicatif",
  "inquire",
  "jsonschema",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
@@ -4548,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-core"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "aes-gcm 0.11.0",
  "arrow",
@@ -4599,6 +4601,7 @@ dependencies = [
 name = "faucet-lineage"
 version = "2.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "chrono",
  "faucet-core",
@@ -4642,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-bigquery"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4652,9 +4655,11 @@ dependencies = [
  "faucet-conformance",
  "faucet-core",
  "flate2",
+ "futures",
  "gcp-bigquery-client",
  "google-cloud-storage",
  "parquet",
+ "reqwest 0.13.3",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -5779,7 +5784,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-rest"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5801,6 +5806,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "wiremock",

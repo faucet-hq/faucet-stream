@@ -14,6 +14,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 pub use token_endpoint::ResponseValidator;
 
+/// Body encoding for the token-endpoint request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenBodyEncoding {
+    /// JSON body (`application/json`) — the default (back-compat).
+    #[default]
+    Json,
+    /// Form-urlencoded body (`application/x-www-form-urlencoded`) — required by
+    /// RFC-6749 OAuth token endpoints (Salesforce, Google, most OAuth servers),
+    /// which reject a JSON body with `unsupported_grant_type`.
+    Form,
+}
+
 /// Supported authentication methods.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
@@ -79,6 +92,11 @@ pub enum Auth {
         /// Fraction of the expiry after which the token is proactively refreshed.
         /// Must be in `(0.0, 1.0]`. Defaults to `0.9`.
         expiry_ratio: f64,
+        /// Body encoding: `json` (default) or `form`
+        /// (`application/x-www-form-urlencoded`, required by RFC-6749 OAuth
+        /// token endpoints like Salesforce/Google).
+        #[serde(default)]
+        encoding: TokenBodyEncoding,
         /// Optional callback to decide whether the token endpoint response is
         /// successful. Receives the HTTP status code. When `None`, defaults to
         /// `status.is_success()` (2xx).
@@ -241,6 +259,7 @@ mod tests {
             token_path: "$.token".into(),
             expiry_path: None,
             expiry_ratio: 0.9,
+            encoding: TokenBodyEncoding::default(),
             response_validator: None,
         }
         .apply(&mut headers);

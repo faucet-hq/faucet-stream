@@ -2,9 +2,41 @@ import { api, toast } from "../api.js";
 import { streamLogs } from "../sse.js";
 import { navigate } from "../router.js";
 import { fmtTime } from "./runs.js";
-import { escapeHtml } from "../utils.js";
+import { escapeHtml, fmtInt, fmtCompact } from "../utils.js";
+
+/** Human duration between two RFC3339 timestamps; "—" if either is missing. */
+function fmtDur(fromISO, toISO) {
+  if (!fromISO || !toISO) return "—";
+  const ms = Date.parse(toISO) - Date.parse(fromISO);
+  if (!(ms >= 0)) return "—";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/** Human duration from a millisecond count (per-row invocation timing, #645). */
+function fmtMs(ms) {
+  if (ms == null) return "—";
+  if (ms < 1000) return `${ms} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)} s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${Math.round(s % 60)}s`;
+}
 
 const TERMINAL = ["completed", "failed", "cancelled"];
+
+/** Provenance line for a run triggered from a template: its labels carry the
+ *  template id + the numeric version it resolved to. Links to the template.
+ *  Empty for non-template runs. */
+function templateProvenance(rec) {
+  const l = rec.labels || {};
+  if (!l.template) return "";
+  const ver = l.template_version ? ` <b>v${escapeHtml(String(l.template_version))}</b>` : "";
+  return `<div title="run triggered from a registered template">template: <a href="#/templates/${encodeURIComponent(l.template)}">${escapeHtml(l.template)}</a>${ver}</div>`;
+}
 
 // Location-driven DLQ panel: inspect / replay / discard envelopes at a
 // server-local path. The DLQ is not run-scoped, so the location is entered
@@ -93,7 +125,7 @@ export async function renderDetail(container, { id }) {
       <div class="page-head">
         <button class="btn-ghost" id="back">← Runs</button>
         <div class="detail-actions">
-          <button class="btn-ghost" id="cancel" hidden>Cancel</button>
+          <button class="btn-warn" id="cancel" hidden>Cancel</button>
           <button class="btn-danger" id="delete" hidden>Delete</button>
         </div>
       </div>
@@ -119,7 +151,7 @@ export async function renderDetail(container, { id }) {
             <option value="contract">contract</option>
           </select>
           <button class="btn-ghost" id="dlq-inspect">Inspect</button>
-          <button class="btn-ghost" id="dlq-discard">Discard</button>
+          <button class="btn-warn" id="dlq-discard">Discard</button>
           <label class="dlq-check"><input type="checkbox" id="dlq-delete" /> delete (no archive)</label>
         </div>
         <div id="dlq-result"></div>
@@ -179,17 +211,40 @@ export async function renderDetail(container, { id }) {
         <div>submitted ${fmtTime(rec.submitted_at)}</div>
         <div>started ${fmtTime(rec.started_at)}</div>
         <div>finished ${fmtTime(rec.finished_at)}</div>
-        <div>${rec.records_written ?? 0} rows</div>
+        <div title="submitted → finished (includes time queued)">total ${fmtDur(rec.submitted_at, rec.finished_at)}</div>
+        <div title="started → finished (execution only)">run ${fmtDur(rec.started_at, rec.finished_at)}</div>
+        <div title="${fmtInt(rec.records_written ?? 0)} rows">${fmtCompact(rec.records_written ?? 0)} rows</div>
+        ${templateProvenance(rec)}
         ${rec.idempotency_key ? `<div>idem: ${escapeHtml(rec.idempotency_key)}</div>` : ""}
       </div>${errors}`;
     const inv = container.querySelector("#invocations");
+    // Per-row timing (#645): sort slowest-first so the object dominating the
+    // run's makespan is obvious, and draw a proportional bar next to each.
+    const invs = (rec.invocations || [])
+      .slice()
+      .sort((a, b) => (b.duration_ms || 0) - (a.duration_ms || 0));
+    const maxMs = Math.max(1, ...invs.map((i) => i.duration_ms || 0));
     inv.innerHTML =
-      `<table class="tbl"><thead><tr><th>row</th><th>parent key</th><th>rows</th><th>error</th></tr></thead><tbody>` +
-      (rec.invocations || [])
-        .map(
-          (i) =>
-            `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td>${i.records_written ?? 0}</td><td>${escapeHtml(i.error || "")}</td></tr>`,
-        )
+      `<table class="tbl"><thead><tr><th>row</th><th>parent key</th><th>rows</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
+      invs
+        .map((i) => {
+          const ms = i.duration_ms || 0;
+          const pct = Math.round((ms / maxMs) * 100);
+          // A recessed neutral track (groove) with a glossy 3D pill fill
+          // proportional to the time — the slowest row fills it completely. The
+          // fill layers a white top-sheen over a light→dark teal gradient, with a
+          // drop shadow + inner highlight for depth. Lives inside the duration
+          // cell so it reads as a duration visual, not the error column. Track
+          // uses a translucent neutral so it works on light+dark.
+          const fill =
+            `<div style="height:100%;width:${pct}%;min-width:3px;border-radius:4px;` +
+            `background:linear-gradient(to bottom, var(--brand-strong), var(--brand));` +
+            `box-shadow:inset 0 1px 0 rgba(255,255,255,0.25), 0 1px 1px rgba(0,0,0,0.12)"></div>`;
+          const bar =
+            `<div style="height:9px;width:100%;max-width:180px;border-radius:4px;background:rgba(120,120,120,0.14);` +
+            `box-shadow:inset 0 1px 1px rgba(0,0,0,0.12);margin-top:5px">${fill}</div>`;
+          return `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td>${i.records_written ?? 0}</td><td><div style="white-space:nowrap">${fmtMs(ms)}</div>${bar}</td><td>${escapeHtml(i.error || "")}</td></tr>`;
+        })
         .join("") +
       `</tbody></table>`;
   }

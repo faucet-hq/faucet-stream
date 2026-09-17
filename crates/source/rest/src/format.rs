@@ -32,17 +32,126 @@ pub async fn parse_csv(
             headers = Some(rec.iter().map(str::to_string).collect());
             continue;
         }
-        let mut obj = Map::new();
-        for (i, field) in rec.iter().enumerate() {
-            let key = headers
-                .as_ref()
-                .and_then(|h| h.get(i).cloned())
-                .unwrap_or_else(|| format!("column_{i}"));
-            obj.insert(key, Value::String(field.to_string()));
-        }
-        out.push(Value::Object(obj));
+        out.push(Value::Object(csv_record_to_object(
+            &rec,
+            headers.as_deref(),
+        )));
     }
     Ok(out)
+}
+
+/// The single definition of how a CSV record becomes a JSON object — header-
+/// derived keys with the `column_<i>` fallback, all-`String` values. Shared by
+/// the `Value` path ([`parse_csv`]) and both NDJSON converters so the encodings
+/// can never drift apart (the parity tests additionally pin them byte-identical).
+fn csv_record_to_object(
+    rec: &csv_async::StringRecord,
+    headers: Option<&[String]>,
+) -> Map<String, Value> {
+    let mut obj = Map::new();
+    for (i, field) in rec.iter().enumerate() {
+        let key = headers
+            .and_then(|h| h.get(i).cloned())
+            .unwrap_or_else(|| format!("column_{i}"));
+        obj.insert(key, Value::String(field.to_string()));
+    }
+    obj
+}
+
+/// [`csv_record_to_object`] serialized as one NDJSON line (no trailing newline).
+fn csv_record_to_ndjson_line(
+    rec: &csv_async::StringRecord,
+    headers: Option<&[String]>,
+) -> Result<String, FaucetError> {
+    serde_json::to_string(&Value::Object(csv_record_to_object(rec, headers)))
+        .map_err(|e| FaucetError::Source(format!("rest: CSV→NDJSON encode error: {e}")))
+}
+
+/// Stream CSV bytes straight to newline-delimited JSON **without materializing a
+/// `Vec<Value>`** — the native byte-passthrough source path (#633).
+///
+/// Emits the *identical* NDJSON the `Value` path would (`parse_csv` →
+/// `serde_json::to_string` per record): the same header-derived keys (missing →
+/// `column_<i>`) and the same all-`String` values, so switching to this path does
+/// not change the bytes BigQuery loads (and hence its autodetected schema). The
+/// difference is memory: one record is held at a time instead of the whole page,
+/// so peak is `O(output bytes)` (~1× the data) rather than `Vec<serde_json::Value>`'s
+/// ~15–20× overhead. Returns the NDJSON bytes and the data-row count.
+pub async fn csv_to_ndjson(
+    bytes: &[u8],
+    delimiter: u8,
+    has_headers: bool,
+) -> Result<(Vec<u8>, u64), FaucetError> {
+    use futures::StreamExt as _;
+    let mut rdr = csv_async::AsyncReaderBuilder::new()
+        .has_headers(false)
+        .delimiter(delimiter)
+        .flexible(true)
+        .create_reader(bytes);
+    let mut records = rdr.records();
+    let mut headers: Option<Vec<String>> = None;
+    let mut out: Vec<u8> = Vec::new();
+    let mut count = 0u64;
+    while let Some(rec) = records.next().await {
+        let rec = rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
+        if has_headers && headers.is_none() {
+            headers = Some(rec.iter().map(str::to_string).collect());
+            continue;
+        }
+        let line = csv_record_to_ndjson_line(&rec, headers.as_deref())?;
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+        count += 1;
+    }
+    Ok((out, count))
+}
+
+/// Chunk size at which the streaming converter yields accumulated NDJSON.
+const NDJSON_STREAM_CHUNK: usize = 256 * 1024;
+
+/// Stream CSV from an async reader straight to NDJSON **chunks**, holding only one
+/// record + a bounded (~256 KiB) output buffer at a time — never the whole page
+/// (#633). This is the true-streaming form of [`csv_to_ndjson`]: fed the HTTP
+/// response body, it lets `load_native` push bytes into a resumable upload with
+/// peak memory independent of the page/row count. Per-record encoding is
+/// byte-identical to [`csv_to_ndjson`] / the `Value` path (all-`String` fields,
+/// header-derived keys, `column_<i>` fallback).
+pub fn csv_reader_to_ndjson_stream<R>(
+    reader: R,
+    delimiter: u8,
+    has_headers: bool,
+) -> impl futures::Stream<Item = Result<Vec<u8>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use futures::StreamExt as _;
+    async_stream::try_stream! {
+        let mut rdr = csv_async::AsyncReaderBuilder::new()
+            .has_headers(false)
+            .delimiter(delimiter)
+            .flexible(true)
+            .create_reader(reader);
+        let mut records = rdr.records();
+        let mut headers: Option<Vec<String>> = None;
+        let mut buf: Vec<u8> = Vec::with_capacity(NDJSON_STREAM_CHUNK + 4096);
+        while let Some(rec) = records.next().await {
+            let rec =
+                rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
+            if has_headers && headers.is_none() {
+                headers = Some(rec.iter().map(str::to_string).collect());
+                continue;
+            }
+            let line = csv_record_to_ndjson_line(&rec, headers.as_deref())?;
+            buf.extend_from_slice(line.as_bytes());
+            buf.push(b'\n');
+            if buf.len() >= NDJSON_STREAM_CHUNK {
+                yield std::mem::take(&mut buf);
+            }
+        }
+        if !buf.is_empty() {
+            yield buf;
+        }
+    }
 }
 
 /// Parse Excel bytes into records. Requires the `excel` feature.
@@ -157,6 +266,82 @@ mod tests {
         assert_eq!(recs[0]["id"], "1");
         assert_eq!(recs[0]["name"], "Alice");
         assert_eq!(recs[1]["name"], "Bob");
+    }
+
+    /// The native NDJSON converter (#633) must produce byte-identical output to
+    /// the `Value` path (`parse_csv` → one `serde_json::to_string` per record), so
+    /// switching paths never changes what the sink loads.
+    #[tokio::test]
+    async fn csv_to_ndjson_matches_value_path_bytes() {
+        let csv = b"id,name\n1,Alice\n2,Bob\n";
+        let (ndjson, rows) = csv_to_ndjson(csv, b',', true).await.unwrap();
+        assert_eq!(rows, 2);
+        let expected: String = parse_csv(csv, b',', true)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+            .collect();
+        assert_eq!(String::from_utf8(ndjson).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn csv_to_ndjson_handles_quoted_fields_and_custom_delimiter() {
+        // A quoted field containing the delimiter and a newline stays one record.
+        let csv = b"a;b\n\"x;y\";\"line1\nline2\"\n";
+        let (ndjson, rows) = csv_to_ndjson(csv, b';', true).await.unwrap();
+        assert_eq!(rows, 1);
+        let line = String::from_utf8(ndjson).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["a"], "x;y");
+        assert_eq!(v["b"], "line1\nline2");
+    }
+
+    #[tokio::test]
+    async fn csv_reader_stream_matches_buffered_ndjson() {
+        use futures::StreamExt as _;
+        // A big enough input to cross the 256 KiB chunk boundary (multi-chunk path).
+        let mut csv = String::from("id,name\n");
+        for i in 0..20_000 {
+            csv.push_str(&format!("{i},name-{i}-padding-to-grow-the-row\n"));
+        }
+        let reader = std::io::Cursor::new(csv.clone().into_bytes());
+        let chunks: Vec<Vec<u8>> = csv_reader_to_ndjson_stream(reader, b',', true)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert!(chunks.len() > 1, "large input should yield multiple chunks");
+        let streamed: Vec<u8> = chunks.concat();
+        let (buffered, rows) = csv_to_ndjson(csv.as_bytes(), b',', true).await.unwrap();
+        assert_eq!(rows, 20_000);
+        // Byte-identical to the buffered converter (and thus the Value path).
+        assert_eq!(streamed, buffered);
+    }
+
+    #[tokio::test]
+    async fn csv_reader_stream_small_input_single_chunk() {
+        use futures::StreamExt as _;
+        let reader = std::io::Cursor::new(b"a,b\n1,2\n3,4\n".to_vec());
+        let chunks: Vec<Vec<u8>> = csv_reader_to_ndjson_stream(reader, b',', true)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        let out = String::from_utf8(chunks.concat()).unwrap();
+        assert_eq!(out.lines().count(), 2);
+        let v: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(v["a"], "1");
+        assert_eq!(v["b"], "2");
+    }
+
+    #[tokio::test]
+    async fn csv_to_ndjson_missing_header_uses_column_index() {
+        // A row wider than the header falls back to `column_<i>` — same as parse_csv.
+        let (ndjson, rows) = csv_to_ndjson(b"a\n1,2\n", b',', true).await.unwrap();
+        assert_eq!(rows, 1);
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8(ndjson).unwrap().trim_end()).unwrap();
+        assert_eq!(v["a"], "1");
+        assert_eq!(v["column_1"], "2");
     }
 
     #[tokio::test]

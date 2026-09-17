@@ -573,9 +573,13 @@ jobs:
   # trait surface would silently break every external `faucet-source-*` /
   # `faucet-sink-*`. cargo-semver-checks compares this revision's public API
   # against the version last published to crates.io and fails on any breaking
-  # change; the only sanctioned way past it is bumping the crate's major version
-  # (which moves the baseline). Additive changes (new defaulted trait methods,
-  # new items) are a minor bump and pass. See CONTRIBUTING.md.
+  # change. Two sanctioned ways past it: bump the crate's major version (moves
+  # the baseline), or — for additive evolution of config/data types — the
+  # declared contract in `[package.metadata.cargo-semver-checks.lints]`
+  # (struct-literal construction / exhaustive matching are not part of the
+  # stability surface; construct via serde, `new()`/`Default`, or builders).
+  # Additive changes (new defaulted trait methods, new items) are a minor bump
+  # and pass. See CONTRIBUTING.md.
   semver-checks:
     name: API stability (cargo-semver-checks)
     runs-on: ubuntu-latest
@@ -664,8 +668,8 @@ jobs:
           # so they are excluded here and in codecov.yml (kept in sync).
           cargo llvm-cov report --lcov --output-path lcov.info \
             --ignore-filename-regex '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/source/gcs/src/stream\.rs$|crates/sink/gcs/src/sink\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
-      - name: Enforce >=90% patch coverage
-        # The project standard is >=90% coverage of changed lines. `codecov/patch`
+      - name: Enforce >=95% patch coverage
+        # The project standard is >=95% coverage of changed lines. `codecov/patch`
         # reports the same number but posts unreliably — of the eight PRs merged
         # before this gate landed, only one carried a codecov status on its head
         # commit (including a large code PR that carried none), so it cannot be a
@@ -678,7 +682,7 @@ jobs:
           python3 scripts/patch-coverage.py \
             --lcov lcov.info \
             --base "origin/${{ github.base_ref }}" \
-            --min 90
+            --min 95
       - name: Upload to Codecov
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         # `continue-on-error` keeps a Codecov outage from failing the build — the

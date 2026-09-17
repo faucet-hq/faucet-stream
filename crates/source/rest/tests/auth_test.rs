@@ -149,6 +149,7 @@ fn expiry_ratio_one_accepted() {
 fn token_endpoint_apply_without_resolution_returns_error() {
     let mut headers = HeaderMap::new();
     let result = Auth::TokenEndpoint {
+        encoding: Default::default(),
         url: "https://example.com/auth".into(),
         method: reqwest::Method::POST,
         headers: HeaderMap::new(),
@@ -166,6 +167,7 @@ fn token_endpoint_apply_without_resolution_returns_error() {
 fn token_endpoint_expiry_ratio_zero_rejected() {
     let result = RestStream::new(RestStreamConfig::new("https://example.com", "/api").auth(
         Auth::TokenEndpoint {
+            encoding: Default::default(),
             url: "https://example.com/auth".into(),
             method: reqwest::Method::POST,
             headers: HeaderMap::new(),
@@ -183,6 +185,7 @@ fn token_endpoint_expiry_ratio_zero_rejected() {
 fn token_endpoint_expiry_ratio_valid_accepted() {
     let result = RestStream::new(RestStreamConfig::new("https://example.com", "/api").auth(
         Auth::TokenEndpoint {
+            encoding: Default::default(),
             url: "https://example.com/auth".into(),
             method: reqwest::Method::POST,
             headers: HeaderMap::new(),

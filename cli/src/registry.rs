@@ -904,6 +904,21 @@ pub fn sink_supports_scoped_overwrite(kind: &str) -> bool {
     SCOPED_OVERWRITE_SINK_KINDS.contains(&kind)
 }
 
+/// Sinks with a **direct** (staging-free) overwrite path: a solo full-refresh
+/// loads straight into the target (e.g. an atomic BigQuery `WRITE_TRUNCATE`
+/// load, which replaces the table only on success), so no staging table is
+/// needed. The executor injects the internal `_overwrite_staging` signal into
+/// *these* sinks only when the overwrite is a grouped fan-out (>1 writer → one
+/// physical table), where a shared staging table is the only safe cross-writer
+/// swap. Non-listed sinks always stage via their own begin/commit lifecycle.
+pub const DIRECT_OVERWRITE_SINK_KINDS: &[&str] = &["bigquery"];
+
+/// Whether a sink kind has a staging-free direct overwrite path (and therefore
+/// understands the internal `_overwrite_staging` grouped-signal).
+pub fn sink_supports_direct_overwrite(kind: &str) -> bool {
+    DIRECT_OVERWRITE_SINK_KINDS.contains(&kind)
+}
+
 /// Sink kinds that bulk-load via an object-store stage + native load command
 /// (staged bulk load, #528). These mirror each sink's
 /// `Sink::supports_staged_load` override. Redshift (`write_strategy: copy`), Snowflake (`bulk_load`), and

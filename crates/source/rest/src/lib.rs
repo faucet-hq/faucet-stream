@@ -9,6 +9,7 @@ pub mod async_job;
 pub mod auth;
 pub mod config;
 pub mod decode;
+pub mod discovery;
 pub mod extract;
 pub mod format;
 pub mod odata;

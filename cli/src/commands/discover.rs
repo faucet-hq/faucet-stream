@@ -42,8 +42,8 @@ pub async fn run(args: DiscoverArgs) -> CliResult<()> {
         return Err(CliError::Config(format!(
             "source '{}' does not support dataset discovery — discovery is available for \
              catalog-backed sources (postgres, mysql, mssql, sqlite, mongodb, elasticsearch, \
-             bigquery, snowflake, spanner, s3, gcs) and for `rest` sources with an `odata:` \
-             block (via OData `$metadata`)",
+             bigquery, snowflake, spanner, s3, gcs) and for `rest` sources with a `discovery:` \
+             recipe (config-driven API calls) or an `odata:` block (via OData `$metadata`)",
             spec.kind
         )));
     }
@@ -78,7 +78,7 @@ pub async fn run(args: DiscoverArgs) -> CliResult<()> {
         return Ok(());
     }
 
-    let doc = render_discovered_config(&raw_composed, template, &datasets)?;
+    let doc = render_discovered_config(&raw_composed, template, args.sink.as_deref(), &datasets)?;
 
     // Guard: the emitted document must itself load + expand. Configs holding
     // secrets-manager directives can't be re-verified offline — warn, don't fail.
@@ -213,7 +213,7 @@ fn sanitize_row_id(name: &str) -> String {
 }
 
 /// Assign unique row ids to the datasets (a `-2`, `-3`, … suffix on collision).
-fn unique_row_ids(datasets: &[DatasetDescriptor]) -> Vec<String> {
+pub(crate) fn unique_row_ids(datasets: &[DatasetDescriptor]) -> Vec<String> {
     let mut seen = std::collections::HashMap::<String, usize>::new();
     datasets
         .iter()
@@ -279,6 +279,7 @@ fn yaml_seq_item(value: &Value) -> CliResult<String> {
 fn render_discovered_config(
     raw_composed: &str,
     template: &str,
+    sink_template: Option<&str>,
     datasets: &[DatasetDescriptor],
 ) -> CliResult<String> {
     let mut root: serde_yaml::Value = serde_yaml::from_str(raw_composed)
@@ -320,6 +321,19 @@ fn render_discovered_config(
         let mut row = json!({ "id": id, "source": { "config": d.config_patch } });
         if template != "default" {
             row["source"]["ref"] = json!(template);
+        }
+        // Per-dataset sink routing: a `--sink` template ref and/or the
+        // descriptor's own `sink_patch` (e.g. `{table_id: account}` so a
+        // fan-out lands one table per dataset).
+        if sink_template.is_some() || d.sink_patch.is_some() {
+            let mut sink = json!({});
+            if let Some(s) = sink_template {
+                sink["ref"] = json!(s);
+            }
+            if let Some(patch) = &d.sink_patch {
+                sink["config"] = patch.clone();
+            }
+            row["sink"] = sink;
         }
         doc.push_str(&yaml_seq_item(&row)?);
     }
@@ -448,7 +462,7 @@ pipeline:
                 json!({"query": "SELECT * FROM \"sales\".\"leads\""}),
             ),
         ];
-        let doc = render_discovered_config(RAW, "default", &datasets).unwrap();
+        let doc = render_discovered_config(RAW, "default", None, &datasets).unwrap();
 
         // Raw `${env:…}` reference echoed, never a resolved value.
         assert!(doc.contains("${env:DATABASE_URL}"), "{doc}");
@@ -476,9 +490,38 @@ pipeline:
     fn render_replaces_existing_matrix_and_notes_it() {
         let raw = format!("{RAW}matrix:\n  - id: old\n");
         let datasets = vec![ds("t", "table", json!({"query": "SELECT * FROM t"}))];
-        let doc = render_discovered_config(&raw, "default", &datasets).unwrap();
+        let doc = render_discovered_config(&raw, "default", None, &datasets).unwrap();
         assert!(doc.contains("was replaced"), "{doc}");
         assert!(!doc.contains("id: old"), "{doc}");
+    }
+
+    #[test]
+    fn render_emits_sink_ref_and_sink_patch_per_row() {
+        // A Salesforce-style discovery: source config_patch + a per-object sink
+        // patch, targeting a named sink template via --sink.
+        let raw = r#"
+version: 1
+pipeline:
+  sources:
+    default:
+      type: rest
+      config: { base_url: "https://x.my.salesforce.com" }
+  sinks:
+    bigquery:
+      type: jsonl
+      config: { path: ./out.jsonl }
+"#;
+        let datasets = vec![
+            DatasetDescriptor::new(
+                "Account",
+                "sobject",
+                json!({"async_job": {"submit": {"json": {"query": "SELECT Id FROM Account"}}}}),
+            )
+            .with_sink_patch(json!({ "table_id": "account" })),
+        ];
+        let doc = render_discovered_config(raw, "default", Some("bigquery"), &datasets).unwrap();
+        assert!(doc.contains("ref: bigquery"), "{doc}");
+        assert!(doc.contains("table_id: account"), "{doc}");
     }
 
     #[test]
@@ -496,7 +539,7 @@ pipeline:
       config: { path: ./out.jsonl }
 "#;
         let datasets = vec![ds("t", "table", json!({"query": "SELECT * FROM t"}))];
-        let doc = render_discovered_config(raw, "warehouse", &datasets).unwrap();
+        let doc = render_discovered_config(raw, "warehouse", None, &datasets).unwrap();
         assert!(doc.contains("ref: warehouse"), "{doc}");
         let cfg = crate::config::parse_with_extension(&doc, "yaml").unwrap();
         let nodes = crate::expand::expand(&cfg).unwrap();
@@ -527,6 +570,7 @@ mod run_tests {
         DiscoverArgs {
             config: Some(config),
             source: None,
+            sink: None,
             include: vec![],
             exclude: vec![],
             output: None,

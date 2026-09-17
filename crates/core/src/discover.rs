@@ -39,6 +39,13 @@ pub struct DatasetDescriptor {
     /// `{"collection": "orders"}` for MongoDB, `{"prefix": "raw/orders/"}`
     /// for an object store). Must never contain credentials.
     pub config_patch: Value,
+    /// Optional partial **sink**-config override routing this dataset to its own
+    /// destination — deep-merged over the sink template by a matrix row (e.g.
+    /// `{"table_id": "account"}` so a fan-out of Salesforce objects lands one
+    /// table per object). `None` (the common case) leaves the sink untouched.
+    /// Must never contain credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink_patch: Option<Value>,
 }
 
 impl DatasetDescriptor {
@@ -50,12 +57,19 @@ impl DatasetDescriptor {
             schema: None,
             estimated_rows: None,
             config_patch,
+            sink_patch: None,
         }
     }
 
     /// Attach an inferred/introspected schema.
     pub fn with_schema(mut self, schema: Value) -> Self {
         self.schema = Some(schema);
+        self
+    }
+
+    /// Attach a sink-config override routing this dataset to its own destination.
+    pub fn with_sink_patch(mut self, sink_patch: Value) -> Self {
+        self.sink_patch = Some(sink_patch);
         self
     }
 
@@ -113,11 +127,17 @@ pub fn sql_type_to_json_schema(data_type: &str) -> Value {
 
 /// Wrap a type fragment as nullable (`{"type": ["T", "null"]}`), matching the
 /// nullable shape [`infer_schema`](crate::schema::infer_schema) emits.
-pub fn nullable_type(fragment: Value) -> Value {
-    match fragment.get("type") {
-        Some(Value::String(t)) => json!({ "type": [t, "null"] }),
-        _ => fragment,
+pub fn nullable_type(mut fragment: Value) -> Value {
+    let single = match fragment.get("type") {
+        Some(Value::String(t)) => t.clone(),
+        _ => return fragment,
+    };
+    // Wrap only the `type` in place so sibling keys (e.g. a `format: date-time`
+    // hint a typed sink maps to TIMESTAMP/DATE) survive the nullability wrap.
+    if let Some(obj) = fragment.as_object_mut() {
+        obj.insert("type".into(), json!([single, "null"]));
     }
+    fragment
 }
 
 /// Assemble an `infer_schema`-shaped object schema from
@@ -203,6 +223,12 @@ mod tests {
         // Already-complex fragments pass through untouched.
         let complex = json!({"type": ["string", "null"]});
         assert_eq!(nullable_type(complex.clone()), complex);
+        // Sibling keys survive the wrap — a temporal `format` hint must not be
+        // lost when the column is nullable (a typed sink maps it to TIMESTAMP).
+        assert_eq!(
+            nullable_type(json!({"type": "string", "format": "date-time"})),
+            json!({"type": ["string", "null"], "format": "date-time"})
+        );
     }
 
     #[test]

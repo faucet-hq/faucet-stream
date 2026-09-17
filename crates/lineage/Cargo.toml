@@ -25,6 +25,7 @@ tokio = { workspace = true, features = ["sync", "time", "rt", "fs"] }
 indexmap = "2"
 futures = { workspace = true }
 rdkafka = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -34,6 +35,10 @@ tempfile = "3"
 [features]
 default = []
 transport-kafka = ["dep:rdkafka"]
+# Forward the Arrow columnar fast path (#375) through the sampling wrappers so
+# lineage/catalog sampling does not disable it (#639). Mirrors the native
+# byte-passthrough forwarding, which needs no feature.
+arrow = ["dep:arrow", "faucet-core/arrow"]
 
 [package.metadata.docs.rs]
 all-features = true

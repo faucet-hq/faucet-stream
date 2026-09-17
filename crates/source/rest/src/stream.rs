@@ -66,6 +66,10 @@ pub struct RestStream {
     /// (data pages, async-job requests, `$metadata` probes) *before* the auth
     /// provider's placements — so an auth header of the same name wins.
     static_headers: HeaderMap,
+    /// The service `$metadata` CSDL, fetched lazily at most once per instance
+    /// (see [`metadata_xml`](Self::metadata_xml)). Instance-owned by design —
+    /// no process-global cache state.
+    metadata_xml_cache: tokio::sync::OnceCell<Arc<String>>,
 }
 
 /// Default value of [`RestStreamConfig::max_retries`]. When the user leaves this
@@ -75,6 +79,18 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Default value of [`RestStreamConfig::retry_backoff`]. Same precedence rule as
 /// [`DEFAULT_MAX_RETRIES`].
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Starting delay for async-job poll backoff (doubles each Pending poll, up to
+/// the configured `poll.interval_secs` cap).
+const POLL_BACKOFF_BASE_SECS: u64 = 1;
+
+/// Next async-job poll delay: exponential backoff (double the current delay),
+/// capped at `cap`. `interval_secs` is the ceiling, so a quick job is noticed in
+/// ~1s while a long job settles at the configured interval. Saturating so a
+/// large current delay never overflows.
+fn next_poll_delay(current: Duration, cap: Duration) -> Duration {
+    std::cmp::min(current.saturating_mul(2), cap)
+}
 
 /// Attach a mutual-TLS client identity (from [`TlsClientConfig`]) to the HTTP
 /// client builder. Only compiled with the `mtls` feature; the non-`mtls` stub
@@ -194,6 +210,180 @@ fn is_terminal_locator(value: &str) -> bool {
     v.is_empty() || v.eq_ignore_ascii_case("null")
 }
 
+/// Derive the queried object name for an async-job source's `dataset_uri` (#640).
+/// Looks for a `query` string in the submit body (Salesforce Bulk SOQL, etc.) and
+/// returns its `FROM <object>`. `None` when there's no query or it can't be parsed
+/// (the caller then falls back to a hash of the submit body).
+fn async_job_object(submit_json: Option<&Value>) -> Option<String> {
+    let query = submit_json?.get("query")?.as_str()?;
+    sql_from_object(query)
+}
+
+/// Extract the driving object from a bulk-query SQL statement: the token after
+/// the first **top-level** `FROM` (a subquery's `FROM` — e.g. a parent-child
+/// relationship query in the SELECT list — is never mistaken for it).
+/// Case-insensitive on the keyword; preserves the object's own casing. Returns
+/// `None` if there's no top-level `FROM` or the following token is empty.
+fn sql_from_object(query: &str) -> Option<String> {
+    let toks = top_level_tokens(query);
+    let mut after_from = false;
+    for (_, tok) in toks {
+        if after_from {
+            let obj = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            return if obj.is_empty() {
+                None
+            } else {
+                Some(obj.to_string())
+            };
+        }
+        if tok.eq_ignore_ascii_case("from") {
+            after_from = true;
+        }
+    }
+    None
+}
+
+/// Whitespace-split tokens of a query with their byte offsets, **restricted to
+/// tokens that sit entirely at paren depth 0 and outside single-quoted string
+/// literals**. This is what makes clause detection safe for the mainstream
+/// query shapes: a subquery's `WHERE`/`FROM` (inside parens) and a keyword that
+/// merely appears inside a quoted value (`WHERE name = 'a limit b'`) are never
+/// mistaken for the outer statement's own clauses. Quote handling honors
+/// backslash escapes (the escaping convention of the bulk-query grammars this
+/// path targets).
+fn top_level_tokens(s: &str) -> Vec<(usize, &str)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: i64 = 0;
+    let mut in_quote = false;
+    let mut tok_start: Option<usize> = None;
+    let mut tok_clean = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() && !in_quote {
+            if let Some(start) = tok_start.take()
+                && tok_clean
+            {
+                out.push((start, &s[start..i]));
+            }
+            tok_clean = true;
+            i += 1;
+            continue;
+        }
+        if tok_start.is_none() {
+            tok_start = Some(i);
+            tok_clean = depth == 0 && !in_quote;
+        }
+        if in_quote {
+            match b {
+                b'\\' => i += 1, // skip the escaped byte below
+                b'\'' => in_quote = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'\'' => {
+                    in_quote = true;
+                    tok_clean = false;
+                }
+                b'(' => {
+                    depth += 1;
+                    tok_clean = false;
+                }
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    tok_clean = false;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if let Some(start) = tok_start
+        && tok_clean
+        && !in_quote
+    {
+        out.push((start, &s[start..]));
+    }
+    out
+}
+
+/// Inject an incremental-replication predicate into a bulk-query SQL statement
+/// (#630).
+///
+/// Adds `WHERE <predicate>` when there is no existing top-level `WHERE`, or
+/// wraps the existing condition as `WHERE (<existing>) AND (<predicate>)` — the
+/// parens keep operator precedence correct when the existing filter contains
+/// `OR`. The predicate is placed *before* any trailing top-level clause
+/// (`GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET` / `WITH` / `FOR`),
+/// which is where a `WHERE` must sit. Clause detection is whitespace-tolerant
+/// (handles newlines) and, via [`top_level_tokens`], ignores keywords inside
+/// subqueries and quoted literals.
+fn inject_sql_predicate(query: &str, predicate: &str) -> String {
+    let toks = top_level_tokens(query);
+    let kw = |t: &str, k: &str| t.eq_ignore_ascii_case(k);
+    let mut where_at: Option<usize> = None;
+    let mut boundary: Option<usize> = None;
+    let mut i = 0;
+    while i < toks.len() {
+        let (pos, t) = toks[i];
+        let two = |a: &str, b: &str| kw(t, a) && i + 1 < toks.len() && kw(toks[i + 1].1, b);
+        if where_at.is_none() && kw(t, "where") {
+            where_at = Some(pos);
+        } else if two("order", "by")
+            || two("group", "by")
+            || kw(t, "having")
+            || kw(t, "limit")
+            || kw(t, "offset")
+            || kw(t, "with")
+            || kw(t, "for")
+        {
+            boundary = Some(pos);
+            break;
+        }
+        i += 1;
+    }
+    let boundary = boundary.unwrap_or(query.len());
+    match where_at {
+        Some(w) => {
+            let head = query[..w + "where".len()].trim_end(); // "… WHERE"
+            let cond = query[w + "where".len()..boundary].trim();
+            let tail = query[boundary..].trim_start();
+            let sep = if tail.is_empty() { "" } else { " " };
+            format!("{head} ({cond}) AND ({predicate}){sep}{tail}")
+        }
+        None => {
+            let head = query[..boundary].trim_end();
+            let tail = query[boundary..].trim_start();
+            let sep = if tail.is_empty() { "" } else { " " };
+            format!("{head} WHERE {predicate}{sep}{tail}")
+        }
+    }
+}
+
+/// Render a bookmark value as a literal for the incremental predicate:
+/// datetime/date values are **unquoted** (the datetime-literal convention of
+/// the bulk-query grammars this path targets — replication keys are datetimes),
+/// everything else is single-quoted with `'` backslash-escaped (same grammar
+/// convention; standard-SQL `''` doubling can become a dialect knob if a second
+/// grammar ever needs it).
+fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::String(s) if is_sql_datetime(s) => s.clone(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        other => format!("'{}'", other.to_string().replace('\'', "\\'")),
+    }
+}
+
+/// Whether a string is a datetime/date literal (RFC3339 or `YYYY-MM-DD`).
+fn is_sql_datetime(s: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(s).is_ok()
+        || chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+
 /// Read the next result-set locator (#557) from the fetch response header or
 /// body, per the `fetch` config. Returns `None` when no locator source is
 /// configured or the locator signals completion.
@@ -253,6 +443,11 @@ impl RestStream {
         }
 
         let mut builder = Client::builder();
+        // Transparently request + decode gzip/brotli/deflate so large JSON APIs
+        // (e.g. D365 F&O OData, which compresses ~5-10x) ship compressed bytes
+        // instead of raw JSON. reqwest sets the `Accept-Encoding` header and
+        // decompresses the body automatically.
+        builder = builder.gzip(true).brotli(true).deflate(true);
         if let Some(t) = config.timeout {
             builder = builder.timeout(t);
         }
@@ -287,6 +482,7 @@ impl RestStream {
             now_override: None,
             retry_policy,
             static_headers,
+            metadata_xml_cache: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -462,7 +658,7 @@ impl RestStream {
     pub fn stream_pages(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + '_>> {
-        let mut inner = self.stream_pages_inner(None);
+        let mut inner = self.stream_pages_inner(None, None);
         Box::pin(async_stream::try_stream! {
             loop {
                 let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
@@ -482,13 +678,24 @@ impl RestStream {
     /// fan-out), `record_ancestors` (#549, nested path with lifted ancestor
     /// fields), or the classic single `records_path`.
     fn extract_page(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
-        extract::extract_configured(
+        let mut records = extract::extract_configured(
             body,
             self.config.records_path.as_deref(),
             self.config.record_ancestors.as_ref(),
             &self.config.records_multi,
             self.config.op_field.as_deref().unwrap_or("_op"),
-        )
+        )?;
+        // OData responses stamp per-record protocol control fields (`@odata.etag`,
+        // `@odata.editLink`, …) that are metadata, not data, and are invalid column
+        // names downstream. Drop them so records carry only the entity's own fields.
+        if self.config.odata.is_some() {
+            for rec in &mut records {
+                if let Value::Object(map) = rec {
+                    map.retain(|k, _| !k.starts_with("@odata."));
+                }
+            }
+        }
+        Ok(records)
     }
 
     /// Core pagination loop shared by [`Source::stream_pages`] and
@@ -501,17 +708,61 @@ impl RestStream {
     fn stream_pages_inner(
         &self,
         context: Option<&HashMap<String, Value>>,
+        range_filter: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
         // Clone the context into an owned map so it can live inside the
         // `async_stream` generator without borrowing from the caller.
         let owned_context: Option<HashMap<String, Value>> = context.cloned();
 
         Box::pin(async_stream::try_stream! {
-            // Async-job lifecycle (#514): submit → poll → fetch replaces the
-            // normal single-GET + pagination flow and yields one result page.
-            if self.config.async_job.is_some() {
-                let records = self.run_async_job().await?;
-                yield faucet_core::StreamPage { records, bookmark: None };
+            // Async-job lifecycle (#514/#623): submit → poll → resolve the fetch
+            // URL once, then stream one `StreamPage` per locator-paged result set
+            // (#557) instead of buffering the entire extract into a single page.
+            if let Some(job) = self.config.async_job.as_ref() {
+                // Capture the incremental bookmark (#630) BEFORE submitting, so it
+                // reflects the query's start time (conservative — a small re-read
+                // overlap next run, deduped by an upsert sink). `None` for full-table.
+                let new_bookmark = self.async_job_new_bookmark();
+                let fetch_url = self.prepare_async_job().await?;
+                let mut locator: Option<String> = None;
+                loop {
+                    // Send the locator (when we have one) as the configured query param.
+                    let mut query = job.fetch.query.clone();
+                    if let (Some(loc), Some(param)) = (&locator, &job.fetch.locator_param) {
+                        query.insert(param.clone(), loc.clone());
+                    }
+                    let (bytes, resp_headers) = self
+                        .job_request_bytes(
+                            &job.fetch.method,
+                            &fetch_url,
+                            &job.fetch.headers,
+                            &query,
+                            job.fetch.json.as_ref(),
+                        )
+                        .await?;
+                    let (records, body_value) = self.parse_fetch_page(&bytes, job).await?;
+                    // Stream this locator page immediately — peak memory is
+                    // O(one page), not O(whole extract). Per-page bookmark stays
+                    // `None`; the incremental bookmark is emitted once at the end.
+                    yield faucet_core::StreamPage { records, bookmark: None };
+
+                    // Advance to the next locator; stop when it is absent, empty,
+                    // `"null"`, or repeats (loop guard) — matching the previous
+                    // buffering behavior.
+                    let next = next_locator(&resp_headers, body_value.as_ref(), job);
+                    match next {
+                        Some(loc) if locator.as_deref() != Some(loc.as_str()) => {
+                            locator = Some(loc);
+                        }
+                        _ => break,
+                    }
+                }
+                // Incremental (#630): emit the run-start bookmark on a final empty
+                // page so the pipeline persists it after the sink confirms — the
+                // next run injects `WHERE <key> > <this>` and pulls only the delta.
+                if let Some(bm) = new_bookmark {
+                    yield faucet_core::StreamPage { records: Vec::new(), bookmark: Some(bm) };
+                }
                 return;
             }
 
@@ -631,6 +882,19 @@ impl RestStream {
 
                     let mut params = self.config.query_params.clone();
                     self.config.pagination.apply_params(&mut params, &state);
+
+                    // Key-range partition filter: the first request of a range
+                    // carries the half-open PK `$filter`; `@odata.nextLink`
+                    // preserves it on every subsequent page, so it is applied once.
+                    if let Some(range_filter) = range_filter.as_deref() {
+                        let combined = match params.get("$filter") {
+                            Some(existing) if !existing.is_empty() => {
+                                format!("({existing}) and {range_filter}")
+                            }
+                            _ => range_filter.to_string(),
+                        };
+                        params.insert("$filter".to_string(), combined);
+                    }
 
                     let url_override = match &self.config.pagination {
                         PaginationStyle::LinkHeader | PaginationStyle::NextLinkInBody { .. } => {
@@ -818,7 +1082,7 @@ impl RestStream {
     ) -> Result<Vec<Value>, FaucetError> {
         let mut all_records = Vec::new();
         let mut pages_fetched = 0usize;
-        let mut pages = self.stream_pages_inner(context);
+        let mut pages = self.stream_pages_inner(context, None);
 
         // Poll the stream without requiring StreamExt (avoids extra dependency).
         loop {
@@ -984,6 +1248,60 @@ impl RestStream {
         query: &HashMap<String, String>,
         json: Option<&Value>,
     ) -> Result<(Vec<u8>, HeaderMap), FaucetError> {
+        // Retry the request *and* the body read as one unit — a transient 502
+        // on poll #40 of a 30-minute bulk job must not discard the whole
+        // submitted job, and a connection dropped mid-body is retried the same
+        // way the pagination path retries a page. Same policy knobs as the
+        // pagination runner.
+        retry::execute_with_retry(
+            self.retry_policy.max_attempts.saturating_sub(1),
+            self.retry_policy.base,
+            || async {
+                let resp = self
+                    .job_request_response_once(method, url, headers, query, json)
+                    .await?;
+                let resp_headers = resp.headers().clone();
+                let bytes = resp.bytes().await.map_err(FaucetError::Http)?;
+                Ok((bytes.to_vec(), resp_headers))
+            },
+        )
+        .await
+    }
+
+    /// Send a fetch request and return the raw [`reqwest::Response`] with its body
+    /// **unconsumed** — the caller reads headers (e.g. the locator header) and
+    /// then streams the body. Retries the request itself under the shared
+    /// policy; a failure *while streaming the body* is not retried here (the
+    /// caller owns what has already been consumed downstream). Note a retried
+    /// submit may orphan a job the server created before the failure — harmless
+    /// (never fetched, expires server-side) and at-least-once-consistent.
+    async fn job_request_response(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        query: &HashMap<String, String>,
+        json: Option<&Value>,
+    ) -> Result<reqwest::Response, FaucetError> {
+        retry::execute_with_retry(
+            self.retry_policy.max_attempts.saturating_sub(1),
+            self.retry_policy.base,
+            || self.job_request_response_once(method, url, headers, query, json),
+        )
+        .await
+    }
+
+    /// One unretried attempt — the shared request-building core of
+    /// [`job_request_bytes`](Self::job_request_bytes) /
+    /// [`job_request_response`](Self::job_request_response).
+    async fn job_request_response_once(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        query: &HashMap<String, String>,
+        json: Option<&Value>,
+    ) -> Result<reqwest::Response, FaucetError> {
         let m = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).map_err(|_| {
             FaucetError::Config(format!("async_job: invalid HTTP method '{method}'"))
         })?;
@@ -1007,10 +1325,11 @@ impl RestStream {
         if let Some(j) = json {
             req = req.json(j);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| FaucetError::Source(format!("async_job: request to {url} failed: {e}")))?;
+        // Transport errors stay typed (`FaucetError::Http`) so the shared retry
+        // runner's `is_retriable` classification sees connect/timeout failures —
+        // stringifying them into `Source(...)` would silently make every
+        // transient network blip fatal to a 30-minute bulk job.
+        let resp = req.send().await.map_err(FaucetError::Http)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(FaucetError::HttpStatus {
@@ -1019,8 +1338,7 @@ impl RestStream {
                 body: format!("async_job: {url} returned HTTP {}", status.as_u16()),
             });
         }
-        let resp_headers = resp.headers().clone();
-        Ok((resp.bytes().await?.to_vec(), resp_headers))
+        Ok(resp)
     }
 
     async fn job_request_json(
@@ -1038,9 +1356,68 @@ impl RestStream {
             .map_err(|e| FaucetError::Source(format!("async_job: {url} returned non-JSON: {e}")))
     }
 
-    /// Run the submit → poll → fetch job lifecycle (#514) and return the
-    /// decoded result records.
-    async fn run_async_job(&self) -> Result<Vec<Value>, FaucetError> {
+    /// Run the async-job lifecycle up to resolving the fetch URL (#514): submit
+    /// → poll-to-terminal → resolve `fetch.url` / `fetch.url_from`. The caller
+    /// then fetches the (possibly locator-paged, #557) result and streams one
+    /// [`faucet_core::StreamPage`] per locator page, rather than buffering the
+    /// whole extract into a single page (#623).
+    /// Incremental replication for the async-job path (#630): if replicating
+    /// incrementally with a start bookmark (from the state store via
+    /// `apply_start_bookmark`, else `start_replication_value`), return a clone of
+    /// the submit body with `WHERE <replication_key> > <bookmark>` injected into
+    /// its `query`. Returns `None` (→ unmodified submit, full export) on the first
+    /// run, for full-table replication, or when there is no `query` to amend.
+    async fn incremental_submit_json(
+        &self,
+        job: &crate::async_job::AsyncJobConfig,
+    ) -> Option<Value> {
+        if self.config.replication_method != ReplicationMethod::Incremental {
+            return None;
+        }
+        let key = self.config.replication_key.as_ref()?;
+        let start = {
+            let guard = self.runtime_start.lock().await;
+            guard
+                .clone()
+                .or_else(|| self.config.start_replication_value.clone())
+        }?;
+        let submit = job.submit.json.as_ref()?;
+        let query = submit.get("query")?.as_str()?;
+        let predicate = format!("{key} > {}", sql_literal(&start));
+        let mut cloned = submit.clone();
+        cloned["query"] = Value::String(inject_sql_predicate(query, &predicate));
+        Some(cloned)
+    }
+
+    /// The bookmark to persist after an incremental async-job run: the run's
+    /// start time (RFC3339) **minus the `lookback` margin**. Using the start
+    /// time (not `max(replication_key)` scraped from the rows) keeps this
+    /// native/streaming-compatible — no row parsing; the subtracted margin
+    /// makes it safe against a client clock running ahead of the server, which
+    /// would otherwise permanently exclude records stamped in the skew gap
+    /// from every future `key > bookmark` predicate. The cost is a bounded
+    /// re-read overlap next run (deduped by an upsert sink). `None` for
+    /// full-table replication, and `None` when the submit body has no
+    /// amendable `query` — a bookmark that advances while every run stays a
+    /// full export would be a lie (`validate()` rejects that config shape;
+    /// this is the backstop for callers that skipped validation).
+    fn async_job_new_bookmark(&self) -> Option<Value> {
+        if self.config.replication_method != ReplicationMethod::Incremental
+            || self.config.replication_key.is_none()
+        {
+            return None;
+        }
+        let job = self.config.async_job.as_ref()?;
+        if !job.supports_incremental_query() {
+            return None;
+        }
+        let now = self.now_override.unwrap_or_else(chrono::Utc::now) - job.lookback_duration();
+        Some(Value::String(
+            now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ))
+    }
+
+    async fn prepare_async_job(&self) -> Result<String, FaucetError> {
         use crate::async_job::{JobOutcome, resolve_url, substitute_job_id};
         let job = self
             .config
@@ -1049,15 +1426,20 @@ impl RestStream {
             .expect("run_async_job called with async_job set");
         let base = &self.config.base_url;
 
-        // 1) Submit → capture the job id.
+        // 1) Submit → capture the job id. Incremental (#630): inject a
+        // `WHERE <replication_key> > <bookmark>` predicate into the submit SOQL
+        // when replicating incrementally with a start bookmark; falls back to the
+        // unmodified submit body on the first run / full-table.
         let submit_url = resolve_url(base, job.submit.url.as_deref().unwrap_or_default());
+        let injected = self.incremental_submit_json(job).await;
+        let submit_json = injected.as_ref().or(job.submit.json.as_ref());
         let submit_body = self
             .job_request_json(
                 &job.submit.method,
                 &submit_url,
                 &job.submit.headers,
                 &job.submit.query,
-                job.submit.json.as_ref(),
+                submit_json,
             )
             .await?;
         let job_id = jsonpath_first_string(&submit_body, &job.job_id).ok_or_else(|| {
@@ -1071,6 +1453,16 @@ impl RestStream {
         let poll_url = resolve_url(base, &substitute_job_id(&job.poll.url, &job_id));
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(job.poll.timeout_secs);
+        // Exponential poll backoff: start small so a job that finishes seconds
+        // after submit is noticed in ~1s, doubling up to `interval_secs` (the
+        // cap) so a long-running job doesn't hammer the API. `interval_secs` is
+        // the ceiling, not a fixed wait — a fixed 15s made an instant job take
+        // ~15s of dead poll-wait.
+        let poll_cap = std::time::Duration::from_secs(job.poll.interval_secs);
+        let mut poll_delay = std::cmp::min(
+            std::time::Duration::from_secs(POLL_BACKOFF_BASE_SECS),
+            poll_cap,
+        );
         // Retain the last poll response so `fetch.url_from` (#543) can source the
         // download URL from the terminal (success) poll body.
         let last_poll_body: Value = loop {
@@ -1098,8 +1490,8 @@ impl RestStream {
                             job.poll.timeout_secs
                         )));
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(job.poll.interval_secs))
-                        .await;
+                    tokio::time::sleep(poll_delay).await;
+                    poll_delay = next_poll_delay(poll_delay, poll_cap);
                 }
             }
         };
@@ -1123,40 +1515,9 @@ impl RestStream {
             }
         };
 
-        // 4) Fetch the result and decode it — looping across locator-paged result
-        // sets (#557) when a `locator_header` / `locator_body` is configured.
-        // Without a locator this runs exactly once (the classic single fetch).
-        let mut all_records = Vec::new();
-        let mut locator: Option<String> = None;
-        loop {
-            // Send the locator (when we have one) as the configured query param.
-            let mut query = job.fetch.query.clone();
-            if let (Some(loc), Some(param)) = (&locator, &job.fetch.locator_param) {
-                query.insert(param.clone(), loc.clone());
-            }
-            let (bytes, resp_headers) = self
-                .job_request_bytes(
-                    &job.fetch.method,
-                    &fetch_url,
-                    &job.fetch.headers,
-                    &query,
-                    job.fetch.json.as_ref(),
-                )
-                .await?;
-            let (records, body_value) = self.parse_fetch_page(&bytes, job).await?;
-            all_records.extend(records);
-
-            // Determine the next locator from the header or the body; stop when
-            // it is absent, empty, `"null"`, or repeats (loop guard).
-            let next = next_locator(&resp_headers, body_value.as_ref(), job);
-            match next {
-                Some(loc) if locator.as_deref() != Some(loc.as_str()) => {
-                    locator = Some(loc);
-                }
-                _ => break,
-            }
-        }
-        Ok(all_records)
+        // Steps 1-3 done; the caller fetches the (locator-paged) result and
+        // streams it page-by-page. See `stream_pages_inner` (#623).
+        Ok(fetch_url)
     }
 
     /// Parse one async-job fetch page into records, returning the parsed JSON
@@ -1258,11 +1619,12 @@ impl RestStream {
                     token_path,
                     expiry_path,
                     expiry_ratio,
+                    encoding,
                     response_validator,
                 }) => {
                     let token = self
                         .token_endpoint_cache
-                        .get_or_refresh(
+                        .get_or_refresh_with_encoding(
                             &self.client,
                             token_url,
                             token_method,
@@ -1271,6 +1633,7 @@ impl RestStream {
                             token_path,
                             expiry_path.as_deref(),
                             *expiry_ratio,
+                            *encoding,
                             response_validator.as_ref(),
                         )
                         .await?;
@@ -1420,11 +1783,12 @@ impl RestStream {
                     token_path,
                     expiry_path,
                     expiry_ratio,
+                    encoding,
                     response_validator,
                 }) => {
                     let token = self
                         .token_endpoint_cache
-                        .get_or_refresh(
+                        .get_or_refresh_with_encoding(
                             &self.client,
                             token_url,
                             token_method,
@@ -1433,6 +1797,7 @@ impl RestStream {
                             token_path,
                             expiry_path.as_deref(),
                             *expiry_ratio,
+                            *encoding,
                             response_validator.as_ref(),
                         )
                         .await?;
@@ -1852,15 +2217,57 @@ impl faucet_core::Source for RestStream {
     }
 
     fn dataset_uri(&self) -> String {
-        format!(
+        let base = format!(
             "{}{}",
             faucet_core::redact_uri_credentials(&self.config.base_url),
             self.config.path
-        )
+        );
+        // Async-job sources (Salesforce Bulk etc.) address every object through the
+        // *same* endpoint — the object lives in the SOQL query body, not the URL. So
+        // without this, a 21-object matrix collapses to one catalog/lineage dataset
+        // (#640). Derive a per-object URI from the query: the `FROM <SObject>` when
+        // parseable, else a stable hash of the submit body (distinct query → distinct
+        // dataset either way).
+        if let Some(job) = &self.config.async_job {
+            let sep = if base.ends_with('/') { "" } else { "/" };
+            if let Some(obj) = async_job_object(job.submit.json.as_ref()) {
+                return format!("{base}{sep}objects/{obj}");
+            }
+            if let Some(j) = &job.submit.json {
+                // FNV-1a from core (stable across Rust releases — this feeds persisted
+                // catalog/lineage identity, so `DefaultHasher` would re-key it on a
+                // toolchain bump).
+                return format!(
+                    "{base}{sep}job/{:016x}",
+                    faucet_core::shard::shard_hash(&j.to_string())
+                );
+            }
+        }
+        base
     }
 
     fn state_key(&self) -> Option<String> {
-        self.config.state_key.clone()
+        // A source is only made resumable (executor wraps it + persists the
+        // bookmark) when it reports a state key. Incremental replication (#630)
+        // is meaningless without persistence, so opt in automatically when
+        // replicating incrementally — otherwise `replication_method: incremental`
+        // + a `state:` block would silently full-refresh every run. The CLI
+        // executor overrides the concrete key per invocation (StateKeyOverride);
+        // the fallback below matters for library callers driving `Pipeline`
+        // directly, so it derives from the dataset identity — two REST sources
+        // sharing one StateStore must never collide on a fixed literal and
+        // resume from each other's bookmark. FNV-1a from core keeps the derived
+        // key stable across Rust releases.
+        self.config.state_key.clone().or_else(|| {
+            (self.config.replication_method == ReplicationMethod::Incremental
+                && self.config.replication_key.is_some())
+            .then(|| {
+                format!(
+                    "rest:{:016x}",
+                    faucet_core::shard::shard_hash(&faucet_core::Source::dataset_uri(self))
+                )
+            })
+        })
     }
 
     fn stream_pages<'a>(
@@ -1872,13 +2279,25 @@ impl faucet_core::Source for RestStream {
         // in-memory `batch_size` knob. The arg is accepted for trait
         // conformance and reserved for a future `page_size` mapping.
         //
+        // Key-range partitioning (#479): when an integer PK is configured, tile the
+        // key space and stream the tiles concurrently (the fix for a huge OData
+        // entity whose sequential `@odata.nextLink` paging dominates the run).
+        if let Some(key) = self
+            .config
+            .odata
+            .as_ref()
+            .and_then(|o| o.partition.as_ref())
+            .and_then(|p| p.key.clone())
+        {
+            return self.stream_key_range_partitions(context, key);
+        }
         // Partition fan-out (#535): when `partitions` are configured the stream
         // must run once per partition — mirroring `fetch_all` / `fetch_with_context`
         // — or every partition's records are silently dropped under `faucet run`
         // (the pipeline drives this method). Any parent `context` is merged into
         // each partition context, exactly as `fetch_with_context` does.
         if self.config.partitions.is_empty() {
-            return self.stream_pages_inner(Some(context));
+            return self.stream_pages_inner(Some(context), None);
         }
         let contexts: Vec<HashMap<String, Value>> = self
             .config
@@ -1897,7 +2316,7 @@ impl faucet_core::Source for RestStream {
             // mark rather than whichever partition happened to finish last.
             let mut max_bookmark: Option<Value> = None;
             for ctx in &contexts {
-                let mut inner = self.stream_pages_inner(Some(ctx));
+                let mut inner = self.stream_pages_inner(Some(ctx), None);
                 loop {
                     let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
                     match page {
@@ -1925,45 +2344,415 @@ impl faucet_core::Source for RestStream {
         Ok(())
     }
 
+    /// Native byte-passthrough (#633): an `async_job` (Salesforce Bulk-style)
+    /// source whose fetch pages are CSV can stream straight to a byte-loading sink
+    /// (e.g. BigQuery's load job) as NDJSON, never building `Vec<Value>`. Advertised
+    /// only for the CSV async-job path with no custom `decode` (JSON async jobs and
+    /// the paginated non-job path keep the `Value` path). Emits `NdJson` — the
+    /// converted bytes are identical to the `Value` path's, preserving the
+    /// destination's autodetected schema (see [`crate::format::csv_to_ndjson`]).
+    fn native_output_formats(&self) -> &'static [faucet_core::NativeFormat] {
+        let csv_async_job = self.config.async_job.is_some()
+            && self.config.response_format == crate::config::ResponseFormat::Csv
+            && self.config.decode.is_empty();
+        if csv_async_job {
+            &[faucet_core::NativeFormat::NdJson]
+        } else {
+            &[]
+        }
+    }
+
+    fn stream_native<'a>(
+        &'a self,
+        _context: &'a HashMap<String, Value>,
+        format: faucet_core::NativeFormat,
+        _batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>>
+    {
+        Box::pin(async_stream::try_stream! {
+            let job = self.config.async_job.as_ref().ok_or_else(|| {
+                FaucetError::Source(
+                    "rest: stream_native invoked without an async_job config".into(),
+                )
+            })?;
+            if format != faucet_core::NativeFormat::NdJson {
+                Err(FaucetError::Source(format!(
+                    "rest: stream_native only emits NdJson, got {format:?}"
+                )))?;
+            }
+            // Mirror the async-job locator loop from `stream_pages_inner`, but
+            // **stream** each CSV page's response body straight into the CSV→NDJSON
+            // converter and emit a `NativePayload::Stream` — the full page is never
+            // buffered on either side (source or sink), so peak memory is O(one
+            // ~256 KiB chunk), independent of page/row count (#633).
+            use futures::TryStreamExt as _;
+            // Incremental bookmark (#630) captured before submit — same semantics
+            // as the Value path; emitted on a final empty batch below.
+            let new_bookmark = self.async_job_new_bookmark();
+            let fetch_url = self.prepare_async_job().await?;
+            let mut locator: Option<String> = None;
+            loop {
+                let mut query = job.fetch.query.clone();
+                if let (Some(loc), Some(param)) = (&locator, &job.fetch.locator_param) {
+                    query.insert(param.clone(), loc.clone());
+                }
+                let resp = self
+                    .job_request_response(
+                        &job.fetch.method,
+                        &fetch_url,
+                        &job.fetch.headers,
+                        &query,
+                        job.fetch.json.as_ref(),
+                    )
+                    .await?;
+                // Read the locator from headers *before* the body is consumed.
+                let resp_headers = resp.headers().clone();
+                let delimiter = self.config.csv_delimiter;
+                let has_headers = self.config.csv_has_headers;
+                // reqwest (tokio) byte stream → AsyncRead → futures AsyncRead (compat)
+                // → the CSV→NDJSON chunk stream. Owns `resp`, so it is `'static`.
+                let body = resp
+                    .bytes_stream()
+                    .map_err(std::io::Error::other);
+                let reader = tokio_util::io::StreamReader::new(body);
+                let ndjson_chunks =
+                    crate::format::csv_reader_to_ndjson_stream(reader, delimiter, has_headers);
+                yield faucet_core::NativeBatch {
+                    format: faucet_core::NativeFormat::NdJson,
+                    payload: faucet_core::NativePayload::Stream(Box::pin(ndjson_chunks)),
+                    csv: faucet_core::CsvDialect { has_header: has_headers, delimiter },
+                    records: None,
+                    bookmark: None,
+                };
+
+                // Per-page bookmark stays `None`; the incremental bookmark (#630)
+                // is emitted once at the end. Advance the locator (same guard as
+                // the Value path).
+                let next = next_locator(&resp_headers, None, job);
+                match next {
+                    Some(loc) if locator.as_deref() != Some(loc.as_str()) => {
+                        locator = Some(loc);
+                    }
+                    _ => break,
+                }
+            }
+            // Incremental (#630): final empty batch carrying the run-start bookmark
+            // (load_native no-ops on empty bytes, then the pipeline flushes the
+            // session + persists this bookmark). Native/streaming-compatible.
+            if let Some(bm) = new_bookmark {
+                yield faucet_core::NativeBatch::bytes(faucet_core::NativeFormat::NdJson, Vec::new())
+                    .with_bookmark(Some(bm));
+            }
+        })
+    }
+
     fn supports_discover(&self) -> bool {
-        // OData exposes a machine-readable `$metadata` catalog; a plain REST API
-        // has none, so discovery is OData-only.
-        self.config.odata.is_some()
+        // A generic `discovery:` recipe or an OData `$metadata` catalog. A plain
+        // REST API has neither.
+        self.config.discovery.is_some() || self.config.odata.is_some()
     }
 
     async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
-        if self.config.odata.is_none() {
+        if let Some(spec) = &self.config.discovery {
+            return self.discover_via_recipe(spec).await;
+        }
+        let Some(odata) = self.config.odata.as_ref() else {
             return Err(FaucetError::Source(
-                "rest: discovery is only supported for OData sources — set an `odata:` block"
+                "rest: discovery needs a `discovery:` recipe (config-driven API calls) or an \
+                 `odata:` block (OData `$metadata`)"
                     .into(),
             ));
+        };
+        // Explicit object list (run-time fan-out): one descriptor per entity, its
+        // sink `table_id` rendered from `emit.table_id` (default `${name_snake}`).
+        // Type each entity's columns from the service `$metadata` (authoritative
+        // EDM types → the sink declares the real column types instead of
+        // autodetecting and rejecting a row that doesn't fit the guessed type).
+        // `$metadata` is a single monolithic CSDL for the whole service, so it
+        // cannot be scoped to the synced entities and some services regenerate
+        // tens of MB on every call — hence it is fetched once per source instance
+        // (see `metadata_xml`); only the requested entities are parsed out. On any
+        // `$metadata` failure, fall back to untyped descriptors (sink autodetect)
+        // so the run proceeds.
+        if !odata.objects.is_empty() {
+            let table_template = odata
+                .emit
+                .as_ref()
+                .and_then(|e| e.table_id.as_deref())
+                .unwrap_or("${name_snake}");
+            let xml = match self.metadata_xml().await {
+                Ok(xml) => xml,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "OData $metadata unavailable; fanning out untyped (sink autodetect)"
+                    );
+                    return Ok(crate::odata::descriptors_from_objects(
+                        &odata.objects,
+                        table_template,
+                    ));
+                }
+            };
+            let mut descs = crate::odata::descriptors_from_edmx_for_objects(
+                &xml,
+                &odata.objects,
+                table_template,
+            )?;
+            // Key-range partitioning opt-in: for each entity in `partition.objects`
+            // whose `$metadata` declares a single integer key, stamp a resolved
+            // `partition` block onto its source `config_patch` so the run tiles it
+            // concurrently. Entities without a single int key (or absent from
+            // `$metadata`) are left to extract sequentially.
+            if let Some(partition) = odata.partition.as_ref().filter(|p| !p.objects.is_empty()) {
+                let targets: std::collections::HashSet<&str> =
+                    partition.objects.iter().map(String::as_str).collect();
+                for d in &mut descs {
+                    if !targets.contains(d.name.as_str()) {
+                        continue;
+                    }
+                    match crate::odata::single_int_key_from_edmx(&xml, &d.name) {
+                        Some(key) => {
+                            if let Some(o) = d
+                                .config_patch
+                                .get_mut("odata")
+                                .and_then(Value::as_object_mut)
+                            {
+                                // Per-entity resolved block: the key is concrete;
+                                // workers/count carry over only when set (the
+                                // row's `PartitionSpec` applies the defaults).
+                                let mut block = serde_json::Map::new();
+                                block.insert("key".into(), Value::String(key));
+                                if let Some(w) = partition.workers {
+                                    block.insert("workers".into(), serde_json::json!(w));
+                                }
+                                if let Some(c) = partition.count {
+                                    block.insert("count".into(), serde_json::json!(c));
+                                }
+                                o.insert("partition".into(), Value::Object(block));
+                            }
+                        }
+                        None => tracing::warn!(
+                            entity = %d.name,
+                            "partition.objects entity has no single integer key; \
+                             extracting sequentially"
+                        ),
+                    }
+                }
+            }
+            return Ok(descs);
         }
         let url = format!("{}/$metadata", self.config.base_url.trim_end_matches('/'));
+        let xml = self.discover_get_text(&url, "OData $metadata").await?;
+        crate::odata::descriptors_from_edmx(&xml)
+    }
+}
+
+impl RestStream {
+    /// Authed GET for a discovery probe, returning the response body as text.
+    /// Shared by the OData `$metadata` and Salesforce `/sobjects` paths.
+    async fn discover_get_text(&self, url: &str, what: &str) -> Result<String, FaucetError> {
         // Static config headers (#539) form the base; auth is applied on top.
         let mut headers = self.static_headers.clone();
-        for (k, v) in self.metadata_headers(&url).await?.iter() {
+        for (k, v) in self.metadata_headers(url).await?.iter() {
             headers.insert(k.clone(), v.clone());
         }
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .headers(headers)
             .send()
             .await
-            .map_err(|e| {
-                FaucetError::Source(format!("rest: OData $metadata request failed: {e}"))
-            })?;
+            .map_err(|e| FaucetError::Source(format!("rest: {what} request failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(FaucetError::Source(format!(
-                "rest: OData $metadata returned HTTP {}",
+                "rest: {what} returned HTTP {}",
                 status.as_u16()
             )));
         }
-        let xml = resp.text().await.map_err(|e| {
-            FaucetError::Source(format!("rest: reading OData $metadata failed: {e}"))
-        })?;
-        crate::odata::descriptors_from_edmx(&xml)
+        resp.text()
+            .await
+            .map_err(|e| FaucetError::Source(format!("rest: reading {what} failed: {e}")))
+    }
+
+    /// Authed GET returning a parsed JSON body (discovery probes).
+    async fn discover_get_json(
+        &self,
+        url: &str,
+        what: &str,
+    ) -> Result<serde_json::Value, FaucetError> {
+        let txt = self.discover_get_text(url, what).await?;
+        serde_json::from_str(&txt)
+            .map_err(|e| FaucetError::Source(format!("rest: {what} returned invalid JSON: {e}")))
+    }
+
+    /// The service `$metadata` CSDL, fetched at most once **per source instance**
+    /// (an instance serves one `base_url`). Some services regenerate a very large
+    /// CSDL on every call and it cannot be scoped to a subset of entities, so one
+    /// fan-out/discover shares a single fetch. Deliberately instance-owned rather
+    /// than process-global: no hidden cross-pipeline state, testable, and dropped
+    /// with the source.
+    async fn metadata_xml(&self) -> Result<Arc<String>, FaucetError> {
+        self.metadata_xml_cache
+            .get_or_try_init(|| async {
+                let url = format!("{}/$metadata", self.config.base_url.trim_end_matches('/'));
+                Ok(Arc::new(
+                    self.discover_get_text(&url, "OData $metadata").await?,
+                ))
+            })
+            .await
+            .cloned()
+    }
+
+    /// Discover the inclusive `(min, max)` of an integer primary key for key-range
+    /// partitioning — two cheap requests (`$orderby {key} asc|desc, $top=1,
+    /// $select={key}`). Returns `None` when the entity is empty (nothing to
+    /// partition). Mirrors the reference tap's `discover_key_bounds`.
+    async fn discover_key_bounds(
+        &self,
+        entity: &str,
+        key: &str,
+    ) -> Result<Option<(i64, i64)>, FaucetError> {
+        fn coerce_i64(v: &serde_json::Value) -> Option<i64> {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        }
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = format!("{base}/{entity}");
+        let mut bounds = [0i64; 2];
+        for (i, dir) in ["asc", "desc"].into_iter().enumerate() {
+            let mut headers = self.static_headers.clone();
+            for (k, v) in self.metadata_headers(&url).await?.iter() {
+                headers.insert(k.clone(), v.clone());
+            }
+            let resp = self
+                .client
+                .get(&url)
+                .headers(headers)
+                .query(&[
+                    ("cross-company", "true"),
+                    ("$orderby", &format!("{key} {dir}")),
+                    ("$top", "1"),
+                    ("$select", key),
+                    ("$format", "json"),
+                ])
+                .send()
+                .await
+                .map_err(|e| {
+                    FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+                })?;
+            if !resp.status().is_success() {
+                return Err(FaucetError::Source(format!(
+                    "rest: OData key-bounds returned HTTP {}",
+                    resp.status().as_u16()
+                )));
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))?;
+            let Some(row) = body
+                .get("value")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+            else {
+                return Ok(None); // empty entity
+            };
+            bounds[i] = row.get(key).and_then(coerce_i64).ok_or_else(|| {
+                FaucetError::Source(format!("rest: OData key '{key}' is not an integer"))
+            })?;
+        }
+        Ok(Some((bounds[0], bounds[1])))
+    }
+
+    /// Stream an OData entity as concurrent key-range tiles: discover the key's
+    /// min/max, plan contiguous ranges with the shared
+    /// [`faucet_core::shard::plan_pk_shards`] primitive (i128-width math — a
+    /// full-range i64 key cannot overflow — and unbounded first/last ranges so
+    /// rows inserted outside `[MIN, MAX]` mid-run are still read), and page each
+    /// range's `$filter` concurrently, bounded by `partition.workers`. Ranges are
+    /// intra-run only — never bookmarked; every run re-tiles. An empty entity
+    /// yields nothing.
+    fn stream_key_range_partitions<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+        key: String,
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
+        use futures::StreamExt as _;
+        let odata = self.config.odata.as_ref().expect("odata configured");
+        let partition = odata.partition.as_ref().expect("partition configured");
+        let entity = odata.entity.clone().unwrap_or_default();
+        let workers = partition.resolved_workers();
+        let count = partition.resolved_count();
+        let parent = context.clone();
+        Box::pin(async_stream::try_stream! {
+            let Some((low, high)) = self.discover_key_bounds(&entity, &key).await? else {
+                return; // empty entity → no rows
+            };
+            let shards = faucet_core::shard::plan_pk_shards(&key, low, high, count);
+            tracing::info!(
+                entity = %entity, key = %key, low, high,
+                ranges = shards.len(), workers,
+                "OData key-range partitioned extraction"
+            );
+            // One filtered page-stream per range; poll up to `workers` concurrently.
+            let streams: Vec<_> = shards
+                .iter()
+                .filter_map(faucet_core::shard::PkShardBounds::from_spec)
+                .map(|bounds| {
+                    let filter = crate::odata::key_range_filter(&bounds);
+                    self.stream_pages_inner(Some(&parent), filter)
+                })
+                .collect();
+            let mut merged = futures::stream::iter(streams).flatten_unordered(workers);
+            while let Some(page) = merged.next().await {
+                // Partitioning is a full-table intra-run read: suppress per-range
+                // bookmarks so no partial high-water mark is persisted.
+                let page = page?;
+                yield faucet_core::StreamPage { records: page.records, bookmark: None };
+            }
+        })
+    }
+
+    /// Generic, config-driven discovery (#647): run the [`DiscoverySpec`]
+    /// recipe — enumerate datasets (a `list` request or an explicit `objects`
+    /// list), optionally `describe` each, and emit one
+    /// [`DatasetDescriptor`](faucet_core::DatasetDescriptor) per dataset. All
+    /// requests reuse this source's authenticated client; nothing here is
+    /// connector-specific.
+    async fn discover_via_recipe(
+        &self,
+        spec: &crate::discovery::DiscoverySpec,
+    ) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
+        let base = self.config.base_url.trim_end_matches('/');
+        // Dataset names: an explicit `objects:` list wins; else run the `list`
+        // request and extract/filter names from it.
+        let names = if !spec.objects.is_empty() {
+            spec.objects.clone()
+        } else if let Some(list) = &spec.list {
+            let url = format!("{base}{}", list.get);
+            let resp = self.discover_get_json(&url, "discovery list").await?;
+            crate::discovery::dataset_names(&resp, list)
+        } else {
+            return Err(FaucetError::Source(
+                "rest discovery: neither `list` nor `objects` produced any datasets".into(),
+            ));
+        };
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let describe_resp = match &spec.describe {
+                Some(desc) => {
+                    let url = format!("{base}{}", desc.get.replace("${name}", &name));
+                    Some(self.discover_get_json(&url, "discovery describe").await?)
+                }
+                None => None,
+            };
+            if let Some(d) = crate::discovery::build_descriptor(&name, describe_resp.as_ref(), spec)
+            {
+                out.push(d);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1971,6 +2760,34 @@ impl faucet_core::Source for RestStream {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn next_poll_delay_doubles_then_caps() {
+        let cap = Duration::from_secs(15);
+        // Exponential doubling below the cap.
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(1), cap),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(2), cap),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_poll_delay(Duration::from_secs(4), cap),
+            Duration::from_secs(8)
+        );
+        // Doubling past the cap clamps to the cap.
+        assert_eq!(next_poll_delay(Duration::from_secs(8), cap), cap);
+        assert_eq!(next_poll_delay(cap, cap), cap);
+        // A zero cap (interval_secs: 0) keeps the delay at zero (poll as fast as possible).
+        assert_eq!(
+            next_poll_delay(Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
+        // Saturating: a huge current delay never overflows.
+        assert_eq!(next_poll_delay(Duration::from_secs(u64::MAX), cap), cap);
+    }
 
     #[test]
     fn value_max_consolidates_partition_bookmarks() {
@@ -2252,6 +3069,157 @@ mod tests {
     }
 
     #[test]
+    fn sql_from_object_parses_the_driving_object() {
+        // Common shapes: with WHERE, with a leading newline/whitespace, lowercase
+        // keyword, trailing clause, and a field literally containing "from".
+        assert_eq!(
+            sql_from_object("SELECT Id, Name FROM Account WHERE IsDeleted = false"),
+            Some("Account".to_string())
+        );
+        assert_eq!(
+            sql_from_object("SELECT Id\nFROM SBQQ__Quote__c\nORDER BY Id"),
+            Some("SBQQ__Quote__c".to_string())
+        );
+        assert_eq!(
+            sql_from_object("select id from contact"),
+            Some("contact".to_string())
+        );
+        assert_eq!(
+            sql_from_object("SELECT Id FROM Opportunity_Line_Item"),
+            Some("Opportunity_Line_Item".to_string())
+        );
+        // No FROM → None (caller falls back to a hash).
+        assert_eq!(sql_from_object("SELECT 1"), None);
+    }
+
+    #[test]
+    fn sql_from_object_ignores_subquery_and_quoted_from() {
+        // A parent-child relationship subquery in the SELECT list: its FROM is
+        // inside parens and must not be mistaken for the driving object.
+        assert_eq!(
+            sql_from_object(
+                "SELECT Id, (SELECT Id FROM Contacts WHERE IsDeleted = false) FROM Account"
+            ),
+            Some("Account".to_string())
+        );
+        // "from" inside a quoted literal is not a clause keyword.
+        assert_eq!(
+            sql_from_object("SELECT Id FROM Lead WHERE Source = 'from web'"),
+            Some("Lead".to_string())
+        );
+    }
+
+    #[test]
+    fn async_job_object_reads_query_field() {
+        assert_eq!(
+            async_job_object(Some(&serde_json::json!({
+                "operation": "queryAll",
+                "query": "SELECT Id FROM Lead"
+            }))),
+            Some("Lead".to_string())
+        );
+        // Missing query / missing body → None.
+        assert_eq!(
+            async_job_object(Some(&serde_json::json!({"operation": "queryAll"}))),
+            None
+        );
+        assert_eq!(async_job_object(None), None);
+    }
+
+    #[test]
+    fn inject_sql_predicate_adds_or_wraps_where() {
+        // No WHERE, no trailing clause → append WHERE.
+        assert_eq!(
+            inject_sql_predicate(
+                "SELECT Id FROM Account",
+                "SystemModstamp > 2026-01-01T00:00:00Z"
+            ),
+            "SELECT Id FROM Account WHERE SystemModstamp > 2026-01-01T00:00:00Z"
+        );
+        // Existing WHERE → wrap in parens + AND (keeps OR precedence correct).
+        assert_eq!(
+            inject_sql_predicate(
+                "SELECT Id FROM Account WHERE IsActive = true OR Rating = 'Hot'",
+                "SystemModstamp > 2026-01-01T00:00:00Z"
+            ),
+            "SELECT Id FROM Account WHERE (IsActive = true OR Rating = 'Hot') AND (SystemModstamp > 2026-01-01T00:00:00Z)"
+        );
+        // Trailing ORDER BY → predicate goes before it.
+        assert_eq!(
+            inject_sql_predicate("SELECT Id FROM Account ORDER BY Id", "X > 1"),
+            "SELECT Id FROM Account WHERE X > 1 ORDER BY Id"
+        );
+        // WHERE + trailing LIMIT (newline-tolerant).
+        assert_eq!(
+            inject_sql_predicate("SELECT Id\nFROM Account\nWHERE A = 1\nLIMIT 10", "X > 1"),
+            "SELECT Id\nFROM Account\nWHERE (A = 1) AND (X > 1) LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn inject_sql_predicate_ignores_subquery_and_quoted_keywords() {
+        // A subquery's WHERE (inside parens) is not the outer statement's WHERE:
+        // the predicate must attach at the top level, after the subquery.
+        assert_eq!(
+            inject_sql_predicate(
+                "SELECT Id, (SELECT Id FROM Contacts WHERE IsDeleted = false) FROM Account",
+                "X > 1"
+            ),
+            "SELECT Id, (SELECT Id FROM Contacts WHERE IsDeleted = false) FROM Account WHERE X > 1"
+        );
+        // Outer WHERE + subquery WHERE: only the outer one is wrapped.
+        assert_eq!(
+            inject_sql_predicate(
+                "SELECT Id, (SELECT Id FROM Contacts WHERE A = 1) FROM Account WHERE B = 2",
+                "X > 1"
+            ),
+            "SELECT Id, (SELECT Id FROM Contacts WHERE A = 1) FROM Account WHERE (B = 2) AND (X > 1)"
+        );
+        // A clause keyword inside a quoted literal is data, not a boundary.
+        assert_eq!(
+            inject_sql_predicate("SELECT Id FROM A WHERE Name = 'a limit b'", "X > 1"),
+            "SELECT Id FROM A WHERE (Name = 'a limit b') AND (X > 1)"
+        );
+    }
+
+    #[test]
+    fn incremental_source_auto_opts_into_state_key() {
+        use faucet_core::{ReplicationMethod, Source};
+        // Full-table + no explicit key → not resumable.
+        let ft = RestStream::new(RestStreamConfig::new("https://api.example.com", "/x")).unwrap();
+        assert_eq!(ft.state_key(), None);
+        // Incremental + replication_key → auto-opts-in (Some), so the executor
+        // wraps it and persists the bookmark (#630).
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "/x");
+        cfg.replication_method = ReplicationMethod::Incremental;
+        cfg.replication_key = Some("SystemModstamp".into());
+        let inc = RestStream::new(cfg).unwrap();
+        assert!(inc.state_key().is_some());
+        // An explicit key always wins.
+        let mut cfg2 = RestStreamConfig::new("https://api.example.com", "/x");
+        cfg2.state_key = Some("mykey".into());
+        let ex = RestStream::new(cfg2).unwrap();
+        assert_eq!(ex.state_key().as_deref(), Some("mykey"));
+    }
+
+    #[test]
+    fn sql_literal_quotes_by_type() {
+        use serde_json::json;
+        // Datetime / date → unquoted (datetime literal).
+        assert_eq!(
+            sql_literal(&json!("2026-08-28T12:00:00Z")),
+            "2026-08-28T12:00:00Z"
+        );
+        assert_eq!(sql_literal(&json!("2026-08-28")), "2026-08-28");
+        // Plain string → single-quoted.
+        assert_eq!(sql_literal(&json!("Hot")), "'Hot'");
+        // Number → bare.
+        assert_eq!(sql_literal(&json!(42)), "42");
+        assert!(is_sql_datetime("2026-08-28T00:00:00+05:30"));
+        assert!(!is_sql_datetime("not-a-date"));
+    }
+
+    #[test]
     fn dataset_uri_redacts_credentials() {
         use faucet_core::Source;
         let source = RestStream::new(RestStreamConfig::new(
@@ -2339,5 +3307,138 @@ mod mtls_tests {
         };
         let cfg = RestStreamConfig::new("https://x.test", "/y").tls(tls);
         assert!(RestStream::new(cfg).is_err());
+    }
+}
+
+#[cfg(test)]
+mod patch_edge_tests {
+    use super::*;
+    use crate::config::RestStreamConfig;
+    use serde_json::json;
+
+    fn bulk_job_json(submit_json: Option<Value>) -> crate::async_job::AsyncJobConfig {
+        let mut submit = json!({ "method": "POST", "url": "/jobs" });
+        if let Some(j) = submit_json {
+            submit["json"] = j;
+        }
+        serde_json::from_value(json!({
+            "submit": submit,
+            "job_id": "$.id",
+            "poll": { "url": "/jobs/${job_id}", "interval_secs": 0, "timeout_secs": 1 },
+            "status": { "path": "$.state", "success": ["ok"] },
+            "fetch": { "url": "/jobs/${job_id}/result" }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sql_from_object_empty_identifier_is_none() {
+        // The token after FROM strips to nothing → no driving object.
+        assert_eq!(sql_from_object("SELECT Id FROM ,"), None);
+    }
+
+    #[test]
+    fn top_level_tokens_honors_backslash_escaped_quotes() {
+        // The escaped quote must not close the literal: the quoted `limit`
+        // stays inside one dirty token and never surfaces as a clause keyword.
+        let q = r"SELECT Id FROM A WHERE n = 'a\'limit\'b' LIMIT 5";
+        let toks = top_level_tokens(q);
+        assert!(toks.iter().any(|(_, t)| *t == "LIMIT"));
+        assert!(toks.iter().all(|(_, t)| !t.contains('\'')));
+        // …and the injector places the predicate before the REAL clause.
+        assert_eq!(
+            inject_sql_predicate(q, "X > 1"),
+            r"SELECT Id FROM A WHERE (n = 'a\'limit\'b') AND (X > 1) LIMIT 5"
+        );
+    }
+
+    #[test]
+    fn sql_literal_bool_and_composite_values() {
+        assert_eq!(sql_literal(&json!(true)), "true");
+        assert_eq!(sql_literal(&json!(false)), "false");
+        // Non-scalars stringify quoted (defensive; bookmarks are scalars).
+        assert_eq!(sql_literal(&json!([1, 2])), "'[1,2]'");
+    }
+
+    #[test]
+    fn full_table_async_job_emits_no_bookmark() {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.async_job = Some(bulk_job_json(Some(json!({ "query": "SELECT Id FROM A" }))));
+        let s = RestStream::new(cfg).unwrap();
+        assert!(s.async_job_new_bookmark().is_none());
+    }
+
+    #[test]
+    fn dataset_uri_uses_object_or_stable_job_hash() {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.async_job = Some(bulk_job_json(Some(
+            json!({ "query": "SELECT Id FROM Lead" }),
+        )));
+        let s = RestStream::new(cfg).unwrap();
+        assert!(
+            faucet_core::Source::dataset_uri(&s).ends_with("/objects/Lead"),
+            "{}",
+            faucet_core::Source::dataset_uri(&s)
+        );
+
+        // No parseable object → a stable 16-hex job hash, deterministic across
+        // instances (it feeds persisted catalog/lineage identity).
+        let mk = || {
+            let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+            cfg.async_job = Some(bulk_job_json(Some(json!({ "report_type": "x" }))));
+            RestStream::new(cfg).unwrap()
+        };
+        let (a, b) = (
+            faucet_core::Source::dataset_uri(&mk()),
+            faucet_core::Source::dataset_uri(&mk()),
+        );
+        assert_eq!(a, b);
+        let suffix = a.rsplit("/job/").next().unwrap();
+        assert_eq!(suffix.len(), 16, "{a}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn auto_state_key_derives_from_dataset_identity() {
+        let mk = |query: &str| {
+            let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+            cfg.replication_method = ReplicationMethod::Incremental;
+            cfg.replication_key = Some("m".into());
+            cfg.async_job = Some(bulk_job_json(Some(json!({ "query": query }))));
+            faucet_core::Source::state_key(&RestStream::new(cfg).unwrap()).unwrap()
+        };
+        let (a, b) = (mk("SELECT Id FROM Lead"), mk("SELECT Id FROM Account"));
+        assert!(a.starts_with("rest:"), "{a}");
+        assert_ne!(a, b, "two sources must never collide on one bookmark key");
+        assert_eq!(a, mk("SELECT Id FROM Lead"), "stable across constructions");
+    }
+
+    #[test]
+    fn extract_page_strips_odata_control_fields() {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.odata = Some(serde_json::from_value(json!({ "entity": "Orders" })).unwrap());
+        cfg.records_path = Some("$.value[*]".into());
+        let s = RestStream::new(cfg).unwrap();
+        let body = json!({ "value": [
+            { "@odata.etag": "W/\"1\"", "Id": 1, "Name": "a" },
+        ]});
+        let recs = s.extract_page(&body).unwrap();
+        assert_eq!(recs, vec![json!({ "Id": 1, "Name": "a" })]);
+    }
+
+    #[test]
+    fn native_output_formats_gated_on_csv_async_job() {
+        // CSV async-job with no decode → NDJSON advertised.
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.async_job = Some(bulk_job_json(None));
+        cfg.response_format = crate::config::ResponseFormat::Csv;
+        let s = RestStream::new(cfg).unwrap();
+        assert_eq!(
+            faucet_core::Source::native_output_formats(&s),
+            &[faucet_core::NativeFormat::NdJson]
+        );
+        // Plain paginated source → no native formats.
+        let plain = RestStream::new(RestStreamConfig::new("https://api.example.com", "")).unwrap();
+        assert!(faucet_core::Source::native_output_formats(&plain).is_empty());
     }
 }

@@ -273,6 +273,9 @@ arrow = [
     "faucet-source-bigquery?/arrow",
     "faucet-sink-bigquery?/arrow",
     "faucet-sink-snowflake?/arrow",
+    # So lineage/catalog sampling forwards the columnar fast path (#639) rather
+    # than masking it — matches the native byte-passthrough forwarding.
+    "faucet-lineage?/arrow",
 ]
 
 # Secrets-manager interpolation resolvers for the config layer. None in
@@ -537,6 +540,11 @@ rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 object_store = { workspace = true, optional = true, features = ["aws", "gcp"] }
 redis = { workspace = true, optional = true }
 rdkafka = { workspace = true, optional = true }
+
+# Process peak-RSS reporting (#631) via getrusage — unix-only (memstat.rs falls
+# back to `None` elsewhere), so the dep is target-gated to keep Windows building.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

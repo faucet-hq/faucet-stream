@@ -36,6 +36,7 @@ pub mod local_outputs;
 #[cfg(feature = "masking")]
 pub mod masking;
 pub mod metadata;
+pub mod native;
 pub mod observability;
 pub mod pipeline;
 #[cfg(feature = "quality")]
@@ -106,6 +107,10 @@ pub use local_outputs::{LocalOutput, LocalOutputLog, probe_pre_existing};
 pub use metadata::{
     CompiledMetadata, MetadataColumn, MetadataColumnsSpec, MetadataContext, MetadataSink,
 };
+pub use native::{
+    CsvDialect, NativeBatch, NativeFormat, NativeLoadCapability, NativeLoadContext, NativePayload,
+    NativePlan, NativePlanInputs, plan_native_transfer,
+};
 #[cfg(feature = "contract")]
 pub use observability::instrumented_apply_contract;
 #[cfg(feature = "masking")]
@@ -156,8 +161,6 @@ pub use topology::{
 pub use traits::{RowOutcome, Sink, Source};
 #[cfg(feature = "transform-json-parse")]
 pub use transform::JsonParseOnError;
-#[cfg(feature = "transform-keys-case")]
-pub use transform::KeyCaseMode;
 #[cfg(feature = "transform-lookup")]
 pub use transform::LookupOnMissing;
 pub use transform::RecordTransform;
@@ -167,6 +170,8 @@ pub use transform::ValueCaseMode;
 pub use transform::{CastOnError, CastType};
 #[cfg(feature = "transform-hash")]
 pub use transform::{HashAlgorithm, HashEncoding};
+#[cfg(feature = "transform-keys-case")]
+pub use transform::{KeyCaseMode, KeyCollision};
 pub use transforming_source::TransformingSource;
 #[cfg(feature = "transform-tree-flatten")]
 pub use tree::{AncestorsSpec, ColumnsSpec, CompiledTreeFlatten, TreeFlattenSpec};

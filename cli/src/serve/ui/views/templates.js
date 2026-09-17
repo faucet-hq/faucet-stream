@@ -191,26 +191,31 @@ function listRow(t) {
   return el;
 }
 
-/** The register panel: a raw config editor plus id / description / launch. */
-function registerPanel(onDone) {
+/** The register panel: a raw config editor plus id / description / launch.
+ *  `opts` lets the same panel add a *new version* to an existing template from
+ *  the detail page — the id is fixed, the editor is seeded with the current
+ *  config, and staying on the detail page just reloads it rather than navigating. */
+function registerPanel(onDone, opts = {}) {
+  const { presetId = "", presetBody = "", presetDesc = "", lockId = false, newVersion = false } = opts;
   const el = document.createElement("div");
   el.className = "tpl-register";
   el.innerHTML = `
+    ${newVersion ? `<p class="tpl-desc">Appends a new version to <b class="mono">${escapeHtml(presetId)}</b> — registering does <b>not</b> change what <code>stable</code> resolves to. Tick “launch” to make the new version live immediately.</p>` : ""}
     <textarea id="tr-cfg" class="code" spellcheck="false" placeholder="version: 1
 params:
   table: { type: string, required: true }
 pipeline:
   source: { type: postgres, config: { query: 'select * from \${param.table}' } }
-  sink: { type: jsonl, config: { path: ./out.jsonl } }"></textarea>
+  sink: { type: jsonl, config: { path: ./out.jsonl } }">${escapeHtml(presetBody)}</textarea>
     <fieldset class="submit-opts">
-      <label>id <input id="tr-id" placeholder="derived from name:" /></label>
+      <label>id <input id="tr-id" value="${escapeHtml(presetId)}" ${lockId ? "readonly" : ""} placeholder="derived from name:" /></label>
       <label>format
         <select id="tr-format"><option value="yaml">yaml</option><option value="json">json</option></select>
       </label>
-      <label>description <input id="tr-desc" /></label>
+      <label>description <input id="tr-desc" value="${escapeHtml(presetDesc)}" /></label>
       <label><input id="tr-launch" type="checkbox" /> launch it (make live now)</label>
     </fieldset>
-    <div class="submit-actions"><button id="tr-go" class="btn-primary">Register</button></div>
+    <div class="submit-actions"><button id="tr-go" class="btn-primary">${newVersion ? "Register new version" : "Register"}</button></div>
     <pre id="tr-out" class="submit-out" hidden></pre>`;
 
   const out = el.querySelector("#tr-out");
@@ -228,7 +233,9 @@ pipeline:
       const resp = await api("/v1/templates", { method: "POST", body });
       out.hidden = true;
       toast(`${resp.id} v${resp.version} registered`);
-      navigate(`#/templates/${encodeURIComponent(resp.id)}`);
+      // Adding a version from the detail page stays put and reloads; the
+      // list-page flow navigates into the freshly-registered template.
+      if (!newVersion) navigate(`#/templates/${encodeURIComponent(resp.id)}`);
       onDone();
     } catch (e) {
       out.hidden = false;
@@ -266,11 +273,14 @@ export async function renderTemplateDetail(container, { id }) {
         <h1 class="dataset-title mono">${escapeHtml(d.id)}</h1>
         ${statusPill(st.status)}
         <div class="detail-actions">
+          <button class="btn-primary" id="t-newver" title="register a new version of this template">+ New version</button>
           <button class="btn-ghost" id="t-rollback" ${st.previous == null ? "disabled" : ""}
             title="${st.previous == null ? "no earlier launch to roll back to" : `re-launch v${st.previous}`}">Roll back</button>
-          <button class="btn-ghost" id="t-deprecate">${st.status === "deprecated" ? "Revive" : "Deprecate"}</button>
+          <button class="${st.status === "deprecated" ? "btn-ghost" : "btn-warn"}" id="t-deprecate">${st.status === "deprecated" ? "Revive" : "Deprecate"}</button>
         </div>
       </div>
+
+      <div id="t-newver-host" hidden></div>
 
       ${st.status === "draft" ? `<div class="tpl-notice">This template is a <b>draft</b> — nothing has been launched, so a run without an explicit version is refused. Launch a version to make it live.</div>` : ""}
       ${st.status === "deprecated" ? `<div class="tpl-notice tpl-notice-warn">Deprecated${d.deprecation && d.deprecation.reason ? ` — ${escapeHtml(d.deprecation.reason)}` : ""}. Existing callers still resolve <code>stable</code>, but every trigger warns.</div>` : ""}
@@ -281,7 +291,7 @@ export async function renderTemplateDetail(container, { id }) {
         <div><label>previous</label><b>${st.previous == null ? "—" : `v${st.previous}`}</b></div>
         <div><label>newest</label><b>${st.newest == null ? "—" : `v${st.newest}`}</b></div>
         <div><label>versions</label><b>${st.versions.length}</b></div>
-        ${d.name ? `<div><label>config name</label><b>${escapeHtml(d.name)}</b></div>` : ""}
+        ${d.name && d.name !== d.id ? `<div><label>config name</label><b>${escapeHtml(d.name)}</b></div>` : ""}
       </div>
       ${d.description ? `<p class="tpl-desc">${escapeHtml(d.description)}</p>` : ""}
 
@@ -296,6 +306,24 @@ export async function renderTemplateDetail(container, { id }) {
     </div>`;
 
   container.querySelector("#t-back").onclick = () => navigate("#/templates");
+
+  // "+ New version" — open the same register panel, but pinned to this id and
+  // seeded with the newest version's config so a new build is an edit of the
+  // current one rather than a blank slate.
+  const newverHost = container.querySelector("#t-newver-host");
+  container.querySelector("#t-newver").onclick = async () => {
+    if (!newverHost.hidden) { newverHost.hidden = true; newverHost.innerHTML = ""; return; }
+    let seed = "";
+    try {
+      const rec = await api(`/v1/templates/${encodeURIComponent(id)}?version=${st.newest}`);
+      seed = rec.body || "";
+    } catch (e) { toast(`could not load v${st.newest} config: ${e.message}`, "error"); }
+    newverHost.innerHTML = "";
+    newverHost.appendChild(
+      registerPanel(reload, { presetId: id, presetBody: seed, presetDesc: d.description || "", lockId: true, newVersion: true }),
+    );
+    newverHost.hidden = false;
+  };
 
   container.querySelector("#t-rollback").onclick = async () => {
     if (st.previous == null) return;

@@ -1342,6 +1342,11 @@ pub struct DiscoverArgs {
     /// Defaults to `default` (the legacy singular `pipeline.source`).
     #[arg(long)]
     pub source: Option<String>,
+    /// Sink template each generated matrix row should target (an entry under
+    /// `pipeline.sinks`). Needed when the config selects a named sink (e.g. the
+    /// Salesforce template's `${param.sink}`); omit for a single default sink.
+    #[arg(long)]
+    pub sink: Option<String>,
     /// Only include datasets whose name matches this `*`-wildcard pattern
     /// (repeatable; no patterns = include everything).
     #[arg(long)]

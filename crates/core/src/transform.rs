@@ -148,6 +148,34 @@ pub enum KeyCaseMode {
     Dot,
 }
 
+/// Policy for [`RecordTransform::KeysCase`] when two distinct source keys
+/// re-case to the same name (common on wide, vendor-namespaced sources such
+/// as Salesforce, e.g. `AccountId__c` + `Account_Id__c` → `account_id_c`).
+#[cfg(feature = "transform-keys-case")]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyCollision {
+    /// Fail the record with a `Transform` error naming the colliding key
+    /// (the default — never silently drops a column).
+    #[default]
+    Error,
+    /// Disambiguate colliding keys by appending `_2`, `_3`, … in original
+    /// key order (first occurrence keeps the base name). Deterministic and
+    /// order-stable, mirroring z3z1ma `target-bigquery`'s
+    /// `add_underscore_when_invalid`.
+    Suffix,
+}
+
 /// String-value casing mode for [`RecordTransform::ValueCase`].
 #[cfg(feature = "transform-value-case")]
 #[derive(
@@ -311,7 +339,12 @@ pub enum RecordTransform {
     /// | `"last-name"`  | `"last_name"`  | `"lastName"`  | `"LastName"` | `"last-name"`  | `"LAST_NAME"`    |
     /// | `"camelCase"`  | `"camel_case"` | `"camelCase"` | `"CamelCase"`| `"camel-case"` | `"CAMEL_CASE"`   |
     #[cfg(feature = "transform-keys-case")]
-    KeysCase { mode: KeyCaseMode },
+    KeysCase {
+        /// Output convention for every key.
+        mode: KeyCaseMode,
+        /// What to do when two distinct keys re-case to the same name.
+        on_collision: KeyCollision,
+    },
 
     /// Keep only the listed top-level fields on each record; remove the rest.
     ///
@@ -597,7 +630,11 @@ impl fmt::Debug for RecordTransform {
                 .field("replacement", replacement)
                 .finish(),
             #[cfg(feature = "transform-keys-case")]
-            Self::KeysCase { mode } => f.debug_struct("KeysCase").field("mode", mode).finish(),
+            Self::KeysCase { mode, on_collision } => f
+                .debug_struct("KeysCase")
+                .field("mode", mode)
+                .field("on_collision", on_collision)
+                .finish(),
             #[cfg(feature = "transform-select")]
             Self::Select { fields } => f.debug_struct("Select").field("fields", fields).finish(),
             #[cfg(feature = "transform-drop")]
@@ -740,7 +777,10 @@ impl Clone for RecordTransform {
                 replacement: replacement.clone(),
             },
             #[cfg(feature = "transform-keys-case")]
-            Self::KeysCase { mode } => Self::KeysCase { mode: *mode },
+            Self::KeysCase { mode, on_collision } => Self::KeysCase {
+                mode: *mode,
+                on_collision: *on_collision,
+            },
             #[cfg(feature = "transform-select")]
             Self::Select { fields } => Self::Select {
                 fields: fields.clone(),
@@ -873,7 +913,10 @@ impl Clone for CompiledTransform {
                 replacement: replacement.clone(),
             },
             #[cfg(feature = "transform-keys-case")]
-            Self::KeysCase { mode } => Self::KeysCase { mode: *mode },
+            Self::KeysCase { mode, on_collision } => Self::KeysCase {
+                mode: *mode,
+                on_collision: *on_collision,
+            },
             #[cfg(feature = "transform-select")]
             Self::Select { fields } => Self::Select {
                 fields: fields.clone(),
@@ -1048,6 +1091,7 @@ pub enum CompiledTransform {
     #[cfg(feature = "transform-keys-case")]
     KeysCase {
         mode: KeyCaseMode,
+        on_collision: KeyCollision,
     },
     #[cfg(feature = "transform-select")]
     Select {
@@ -1161,7 +1205,10 @@ pub fn compile(t: &RecordTransform) -> Result<CompiledTransform, FaucetError> {
             })
         }
         #[cfg(feature = "transform-keys-case")]
-        RecordTransform::KeysCase { mode } => Ok(CompiledTransform::KeysCase { mode: *mode }),
+        RecordTransform::KeysCase { mode, on_collision } => Ok(CompiledTransform::KeysCase {
+            mode: *mode,
+            on_collision: *on_collision,
+        }),
         #[cfg(feature = "transform-select")]
         RecordTransform::Select { fields } => Ok(CompiledTransform::Select {
             fields: fields.clone(),
@@ -1389,7 +1436,9 @@ fn apply_one(value: Value, t: &CompiledTransform) -> Result<Value, FaucetError> 
             Ok(rename_keys(value, re, replacement))
         }
         #[cfg(feature = "transform-keys-case")]
-        CompiledTransform::KeysCase { mode } => keys_case(value, *mode),
+        CompiledTransform::KeysCase { mode, on_collision } => {
+            keys_case(value, *mode, *on_collision)
+        }
         #[cfg(feature = "transform-select")]
         CompiledTransform::Select { fields } => Ok(select_fields(value, fields)),
         #[cfg(feature = "transform-drop")]
@@ -1544,8 +1593,17 @@ fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Value {
 // ── KeysCase ──────────────────────────────────────────────────────────────────
 
 /// Recursively re-case every key in the record according to `mode`.
+///
+/// When two distinct keys within the same object re-case to the same name,
+/// `on_collision` decides: [`KeyCollision::Error`] fails the record (default,
+/// never drops a column); [`KeyCollision::Suffix`] appends `_2`, `_3`, … in
+/// original key order to make each unique (deterministic + order-stable).
 #[cfg(feature = "transform-keys-case")]
-fn keys_case(value: Value, mode: KeyCaseMode) -> Result<Value, FaucetError> {
+fn keys_case(
+    value: Value,
+    mode: KeyCaseMode,
+    on_collision: KeyCollision,
+) -> Result<Value, FaucetError> {
     match value {
         Value::Object(map) => {
             let mut new_map = Map::with_capacity(map.len());
@@ -1558,21 +1616,39 @@ fn keys_case(value: Value, mode: KeyCaseMode) -> Result<Value, FaucetError> {
                 } else {
                     apply_key_case(tokens, mode)
                 };
-                let new_v = keys_case(v, mode)?;
-                if new_map.contains_key(&recased) {
-                    return Err(FaucetError::Transform(format!(
-                        "keys_case produced a duplicate key '{recased}'; two distinct keys \
-                         re-case to the same name under mode {mode:?}"
-                    )));
-                }
-                new_map.insert(recased, new_v);
+                let new_v = keys_case(v, mode, on_collision)?;
+                let final_key = if new_map.contains_key(&recased) {
+                    match on_collision {
+                        KeyCollision::Error => {
+                            return Err(FaucetError::Transform(format!(
+                                "keys_case produced a duplicate key '{recased}'; two distinct \
+                                 keys re-case to the same name under mode {mode:?} (set \
+                                 on_collision: suffix to disambiguate)"
+                            )));
+                        }
+                        KeyCollision::Suffix => {
+                            // Bump the numeric suffix until the name is free —
+                            // guards against colliding with a real `name_2` key.
+                            let mut n = 2usize;
+                            let mut candidate = format!("{recased}_{n}");
+                            while new_map.contains_key(&candidate) {
+                                n += 1;
+                                candidate = format!("{recased}_{n}");
+                            }
+                            candidate
+                        }
+                    }
+                } else {
+                    recased
+                };
+                new_map.insert(final_key, new_v);
             }
             Ok(Value::Object(new_map))
         }
         Value::Array(arr) => {
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                out.push(keys_case(v, mode)?);
+                out.push(keys_case(v, mode, on_collision)?);
             }
             Ok(Value::Array(out))
         }
@@ -1587,27 +1663,9 @@ fn keys_case(value: Value, mode: KeyCaseMode) -> Result<Value, FaucetError> {
 /// limitation in the cookbook rather than complicating the tokeniser.
 #[cfg(feature = "transform-keys-case")]
 fn tokenize_key(key: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut prev_was_lower = false;
-    for ch in key.chars() {
-        if ch.is_alphanumeric() {
-            if prev_was_lower && ch.is_uppercase() && !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            current.push(ch);
-            prev_was_lower = ch.is_lowercase();
-        } else {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            prev_was_lower = false;
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+    // Single source of truth (shared with connector code that must snake_case
+    // column names identically — see `crate::util::tokenize_identifier`).
+    crate::util::tokenize_identifier(key)
 }
 
 #[cfg(feature = "transform-keys-case")]
@@ -2612,6 +2670,7 @@ mod tests {
             &compiled(&[
                 RecordTransform::KeysCase {
                     mode: KeyCaseMode::Snake,
+                    on_collision: KeyCollision::Error,
                 },
                 RecordTransform::Flatten {
                     separator: "_".into(),
@@ -2670,6 +2729,88 @@ mod tests {
         .expect_err("colliding flattened keys must error, not drop a value");
         assert!(matches!(err, FaucetError::Transform(_)));
         assert!(format!("{err}").contains("a__b"), "{err}");
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_collision_errors_by_default() {
+        // `AccountId` and `account_id` both snake-case to `account_id`.
+        let record = json!({"AccountId": 1, "account_id": 2});
+        let err = super::apply_all(
+            record,
+            &compiled(&[RecordTransform::KeysCase {
+                mode: KeyCaseMode::Snake,
+                on_collision: KeyCollision::Error,
+            }]),
+        )
+        .expect_err("colliding re-cased keys must error by default, not drop a value");
+        assert!(matches!(err, FaucetError::Transform(_)));
+        assert!(format!("{err}").contains("account_id"), "{err}");
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_collision_suffix_disambiguates() {
+        let record = json!({"AccountId": 1, "account_id": 2});
+        let result = apply_all(
+            record,
+            &compiled(&[RecordTransform::KeysCase {
+                mode: KeyCaseMode::Snake,
+                on_collision: KeyCollision::Suffix,
+            }]),
+        );
+        let obj = result.as_object().unwrap();
+        // Both columns survive under unique names (order/backend-independent).
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["account_id", "account_id_2"].into_iter().collect(),
+            "got {keys:?}"
+        );
+        let vals: std::collections::BTreeSet<i64> =
+            obj.values().filter_map(Value::as_i64).collect();
+        assert_eq!(vals, [1, 2].into_iter().collect(), "both values preserved");
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_collision_suffix_three_way() {
+        // `Foo`, `foo`, `FOO` all snake-case to `foo`.
+        let record = json!({"Foo": 1, "foo": 2, "FOO": 3});
+        let result = apply_all(
+            record,
+            &compiled(&[RecordTransform::KeysCase {
+                mode: KeyCaseMode::Snake,
+                on_collision: KeyCollision::Suffix,
+            }]),
+        );
+        let obj = result.as_object().unwrap();
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["foo", "foo_2", "foo_3"].into_iter().collect(),
+            "got {keys:?}"
+        );
+        let vals: std::collections::BTreeSet<i64> =
+            obj.values().filter_map(Value::as_i64).collect();
+        assert_eq!(vals, [1, 2, 3].into_iter().collect());
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_collision_suffix_is_order_stable() {
+        let record = json!({"AccountId": 1, "account_id": 2, "Account_Id": 3});
+        let run = || {
+            apply_all(
+                record.clone(),
+                &compiled(&[RecordTransform::KeysCase {
+                    mode: KeyCaseMode::Snake,
+                    on_collision: KeyCollision::Suffix,
+                }]),
+            )
+        };
+        // Deterministic: same input yields byte-identical output across runs.
+        assert_eq!(run(), run());
     }
 
     // ── Select ────────────────────────────────────────────────────────────────
@@ -3190,6 +3331,7 @@ mod tests {
                 },
                 RecordTransform::KeysCase {
                     mode: KeyCaseMode::Snake,
+                    on_collision: KeyCollision::Error,
                 },
             ]),
         )
@@ -3273,7 +3415,10 @@ mod tests {
 
     #[cfg(feature = "transform-keys-case")]
     fn keys_case_specs(mode: KeyCaseMode) -> Vec<RecordTransform> {
-        vec![RecordTransform::KeysCase { mode }]
+        vec![RecordTransform::KeysCase {
+            mode,
+            on_collision: KeyCollision::Error,
+        }]
     }
 
     #[cfg(feature = "transform-keys-case")]
@@ -3422,7 +3567,8 @@ mod tests {
             let dbg = format!(
                 "{:?}",
                 RecordTransform::KeysCase {
-                    mode: KeyCaseMode::Snake
+                    mode: KeyCaseMode::Snake,
+                    on_collision: Default::default(),
                 }
             );
             assert!(dbg.starts_with("KeysCase"), "{dbg}");
@@ -3617,6 +3763,7 @@ mod tests {
         #[cfg(feature = "transform-keys-case")]
         variants.push(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Error,
         });
         #[cfg(feature = "transform-select")]
         variants.push(RecordTransform::Select {
@@ -3720,6 +3867,7 @@ mod tests {
         #[cfg(feature = "transform-keys-case")]
         specs.push(RecordTransform::KeysCase {
             mode: KeyCaseMode::Camel,
+            on_collision: KeyCollision::Error,
         });
         #[cfg(feature = "transform-select")]
         specs.push(RecordTransform::Select {

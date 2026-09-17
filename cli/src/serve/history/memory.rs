@@ -153,7 +153,7 @@ impl RunHistory for MemoryHistory {
             .runs
             .iter()
             .map(|r| r.clone())
-            .filter(|r| filter.status.is_none_or(|s| r.status == s))
+            .filter(|r| filter.status.is_empty() || filter.status.contains(&r.status))
             .filter(|r| {
                 filter
                     .name
@@ -1014,7 +1014,7 @@ mod tests {
             .unwrap();
         let only_failed = h
             .list(&ListFilter {
-                status: Some(RunStatus::Failed),
+                status: vec![RunStatus::Failed],
                 limit: 50,
                 ..Default::default()
             })

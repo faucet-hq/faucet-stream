@@ -89,10 +89,25 @@ listing, never a data scan.
 | `spanner` | base tables (default schema) | `INFORMATION_SCHEMA.COLUMNS` | — | `query` |
 | `s3` | common prefixes under the configured prefix (one delimiter listing; falls back to per-object entries) | — | — | `prefix` |
 | `gcs` | same as s3 | — | — | `prefix` (objects: `object_keys`) |
+| `rest` + `odata:` | OData entity sets (from `$metadata` EDMX) | EDM property types | — | `odata.entity` |
+| `rest` + `discovery:` | whatever the recipe's listing endpoint returns | per-dataset describe request (optional) | — | `emit.config` (templated; + optional sink `table_id` / `sink_ref`) |
 
-Any other source kind fails with a typed error naming the supported set. Library
-users can call `Source::discover()` directly — it returns the same
-`DatasetDescriptor` list.
+The `rest` source discovers only when an `odata:` or `discovery:` block is set.
+`discovery:` is a **config-driven recipe** — no vendor code path: `list`
+enumerates dataset names from a listing endpoint (JSONPath `items`/`name`, an
+optional `keep_if` predicate, and `exclude_name_suffixes`), or `objects`
+supplies them directly (a YAML list or a comma-separated run param);
+`describe` optionally fetches each dataset's fields; `emit` templates what
+each dataset becomes, using `${name}` / `${name_snake}` / `${name_lower}` /
+`${field_names}` in the source `config` patch and the sink `table_id`. A
+bulk-query API that needs an explicit column list (no `SELECT *`) is exactly
+`describe` + `${field_names}` in the emitted query. Setting `fan_out: true`
+(same key on `odata:`) applies the recipe **at run time** — `faucet run` /
+`serve` turn the discovered datasets into one matrix row each before
+expansion. Pass `--sink <template>` to `faucet discover` so each dataset
+routes to its own table. Any other source kind fails with a typed error
+naming the supported set. Library users can call `Source::discover()`
+directly — it returns the same `DatasetDescriptor` list.
 
 ## See also
 

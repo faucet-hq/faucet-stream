@@ -12,7 +12,8 @@
 // as `expired`, never as a broken row.
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { escapeHtml } from "../utils.js";
+import { escapeHtml, fmtCompact, fmtInt } from "../utils.js";
+import { attachDatePicker } from "./date-picker.js";
 import { fmtTime } from "./runs.js";
 
 const CATALOG_MISSING =
@@ -26,55 +27,213 @@ export function catalogUnavailable(e) {
 
 export async function renderDatasets(container) {
   container.innerHTML = `
-    <div class="page">
+    <div class="page page-wide">
       <div class="page-head">
         <h1>Datasets</h1>
         <button class="btn-ghost" id="d-lineage">Lineage graph →</button>
       </div>
-      <div class="filters">
-        <input id="f-kind" placeholder="kind (csv, postgres, …)" />
+      <div class="filters filters-1line">
+        <details class="dd" id="f-kind-dd">
+          <summary id="f-kind-sum">kind ▾</summary>
+          <div class="dd-menu" id="f-kind-menu"><span class="dd-empty">run a pipeline first</span></div>
+        </details>
         <input id="f-q" placeholder="search URI" />
-        <button class="btn-ghost" id="f-apply">Apply</button>
-        <button class="btn-ghost" id="f-refresh">↻</button>
+        <button class="btn-ghost" id="f-refresh" title="refresh">↻</button>
+        <span class="filter-chips" id="f-roles">
+          <button class="chip chip-on" data-role="">all</button>
+          <button class="chip" data-role="source">source</button>
+          <button class="chip" data-role="sink">sink</button>
+        </span>
+        <input id="f-from" class="date-input" type="text" readonly placeholder="from…" />
+        <input id="f-to" class="date-input" type="text" readonly placeholder="to…" />
       </div>
-      <div id="ds-list" class="runs-list"></div>
-      <button class="btn-ghost" id="d-more" hidden>Load more</button>
+      <table class="ds-table">
+        <thead><tr>
+          <th>kind</th><th>dataset</th><th>roles</th><th>runs</th><th>rows</th><th>last seen</th>
+        </tr></thead>
+        <tbody id="ds-list"></tbody>
+      </table>
+      <nav id="ds-pager" class="pager" aria-label="Dataset pages"></nav>
       <div id="lo-section"></div>
     </div>`;
 
   const list = container.querySelector("#ds-list");
+  const pager = container.querySelector("#ds-pager");
   container.querySelector("#d-lineage").onclick = () => navigate("#/lineage");
-  let cursor = null;
+  const PAGE_SIZE = 50;
+  let page = 1; // 1-based current page over the *filtered* set
+  let all = []; // the whole catalog, fetched once; filtered + paginated client-side
+  let role = ""; // "", "source", or "sink"
+  const kinds = new Set(); // selected kinds (empty = all)
 
-  async function load(reset) {
-    if (reset) cursor = null;
-    const p = new URLSearchParams();
-    const kind = container.querySelector("#f-kind").value.trim();
-    const q = container.querySelector("#f-q").value.trim();
-    if (kind) p.set("kind", kind);
-    if (q) p.set("q", q);
-    p.set("limit", "50");
-    if (cursor) p.set("cursor", cursor);
+  // Datasets matching every filter EXCEPT kind — the base the kind facet and
+  // the final table are both computed from, so the kind options only ever list
+  // kinds still reachable given the active role/date filters (faceted).
+  function baseFiltered() {
+    const from = container.querySelector("#f-from").dataset.value || ""; // ISO or ""
+    const to = container.querySelector("#f-to").dataset.value || "";
+    return all.filter((d) => {
+      if (role && !(d.roles || []).includes(role)) return false;
+      const ts = d.last_success || "";
+      if (from && ts && ts < from) return false;
+      if (to && ts && ts > to) return false;
+      return true;
+    });
+  }
+
+  // The fully-filtered set (role/date + kind + URI search), sorted as the server
+  // returned it. Pagination slices this — so the page count always reflects the
+  // active filters.
+  function filtered() {
+    const q = container.querySelector("#f-q").value.trim().toLowerCase();
+    return baseFiltered()
+      .filter((d) => !kinds.size || kinds.has(d.kind))
+      .filter((d) => !q || (d.uri || "").toLowerCase().includes(q));
+  }
+
+  function render() {
+    populateKinds(); // keep the kind facet in sync with role/date
+    const rows = filtered();
+    const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+    if (page > pageCount) page = pageCount;
+    if (page < 1) page = 1;
+    list.innerHTML = "";
+    if (!rows.length) {
+      list.innerHTML = `<tr><td colspan="6" class="empty">${
+        all.length ? "No datasets match the filters." : "No datasets catalogued yet — run a pipeline first."
+      }</td></tr>`;
+      renderPager(0, 0);
+      return;
+    }
+    const start = (page - 1) * PAGE_SIZE;
+    for (const d of rows.slice(start, start + PAGE_SIZE)) list.appendChild(row(d));
+    renderPager(pageCount, rows.length);
+  }
+
+  // « ‹ 1 … 4 [5] 6 … 20 › » — numbered pages with ellipses; a single page hides
+  // the pager entirely. A count summary ("51–58 of 58") sits alongside.
+  function renderPager(pageCount, total) {
+    pager.innerHTML = "";
+    if (pageCount <= 1) return;
+    const go = (p) => { page = Math.min(Math.max(1, p), pageCount); render(); };
+    const btn = (label, target, opts = {}) => {
+      const b = document.createElement("button");
+      b.className = "pager-btn" + (opts.current ? " is-current" : "");
+      b.textContent = label;
+      if (opts.disabled) b.disabled = true;
+      else b.onclick = () => go(target);
+      return b;
+    };
+    const gap = () => {
+      const s = document.createElement("span");
+      s.className = "pager-gap";
+      s.textContent = "…";
+      return s;
+    };
+    // window of page numbers around the current page
+    const nums = new Set([1, pageCount, page, page - 1, page + 1]);
+    const shown = [...nums].filter((n) => n >= 1 && n <= pageCount).sort((a, b) => a - b);
+    pager.appendChild(btn("‹", page - 1, { disabled: page === 1 }));
+    let prev = 0;
+    for (const n of shown) {
+      if (n - prev > 1) pager.appendChild(gap());
+      pager.appendChild(btn(String(n), n, { current: n === page }));
+      prev = n;
+    }
+    pager.appendChild(btn("›", page + 1, { disabled: page === pageCount }));
+    const info = document.createElement("span");
+    info.className = "pager-info";
+    const from = (page - 1) * PAGE_SIZE + 1;
+    const to = Math.min(page * PAGE_SIZE, total);
+    info.textContent = `${from}–${to} of ${total}`;
+    pager.appendChild(info);
+  }
+
+  // Populate the kind multi-select from the kinds reachable under the *other*
+  // active filters (role/date), and drop any selected kind that no longer fits.
+  function populateKinds() {
+    const menu = container.querySelector("#f-kind-menu");
+    const distinct = [...new Set(baseFiltered().map((d) => d.kind))].sort();
+    for (const k of [...kinds]) if (!distinct.includes(k)) kinds.delete(k);
+    if (!distinct.length) return;
+    menu.innerHTML = distinct
+      .map(
+        (k) =>
+          `<label class="dd-opt"><input type="checkbox" value="${escapeHtml(k)}"${
+            kinds.has(k) ? " checked" : ""
+          } /> ${escapeHtml(k)}</label>`,
+      )
+      .join("");
+    menu.querySelectorAll("input").forEach((cb) => {
+      cb.onchange = () => {
+        if (cb.checked) kinds.add(cb.value);
+        else kinds.delete(cb.value);
+        container.querySelector("#f-kind-sum").textContent = kinds.size ? `kind (${kinds.size}) ▾` : "kind ▾";
+        page = 1;
+        render();
+      };
+    });
+  }
+
+  // The catalog is a bounded set (the datasets a pipeline touches), so we fetch
+  // it all once by walking the server's cursor, then filter + paginate in the
+  // client — which is what makes true numbered pages (jump to any page, a page
+  // count that tracks the filters) possible. Deduped by id in case a concurrent
+  // write shifts the server sort between cursor pages.
+  const MAX_FETCH_PAGES = 100; // safety backstop (~5000 datasets)
+  async function loadAll() {
     try {
-      const data = await api(`/v1/catalog/datasets?${p}`);
-      if (reset) list.innerHTML = "";
-      if (!data.datasets.length && reset) {
-        list.innerHTML = `<div class="empty">No datasets catalogued yet — run a pipeline first.</div>`;
+      const acc = [];
+      const seen = new Set();
+      let cursor = null;
+      for (let i = 0; i < MAX_FETCH_PAGES; i++) {
+        const p = new URLSearchParams();
+        p.set("limit", "200");
+        if (cursor) p.set("cursor", cursor);
+        const data = await api(`/v1/catalog/datasets?${p}`);
+        for (const d of data.datasets) if (!seen.has(d.id)) { seen.add(d.id); acc.push(d); }
+        cursor = data.next_cursor || null;
+        if (!cursor) break;
       }
-      for (const d of data.datasets) list.appendChild(row(d));
-      cursor = data.next_cursor || null;
-      container.querySelector("#d-more").hidden = !cursor;
+      all = acc;
+      page = 1;
+      populateKinds();
+      render();
     } catch (e) {
-      if (catalogUnavailable(e)) list.innerHTML = `<div class="empty">${CATALOG_MISSING}</div>`;
+      if (catalogUnavailable(e)) list.innerHTML = `<tr><td colspan="6" class="empty">${CATALOG_MISSING}</td></tr>`;
       else toast(e.message, "error");
     }
   }
 
-  container.querySelector("#f-apply").onclick = () => load(true);
-  container.querySelector("#f-refresh").onclick = () => load(true);
-  container.querySelector("#d-more").onclick = () => load(false);
-  await load(true);
-  await renderLocalOutputs(container.querySelector("#lo-section"), {});
+  // Any filter change re-filters the already-fetched set and jumps back to page 1.
+  const refilter = () => { page = 1; render(); };
+  container.querySelector("#f-refresh").onclick = () => loadAll();
+  container.querySelector("#f-q").oninput = refilter;
+  attachDatePicker(container.querySelector("#f-from"));
+  attachDatePicker(container.querySelector("#f-to"));
+  container.querySelector("#f-from").addEventListener("change", refilter);
+  container.querySelector("#f-to").addEventListener("change", refilter);
+  container.querySelectorAll("#f-roles .chip").forEach((c) => {
+    c.onclick = () => {
+      role = c.dataset.role;
+      container.querySelectorAll("#f-roles .chip").forEach((x) => x.classList.toggle("chip-on", x === c));
+      refilter();
+    };
+  });
+  // Collapse the kind dropdown when clicking anywhere outside it. Named so the
+  // teardown can remove it — a per-render anonymous listener would accumulate
+  // on `document` across navigations, each closure pinning its detached DOM.
+  const kindDd = container.querySelector("#f-kind-dd");
+  const closeKindDd = (e) => {
+    if (kindDd.open && !kindDd.contains(e.target)) kindDd.open = false;
+  };
+  document.addEventListener("click", closeKindDd);
+  await loadAll();
+  const loCleanup = await renderLocalOutputs(container.querySelector("#lo-section"), {});
+  return () => {
+    document.removeEventListener("click", closeKindDd);
+    if (loCleanup) loCleanup();
+  };
 }
 
 // ── Local outputs (#587/#588) ───────────────────────────────────────────────
@@ -106,8 +265,19 @@ const STATE_HINT = {
  * buttons, rather than buttons that can only 403.
  */
 export async function renderLocalOutputs(host, scope = {}) {
-  if (!host) return;
+  if (!host) return null;
   const datasetId = scope.datasetId || null;
+  // Collapse the Manage disclosure when clicking anywhere outside it. One
+  // delegated document listener per panel render — installed here (not inside
+  // `load()`, which re-runs on every refresh/toggle and would accumulate one
+  // listener per click) and removed by the returned teardown. (Named
+  // `removeListeners` — `cleanup` is already the local-outputs sweep helper.)
+  const collapseManage = (e) => {
+    const manage = host.querySelector(".lo-manage");
+    if (manage && manage.open && !manage.contains(e.target)) manage.open = false;
+  };
+  document.addEventListener("click", collapseManage);
+  const removeListeners = () => document.removeEventListener("click", collapseManage);
   let showExpired = false;
 
   host.innerHTML = `
@@ -142,7 +312,7 @@ export async function renderLocalOutputs(host, scope = {}) {
       preview_max_rows: previewMax,
     } = data;
     // Either cap may be null — the server's way of saying "no limit".
-    const caps = { defaultRows: previewDefault, maxRows: previewMax };
+    const caps = { defaultRows: previewDefault, maxRows: previewMax, total: scope.totalRecords };
     body.innerHTML = `
       <div class="lo-bar">
         <span class="run-meta">${outputs.length} tracked${
@@ -150,21 +320,26 @@ export async function renderLocalOutputs(host, scope = {}) {
             ? ` · auto-cleaned after ${retention} day${retention === 1 ? "" : "s"}`
             : " · automatic cleanup disabled"
         }</span>
-        <label class="lo-toggle"><input type="checkbox" id="lo-expired" ${
-          showExpired ? "checked" : ""
-        } /> show cleaned</label>
-        ${
-          canManage
-            ? `<span class="lo-purge">
-                 <input type="number" id="lo-days" min="0" value="${retention}" />
-                 <button class="btn-ghost" id="lo-purge-btn">Purge older than N days</button>
-               </span>
-               <button class="btn-danger" id="lo-all">${
-                 datasetId ? "Clean this dataset's outputs" : "Clean all local outputs"
-               }</button>`
-            : ""
-        }
-        <button class="btn-ghost" id="lo-refresh">↻</button>
+        <details class="lo-manage">
+          <summary>Manage ▾</summary>
+          <div class="lo-manage-menu">
+            <label class="lo-toggle"><input type="checkbox" id="lo-expired" ${
+              showExpired ? "checked" : ""
+            } /> show cleaned</label>
+            ${
+              canManage
+                ? `<span class="lo-purge">
+                     <input type="number" id="lo-days" min="0" value="${retention}" />
+                     <button class="btn-warn" id="lo-purge-btn">Purge older than ${retention} day${retention === 1 ? "" : "s"}</button>
+                   </span>
+                   <button class="btn-danger" id="lo-all">${
+                     datasetId ? "Clean this dataset's outputs" : "Clean all local outputs"
+                   }</button>`
+                : ""
+            }
+            <button class="btn-ghost" id="lo-refresh">↻ refresh</button>
+          </div>
+        </details>
       </div>
       <div class="lo-list">${
         outputs.length
@@ -180,13 +355,24 @@ export async function renderLocalOutputs(host, scope = {}) {
     };
     body.querySelector("#lo-refresh").onclick = () => load();
 
+
+
     body.querySelectorAll(".lo-preview-btn").forEach((btn) => {
       btn.onclick = () => togglePreview(btn, caps);
     });
 
     if (!canManage) return;
-    body.querySelector("#lo-purge-btn").onclick = () => {
-      const days = Number(body.querySelector("#lo-days").value);
+    const daysInput = body.querySelector("#lo-days");
+    const purgeBtn = body.querySelector("#lo-purge-btn");
+    // Keep the button label in sync with the typed window, so N is never a
+    // placeholder — it always names the exact days that will be purged.
+    daysInput.oninput = () => {
+      const n = daysInput.value.trim();
+      purgeBtn.textContent =
+        n === "" ? "Purge older than N days" : `Purge older than ${n} day${n === "1" ? "" : "s"}`;
+    };
+    purgeBtn.onclick = () => {
+      const days = Number(daysInput.value);
       if (!Number.isFinite(days) || days < 0) {
         toast("Enter a number of days (0 or more).", "error");
         return;
@@ -258,6 +444,7 @@ export async function renderLocalOutputs(host, scope = {}) {
   }
 
   await load();
+  return removeListeners;
 }
 
 function outputRow(o, canManage, canPreview) {
@@ -355,9 +542,9 @@ function togglePreview(btn, caps) {
       <button class="btn-ghost dp-load">Load</button>
       <button class="btn-ghost dp-load-all" title="${
         caps.maxRows
-          ? `every row, up to this server's ceiling of ${caps.maxRows}`
+          ? `load up to this server's preview ceiling of ${caps.maxRows} rows`
           : "every row in the dataset"
-      }">All rows</button>
+      }">${caps.maxRows ? `Max (${caps.maxRows})` : "All rows"}</button>
       <span class="run-meta dp-status"></span>
     </div>
     <div class="dp-body"></div>`;
@@ -390,7 +577,7 @@ async function loadPreview(id, panel, caps, all) {
     // Reflect what the server actually resolved to — an out-of-range entry (or
     // "all" against a ceiling) visibly becomes the number that was really used.
     input.value = data.row_limit === null ? "" : String(data.row_limit);
-    status.textContent = previewStatus(data);
+    status.textContent = previewStatus(data, caps);
     out.innerHTML = previewTable(data);
   } catch (e) {
     // Every documented failure here is expected and explainable — the file was
@@ -412,15 +599,23 @@ function rowsParam(raw, caps) {
   return caps.maxRows ? Math.min(n, caps.maxRows) : n;
 }
 
-function previewStatus(d) {
+function previewStatus(d, caps) {
   const n = d.row_count;
-  const base = `${n} row${n === 1 ? "" : "s"} · ${d.elapsed_ms} ms`;
-  // A capped read must say so — "500 rows" next to a million-row file would read
-  // as the whole file — and a complete one should say that too, so "no warning"
-  // is never something the reader has to infer.
-  return d.truncated
-    ? `${base} · ${CAPPED_HINT[d.capped_by] || "stopped early — the dataset has more"}`
-    : `${base} · whole dataset`;
+  const total = caps && caps.total;
+  const ms = `${d.elapsed_ms} ms`;
+  // When the dataset's total row count is known, say "N of M" outright — far
+  // clearer than "N rows … the dataset has more". Otherwise fall back to the
+  // capped/whole wording.
+  if (d.truncated) {
+    if (total != null) {
+      return `showing ${fmtInt(n)} of ${fmtInt(total)} rows · ${ms}`;
+    }
+    const cap = caps && caps.maxRows ? ` (UI cap ${fmtInt(caps.maxRows)})` : "";
+    return `${fmtInt(n)} row${n === 1 ? "" : "s"}${cap} · ${ms} · dataset has more`;
+  }
+  return total != null && Number(total) > n
+    ? `showing all ${fmtInt(n)} of ${fmtInt(total)} rows · ${ms}`
+    : `${fmtInt(n)} row${n === 1 ? "" : "s"} · ${ms} · whole dataset`;
 }
 
 function previewTable(d) {
@@ -500,16 +695,25 @@ function fmtBytes(bytes) {
 }
 
 function row(d) {
-  const el = document.createElement("div");
-  el.className = "run-row";
+  const el = document.createElement("tr");
+  el.className = "ds-tr";
   el.onclick = () => navigate(`#/catalog/${d.id}`);
   el.innerHTML = `
-    <span class="pill">${escapeHtml(d.kind)}</span>
-    <span class="run-name mono">${escapeHtml(d.uri)}</span>
-    <span class="run-meta">${escapeHtml(d.roles.join("+"))}</span>
-    <span class="run-meta">${d.runs} run${d.runs === 1 ? "" : "s"}</span>
-    <span class="run-meta">${d.last_records} rows</span>
-    <span class="run-meta run-time" title="last success">${fmtTime(d.last_success)}</span>`;
+    <td><span class="pill">${escapeHtml(d.kind)}</span></td>
+    <td class="ds-uri"><div class="ds-uri-in mono" title="${escapeHtml(d.uri)}">${escapeHtml(d.uri)}</div></td>
+    <td class="ds-meta">${escapeHtml(d.roles.join("+"))}</td>
+    <td class="ds-meta ds-num">${fmtInt(d.runs)}</td>
+    <td class="ds-meta ds-num" title="${fmtInt(d.last_records)}">${fmtCompact(d.last_records)}</td>
+    <td class="ds-meta ds-time" title="last success">${fmtTime(d.last_success)}</td>`;
+  // Drop the right-edge fade once the URI is scrolled to its end (or doesn't
+  // scroll at all), so the last characters render crisp instead of faded.
+  const uri = el.querySelector(".ds-uri-in");
+  if (uri) {
+    const syncFade = () =>
+      uri.classList.toggle("at-end", uri.scrollLeft + uri.clientWidth >= uri.scrollWidth - 1);
+    uri.addEventListener("scroll", syncFade, { passive: true });
+    requestAnimationFrame(syncFade); // initial state, after layout
+  }
   return el;
 }
 
@@ -536,28 +740,30 @@ export async function renderDatasetDetail(container, params) {
         <div><label>Roles</label>${escapeHtml(d.roles.join(", "))}</div>
         <div><label>Pipeline</label>${escapeHtml(d.pipeline)}</div>
         <div><label>Runs</label>${d.runs}</div>
-        <div><label>Rows (last / total)</label>${d.last_records} / ${d.total_records}</div>
+        <div><label>Rows (last / total)</label>${fmtInt(d.last_records)} / ${fmtInt(d.total_records)}</div>
         <div><label>First seen</label>${fmtTime(d.first_seen)}</div>
         <div><label>Last success</label>${fmtTime(d.last_success)}</div>
         <div><label>Id</label><span class="mono">${escapeHtml(d.id)}</span></div>
       </div>
 
       <h2>Volume (recent runs)</h2>
-      <div class="volume-bars">
-        ${
-          d.stats.length
-            ? d.stats
-                .slice()
-                .reverse()
-                .map(
-                  (s) =>
-                    `<div class="volume-bar" title="${escapeHtml(`${s.records} rows — ${fmtTime(s.recorded_at)} (run ${s.run_id})`)}"
-                      style="height:${Math.max(4, Math.round((s.records / maxRows) * 64))}px"></div>`,
-                )
-                .join("")
+      ${
+        d.stats.length >= 3
+          ? `<div class="volume-bars">${d.stats
+              .slice()
+              .reverse()
+              .map(
+                (s) =>
+                  `<div class="volume-bar" title="${escapeHtml(`${fmtInt(s.records)} rows — ${fmtTime(s.recorded_at)} (run ${s.run_id})`)}"
+                    style="height:${Math.max(4, Math.round((s.records / maxRows) * 64))}px"></div>`,
+              )
+              .join("")}</div>`
+          : d.stats.length
+            ? `<div class="volume-summary">${d.stats.length} run${d.stats.length === 1 ? "" : "s"} recorded · latest <b>${fmtInt(
+                d.stats[d.stats.length - 1].records,
+              )}</b> rows on ${fmtTime(d.stats[d.stats.length - 1].recorded_at)} <span class="volume-hint">— the trend chart appears once there are 3+ runs</span></div>`
             : `<div class="empty">no volume points yet</div>`
-        }
-      </div>
+      }
 
       <h2>Schema timeline</h2>
       <div id="timeline"></div>
@@ -580,7 +786,10 @@ export async function renderDatasetDetail(container, params) {
 
   container.querySelector("#d-graph").onclick = () => navigate(`#/lineage/${d.id}`);
   // This dataset's own local files, with the same controls scoped to it.
-  await renderLocalOutputs(container.querySelector("#lo-section"), { datasetId: d.id });
+  const loCleanup = await renderLocalOutputs(container.querySelector("#lo-section"), {
+    datasetId: d.id,
+    totalRecords: d.total_records,
+  });
   container.querySelectorAll(".edge-link").forEach((a) => {
     a.onclick = () => navigate(`#/catalog/${a.dataset.id}`);
   });
@@ -592,6 +801,9 @@ export async function renderDatasetDetail(container, params) {
   for (const v of d.schema_timeline.slice().reverse()) {
     timeline.appendChild(versionCard(v));
   }
+  return () => {
+    if (loCleanup) loCleanup();
+  };
 }
 
 function edgeList(edges, idOf, uriOf) {
@@ -601,8 +813,8 @@ function edgeList(edges, idOf, uriOf) {
       (e) =>
         `<div class="run-row edge-link" data-id="${escapeHtml(idOf(e))}">
           <span class="run-name mono">${escapeHtml(uriOf(e))}</span>
-          <span class="run-meta">${e.runs} run${e.runs === 1 ? "" : "s"}</span>
-          <span class="run-meta">${e.last_records} rows</span>
+          <span class="run-meta">${fmtInt(e.runs)} run${e.runs === 1 ? "" : "s"}</span>
+          <span class="run-meta">${fmtInt(e.last_records)} rows</span>
         </div>`,
     )
     .join("");

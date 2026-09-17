@@ -464,7 +464,14 @@ pub fn bq_column_type(field_spec: &serde_json::Value) -> &'static str {
         Some("integer") => "INT64",
         Some("number") => "FLOAT64",
         Some("boolean") => "BOOL",
-        Some("string") => "STRING",
+        Some("string") => match field_spec.get("format").and_then(|f| f.as_str()) {
+            // RFC3339 timestamp / date strings (e.g. OData `Edm.DateTimeOffset` /
+            // `Edm.Date`) get their real column type; BigQuery coerces the string
+            // value into it on load.
+            Some("date-time") => "TIMESTAMP",
+            Some("date") => "DATE",
+            _ => "STRING",
+        },
         Some("object") | Some("array") => "JSON",
         _ => "STRING",
     }
@@ -488,6 +495,19 @@ pub fn build_create_table_ddl(
     sample: &[serde_json::Value],
 ) -> Option<String> {
     let schema = faucet_core::schema::infer_schema(sample);
+    build_create_table_ddl_from_schema(project, dataset, table, &schema)
+}
+
+/// Like [`build_create_table_ddl`], but from an already-computed `infer_schema`-shaped
+/// JSON Schema (`{"type":"object","properties":{…}}`) — used when the column types
+/// are known authoritatively (e.g. from OData `$metadata`) rather than inferred
+/// from a data sample. Returns `None` when no columns can be derived.
+pub fn build_create_table_ddl_from_schema(
+    project: &str,
+    dataset: &str,
+    table: &str,
+    schema: &serde_json::Value,
+) -> Option<String> {
     let props = schema.get("properties")?.as_object()?;
     if props.is_empty() {
         return None;

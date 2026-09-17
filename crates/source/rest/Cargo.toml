@@ -1,6 +1,6 @@
 [package]
 name = "faucet-source-rest"
-version = "1.6.0"
+version = "1.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -45,7 +45,13 @@ excel = ["dep:calamine"]
 
 [dependencies]
 faucet-core.workspace = true
-reqwest.workspace = true
+# `stream` for `Response::bytes_stream()` — the native byte-passthrough path (#633)
+# streams the async-job CSV response body straight into the CSV→NDJSON converter
+# without buffering the whole page.
+reqwest = { workspace = true, features = ["stream", "gzip", "brotli", "deflate"] }
+# `StreamReader` bridges reqwest's byte stream to the tokio `AsyncRead` that
+# `csv-async` (tokio flavor) consumes for streaming CSV→NDJSON (#633).
+tokio-util = { workspace = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -56,7 +62,7 @@ zip = { workspace = true }  # unzip decode step (#515)
 csv-async = { workspace = true }
 calamine = { workspace = true, optional = true }
 chrono = { workspace = true }  # datetime window slicing (#527): now-clock + RFC3339 boundaries
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "sync"] }
 base64 = "0.22"
 httpdate = "1"
 tracing.workspace = true
@@ -78,3 +84,14 @@ faucet-conformance.workspace = true
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+# ── API-evolution contract ────────────────────────────────────────────────────
+# Additive evolution is a MINOR bump by policy: struct-literal construction and
+# exhaustive matching of config/data types are NOT part of this crate's
+# stability surface — construct via serde deserialization, `new()`/`Default`,
+# or builders, and match with a `_` arm. cargo-semver-checks honors this
+# declared contract below, so adding an optional field never forces a major.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

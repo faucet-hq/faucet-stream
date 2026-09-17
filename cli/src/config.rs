@@ -759,7 +759,10 @@ pub struct SelectionSpec {
 pub struct ExecutionSpec {
     /// Maximum concurrent pipeline invocations (root + per-parent-record
     /// child invocations all share this budget). Defaults to
-    /// `num_cpus::get().min(4)` at runtime when `None`.
+    /// `num_cpus::get().min(4)` at runtime when `None`. `0` = **no limit**
+    /// (the house `0`-sentinel, like `batch_size: 0`) — every invocation runs
+    /// in parallel; before 1.7 a `0` here clamped to fully-serial instead, so
+    /// audit any config that relied on that.
     #[serde(default)]
     pub max_concurrent: Option<usize>,
 

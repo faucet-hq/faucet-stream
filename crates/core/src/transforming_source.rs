@@ -31,7 +31,7 @@ use std::pin::Pin;
 /// let inner: Box<dyn Source> = build_inner();
 /// let wrapped = TransformingSource::new(
 ///     inner,
-///     vec![TransformStage::Map(RecordTransform::KeysCase { mode: KeyCaseMode::Snake })],
+///     vec![TransformStage::Map(RecordTransform::KeysCase { mode: KeyCaseMode::Snake, on_collision: Default::default() })],
 ///     Labels::for_named("rest"),
 /// ).unwrap();
 /// ```
@@ -132,6 +132,15 @@ impl Source for TransformingSource {
             let mut pages = self.inner.stream_pages(ctx, batch_size);
             while let Some(page) = pages.next().await {
                 let page = page?;
+                // The inner source already sized this page per its own config
+                // `batch_size` (the authoritative knob — the pipeline-supplied
+                // hint is only informational). Re-chunking the transformed
+                // output *below* that inner page size would silently defeat an
+                // explicit source `batch_size` (e.g. a 200k-row page shrunk to
+                // the 1k default hint → 200 tiny sink writes / load jobs). So
+                // never chunk smaller than the inner page; only bound *growth*
+                // from a 1→N stage (explode) at that inner size.
+                let page_len = page.records.len();
                 let out = instrumented_apply_stages(
                     page.records, &self.stages, &self.labels,
                 )?;
@@ -143,10 +152,11 @@ impl Source for TransformingSource {
                     yield StreamPage { records: out, bookmark: page.bookmark };
                     continue;
                 }
+                let effective = std::cmp::max(batch_size, page_len);
                 let total = out.len();
                 let mut start = 0usize;
                 while start < total {
-                    let end = std::cmp::min(start + batch_size, total);
+                    let end = std::cmp::min(start + effective, total);
                     let is_last = end == total;
                     let chunk: Vec<Value> = out[start..end].to_vec();
                     yield StreamPage {
@@ -253,6 +263,7 @@ mod tests {
             inner,
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             })],
             Labels::for_named("test"),
         )
@@ -293,6 +304,7 @@ mod tests {
             inner,
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             })],
             Labels::for_named("test"),
         )
@@ -355,6 +367,7 @@ mod tests {
             inner,
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             })],
             Labels::for_named("test"),
         )
@@ -374,6 +387,42 @@ mod tests {
         assert!(collected[1].bookmark.is_none());
         assert_eq!(collected[2].records, vec![json!({"foo_bar": 3})]);
         assert_eq!(collected[2].bookmark, Some(json!("v1")));
+    }
+
+    /// Regression: a 1→1 transform must NOT re-chunk the inner page below the
+    /// size the inner source already chose. A source that yields one large page
+    /// (its config `batch_size` honored) followed by a `keys_case` stage must
+    /// still emit that page as ONE `StreamPage`, not many hint-sized sub-pages —
+    /// otherwise an explicit source `batch_size` is silently defeated whenever a
+    /// transform is present (the cause of 60 tiny BigQuery load jobs instead of
+    /// one).
+    #[tokio::test]
+    async fn stream_pages_does_not_rechunk_large_page_below_inner_size() {
+        let big: Vec<Value> = (0..2500).map(|i| json!({"FooBar": i})).collect();
+        let inner: Box<dyn Source> = Box::new(PagedSource {
+            pages: vec![big],
+            final_bookmark: json!("v1"),
+        });
+        let wrapped = TransformingSource::new(
+            inner,
+            vec![TransformStage::Map(RecordTransform::KeysCase {
+                mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
+            })],
+            Labels::for_named("t"),
+        )
+        .unwrap();
+        let ctx = HashMap::new();
+        // Pipeline hint is the 1000-row default; it must NOT shrink the page.
+        let mut stream = wrapped.stream_pages(&ctx, 1000);
+        let mut pages: Vec<StreamPage> = Vec::new();
+        while let Some(p) = stream.next().await {
+            pages.push(p.unwrap());
+        }
+        assert_eq!(pages.len(), 1, "one inner page must stay one page");
+        assert_eq!(pages[0].records.len(), 2500);
+        assert_eq!(pages[0].records[0], json!({"foo_bar": 0}));
+        assert_eq!(pages[0].bookmark, Some(json!("v1")));
     }
 
     #[tokio::test]
@@ -403,6 +452,7 @@ mod tests {
             Box::new(EmptyWithBookmark),
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             })],
             Labels::for_named("test"),
         )
@@ -455,6 +505,7 @@ mod tests {
             Box::new(inner),
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             })],
             Labels::for_named("test"),
         )
@@ -522,6 +573,7 @@ mod tests {
                 inner,
                 vec![TransformStage::Map(RecordTransform::KeysCase {
                     mode: KeyCaseMode::Snake,
+                    on_collision: Default::default(),
                 })],
                 Labels::for_named("test"),
             )
@@ -746,6 +798,7 @@ mod columnar_tests {
             vec![TransformStage::Map(
                 crate::transform::RecordTransform::KeysCase {
                     mode: crate::transform::KeyCaseMode::Snake,
+                    on_collision: crate::transform::KeyCollision::Error,
                 },
             )],
             Labels::for_named("t"),

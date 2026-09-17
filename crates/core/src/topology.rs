@@ -2271,6 +2271,7 @@ mod tests {
         use crate::transform::{KeyCaseMode, RecordTransform};
         let stage = compile_stage(&TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
+            on_collision: Default::default(),
         }))
         .unwrap();
         let (sink, store) = CollectSink::new();

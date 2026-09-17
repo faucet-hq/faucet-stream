@@ -45,6 +45,32 @@ impl SampleState {
             s.push(r.clone());
         }
     }
+    /// Bump only the throughput counter (no sampling) — used by the native
+    /// byte-passthrough tap (#639), which counts records by newline across the
+    /// whole stream but samples only a bounded prefix.
+    fn add_count(&self, n: u64) {
+        self.count.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Push one already-parsed record into the sample if there is room (no count
+    /// bump). Companion to [`add_count`](Self::add_count) for the native tap.
+    fn sample_record(&self, v: Value) {
+        if self.cap == 0 {
+            return;
+        }
+        let mut s = self.sample.lock().unwrap();
+        if s.len() < self.cap {
+            s.push(v);
+        }
+    }
+    /// Whether the sample is full — lets the native tap stop parsing early.
+    fn sample_full(&self) -> bool {
+        self.cap == 0 || self.sample.lock().unwrap().len() >= self.cap
+    }
+    /// How many more records the sample can still take (0 once full).
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    fn sample_remaining(&self) -> usize {
+        self.cap.saturating_sub(self.sample.lock().unwrap().len())
+    }
     /// A copy of the sampled records (bounded by the construction-time cap).
     /// Used by consumers that run their own schema inference over the sample —
     /// e.g. the CLI's Data Movement Catalog (#279), which feeds them to
@@ -95,6 +121,94 @@ fn ol_type_of(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+/// Tap a native NDJSON byte payload (#639): pass every chunk through **unchanged**
+/// (streaming preserved) while counting records by newline and sampling a bounded
+/// prefix into `state`. This lets lineage/catalog sampling coexist with the native
+/// byte-passthrough fast path (#633) instead of forcing the `Value` path (which
+/// ballooned memory ~35×). Non-NDJSON payloads pass through untapped (no schema
+/// sample), but the batch's declared row count — when the source knows it — still
+/// feeds the volume counters so catalog/lineage never report zero for a
+/// successful CSV/Parquet native run.
+fn tap_native_payload(
+    payload: faucet_core::NativePayload,
+    format: faucet_core::NativeFormat,
+    records: Option<u64>,
+    state: std::sync::Arc<SampleState>,
+) -> faucet_core::NativePayload {
+    use faucet_core::{NativeFormat, NativePayload};
+    if format != NativeFormat::NdJson {
+        if let Some(n) = records {
+            state.add_count(n);
+        }
+        return payload;
+    }
+    match payload {
+        NativePayload::Bytes(b) => {
+            let mut n = 0u64;
+            for line in b.split(|&x| x == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                n += 1;
+                if !state.sample_full()
+                    && let Ok(v) = serde_json::from_slice::<Value>(line)
+                {
+                    state.sample_record(v);
+                }
+            }
+            state.add_count(n);
+            NativePayload::Bytes(b)
+        }
+        NativePayload::Stream(inner) => {
+            let tapped = faucet_core::async_stream::try_stream! {
+                let mut inner = inner;
+                let mut buf: Vec<u8> = Vec::new();
+                let mut sampling = !state.sample_full();
+                // Track whether the payload's final byte is a newline: a last
+                // line without a trailing `\n` is a real record the per-chunk
+                // newline count misses (the `Bytes` arm counts it via `split`),
+                // so it is counted — and sampled — at stream end.
+                let mut last_byte: Option<u8> = None;
+                while let Some(chunk) = inner.next().await {
+                    let chunk = chunk?;
+                    state.add_count(chunk.iter().filter(|&&b| b == b'\n').count() as u64);
+                    if let Some(&b) = chunk.last() {
+                        last_byte = Some(b);
+                    }
+                    if sampling {
+                        buf.extend_from_slice(&chunk);
+                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                            let line: Vec<u8> = buf.drain(..=pos).collect();
+                            let trimmed = &line[..line.len() - 1];
+                            if !trimmed.is_empty()
+                                && let Ok(v) = serde_json::from_slice::<Value>(trimmed)
+                            {
+                                state.sample_record(v);
+                            }
+                            if state.sample_full() {
+                                sampling = false;
+                                buf.clear();
+                                break;
+                            }
+                        }
+                    }
+                    yield chunk;
+                }
+                if last_byte.is_some_and(|b| b != b'\n') {
+                    state.add_count(1);
+                    if sampling
+                        && !buf.is_empty()
+                        && let Ok(v) = serde_json::from_slice::<Value>(&buf)
+                    {
+                        state.sample_record(v);
+                    }
+                }
+            };
+            NativePayload::Stream(Box::pin(tapped))
+        }
     }
 }
 
@@ -190,6 +304,78 @@ impl Sink for SamplingSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    // Native byte-passthrough passthrough (#639). Without forwarding these, the
+    // wrapper's trait defaults would report "no native load capability", forcing
+    // the pipeline onto the `Value` path whenever sampling is active — the exact
+    // regression this fix closes (memory ~35× higher). We tap the payload for the
+    // sink-side schema sample while the inner sink drains it, so the fast path and
+    // the catalog schema both survive.
+    fn native_load_capabilities(&self) -> Vec<faucet_core::NativeLoadCapability> {
+        self.inner.native_load_capabilities()
+    }
+    async fn load_native(
+        &self,
+        batch: faucet_core::NativeBatch,
+        scope: &str,
+        ctx: faucet_core::NativeLoadContext,
+    ) -> Result<usize, FaucetError> {
+        let faucet_core::NativeBatch {
+            format,
+            payload,
+            csv,
+            records,
+            bookmark,
+        } = batch;
+        let tapped = faucet_core::NativeBatch {
+            format,
+            payload: tap_native_payload(
+                payload,
+                format,
+                records,
+                std::sync::Arc::clone(&self.state),
+            ),
+            csv,
+            records,
+            bookmark,
+        };
+        self.inner.load_native(tapped, scope, ctx).await
+    }
+    // Columnar (Arrow) fast-path passthrough (#639, #375). Same rationale as the
+    // native methods: without forwarding, the wrapper masks the inner sink's
+    // columnar capability and forces the `Value` path. We sample a bounded row
+    // prefix of the batch for the schema, then forward the batch unchanged.
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.inner.supports_columnar()
+    }
+    #[cfg(feature = "arrow")]
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        let n = self.inner.write_batch_columnar(batch).await?;
+        sample_record_batch(batch, &self.state);
+        Ok(n)
+    }
+}
+
+/// Sample a bounded row prefix of an Arrow `RecordBatch` into `state` (#639).
+/// Converts only as many leading rows as the sample still needs (never the whole
+/// batch), and counts every row for volume regardless.
+#[cfg(feature = "arrow")]
+fn sample_record_batch(batch: &arrow::array::RecordBatch, state: &SampleState) {
+    let rows = batch.num_rows();
+    state.add_count(rows as u64);
+    if state.sample_full() || rows == 0 {
+        return;
+    }
+    let want = state.sample_remaining().min(rows);
+    let slice = batch.slice(0, want);
+    if let Ok(values) = faucet_core::columnar::record_batch_to_values(&slice) {
+        for v in values {
+            state.sample_record(v);
+        }
+    }
 }
 
 /// Wraps a source, sampling the records it yields (pre-transform input schema).
@@ -244,6 +430,63 @@ impl Source for SamplingSource {
     }
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         self.inner.apply_start_bookmark(bookmark).await
+    }
+    // Native byte-passthrough passthrough (#639) — mirror of the sink side. We
+    // forward the format advertisement and wrap each native batch's payload in a
+    // tap that samples a bounded prefix + counts records by newline while passing
+    // every byte through unchanged, so the fast path stays memory-flat and the
+    // input-side schema sample is still captured.
+    fn native_output_formats(&self) -> &'static [faucet_core::NativeFormat] {
+        self.inner.native_output_formats()
+    }
+    fn stream_native<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+        format: faucet_core::NativeFormat,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>>
+    {
+        let state = std::sync::Arc::clone(&self.state);
+        let inner = self.inner.stream_native(context, format, batch_size);
+        Box::pin(faucet_core::async_stream::try_stream! {
+            let mut inner = inner;
+            while let Some(batch) = inner.next().await {
+                let faucet_core::NativeBatch { format, payload, csv, records, bookmark } = batch?;
+                yield faucet_core::NativeBatch {
+                    format,
+                    payload: tap_native_payload(payload, format, records, std::sync::Arc::clone(&state)),
+                    csv,
+                    records,
+                    bookmark,
+                };
+            }
+        })
+    }
+    // Columnar (Arrow) fast-path passthrough (#639, #375) — mirror of the sink.
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.inner.supports_columnar()
+    }
+    #[cfg(feature = "arrow")]
+    fn stream_batches<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a,
+        >,
+    > {
+        let state = std::sync::Arc::clone(&self.state);
+        let inner = self.inner.stream_batches(context, batch_size);
+        Box::pin(faucet_core::async_stream::try_stream! {
+            let mut inner = inner;
+            while let Some(page) = inner.next().await {
+                let page = page?;
+                sample_record_batch(&page.batch, &state);
+                yield page;
+            }
+        })
     }
     // Bookmark + capability passthroughs. `fetch_with_context_incremental`
     // matters even though the pipeline drives `stream_pages`: an *outer*
@@ -302,6 +545,18 @@ mod tests {
         let names: Vec<&str> = schema.fields.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"id"));
         assert!(names.contains(&"name"));
+    }
+
+    #[test]
+    fn sample_record_is_a_noop_when_cap_is_zero() {
+        // cap 0 = counting only: the native tap must never retain a record.
+        let state = SampleState::new(0);
+        state.sample_record(json!({"id": 1}));
+        assert!(state.samples().is_empty());
+        assert!(
+            state.sample_full(),
+            "cap 0 reports full so the tap skips line parsing entirely"
+        );
     }
 
     #[tokio::test]
@@ -492,5 +747,387 @@ mod tests {
             s.capture_resume_position().await.unwrap(),
             Some(json!("pos"))
         );
+    }
+
+    // ---- #639: native byte-passthrough must survive lineage/catalog sampling ----
+
+    /// Drain a tapped payload back to its raw bytes, whichever variant it is.
+    async fn drain_payload(payload: faucet_core::NativePayload) -> Vec<u8> {
+        use futures::StreamExt as _;
+        match payload {
+            faucet_core::NativePayload::Bytes(b) => b,
+            faucet_core::NativePayload::Stream(mut st) => {
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(c) = st.next().await {
+                    out.extend_from_slice(&c.unwrap());
+                }
+                out
+            }
+        }
+    }
+
+    /// A native-load-capable sink that drains the payload into a buffer and
+    /// returns the newline (record) count — modelling a real byte-loading sink.
+    struct NativeSink(Arc<std::sync::Mutex<Vec<u8>>>);
+    #[async_trait]
+    impl Sink for NativeSink {
+        async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+            Ok(r.len())
+        }
+        fn connector_name(&self) -> &'static str {
+            "nativesink"
+        }
+        fn native_load_capabilities(&self) -> Vec<faucet_core::NativeLoadCapability> {
+            vec![faucet_core::NativeLoadCapability {
+                format: faucet_core::NativeFormat::NdJson,
+                mechanism: "test-native",
+                write_modes: &[faucet_core::WriteMode::Append],
+            }]
+        }
+        async fn load_native(
+            &self,
+            batch: faucet_core::NativeBatch,
+            _scope: &str,
+            _ctx: faucet_core::NativeLoadContext,
+        ) -> Result<usize, FaucetError> {
+            use futures::StreamExt as _;
+            match batch.payload {
+                faucet_core::NativePayload::Bytes(b) => {
+                    self.0.lock().unwrap().extend_from_slice(&b)
+                }
+                faucet_core::NativePayload::Stream(mut st) => {
+                    while let Some(c) = st.next().await {
+                        self.0.lock().unwrap().extend_from_slice(&c?);
+                    }
+                }
+            }
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&x| x == b'\n')
+                .count())
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_load_native_forwards_capability_and_taps_sample() {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner: Box<dyn Sink> = Box::new(NativeSink(Arc::clone(&buf)));
+        let shared = Arc::new(SampleState::new(2));
+        let s = SamplingSink::new(inner, Arc::clone(&shared));
+
+        // Capability must forward (not be masked by the wrapper's default).
+        let caps = s.native_load_capabilities();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].mechanism, "test-native");
+
+        let bytes = b"{\"id\":1,\"name\":\"a\"}\n{\"id\":2}\n{\"id\":3}\n".to_vec();
+        let batch =
+            faucet_core::NativeBatch::bytes(faucet_core::NativeFormat::NdJson, bytes.clone());
+        let ctx = faucet_core::NativeLoadContext {
+            write_mode: faucet_core::WriteMode::Append,
+            first_batch: true,
+        };
+        let n = s.load_native(batch, "scope", ctx).await.unwrap();
+
+        // Inner sink saw every byte unchanged (passthrough), all 3 records.
+        assert_eq!(*buf.lock().unwrap(), bytes);
+        assert_eq!(n, 3);
+        // Tap counted all 3 records but sampled only the first 2 for the schema.
+        assert_eq!(shared.count(), 3);
+        let names: Vec<String> = shared
+            .inferred_schema()
+            .fields
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert!(names.contains(&"id".to_string()));
+        assert!(names.contains(&"name".to_string()));
+
+        // The wrapper forwards the plain-write path and the connector name of
+        // the same inner sink the native path targets.
+        assert_eq!(s.connector_name(), "nativesink");
+        assert_eq!(s.write_batch(&[json!({"id": 4})]).await.unwrap(), 1);
+        assert_eq!(shared.count(), 4);
+    }
+
+    /// A native-streaming source that emits one NDJSON batch split across two
+    /// byte chunks (so the tap must reassemble a line spanning a chunk boundary).
+    struct NativeSource;
+    #[async_trait]
+    impl faucet_core::Source for NativeSource {
+        async fn fetch_with_context(
+            &self,
+            _: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn connector_name(&self) -> &'static str {
+            "nativesource"
+        }
+        fn native_output_formats(&self) -> &'static [faucet_core::NativeFormat] {
+            &[faucet_core::NativeFormat::NdJson]
+        }
+        fn stream_native<'a>(
+            &'a self,
+            _ctx: &'a std::collections::HashMap<String, Value>,
+            _format: faucet_core::NativeFormat,
+            _batch_size: usize,
+        ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::NativeBatch, FaucetError>> + Send + 'a>>
+        {
+            Box::pin(faucet_core::async_stream::try_stream! {
+                let chunks: Vec<Vec<u8>> = vec![
+                    b"{\"id\":1}\n{\"i".to_vec(),
+                    b"d\":2}\n".to_vec(),
+                ];
+                let payload = faucet_core::NativePayload::Stream(Box::pin(
+                    faucet_core::async_stream::try_stream! {
+                        for c in chunks { yield c; }
+                    },
+                ));
+                yield faucet_core::NativeBatch {
+                    format: faucet_core::NativeFormat::NdJson,
+                    payload,
+                    csv: Default::default(),
+                    records: Some(2),
+                    bookmark: Some(json!("bm")),
+                };
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn source_stream_native_forwards_format_and_taps_stream() {
+        use faucet_core::Source as _;
+        use futures::StreamExt as _;
+        let shared = Arc::new(SampleState::new(10));
+        let s = SamplingSource::new(Box::new(NativeSource), Arc::clone(&shared));
+        assert_eq!(
+            s.native_output_formats(),
+            &[faucet_core::NativeFormat::NdJson]
+        );
+        assert_eq!(s.connector_name(), "nativesource");
+        let ctx = std::collections::HashMap::new();
+        // The required `fetch_with_context` delegates to the inner source.
+        assert!(s.fetch_with_context(&ctx).await.unwrap().is_empty());
+        let mut collected: Vec<u8> = Vec::new();
+        let mut batches = s.stream_native(&ctx, faucet_core::NativeFormat::NdJson, 1000);
+        while let Some(b) = batches.next().await {
+            collected.extend(drain_payload(b.unwrap().payload).await);
+        }
+        // Every byte flowed through unchanged (line split across the chunk boundary).
+        assert_eq!(collected, b"{\"id\":1}\n{\"id\":2}\n");
+        // Tap counted both records and sampled the schema.
+        assert_eq!(shared.count(), 2);
+        let names: Vec<String> = shared
+            .inferred_schema()
+            .fields
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert!(names.contains(&"id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_tap_counts_and_samples_a_final_line_without_trailing_newline() {
+        // `…{"id":2}` (no trailing `\n`) is a real record: the `Bytes` arm
+        // counts it via `split`, so the `Stream` arm must agree — same bytes,
+        // same count, regardless of payload variant.
+        let shared = Arc::new(SampleState::new(10));
+        let chunks: Vec<Vec<u8>> = vec![b"{\"id\":1}\n{\"i".to_vec(), b"d\":2}".to_vec()];
+        let payload =
+            faucet_core::NativePayload::Stream(Box::pin(faucet_core::async_stream::try_stream! {
+                for c in chunks { yield c; }
+            }));
+        let tapped = tap_native_payload(
+            payload,
+            faucet_core::NativeFormat::NdJson,
+            None,
+            Arc::clone(&shared),
+        );
+        assert!(
+            matches!(&tapped, faucet_core::NativePayload::Stream(_)),
+            "stream stays a stream"
+        );
+        let collected = drain_payload(tapped).await;
+        assert_eq!(collected, b"{\"id\":1}\n{\"id\":2}");
+        assert_eq!(shared.count(), 2, "trailing line must be counted");
+        assert_eq!(shared.samples().len(), 2, "trailing line must be sampled");
+    }
+
+    #[tokio::test]
+    async fn non_ndjson_tap_passes_through_but_still_counts_declared_records() {
+        // CSV/Parquet payloads carry no per-line structure the tap can parse,
+        // but a declared row count must still feed the volume counters so a
+        // successful native CSV run never shows zero rows in catalog/lineage.
+        let shared = Arc::new(SampleState::new(10));
+        let payload = faucet_core::NativePayload::Bytes(b"h\na,b\nc,d\n".to_vec());
+        let tapped = tap_native_payload(
+            payload,
+            faucet_core::NativeFormat::Csv,
+            Some(2),
+            Arc::clone(&shared),
+        );
+        assert!(
+            matches!(&tapped, faucet_core::NativePayload::Bytes(_)),
+            "bytes stay bytes"
+        );
+        assert_eq!(drain_payload(tapped).await, b"h\na,b\nc,d\n".to_vec());
+        assert_eq!(shared.count(), 2, "declared count feeds the counter");
+        assert!(shared.samples().is_empty(), "no schema sample for CSV");
+    }
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn sink_columnar_forwards_capability_and_samples() {
+        use faucet_core::columnar::values_to_record_batch_inferred;
+        struct ColSink(Arc<std::sync::Mutex<usize>>);
+        #[async_trait]
+        impl Sink for ColSink {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            fn connector_name(&self) -> &'static str {
+                "colsink"
+            }
+            fn supports_columnar(&self) -> bool {
+                true
+            }
+            async fn write_batch_columnar(
+                &self,
+                batch: &arrow::array::RecordBatch,
+            ) -> Result<usize, FaucetError> {
+                *self.0.lock().unwrap() += batch.num_rows();
+                Ok(batch.num_rows())
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let inner: Box<dyn Sink> = Box::new(ColSink(Arc::clone(&seen)));
+        let shared = Arc::new(SampleState::new(2));
+        let s = SamplingSink::new(inner, Arc::clone(&shared));
+        // Capability must forward, not be masked by the wrapper default.
+        assert!(s.supports_columnar());
+        let batch = values_to_record_batch_inferred(&[
+            json!({"id": 1, "name": "a"}),
+            json!({"id": 2, "name": "b"}),
+            json!({"id": 3, "name": "c"}),
+        ])
+        .unwrap();
+        let n = s.write_batch_columnar(&batch).await.unwrap();
+        // Inner sink saw all 3 rows; count is all 3; sample is bounded to 2.
+        assert_eq!(n, 3);
+        assert_eq!(*seen.lock().unwrap(), 3);
+        assert_eq!(shared.count(), 3);
+        let names: Vec<String> = shared
+            .inferred_schema()
+            .fields
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert!(names.contains(&"id".to_string()));
+        assert!(names.contains(&"name".to_string()));
+
+        // The wrapper forwards the plain-write path and the connector name of
+        // the same inner sink the columnar path targets.
+        assert_eq!(s.connector_name(), "colsink");
+        assert_eq!(
+            s.write_batch(&[json!({"id": 4, "name": "d"})])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(shared.count(), 4);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn sample_record_batch_counts_rows_but_skips_conversion_once_full() {
+        use faucet_core::columnar::values_to_record_batch_inferred;
+        let batch = values_to_record_batch_inferred(&[json!({"id": 1}), json!({"id": 2})]).unwrap();
+        // A zero-row batch counts nothing and samples nothing.
+        let state = SampleState::new(5);
+        sample_record_batch(&batch.slice(0, 0), &state);
+        assert_eq!(state.count(), 0);
+        assert!(state.samples().is_empty());
+        // A capped sample converts only the leading row; every row still counts.
+        let state = SampleState::new(1);
+        sample_record_batch(&batch, &state);
+        assert_eq!(state.count(), 2);
+        assert_eq!(state.samples().len(), 1, "sample bounded by cap");
+        // Once full, later batches count for volume but the sample is untouched.
+        sample_record_batch(&batch, &state);
+        assert_eq!(state.count(), 4);
+        assert_eq!(state.samples().len(), 1);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn source_stream_batches_forwards_pages_and_samples() {
+        use faucet_core::Source as _;
+        use faucet_core::columnar::{ColumnarPage, values_to_record_batch_inferred};
+        use futures::StreamExt as _;
+        struct ColSource;
+        #[async_trait]
+        impl faucet_core::Source for ColSource {
+            async fn fetch_with_context(
+                &self,
+                _: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(vec![])
+            }
+            fn connector_name(&self) -> &'static str {
+                "colsource"
+            }
+            fn supports_columnar(&self) -> bool {
+                true
+            }
+            fn stream_batches<'a>(
+                &'a self,
+                _context: &'a std::collections::HashMap<String, Value>,
+                _batch_size: usize,
+            ) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'a>>
+            {
+                Box::pin(faucet_core::async_stream::try_stream! {
+                    let batch = values_to_record_batch_inferred(&[
+                        json!({"id": 1, "name": "a"}),
+                        json!({"id": 2, "name": "b"}),
+                        json!({"id": 3, "name": "c"}),
+                    ])
+                    .unwrap();
+                    yield ColumnarPage::new(batch, Some(json!("bm")));
+                })
+            }
+        }
+        let shared = Arc::new(SampleState::new(2));
+        let s = SamplingSource::new(Box::new(ColSource), Arc::clone(&shared));
+        // Capability must forward, not be masked by the wrapper default.
+        assert!(s.supports_columnar());
+        assert_eq!(s.connector_name(), "colsource");
+        let ctx = std::collections::HashMap::new();
+        assert!(s.fetch_with_context(&ctx).await.unwrap().is_empty());
+        let mut pages = s.stream_batches(&ctx, 1000);
+        let mut rows = 0usize;
+        let mut bookmark = None;
+        while let Some(p) = pages.next().await {
+            let p = p.unwrap();
+            rows += p.batch.num_rows();
+            bookmark = p.bookmark.clone();
+        }
+        // The page flows through unchanged, bookmark included.
+        assert_eq!(rows, 3);
+        assert_eq!(bookmark, Some(json!("bm")));
+        // Tap counted all 3 rows but sampled only the first 2 for the schema.
+        assert_eq!(shared.count(), 3);
+        assert_eq!(shared.samples().len(), 2, "sample bounded by cap");
+        let names: Vec<String> = shared
+            .inferred_schema()
+            .fields
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert!(names.contains(&"id".to_string()));
+        assert!(names.contains(&"name".to_string()));
     }
 }

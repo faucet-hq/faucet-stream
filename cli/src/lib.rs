@@ -23,9 +23,11 @@ pub mod config;
 pub mod conformance;
 pub mod discovery_matrix;
 pub mod dlq_replay;
+pub mod dynamic_fanout;
 pub mod env_config;
 pub mod env_loader;
 pub mod error;
+pub mod exec_metrics;
 pub mod executor;
 pub mod expand;
 pub mod init_template;
@@ -40,6 +42,7 @@ pub mod livemetrics;
 pub mod local_outputs;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod memstat;
 pub mod merge;
 #[cfg(feature = "notify")]
 pub mod notify;

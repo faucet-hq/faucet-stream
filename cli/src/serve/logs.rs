@@ -483,9 +483,18 @@ where
         let mut visitor = EventLineVisitor::default();
         event.record(&mut visitor);
         let meta = event.metadata();
-        let line = format!("{} {}: {}", meta.level(), meta.target(), visitor.finish());
-        let line = crate::secrets::registry::redact(&line).into_owned();
+        // Render the line self-describing: `<ts> <LEVEL> <target>: <msg>`, mirroring
+        // the stderr fmt layer's format. The ephemeral ring / SSE / console only ever
+        // see `line`, so the timestamp must live in the line text itself; the separate
+        // `ts` field is still carried for the structured jsonl persisted-log API.
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let line = format!(
+            "{ts} {} {}: {}",
+            meta.level(),
+            meta.target(),
+            visitor.finish()
+        );
+        let line = crate::secrets::registry::redact(&line).into_owned();
         self.hub.capture(&run_id, meta.level().as_str(), ts, line);
     }
 }
@@ -614,11 +623,18 @@ mod tests {
             tracing::info!("hello from the run");
         });
         let (snapshot, _rx, _ended) = hub.reader("run-xyz").expect("buffer for the run exists");
+        let captured = snapshot
+            .iter()
+            .find(|l| l.line.contains("hello from the run"))
+            .expect("in-span event must be captured");
+        // The rendered line is self-describing: it leads with an RFC3339 timestamp,
+        // then the level and target, mirroring the stderr fmt format.
         assert!(
-            snapshot
-                .iter()
-                .any(|l| l.line.contains("hello from the run")),
-            "in-span event must be captured: {snapshot:?}"
+            captured.line.starts_with(char::is_numeric)
+                && captured.line.contains('T')
+                && captured.line.contains("INFO "),
+            "captured line must lead with a timestamp then level: {:?}",
+            captured.line
         );
         assert!(
             snapshot.iter().all(|l| !l.line.contains("orphan")),

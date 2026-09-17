@@ -153,7 +153,7 @@ async fn list_orders_desc_filters_and_paginates() {
     .unwrap();
     let failed = h
         .list(&ListFilter {
-            status: Some(RunStatus::Failed),
+            status: vec![RunStatus::Failed],
             limit: 50,
             ..Default::default()
         })
@@ -161,6 +161,60 @@ async fn list_orders_desc_filters_and_paginates() {
         .unwrap();
     assert_eq!(failed.runs.len(), 1);
     assert_eq!(failed.runs[0].run_id, "x");
+
+    // Multi-status membership: the comma-wrapped SQL clause must match each
+    // listed status exactly (a/b/c are Completed from `rec`, x is Failed).
+    let multi = h
+        .list(&ListFilter {
+            status: vec![RunStatus::Failed, RunStatus::Completed],
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(multi.runs.len(), 4, "failed + completed");
+    // A status with no matches contributes nothing (exact-token match — no
+    // substring false-positives between names).
+    let none = h
+        .list(&ListFilter {
+            status: vec![RunStatus::Sharded],
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(none.runs.is_empty());
+    // Empty vec = every status.
+    let all = h
+        .list(&ListFilter {
+            status: Vec::new(),
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.runs.len(), 4);
+    // The multi-status filter composes with keyset pagination: filtered pages
+    // stay dense and the cursor stays valid.
+    let p1 = h
+        .list(&ListFilter {
+            status: vec![RunStatus::Failed, RunStatus::Completed],
+            limit: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1.runs.len(), 2);
+    let p2 = h
+        .list(&ListFilter {
+            status: vec![RunStatus::Failed, RunStatus::Completed],
+            limit: 50,
+            cursor: p1.next_cursor.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1.runs.len() + p2.runs.len(), 4, "no gaps across pages");
 }
 
 #[tokio::test]

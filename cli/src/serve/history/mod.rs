@@ -59,6 +59,19 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
         }
     }
+    /// Parse a lowercase status name (inverse of [`as_str`](Self::as_str)).
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "queued" => Self::Queued,
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "sharded" => Self::Sharded,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
 }
 
 /// Serializable mirror of one pipeline invocation's outcome.
@@ -67,6 +80,11 @@ pub struct InvocationRecord {
     pub row_id: String,
     pub parent_record_key: Option<String>,
     pub records_written: usize,
+    /// Wall-clock duration of this invocation, in milliseconds (#645). Lives in
+    /// the JSON `body`, so a defaulted field is backward-compatible with records
+    /// written before it existed.
+    #[serde(default)]
+    pub duration_ms: u64,
     pub error: Option<String>,
 }
 
@@ -76,6 +94,7 @@ impl From<&InvocationOutcome> for InvocationRecord {
             row_id: o.row_id.clone(),
             parent_record_key: o.parent_record_key.clone(),
             records_written: o.records_written,
+            duration_ms: o.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
             error: o.error.clone(),
         }
     }
@@ -214,7 +233,8 @@ pub struct InstanceRecord {
 /// Filter + pagination for `list`. `limit`/`cursor` are resolved by the handler.
 #[derive(Debug, Default, Clone)]
 pub struct ListFilter {
-    pub status: Option<RunStatus>,
+    /// Statuses to include (OR-ed). Empty = every status.
+    pub status: Vec<RunStatus>,
     pub name: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
@@ -1085,6 +1105,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_status_parse_round_trips_every_variant() {
+        // The match forces this list to grow with the enum at compile time —
+        // `parse`'s `_ => None` catch-all would otherwise let a future variant
+        // compile cleanly while silently becoming unfilterable over the API.
+        fn all_variants() -> Vec<RunStatus> {
+            [
+                RunStatus::Queued,
+                RunStatus::Pending,
+                RunStatus::Running,
+                RunStatus::Sharded,
+                RunStatus::Completed,
+                RunStatus::Failed,
+                RunStatus::Cancelled,
+            ]
+            .into_iter()
+            .inspect(|s| match s {
+                RunStatus::Queued
+                | RunStatus::Pending
+                | RunStatus::Running
+                | RunStatus::Sharded
+                | RunStatus::Completed
+                | RunStatus::Failed
+                | RunStatus::Cancelled => {}
+            })
+            .collect()
+        }
+        for s in all_variants() {
+            assert_eq!(RunStatus::parse(s.as_str()), Some(s), "{}", s.as_str());
+        }
+        assert_eq!(RunStatus::parse("faild"), None);
+        assert_eq!(RunStatus::parse(" failed "), Some(RunStatus::Failed));
+    }
+
+    #[test]
     fn terminal_classification() {
         assert!(!RunStatus::Queued.is_terminal());
         assert!(!RunStatus::Pending.is_terminal());
@@ -1092,6 +1146,31 @@ mod tests {
         assert!(RunStatus::Completed.is_terminal());
         assert!(RunStatus::Failed.is_terminal());
         assert!(RunStatus::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn invocation_record_carries_duration_and_is_backward_compatible() {
+        use crate::executor::{InvocationMetrics, InvocationOutcome};
+        let o = InvocationOutcome {
+            row_id: "contact".into(),
+            parent_record_key: None,
+            records_written: 483,
+            error: None,
+            metrics: Some(InvocationMetrics {
+                source_kind: "rest".into(),
+                sink_kind: "bigquery".into(),
+                duration_ms: 1_910_000,
+                ..Default::default()
+            }),
+        };
+        assert_eq!(InvocationRecord::from(&o).duration_ms, 1_910_000);
+        // A record serialized before `duration_ms` existed must still deserialize
+        // (the field lives in the JSON body; `#[serde(default)]` → 0).
+        let old: InvocationRecord = serde_json::from_str(
+            r#"{"row_id":"r","parent_record_key":null,"records_written":1,"error":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.duration_ms, 0);
     }
 
     #[test]

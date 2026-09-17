@@ -1023,6 +1023,7 @@ mod tests {
     fn map_round_trip_with_keys_case() {
         let compiled = compile(&[TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
+            on_collision: Default::default(),
         })]);
         let out = apply_stages(json!({"FooBar": 1}), &compiled).unwrap();
         assert_eq!(out, vec![json!({"foo_bar": 1})]);
@@ -1634,6 +1635,7 @@ mod tests {
         // A page of per-record stages routes identically through both runners.
         let compiled = compile(&[TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
+            on_collision: Default::default(),
         })]);
         let page = vec![json!({"FooBar": 1}), json!({"BazQux": 2})];
         let via_page = apply_stages_to_page(page.clone(), &compiled).unwrap();
@@ -1682,7 +1684,8 @@ mod tests {
         let dbg = format!(
             "{:?}",
             TransformStage::Map(RecordTransform::KeysCase {
-                mode: KeyCaseMode::Snake
+                mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             })
         );
         assert!(dbg.starts_with("Map"), "{dbg}");
@@ -1718,6 +1721,7 @@ mod tests {
         );
         let map = compile(&[TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
+            on_collision: Default::default(),
         })]);
         assert_eq!(format!("{:?}", map[0]), "Map(<compiled>)");
 
@@ -1742,6 +1746,7 @@ mod tests {
         let mut stages: Vec<TransformStage> = vec![
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             }),
             TransformStage::Custom(Arc::new(|v| vec![v])),
             TransformStage::PageFn(Arc::new(Ok)),
@@ -1775,6 +1780,7 @@ mod tests {
         let mut specs: Vec<TransformStage> = vec![
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
             }),
             TransformStage::Custom(Arc::new(|v| vec![v])),
             TransformStage::PageFn(Arc::new(Ok)),
