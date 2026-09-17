@@ -1041,3 +1041,28 @@ ci failed on test coverage. can you please ensure always that we follow atleat 9
 <status>failed</status>
 <summary>Background command "Run CLI instrumented tests, build lcov, compute patch coverage" failed with exit code 1</summary>
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>bltomcriz</task-id>
+<tool-use-id>toolu_01UbNUUwr4VqNVgFpZXgJCXy</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-c-sikawats-Documents-GitHub-Personal-faucet-stream/2e42fef2-d7da-4f6e-97b1-064e451b2570/tasks/bltomcriz.output</output-file>
+<status>killed</status>
+<summary>Background command "Retry CLI coverage run + full patch-coverage computation" was stopped</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a40fdc2012d04cda9</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-c-sikawats-Documents-GitHub-Personal-faucet-stream/2e42fef2-d7da-4f6e-97b1-064e451b2570/tasks/a40fdc2012d04cda9.output</output-file>
+<status>failed</status>
+<summary>Agent "Cover CLI patch gaps" failed: Agent terminated early due to an API error: You've hit your monthly spend limit. /model to switch models.</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+</task-notification>
+
+---
+
+continue
