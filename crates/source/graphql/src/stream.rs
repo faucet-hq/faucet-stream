@@ -390,33 +390,11 @@ impl GraphqlStream {
             && let Some(arr) = errors.as_array()
             && !arr.is_empty()
         {
-            let msg = join_error_messages(arr);
-            // The `batch_size = 0` sentinel omits the page-size variable, so a
-            // schema declaring it non-null rejects the request. Offer the hint
-            // only when that sentinel is actually in play.
-            let page_size_variable = match (&self.config.pagination, self.config.batch_size) {
-                (Some(GraphqlPaginationSpec::Cursor(pag)), 0) => {
-                    Some(pag.page_size_variable.as_str())
-                }
-                _ => None,
-            };
-            let verdict = classify_graphql_errors(arr, page_size_variable);
-            let hint = match (verdict.page_size_hint, page_size_variable) {
-                (true, Some(var)) => format!(
-                    " (hint: batch_size = 0 omits the {var}: argument — set an explicit \
-                     batch_size if the upstream requires a non-null value)"
-                ),
-                _ => String::new(),
-            };
-            let body = format!("GraphQL errors: {msg}{hint}");
-            return Err(match verdict.class {
-                GraphqlErrorClass::Config => FaucetError::Config(body),
-                GraphqlErrorClass::Transport => FaucetError::HttpStatus {
-                    status: 200,
-                    url: self.config.endpoint.clone(),
-                    body,
-                },
-            });
+            return Err(graphql_error_from_payload(
+                arr,
+                sentinel_page_size_variable(&self.config.pagination, self.config.batch_size),
+                &self.config.endpoint,
+            ));
         }
 
         Ok(body)
@@ -696,6 +674,56 @@ fn classify_graphql_errors(
     GraphqlErrorVerdict {
         class,
         page_size_hint,
+    }
+}
+
+/// The page-size variable name whose absence the `batch_size = 0` sentinel
+/// causes, or `None` when the sentinel is not in play.
+///
+/// The sentinel only omits a page size under **cursor** pagination — the one
+/// style that sends one — so any other pagination (or a real `batch_size`)
+/// means a validation error naming that variable has some other cause and must
+/// not be explained away with the sentinel hint. Pure.
+fn sentinel_page_size_variable(
+    pagination: &Option<GraphqlPaginationSpec>,
+    batch_size: usize,
+) -> Option<&str> {
+    match (pagination, batch_size) {
+        (Some(GraphqlPaginationSpec::Cursor(pag)), 0) => Some(pag.page_size_variable.as_str()),
+        _ => None,
+    }
+}
+
+/// Build the error for a `200` response carrying a non-empty GraphQL `errors[]`.
+///
+/// Pure, and deliberately the *whole* decision: which `FaucetError` variant,
+/// what the message says, and whether the `batch_size = 0` hint is appended.
+/// Keeping it out of the async fetch path is what makes every branch reachable
+/// from a unit test (PRINCIPLES §7) — the fetch path is left with one call.
+fn graphql_error_from_payload(
+    errors: &[Value],
+    page_size_variable: Option<&str>,
+    endpoint: &str,
+) -> FaucetError {
+    let msg = join_error_messages(errors);
+    let verdict = classify_graphql_errors(errors, page_size_variable);
+    let hint = match (verdict.page_size_hint, page_size_variable) {
+        (true, Some(var)) => format!(
+            " (hint: batch_size = 0 omits the {var}: argument — set an explicit \
+             batch_size if the upstream requires a non-null value)"
+        ),
+        _ => String::new(),
+    };
+    let body = format!("GraphQL errors: {msg}{hint}");
+    match verdict.class {
+        GraphqlErrorClass::Config => FaucetError::Config(body),
+        // A `200` carrying application errors keeps the transport-shaped
+        // classification the source has always used for it.
+        GraphqlErrorClass::Transport => FaucetError::HttpStatus {
+            status: 200,
+            url: endpoint.to_string(),
+            body,
+        },
     }
 }
 
@@ -1171,6 +1199,119 @@ mod tests {
     fn classify_empty_variable_name_never_hints() {
         let errors = errs(json!([{"message": "anything at all"}]));
         assert!(!classify_graphql_errors(&errors, Some("")).page_size_hint);
+    }
+
+    // ─── The pure error builder behind the fetch path ───────────────────────
+
+    /// Cursor pagination naming `var` as its page-size variable.
+    fn cursor_pagination(var: &str) -> Option<GraphqlPaginationSpec> {
+        Some(GraphqlPaginationSpec::Cursor(GraphqlPagination {
+            page_size_variable: var.into(),
+            ..GraphqlPagination::default()
+        }))
+    }
+
+    #[test]
+    fn sentinel_variable_only_under_cursor_pagination_with_batch_size_zero() {
+        // The sentinel is live: cursor pagination + batch_size 0.
+        assert_eq!(
+            sentinel_page_size_variable(&cursor_pagination("first"), 0),
+            Some("first")
+        );
+        // A real batch_size sends the variable, so an error naming it has some
+        // other cause and must not be explained away.
+        assert_eq!(
+            sentinel_page_size_variable(&cursor_pagination("first"), 50),
+            None
+        );
+        // Offset pagination never sends a page-size variable at all.
+        assert_eq!(
+            sentinel_page_size_variable(
+                &Some(GraphqlPaginationSpec::Offset(offset_pagination(100, true))),
+                0
+            ),
+            None
+        );
+        // No pagination configured.
+        assert_eq!(sentinel_page_size_variable(&None, 0), None);
+    }
+
+    #[test]
+    fn payload_error_is_transport_with_the_endpoint_and_joined_messages() {
+        let errors = errs(json!([{"message": "upstream exploded"}, {"message": "and again"}]));
+        match graphql_error_from_payload(&errors, None, "https://api.example/graphql") {
+            FaucetError::HttpStatus { status, url, body } => {
+                assert_eq!(status, 200, "a GraphQL error arrives on a 200");
+                assert_eq!(url, "https://api.example/graphql");
+                assert_eq!(body, "GraphQL errors: upstream exploded; and again");
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_error_is_config_for_a_typed_request_rejection() {
+        let errors = errs(json!([
+            {"message": "unknown argument", "extensions": {"code": "BAD_USER_INPUT"}}
+        ]));
+        match graphql_error_from_payload(&errors, None, "https://api.example/graphql") {
+            FaucetError::Config(body) => {
+                assert_eq!(body, "GraphQL errors: unknown argument");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_error_appends_the_hint_only_when_the_sentinel_is_live() {
+        let errors = errs(json!([
+            {"message": "Variable \"$first\" of required type \"Int!\" must not be null."}
+        ]));
+        // Sentinel live and the message names the variable — hint appended, and
+        // the variant stays transport (prose never flips it).
+        let with_hint = graphql_error_from_payload(&errors, Some("first"), "https://e/g");
+        let msg = with_hint.to_string();
+        assert!(
+            msg.contains("hint: batch_size = 0 omits the first: argument"),
+            "hint missing: {msg}"
+        );
+        assert!(matches!(with_hint, FaucetError::HttpStatus { .. }));
+
+        // Same errors, sentinel not live — no hint.
+        let without = graphql_error_from_payload(&errors, None, "https://e/g").to_string();
+        assert!(
+            !without.contains("hint:"),
+            "hint must not appear: {without}"
+        );
+    }
+
+    #[test]
+    fn payload_error_composes_a_config_code_with_the_hint() {
+        let errors = errs(json!([
+            {
+                "message": "Variable \"$first\" was not provided.",
+                "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}
+            }
+        ]));
+        match graphql_error_from_payload(&errors, Some("first"), "https://e/g") {
+            FaucetError::Config(body) => {
+                assert!(body.contains("was not provided"), "{body}");
+                assert!(body.contains("hint: batch_size = 0"), "{body}");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_error_survives_errors_with_no_message_field() {
+        // A server that ships only `extensions` leaves the joined message empty;
+        // the error must still be well-formed rather than panicking or losing
+        // the classification.
+        let errors = errs(json!([{"extensions": {"code": "BAD_REQUEST"}}]));
+        match graphql_error_from_payload(&errors, None, "https://e/g") {
+            FaucetError::Config(body) => assert_eq!(body, "GraphQL errors: "),
+            other => panic!("expected Config, got {other:?}"),
+        }
     }
 
     #[test]
