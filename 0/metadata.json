@@ -1,0 +1,337 @@
+{
+  "cli_version": "0.10.2",
+  "checkpoint_id": "01M2QTTZ51NJWX4ENBXG931A7E",
+  "session_id": "55398c64-7c65-40db-9b68-886111a86d7f",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-17T14:03:28.027418Z",
+  "branch": "fix/audit-correctness-paths",
+  "checkpoints_count": 4,
+  "save_step_count": 5,
+  "files_touched": [
+    "cli/Cargo.toml",
+    "cli/src/commands/run.rs",
+    "cli/src/commands/schedule.rs",
+    "cli/src/executor.rs",
+    "cli/src/replication/orchestrator.rs",
+    "cli/src/serve/history/mod.rs",
+    "cli/src/serve/history/postgres.rs",
+    "cli/src/serve/history/sql.rs",
+    "cli/src/serve/history/sqlite.rs",
+    "cli/src/serve/runner.rs",
+    "cli/src/topology.rs",
+    "cli/src/transforms.rs",
+    "crates/common/clickhouse/src/lib.rs",
+    "crates/conformance/src/doubles.rs",
+    "crates/core/src/idempotency.rs",
+    "crates/core/src/lib.rs",
+    "crates/core/src/quality/config.rs",
+    "crates/core/src/stage.rs",
+    "crates/core/src/write_mode.rs",
+    "crates/sink/bigquery/src/idempotent.rs",
+    "crates/sink/kafka/README.md",
+    "crates/sink/kafka/src/config.rs",
+    "crates/sink/kinesis/README.md",
+    "crates/sink/kinesis/src/config.rs",
+    "crates/sink/kinesis/src/sink.rs",
+    "crates/sink/mongodb/src/sink.rs",
+    "crates/sink/mssql/src/sink.rs",
+    "crates/sink/mysql/src/sink.rs",
+    "crates/sink/parquet/src/sink.rs",
+    "crates/sink/postgres/src/sink.rs",
+    "crates/sink/pubsub/README.md",
+    "crates/sink/pubsub/src/config.rs",
+    "crates/sink/sqlite/src/sink.rs",
+    "crates/sink/sqs/README.md",
+    "crates/sink/sqs/src/config.rs",
+    "crates/sink/sqs/src/sink.rs",
+    "crates/source/azure-blob/README.md",
+    "crates/source/azure-blob/src/config.rs",
+    "crates/source/azure-blob/src/stream.rs",
+    "crates/source/clickhouse/src/stream.rs",
+    "crates/source/databricks/README.md",
+    "crates/source/databricks/src/config.rs",
+    "crates/source/gcs/README.md",
+    "crates/source/gcs/src/config.rs",
+    "crates/source/graphql/src/stream.rs",
+    "crates/source/grpc/src/stream.rs",
+    "crates/source/kinesis/src/shard.rs",
+    "crates/source/postgres-cdc/README.md",
+    "crates/source/postgres-cdc/src/replication.rs",
+    "crates/source/postgres-cdc/src/stream.rs",
+    "crates/source/rest/src/decode.rs",
+    "crates/source/s3/README.md",
+    "crates/source/s3/src/config.rs",
+    "crates/source/websocket/src/stream.rs",
+    "crates/source/xml/src/decode.rs",
+    "crates/transform-sql/src/compile.rs",
+    "crates/transform-sql/tests/runtime.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-5[1m]",
+  "turn_id": "eb4c0b34fd08",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 15154,
+    "cache_creation_tokens": 51950322,
+    "cache_read_tokens": 4386917747,
+    "output_tokens": 8805818,
+    "api_call_count": 7612,
+    "subagent_tokens": {
+      "input_tokens": 1534,
+      "cache_creation_tokens": 3686919,
+      "cache_read_tokens": 201107821,
+      "output_tokens": 335974,
+      "api_call_count": 767
+    }
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_017ZfRgSytScg56gq1T9UQPE",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "eb4c0b34fd08",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 7917,
+        "end": 7918,
+        "entry_ids": [
+          "77fc9a79-96ea-4356-a27c-a75ba0299ea3"
+        ],
+        "tool_use_id": "toolu_017ZfRgSytScg56gq1T9UQPE"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017ZfRgSytScg56gq1T9UQPE"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_01MJQ8Y6HmbmGqKCCexDcdHR",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "eb4c0b34fd08",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 21427,
+        "end": 21428,
+        "entry_ids": [
+          "71548694-66ab-42a0-9606-4771e135588e"
+        ],
+        "tool_use_id": "toolu_01MJQ8Y6HmbmGqKCCexDcdHR"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01MJQ8Y6HmbmGqKCCexDcdHR"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_017asfQCcZaMKX3JWdwmjpEh",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "code-review"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "eb4c0b34fd08",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 31762,
+        "end": 31763,
+        "entry_ids": [
+          "f5c37f7a-f2a5-45b4-847f-82e5a1eea868"
+        ],
+        "tool_use_id": "toolu_017asfQCcZaMKX3JWdwmjpEh"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_017asfQCcZaMKX3JWdwmjpEh"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: code-review",
+        "default_collapsed": true
+      }
+    },
+    {
+      "id": "claude-skill-toolu_013Vxbfp1Mk6xDvLzCsLvWns",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "artifact-design"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "eb4c0b34fd08",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 57107,
+        "end": 57108,
+        "entry_ids": [
+          "7b013d9f-a9bf-4b28-b81e-5634986b1e82"
+        ],
+        "tool_use_id": "toolu_013Vxbfp1Mk6xDvLzCsLvWns"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_013Vxbfp1Mk6xDvLzCsLvWns"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: artifact-design",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "session_metrics": {
+    "turn_count": 35
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-09-17T14:03:21.636125Z",
+    "agent_lines": 2037,
+    "agent_removed": 353,
+    "human_added": 661,
+    "human_modified": 344,
+    "human_removed": 0,
+    "total_committed": 2914,
+    "total_lines_changed": 3448,
+    "agent_percentage": 69.3155452436195,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 1,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claire/worktrees/serve-http-control-plane/cli/src/serve/auth.rs": 1
+      }
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 39,
+      "user_lines_removed": 29,
+      "agent_lines_added": 2795,
+      "agent_lines_removed": 479,
+      "user_added_per_file": {
+        ".claire/worktrees/serve-http-control-plane/cli/src/serve/auth.rs": 1,
+        "cli/src/commands/schedule.rs": 4,
+        "cli/src/serve/history/mod.rs": 5,
+        "cli/src/serve/history/postgres.rs": 3,
+        "cli/src/serve/history/sql.rs": 3,
+        "cli/src/serve/history/sqlite.rs": 3,
+        "cli/src/transforms.rs": 4,
+        "crates/core/src/verify.rs": 3,
+        "crates/sink/kinesis/README.md": 1,
+        "crates/sink/pubsub/README.md": 9,
+        "crates/sink/sqs/README.md": 1,
+        "crates/source/azure-blob/src/config.rs": 1,
+        "crates/source/databricks/README.md": 1
+      },
+      "user_removed_per_file": {
+        "cli/src/commands/schedule.rs": 3,
+        "cli/src/serve/history/mod.rs": 2,
+        "cli/src/serve/history/postgres.rs": 6,
+        "cli/src/serve/history/sql.rs": 1,
+        "cli/src/serve/history/sqlite.rs": 6,
+        "cli/src/transforms.rs": 1,
+        "crates/core/src/verify.rs": 4,
+        "crates/sink/kinesis/README.md": 1,
+        "crates/sink/pubsub/README.md": 1,
+        "crates/sink/sqs/README.md": 1,
+        "crates/source/azure-blob/src/config.rs": 2,
+        "crates/source/databricks/README.md": 1
+      }
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 1,
+      "user_lines_removed": 0,
+      "agent_lines_added": 2816,
+      "agent_lines_removed": 489,
+      "user_added_per_file": {
+        ".claire/worktrees/serve-http-control-plane/cli/src/serve/auth.rs": 1
+      }
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 584,
+      "user_lines_removed": 177,
+      "agent_lines_added": 2809,
+      "agent_lines_removed": 531,
+      "user_added_per_file": {
+        ".claire/worktrees/serve-http-control-plane/cli/src/serve/auth.rs": 1,
+        "cli/src/serve/history/sql.rs": 51,
+        "cli/src/serve/history/sqlite.rs": 37,
+        "crates/common/delta/src/connection.rs": 38,
+        "crates/core/src/pipeline.rs": 5,
+        "crates/sink/http/src/sink.rs": 17,
+        "crates/sink/kafka/src/config.rs": 17,
+        "crates/sink/mssql/src/sink.rs": 55,
+        "crates/source/azure-blob/Cargo.toml": 10,
+        "crates/source/azure-blob/src/config.rs": 34,
+        "crates/source/azure-blob/src/stream.rs": 3,
+        "crates/source/gcs/Cargo.toml": 10,
+        "crates/source/gcs/src/config.rs": 38,
+        "crates/source/postgres-cdc/src/replication.rs": 102,
+        "crates/source/s3/Cargo.toml": 10,
+        "crates/source/s3/src/config.rs": 38,
+        "crates/source/websocket/README.md": 4,
+        "crates/source/websocket/src/config.rs": 5,
+        "schemas/faucet.schema.json": 109
+      },
+      "user_removed_per_file": {
+        "cli/src/serve/history/sql.rs": 17,
+        "crates/sink/bigquery/src/idempotent.rs": 1,
+        "crates/sink/http/src/sink.rs": 30,
+        "crates/sink/kafka/src/config.rs": 6,
+        "crates/sink/mssql/src/sink.rs": 6,
+        "crates/source/azure-blob/src/config.rs": 23,
+        "crates/source/azure-blob/src/stream.rs": 3,
+        "crates/source/gcs/src/config.rs": 20,
+        "crates/source/postgres-cdc/src/replication.rs": 28,
+        "crates/source/s3/src/config.rs": 20,
+        "crates/source/websocket/README.md": 4,
+        "crates/source/websocket/src/config.rs": 1,
+        "schemas/faucet.schema.json": 18
+      }
+    }
+  ]
+}
