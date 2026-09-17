@@ -502,6 +502,10 @@ impl Sink for ScriptedSink {
 pub struct PagedSource {
     pages: usize,
     per_page: usize,
+    /// Emit this many pages, then fail the stream — models a connection lost
+    /// mid-read, which is the failure the resilience policy and the bookmark
+    /// invariant have to survive together.
+    fail_after: Option<usize>,
     /// Pages already covered by a durable bookmark; the run starts after this.
     start_after: Arc<Mutex<Option<usize>>>,
     /// Pages the source actually emitted, for asserting resume behaviour.
@@ -514,9 +518,19 @@ impl PagedSource {
         Self {
             pages,
             per_page,
+            fail_after: None,
             start_after: Arc::new(Mutex::new(None)),
             emitted: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Fail the stream after emitting `pages` pages — a read-side failure
+    /// (dropped connection, expired cursor, revoked token) rather than a
+    /// write-side one. The pages already emitted were genuinely read, so the
+    /// engine must keep whatever of them the sink confirmed.
+    pub fn failing_after(mut self, pages: usize) -> Self {
+        self.fail_after = Some(pages);
+        self
     }
 
     /// Page indices this source emitted, in order — so a resume test can show
@@ -572,7 +586,14 @@ impl faucet_core::Source for PagedSource {
             .map(|p| p + 1)
             .unwrap_or(0);
         Box::pin(async_stream::try_stream! {
-            for p in start..self.pages {
+            for (emitted_here, p) in (start..self.pages).enumerate() {
+                if self.fail_after == Some(emitted_here) {
+                    Err(FaucetError::Source(format!(
+                        "scripted source: the read failed after {emitted_here} page(s) \
+                         (connection lost mid-stream)"
+                    )))?;
+                    return;
+                }
                 self.emitted.lock().expect("emitted lock").push(p);
                 let records: Vec<Value> = (0..self.per_page)
                     .map(|i| json!({ "page": p, "n": p * self.per_page + i }))
