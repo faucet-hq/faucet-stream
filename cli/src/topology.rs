@@ -743,9 +743,34 @@ pub async fn run_topology(
         .await;
     }
 
-    let mut invocations: Vec<InvocationOutcome> = reported
-        .result
-        .per_sink
+    let failures: Vec<(&str, &str)> = reported
+        .nodes
+        .iter()
+        .filter_map(|n| n.error.as_deref().map(|e| (n.node_id.as_str(), e)))
+        .collect();
+    Ok(build_summary(&reported.result.per_sink, &failures))
+}
+
+/// Flatten a topology run's per-node attribution into the same
+/// [`RunSummary`] shape a matrix run produces, so every caller downstream of
+/// `run`/`schedule`/`serve` sees one summary type.
+///
+/// Takes the two pieces it needs rather than the whole `TopologyRun`, which
+/// keeps it pure *and* constructible from a test — `NodeReport` is
+/// `#[non_exhaustive]`, so no other crate can build one.
+///
+/// One row per **sink** node carrying its record count, sorted by node id so
+/// the output is deterministic, then one row per **failed** node — attributed
+/// to the node that produced the failure rather than a single flat `topology`
+/// row (#459). Pure, so the mapping is unit-testable without standing up a
+/// graph.
+///
+/// `error_kind` is `None` throughout: a topology node reports its failure as an
+/// already-rendered string (`NodeReport::error`), so there is no typed error
+/// left here to classify. That is the gap tracked in #658 — until it closes, a
+/// topology node that trips the circuit breaker gets no scheduler cooldown.
+fn build_summary(per_sink: &HashMap<String, usize>, failures: &[(&str, &str)]) -> RunSummary {
+    let mut invocations: Vec<InvocationOutcome> = per_sink
         .iter()
         .map(|(node_id, records)| InvocationOutcome {
             row_id: node_id.clone(),
@@ -758,23 +783,18 @@ pub async fn run_topology(
         .collect();
     invocations.sort_by(|a, b| a.row_id.cmp(&b.row_id));
 
-    // Failures, attributed to the node that produced them instead of a flat
-    // "topology" row (#459).
-    for n in reported.nodes.iter().filter(|n| n.error.is_some()) {
+    for (node_id, error) in failures {
         invocations.push(InvocationOutcome {
-            row_id: n.node_id.clone(),
+            row_id: (*node_id).to_string(),
             parent_record_key: None,
             records_written: 0,
-            error: n.error.clone(),
-            // A topology node reports its failure as an already-rendered
-            // string (`NodeReport.error`), so there is no typed error left to
-            // classify here.
+            error: Some((*error).to_string()),
             error_kind: None,
             metrics: None,
         });
     }
 
-    Ok(RunSummary { invocations })
+    RunSummary { invocations }
 }
 
 /// Build the lineage context for one sink node: every source that reaches it as
@@ -1086,6 +1106,82 @@ mod tests {
 
     fn cfg(yaml: &str) -> PipelineConfig {
         serde_yaml::from_str(yaml).expect("valid config")
+    }
+
+    // ─── build_summary ──────────────────────────────────────────────────────
+
+    /// Per-sink counts as the executor sees them (a `HashMap`, hence unordered).
+    fn sinks(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn summary_rows_are_one_per_sink_node_sorted_by_id() {
+        // `per_sink` is a HashMap, so without the explicit sort the row order
+        // would vary run to run — and `faucet run --output json` prints it.
+        let summary = build_summary(&sinks(&[("zulu", 3), ("alpha", 7), ("mike", 0)]), &[]);
+        let rows: Vec<(&str, usize)> = summary
+            .invocations
+            .iter()
+            .map(|i| (i.row_id.as_str(), i.records_written))
+            .collect();
+        assert_eq!(rows, vec![("alpha", 7), ("mike", 0), ("zulu", 3)]);
+        assert!(
+            summary.invocations.iter().all(|i| i.error.is_none()),
+            "no node failed, so no row carries an error"
+        );
+    }
+
+    #[test]
+    fn summary_appends_one_row_per_failed_node_attributed_to_that_node() {
+        // #459: a failure is attributed to the node that produced it, not to a
+        // single flat `topology` row.
+        let summary = build_summary(
+            &sinks(&[("sink_a", 5)]),
+            &[("source_x", "connection refused"), ("sink_b", "disk full")],
+        );
+        // The sink-count row comes first, then the failures in node order.
+        assert_eq!(summary.invocations[0].row_id, "sink_a");
+        assert_eq!(summary.invocations[0].records_written, 5);
+
+        let failures: Vec<(&str, &str)> = summary
+            .invocations
+            .iter()
+            .filter_map(|i| i.error.as_deref().map(|e| (i.row_id.as_str(), e)))
+            .collect();
+        assert_eq!(
+            failures,
+            vec![("source_x", "connection refused"), ("sink_b", "disk full")]
+        );
+        assert!(
+            summary
+                .invocations
+                .iter()
+                .filter(|i| i.error.is_some())
+                .all(|i| i.records_written == 0),
+            "a failure row reports no records written"
+        );
+    }
+
+    #[test]
+    fn summary_leaves_error_kind_unclassified() {
+        // #658: `NodeReport.error` is already a rendered string, so there is no
+        // typed error left to classify. `None` means "not classified" and must
+        // never be inferred from the text — pinned so the day #658 lands, this
+        // test is what changes rather than being silently contradicted.
+        let summary = build_summary(
+            &sinks(&[("s", 1)]),
+            &[("s", "Circuit open after 3 consecutive failures")],
+        );
+        assert!(
+            summary.invocations.iter().all(|i| i.error_kind.is_none()),
+            "a message that reads like a breaker trip must not be classified as one"
+        );
+    }
+
+    #[test]
+    fn summary_of_an_empty_run_is_empty() {
+        assert!(build_summary(&HashMap::new(), &[]).invocations.is_empty());
     }
 
     #[cfg(feature = "lineage")]

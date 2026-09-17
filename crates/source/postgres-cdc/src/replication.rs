@@ -733,6 +733,83 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use pgwire_replication::SslMode;
 
+    // ─── SQLSTATE preservation (#654 H8) ────────────────────────────────────
+
+    /// `pg_err` is the whole point of the H8 fix: the SQLSTATE must survive the
+    /// hop into `FaucetError`, because once the error is stringified the code
+    /// cannot be recovered. A non-database `sqlx::Error` has no code, and must
+    /// therefore carry `None` rather than a guess.
+    #[test]
+    fn pg_err_preserves_context_and_message_without_a_sqlstate() {
+        let err = pg_err("postgres-cdc slot lookup", sqlx::Error::PoolTimedOut);
+        let FaucetError::Custom(inner) = &err else {
+            panic!("pg_err must produce FaucetError::Custom, got {err:?}");
+        };
+        let pg = inner
+            .downcast_ref::<PostgresError>()
+            .expect("the boxed error must still be a PostgresError");
+        assert_eq!(pg.context, "postgres-cdc slot lookup");
+        assert_eq!(pg.message, sqlx::Error::PoolTimedOut.to_string());
+        assert_eq!(
+            pg.sqlstate, None,
+            "a pool timeout is not a database-reported failure, so it has no SQLSTATE"
+        );
+        // The rendered form still names both halves, so a log line is useful.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("postgres-cdc slot lookup"),
+            "context must survive into the display form: {rendered}"
+        );
+    }
+
+    /// `sqlstate_of` reads the code back only from a `PostgresError`; every
+    /// other error — including one whose *text* contains a SQLSTATE — yields
+    /// `None`, which is what stops `is_slot_active_error` from ever being
+    /// fooled by prose.
+    #[test]
+    fn sqlstate_of_reads_only_the_typed_carrier() {
+        let carried = PostgresError::new(
+            Some(SQLSTATE_OBJECT_IN_USE.to_string()),
+            "acquire slot",
+            "replication slot \"s\" is active for PID 42",
+        );
+        let err = FaucetError::Custom(Box::new(carried));
+        assert_eq!(sqlstate_of(&err), Some(SQLSTATE_OBJECT_IN_USE));
+        assert!(
+            is_slot_active_error(&err),
+            "the typed 55006 carrier is what slot-active detection keys off"
+        );
+
+        // A PostgresError with no code.
+        let codeless = FaucetError::Custom(Box::new(PostgresError::new(
+            None,
+            "acquire slot",
+            "replication slot is active for PID 42",
+        )));
+        assert_eq!(sqlstate_of(&codeless), None);
+        assert!(!is_slot_active_error(&codeless));
+
+        // Not a PostgresError at all, but the message reads exactly like one.
+        // Before the fix this class of message drove the retry decision.
+        let lookalike = FaucetError::Source(
+            "replication slot \"s\" is active for PID 42 (SQLSTATE 55006)".into(),
+        );
+        assert_eq!(sqlstate_of(&lookalike), None);
+        assert!(
+            !is_slot_active_error(&lookalike),
+            "prose must never be mistaken for a SQLSTATE"
+        );
+
+        // A different real SQLSTATE must not match slot-active.
+        let other_code = FaucetError::Custom(Box::new(PostgresError::new(
+            Some("42P01".to_string()),
+            "acquire slot",
+            "relation does not exist",
+        )));
+        assert_eq!(sqlstate_of(&other_code), Some("42P01"));
+        assert!(!is_slot_active_error(&other_code));
+    }
+
     #[test]
     fn apply_cdc_tls_sets_ssl_mode_on_control_plane_options() {
         // #321 M5: the control-plane PgConnectOptions must carry the configured
