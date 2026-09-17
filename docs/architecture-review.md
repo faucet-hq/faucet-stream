@@ -51,7 +51,7 @@ limitation. Where a risk already has a mitigation planned, the relevant
   OpenLineage emission, a data catalog, and an offline fixture test harness
   (`faucet test`) are all present. Few frameworks at this stage have this breadth.
 - **High enforced test bar.** The `codecov/patch` gate is a *required* merge check
-  at 90% patch coverage, so new code cannot merge under-tested.
+  at 95% patch coverage, so new code cannot merge under-tested.
 
 ---
 
@@ -148,7 +148,7 @@ limitation. Where a risk already has a mitigation planned, the relevant
 
 ## Testing
 
-- **Bar is high and enforced:** 90% required patch coverage, unit + `wiremock` /
+- **Bar is high and enforced:** 95% required patch coverage, unit + `wiremock` /
   `testcontainers` integration tests, an offline fixture harness, and property
   tests for resume/checkpoint. The main caveat is that Docker-dependent
   integration tests do not count toward patch coverage, so changed lines must be
