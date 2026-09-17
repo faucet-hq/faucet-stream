@@ -343,20 +343,16 @@ impl MssqlSink {
         cols: &[String],
         rows: &[Vec<BoundParam>],
     ) -> Result<usize, ChunkError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let cols_quoted = quote_columns(cols)?;
         // Anything that is not a typed server rejection is infrastructure:
         // propagate it, never blame a row for it, never blindly re-run it.
         let infra = |err: FaucetError| ChunkError {
             class: ChunkFailure::Infrastructure,
             err,
         };
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let cols_quoted: Vec<String> = cols
-            .iter()
-            .map(|c| quote_ident_mssql(c))
-            .collect::<Result<_, _>>()
-            .map_err(infra)?;
         let per_insert = max_rows_per_insert(cols_quoted.len());
 
         // Wrap the chunk in a transaction when configured, OR whenever it spans
@@ -862,8 +858,23 @@ pub(crate) fn classify_chunk_failure(e: &tiberius::error::Error) -> ChunkFailure
     }
 }
 
+/// Quote a chunk's column identifiers. Pure, so the failure path is unit-testable
+/// without a server: a rejected identifier is **infrastructure**, not a row
+/// rejection — it is a config/schema problem that every row in the chunk shares,
+/// so blaming one row (and DLQ-ing it) would be wrong.
+pub(crate) fn quote_columns(cols: &[String]) -> Result<Vec<String>, ChunkError> {
+    cols.iter()
+        .map(|c| quote_ident_mssql(c))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ChunkError {
+            class: ChunkFailure::Infrastructure,
+            err,
+        })
+}
+
 /// A chunk-insert failure carrying its typed classification alongside the
 /// user-facing error, so callers never re-parse the message.
+#[derive(Debug)]
 pub(crate) struct ChunkError {
     pub(crate) class: ChunkFailure,
     pub(crate) err: FaucetError,
@@ -1603,5 +1614,19 @@ mod tests {
             ChunkFailure::RowRejected,
             "message text must not influence the verdict"
         );
+    }
+
+    #[test]
+    fn quote_columns_rejects_a_bad_identifier_as_infrastructure() {
+        use super::{ChunkFailure, quote_columns};
+        // Normal columns quote through.
+        let ok = quote_columns(&["id".to_string(), "order date".to_string()]).unwrap();
+        assert_eq!(ok, vec!["[id]".to_string(), "[order date]".to_string()]);
+        // A rejected identifier is a schema/config problem shared by every row
+        // in the chunk, so it must NOT be classified as a row rejection (which
+        // would DLQ one arbitrary row and keep going).
+        let err = quote_columns(&["ok".to_string(), "bad\0name".to_string()])
+            .expect_err("NUL is not a legal identifier");
+        assert_eq!(err.class, ChunkFailure::Infrastructure);
     }
 }
