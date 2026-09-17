@@ -1367,3 +1367,13 @@ If this event is something the user would act on now, send a PushNotification. R
 <status>completed</status>
 <summary>Background command "Instrument the source crates" completed (exit code 0)</summary>
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>bbvw30cgz</task-id>
+<tool-use-id>toolu_01EttBinJb82UnnJVtR9bkK1</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-c-sikawats-Documents-GitHub-Personal-faucet-stream/a428815f-08da-4c4b-ac62-ba4eea090877/tasks/bbvw30cgz.output</output-file>
+<status>completed</status>
+<summary>Background command "Instrument the core+sink crates" completed (exit code 0)</summary>
+</task-notification>
