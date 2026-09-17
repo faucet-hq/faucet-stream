@@ -146,6 +146,23 @@ pub struct ExecuteOptions {
 /// a hung sink can't wedge the whole run.
 const STOP_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
+/// Typed classification of an invocation failure, carried alongside the
+/// rendered [`InvocationOutcome::error`] so a consumer can react to a *kind* of
+/// failure without matching its prose (PRINCIPLES §6). Grows by addition as
+/// consumers need to distinguish more kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvocationErrorKind {
+    /// [`FaucetError::CircuitOpen`] — the resilience circuit breaker tripped.
+    /// `faucet schedule` delays its next tick by the policy cooldown rather
+    /// than re-firing immediately at a destination that just tripped.
+    CircuitOpen,
+    /// Any other failure. No consumer needs to distinguish these yet, and it
+    /// stays separate from `None` (= this outcome was never classified, e.g. a
+    /// synthetic placeholder outcome) so the two are never confused.
+    Other,
+}
+
 /// One pipeline invocation's outcome.
 #[derive(Debug)]
 pub struct InvocationOutcome {
@@ -155,11 +172,30 @@ pub struct InvocationOutcome {
     pub parent_record_key: Option<String>,
     pub records_written: usize,
     pub error: Option<String>,
+    /// Typed kind of `error`, set wherever the failure is still a typed
+    /// `CliError`. `None` means "not classified" — either a success or a
+    /// synthetic outcome built from an already-flattened message — so a
+    /// consumer must never infer a kind from the `error` string.
+    pub error_kind: Option<InvocationErrorKind>,
     /// Machine-readable per-invocation stats for `faucet run --output json`
     /// (#390). `None` for synthetic outcomes (a task panic, or the placeholder
     /// outcomes the replication / schedule orchestrators build) where no
     /// pipeline actually ran.
     pub metrics: Option<InvocationMetrics>,
+}
+
+/// Classify a failed invocation's typed error (#654 M2).
+///
+/// Pure: the one place a `CliError` becomes an [`InvocationErrorKind`], so the
+/// scheduler's circuit-breaker cooldown keys off a variant instead of the
+/// `CircuitOpen` display text — which a reworded `#[error(...)]` would silently
+/// break, leaving the next cron tick to re-fire at a destination that just
+/// tripped its own breaker.
+pub fn classify_error(err: &CliError) -> InvocationErrorKind {
+    match err {
+        CliError::Faucet(FaucetError::CircuitOpen { .. }) => InvocationErrorKind::CircuitOpen,
+        _ => InvocationErrorKind::Other,
+    }
 }
 
 /// Per-invocation stats surfaced by `faucet run --output json` (#390). Every
@@ -696,6 +732,8 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         parent_record_key,
                         records_written: 0,
                         error: Some(format!("pipeline invocation task panicked: {e}")),
+                        // A panicked task never produced a typed error.
+                        error_kind: None,
                         metrics: None,
                     }
                 }
@@ -1072,6 +1110,7 @@ async fn run_unit(
                 parent_record_key,
                 records_written: stats.records_written,
                 error: None,
+                error_kind: None,
                 metrics: Some(InvocationMetrics {
                     records_read: stats.records_read,
                     dlq_count: stats.dlq_count,
@@ -1085,6 +1124,7 @@ async fn run_unit(
             parent_record_key,
             records_written: 0,
             error: Some(e.to_string()),
+            error_kind: Some(classify_error(&e)),
             metrics: Some(base_metrics()),
         },
     }
@@ -1171,6 +1211,7 @@ async fn run_discovery(
                 parent_record_key: None,
                 records_written: 0,
                 error: None,
+                error_kind: None,
                 metrics: Some(metrics(n)),
             }
         }
@@ -1179,6 +1220,7 @@ async fn run_discovery(
             parent_record_key: None,
             records_written: 0,
             error: Some(e.to_string()),
+            error_kind: Some(classify_error(&e)),
             metrics: Some(metrics(0)),
         },
     }
@@ -2717,6 +2759,31 @@ mod tests {
     use crate::config::{ConnectorSpec, PipelineConfig, PipelineSpec};
     use crate::expand::expand;
     use serde_json::json;
+
+    #[test]
+    fn classify_error_picks_out_a_circuit_open_trip() {
+        assert_eq!(
+            classify_error(&CliError::Faucet(FaucetError::CircuitOpen {
+                failures: 3,
+                cooldown: Duration::from_secs(60),
+            })),
+            InvocationErrorKind::CircuitOpen
+        );
+        // Every other failure — including a *message* that reads like a breaker
+        // trip — is `Other`: the classification is the variant, not the prose
+        // (#654 M2).
+        for err in [
+            CliError::Faucet(FaucetError::Sink("Circuit open after 3 failures".into())),
+            CliError::Internal("Circuit open after 3 failures".into()),
+            CliError::Faucet(FaucetError::Source("connection refused".into())),
+        ] {
+            assert_eq!(
+                classify_error(&err),
+                InvocationErrorKind::Other,
+                "must not be CircuitOpen: {err}"
+            );
+        }
+    }
 
     /// A source advertising both fast paths, so the per-row state-key wrapper
     /// can be checked for forwarding rather than masking them.

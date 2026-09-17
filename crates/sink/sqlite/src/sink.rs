@@ -299,7 +299,11 @@ impl SqliteSink {
 
     /// The staging table name used while an overwrite run is in flight.
     fn staging_table(&self) -> String {
-        format!("{}__faucet_ovw", self.config.table_name)
+        format!(
+            "{}{}",
+            self.config.table_name,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        )
     }
 
     /// The table the data-write path targets. For `write_mode: overwrite` every

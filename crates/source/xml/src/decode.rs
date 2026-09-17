@@ -341,6 +341,36 @@ fn records_from_value(v: Value, records_path: Option<&str>) -> Vec<Value> {
     }
 }
 
+/// One open element in the compact XML decoder: its object and its accumulated
+/// text. The stack is seeded with a synthetic document-root frame.
+type XmlFrame = (Map<String, Value>, String);
+
+/// Unbalanced-input error for the compact XML decoder.
+///
+/// The frame stack is seeded with one synthetic document-root frame, so
+/// *balanced* input never empties it — but an unbalanced extra `</x>` pops the
+/// root, and the frame access that follows used to `.expect()`, i.e. panic on
+/// untrusted network input inside a live pipeline. `quick_xml`'s
+/// `check_end_names` happens to reject the mismatch first, but that is a
+/// dependency default, not an invariant this code owns (#654 L25) — so the
+/// shortfall is reported as a typed error, matching `convert::xml_to_json`.
+fn unbalanced_xml(detail: &str) -> FaucetError {
+    FaucetError::Source(format!(
+        "decode `parse` xml: malformed XML: {detail}; the document has more closing \
+         than opening tags"
+    ))
+}
+
+/// Borrow the innermost open frame, or report unbalanced input.
+fn top_frame<'a>(stack: &'a mut [XmlFrame], detail: &str) -> Result<&'a mut XmlFrame, FaucetError> {
+    stack.last_mut().ok_or_else(|| unbalanced_xml(detail))
+}
+
+/// Pop the innermost open frame, or report unbalanced input.
+fn pop_frame(stack: &mut Vec<XmlFrame>, detail: &str) -> Result<XmlFrame, FaucetError> {
+    stack.pop().ok_or_else(|| unbalanced_xml(detail))
+}
+
 /// Compact XML → JSON: each element becomes an object of its children; repeated
 /// child tags become arrays; attributes are `@name`; text is `#text` (or the
 /// value directly when an element has only text).
@@ -407,25 +437,26 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
             Event::Empty(e) => {
                 let name = local(e.name().as_ref());
                 let val = finish(attrs(&e), String::new());
-                let top = stack.last_mut().expect("root frame present");
+                let top = top_frame(&mut stack, "element after the document root closed")?;
                 insert_child(&mut top.0, name, val);
             }
             Event::End(e) => {
-                let (obj, text) = stack.pop().expect("matched start frame");
                 let name = local(e.name().as_ref());
+                let detail = format!("unexpected end tag `</{name}>`");
+                let (obj, text) = pop_frame(&mut stack, &detail)?;
                 let val = finish(obj, text);
-                let top = stack.last_mut().expect("root frame present");
+                let top = top_frame(&mut stack, &detail)?;
                 insert_child(&mut top.0, name, val);
             }
             Event::Text(t) => {
                 if let Ok(s) = t.unescape() {
-                    stack.last_mut().expect("root frame present").1.push_str(&s);
+                    top_frame(&mut stack, "text after the document root closed")?
+                        .1
+                        .push_str(&s);
                 }
             }
             Event::CData(t) => {
-                stack
-                    .last_mut()
-                    .expect("root frame present")
+                top_frame(&mut stack, "CDATA after the document root closed")?
                     .1
                     .push_str(&String::from_utf8_lossy(&t));
             }
@@ -661,5 +692,82 @@ mod tests {
         assert!(matches!(steps[2], DecodeStep::Extract { .. }));
         assert!(matches!(steps[3], DecodeStep::Unzip { .. }));
         assert!(matches!(steps[4], DecodeStep::Parse { .. }));
+    }
+
+    // ─── Unbalanced-XML frame guards (#654 L25) ─────────────────────────────
+
+    /// An unbalanced extra `</x>` drains the synthetic root frame. That must be
+    /// a typed error, never a panic — a panic here would take down a live
+    /// pipeline on attacker-controlled input.
+    #[test]
+    fn top_frame_on_empty_stack_is_a_typed_error() {
+        let mut empty: Vec<XmlFrame> = Vec::new();
+        let err = top_frame(&mut empty, "text after the document root closed")
+            .expect_err("an empty frame stack must error, not panic");
+        let FaucetError::Source(msg) = err else {
+            panic!("unbalanced XML must be FaucetError::Source, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            "decode `parse` xml: malformed XML: text after the document root closed; \
+             the document has more closing than opening tags"
+        );
+    }
+
+    #[test]
+    fn pop_frame_on_empty_stack_is_a_typed_error() {
+        let mut empty: Vec<XmlFrame> = Vec::new();
+        let err = pop_frame(&mut empty, "unexpected end tag `</a>`")
+            .expect_err("an empty frame stack must error, not panic");
+        let FaucetError::Source(msg) = err else {
+            panic!("unbalanced XML must be FaucetError::Source, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            "decode `parse` xml: malformed XML: unexpected end tag `</a>`; \
+             the document has more closing than opening tags"
+        );
+    }
+
+    #[test]
+    fn frame_helpers_return_the_innermost_frame_when_present() {
+        let mut stack: Vec<XmlFrame> =
+            vec![(Map::new(), "root".into()), (Map::new(), "inner".into())];
+        assert_eq!(
+            top_frame(&mut stack, "unused").expect("frame present").1,
+            "inner"
+        );
+        assert_eq!(
+            pop_frame(&mut stack, "unused").expect("frame present").1,
+            "inner"
+        );
+        assert_eq!(
+            top_frame(&mut stack, "unused").expect("frame present").1,
+            "root",
+            "popping must expose the enclosing frame"
+        );
+    }
+
+    #[test]
+    fn xml_to_json_rejects_unbalanced_end_tag_without_panicking() {
+        // `quick_xml`'s `check_end_names` currently rejects this before the
+        // frame stack can underflow; either way the contract is the same — a
+        // typed `Source` error naming the malformed document, no panic.
+        let err =
+            xml_to_json(b"<a><b>1</b></a></a>").expect_err("an extra closing tag must be rejected");
+        assert!(
+            matches!(err, FaucetError::Source(_)),
+            "malformed XML must surface as FaucetError::Source, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn xml_to_json_keeps_the_balanced_happy_path() {
+        // Byte-parity guard: the typed-error refactor must not shift decoding.
+        let v = xml_to_json(b"<r><a x=\"1\">hi</a><a>there</a></r>").expect("balanced XML decodes");
+        assert_eq!(
+            v,
+            json!({"r": {"a": [{"@x": "1", "#text": "hi"}, "there"]}})
+        );
     }
 }

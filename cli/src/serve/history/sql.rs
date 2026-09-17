@@ -16,7 +16,7 @@
 //! via `INSERT … ON CONFLICT DO NOTHING` plus an optimistic, expiry-guarded
 //! takeover `UPDATE`, mirroring the memory backend's shard-locked semantics.
 
-use super::{HistoryError, RunRecord, RunStatus};
+use super::{HistoryError, RunRecord, RunStatus, Transience};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
@@ -1148,6 +1148,97 @@ pub fn threshold(now: DateTime<Utc>, window: Duration) -> String {
     fmt_ts(now - delta)
 }
 
+/// Wrap a driver error as a [`HistoryError`], classifying its transience here —
+/// the one place the typed `sqlx::Error` is still intact. Every statement in
+/// the macro below maps through this, so no caller has to grep the rendered
+/// message to decide whether retrying is worthwhile (PRINCIPLES §6, #654 M1).
+pub fn classify_backend_error(e: sqlx::Error) -> HistoryError {
+    HistoryError::BackendClassified {
+        message: e.to_string(),
+        transience: transience_of(&e),
+    }
+}
+
+/// [`classify_backend_error`] with a phase prefix, for the connect / DDL steps
+/// whose message needs to name what was being attempted.
+pub fn classify_backend_error_with_context(context: &str, e: sqlx::Error) -> HistoryError {
+    HistoryError::BackendClassified {
+        message: format!("{context}: {e}"),
+        transience: transience_of(&e),
+    }
+}
+
+/// Transience of a driver error, from its variant (and, for a database-reported
+/// failure, its code — see [`transience_of_code`]).
+pub fn transience_of(e: &sqlx::Error) -> Transience {
+    use sqlx::Error as E;
+    match e {
+        // The database answered, so connectivity is fine: the verdict is
+        // entirely in the code it returned.
+        E::Database(db) => transience_of_code(db.code().as_deref()),
+        // No connection was available in time, or the link dropped mid-call.
+        E::PoolTimedOut | E::Io(_) => Transience::Transient,
+        // Deterministic request-side failures: the same call fails the same way
+        // forever, so retrying only delays the report.
+        E::Configuration(_)
+        | E::InvalidArgument(_)
+        | E::Protocol(_)
+        | E::RowNotFound
+        | E::TypeNotFound { .. }
+        | E::ColumnIndexOutOfBounds { .. }
+        | E::ColumnNotFound(_)
+        | E::ColumnDecode { .. }
+        | E::Encode(_)
+        | E::Decode(_) => Transience::Permanent,
+        // `sqlx::Error` is `#[non_exhaustive]` and grows; an unrecognised
+        // variant is left `Unknown` rather than guessed at, so a driver upgrade
+        // can never silently turn a recoverable failure into a fatal one.
+        _ => Transience::Unknown,
+    }
+}
+
+/// Length of a SQLSTATE, which the standard fixes at exactly five characters.
+/// It is what separates the two dialects' code spaces here: a SQLite extended
+/// result code is at most four digits (`primary | offset << 8`, and the largest
+/// real offset keeps it under 10_000), while plenty of SQLSTATEs are all-digit
+/// (`53300`), so *numeric-ness* alone cannot tell them apart.
+const SQLSTATE_LEN: usize = 5;
+
+/// Pure code → transience mapping, covering both dialects.
+pub fn transience_of_code(code: Option<&str>) -> Transience {
+    let Some(code) = code else {
+        return Transience::Unknown;
+    };
+    if code.len() == SQLSTATE_LEN {
+        return match code {
+            // 57P03 cannot_connect_now: the server is still starting up.
+            // 53300 too_many_connections: transient saturation.
+            // 40001 / 40P01: serialization failure / deadlock — the canonical
+            // "retry the transaction" codes.
+            "57P03" | "53300" | "40001" | "40P01" => Transience::Transient,
+            // Class 08 — connection exception (08000/08001/08003/08004/08006…).
+            _ if code.starts_with("08") => Transience::Transient,
+            // The database answered with a deterministic condition (syntax,
+            // constraint, undefined object): retrying changes nothing.
+            _ => Transience::Permanent,
+        };
+    }
+    if let Ok(numeric) = code.parse::<i32>() {
+        // SQLite's extended code packs the primary code in its low byte
+        // (`SQLITE_BUSY_SNAPSHOT` = 517 = 5 | 2<<8), so mask before comparing;
+        // matching the text `database is locked` misses every extended form.
+        // SQLITE_BUSY (5) / SQLITE_LOCKED (6): another connection (or another
+        // serve instance) holds the write lock — the startup WAL/DDL race, and
+        // exactly what the busy timeout exists to ride out.
+        return match numeric & 0xFF {
+            5 | 6 => Transience::Transient,
+            _ => Transience::Permanent,
+        };
+    }
+    // Neither shape: a driver we don't know reporting something we can't read.
+    Transience::Unknown
+}
+
 pub fn encode_body(rec: &RunRecord) -> Result<String, HistoryError> {
     serde_json::to_string(rec).map_err(|e| HistoryError::Backend(format!("encode run record: {e}")))
 }
@@ -1232,12 +1323,11 @@ macro_rules! impl_sql_history {
             ) -> Result<$crate::serve::history::Claim, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
                 use $crate::serve::history::Claim;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
 
                 let now = chrono::Utc::now();
                 let now_s = sql::fmt_ts(now);
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
 
                 for _ in 0..sql::CLAIM_ATTEMPTS {
                     // 1) Atomic first-claim: the winner inserts exactly one row.
@@ -1304,7 +1394,6 @@ macro_rules! impl_sql_history {
                 &self,
                 rec: &$crate::serve::history::RunRecord,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
                 let body = sql::encode_body(rec)?;
                 let submitted = sql::fmt_ts(rec.submitted_at);
@@ -1326,7 +1415,7 @@ macro_rules! impl_sql_history {
                     .bind(&body)
                     .execute(&self.pool)
                     .await
-                    .map_err(|e| HistoryError::Backend(e.to_string()))?;
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
                 Ok(())
             }
 
@@ -1338,19 +1427,18 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
                 let row = sqlx::query(&self.stmts.select_body)
                     .bind(id)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(|e| HistoryError::Backend(e.to_string()))?;
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
                 match row {
                     None => Ok(None),
                     Some(r) => {
                         let body: String = r
                             .try_get("body")
-                            .map_err(|e| HistoryError::Backend(e.to_string()))?;
+                            .map_err($crate::serve::history::sql::classify_backend_error)?;
                         Ok(Some(sql::decode_body(&body)?))
                     }
                 }
@@ -1362,10 +1450,9 @@ macro_rules! impl_sql_history {
             ) -> Result<$crate::serve::history::ListPage, $crate::serve::history::HistoryError>
             {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::ListPage;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
 
                 // Resolve the cursor's submitted_at for keyset pagination. An
                 // unknown cursor is ignored (page starts from the top), matching
@@ -1449,9 +1536,8 @@ macro_rules! impl_sql_history {
             {
                 use sqlx::Row as _;
                 use $crate::serve::history::DeleteOutcome;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let status: Option<String> = sqlx::query(&self.stmts.select_status)
                     .bind(id)
                     .fetch_optional(&self.pool)
@@ -1498,12 +1584,11 @@ macro_rules! impl_sql_history {
                 &self,
                 run_id: &str,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 sqlx::query(&self.stmts.delete_idem_by_run)
                     .bind(run_id)
                     .execute(&self.pool)
                     .await
-                    .map_err(|e| HistoryError::Backend(e.to_string()))?;
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
                 Ok(())
             }
 
@@ -1511,9 +1596,8 @@ macro_rules! impl_sql_history {
                 &self,
                 retain_for: std::time::Duration,
             ) -> Result<usize, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = chrono::Utc::now();
                 let removed = sqlx::query(&self.stmts.purge_runs)
                     .bind(sql::threshold(now, retain_for))
@@ -1549,10 +1633,9 @@ macro_rules! impl_sql_history {
 
             async fn recover_orphans(&self) -> Result<usize, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = chrono::Utc::now();
                 // Only non-terminal runs whose lease has expired (the owning
                 // instance is presumed dead). A live instance heartbeats its
@@ -1584,9 +1667,8 @@ macro_rules! impl_sql_history {
             }
 
             async fn renew_leases(&self) -> Result<usize, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let new_lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
                 let renewed = sqlx::query(&self.stmts.renew_leases)
                     .bind(&new_lease)
@@ -1604,10 +1686,9 @@ macro_rules! impl_sql_history {
             ) -> Result<Vec<$crate::serve::history::RunRecord>, $crate::serve::history::HistoryError>
             {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 if limit == 0 {
                     return Ok(Vec::new());
                 }
@@ -1658,11 +1739,10 @@ macro_rules! impl_sql_history {
             ) -> Result<$crate::serve::history::ReclaimReport, $crate::serve::history::HistoryError>
             {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::ReclaimReport;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = chrono::Utc::now();
                 let now_s = sql::fmt_ts(now);
 
@@ -1733,9 +1813,8 @@ macro_rules! impl_sql_history {
                 &self,
                 rec: &$crate::serve::history::RunRecord,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 // Defensive: a terminal record must carry finished_at, or
                 // purge_runs (which requires finished_at IS NOT NULL) can never
                 // reclaim it. Stamp it if a caller left it unset.
@@ -1768,10 +1847,9 @@ macro_rules! impl_sql_history {
                 error: Option<String>,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 // Read the parent body, apply the terminal status, and write back
                 // conditional on it still being `sharded` — so a concurrent
                 // double-finalize from two instances has exactly one winner and
@@ -1810,10 +1888,9 @@ macro_rules! impl_sql_history {
                 run_id: &str,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 // Read the pending run's body, flip it to Cancelled, and write back
                 // conditional on it still being pending (loses the race to a claim).
                 let Some(row) = sqlx::query(&self.stmts.select_body)
@@ -1848,9 +1925,8 @@ macro_rules! impl_sql_history {
                 &self,
                 run_id: &str,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 sqlx::query(&self.stmts.request_cancel)
                     .bind(sql::fmt_ts(chrono::Utc::now()))
                     .bind(run_id)
@@ -1864,8 +1940,7 @@ macro_rules! impl_sql_history {
                 &self,
             ) -> Result<Vec<String>, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.pending_cancellations)
                     .bind(&self.instance_id)
                     .fetch_all(&self.pool)
@@ -1882,9 +1957,8 @@ macro_rules! impl_sql_history {
                 &self,
                 beat: &$crate::serve::history::InstanceHeartbeat,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = sql::fmt_ts(chrono::Utc::now());
                 sqlx::query(&self.stmts.heartbeat_instance)
                     .bind(&self.instance_id)
@@ -1905,10 +1979,9 @@ macro_rules! impl_sql_history {
             ) -> Result<Vec<$crate::serve::history::InstanceRecord>, $crate::serve::history::HistoryError>
             {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::InstanceRecord;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = chrono::Utc::now();
                 let rows = sqlx::query(&self.stmts.live_instances)
                     .bind(sql::threshold(now, ttl))
@@ -1946,7 +2019,7 @@ macro_rules! impl_sql_history {
                 shards: &[$crate::serve::history::ShardInsert],
             ) -> Result<usize, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::HistoryError;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut inserted = 0usize;
                 for s in shards {
                     let descriptor = serde_json::to_string(&s.descriptor).map_err(|e| {
@@ -1978,7 +2051,7 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::ClaimedShard;
                 use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 if limit == 0 {
                     return Ok(Vec::new());
                 }
@@ -2028,9 +2101,8 @@ macro_rules! impl_sql_history {
             async fn renew_shard_leases(
                 &self,
             ) -> Result<usize, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
                 let n = sqlx::query(&self.stmts.renew_shard_leases)
                     .bind(&lease)
@@ -2048,10 +2120,9 @@ macro_rules! impl_sql_history {
             ) -> Result<$crate::serve::history::ReclaimReport, $crate::serve::history::HistoryError>
             {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::ReclaimReport;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let now_s = sql::fmt_ts(chrono::Utc::now());
 
                 let rows = sqlx::query(&self.stmts.reclaim_shards_select)
@@ -2104,9 +2175,8 @@ macro_rules! impl_sql_history {
                 shard_id: &str,
                 success: bool,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let status = if success { "completed" } else { "failed" };
                 let now_s = sql::fmt_ts(chrono::Utc::now());
                 let n = sqlx::query(&self.stmts.finalize_shard)
@@ -2128,9 +2198,8 @@ macro_rules! impl_sql_history {
             ) -> Result<$crate::serve::history::ShardProgress, $crate::serve::history::HistoryError>
             {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::ShardProgress;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.shard_progress)
                     .bind(run_id)
                     .fetch_all(&self.pool)
@@ -2156,8 +2225,7 @@ macro_rules! impl_sql_history {
                 &self,
             ) -> Result<Vec<String>, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.pending_shard_cancellations)
                     .bind(&self.instance_id)
                     .fetch_all(&self.pool)
@@ -2174,10 +2242,9 @@ macro_rules! impl_sql_history {
                 &self,
             ) -> Result<usize, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::RunStatus;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
 
                 // Candidate `sharded` parents — finalize each whose shards are all
                 // terminal. The status-fenced UPDATE makes a concurrent finalize
@@ -2258,9 +2325,8 @@ macro_rules! impl_sql_history {
                 &self,
                 entry: &$crate::serve::history::AuditEntry,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 sqlx::query(&self.stmts.insert_audit)
                     .bind(&entry.id)
                     .bind(sql::fmt_ts(entry.timestamp))
@@ -2286,9 +2352,8 @@ macro_rules! impl_sql_history {
             > {
                 use sqlx::Row as _;
                 use $crate::serve::history::AuditEntry;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let principal = filter.principal.as_deref();
                 let action = filter.action.as_deref();
                 let since = filter.since.map(sql::fmt_ts);
@@ -2333,12 +2398,11 @@ macro_rules! impl_sql_history {
                 run_id: &str,
                 lines: &[$crate::serve::history::RunLogLine],
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
                 if lines.is_empty() {
                     return Ok(());
                 }
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
                 for l in lines {
                     sqlx::query(&self.stmts.insert_run_log)
@@ -2365,10 +2429,9 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
                 use $crate::serve::history::{RunLogLine, RunLogPage, RUN_LOG_TRUNCATED_SEQ};
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let sentinel = sql::pad_seq(RUN_LOG_TRUNCATED_SEQ);
                 let after = after_seq.map(sql::pad_seq);
                 let limit = limit.max(1) as i64;
@@ -2405,9 +2468,8 @@ macro_rules! impl_sql_history {
                 &self,
                 older_than: std::time::Duration,
             ) -> Result<usize, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let cutoff = sql::threshold(chrono::Utc::now(), older_than);
                 let res = sqlx::query(&self.stmts.purge_run_logs)
                     .bind(cutoff)
@@ -2424,10 +2486,9 @@ macro_rules! impl_sql_history {
                 update: &$crate::serve::history::catalog::CatalogUpdate,
             ) -> Result<(), $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::catalog;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let now_s = sql::fmt_ts(update.recorded_at);
 
                 for obs in update.sources.iter().chain(std::iter::once(&update.sink)) {
@@ -2521,10 +2582,9 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::catalog;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.catalog_select_datasets)
                     .fetch_all(&self.pool)
                     .await
@@ -2545,10 +2605,9 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::catalog;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let Some(row) = sqlx::query(&self.stmts.catalog_select_dataset)
                     .bind(id)
                     .fetch_optional(&self.pool)
@@ -2622,9 +2681,8 @@ macro_rules! impl_sql_history {
                 &self,
                 snapshot: &$crate::serve::history::catalog::ConfigSnapshot,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 sqlx::query(&self.stmts.catalog_upsert_config_snapshot)
                     .bind(&snapshot.pipeline)
                     .bind(sql::fmt_ts(snapshot.recorded_at))
@@ -2644,9 +2702,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let Some(row) = sqlx::query(&self.stmts.catalog_select_config_snapshot)
                     .bind(pipeline)
                     .fetch_optional(&self.pool)
@@ -2667,9 +2724,8 @@ macro_rules! impl_sql_history {
             ) -> Result<(), $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
                 use $crate::local_outputs::LocalOutputRecord;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let id = $crate::local_outputs::ledger::output_id(&obs.path);
 
                 // Read-modify-write so the sticky first-open fields survive a
@@ -2721,9 +2777,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 // Filter + cap pushed into SQL so a never-purged table cannot
                 // grow into an unbounded scan; see `Stmts::local_output_query`.
                 let (sql, binds) = self.stmts.local_output_query(filter);
@@ -2758,9 +2813,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let Some(row) = sqlx::query(&self.stmts.local_output_select)
                     .bind(id)
                     .fetch_optional(&self.pool)
@@ -2779,9 +2833,8 @@ macro_rules! impl_sql_history {
                 at: chrono::DateTime<chrono::Utc>,
                 bytes: u64,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let Some(mut rec) =
                     $crate::serve::history::RunHistory::local_output_get(self, id).await?
                 else {
@@ -2812,7 +2865,7 @@ macro_rules! impl_sql_history {
                 use sqlx::Row as _;
                 use $crate::serve::history::HistoryError;
                 use $crate::serve::history::{sql, templates};
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let id = draft.id.to_string();
 
                 // Read-max-then-insert inside a transaction. Two concurrent
@@ -2921,9 +2974,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let row = match version {
                     Some(v) => sqlx::query(&self.stmts.template_select_version)
                         .bind(id)
@@ -2950,9 +3002,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::{sql, templates};
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.template_select_all)
                     .fetch_all(&self.pool)
                     .await
@@ -2970,8 +3021,7 @@ macro_rules! impl_sql_history {
                 id: &str,
             ) -> Result<Vec<u32>, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.template_versions)
                     .bind(id)
                     .fetch_all(&self.pool)
@@ -2992,8 +3042,7 @@ macro_rules! impl_sql_history {
                 id: &str,
                 version: Option<u32>,
             ) -> Result<usize, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let result = match version {
                     Some(v) => {
                         // Drop channels + launch entries aimed at this version
@@ -3044,9 +3093,8 @@ macro_rules! impl_sql_history {
                 tag: &str,
                 version: u32,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 sqlx::query(&self.stmts.template_upsert_tag)
                     .bind(id)
                     .bind(tag)
@@ -3066,8 +3114,7 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.template_select_tags)
                     .bind(id)
                     .fetch_all(&self.pool)
@@ -3089,8 +3136,7 @@ macro_rules! impl_sql_history {
                 id: &str,
                 tag: &str,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let result = sqlx::query(&self.stmts.template_delete_tag)
                     .bind(id)
                     .bind(tag)
@@ -3109,7 +3155,7 @@ macro_rules! impl_sql_history {
                 use sqlx::Row as _;
                 use $crate::serve::history::HistoryError;
                 use $crate::serve::history::{sql, templates};
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
 
                 // Re-launching what is already stable is a no-op: appending would
                 // make `previous` a duplicate of `stable` and destroy the rollback
@@ -3175,9 +3221,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::{sql, templates};
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.template_select_launches)
                     .bind(id)
                     .fetch_all(&self.pool)
@@ -3209,9 +3254,8 @@ macro_rules! impl_sql_history {
                 id: &str,
                 record: Option<&$crate::serve::history::templates::DeprecationRecord>,
             ) -> Result<(), $crate::serve::history::HistoryError> {
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 match record {
                     Some(r) => {
                         sqlx::query(&self.stmts.template_upsert_deprecation)
@@ -3242,9 +3286,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::{sql, templates};
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let Some(row) = sqlx::query(&self.stmts.template_select_deprecation)
                     .bind(id)
                     .fetch_optional(&self.pool)
@@ -3277,9 +3320,8 @@ macro_rules! impl_sql_history {
                 $crate::serve::history::HistoryError,
             > {
                 use sqlx::Row as _;
-                use $crate::serve::history::HistoryError;
                 use $crate::serve::history::sql;
-                let backend = |e: sqlx::Error| HistoryError::Backend(e.to_string());
+                let backend = $crate::serve::history::sql::classify_backend_error;
                 let rows = sqlx::query(&self.stmts.catalog_select_edges)
                     .fetch_all(&self.pool)
                     .await
@@ -3373,6 +3415,162 @@ mod tests {
         let decoded = decode_body(&encoded).unwrap();
         assert_eq!(decoded.run_id, "r1");
         assert_eq!(decoded.idempotency_key.as_deref(), Some("idem"));
+    }
+
+    /// A minimal [`sqlx::error::DatabaseError`] so the `Database` arm can be
+    /// classified without a live server — the codes are what the drivers really
+    /// report (SQLite: extended result code; Postgres: SQLSTATE).
+    #[derive(Debug)]
+    struct FakeDbError(&'static str);
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "db error {}", self.0)
+        }
+    }
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "db error"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError(code)))
+    }
+
+    #[test]
+    fn sqlite_busy_and_locked_codes_are_transient_including_extended_forms() {
+        // SQLITE_BUSY = 5, SQLITE_LOCKED = 6; the extended forms pack the
+        // primary code in the low byte (SQLITE_BUSY_SNAPSHOT = 517,
+        // SQLITE_LOCKED_SHAREDCACHE = 262), which a text match on
+        // "database is locked" would miss entirely.
+        for code in ["5", "6", "517", "262", "261"] {
+            assert_eq!(
+                transience_of(&db(code)),
+                Transience::Transient,
+                "sqlite code {code}"
+            );
+        }
+        // SQLITE_ERROR (1) / SQLITE_CONSTRAINT (19) / SQLITE_CONSTRAINT_UNIQUE
+        // (2067): deterministic, no retry.
+        for code in ["1", "19", "2067"] {
+            assert_eq!(
+                transience_of(&db(code)),
+                Transience::Permanent,
+                "sqlite code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_sqlstates_split_transient_from_permanent() {
+        for code in [
+            "57P03", "53300", "40001", "40P01", "08006", "08000", "08003",
+        ] {
+            assert_eq!(
+                transience_of(&db(code)),
+                Transience::Transient,
+                "sqlstate {code}"
+            );
+        }
+        // 42601 syntax error, 42P01 undefined table, 23505 unique violation.
+        for code in ["42601", "42P01", "23505"] {
+            assert_eq!(
+                transience_of(&db(code)),
+                Transience::Permanent,
+                "sqlstate {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_database_variants_classify_from_the_variant() {
+        assert_eq!(
+            transience_of(&sqlx::Error::PoolTimedOut),
+            Transience::Transient
+        );
+        assert_eq!(
+            transience_of(&sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset"
+            ))),
+            Transience::Transient
+        );
+        assert_eq!(
+            transience_of(&sqlx::Error::RowNotFound),
+            Transience::Permanent
+        );
+        assert_eq!(
+            transience_of(&sqlx::Error::ColumnNotFound("nope".into())),
+            Transience::Permanent
+        );
+        // A variant we don't map (and every future one) stays Unknown, so a
+        // driver upgrade can't silently make a recoverable failure fatal.
+        assert_eq!(
+            transience_of(&sqlx::Error::WorkerCrashed),
+            Transience::Unknown
+        );
+        // A database error with no code at all is likewise unclassified, as is
+        // one in neither dialect's shape.
+        assert_eq!(transience_of_code(None), Transience::Unknown);
+        assert_eq!(transience_of_code(Some("nonsense")), Transience::Unknown);
+    }
+
+    #[test]
+    fn code_length_separates_the_two_dialects() {
+        // `53300` is an all-digit SQLSTATE: read as a SQLite code its low byte
+        // would be 52 (an unknown code → Permanent), so a numeric-first parse
+        // silently dropped too_many_connections out of the transient set.
+        assert_eq!(transience_of_code(Some("53300")), Transience::Transient);
+        // …while the 3-digit SQLite extended code 517 must not be read as a
+        // (truncated) SQLSTATE.
+        assert_eq!(transience_of_code(Some("517")), Transience::Transient);
+    }
+
+    #[test]
+    fn classify_backend_error_carries_the_verdict_and_keeps_the_message() {
+        let err = classify_backend_error(db("57P03"));
+        assert_eq!(err.transience(), Transience::Transient);
+        assert!(err.is_retriable());
+        assert!(
+            err.to_string().starts_with("run-history backend error:"),
+            "display is unchanged for users: {err}"
+        );
+
+        let err = classify_backend_error(db("42601"));
+        assert_eq!(err.transience(), Transience::Permanent);
+        assert!(
+            !err.is_retriable(),
+            "a syntax error must not be retried at the connect gate"
+        );
+    }
+
+    #[test]
+    fn context_variant_names_the_phase_and_keeps_the_verdict() {
+        let err = classify_backend_error_with_context("creating run-history schema", db("5"));
+        assert_eq!(err.transience(), Transience::Transient);
+        assert!(
+            err.to_string()
+                .contains("creating run-history schema: error returned from database"),
+            "the phase that failed must survive classification: {err}"
+        );
     }
 
     #[test]

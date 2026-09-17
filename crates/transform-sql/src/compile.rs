@@ -181,20 +181,54 @@ pub(crate) fn sql_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Validate the query: parse + bind, tolerating the not-yet-existing `batch`.
+/// Whether a bind failure is about **column resolution** — the one class that
+/// is genuinely unknowable at config-load time.
+///
+/// `batch`'s column schema comes from the first page at run time, so a query
+/// selecting `batch` columns cannot be fully bound yet. Everything else —
+/// syntax, a missing table, an unknown function — is a real defect and must
+/// fail here rather than on page 1 of a production run.
+///
+/// This is the only residual text match in validation, scoped to one DuckDB
+/// error family. It replaced a rule that fail-**opened**: it tolerated any
+/// error whose text merely contained "batch", so a query joining a genuinely
+/// missing `daily_batches` table was accepted (#654 H7).
+fn is_column_resolution_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    // Both DuckDB wordings occur: unqualified ("Referenced column \"x\" not
+    // found") and qualified/aliased ("Table \"b\" does not have a column
+    // named \"x\"").
+    m.contains("referenced column")
+        || m.contains("does not have a column named")
+        || (m.contains("binder error") && m.contains("group by"))
+}
+
+/// Validate the query at config-load time, binding it against a
+/// **placeholder** `batch` relation so table resolution actually happens.
+///
+/// Registering the placeholder is what lets this fail closed: previously no
+/// `batch` existed during validation, so every "relation does not exist"
+/// error had to be tolerated. Now only column resolution against the unknown
+/// page schema is excused — see [`is_column_resolution_error`].
 pub(crate) fn validate_query(conn: &Connection, query: &str) -> Result<(), FaucetError> {
+    // Zero-row placeholder so `FROM batch` resolves. The real run replaces it
+    // (`CREATE OR REPLACE TEMP TABLE batch AS SELECT * FROM arrow(...)`)
+    // before the first page is transformed, so it cannot reach any output.
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TEMP TABLE \"{RESERVED}\" AS \
+         SELECT NULL AS __faucet_placeholder WHERE 1=0;"
+    ))
+    .map_err(|e| {
+        FaucetError::Config(format!(
+            "sql transform: could not register the `{RESERVED}` validation placeholder: {e}"
+        ))
+    })?;
+
     match conn.prepare(query) {
         Ok(_) => Ok(()),
         Err(e) => {
             let msg = e.to_string();
-            let lower = msg.to_lowercase();
-            // Tolerate binder errors that are only about the missing `batch`.
-            let about_batch = lower.contains("batch")
-                && (lower.contains("does not exist")
-                    || lower.contains("not found")
-                    || lower.contains("referenced")
-                    || lower.contains("no such table"));
-            if about_batch {
+            if is_column_resolution_error(&msg) {
                 Ok(())
             } else {
                 Err(FaucetError::Transform(format!(

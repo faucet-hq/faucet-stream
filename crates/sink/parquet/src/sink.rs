@@ -707,16 +707,33 @@ fn warn_on_unknown_fields(
     }
 }
 
-/// Map a decoder error to `FaucetError::Sink`. When the message looks like
-/// arrow-json's type-conflict report, we re-shape it to name both sides
-/// of the drift so the user can diagnose it without reading arrow internals.
+/// Whether this decoder error can be a JSON-value ↔ Arrow-schema type
+/// conflict. Classified from the error's *variant*, never its rendered text: a
+/// substring probe like `msg.contains("type")` matches nearly every arrow
+/// message, so an unrelated I/O or memory failure used to be reported as type
+/// drift (#654 L28).
+fn is_type_conflict(err: &arrow::error::ArrowError) -> bool {
+    use arrow::error::ArrowError as E;
+    matches!(
+        err,
+        // `JsonError` is what the arrow-json decoder raises for a value that
+        // does not fit the locked field type ("whilst decoding field 'a':
+        // expected string got 1"); the other three cover the same conflict
+        // reported by the schema/cast/parse layers underneath it.
+        E::JsonError(_) | E::SchemaError(_) | E::CastError(_) | E::ParseError(_)
+    )
+}
+
+/// Map a decoder error to `FaucetError::Sink`. For a type-conflict variant we
+/// re-shape it to name both sides of the drift so the user can diagnose it
+/// without reading arrow internals; anything else keeps the raw message.
 fn classify_decoder_error(
     schema: &SchemaRef,
     records: &[Value],
     err: arrow::error::ArrowError,
 ) -> FaucetError {
     let msg = err.to_string();
-    if (msg.contains("whilst decoding field") || msg.contains("type"))
+    if is_type_conflict(&err)
         && let Some(field) = guess_drifting_field(schema, records)
     {
         let schema_type = schema
@@ -1382,5 +1399,96 @@ mod tests {
             outs[0].pre_existing,
             "faucet overwrote a file it did not create — never collectable"
         );
+    }
+
+    /// One `id: Int64` column — the locked file schema the drifting batch below
+    /// contradicts.
+    fn int_schema() -> SchemaRef {
+        use arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]))
+    }
+
+    #[test]
+    fn classify_decoder_error_reshapes_a_type_conflict_variant() {
+        use arrow::error::ArrowError;
+        let records = vec![json!({"id": "not-an-int"})];
+        let err = classify_decoder_error(
+            &int_schema(),
+            &records,
+            // The arrow-json decoder's real shape for a value that does not fit
+            // the locked field type.
+            ArrowError::JsonError("whilst decoding field 'id': expected i64 got string".into()),
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parquet type drift for field 'id'")
+                && msg.contains("schema declares Int64")
+                && msg.contains("batch contains string"),
+            "both sides of the drift must be named: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_decoder_error_leaves_a_non_type_variant_alone() {
+        use arrow::error::ArrowError;
+        // Same drifting batch, so the field-guessing half would happily find a
+        // mismatch — only the typed variant keeps an unrelated allocation
+        // failure from being reported as type drift (#654 L28).
+        let records = vec![json!({"id": "not-an-int"})];
+        let err = classify_decoder_error(
+            &int_schema(),
+            &records,
+            ArrowError::MemoryError("allocation of 8 bytes failed".into()),
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parquet encode failed") && msg.contains("allocation of 8 bytes failed"),
+            "a non-type failure must keep its raw message: {msg}"
+        );
+        assert!(
+            !msg.contains("type drift"),
+            "an unrelated failure must not be reported as type drift: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_decoder_error_falls_back_when_no_field_drifts() {
+        use arrow::error::ArrowError;
+        // A type-conflict variant whose batch contains nothing contradicting the
+        // schema (e.g. the conflict is inside a nested value we don't inspect):
+        // there is no field to name, so the raw message is preserved.
+        let records = vec![json!({"id": 7})];
+        let err = classify_decoder_error(
+            &int_schema(),
+            &records,
+            ArrowError::JsonError("offset overflow decoding ListArray".into()),
+        );
+        assert_eq!(
+            err.to_string(),
+            "Sink error: parquet encode failed: Json error: offset overflow decoding ListArray"
+        );
+    }
+
+    #[test]
+    fn is_type_conflict_covers_the_decoder_variants_only() {
+        use arrow::error::ArrowError as E;
+        for err in [
+            E::JsonError("x".into()),
+            E::SchemaError("x".into()),
+            E::CastError("x".into()),
+            E::ParseError("x".into()),
+        ] {
+            assert!(is_type_conflict(&err), "{err} must classify as a conflict");
+        }
+        for err in [
+            E::MemoryError("x".into()),
+            E::ComputeError("x".into()),
+            E::NotYetImplemented("x".into()),
+            E::InvalidArgumentError("x".into()),
+            E::IoError("x".into(), std::io::Error::other("x")),
+            E::DivideByZero,
+        ] {
+            assert!(!is_type_conflict(&err), "{err} must not be a conflict");
+        }
     }
 }

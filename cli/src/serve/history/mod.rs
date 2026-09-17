@@ -249,17 +249,77 @@ pub struct ListPage {
     pub next_cursor: Option<String>,
 }
 
+/// Whether a backend failure is worth retrying, decided from the driver's
+/// **typed** error at the I/O boundary — never from its rendered message, which
+/// is not API and gets reworded by a dependency bump (PRINCIPLES §6, #654 M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transience {
+    /// Self-resolving: a pool timeout, a lost/refused connection, SQLite
+    /// `BUSY`/`LOCKED`, Postgres `57P03` / `53300` / class-`08` / `40001`.
+    /// Retrying the same call can succeed.
+    Transient,
+    /// Permanent for this call: the database answered with a deterministic
+    /// SQLSTATE (syntax, constraint, missing relation), or the driver rejected
+    /// the request outright. Retrying cannot change the outcome.
+    Permanent,
+    /// No typed driver error was available to classify — a poisoned in-memory
+    /// lock, a serde failure, or a connect shim that already flattened the
+    /// `sqlx::Error` into a string. Callers treat this as retriable: the cost
+    /// of retrying a permanent failure is a few bounded seconds, while
+    /// permanently degrading on an unclassified blip strands a cluster
+    /// instance on the in-memory store (#235).
+    Unknown,
+}
+
 /// Backend failure. The memory backend never returns one; the variant exists so
 /// the async trait stays fallible for the Phase 5 SQL backends.
+///
+/// `#[non_exhaustive]`: the failure classes grow (matching is not part of the
+/// stability surface — see PRINCIPLES §3), so match with a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HistoryError {
+    /// A backend failure with no typed driver error behind it (a poisoned lock,
+    /// a serde failure, an unsupported operation, or a connect shim that
+    /// already rendered its `sqlx::Error`). Classifies as
+    /// [`Transience::Unknown`].
     #[error("run-history backend error: {0}")]
     Backend(String),
+    /// A backend failure carrying the transience verdict computed from the
+    /// driver's typed error (see `sql::classify_backend_error`). Renders
+    /// identically to [`Backend`](Self::Backend) — the classification is for
+    /// retry gates, not for users.
+    #[error("run-history backend error: {message}")]
+    BackendClassified {
+        message: String,
+        transience: Transience,
+    },
     /// The backend is degraded and the operation can't be honored safely
     /// (e.g. an idempotency claim that would risk a duplicate run). Maps to a
     /// `503` so the caller can retry once the backend recovers (#146 M5).
     #[error("{0}")]
     Degraded(String),
+}
+
+impl HistoryError {
+    /// This failure's typed transience. Unclassified variants report
+    /// [`Transience::Unknown`] rather than guessing from their text.
+    pub fn transience(&self) -> Transience {
+        match self {
+            Self::BackendClassified { transience, .. } => *transience,
+            // A degraded backend recovers on its own, so a caller retrying is
+            // exactly the right response.
+            Self::Degraded(_) => Transience::Transient,
+            _ => Transience::Unknown,
+        }
+    }
+
+    /// Whether retrying the failed call could plausibly succeed. Everything but
+    /// a *typed-permanent* failure qualifies — see [`Transience::Unknown`] for
+    /// why the unclassified case errs toward retrying.
+    pub fn is_retriable(&self) -> bool {
+        self.transience() != Transience::Permanent
+    }
 }
 
 /// One shard row to persist when a run is expanded into shards (Mode B, #230).
@@ -1022,14 +1082,20 @@ async fn connect_sqlite(
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
 const CONNECT_ATTEMPTS: usize = 8;
 
-/// Retry a *transient* backend-connect failure before falling back to degraded
+/// Retry a *retriable* backend-connect failure before falling back to degraded
 /// mode. Two clustered instances opening the same SQLite file at startup briefly
-/// race the WAL/DDL setup and surface `database is locked`; a freshly-booting
-/// Postgres can refuse connections for a moment. Both are self-resolving — but
-/// degrading permanently on the *first* blip strands a cluster instance on the
-/// in-memory store, which cannot serve cluster submits and returns `503` for
-/// every request (#235). A genuinely unreachable backend still degrades once the
+/// race the WAL/DDL setup and surface `SQLITE_BUSY`; a freshly-booting Postgres
+/// can refuse connections for a moment. Both are self-resolving — but degrading
+/// permanently on the *first* blip strands a cluster instance on the in-memory
+/// store, which cannot serve cluster submits and returns `503` for every
+/// request (#235). A genuinely unreachable backend still degrades once the
 /// attempt budget is spent, preserving the stay-alive fallback.
+///
+/// The gate is [`HistoryError::is_retriable`] — a typed verdict, so a driver
+/// reword can no longer flip a recoverable startup race into a permanent
+/// degrade (#654 M1). Only a *typed-permanent* failure short-circuits; an
+/// unclassified one costs at most the (bounded) attempt budget before
+/// degrading with the same message it would have degraded with immediately.
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
 async fn connect_with_retry<H, F, Fut>(label: &str, mut make: F) -> Result<H, HistoryError>
 where
@@ -1040,7 +1106,7 @@ where
     for attempt in 1..=CONNECT_ATTEMPTS {
         match make().await {
             Ok(backend) => return Ok(backend),
-            Err(e) if attempt < CONNECT_ATTEMPTS && is_transient_connect_error(&e) => {
+            Err(e) if attempt < CONNECT_ATTEMPTS && e.is_retriable() => {
                 tracing::warn!(
                     backend = label,
                     attempt,
@@ -1054,26 +1120,6 @@ where
         }
     }
     unreachable!("the final attempt returns Ok or Err rather than looping")
-}
-
-/// Whether a connect error is worth retrying: transient contention or a
-/// still-booting backend, as opposed to a permanent misconfiguration (e.g. a
-/// malformed URL) that no amount of retrying will fix.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
-fn is_transient_connect_error(e: &HistoryError) -> bool {
-    let msg = e.to_string().to_ascii_lowercase();
-    [
-        "database is locked", // SQLite: two cluster instances race WAL/DDL at startup
-        "busy",               // SQLITE_BUSY
-        "connection refused", // backend still binding its listener
-        "connection reset",
-        "timed out",
-        "timeout",
-        "starting up",          // Postgres: "the database system is starting up"
-        "too many connections", // transient connection saturation
-    ]
-    .iter()
-    .any(|needle| msg.contains(needle))
 }
 
 /// Wrap a SQL backend in `FallbackHistory`: healthy on success; degraded-on-
@@ -1156,6 +1202,7 @@ mod tests {
             parent_record_key: None,
             records_written: 483,
             error: None,
+            error_kind: None,
             metrics: Some(InvocationMetrics {
                 source_kind: "rest".into(),
                 sink_kind: "bigquery".into(),
@@ -1275,22 +1322,43 @@ mod connect_retry_tests {
     use super::*;
     use std::cell::Cell;
 
+    /// A classified backend failure, as the connect shims now build one from
+    /// the driver's typed error.
+    fn classified(message: &str, transience: Transience) -> HistoryError {
+        HistoryError::BackendClassified {
+            message: message.into(),
+            transience,
+        }
+    }
+
     #[test]
-    fn classifies_transient_vs_permanent_connect_errors() {
+    fn the_retry_gate_reads_the_typed_verdict_not_the_message() {
         // SQLite concurrent-startup contention (#235) — retryable.
-        assert!(is_transient_connect_error(&HistoryError::Backend(
-            "SQLite connection failed: error returned from database: (code: 5) \
-             database is locked"
-                .into()
-        )));
-        // Booting Postgres — retryable.
-        assert!(is_transient_connect_error(&HistoryError::Backend(
-            "connection refused (os error 111)".into()
-        )));
-        // Permanent misconfiguration — not worth retrying.
-        assert!(!is_transient_connect_error(&HistoryError::Backend(
-            "invalid sqlite url 'sqlite::nonsense': ParseError".into()
-        )));
+        assert!(
+            classified(
+                "creating run-history schema: (code: 5)",
+                Transience::Transient
+            )
+            .is_retriable()
+        );
+        // Permanent misconfiguration — not worth retrying, whatever it says.
+        assert!(
+            !classified(
+                "invalid sqlite url 'sqlite::nonsense': database is locked, timed out, busy",
+                Transience::Permanent
+            )
+            .is_retriable(),
+            "a permanent verdict must win over transient-sounding prose"
+        );
+        // Unclassified (no driver error behind it): retried, because degrading
+        // permanently on an unclassified blip is the costlier mistake.
+        assert!(HistoryError::Backend("lock poisoned".into()).is_retriable());
+        assert_eq!(
+            HistoryError::Backend("lock poisoned".into()).transience(),
+            Transience::Unknown
+        );
+        // A degraded backend recovers on its own.
+        assert!(HistoryError::Degraded("degraded".into()).is_retriable());
     }
 
     #[tokio::test]
@@ -1301,7 +1369,7 @@ mod connect_retry_tests {
             calls.set(n);
             async move {
                 if n < 3 {
-                    Err(HistoryError::Backend("database is locked".into()))
+                    Err(classified("database is locked", Transience::Transient))
                 } else {
                     Ok(42u32)
                 }
@@ -1321,7 +1389,12 @@ mod connect_retry_tests {
         let calls = Cell::new(0usize);
         let result: Result<u32, HistoryError> = connect_with_retry("test", || {
             calls.set(calls.get() + 1);
-            async move { Err::<u32, _>(HistoryError::Backend("invalid sqlite url 'x'".into())) }
+            async move {
+                Err::<u32, _>(classified(
+                    "invalid sqlite url 'x'",
+                    Transience::Permanent,
+                ))
+            }
         })
         .await;
         assert!(result.is_err());
@@ -1330,5 +1403,21 @@ mod connect_retry_tests {
             1,
             "a permanent error degrades immediately, no retry"
         );
+    }
+
+    // `start_paused` auto-advances the backoff sleeps, so the full attempt
+    // budget costs no wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_the_attempt_budget() {
+        // A backend that is transiently-but-persistently unreachable still
+        // degrades rather than retrying forever.
+        let calls = Cell::new(0usize);
+        let result: Result<u32, HistoryError> = connect_with_retry("test", || {
+            calls.set(calls.get() + 1);
+            async move { Err::<u32, _>(classified("connection refused", Transience::Transient)) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), CONNECT_ATTEMPTS);
     }
 }

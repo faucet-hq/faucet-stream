@@ -29,10 +29,20 @@ impl Encoded {
     }
 }
 
-/// Deterministic exponential backoff: `initial * 2^attempt`, capped. Pure.
+/// Exponential backoff between the configured bounds — `initial * 2^attempt`
+/// capped at `max_ms` — jittered through core's shared decorrelated helper.
+///
+/// The jitter is load-bearing, not cosmetic: a partially-failed `PutRecords`
+/// can leave up to 500 entries to retry, and without decorrelation every one of
+/// them (and every concurrent request) re-fires in the same instant, re-creating
+/// the throttle that caused the failure. Delegating to
+/// [`faucet_core::retry::apply_jitter`] also means the two jitter bugs fixed
+/// there (a divisor that capped the factor at 0.733, and same-nanosecond
+/// alignment across tasks) apply here rather than having to be rediscovered
+/// (#654 M13).
 pub(crate) fn backoff_delay(initial_ms: u64, max_ms: u64, attempt: usize) -> Duration {
     let exp = initial_ms.saturating_mul(1u64 << attempt.min(20));
-    Duration::from_millis(exp.min(max_ms))
+    faucet_core::retry::apply_jitter(Duration::from_millis(exp.min(max_ms)))
 }
 
 /// Chunk encoded entries into `PutRecords` requests honouring both the entry
@@ -363,15 +373,41 @@ mod tests {
         }
     }
 
+    /// Assert a jittered delay sits in core's documented `[0.5, 1.5)` band
+    /// around `expected_ms` and never collapses to zero (a zero sleep would
+    /// busy-spin the retry loop).
+    fn assert_jittered_around(actual: Duration, expected_ms: u64) {
+        let lo = Duration::from_micros(expected_ms * 500);
+        let hi = Duration::from_micros(expected_ms * 1500);
+        assert!(
+            actual >= lo && actual < hi,
+            "delay {actual:?} outside jitter band [{lo:?}, {hi:?}) for {expected_ms}ms"
+        );
+        assert!(!actual.is_zero(), "jittered delay collapsed to zero");
+    }
+
     #[test]
-    fn backoff_doubles_and_caps() {
-        assert_eq!(backoff_delay(100, 30_000, 0), Duration::from_millis(100));
-        assert_eq!(backoff_delay(100, 30_000, 1), Duration::from_millis(200));
-        assert_eq!(backoff_delay(100, 30_000, 4), Duration::from_millis(1600));
-        assert_eq!(backoff_delay(100, 30_000, 20), Duration::from_secs(30));
-        assert_eq!(
-            backoff_delay(100, 30_000, usize::MAX),
-            Duration::from_secs(30)
+    fn backoff_doubles_and_caps_within_the_jitter_band() {
+        assert_jittered_around(backoff_delay(100, 30_000, 0), 100);
+        assert_jittered_around(backoff_delay(100, 30_000, 1), 200);
+        assert_jittered_around(backoff_delay(100, 30_000, 4), 1_600);
+        // Capped at the configured ceiling, not core's own 60s cap.
+        assert_jittered_around(backoff_delay(100, 30_000, 20), 30_000);
+        assert_jittered_around(backoff_delay(100, 30_000, usize::MAX), 30_000);
+        // A tight configured ceiling is still honoured (no unjittered floor
+        // sneaking past the cap).
+        assert_jittered_around(backoff_delay(100, 250, 9), 250);
+    }
+
+    #[test]
+    fn backoff_is_decorrelated_across_calls() {
+        // The whole point of #654 M13: up to 500 failed PutRecords entries must
+        // not retry in lockstep. Identical inputs must not yield an identical
+        // delay every time.
+        let delays: Vec<Duration> = (0..32).map(|_| backoff_delay(100, 30_000, 3)).collect();
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "every delay identical — jitter is not being applied: {delays:?}"
         );
     }
 

@@ -1461,6 +1461,7 @@ mod tests {
                 parent_record_key: None,
                 records_written: 3,
                 error: None,
+                error_kind: None,
                 metrics: None,
             }],
         };
@@ -1479,6 +1480,7 @@ mod tests {
                 parent_record_key: None,
                 records_written: 0,
                 error: Some("boom".into()),
+                error_kind: None,
                 metrics: None,
             }],
         };

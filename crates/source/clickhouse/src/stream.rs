@@ -90,21 +90,34 @@ impl ClickHouseSource {
     }
 }
 
+/// The user-facing incremental-cursor token, normalised into a `{key}`
+/// placeholder so the bookmark and the parent-context values are substituted by
+/// the *same* single pass. Substituting them in two passes let either one's
+/// output be re-scanned by the other, which is the injection hazard #654 M14
+/// describes.
+const BOOKMARK_TOKEN: &str = "@bookmark";
+
+/// Reserved placeholder key that [`BOOKMARK_TOKEN`] is rewritten to. Named (not
+/// inlined) because it is a reserved word in the substitution namespace: a
+/// parent-context key of the same name is shadowed by the bookmark.
+const BOOKMARK_KEY: &str = "__faucet_bookmark";
+
 /// Build the final query string and (for incremental runs) the client-side
 /// filter context. Pure (no client) so it is unit-testable.
 ///
-/// Substitution order: parent-context `{key}` tokens (as injection-safe SQL
-/// literals) → the incremental bookmark bound where the user wrote `@bookmark`.
+/// Both the parent-context `{key}` tokens and the incremental cursor written as
+/// `@bookmark` are rendered as injection-safe SQL literals and substituted in
+/// **one** left-to-right pass, so no substituted value is ever re-scanned as a
+/// placeholder for another. The `@bookmark` → `{BOOKMARK_KEY}` rewrite happens
+/// on the raw, author-controlled query template (never on substituted output),
+/// which is why it is safe to do with a plain `replace`.
 fn build_effective_query(
     config: &ClickHouseSourceConfig,
     context: &HashMap<String, Value>,
     start_bookmark: Option<&Value>,
 ) -> (String, Option<IncrementalCtx>) {
-    let mut query = if context.is_empty() {
-        config.query.clone()
-    } else {
-        substitute_context_sql(&config.query, context)
-    };
+    let mut template = config.query.clone();
+    let mut literals: HashMap<String, Value> = HashMap::new();
 
     let incremental = match &config.replication {
         ClickHouseReplication::Full => None,
@@ -115,11 +128,11 @@ fn build_effective_query(
             let start = start_bookmark
                 .cloned()
                 .unwrap_or_else(|| initial_value.clone());
-            // Server-side pushdown: substitute the cursor as an injection-safe
-            // SQL literal where the user wrote `@bookmark`. If absent, only the
-            // client-side filter applies.
-            if query.contains("@bookmark") {
-                query = query.replace("@bookmark", &sql_literal(&start));
+            // Server-side pushdown where the user wrote `@bookmark`; absent
+            // that, only the client-side filter applies.
+            if template.contains(BOOKMARK_TOKEN) {
+                template = template.replace(BOOKMARK_TOKEN, &format!("{{{BOOKMARK_KEY}}}"));
+                literals.insert(BOOKMARK_KEY.to_owned(), Value::String(sql_literal(&start)));
             }
             Some(IncrementalCtx {
                 column: column.clone(),
@@ -128,18 +141,53 @@ fn build_effective_query(
         }
     };
 
-    (query, incremental)
+    if literals.is_empty() && context.is_empty() {
+        return (template, incremental);
+    }
+    (
+        substitute_context_sql(&template, context, literals),
+        incremental,
+    )
 }
 
 /// Replace each `{key}` token with the injection-safe SQL literal of the
-/// corresponding context value. Tokens with no matching context entry are left
-/// verbatim.
-fn substitute_context_sql(query: &str, context: &HashMap<String, Value>) -> String {
-    let mut out = query.to_string();
-    for (key, value) in context {
-        out = out.replace(&format!("{{{key}}}"), &sql_literal(value));
-    }
-    out
+/// corresponding value, drawn from `context` and then from `reserved` (which
+/// wins on a name clash). Tokens with no matching entry are left verbatim.
+///
+/// Escaping happens **before** substitution and the substituted text is never
+/// re-scanned. The previous implementation looped `String::replace` once per
+/// context entry over the *running output*, which had two defects (#654 M14):
+///
+/// - **second-order injection** — a value whose text contained another key's
+///   placeholder (`{other}`) was substituted again on a later iteration, so a
+///   record field could inject a different context value into the query;
+/// - **nondeterminism** — `HashMap` iteration order varies per process, so which
+///   re-substitution happened (if any) changed run to run.
+///
+/// Core's [`substitute_context`](faucet_core::util::substitute_context) is the
+/// single left-to-right scanner that cannot re-scan its own output, so the
+/// values are pre-rendered to ClickHouse literals and handed to it as strings.
+/// That keeps the escaping in one audited place ([`sql_literal`]) and the
+/// scanning in another, rather than re-deriving either here.
+///
+/// ClickHouse's own parameter binding (`{name:Type}` + `param_name=…`) is not
+/// used: it requires an explicit ClickHouse type inside the placeholder, so
+/// routing `{key}` through it would change the documented token grammar and
+/// force us to infer a ClickHouse type per JSON value — a breaking config change
+/// carrying its own mis-typing hazards. Escaping via one audited literal encoder
+/// closes the injection path without that.
+fn substitute_context_sql(
+    query: &str,
+    context: &HashMap<String, Value>,
+    reserved: HashMap<String, Value>,
+) -> String {
+    let mut literals: HashMap<String, Value> = context
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(sql_literal(value))))
+        .collect();
+    // Already rendered to literals by the caller; reserved keys shadow context.
+    literals.extend(reserved);
+    faucet_core::util::substitute_context(query, &literals)
 }
 
 /// Filter a page for incremental replication and advance `running_max`.
@@ -428,6 +476,119 @@ mod tests {
         let (q, _incr) = build_effective_query(&cfg, &ctx, None);
         assert!(q.contains("tenant = 'ac\\'me'"), "got: {q}");
         assert!(q.contains("id = 7"), "got: {q}");
+    }
+
+    #[test]
+    fn substituted_value_is_not_re_substituted() {
+        // Second-order injection (#654 M14): the value of `a` names another
+        // context key. The old per-entry `String::replace` loop re-scanned its
+        // own output, so `{b}` inside a's value was substituted on a later
+        // iteration and `b`'s value leaked into the query.
+        let mut ctx = HashMap::new();
+        ctx.insert("a".to_string(), json!("{b}"));
+        ctx.insert("b".to_string(), json!("SECRET"));
+        let cfg = ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE x = {a}");
+        let (q, _incr) = build_effective_query(&cfg, &ctx, None);
+        assert_eq!(q, "SELECT * FROM t WHERE x = '{b}'");
+        assert!(
+            !q.contains("SECRET"),
+            "value of `b` was re-substituted into a's output: {q}"
+        );
+    }
+
+    #[test]
+    fn substituted_value_cannot_inject_the_bookmark_token() {
+        // The same hazard across the two substitution kinds: a context value
+        // containing `@bookmark` must not pick up the cursor literal, which
+        // would close the quote it sits inside.
+        let mut ctx = HashMap::new();
+        ctx.insert("a".to_string(), json!("x@bookmark"));
+        let cfg = ClickHouseSourceConfig::new(
+            "http://h:8123",
+            "SELECT * FROM t WHERE x = {a} AND c > @bookmark",
+        )
+        .incremental("c", json!("2024-01-01"));
+        let (q, _incr) = build_effective_query(&cfg, &ctx, None);
+        assert_eq!(
+            q,
+            "SELECT * FROM t WHERE x = 'x@bookmark' AND c > '2024-01-01'"
+        );
+    }
+
+    #[test]
+    fn bookmark_literal_cannot_inject_a_context_placeholder() {
+        // And the mirror direction: a bookmark read back from the state store is
+        // source-derived, so its text must not be re-scanned for `{key}` either.
+        let mut ctx = HashMap::new();
+        ctx.insert("a".to_string(), json!("SECRET"));
+        let cfg =
+            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c > @bookmark")
+                .incremental("c", json!(0));
+        let stored = json!("{a}");
+        let (q, _incr) = build_effective_query(&cfg, &ctx, Some(&stored));
+        assert_eq!(q, "SELECT * FROM t WHERE c > '{a}'");
+        assert!(!q.contains("SECRET"), "bookmark output was re-scanned: {q}");
+    }
+
+    #[test]
+    fn substitution_is_independent_of_context_insertion_order() {
+        // `HashMap` iteration order varies per process, so the old loop could
+        // produce different SQL run to run. Build the same context two ways and
+        // require identical output.
+        let cfg = ClickHouseSourceConfig::new(
+            "http://h:8123",
+            "SELECT * FROM t WHERE a = {a} AND b = {b} AND c = {c}",
+        );
+        let entries = [
+            ("a", json!("{b}")),
+            ("b", json!("{c}")),
+            ("c", json!("{a}")),
+        ];
+
+        let forward: HashMap<String, Value> = entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        let reverse: HashMap<String, Value> = entries
+            .iter()
+            .rev()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+
+        let (q1, _) = build_effective_query(&cfg, &forward, None);
+        let (q2, _) = build_effective_query(&cfg, &reverse, None);
+        assert_eq!(q1, q2);
+        assert_eq!(
+            q1,
+            "SELECT * FROM t WHERE a = '{b}' AND b = '{c}' AND c = '{a}'"
+        );
+    }
+
+    #[test]
+    fn a_context_key_cannot_shadow_the_reserved_bookmark_key() {
+        // The `@bookmark` token is normalised to a reserved placeholder key; a
+        // parent-context entry of that name must not be able to take it over and
+        // substitute attacker text where the cursor belongs.
+        let mut ctx = HashMap::new();
+        ctx.insert(BOOKMARK_KEY.to_string(), json!("HIJACKED"));
+        let cfg =
+            ClickHouseSourceConfig::new("http://h:8123", "SELECT * FROM t WHERE c > @bookmark")
+                .incremental("c", json!(42));
+        let (q, _incr) = build_effective_query(&cfg, &ctx, None);
+        assert_eq!(q, "SELECT * FROM t WHERE c > 42");
+        assert!(!q.contains("HIJACKED"), "reserved key was shadowed: {q}");
+    }
+
+    #[test]
+    fn unmatched_placeholders_are_left_verbatim() {
+        let mut ctx = HashMap::new();
+        ctx.insert("known".to_string(), json!(1));
+        let cfg = ClickHouseSourceConfig::new(
+            "http://h:8123",
+            "SELECT * FROM t WHERE a = {known} AND b = {unknown}",
+        );
+        let (q, _incr) = build_effective_query(&cfg, &ctx, None);
+        assert_eq!(q, "SELECT * FROM t WHERE a = 1 AND b = {unknown}");
     }
 
     #[test]

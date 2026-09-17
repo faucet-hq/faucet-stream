@@ -657,13 +657,14 @@
       "additionalProperties": false
     },
     "RecordCheck": {
-      "description": "A per-record check. Addressed field accepts the filter/explode path subset\n(bare key, `dot.path`, `$['bracketed']`).",
+      "description": "A per-record check. Addressed field accepts the filter/explode path subset\n(bare key, `dot.path`, `$['bracketed']`).\n\nEvery variant carries `field` (the path to check) and `on_failure` (what a\nfailure does). Per-record checks accept only [`OnFailure::Quarantine`] or\n[`OnFailure::Abort`] — `quarantine_batch` is rejected at compile time\nbecause a per-record failure is always attributable to one row.",
       "oneOf": [
         {
           "description": "Field present and non-null.",
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field.",
               "type": "string"
             },
             "treat_missing_as_null": {
@@ -672,6 +673,7 @@
               "default": true
             },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -691,9 +693,11 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field. A missing field, a `null`, or a\nnon-string value all fail.",
               "type": "string"
             },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -713,12 +717,15 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field. A missing field or a non-string value\nfails.",
               "type": "string"
             },
             "pattern": {
+              "description": "Rust `regex`-crate pattern. Unanchored — it only has to match\n*somewhere* in the value, so anchor with `^…$` for a full match.\nAn invalid pattern is rejected at config load, never mid-run.",
               "type": "string"
             },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -739,13 +746,16 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field. A missing field fails.",
               "type": "string"
             },
             "values": {
+              "description": "The allowed values. Must be non-empty. Compared by JSON equality\nwith no type coercion, so the string `\"5\"` does not match the\nnumber `5`.",
               "type": "array",
               "items": true
             },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -766,13 +776,16 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field. A **missing** field passes — there is no\nvalue to forbid.",
               "type": "string"
             },
             "values": {
+              "description": "The forbidden values. Must be non-empty. Compared by JSON equality\nwith no type coercion.",
               "type": "array",
               "items": true
             },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -793,13 +806,18 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field. A missing field fails.",
               "type": "string"
             },
             "op": {
+              "description": "The comparison to apply, as `field <op> value`.",
               "$ref": "#/$defs/CompareOp"
             },
-            "value": true,
+            "value": {
+              "description": "The right-hand side of the comparison. The ordering ops\n(`gt`/`gte`/`lt`/`lte`) require a JSON number here — anything else\nis rejected at config load — and also require the record's value to\nbe a number; `eq`/`ne` accept any JSON value."
+            },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -821,12 +839,15 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field. A missing field fails, which is distinct\nfrom an `expected: null` match on a present `null`.",
               "type": "string"
             },
             "expected": {
+              "description": "The required JSON type.",
               "$ref": "#/$defs/JsonType"
             },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -847,9 +868,11 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the checked field. A missing field or a non-string value\nfails.",
               "type": "string"
             },
             "min": {
+              "description": "Inclusive minimum length in Unicode **characters** (not bytes).\nOmit for no lower bound.",
               "type": [
                 "integer",
                 "null"
@@ -859,6 +882,7 @@
               "default": null
             },
             "max": {
+              "description": "Inclusive maximum length in Unicode **characters** (not bytes).\nOmit for no upper bound. At least one of `min`/`max` is required,\nand `min <= max`, both enforced at config load.",
               "type": [
                 "integer",
                 "null"
@@ -868,6 +892,7 @@
               "default": null
             },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -886,8 +911,11 @@
           "description": "The whole record validates against a JSON Schema document.",
           "type": "object",
           "properties": {
-            "schema": true,
+            "schema": {
+              "description": "The JSON Schema document, inline. Compiled once at config load —\nan invalid schema fails there, not on the first page. The first\nvalidation error becomes the DLQ/abort message."
+            },
             "on_failure": {
+              "description": "What a failure does: `quarantine` (row to the DLQ) or `abort`.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -995,13 +1023,14 @@
       ]
     },
     "BatchCheck": {
-      "description": "A per-batch check, evaluated per page over the survivors of the per-record\npass.",
+      "description": "A per-batch check, evaluated per page over the survivors of the per-record\npass.\n\n**Scope is one page, not the whole run** — with a source `batch_size` of\n1000, `row_count` sees 1000 rows at a time. Set the source's\n`batch_size: 0` to evaluate these over the entire result set instead.\n\nThe aggregate checks (`row_count` / `null_rate` / `distinct_count`) cannot\nblame an individual row, so they accept only [`OnFailure::Abort`] or\n[`OnFailure::QuarantineBatch`]; `unique` *is* row-attributable and so\naccepts `quarantine` or `abort`. Either way the wrong choice is rejected at\nconfig load.",
       "oneOf": [
         {
           "description": "Survivor count is within `[min, max]` (at least one bound required).",
           "type": "object",
           "properties": {
             "min": {
+              "description": "Inclusive minimum surviving rows in the page. Omit for no lower\nbound.",
               "type": [
                 "integer",
                 "null"
@@ -1011,6 +1040,7 @@
               "default": null
             },
             "max": {
+              "description": "Inclusive maximum surviving rows in the page. Omit for no upper\nbound. At least one of `min`/`max` is required, and `min <= max`,\nboth enforced at config load.",
               "type": [
                 "integer",
                 "null"
@@ -1020,6 +1050,7 @@
               "default": null
             },
             "on_failure": {
+              "description": "What a failure does: `abort`, or `quarantine_batch` (every survivor\nin the page goes to the DLQ and nothing is written).",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -1038,6 +1069,7 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the measured field. A missing field counts the same as an\nexplicit `null`.",
               "type": "string"
             },
             "max": {
@@ -1046,6 +1078,7 @@
               "format": "double"
             },
             "on_failure": {
+              "description": "What a failure does: `abort`, or `quarantine_batch` (every survivor\nin the page goes to the DLQ and nothing is written).",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -1066,12 +1099,14 @@
           "type": "object",
           "properties": {
             "fields": {
+              "description": "Paths forming the uniqueness key, in order. One path for a simple\nkey, several for a composite one. Must be non-empty. A missing\nfield is a distinct key value from an explicit `null`.",
               "type": "array",
               "items": {
                 "type": "string"
               }
             },
             "on_failure": {
+              "description": "What a failure does. This check names the offending rows, so\n`quarantine` sends the **duplicate occurrences** to the DLQ (the\nfirst occurrence of each key is kept); `abort` fails the run.",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -1091,9 +1126,11 @@
           "type": "object",
           "properties": {
             "field": {
+              "description": "Path to the counted field. A missing field counts as its own\ndistinct value, separate from an explicit `null`.",
               "type": "string"
             },
             "min": {
+              "description": "Inclusive minimum number of distinct values. Omit for no lower\nbound.",
               "type": [
                 "integer",
                 "null"
@@ -1103,6 +1140,7 @@
               "default": null
             },
             "max": {
+              "description": "Inclusive maximum number of distinct values. Omit for no upper\nbound. At least one of `min`/`max` is required, and `min <= max`,\nboth enforced at config load.",
               "type": [
                 "integer",
                 "null"
@@ -1112,6 +1150,7 @@
               "default": null
             },
             "on_failure": {
+              "description": "What a failure does: `abort`, or `quarantine_batch` (every survivor\nin the page goes to the DLQ and nothing is written).",
               "$ref": "#/$defs/OnFailure"
             },
             "type": {
@@ -8696,11 +8735,14 @@
       }
     },
     "sink_kafka__KafkaSinkTopic": {
+      "description": "Where each message's destination topic comes from.",
       "oneOf": [
         {
+          "description": "One fixed topic for every record.",
           "type": "object",
           "properties": {
             "name": {
+              "description": "Topic name. Must not be blank.",
               "type": "string"
             },
             "type": {
@@ -8710,9 +8752,11 @@
           }
         },
         {
+          "description": "Per-record routing: the topic is read from the record itself.",
           "type": "object",
           "properties": {
             "path": {
+              "description": "JSONPath to the topic name (first match wins). A record whose path\ndoes not resolve fails the batch. Must not be blank.",
               "type": "string"
             },
             "type": {
@@ -9018,11 +9062,23 @@
       ]
     },
     "sink_kafka__Acks": {
-      "type": "string",
-      "enum": [
-        "none",
-        "leader",
-        "all"
+      "description": "Broker acknowledgement level required before a send is considered\ndelivered — librdkafka's `acks`.",
+      "oneOf": [
+        {
+          "description": "`acks=0` — fire-and-forget: no acknowledgement is awaited, so a send\ncan be silently lost. Fastest and least safe.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "`acks=1` — the partition leader has written the message; it can still\nbe lost if the leader fails before the followers replicate it.",
+          "type": "string",
+          "const": "leader"
+        },
+        {
+          "description": "`acks=all` — every in-sync replica has written the message. The\ndefault, and the only level compatible with\n[`KafkaSinkConfig::idempotent`].",
+          "type": "string",
+          "const": "all"
+        }
       ]
     },
     "sink_kinesis__KinesisCredentials": {
@@ -12029,7 +12085,7 @@
                       "default": 1000
                     },
                     "verify_length": {
-                      "description": "Verify each object's byte length against the `Content-Length` the\nstore advertises, failing the read with [`FaucetError::Source`](faucet_core::FaucetError::Source)\non a short (truncated) or over-long transfer (#161). The check is\ncheap (a byte counter over the body that is read anyway) and defaults\nto `true`. Disable it only for an S3-compatible store that does not\nreturn a reliable `Content-Length`. When the store reports no length,\nthe check is skipped (a debug log notes it) rather than failing.",
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
                       "type": [
                         "boolean",
                         "string"
@@ -12037,7 +12093,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises —\nan `x-amz-checksum-{crc32,crc32c,sha1,sha256}` header when present, or\nthe ETag as MD5 for a non-multipart upload (#161). Stronger than the\nlength check but costs a hash over the full body, so it defaults to\n`false`. Enabling it sets `ChecksumMode::Enabled` on each `GetObject`\nso the store returns its stored checksum. When the store advertises no\nusable checksum for an object, verification is skipped for that object\n(a debug log notes it); the length check still applies.",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
                       "type": [
                         "boolean",
                         "string"
@@ -12981,6 +13037,22 @@
                       "minimum": 0,
                       "default": 1000
                     },
+                    "verify_length": {
+                      "description": "Verify each blob's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer. Cheap — a byte counter over a body\nthat is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored blob's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Not supported on Azure Blob: `object_store` exposes no `Content-MD5`\nattribute and an Azure ETag is not a content hash, so there is nothing\nto verify against. Setting it `true` is **rejected at config load**\nrather than silently ignored — see `validate()`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
                     "compression": {
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the\ncodec is resolved per-object-key, so a single source can read a mix of\ncompressed and uncompressed objects. Requires the crate-local\n`compression` feature.",
                       "$ref": "#/$defs/source_azure-blob__CompressionConfig",
@@ -13251,7 +13323,7 @@
                       "default": false
                     },
                     "reconnect_backoff": {
-                      "description": "Fixed wait (seconds) between reconnect attempts. Default 1s.",
+                      "description": "Base wait (seconds) for reconnect backoff. Default 1s.\n\nRetries grow **exponentially with jitter** from this base and are\ncapped, so a dead endpoint is not dialled at a fixed rate forever.\nSet it to the delay you want before the *first* retry.",
                       "type": [
                         "integer",
                         "string"
@@ -14202,7 +14274,7 @@
                       "default": 1
                     },
                     "batch_size": {
-                      "description": "Page size — rows accumulated before a `StreamPage` is emitted.",
+                      "description": "Page size — rows accumulated before a `StreamPage` is emitted.\nDefaults to [`DEFAULT_BATCH_SIZE`](faucet_core::DEFAULT_BATCH_SIZE).\n\n`batch_size = 0` is the \"no batching\" sentinel: result chunks are fully\ndrained and the entire result set is emitted in a single page. Useful\nfor small lookup tables or for sinks (e.g. SQL `COPY`, BigQuery load\njobs) that prefer one large request to many small ones.",
                       "type": [
                         "integer",
                         "string"
@@ -14331,7 +14403,7 @@
                       "default": 1000
                     },
                     "verify_length": {
-                      "description": "Verify each object's byte length against the `size` GCS reports for it,\nfailing the read with [`FaucetError::Source`](faucet_core::FaucetError::Source)\non a short (truncated) or over-long transfer (#161). Cheap (a byte\ncounter over the body that is read anyway) and defaults to `true`.\nThe check is automatically skipped for an object served with a\nnon-empty `Content-Encoding` (GCS may decompressively transcode it on\nread, so the received byte count would not match the stored `size`).",
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
                       "type": [
                         "boolean",
                         "string"
@@ -14339,7 +14411,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the CRC32C (or MD5) checksum GCS\nreports for it (#161). Stronger than the length check but costs a hash\nover the full body, so it defaults to `false`. Skipped for an object\nwith no usable checksum or one served with a non-empty\n`Content-Encoding` (the stored checksum covers the stored bytes, which\ntranscoding would not return).",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
                       "type": [
                         "boolean",
                         "string"
@@ -15542,7 +15614,7 @@
                       ]
                     },
                     "batch_size": {
-                      "description": "Max entries per `SendMessageBatch` request (1–10). Default 10.",
+                      "description": "Max entries per `SendMessageBatch` request (1–10). Default 10.\n\n**The house `batch_size = 0` \"no batching\" sentinel does not apply\nhere** — `SendMessageBatch` caps a request at\n[`MAX_ENTRIES_PER_REQUEST`](crate::MAX_ENTRIES_PER_REQUEST)\n(10) entries, so an unbatched whole-page request is not expressible.\n`0` (and anything above 10) is rejected at config load; pages larger\nthan `batch_size` are re-chunked into several requests (also\nre-chunked to stay under the 256 KiB per-request payload limit).",
                       "type": [
                         "integer",
                         "string"
@@ -16179,24 +16251,29 @@
                 {
                   "properties": {
                     "brokers": {
+                      "description": "Comma-separated `host:port` bootstrap brokers, passed straight through\nas librdkafka's `bootstrap.servers` (e.g. `\"b1:9092,b2:9092\"`).\nRequired; a blank value is rejected at config load.",
                       "type": "string"
                     },
                     "topic": {
+                      "description": "Destination topic. Either a fixed name\n(`{ type: fixed, name: events }`) or a per-record JSONPath lookup\n(`{ type: from_path, path: \"$.dest\" }`) for multi-topic routing.\nRequired.",
                       "$ref": "#/$defs/sink_kafka__KafkaSinkTopic"
                     },
                     "auth": {
+                      "description": "Broker authentication — SASL/PLAIN, SASL/SCRAM, SSL client certs, or\nSASL-over-SSL. Defaults to `{ type: none }` (plaintext brokers only).",
                       "$ref": "#/$defs/sink_kafka__KafkaAuth",
                       "default": {
                         "type": "none"
                       }
                     },
                     "value_format": {
+                      "description": "Encoding applied to each record to produce the message **value**.\nDefaults to `{ type: json }`. The Confluent Schema Registry formats\n(`confluent_avro` / `confluent_protobuf` / `confluent_json_schema`)\nadditionally require [`Self::value_schema`] and the crate's\n`schema-registry` feature.",
                       "$ref": "#/$defs/sink_kafka__KafkaValueFormat",
                       "default": {
                         "type": "json"
                       }
                     },
                     "key_format": {
+                      "description": "Encoding applied to the value extracted at [`Self::key_path`] to\nproduce the message **key**. When unset, the extracted value is used\nverbatim as UTF-8 key bytes (numbers and booleans are stringified) —\nset this only when the key needs a real encoder, e.g. a Schema\nRegistry format. Ignored when `key_path` is unset (no key is sent).",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_kafka__KafkaValueFormat"
@@ -16221,36 +16298,43 @@
                       ]
                     },
                     "key_path": {
+                      "description": "JSONPath to the field that becomes each message's key (the first match\nwins). Unset — the default — produces keyless messages, so the broker\npartitions round-robin and log compaction cannot key on them. A path\nthat resolves to nothing is handled per [`Self::on_key_error`].",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
                     "partition_path": {
+                      "description": "JSONPath to an explicit destination partition for each message. The\nmatch must be an integer in `0..=i32::MAX`; anything else fails the\nrecord with [`FaucetError::Sink`]. Unset — the default — lets\nlibrdkafka pick the partition from the key (or round-robin when there\nis no key), which is almost always what you want.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
                     "headers_path": {
+                      "description": "JSONPath to a flat JSON object whose entries become Kafka message\nheaders (values are stringified). Unset by default.\n\n**Not yet applied:** the extraction helper exists and is tested, but\nthe produce path does not attach the headers to the outgoing message,\nso setting this currently has no effect on what reaches the broker.\nCarry the values inside the record body until it is wired up.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
                     "on_key_error": {
+                      "description": "What to do when [`Self::key_path`] resolves to nothing for a record:\n`fail` (default) aborts the batch with [`FaucetError::Sink`], `skip`\ndrops the record (counted and warned once per batch), `round_robin`\nsends it with no key and lets the broker place it. Only consulted when\n`key_path` is set.",
                       "$ref": "#/$defs/sink_kafka__OnKeyError",
                       "default": "fail"
                     },
                     "compression": {
+                      "description": "Producer-side batch compression, set as librdkafka's\n`compression.type`: `none` (default), `gzip`, `snappy`, `lz4`, or\n`zstd`. `lz4` or `zstd` usually pays for itself on JSON payloads.",
                       "$ref": "#/$defs/sink_kafka__CompressionType",
                       "default": "none"
                     },
                     "acks": {
+                      "description": "Broker acknowledgement level (librdkafka `acks`): `all` (default, every\nin-sync replica), `leader` (leader only), or `none` (fire-and-forget).\nAnything but `all` can lose data on a broker failure, and\n[`Self::idempotent`] requires `all` — that combination is rejected at\nconfig load.",
                       "$ref": "#/$defs/sink_kafka__Acks",
                       "default": "all"
                     },
                     "idempotent": {
+                      "description": "Enable the librdkafka idempotent producer (`enable.idempotence`),\nwhich de-duplicates broker-side retries so a retried send cannot\nappend the message twice. Defaults to `true` and requires\n`acks: all`. Independent of `delivery: exactly_once`, which adds a\ntransactional producer plus a commit-token side-topic on top.",
                       "type": [
                         "boolean",
                         "string"
@@ -16258,6 +16342,7 @@
                       "default": true
                     },
                     "linger": {
+                      "description": "How long the producer waits for more messages before sending a batch\n(librdkafka `linger.ms`). Raising it trades latency for larger,\nbetter-compressed batches. Defaults to 5 ms.\n\n**Config granularity is whole seconds**, so the sub-second default is\nnot expressible in YAML — omit the key to keep 5 ms (writing\n`linger: 0` *disables* lingering), and set `linger.ms` through\n[`Self::extra_client_config`] for any other sub-second value.",
                       "type": [
                         "integer",
                         "string"
@@ -16277,6 +16362,7 @@
                       "default": 1000
                     },
                     "message_timeout": {
+                      "description": "Delivery deadline for a single message (librdkafka\n`message.timeout.ms`), in **whole seconds**. Defaults to 30 s. Also\nused as the timeout for `flush()`, for `init_transactions`, and as the\nfloor for the exactly-once `transaction.timeout.ms` (which is raised to\nat least 60 s so a long `message_timeout` cannot make\n`init_transactions` reject the producer).",
                       "type": [
                         "integer",
                         "string"
@@ -16286,6 +16372,7 @@
                       "default": 30
                     },
                     "max_in_flight": {
+                      "description": "Hard ceiling on concurrent in-flight sends inside one\n[`Sink::write_batch`](faucet_core::Sink::write_batch) call. Defaults to\n100 and must be at least 1. When [`Self::batch_size`] is non-zero the\neffective window is `min(max_in_flight, batch_size)`, so this is the\ncap that applies under the `batch_size = 0` sentinel.",
                       "type": [
                         "integer",
                         "string"
@@ -16295,6 +16382,7 @@
                       "default": 100
                     },
                     "queue_full_backoff": {
+                      "description": "How long to wait before retrying a send that librdkafka rejected with\n`QueueFull`. Defaults to 100 ms. See\n[`Self::queue_full_max_retries`].\n\n**Config granularity is whole seconds**, so the sub-second default is\nnot expressible in YAML — omit the key to keep 100 ms (`0` retries\nimmediately with no pause).",
                       "type": [
                         "integer",
                         "string"
@@ -16304,6 +16392,7 @@
                       "default": 0
                     },
                     "queue_full_max_retries": {
+                      "description": "How many times to retry a `QueueFull` send before failing the batch.\nDefaults to 3; `0` fails on the first `QueueFull`. `QueueFull` means\nthe local producer buffer is saturated — raising\n`queue.buffering.max.messages` (via [`Self::extra_client_config`]) or\nlowering [`Self::batch_size`] treats the cause rather than the symptom.",
                       "type": [
                         "integer",
                         "string"
@@ -16343,6 +16432,7 @@
                       "default": -1
                     },
                     "extra_client_config": {
+                      "description": "Raw librdkafka producer properties, applied **last** so they override\neverything this config derives (`acks`, `enable.idempotence`,\n`compression.type`, `linger.ms`, `message.timeout.ms`,\n`queue.buffering.max.messages`). Empty by default.\n\nThe escape hatch for a knob faucet does not model — and the sharp edge\nthat goes with it: overriding a safety property here can weaken\ndelivery guarantees. The only exceptions are the exactly-once\ninvariants (`transactional.id`, `enable.idempotence`, `acks=all`),\nwhich the transactional producer force-sets on top so an override\ncannot break EOS.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -16350,6 +16440,7 @@
                     }
                   },
                   "title": "KafkaSinkConfig",
+                  "description": "Configuration for the Kafka sink connector.\n\nOnly [`brokers`](Self::brokers) and [`topic`](Self::topic) are required;\neverything else has a safe default (`acks: all` + `idempotent: true`).\nValidated at config load by [`validate`](Self::validate).",
                   "type": "object"
                 },
                 true
@@ -16417,7 +16508,7 @@
                       "default": "json"
                     },
                     "batch_size": {
-                      "description": "Max entries per `PutRecords` request (1–500). Default 500.",
+                      "description": "Max entries per `PutRecords` request (1–500). Default 500.\n\n**The house `batch_size = 0` \"no batching\" sentinel does not apply\nhere** — `PutRecords` caps a request at 500 entries, so an unbatched\nwhole-page request is not expressible. `0` (and anything above 500) is\nrejected at config load; pages larger than `batch_size` are re-chunked\ninto several requests (also re-chunked to stay under\n[`Self::max_request_bytes`]).",
                       "type": [
                         "integer",
                         "string"
@@ -17209,7 +17300,7 @@
                       ]
                     },
                     "batch_size": {
-                      "description": "Records per publish batch (1–1000). Default 100.",
+                      "description": "Records per publish batch (1–1000). Default 100.\n\n**The house `batch_size = 0` \"no batching\" sentinel does not apply\nhere** — Pub/Sub caps a single `Publish` request at\n[`MAX_BATCH`](crate::MAX_BATCH) (1000) messages, so an\nunbatched whole-page request is not expressible. `0` (and anything\nabove 1000) is rejected at config load; pages larger than `batch_size`\nare re-chunked into several publishes.",
                       "type": [
                         "integer",
                         "string"

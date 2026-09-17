@@ -603,6 +603,7 @@ mod tests {
             parent_record_key: None,
             records_written: written,
             error: err.map(|s| s.to_string()),
+            error_kind: None,
             metrics: Some(InvocationMetrics {
                 source_kind: "rest".into(),
                 sink_kind: "jsonl".into(),

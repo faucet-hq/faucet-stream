@@ -24,7 +24,7 @@ sink:
 | `partition_key` | `{ type: random }` | See strategies below. |
 | `explicit_hash_key` | `{ type: none }` | `field` / `jsonpath` override — must resolve to a decimal integer in `[0, 2^128)`. |
 | `value_format` | `json` | `json` (serialize the record) \| `string` (record must be a JSON string) \| `bytes` (record must be a base64 string). |
-| `batch_size` | `500` | Entries per `PutRecords` request (hard API cap: 500). |
+| `batch_size` | `500` | Entries per `PutRecords` request (hard API cap: 500). The house `batch_size: 0` "no batching" sentinel does **not** apply — `0` is rejected at config load, since a whole-page request cannot exceed the 500-entry API cap. |
 | `max_record_size_bytes` | `1048576` | Per-record cap (data + partition key; Kinesis hard limit 1 MiB). Oversized records fail per-record, never sent. |
 | `max_request_bytes` | `5242880` | Per-request cap (Kinesis hard limit 5 MiB); batches re-chunk to it. |
 | `concurrency` | `4` | Bounded in-flight `PutRecords` requests. |

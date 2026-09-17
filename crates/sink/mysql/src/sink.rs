@@ -355,12 +355,20 @@ impl MysqlSink {
 
     /// Staging table name used while an overwrite run is in flight.
     fn staging_table_name(&self) -> String {
-        format!("{}__faucet_ovw", self.config.table_name)
+        format!(
+            "{}{}",
+            self.config.table_name,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        )
     }
 
     /// The table the current-target-old is renamed to during the atomic swap.
     fn old_table_name(&self) -> String {
-        format!("{}__faucet_ovw_old", self.config.table_name)
+        format!(
+            "{}{}",
+            self.config.table_name,
+            faucet_core::idempotency::OVERWRITE_STAGING_OLD_SUFFIX
+        )
     }
 
     /// The table the data-write path targets. For `write_mode: overwrite` every

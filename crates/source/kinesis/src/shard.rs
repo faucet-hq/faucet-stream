@@ -16,24 +16,25 @@ use std::time::Duration;
 /// the 2 MB/s/shard read cap, never an error.
 pub(crate) const ERROR_RETRY_BUDGET: u32 = 8;
 
-/// Exponential backoff with deterministic bounds: `base * 2^attempt`, capped
-/// at 30 s. Pure — the jitter (0–25%) is applied by the caller from a hash of
-/// the shard id so tests stay deterministic.
-pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
-    let cap = Duration::from_secs(30);
-    let exp = base.saturating_mul(2u32.saturating_pow(attempt.min(16)));
-    exp.min(cap)
-}
+/// Hard cap on one retry sleep (before jitter). Bounds the exponential so a
+/// long throttle can't stall a shard for minutes while its siblings drain.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Cheap deterministic jitter fraction (0.0–0.25) derived from the shard id,
-/// so concurrent shards don't thundering-herd after a shared throttle event.
-pub(crate) fn jitter_fraction(shard_id: &str) -> f64 {
-    let mut h: u32 = 2166136261;
-    for b in shard_id.as_bytes() {
-        h ^= u32::from(*b);
-        h = h.wrapping_mul(16777619);
-    }
-    f64::from(h % 1000) / 4000.0
+/// Exponential backoff for `attempt` consecutive failures — `base * 2^attempt`
+/// capped at [`MAX_BACKOFF`] — jittered through core's shared decorrelated
+/// helper.
+///
+/// The previous per-shard jitter was a *fixed* 0–25% fraction hashed from the
+/// shard id, which does not break a herd: after one shared throttle event every
+/// shard's retry still landed inside the same narrow window, in the same
+/// relative order, on every attempt. [`faucet_core::retry::apply_jitter`] draws
+/// a fresh `[0.5, 1.5)` factor per call, decorrelated even between two shards
+/// retrying in the same nanosecond (#654 M13).
+pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+    let exp = base
+        .saturating_mul(2u32.saturating_pow(attempt))
+        .min(MAX_BACKOFF);
+    faucet_core::retry::apply_jitter(exp)
 }
 
 /// Where a shard's iterator starts: the persisted bookmark wins, else the
@@ -145,7 +146,6 @@ pub(crate) async fn run_shard(
     tx: tokio::sync::mpsc::Sender<ShardEvent>,
 ) {
     let poll_interval = config.poll_interval();
-    let jitter = jitter_fraction(&shard_id);
     let mut last_sequence = bookmarked_sequence.clone();
     let mut error_attempts: u32 = 0;
 
@@ -231,7 +231,6 @@ pub(crate) async fn run_shard(
                 if service.is_provisioned_throughput_exceeded_exception() {
                     // Expected at the 2 MB/s/shard cap — back off, don't fail.
                     let delay = backoff_delay(poll_interval, error_attempts.min(4));
-                    let delay = delay.mul_f64(1.0 + jitter);
                     tracing::debug!(shard = %shard_id, delay_ms = delay.as_millis() as u64,
                         "kinesis: throughput exceeded; backing off");
                     tokio::time::sleep(delay).await;
@@ -265,7 +264,7 @@ pub(crate) async fn run_shard(
                         .await;
                     return;
                 }
-                let delay = backoff_delay(poll_interval, error_attempts).mul_f64(1.0 + jitter);
+                let delay = backoff_delay(poll_interval, error_attempts);
                 tracing::warn!(shard = %shard_id, error = %service,
                     attempt = error_attempts, delay_ms = delay.as_millis() as u64,
                     "kinesis: GetRecords failed; retrying");
@@ -308,23 +307,42 @@ async fn acquire_iterator(
 mod tests {
     use super::*;
 
-    #[test]
-    fn backoff_doubles_and_caps() {
-        let base = Duration::from_millis(1000);
-        assert_eq!(backoff_delay(base, 0), Duration::from_secs(1));
-        assert_eq!(backoff_delay(base, 1), Duration::from_secs(2));
-        assert_eq!(backoff_delay(base, 3), Duration::from_secs(8));
-        assert_eq!(backoff_delay(base, 10), Duration::from_secs(30), "capped");
-        assert_eq!(backoff_delay(base, u32::MAX), Duration::from_secs(30));
+    /// Assert a jittered delay sits in core's documented `[0.5, 1.5)` band
+    /// around `expected` and never collapses to zero (a zero sleep would turn
+    /// the throttle backoff into a busy-spin against the 5 reads/sec/shard
+    /// budget).
+    fn assert_jittered_around(actual: Duration, expected: Duration) {
+        let lo = expected.mul_f64(0.5);
+        let hi = expected.mul_f64(1.5);
+        assert!(
+            actual >= lo && actual < hi,
+            "delay {actual:?} outside jitter band [{lo:?}, {hi:?}) for {expected:?}"
+        );
+        assert!(!actual.is_zero(), "jittered delay collapsed to zero");
     }
 
     #[test]
-    fn jitter_is_deterministic_and_bounded() {
-        let a = jitter_fraction("shardId-000000000000");
-        let b = jitter_fraction("shardId-000000000001");
-        assert_eq!(a, jitter_fraction("shardId-000000000000"));
-        assert!((0.0..=0.25).contains(&a));
-        assert!((0.0..=0.25).contains(&b));
+    fn backoff_doubles_and_caps_within_the_jitter_band() {
+        let base = Duration::from_millis(1000);
+        assert_jittered_around(backoff_delay(base, 0), Duration::from_secs(1));
+        assert_jittered_around(backoff_delay(base, 1), Duration::from_secs(2));
+        assert_jittered_around(backoff_delay(base, 3), Duration::from_secs(8));
+        // Capped at MAX_BACKOFF, including when `2^attempt` saturates.
+        assert_jittered_around(backoff_delay(base, 10), MAX_BACKOFF);
+        assert_jittered_around(backoff_delay(base, u32::MAX), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_is_decorrelated_across_calls() {
+        // Shards recovering from one shared throttle event must not re-fire in
+        // lockstep — the fixed per-shard fraction this replaced always did
+        // (#654 M13). Identical inputs must not yield an identical delay.
+        let base = Duration::from_millis(1000);
+        let delays: Vec<Duration> = (0..32).map(|_| backoff_delay(base, 2)).collect();
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "every delay identical — jitter is not being applied: {delays:?}"
+        );
     }
 
     #[test]

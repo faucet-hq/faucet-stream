@@ -102,6 +102,13 @@ pub struct KinesisSinkConfig {
     pub value_format: ValueFormat,
 
     /// Max entries per `PutRecords` request (1–500). Default 500.
+    ///
+    /// **The house `batch_size = 0` "no batching" sentinel does not apply
+    /// here** — `PutRecords` caps a request at 500 entries, so an unbatched
+    /// whole-page request is not expressible. `0` (and anything above 500) is
+    /// rejected at config load; pages larger than `batch_size` are re-chunked
+    /// into several requests (also re-chunked to stay under
+    /// [`Self::max_request_bytes`]).
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Per-record size ceiling in bytes (data + partition key; ≤ 1 MiB).

@@ -5285,6 +5285,11 @@ mod tests {
         let sink = TokenCapableButPlainInsertSink {
             attempts: attempts.clone(),
         };
+        // State the premise the regression turned on: this sink DOES advertise
+        // the commit-token protocol, and its plain write is still NOT
+        // replay-safe. Gating on the former is what caused the duplication.
+        assert!(sink.supports_idempotent_writes());
+        assert!(!sink.write_batch_is_replay_safe());
         let pages = futures::stream::iter(vec![Ok(StreamPage {
             records: vec![json!({"a": 1})],
             bookmark: None,

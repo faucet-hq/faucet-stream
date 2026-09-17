@@ -74,6 +74,13 @@ pub struct PubsubSinkConfig {
     pub attributes_field: Option<String>,
 
     /// Records per publish batch (1–1000). Default 100.
+    ///
+    /// **The house `batch_size = 0` "no batching" sentinel does not apply
+    /// here** — Pub/Sub caps a single `Publish` request at
+    /// [`MAX_BATCH`](crate::MAX_BATCH) (1000) messages, so an
+    /// unbatched whole-page request is not expressible. `0` (and anything
+    /// above 1000) is rejected at config load; pages larger than `batch_size`
+    /// are re-chunked into several publishes.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 

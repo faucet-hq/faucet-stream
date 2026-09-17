@@ -69,7 +69,11 @@ impl MssqlSink {
             ));
         }
         let table_quoted = quote_table(&config.table)?;
-        let staging_table_quoted = quote_table(&format!("{}__faucet_ovw", config.table))?;
+        let staging_table_quoted = quote_table(&format!(
+            "{}{}",
+            config.table,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        ))?;
         let pool = build_pool(&config.connection, config.max_connections).await?;
 
         let sink = Self {
@@ -128,7 +132,11 @@ impl MssqlSink {
 
     /// Bare (un-quoted) staging table literal, for `OBJECT_ID(N'…')` lookups.
     fn staging_literal(&self) -> String {
-        format!("{}__faucet_ovw", self.config.table)
+        format!(
+            "{}{}",
+            self.config.table,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        )
     }
 
     /// The bracket-quoted relation the append/insert path targets. For
@@ -824,17 +832,30 @@ pub(crate) enum ChunkFailure {
 /// Azure SQL transient error numbers (connection-level throttling/failover).
 const AZURE_TRANSIENT: &[u32] = &[4060, 40197, 40501, 40613, 49918, 49919, 49920];
 
+/// The pure decision table for a SQL Server error **number**.
+///
+/// Split out from [`classify_chunk_failure`] because `tiberius::error::TokenError`
+/// has no public constructor, so the table is otherwise only reachable with a
+/// live server. Keeping it pure makes the classification itself — the part
+/// that decides whether rows get duplicated or quarantined — unit-testable.
+pub(crate) fn classify_server_code(code: u32) -> ChunkFailure {
+    match code {
+        // Rolled back by the server, so re-running cannot duplicate rows:
+        // 1205 = deadlock victim, 1222 = lock request timeout (never executed).
+        1205 | 1222 => ChunkFailure::RolledBack,
+        // Azure throttle/failover: connection-level, outcome unknown.
+        c if AZURE_TRANSIENT.contains(&c) => ChunkFailure::Infrastructure,
+        // Everything else the server reports is about this row's data.
+        _ => ChunkFailure::RowRejected,
+    }
+}
+
 /// Classify a tiberius failure while the error is still typed.
 pub(crate) fn classify_chunk_failure(e: &tiberius::error::Error) -> ChunkFailure {
     use tiberius::error::Error;
     match e {
         // Server-reported error numbers are the API here.
-        Error::Server(token) => match token.code() {
-            // Rolled back by the server: safe to re-run.
-            1205 | 1222 => ChunkFailure::RolledBack,
-            code if AZURE_TRANSIENT.contains(&code) => ChunkFailure::Infrastructure,
-            _ => ChunkFailure::RowRejected,
-        },
+        Error::Server(token) => classify_server_code(token.code()),
         // Transport/protocol: the session is gone or desynced.
         Error::Io { .. } | Error::Tls(_) | Error::Protocol(_) | Error::Routing { .. } => {
             ChunkFailure::Infrastructure
@@ -1632,5 +1653,41 @@ mod tests {
         let err = quote_columns(&["ok".to_string(), "bad\0name".to_string()])
             .expect_err("NUL is not a legal identifier");
         assert_eq!(err.class, ChunkFailure::Infrastructure);
+    }
+
+    #[test]
+    fn chunk_error_conversions_default_to_infrastructure() {
+        use super::{ChunkError, ChunkFailure};
+        // A plain FaucetError reaching a `?` in the chunk path is, by
+        // definition, not a typed *server* rejection — so it must classify as
+        // infrastructure (propagate) and never as a row rejection (which would
+        // DLQ one arbitrary row and carry on).
+        let ce: ChunkError = FaucetError::Sink("pool checkout failed".into()).into();
+        assert_eq!(ce.class, ChunkFailure::Infrastructure);
+        // Converting back preserves the user-facing error verbatim.
+        let back: FaucetError = ce.into();
+        assert!(back.to_string().contains("pool checkout failed"), "{back}");
+    }
+
+    #[test]
+    fn server_error_numbers_map_to_the_right_handling() {
+        use super::{AZURE_TRANSIENT, ChunkFailure, classify_server_code};
+        // Rolled back server-side → the ONLY class safe to re-run.
+        assert_eq!(classify_server_code(1205), ChunkFailure::RolledBack);
+        assert_eq!(classify_server_code(1222), ChunkFailure::RolledBack);
+        // Azure throttle/failover → propagate, never re-run (outcome unknown),
+        // never blame a row.
+        for code in AZURE_TRANSIENT {
+            assert_eq!(
+                classify_server_code(*code),
+                ChunkFailure::Infrastructure,
+                "code {code}"
+            );
+        }
+        // Anything else the server reports is row-specific → DLQ candidate.
+        // 2627 = unique-constraint violation, the poison row that the old
+        // substring rule misread as transient and propagated forever.
+        assert_eq!(classify_server_code(2627), ChunkFailure::RowRejected);
+        assert_eq!(classify_server_code(8152), ChunkFailure::RowRejected);
     }
 }

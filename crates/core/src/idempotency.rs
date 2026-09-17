@@ -252,6 +252,23 @@ pub const COMMIT_TOKEN_TOKEN_COL: &str = "token";
 pub const ICEBERG_SCOPE_PROP: &str = "faucet.commit-scope";
 pub const ICEBERG_TOKEN_PROP: &str = "faucet.commit-token";
 
+/// Suffix appended to a destination's name to form the staging relation an
+/// in-flight `write_mode: overwrite` run writes into.
+///
+/// Reserved: the overwrite lifecycle creates, truncates, and **drops** whatever
+/// carries this suffix, so a real destination named `<x>__faucet_ovw` would be
+/// destroyed by `abort_overwrite`. Every sink derives its staging name from this
+/// one constant so the reserved set stays enumerable by a collision check or an
+/// orphan sweep (#654 M12).
+pub const OVERWRITE_STAGING_SUFFIX: &str = "__faucet_ovw";
+/// Suffix of the transient relation the *outgoing* destination is renamed to
+/// mid-swap, on backends whose only atomic publish is a rename (MySQL, whose
+/// DDL auto-commits so a transaction cannot span the swap).
+///
+/// Extends [`OVERWRITE_STAGING_SUFFIX`], so a sweep matching the base suffix as
+/// a prefix catches this one too.
+pub const OVERWRITE_STAGING_OLD_SUFFIX: &str = "__faucet_ovw_old";
+
 /// Fit a watermark scope into a length-capped, indexable key column.
 ///
 /// The scope is the pipeline state key — `{name}::{row}` for a root, plus
@@ -490,6 +507,19 @@ mod tests {
         );
         let m: DeliveryMode = serde_json::from_str("\"at_least_once\"").unwrap();
         assert_eq!(m, DeliveryMode::AtLeastOnce);
+    }
+
+    #[test]
+    fn overwrite_staging_suffixes_are_pinned() {
+        // These are on-the-wire relation names: a live destination staged under
+        // the old spelling would be stranded (and the new spelling's relation
+        // dropped) if either value ever moved.
+        assert_eq!(OVERWRITE_STAGING_SUFFIX, "__faucet_ovw");
+        assert_eq!(OVERWRITE_STAGING_OLD_SUFFIX, "__faucet_ovw_old");
+        assert_ne!(OVERWRITE_STAGING_SUFFIX, OVERWRITE_STAGING_OLD_SUFFIX);
+        // An orphan sweep matching the base suffix as a prefix must also catch
+        // the mid-swap relation.
+        assert!(OVERWRITE_STAGING_OLD_SUFFIX.starts_with(OVERWRITE_STAGING_SUFFIX));
     }
 }
 

@@ -7,7 +7,7 @@ use crate::auth_catalog::{AuthCatalog, build_auth_catalog};
 use crate::cli::ScheduleArgs;
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
-use crate::executor::{ExecuteOptions, RunSummary, run_expanded};
+use crate::executor::{ExecuteOptions, InvocationErrorKind, RunSummary, run_expanded};
 use crate::expand::{ExpandedNode, expand};
 use crate::schedule::compiled::CompiledSchedule;
 use crate::schedule::metrics as m;
@@ -336,13 +336,6 @@ fn spawn_run(
     )
 }
 
-/// Display prefix of [`faucet_core::FaucetError::CircuitOpen`]. The per-invocation
-/// typed error is flattened to a string by the executor, so the scheduler matches
-/// on this stable prefix to detect a circuit-open run; the authoritative cooldown
-/// duration is recovered from the run's configured resilience policy (not parsed
-/// out of the message).
-const CIRCUIT_OPEN_PREFIX: &str = "Circuit open after";
-
 /// Classify a joined run task into a scheduler outcome + a log detail. When the
 /// run tripped the circuit breaker, `cooldown` is set to the policy's re-entry
 /// cooldown so the loop can delay the next tick.
@@ -350,14 +343,16 @@ fn classify(
     joined: Result<CliResult<RunSummary>, tokio::task::JoinError>,
     breaker_cooldown: Option<Duration>,
 ) -> RunFinished {
-    // Did any failure indicate a tripped circuit breaker?
+    // Did any failure indicate a tripped circuit breaker? Read off the typed
+    // per-invocation kind (and the typed run-level error), never the rendered
+    // message — a reworded `FaucetError::CircuitOpen` display would otherwise
+    // silently stop the cooldown from applying (#654 M2).
     let circuit_open = match &joined {
         Ok(Ok(summary)) => summary
             .invocations
             .iter()
-            .filter_map(|i| i.error.as_deref())
-            .any(|e| e.starts_with(CIRCUIT_OPEN_PREFIX)),
-        Ok(Err(e)) => e.to_string().contains(CIRCUIT_OPEN_PREFIX),
+            .any(|i| i.error_kind == Some(InvocationErrorKind::CircuitOpen)),
+        Ok(Err(e)) => crate::executor::classify_error(e) == InvocationErrorKind::CircuitOpen,
         Err(_) => false,
     };
     // Recover the typed cooldown through the pure decision helper, using the
@@ -848,6 +843,7 @@ mod tests {
                 } else {
                     None
                 },
+                error_kind: (i < failures).then_some(InvocationErrorKind::Other),
                 metrics: None,
             });
         }
@@ -895,22 +891,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn classify_recovers_cooldown_from_circuit_open_invocation() {
-        // An invocation whose error is the flattened CircuitOpen Display string
-        // is detected; the cooldown is recovered from the configured policy.
-        let circuit_open_msg = faucet_core::FaucetError::CircuitOpen {
-            failures: 3,
-            cooldown: Duration::from_secs(60),
-        }
-        .to_string();
-        let invocations = vec![crate::executor::InvocationOutcome {
+    /// One failed invocation carrying `kind` as its typed classification and
+    /// `msg` as its (irrelevant) rendered text.
+    fn circuit_open_invocations(
+        kind: Option<InvocationErrorKind>,
+        msg: &str,
+    ) -> Vec<crate::executor::InvocationOutcome> {
+        vec![crate::executor::InvocationOutcome {
             row_id: "r0".into(),
             parent_record_key: None,
             records_written: 0,
-            error: Some(circuit_open_msg),
+            error: Some(msg.into()),
+            error_kind: kind,
             metrics: None,
-        }];
+        }]
+    }
+
+    #[test]
+    fn classify_recovers_cooldown_from_circuit_open_invocation() {
+        // An invocation classified `CircuitOpen` is detected; the cooldown is
+        // recovered from the configured policy.
+        let invocations = circuit_open_invocations(
+            Some(InvocationErrorKind::CircuitOpen),
+            &faucet_core::FaucetError::CircuitOpen {
+                failures: 3,
+                cooldown: Duration::from_secs(60),
+            }
+            .to_string(),
+        );
         let joined = Ok(Ok(RunSummary { invocations }));
         let f = classify(joined, Some(Duration::from_secs(45)));
         assert_eq!(f.outcome, RunOutcome::Failure);
@@ -918,21 +926,65 @@ mod tests {
     }
 
     #[test]
+    fn classify_circuit_open_detection_ignores_the_error_text() {
+        // #654 M2: detection must ride the typed kind, so rewording (or
+        // localizing) `CircuitOpen`'s `#[error(...)]` cannot stop the cooldown
+        // from applying …
+        let reworded = circuit_open_invocations(
+            Some(InvocationErrorKind::CircuitOpen),
+            "breaker tripped — wording changed in a dependency bump",
+        );
+        let f = classify(
+            Ok(Ok(RunSummary {
+                invocations: reworded,
+            })),
+            Some(Duration::from_secs(45)),
+        );
+        assert_eq!(f.cooldown, Some(Duration::from_secs(45)));
+
+        // … and conversely, a failure that merely *reads* like a breaker trip
+        // does not earn one.
+        let lookalike = circuit_open_invocations(
+            Some(InvocationErrorKind::Other),
+            "Circuit open after 3 consecutive failures; cooling down for 60s",
+        );
+        let f = classify(
+            Ok(Ok(RunSummary {
+                invocations: lookalike,
+            })),
+            Some(Duration::from_secs(45)),
+        );
+        assert!(f.cooldown.is_none(), "text must not drive the cooldown");
+    }
+
+    #[test]
+    fn classify_detects_circuit_open_from_a_run_level_error() {
+        // A topology run (or any run that fails as a whole) surfaces the typed
+        // `FaucetError` through `CliError::Faucet` instead of a per-invocation
+        // outcome.
+        let joined: Result<CliResult<RunSummary>, tokio::task::JoinError> = Ok(Err(
+            CliError::Faucet(faucet_core::FaucetError::CircuitOpen {
+                failures: 5,
+                cooldown: Duration::from_secs(30),
+            }),
+        ));
+        let f = classify(joined, Some(Duration::from_secs(30)));
+        assert_eq!(f.outcome, RunOutcome::Failure);
+        assert_eq!(f.cooldown, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
     fn classify_circuit_open_without_configured_cooldown_yields_none() {
         // Defensive: a circuit-open run with no configured cooldown (zero)
         // produces no delay rather than a spurious zero-length sleep.
-        let circuit_open_msg = faucet_core::FaucetError::CircuitOpen {
-            failures: 1,
-            cooldown: Duration::from_secs(10),
-        }
-        .to_string();
-        let invocations = vec![crate::executor::InvocationOutcome {
-            row_id: "r0".into(),
-            parent_record_key: None,
-            records_written: 0,
-            error: Some(circuit_open_msg),
-            metrics: None,
-        }];
+        let invocations = circuit_open_invocations(
+            Some(InvocationErrorKind::CircuitOpen),
+            &faucet_core::FaucetError::CircuitOpen {
+                failures: 1,
+                cooldown: Duration::from_secs(10),
+            }
+            .to_string(),
+        );
         let joined = Ok(Ok(RunSummary { invocations }));
         let f = classify(joined, None);
         assert_eq!(f.outcome, RunOutcome::Failure);

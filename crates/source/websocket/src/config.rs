@@ -68,7 +68,11 @@ pub struct WebsocketSourceConfig {
     #[serde(default)]
     pub reconnect: bool,
 
-    /// Fixed wait (seconds) between reconnect attempts. Default 1s.
+    /// Base wait (seconds) for reconnect backoff. Default 1s.
+    ///
+    /// Retries grow **exponentially with jitter** from this base and are
+    /// capped, so a dead endpoint is not dialled at a fixed rate forever.
+    /// Set it to the delay you want before the *first* retry.
     #[serde(
         default = "default_backoff",
         with = "faucet_core::config::duration_secs"

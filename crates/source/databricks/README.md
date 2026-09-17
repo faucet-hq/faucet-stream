@@ -41,7 +41,7 @@ forces billed compute).
 | `parameters` | `[{name, value, type?}]` | `[]` | named `:name` SQL parameters |
 | `wait_timeout_secs` | int | `50` | server wait before async (`0` or `5`–`50`) |
 | `poll_interval_secs` | int | `1` | client poll cadence while running |
-| `batch_size` | int | `1000` | rows per emitted page |
+| `batch_size` | int | `1000` | rows per emitted page; `0` is the "no batching" sentinel — the whole result set is emitted in a single page |
 | `arrow_native` | bool | `false` | fetch as `EXTERNAL_LINKS` + `ARROW_STREAM` and decode Arrow IPC; enables the columnar fast path. Requires the `arrow` feature and `replication: full`. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode). |
 | `replication` | `{ type: full \| incremental, column, initial_value }` | `full` | incremental cursor |
 | `state_key` | string? | derived | explicit bookmark key |

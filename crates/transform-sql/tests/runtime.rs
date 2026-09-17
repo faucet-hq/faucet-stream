@@ -485,3 +485,60 @@ fn reload_on_change_jsonl_picks_up_edits_between_pages() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Compile-time validation must fail CLOSED (#654 H7) ──────────────────────
+
+/// Compile just the config (no page run), returning the validation result.
+fn compile_only(query: &str) -> Result<(), String> {
+    SqlTransform::compile(&SqlTransformConfig {
+        query: query.into(),
+        relations: vec![],
+        memory_limit: None,
+        threads: None,
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn validation_rejects_a_genuinely_missing_table() {
+    // The audit's exact case: the old rule tolerated ANY error whose text
+    // contained "batch", so a join against a table that does not exist was
+    // accepted — the advertised compile-time gate passed and the pipeline
+    // died on page 1 of a real run. The missing table's name deliberately
+    // contains the word "batch".
+    let err = compile_only("SELECT * FROM batch b JOIN daily_batches d USING (id)")
+        .expect_err("a missing table must fail validation");
+    assert!(
+        err.contains("daily_batches"),
+        "the error must name the missing table: {err}"
+    );
+}
+
+#[test]
+fn validation_rejects_syntax_errors_and_unknown_functions() {
+    assert!(compile_only("SELECT * FROM").is_err(), "syntax error");
+    assert!(
+        compile_only("SELECT no_such_fn(id) FROM batch").is_err(),
+        "unknown function"
+    );
+}
+
+#[test]
+fn validation_still_accepts_the_unknown_page_schema() {
+    // `batch`'s columns only exist once the first page arrives, so selecting
+    // them must NOT fail at config-load time — in either DuckDB wording
+    // (unqualified, and qualified through an alias).
+    compile_only("SELECT id, SUM(amount) AS total FROM batch GROUP BY id")
+        .expect("unqualified batch columns are tolerated");
+    compile_only("SELECT b.id, b.amount FROM batch b WHERE b.amount > 0")
+        .expect("qualified batch columns are tolerated");
+}
+
+#[test]
+fn the_validation_placeholder_never_reaches_output() {
+    // Validation registers a zero-row `batch` placeholder; the real run must
+    // replace it, so no placeholder column can appear in transformed records.
+    let out = run("SELECT * FROM batch", vec![json!({"id": 1, "v": "a"})]);
+    assert_eq!(out, vec![json!({"id": 1, "v": "a"})]);
+}

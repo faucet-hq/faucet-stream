@@ -244,3 +244,41 @@ mod tests {
         c.register_handlers();
     }
 }
+
+#[cfg(test)]
+mod missing_table_tests {
+    use super::is_missing_table;
+
+    #[test]
+    fn only_a_typed_object_store_not_found_means_no_table_here() {
+        // A genuinely absent table: object-store NotFound.
+        let absent = deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::NotFound {
+                path: "s3://b/t/_delta_log".into(),
+                source: "no such key".into(),
+            },
+        };
+        assert!(is_missing_table(&absent));
+
+        // The regression this pins (#654 C2): a permission failure whose
+        // rendered text contains "not found"-shaped wording must NOT be read
+        // as "no table here" — doing so made the sink write a fresh
+        // `_delta_log/…0.json` over an EXISTING table and orphan its data
+        // files. Only the typed variant counts now.
+        let denied = deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::Generic {
+                store: "S3",
+                source: "403 AccessDenied: The specified key does not exist".into(),
+            },
+        };
+        assert!(
+            !is_missing_table(&denied),
+            "a 403 must never be mistaken for an absent table"
+        );
+
+        // An explicit NotATable is still the other legitimate signal.
+        assert!(is_missing_table(&deltalake::DeltaTableError::NotATable(
+            "no log".into()
+        )));
+    }
+}

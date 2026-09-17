@@ -123,6 +123,12 @@ pub struct DatabricksSourceConfig {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
     /// Page size — rows accumulated before a `StreamPage` is emitted.
+    /// Defaults to [`DEFAULT_BATCH_SIZE`](faucet_core::DEFAULT_BATCH_SIZE).
+    ///
+    /// `batch_size = 0` is the "no batching" sentinel: result chunks are fully
+    /// drained and the entire result set is emitted in a single page. Useful
+    /// for small lookup tables or for sinks (e.g. SQL `COPY`, BigQuery load
+    /// jobs) that prefer one large request to many small ones.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Fetch results as Apache Arrow instead of JSON. When `true`, the

@@ -198,7 +198,11 @@ impl PostgresSink {
     /// Staging table name used while an overwrite run is in flight (same schema
     /// as the target).
     fn staging_table_name(&self) -> String {
-        format!("{}__faucet_ovw", self.config.table_name)
+        format!(
+            "{}{}",
+            self.config.table_name,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        )
     }
 
     /// The base table name the data-write path targets. For `write_mode:

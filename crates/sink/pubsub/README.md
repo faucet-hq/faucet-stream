@@ -18,7 +18,7 @@ sink:
     value_format: json                # json | string | bytes  (default json)
     ordering_key: { type: field, name: customer_id }   # none | field | jsonpath
     attributes_field: __attributes    # optional: record field -> msg attributes
-    batch_size: 100                   # records per publish batch (1..=1000)
+    batch_size: 100                   # records per publish batch (1..=1000; 0 is rejected — see below)
     concurrency: 4                     # bounded in-flight publishes
 ```
 
@@ -44,6 +44,14 @@ Pub/Sub → Pub/Sub pipeline round-trips attributes.
 
 `json` serializes the whole record; `string` requires a JSON string record
 (raw UTF-8 bytes); `bytes` requires a base64 JSON string (decoded bytes).
+
+### `batch_size`
+
+Records per `Publish` request, `1..=1000`, default `100`. Pages larger than
+`batch_size` are re-chunked into several publishes. The house `batch_size: 0`
+"no batching" sentinel does **not** apply here — Pub/Sub caps a single
+`Publish` at 1000 messages, so a whole-page request is not expressible, and `0`
+(like any value above 1000) is rejected at config load.
 
 ## Delivery semantics — at-least-once
 

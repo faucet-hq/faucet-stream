@@ -124,6 +124,9 @@ complete object — silent data loss otherwise.
 Both checks operate on the **stored** bytes (below decompression), so they work
 unchanged for `compression`-enabled `.gz` / `.zst` objects.
 
+Both keys are named and behave identically across the S3, GCS, and Azure Blob
+sources (Azure exposes no body checksum and rejects `verify_checksum`).
+
 ```yaml
 pipeline:
   source:

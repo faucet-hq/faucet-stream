@@ -440,6 +440,7 @@ pipeline:
                 parent_record_key: None,
                 records_written: 0,
                 error: Some("connection refused".into()),
+                error_kind: None,
                 metrics: None,
             }],
         };
@@ -463,6 +464,7 @@ pipeline:
                 parent_record_key: None,
                 records_written: 0,
                 error: None,
+                error_kind: None,
                 metrics: None,
             }],
         };

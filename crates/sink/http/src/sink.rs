@@ -145,40 +145,27 @@ impl HttpSink {
         for attempt in 0..=self.config.max_retries {
             let req = self.build_request_with_auth(body, auth)?;
 
-            match req.send().await {
+            // One retry path for both failure kinds — a transport error and a
+            // retriable status differ only in how the error is obtained.
+            let err = match req.send().await {
                 Ok(resp) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
                     Ok(_) => return Ok(()),
-                    Err(e) => {
-                        if attempt < self.config.max_retries && e.is_retriable() {
-                            tracing::warn!(
-                                attempt = attempt + 1,
-                                max_retries = self.config.max_retries,
-                                error = %e,
-                                "retrying request"
-                            );
-                            retry_delay(&e, attempt as u32).await;
-                            last_error = Some(e);
-                            continue;
-                        }
-                        return Err(e);
-                    }
+                    Err(e) => e,
                 },
-                Err(e) => {
-                    let faucet_err = FaucetError::Http(e);
-                    if attempt < self.config.max_retries && faucet_err.is_retriable() {
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max_retries = self.config.max_retries,
-                            error = %faucet_err,
-                            "retrying request"
-                        );
-                        retry_delay(&faucet_err, attempt as u32).await;
-                        last_error = Some(faucet_err);
-                        continue;
-                    }
-                    return Err(faucet_err);
-                }
+                Err(e) => FaucetError::Http(e),
+            };
+            if attempt < self.config.max_retries && err.is_retriable() {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_retries = self.config.max_retries,
+                    error = %err,
+                    "retrying request"
+                );
+                retry_delay(&err, attempt as u32).await;
+                last_error = Some(err);
+                continue;
             }
+            return Err(err);
         }
 
         Err(last_error.unwrap_or_else(|| FaucetError::Sink("max retries exhausted".into())))

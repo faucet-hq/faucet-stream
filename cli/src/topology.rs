@@ -752,6 +752,7 @@ pub async fn run_topology(
             parent_record_key: None,
             records_written: *records,
             error: None,
+            error_kind: None,
             metrics: None,
         })
         .collect();
@@ -765,6 +766,10 @@ pub async fn run_topology(
             parent_record_key: None,
             records_written: 0,
             error: n.error.clone(),
+            // A topology node reports its failure as an already-rendered
+            // string (`NodeReport.error`), so there is no typed error left to
+            // classify here.
+            error_kind: None,
             metrics: None,
         });
     }

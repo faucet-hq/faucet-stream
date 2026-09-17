@@ -7,14 +7,38 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+/// Configuration for the Kafka sink connector.
+///
+/// Only [`brokers`](Self::brokers) and [`topic`](Self::topic) are required;
+/// everything else has a safe default (`acks: all` + `idempotent: true`).
+/// Validated at config load by [`validate`](Self::validate).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct KafkaSinkConfig {
+    /// Comma-separated `host:port` bootstrap brokers, passed straight through
+    /// as librdkafka's `bootstrap.servers` (e.g. `"b1:9092,b2:9092"`).
+    /// Required; a blank value is rejected at config load.
     pub brokers: String,
+    /// Destination topic. Either a fixed name
+    /// (`{ type: fixed, name: events }`) or a per-record JSONPath lookup
+    /// (`{ type: from_path, path: "$.dest" }`) for multi-topic routing.
+    /// Required.
     pub topic: KafkaSinkTopic,
+    /// Broker authentication — SASL/PLAIN, SASL/SCRAM, SSL client certs, or
+    /// SASL-over-SSL. Defaults to `{ type: none }` (plaintext brokers only).
     #[serde(default)]
     pub auth: KafkaAuth,
+    /// Encoding applied to each record to produce the message **value**.
+    /// Defaults to `{ type: json }`. The Confluent Schema Registry formats
+    /// (`confluent_avro` / `confluent_protobuf` / `confluent_json_schema`)
+    /// additionally require [`Self::value_schema`] and the crate's
+    /// `schema-registry` feature.
     #[serde(default)]
     pub value_format: KafkaValueFormat,
+    /// Encoding applied to the value extracted at [`Self::key_path`] to
+    /// produce the message **key**. When unset, the extracted value is used
+    /// verbatim as UTF-8 key bytes (numbers and booleans are stringified) —
+    /// set this only when the key needs a real encoder, e.g. a Schema
+    /// Registry format. Ignored when `key_path` is unset (no key is sent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_format: Option<KafkaValueFormat>,
     /// Schema text (Avro `.avsc` JSON, Protobuf `.proto`, or JSON Schema) for
@@ -29,20 +53,62 @@ pub struct KafkaSinkConfig {
     /// those key formats; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_schema: Option<String>,
+    /// JSONPath to the field that becomes each message's key (the first match
+    /// wins). Unset — the default — produces keyless messages, so the broker
+    /// partitions round-robin and log compaction cannot key on them. A path
+    /// that resolves to nothing is handled per [`Self::on_key_error`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_path: Option<String>,
+    /// JSONPath to an explicit destination partition for each message. The
+    /// match must be an integer in `0..=i32::MAX`; anything else fails the
+    /// record with [`FaucetError::Sink`]. Unset — the default — lets
+    /// librdkafka pick the partition from the key (or round-robin when there
+    /// is no key), which is almost always what you want.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_path: Option<String>,
+    /// JSONPath to a flat JSON object whose entries become Kafka message
+    /// headers (values are stringified). Unset by default.
+    ///
+    /// **Not yet applied:** the extraction helper exists and is tested, but
+    /// the produce path does not attach the headers to the outgoing message,
+    /// so setting this currently has no effect on what reaches the broker.
+    /// Carry the values inside the record body until it is wired up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers_path: Option<String>,
+    /// What to do when [`Self::key_path`] resolves to nothing for a record:
+    /// `fail` (default) aborts the batch with [`FaucetError::Sink`], `skip`
+    /// drops the record (counted and warned once per batch), `round_robin`
+    /// sends it with no key and lets the broker place it. Only consulted when
+    /// `key_path` is set.
     #[serde(default)]
     pub on_key_error: OnKeyError,
+    /// Producer-side batch compression, set as librdkafka's
+    /// `compression.type`: `none` (default), `gzip`, `snappy`, `lz4`, or
+    /// `zstd`. `lz4` or `zstd` usually pays for itself on JSON payloads.
     #[serde(default)]
     pub compression: CompressionType,
+    /// Broker acknowledgement level (librdkafka `acks`): `all` (default, every
+    /// in-sync replica), `leader` (leader only), or `none` (fire-and-forget).
+    /// Anything but `all` can lose data on a broker failure, and
+    /// [`Self::idempotent`] requires `all` — that combination is rejected at
+    /// config load.
     #[serde(default = "default_acks")]
     pub acks: Acks,
+    /// Enable the librdkafka idempotent producer (`enable.idempotence`),
+    /// which de-duplicates broker-side retries so a retried send cannot
+    /// append the message twice. Defaults to `true` and requires
+    /// `acks: all`. Independent of `delivery: exactly_once`, which adds a
+    /// transactional producer plus a commit-token side-topic on top.
     #[serde(default = "default_idempotent")]
     pub idempotent: bool,
+    /// How long the producer waits for more messages before sending a batch
+    /// (librdkafka `linger.ms`). Raising it trades latency for larger,
+    /// better-compressed batches. Defaults to 5 ms.
+    ///
+    /// **Config granularity is whole seconds**, so the sub-second default is
+    /// not expressible in YAML — omit the key to keep 5 ms (writing
+    /// `linger: 0` *disables* lingering), and set `linger.ms` through
+    /// [`Self::extra_client_config`] for any other sub-second value.
     #[serde(
         default = "default_linger",
         with = "faucet_core::config::duration_secs"
@@ -70,20 +136,43 @@ pub struct KafkaSinkConfig {
     /// one-shot drains) where forcing additional backpressure adds latency.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Delivery deadline for a single message (librdkafka
+    /// `message.timeout.ms`), in **whole seconds**. Defaults to 30 s. Also
+    /// used as the timeout for `flush()`, for `init_transactions`, and as the
+    /// floor for the exactly-once `transaction.timeout.ms` (which is raised to
+    /// at least 60 s so a long `message_timeout` cannot make
+    /// `init_transactions` reject the producer).
     #[serde(
         default = "default_message_timeout",
         with = "faucet_core::config::duration_secs"
     )]
     #[schemars(with = "u64")]
     pub message_timeout: Duration,
+    /// Hard ceiling on concurrent in-flight sends inside one
+    /// [`Sink::write_batch`](faucet_core::Sink::write_batch) call. Defaults to
+    /// 100 and must be at least 1. When [`Self::batch_size`] is non-zero the
+    /// effective window is `min(max_in_flight, batch_size)`, so this is the
+    /// cap that applies under the `batch_size = 0` sentinel.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
+    /// How long to wait before retrying a send that librdkafka rejected with
+    /// `QueueFull`. Defaults to 100 ms. See
+    /// [`Self::queue_full_max_retries`].
+    ///
+    /// **Config granularity is whole seconds**, so the sub-second default is
+    /// not expressible in YAML — omit the key to keep 100 ms (`0` retries
+    /// immediately with no pause).
     #[serde(
         default = "default_queue_full_backoff",
         with = "faucet_core::config::duration_secs"
     )]
     #[schemars(with = "u64")]
     pub queue_full_backoff: Duration,
+    /// How many times to retry a `QueueFull` send before failing the batch.
+    /// Defaults to 3; `0` fails on the first `QueueFull`. `QueueFull` means
+    /// the local producer buffer is saturated — raising
+    /// `queue.buffering.max.messages` (via [`Self::extra_client_config`]) or
+    /// lowering [`Self::batch_size`] treats the cause rather than the symptom.
     #[serde(default = "default_queue_full_max_retries")]
     pub queue_full_max_retries: u32,
     /// Optional namespace prefix for the producer's auto-derived
@@ -105,15 +194,36 @@ pub struct KafkaSinkConfig {
     /// [`Self::commit_token_topic`]. `-1` means "use the broker default".
     #[serde(default = "default_commit_token_topic_replication")]
     pub commit_token_topic_replication: i32,
+    /// Raw librdkafka producer properties, applied **last** so they override
+    /// everything this config derives (`acks`, `enable.idempotence`,
+    /// `compression.type`, `linger.ms`, `message.timeout.ms`,
+    /// `queue.buffering.max.messages`). Empty by default.
+    ///
+    /// The escape hatch for a knob faucet does not model — and the sharp edge
+    /// that goes with it: overriding a safety property here can weaken
+    /// delivery guarantees. The only exceptions are the exactly-once
+    /// invariants (`transactional.id`, `enable.idempotence`, `acks=all`),
+    /// which the transactional producer force-sets on top so an override
+    /// cannot break EOS.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_client_config: BTreeMap<String, String>,
 }
 
+/// Where each message's destination topic comes from.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KafkaSinkTopic {
-    Fixed { name: String },
-    FromPath { path: String },
+    /// One fixed topic for every record.
+    Fixed {
+        /// Topic name. Must not be blank.
+        name: String,
+    },
+    /// Per-record routing: the topic is read from the record itself.
+    FromPath {
+        /// JSONPath to the topic name (first match wins). A record whose path
+        /// does not resolve fails the batch. Must not be blank.
+        path: String,
+    },
 }
 
 impl Default for KafkaSinkTopic {
@@ -124,11 +234,20 @@ impl Default for KafkaSinkTopic {
     }
 }
 
+/// Broker acknowledgement level required before a send is considered
+/// delivered — librdkafka's `acks`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Acks {
+    /// `acks=0` — fire-and-forget: no acknowledgement is awaited, so a send
+    /// can be silently lost. Fastest and least safe.
     None,
+    /// `acks=1` — the partition leader has written the message; it can still
+    /// be lost if the leader fails before the followers replicate it.
     Leader,
+    /// `acks=all` — every in-sync replica has written the message. The
+    /// default, and the only level compatible with
+    /// [`KafkaSinkConfig::idempotent`].
     #[default]
     All,
 }

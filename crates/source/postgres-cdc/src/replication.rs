@@ -194,7 +194,7 @@ pub async fn ensure_slot(
     let mut conn: PgConnection = opts
         .connect()
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc ensure_slot connect: {e}")))?;
+        .map_err(|e| pg_err("postgres-cdc ensure_slot connect", e))?;
 
     // Check whether the slot already exists.
     let row: Option<(String,)> =
@@ -202,7 +202,7 @@ pub async fn ensure_slot(
             .bind(slot_name)
             .fetch_optional(&mut conn)
             .await
-            .map_err(|e| FaucetError::Source(format!("postgres-cdc slot lookup: {e}")))?;
+            .map_err(|e| pg_err("postgres-cdc slot lookup", e))?;
 
     if row.is_some() {
         debug!("postgres-cdc: replication slot '{slot_name}' already exists");
@@ -230,7 +230,7 @@ pub async fn ensure_slot(
     );
     conn.execute(sql.as_str())
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc create slot: {e}")))?;
+        .map_err(|e| pg_err("postgres-cdc create slot", e))?;
 
     if temporary {
         debug!("postgres-cdc: created temporary replication slot '{slot_name}'");
@@ -262,14 +262,14 @@ pub async fn drop_slot(
     let mut conn: PgConnection = opts
         .connect()
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc drop_slot connect: {e}")))?;
+        .map_err(|e| pg_err("postgres-cdc drop_slot connect", e))?;
 
     let exists: Option<(String,)> =
         sqlx::query_as("SELECT slot_name::text FROM pg_replication_slots WHERE slot_name = $1")
             .bind(slot_name)
             .fetch_optional(&mut conn)
             .await
-            .map_err(|e| FaucetError::Source(format!("postgres-cdc slot lookup: {e}")))?;
+            .map_err(|e| pg_err("postgres-cdc slot lookup", e))?;
     if exists.is_none() {
         debug!("postgres-cdc: replication slot '{slot_name}' already absent; drop is a no-op");
         return Ok(());
@@ -279,7 +279,7 @@ pub async fn drop_slot(
         .bind(slot_name)
         .execute(&mut conn)
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc drop slot: {e}")))?;
+        .map_err(|e| pg_err("postgres-cdc drop slot", e))?;
     debug!("postgres-cdc: dropped replication slot '{slot_name}'");
     Ok(())
 }
@@ -363,7 +363,7 @@ pub async fn advance_slot(
     let mut conn: PgConnection = opts
         .connect()
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc advance_slot connect: {e}")))?;
+        .map_err(|e| pg_err("postgres-cdc advance_slot connect", e))?;
 
     // Bind the slot name and the LSN (as pg_lsn text) as parameters — no string
     // interpolation into the SQL. `format_lsn` emits Postgres' canonical
@@ -373,7 +373,7 @@ pub async fn advance_slot(
         .bind(crate::state::format_lsn(lsn))
         .execute(&mut conn)
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc advance_slot: {e}")))?;
+        .map_err(|e| pg_err("postgres-cdc advance_slot", e))?;
 
     debug!("postgres-cdc: advanced slot '{slot_name}' confirmed_flush_lsn to {lsn:#x}");
     Ok(())
@@ -423,7 +423,7 @@ pub async fn ensure_slot_and_current_lsn(
     let mut conn: PgConnection = opts
         .connect()
         .await
-        .map_err(|e| FaucetError::Source(format!("postgres-cdc capture_position connect: {e}")))?;
+        .map_err(|e| pg_err("postgres-cdc capture_position connect", e))?;
     // Prefer the slot's retained consistent point over the server's current LSN.
     let slot_lsn: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT confirmed_flush_lsn::text, restart_lsn::text \
@@ -432,7 +432,7 @@ pub async fn ensure_slot_and_current_lsn(
     .bind(slot_name)
     .fetch_optional(&mut conn)
     .await
-    .map_err(|e| FaucetError::Source(format!("postgres-cdc slot lsn lookup: {e}")))?;
+    .map_err(|e| pg_err("postgres-cdc slot lsn lookup", e))?;
     let anchor = match slot_lsn {
         Some((confirmed, restart)) => confirmed.or(restart),
         None => None,
@@ -624,8 +624,68 @@ fn quote_literal(s: &str) -> String {
 /// slot momentarily still in use. It clears within a short window, so it is
 /// safe to retry after a backoff (#146 M12).
 pub fn is_slot_active_error(err: &FaucetError) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("is active") || msg.contains("55006")
+    sqlstate_of(err) == Some(SQLSTATE_OBJECT_IN_USE)
+}
+
+/// SQLSTATE `55006` — `object_in_use`. Postgres raises it for
+/// *"replication slot \"…\" is active for PID …"*.
+pub const SQLSTATE_OBJECT_IN_USE: &str = "55006";
+
+/// A Postgres failure that **retains its SQLSTATE**, so retry decisions are
+/// made on the code rather than on rendered text.
+///
+/// SQLSTATE is the documented, stable API; the message is not — it is
+/// localised, it embeds user identifiers (a slot literally named
+/// `orders_is_active` matched the old substring rule), and a `sqlx`/server
+/// reword silently removed the restart-race backoff altogether (#654 H8).
+/// Carried inside [`FaucetError::Custom`], which exists for exactly this kind
+/// of connector-specific wrapping.
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {message}")]
+pub struct PostgresError {
+    /// The five-character SQLSTATE, when the server supplied one.
+    pub sqlstate: Option<String>,
+    context: String,
+    message: String,
+}
+
+impl PostgresError {
+    /// Build one directly, for callers (and tests) that already know the code.
+    pub fn new(
+        sqlstate: Option<String>,
+        context: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            sqlstate,
+            context: context.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Wrap a `sqlx` error, preserving its SQLSTATE. Use this instead of
+/// stringifying at the boundary — once the code is gone it cannot be recovered.
+pub(crate) fn pg_err(context: &str, e: sqlx::Error) -> FaucetError {
+    let sqlstate = e
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.to_string());
+    FaucetError::Custom(Box::new(PostgresError {
+        sqlstate,
+        context: context.to_string(),
+        message: e.to_string(),
+    }))
+}
+
+/// The SQLSTATE carried by a [`PostgresError`], if this error is one.
+fn sqlstate_of(err: &FaucetError) -> Option<&str> {
+    match err {
+        FaucetError::Custom(inner) => inner
+            .downcast_ref::<PostgresError>()
+            .and_then(|pg| pg.sqlstate.as_deref()),
+        _ => None,
+    }
 }
 
 /// Exponential backoff for slot-acquisition retries: `250ms · 2^attempt`,
@@ -776,21 +836,28 @@ mod tests {
     }
 
     #[test]
-    fn is_slot_active_error_classifies_the_postgres_message() {
-        // The canonical Postgres message (SQLSTATE 55006).
-        assert!(is_slot_active_error(&FaucetError::Source(
-            "postgres-cdc start_replication: db error: ERROR: replication slot \"s\" \
-             is active for PID 4242"
-                .into()
-        )));
-        // SQLSTATE code present.
-        assert!(is_slot_active_error(&FaucetError::Source(
-            "55006: replication slot is in use".into()
-        )));
-        // Unrelated errors are NOT slot-active.
+    fn slot_active_is_classified_by_sqlstate_not_message_text() {
+        // SQLSTATE 55006 is the API. The message is not: it is localised and
+        // it embeds the slot name, so a slot literally named
+        // `orders_is_active` used to match the old substring rule, and a
+        // server/driver reword silently removed the restart-race backoff.
+        assert!(is_slot_active_error(&slot_in_use()));
+
+        // Same prose, no SQLSTATE → not classified (text alone proves nothing).
         assert!(!is_slot_active_error(&FaucetError::Source(
-            "connection refused".into()
+            "replication slot \"orders_is_active\" is active for PID 1".into()
         )));
+
+        // A different SQLSTATE is not the slot-in-use condition.
+        assert!(!is_slot_active_error(&FaucetError::Custom(Box::new(
+            PostgresError::new(
+                Some("42P01".to_string()),
+                "postgres-cdc slot lookup",
+                "relation does not exist",
+            )
+        ))));
+
+        // Unrelated error kinds are untouched.
         assert!(!is_slot_active_error(&FaucetError::Config(
             "bad url".into()
         )));
@@ -806,6 +873,15 @@ mod tests {
         assert_eq!(slot_acquire_backoff(64), Duration::from_millis(4000));
     }
 
+    /// The typed slot-in-use error, as the sqlx boundary now produces it.
+    fn slot_in_use() -> FaucetError {
+        FaucetError::Custom(Box::new(PostgresError::new(
+            Some(SQLSTATE_OBJECT_IN_USE.to_string()),
+            "postgres-cdc create slot",
+            "replication slot \"s\" is active for PID 1",
+        )))
+    }
+
     #[tokio::test]
     async fn retry_on_slot_active_retries_then_succeeds() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -814,9 +890,7 @@ mod tests {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 if n < 2 {
-                    Err(FaucetError::Source(
-                        "replication slot \"s\" is active for PID 1".into(),
-                    ))
+                    Err(slot_in_use())
                 } else {
                     Ok::<u32, FaucetError>(42)
                 }
@@ -833,7 +907,7 @@ mod tests {
         let calls = AtomicU32::new(0);
         let result: Result<(), _> = retry_on_slot_active(2, || {
             calls.fetch_add(1, Ordering::SeqCst);
-            async { Err(FaucetError::Source("slot is active".into())) }
+            async { Err(slot_in_use()) }
         })
         .await;
         assert!(result.is_err());

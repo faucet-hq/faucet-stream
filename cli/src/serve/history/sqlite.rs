@@ -3,7 +3,7 @@
 //! shared with Postgres via [`impl_sql_history!`](super::sql).
 
 use super::HistoryError;
-use super::sql::{DDL, Dialect, Stmts, impl_sql_history};
+use super::sql::{DDL, Dialect, Stmts, classify_backend_error_with_context, impl_sql_history};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::str::FromStr;
 use std::time::Duration;
@@ -22,7 +22,9 @@ impl SqliteHistory {
         instance_id: String,
     ) -> Result<Self, HistoryError> {
         let opts = SqliteConnectOptions::from_str(url)
-            .map_err(|e| HistoryError::Backend(format!("invalid sqlite url '{url}': {e}")))?
+            .map_err(|e| {
+                classify_backend_error_with_context(&format!("invalid sqlite url '{url}'"), e)
+            })?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(5));
@@ -30,12 +32,11 @@ impl SqliteHistory {
             .max_connections(5)
             .connect_with(opts)
             .await
-            .map_err(|e| HistoryError::Backend(format!("SQLite connection failed: {e}")))?;
+            .map_err(|e| classify_backend_error_with_context("SQLite connection failed", e))?;
         for stmt in DDL {
-            sqlx::query(stmt)
-                .execute(&pool)
-                .await
-                .map_err(|e| HistoryError::Backend(format!("creating run-history schema: {e}")))?;
+            sqlx::query(stmt).execute(&pool).await.map_err(|e| {
+                classify_backend_error_with_context("creating run-history schema", e)
+            })?;
         }
         Ok(Self::from_parts(
             pool,
@@ -82,6 +83,43 @@ mod shard_tests {
 
     fn url_in(dir: &std::path::Path) -> String {
         format!("sqlite://{}/h.db", dir.display())
+    }
+
+    #[tokio::test]
+    async fn connect_failures_carry_a_typed_permanent_verdict() {
+        use crate::serve::history::Transience;
+        // An unknown query parameter fails `SqliteConnectOptions::from_str`
+        // (`sqlx::Error::Configuration`) …
+        let err = SqliteHistory::connect(
+            "sqlite://h.db?nonsense=1",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            "a".into(),
+        )
+        .await
+        .err()
+        .expect("a bogus query parameter must not connect");
+        assert_eq!(err.transience(), Transience::Permanent);
+        assert!(
+            !err.is_retriable(),
+            "the connect gate must fail fast on a misconfigured URL rather than \
+             spending its whole retry budget: {err}"
+        );
+        assert!(err.to_string().contains("invalid sqlite url"));
+
+        // … and an unreachable directory fails the pool connect itself
+        // (SQLITE_CANTOPEN), which is equally permanent.
+        let err = SqliteHistory::connect(
+            "sqlite://no/such/dir/h.db",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            "a".into(),
+        )
+        .await
+        .err()
+        .expect("an unreachable path must not connect");
+        assert_eq!(err.transience(), Transience::Permanent);
+        assert!(err.to_string().contains("SQLite connection failed"));
     }
 
     #[tokio::test]
