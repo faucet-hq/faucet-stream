@@ -138,6 +138,21 @@ migration.
 
 ### A new source↔sink fidelity pair
 
+Two pairs exist as references:
+
+- **`crates/sink/jsonl/tests/fidelity.rs`** — the strictest, and the control for
+  the whole category. A JSONL file has no schema, no column types and no
+  affinity rules, so nothing can be excused as a destination limitation: the
+  assertion carries **no tolerance at all**. If a value survives here but not in
+  a typed destination, the loss belongs to that destination; if it fails here,
+  the loss is faucet's.
+- **`crates/sink/sqlite/tests/fidelity.rs`** — a typed destination. Its
+  JSON-document mode is exactly lossless; its auto-mapped mode is not, and the
+  test names each reason (SQLite has no boolean type, so `true`/`false` become
+  `1`/`0`; negative zero loses its sign through a TEXT-affinity column) and pins
+  the observed values so a future change that drops those columns entirely
+  cannot hide behind the tolerance.
+
 Use the shared corpus so the pair cannot quietly pick easier data:
 
 ```rust
