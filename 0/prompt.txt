@@ -1087,3 +1087,114 @@ If this event is something the user would act on now, send a PushNotification. R
 ---
 
 based on the new principles we defined, evaluate the whole project and check whether there are any improvement areas or something we should fix
+
+---
+
+<task-notification>
+<task-id>af612f92968bd4e80</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-c-sikawats-Documents-GitHub-Personal-faucet-stream/2e42fef2-d7da-4f6e-97b1-064e451b2570/tasks/af612f92968bd4e80.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit P2/P5 duplication + hidden state" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result># Audit — Principle 2 (correctness lives once) &amp; Principle 5 (no hidden state / magic strings)
+
+Branch `feat/native-byte-passthrough-633`. Read-only; nothing modified.
+
+---
+
+## HIGH
+
+**H1. MSSQL sink runs its own retry loop that defeats core's deliberate no-retry-on-non-idempotent-write rule.**
+`crates/sink/mssql/src/sink.rs:795` (`is_transient_error`), `:806` (`TRANSIENT_RETRIES`), `:866-903` (loop)
+Core primitive: `crates/core/src/resilience/execute.rs:52` `execute_with_policy_metered` + `crates/core/src/resilience/classify.rs:85` `classify`, driven from `crates/core/src/pipeline.rs:1218-1232`.
+Drift risk: core's `with_retry_write!` macro *intentionally refuses* to retry `write_batch` unless `supports_idempotent_writes()`, with the comment "if the request commits server-side but the response is lost, a pipeline-level retry silently duplicates every row — the repo's #1 worst bug class (F29/F32)". The MSSQL copy retries a plain multi-row `INSERT` on `m.contains("timeout")` — precisely the commit-then-lost-response case — so it re-introduces the duplicate-row bug core was written to prevent, and does so *inside* the sink where the pipeline's guard cannot see it. It also grepped classification (P6: `contains("connection")` matches a permanent `connection_url` config error → 3 futile retries), has no jitter, no cancellation token, and multiplies the outer policy's attempt budget (3 × policy attempts).
+
+**H2. BigQuery sink *strips* backticks where the BigQuery source *escapes* them — two incompatible quoting rules for one dialect, plus two more inline copies.**
+`crates/sink/bigquery/src/idempotent.rs:124` (`replace('`', "")`) vs `crates/source/bigquery/src/stream.rs:280` (`replace('\\', r"\\").replace('`', r"\`")`); bypassed again inline at `crates/sink/bigquery/src/sink.rs:1399-1400` and `:2243`.
+Core primitive: `crates/core/src/util.rs:21` `quote_ident` is ANSI-only, so the dialect helper belongs in the existing pair crate `crates/common/bigquery/src/lib.rs` (which currently exports only credentials + `build_client`).
+Drift risk: the sink's helper justifies stripping with "the schema came from BigQuery", but it is applied to **user-supplied** identifiers — `write.key` columns at `merge.rs:51,100,284` and cleanup scope columns at `merge.rs:275` — and to `project_id`/`dataset_id` at `sink.rs:1399`. Stripping silently rewrites an identifier instead of failing (a key column named `` a`b `` becomes `ab`, targeting the wrong column in a `MERGE` predicate), and unlike the source path it never escapes backslashes. Three rules, one dialect: a fix to any one leaves the other two wrong.
+
+**H3. HTTP sink retries with *zero* backoff — an immediate hot loop — and retries a non-idempotent POST.**
+`crates/sink/http/src/sink.rs:121-161` (`send_with_retry`; the retry arms `continue` with no `sleep` at all)
+Core primitive: `crates/core/src/retry.rs:52` `backoff_with_jitter` / `crates/core/src/resilience/execute.rs:34` `execute_with_policy`.
+Drift risk: on a 503 the sink re-fires `max_retries` requests back-to-back within microseconds — the exact thundering-herd/amplification that core's capped, jittered backoff exists to prevent, and it converts a brief upstream blip into an outage-amplifying burst. It uses the typed `is_retriable()` (good), so only the *timing* half of the primitive was reimplemented — the half with all the edge cases (60 s cap, `[0.5,1.5)` jitter, cancel-aware sleep).
+
+**H4. ClickHouse source derives its durable state-store key from `DefaultHasher`.**
+`crates/source/clickhouse/src/stream.rs:201-224` (`default_state_key`, `DefaultHasher` at `:210`)
+Core primitive: `crates/core/src/shard.rs:321` `shard_hash` (FNV-1a, documented "deterministic across processes and platforms"); `crates/auth/src/oauth2.rs:325` already ships `fnv1a_64` with the rationale comment "*unlike `DefaultHasher`, whose value is not contractually stable*".
+Drift risk: `DefaultHasher`'s output is explicitly not stable across Rust releases. A toolchain bump (this repo pins latest stable and bumps it routinely) silently changes the default state key → the bookmark is orphaned → the next run re-replicates the table from scratch (duplicate rows into an append sink) with a green exit code. The identical concern was already reasoned about and solved twice in this workspace; this connector did not consume either.
+
+---
+
+## MEDIUM
+
+**M5. Four independent, unjittered backoff implementations in connectors; core's jitter helper is `pub(crate)` so it cannot be consumed.**
+`crates/sink/kinesis/src/sink.rs:33` and `crates/sink/sqs/src/sink.rs:31` (byte-identical `backoff_delay(initial_ms, max_ms, attempt)`), `crates/source/grpc/src/stream.rs:786` (`next_backoff`), `crates/source/kinesis/src/shard.rs:22,30` (bespoke `backoff_delay` + `jitter_fraction`).
+Core primitive: `crates/core/src/retry.rs:52` `backoff_with_jitter`; `crates/core/src/resilience/policy.rs:21` `BackoffKind::delay`. Structural root cause: `crates/core/src/retry.rs:98` `apply_jitter` is `pub(crate)`, so a connector that computes its own base delay has no way to reuse the tested jitter — which is why four copies exist.
+Drift risk: core's own doc on `backoff_with_jitter` names it — "*this is exactly how the range-bias / no-cap bugs crept into a copy*", and `jitter_factor`/`decorrelate` carry comments about two specific bugs already fixed there (a 1e9-vs-`u32::MAX` divisor that capped every factor at 0.733, and same-nanosecond retry alignment). None of those fixes reached these four copies: all 500 partially-failed `PutRecords` entries across concurrent shard workers retry in lockstep.
+
+**M6. WebSocket reconnect backoff is *constant* — no exponential growth and no cap.**
+`crates/source/websocket/src/stream.rs:190` (`let backoff = self.config.reconnect_backoff;`), slept unchanged at `:224` and `:365`
+Core primitive: `crates/core/src/retry.rs:52` `backoff_with_jitter(base, attempt)`.
+Drift risk: with the default `reconnect_max_attempts: None`, a dead endpoint is dialed once per second indefinitely — no growth toward the 60 s ceiling every other retry path in the repo honours. The gRPC source (`stream.rs:786`) at least doubles; the same subsystem in a sibling connector does not, which is the definition of a guarantee that lives in the wrong place.
+
+**M7. `sql_literal` — the SQL-injection escaping boundary — exists three times with three different escape conventions.**
+`crates/core/src/write_mode.rs:121` (`''` doubling, ANSI), `crates/source/rest/src/stream.rs:371` (`\'` backslash + *unquoted* datetimes), `crates/common/clickhouse/src/lib.rs:239` (`\\`+`\'`, bool→`1`/`0`)
+Core primitive: the ANSI one at `write_mode.rs:121` — but it is a private `fn`, so no connector can reuse it. The bind-parameter alternative that removes escaping from the equation entirely is `crates/core/src/util.rs:164` `substitute_context_bind_params`.
+Drift risk: one name, three meanings (also P8). `\'` is not valid escaping in standard SQL — a value containing `'` survives unescaped into the predicate. Worse, `crates/source/clickhouse/src/stream.rs:138` `substitute_context_sql` applies `String::replace` per context entry **over the already-substituted output**, so a substituted value containing `{other_key}` is re-substituted on a later iteration (second-order injection), and `HashMap` iteration order makes it nondeterministic. Core's `substitute_context_bind_params` is a single left-to-right pass precisely so a substituted value is never re-scanned.
+
+**M8. The `__faucet_ovw` reserved staging-name suffix is an inline literal in six sinks, with a seventh spelling.**
+`crates/sink/postgres/src/sink.rs:201`, `crates/sink/sqlite/src/sink.rs:302`, `crates/sink/mysql/src/sink.rs:358` **and `:363` (`__faucet_ovw_old`)**, `crates/sink/mssql/src/sink.rs:72,131`, `crates/sink/mongodb/src/sink.rs:321`, `crates/sink/bigquery/src/sink.rs:797`
+Core primitive: the established pattern is `crates/core/src/idempotency.rs:245` `COMMIT_TOKEN_TABLE` — one named, documented, exported reserved identifier (which `crates/sink/redis/src/sink.rs:193` correctly consumes).
+Drift risk: P5 verbatim — a reserved key that the overwrite commit/abort lifecycle depends on, defined in seven places instead of one. MySQL already needed a second member of the family (`_ovw_old`) and coined it locally, so the reserved-name *set* is no longer enumerable: a collision check, a docs list, or an orphan-staging sweep cannot know what names to look for, and a user table literally named `orders__faucet_ovw` is silently destroyed by `abort_overwrite`.
+
+**M9. The CLI re-declares core's `CdcUnwrapSpec` field-for-field, including a second definition of the reserved `"__op"` default (and `faucet-conformance` a third).**
+`cli/src/transforms.rs:270-306` (`cdc_marker_field` → `"__op"`) duplicating `crates/core/src/stage.rs:674-703` (`cdc_default_marker_field` → `"__op"`); third copy at `crates/conformance/src/doubles.rs:29` `DELETE_MARKER_FIELD`
+Core primitive: `crates/core/src/stage.rs` `CdcUnwrapSpec` itself (already `Deserialize + JsonSchema`, so the CLI can decode into it directly), and the marker default should be one exported `pub const`.
+Drift risk: this is the reserved key that `WriteSpec::delete_marker` matches against (`crates/core/src/write_mode.rs:47`) — if the two defaults ever diverge, a CDC→upsert pipeline stamps `__op` and the sink looks for something else, so **deletes silently become inserts** with no error. The copies have *already* drifted in the documentation: core's `delete_ops` doc claims "Default covers all three CDC vocabularies" while both implementations return only `["d", "delete"]`.
+
+**M10. Redshift sink reimplements core's staging CSV serializer and its RFC-4180 quoter.**
+`crates/sink/redshift/src/copy.rs:152` (`quote_csv`) and `:161` (`serialize_csv`)
+Core primitive: `crates/core/src/staging.rs:322` `serialize_records(records, StagingFormat::Csv)` and its private `csv_field` at `:391`.
+Drift risk: `quote_csv` is byte-identical to core's `csv_field` — the escaping half is a pure copy. They diverge on structure (core emits a header and a first-seen-order union of keys; Redshift needs a caller-supplied column list and no header), which is the case P2 covers explicitly: *"if the primitive doesn't exist yet but is generic, add it to core and consume it from the connector — in the same PR."* Instead the primitive stayed private and was copied. A CSV-escaping fix (e.g. embedded NUL, or `\r` alone) applied to the staging path will not reach the Redshift `COPY` path.
+
+**M11. SQLite and MySQL dialect identifier quoting is duplicated source↔sink, against the repo's own `faucet-common-*` convention.**
+`crates/source/sqlite/src/stream.rs:35` ≡ `crates/sink/sqlite/src/sink.rs:24`; `crates/source/mysql/src/stream.rs:29` ≡ `crates/sink/mysql/src/sink.rs:31` (all four byte-identical)
+Core primitive: the house pattern is `crates/common/mssql/src/config.rs:168` `quote_ident_mssql` and `crates/common/spanner/src/lib.rs:235` `quote_ident_spanner` — one dialect quoter per pair, in the `-common` crate.
+Drift risk: MSSQL's shared version carries a NUL-byte rejection that neither backtick copy has, which is exactly the kind of hardening that lands in one copy and not the other. Both MSSQL and Spanner pairs already solved this the right way; these two pairs are the outliers, and identifier quoting is the SQL-injection boundary for every dynamically-built `CREATE`/`INSERT`/`MERGE` in both crates.
+
+---
+
+## LOW
+
+**L12. `__unchanged_toast__` is smuggled into the record payload with no declared constant.**
+`crates/source/postgres-cdc/src/stream.rs:744` (`o.insert("__unchanged_toast__".into(), …)`)
+Core primitive: the reserved-key pattern is `crates/core/src/idempotency.rs:245-253` (named `pub const` + doc comment); the typed alternative is the `_faucet_*` metadata layer at `crates/core/src/metadata.rs`.
+Drift risk: P5's "double-underscore key smuggling" case exactly — a control-flow-bearing field name (downstream consumers must know which columns are TOAST placeholders rather than real values) that exists as a bare literal in one expression, documented nowhere, and not excluded by `cdc_unwrap`, quality checks, or schema-drift diffing. It will reach a sink as a real column. (Same class, smaller blast radius: the test-local `ansi_quote` copy at `crates/core/src/shard.rs:459` re-derives `util::quote_ident` inside core itself to "keep this module self-contained" — a copy of the very primitive one module over.)
+
+---
+
+## Verified correct
+
+**Core primitives that ARE properly shared (spot-checked, no connector copies found):**
+- **`plan_writes` / `WriteSpec`** — every one of the 8 upsert sinks calls `faucet_core::plan_writes` (bigquery `:1842,1932,2371`, sqlite `:1021,1079,1125`, mongodb `:810,888,956`, postgres `:1067,1146,1197`, mysql `:1240,1304,1350`, spanner `:596,1072`). Zero local key-partitioning or last-write-wins dedup. Textbook P2.
+- **`drift::diff_schema`** — no connector diffs schemas itself; the SQL sinks only supply `current_schema()` and explicitly document that it "round-trips with `faucet_core::diff_schema`" (postgres `:135`, mysql `:245`, sqlite `:200`, mssql `:768`). The CLI read paths (`commands/plan.rs:208`, `serve/history/catalog.rs:398`) also consume it.
+- **`shard::{plan_pk_shards, plan_hash_shards, shard_hash, PkShardBounds}`** — s3 `stream.rs:676`, sqlite `:418`, postgres `:441` all delegate; no local range-tiling or modulo-assignment.
+- **`replication::{filter_incremental, max_replication_value, json_gt}`** — consumed directly (e.g. clickhouse `stream.rs:14`); bookmark ordering is not reimplemented anywhere.
+- **`retry::backoff_with_jitter`** — the REST source is the model consumer: `crates/source/rest/src/retry/backoff.rs:58` keeps only the 429/`Retry-After`-specific loop and delegates the sleep computation, with a standing comment at `:74-77` explaining why ("so the jitter bug fixed in core can never diverge in a copy here"). `rest/src/auth/token_endpoint.rs:321` does the same.
+- **`idempotency::COMMIT_TOKEN_TABLE`** — reused rather than re-spelled by `crates/sink/redis/src/sink.rs:193` and referenced by doc-link from mongodb `:60,510,906`.
+- **`util::substitute_context`** — `crates/source/parquet/src/stream.rs:592` is a thin empty-context short-circuit over the core call, not a copy.
+
+**Global/shared state judged sanctioned:**
+- `crates/core/src/redact.rs:29` `HOOK: OnceLock&lt;Redactor&gt;` — a first-wins process-wide *install hook*, the explicitly sanctioned shape; identity function when unset, so library users are unaffected.
+- `crates/core/src/observability/decorator.rs:619`, `otel.rs:292` — `OnceLock` guards around `metrics::set_global_recorder` / the OTel provider, which are themselves process-global by API contract. Documented at `timer.rs:89`.
+- `crates/core/src/state.rs:214-215` `PROC_TOKEN` + `SEQ` — process *identity* (random v4 UUID) for atomic-rename temp filenames, not a cache. The comment documents why PID-derived tokens corrupt state on shared volumes (F50).
+- `crates/core/src/retry.rs:62` `COUNTER: AtomicU64` — a monotonic decorrelation counter for jitter; holds no meaning, cannot go stale.
+- `crates/core/src/compression.rs:248` `SEEN` — a log-dedup set, not a behavioral cache, and already bounded by a named, rationale-carrying `MAX_SEEN: usize = 4096` (#146 R). Borderline (it is process-global, so two unrelated `serve` pipelines share warn suppression) but it cannot affect data correctness.
+- `crates/source/s3/src/verify.rs:18-20`, `crates/source/gcs/src/verify.rs:18`, `crates/core/src/masking/detect.rs:23,33` — immutable `static` CRC tables and compiled regexes. Not mutable state.
+- Instance-owned `OnceCell`/atomics are the *correct* pattern and are used as such: `crates/source/rest/src/stream.rs:72` `metadata_xml_cache`, `crates/sink/bigquery/src/sink.rs:551,559,571` (`table_ready`, `overwrite_setup`, `gcs_store`), `crates/source/redis/src/stream.rs:17`, `crates/source/nats/src/stream.rs:32`, `crates/sink/clickhouse/src/sink.rs:24` `stage_seq`. All die with the connector instance.
+- `crates/sink/kafka/src/config.rs:174-177` — the `__faucet_commit_token` topic name diverging from core's `_faucet_commit_token` table constant is documented as deliberate (mirrors Kafka's own `__consumer_offsets` internal-topic convention). Sanctioned; contrast with M8, which has no such rationale anywhere.
+- `crates/source/mssql/src/stream.rs:80` `bracket_quote` — a local infallible quoter, but with an explicit doc comment stating the NUL-freeness was already validated by the shared `quote_ident_mssql` at enumeration time. Justified narrowing of a shared primitive, not a blind copy.</result>
+<usage><subagent_tokens>209329</subagent_tokens><tool_uses>41</tool_uses><duration_ms>390902</duration_ms></usage>
+</task-notification>
