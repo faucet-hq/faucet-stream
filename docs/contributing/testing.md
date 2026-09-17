@@ -18,6 +18,16 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
   [`testcontainers`](https://docs.rs/testcontainers) (these need Docker and are
   CI-gated).
 
+There is a third kind that is neither: the **engine guarantee suites** in
+`crates/conformance/tests/reliability_*.rs`. A guarantee like "the bookmark is
+persisted only after the sink confirms" is a property of the *order* in which
+the engine calls two collaborators, which neither a pure unit test nor a
+per-connector test can observe. Those suites drive the real `Pipeline::run`
+against doubles that fail at one named boundary and assert on the recorded event
+sequence. They are Docker-free, run in seconds, and are a **required** CI check.
+See [Reliability testing](../book/src/operations/reliability-testing.md) for the
+tier map and how to add a guarantee.
+
 ## The coverage gate
 
 Changed lines must be **≥95% covered**. The gate that enforces it is the
@@ -91,6 +101,7 @@ cargo llvm-cov --workspace --all-features   # then intersect with your diff
 
 ## Related
 
+- [Reliability testing](../book/src/operations/reliability-testing.md)
 - [Testing standards](../standards/testing.md)
 - [Debugging](./debugging.md)
 - [Common mistakes](./common-mistakes.md)

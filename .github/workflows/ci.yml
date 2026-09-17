@@ -227,6 +227,37 @@ jobs:
         # the OpenAPI two-way sync test runs against the console-enabled router.
         run: cargo test -p faucet-cli --features serve-ui --test serve_ui --test serve_openapi
 
+  # #651 Category A/G — the reliability gate. Deliberately separate from `test`:
+  # `test` runs the whole workspace including every testcontainer suite, takes
+  # ~25 min, and is NOT a required check. The guarantees this job covers (no
+  # loss, no duplication, atomic refresh, cleanup never deletes on a partial
+  # run, state written by a release stays readable) are the ones a regression in
+  # would corrupt data silently, so they get a fast, Docker-free, REQUIRED job
+  # that cannot be skipped or flake on an image pull.
+  reliability:
+    name: Reliability guarantees
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Engine guarantee suites (Category A) + state-format gates (Category G)
+        # No Docker, no network: the scripted doubles inject failures at exact
+        # engine boundaries, so these run in seconds and never flake.
+        run: cargo test -p faucet-conformance --all-features
+      - name: Engine unit suites backing the same guarantees
+        # `faucet-core`'s own in-file suites cover the DLQ routing/budget matrix
+        # and the masking-before-DLQ ordering, which the Category A5/A7 audit
+        # found already covered there rather than duplicating.
+        run: cargo test -p faucet-core --all-features
+
   # Safety net for frontend-only PRs (serve console assets). When a PR touches
   # ONLY cli/src/serve/ui/** the whole Rust matrix is skipped (code == false),
   # so this one small job rebuilds the embedded console and runs the serve-ui /

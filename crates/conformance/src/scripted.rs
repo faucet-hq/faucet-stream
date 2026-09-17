@@ -231,6 +231,7 @@ pub struct ScriptedSink {
     replay_safe: bool,
     keyed: bool,
     overwrite: bool,
+    cleanup: bool,
     /// Commit token last stored per scope, for `last_committed_token`.
     tokens: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Delay injected into each write, for backpressure / latency tests.
@@ -251,6 +252,7 @@ impl ScriptedSink {
             replay_safe: false,
             keyed: false,
             overwrite: false,
+            cleanup: false,
             tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
             write_delay: None,
         }
@@ -293,6 +295,13 @@ impl ScriptedSink {
     /// Advertise the overwrite lifecycle so `begin`/`commit`/`abort` are driven.
     pub fn overwrite(mut self) -> Self {
         self.overwrite = true;
+        self
+    }
+
+    /// Advertise scoped-cleanup support, so the engine drives `cleanup_scope`
+    /// after a successful run and a test can observe whether it fired.
+    pub fn cleanup(mut self) -> Self {
+        self.cleanup = true;
         self
     }
 
@@ -450,6 +459,22 @@ impl Sink for ScriptedSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.log.push(Event::AbortOverwrite);
         Ok(())
+    }
+
+    fn supports_cleanup(&self) -> bool {
+        self.cleanup
+    }
+
+    async fn cleanup_scope(
+        &self,
+        _scope: &std::collections::BTreeMap<String, Value>,
+        seen: &faucet_core::cleanup::SeenKeys,
+    ) -> Result<u64, FaucetError> {
+        // Logging the *tracked key count* is what makes the safety property
+        // assertable: a cleanup that fired at all is already the bug when the
+        // run did not complete, regardless of how many rows it would delete.
+        self.log.push(Event::Cleanup(seen.keys().len()));
+        Ok(0)
     }
 
     fn config_schema(&self) -> Value {
