@@ -1416,3 +1416,9 @@ If this event is something the user would act on now, send a PushNotification. R
 <status>completed</status>
 <summary>Monitor "CI checks landing on PR 656" stream ended</summary>
 </task-notification>
+
+---
+
+https://github.com/faucet-hq/faucet-stream/issues/651
+
+Let's solve this now completely.
