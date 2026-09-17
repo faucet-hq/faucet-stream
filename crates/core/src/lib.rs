@@ -182,7 +182,7 @@ pub use window::{
 };
 pub use write_mode::{
     DeleteMarker, KeyTuple, OverwriteScope, WriteMode, WritePlan, WriteSpec, key_to_doc_id,
-    key_to_filter, plan_writes,
+    key_to_filter, plan_writes, sql_literal,
 };
 #[cfg(feature = "transform-zip-columns")]
 pub use zip_columns::{CompiledZipColumns, ZipColumnsSpec};

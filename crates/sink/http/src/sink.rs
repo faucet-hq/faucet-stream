@@ -32,6 +32,27 @@ pub struct HttpSink {
     auth_provider: Option<SharedAuthProvider>,
 }
 
+/// Base delay for a retried request; the cap and jitter come from
+/// [`faucet_core::retry::backoff_with_jitter`], so this sink cannot drift from
+/// the rest of the repo's backoff behaviour.
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sleep before re-sending. A `RateLimited` error carries the server's own
+/// `Retry-After`, which always wins; everything else gets capped, jittered
+/// exponential backoff. Retrying with **no** delay (the previous behaviour)
+/// turned a brief upstream 503 into an amplifying burst of requests within
+/// microseconds — the thundering herd core's backoff exists to prevent.
+fn retry_wait(err: &FaucetError, attempt: u32) -> std::time::Duration {
+    match err {
+        FaucetError::RateLimited(d) => *d,
+        _ => faucet_core::retry::backoff_with_jitter(RETRY_BASE, attempt),
+    }
+}
+
+async fn retry_delay(err: &FaucetError, attempt: u32) {
+    tokio::time::sleep(retry_wait(err, attempt)).await;
+}
+
 impl HttpSink {
     /// Create a new HTTP sink from the given configuration.
     pub fn new(config: HttpSinkConfig) -> Self {
@@ -124,38 +145,27 @@ impl HttpSink {
         for attempt in 0..=self.config.max_retries {
             let req = self.build_request_with_auth(body, auth)?;
 
-            match req.send().await {
+            // One retry path for both failure kinds — a transport error and a
+            // retriable status differ only in how the error is obtained.
+            let err = match req.send().await {
                 Ok(resp) => match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
                     Ok(_) => return Ok(()),
-                    Err(e) => {
-                        if attempt < self.config.max_retries && e.is_retriable() {
-                            tracing::warn!(
-                                attempt = attempt + 1,
-                                max_retries = self.config.max_retries,
-                                error = %e,
-                                "retrying request"
-                            );
-                            last_error = Some(e);
-                            continue;
-                        }
-                        return Err(e);
-                    }
+                    Err(e) => e,
                 },
-                Err(e) => {
-                    let faucet_err = FaucetError::Http(e);
-                    if attempt < self.config.max_retries && faucet_err.is_retriable() {
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            max_retries = self.config.max_retries,
-                            error = %faucet_err,
-                            "retrying request"
-                        );
-                        last_error = Some(faucet_err);
-                        continue;
-                    }
-                    return Err(faucet_err);
-                }
+                Err(e) => FaucetError::Http(e),
+            };
+            if attempt < self.config.max_retries && err.is_retriable() {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_retries = self.config.max_retries,
+                    error = %err,
+                    "retrying request"
+                );
+                retry_delay(&err, attempt as u32).await;
+                last_error = Some(err);
+                continue;
             }
+            return Err(err);
         }
 
         Err(last_error.unwrap_or_else(|| FaucetError::Sink("max retries exhausted".into())))
@@ -547,5 +557,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(req.method(), reqwest::Method::PUT);
+    }
+
+    #[test]
+    fn retry_wait_prefers_the_servers_retry_after_then_falls_back_to_jittered_backoff() {
+        use super::{RETRY_BASE, retry_wait};
+        use std::time::Duration;
+
+        // A server-supplied Retry-After always wins — guessing over it is how
+        // you get throttled harder.
+        let after = Duration::from_secs(7);
+        assert_eq!(retry_wait(&FaucetError::RateLimited(after), 3), after);
+
+        // Everything else gets core's capped, jittered exponential backoff.
+        // Jitter is [0.5, 1.5), so assert the band rather than an exact value —
+        // and crucially assert it is NOT zero, which was the bug: retrying with
+        // no delay turned a brief 503 into an amplifying burst.
+        let err = FaucetError::HttpStatus {
+            status: 503,
+            url: "u".into(),
+            body: String::new(),
+        };
+        for attempt in 0..4u32 {
+            let w = retry_wait(&err, attempt);
+            assert!(
+                w > Duration::ZERO,
+                "attempt {attempt} must not be a hot loop"
+            );
+            let ceiling = RETRY_BASE * 2u32.pow(attempt + 1);
+            assert!(w < ceiling, "attempt {attempt}: {w:?} exceeds {ceiling:?}");
+        }
     }
 }

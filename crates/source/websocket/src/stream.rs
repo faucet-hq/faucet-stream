@@ -28,6 +28,20 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Delay before the next (re)connect after `attempt` consecutive failures,
+/// using the configured `reconnect_backoff` as the exponential base.
+///
+/// It grows rather than repeating the base forever: with the default
+/// `max_reconnect_attempts: None`, a constant base meant a dead endpoint was
+/// redialled once per `reconnect_backoff` indefinitely — a client-side hot loop
+/// against a host that is already down, and no cap because the config has no
+/// ceiling field (#654 M6). [`faucet_core::retry::backoff_with_jitter`] supplies
+/// both the ceiling and the decorrelating jitter, so many clients watching one
+/// feed don't all redial on the same tick. Pure.
+fn reconnect_delay(base: Duration, attempt: usize) -> Duration {
+    faucet_core::retry::backoff_with_jitter(base, u32::try_from(attempt).unwrap_or(u32::MAX))
+}
+
 /// Map a [`Credential`] from a shared provider onto [`WebsocketAuth`] so the
 /// existing header-application path can be reused.
 ///
@@ -187,7 +201,7 @@ impl Source for WebsocketSource {
         let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
         let idle_timeout = self.config.idle_timeout;
         let reconnect = self.config.reconnect;
-        let backoff = self.config.reconnect_backoff;
+        let reconnect_backoff = self.config.reconnect_backoff;
         let max_attempts = self.config.max_reconnect_attempts;
         let ping_interval = self.config.ping_interval;
         let format = self.config.message_format;
@@ -219,9 +233,10 @@ impl Source for WebsocketSource {
                         if reconnect
                             && max_attempts.is_none_or(|m| reconnect_attempts < m)
                         {
+                            let delay = reconnect_delay(reconnect_backoff, reconnect_attempts);
                             reconnect_attempts += 1;
-                            tracing::warn!(error = %e, attempt = reconnect_attempts, "websocket source: connect failed, retrying");
-                            tokio::time::sleep(backoff).await;
+                            tracing::warn!(error = %e, attempt = reconnect_attempts, delay_ms = delay.as_millis() as u64, "websocket source: connect failed, retrying");
+                            tokio::time::sleep(delay).await;
                             continue 'outer;
                         }
                         Err(e)?;
@@ -360,9 +375,10 @@ impl Source for WebsocketSource {
                         // and are lost. Inherent to live feeds (documented in the
                         // README under "Not resumable"), not a bug.
                         if reconnect && max_attempts.is_none_or(|m| reconnect_attempts < m) {
+                            let delay = reconnect_delay(reconnect_backoff, reconnect_attempts);
                             reconnect_attempts += 1;
-                            tracing::warn!(attempt = reconnect_attempts, "websocket source: reconnecting");
-                            tokio::time::sleep(backoff).await;
+                            tracing::warn!(attempt = reconnect_attempts, delay_ms = delay.as_millis() as u64, "websocket source: reconnecting");
+                            tokio::time::sleep(delay).await;
                             continue 'outer;
                         } else if reconnect {
                             Err(FaucetError::Source(format!(
@@ -480,6 +496,50 @@ fn resolve_host_port(url: &str) -> Result<(String, u16), String> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn reconnect_delay_grows_and_stays_bounded() {
+        let base = Duration::from_secs(1);
+        // Successive attempts must actually grow, not repeat the base forever
+        // (#654 M6). Compare against the un-jittered `base * 2^attempt`, since
+        // the jitter band ([0.5, 1.5)) overlaps between adjacent attempts and
+        // makes a direct delay-to-delay comparison flaky.
+        for attempt in 0..5u32 {
+            let expected = base * 2u32.pow(attempt);
+            let d = reconnect_delay(base, attempt as usize);
+            assert!(
+                d >= expected.mul_f64(0.5) && d < expected.mul_f64(1.5),
+                "attempt {attempt}: {d:?} outside the jitter band around {expected:?}"
+            );
+            assert!(!d.is_zero(), "attempt {attempt}: delay collapsed to zero");
+        }
+
+        // Bounded: core caps the exponential at 60s, so even a saturating
+        // attempt count stays under 60s × the 1.5 jitter ceiling. Without the
+        // cap a long outage would sleep for centuries.
+        for attempt in [30usize, 1_000, usize::MAX] {
+            let d = reconnect_delay(base, attempt);
+            assert!(
+                d < Duration::from_secs(90),
+                "attempt {attempt}: delay {d:?} is not bounded"
+            );
+            assert!(
+                d >= Duration::from_secs(30),
+                "attempt {attempt}: delay {d:?} should have reached the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_delay_is_decorrelated_across_calls() {
+        // Many clients watching one feed must not all redial on the same tick.
+        let base = Duration::from_secs(1);
+        let delays: Vec<Duration> = (0..32).map(|_| reconnect_delay(base, 2)).collect();
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "every delay identical — jitter is not being applied: {delays:?}"
+        );
+    }
 
     #[test]
     fn credential_bearer_maps_to_bearer() {

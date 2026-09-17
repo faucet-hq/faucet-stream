@@ -32,7 +32,34 @@ Source-specific fields:
 | `max_objects` | int | — | Hard cap on objects read. |
 | `concurrency` | int | `10` | Max concurrent object reads. |
 | `batch_size` | int | `1000` | Records per `StreamPage`; `0` = one page per object. |
+| `verify_length` | bool | `true` | Verify each object's byte count against the `size` Azure reports; a short (truncated) or over-long transfer fails with `FaucetError::Source`. See [Read-integrity verification](#read-integrity-verification). |
+| `verify_checksum` | bool | `false` | **Not supported on Azure Blob** — `true` is rejected at config load. See [Read-integrity verification](#read-integrity-verification). |
 | `compression` | enum | `auto` | `auto` / `gzip` / `zstd` (requires the `compression` feature). |
+
+## Read-integrity verification
+
+A transfer that terminates early but *cleanly* — a truncated body that still
+yields EOF — would otherwise be parsed and emitted as a complete object: silent
+data loss with a green run. To prevent it, every object body is read through
+[`faucet_core::VerifyingReader`], which counts the raw bytes and validates them
+at EOF.
+
+- **Length** (`verify_length`, default `true`) — compares the bytes read against
+  the `size` the store reports for the blob and fails the read on any mismatch.
+  The check is cheap (a counter over a body that is read anyway) and wraps the
+  **raw** stream, below any decompression, so it covers the *stored* bytes. It is
+  skipped, with a debug log, for a blob served with a non-empty
+  `Content-Encoding` (a store may transcode it on read, so the received byte
+  count need not match the stored size).
+- **Checksum** (`verify_checksum`) — **unsupported here.** Azure Blob does not
+  expose a body checksum (`Content-MD5`) through the `object_store` read API this
+  connector uses, so rather than accept a switch it cannot honour, the source
+  **rejects `verify_checksum: true`** at config load with a typed
+  `FaucetError::Config`. The `verify_length` guard above still applies. The S3
+  and GCS sources, whose stores do advertise a checksum, support the field.
+
+Both keys are named and behave identically across the S3, GCS, and Azure Blob
+sources.
 
 ## File formats
 

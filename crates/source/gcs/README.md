@@ -275,6 +275,9 @@ checksum. They operate on the bytes GCS delivers (below the client-side
 `compression` feature's decompression), so `.gz` / `.zst` objects served
 without a `Content-Encoding` header verify correctly.
 
+Both keys are named and behave identically across the S3, GCS, and Azure Blob
+sources (Azure exposes no body checksum and rejects `verify_checksum`).
+
 ```yaml
 pipeline:
   source:

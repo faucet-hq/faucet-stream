@@ -19,6 +19,17 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+/// Field added to a `before`/`after` image listing the columns Postgres elided
+/// because their out-of-line (TOAST) value wasn't rewritten by the change.
+///
+/// Reserved, and **part of the emitted record** — it is an ordinary key in the
+/// row image, so a downstream sink in `auto_map` mode sees it as a column and a
+/// schema-drift policy sees it as an addition. Named here rather than inlined at
+/// the insertion site so the reserved key has one definition and a consumer can
+/// filter on it (#654 L27). Postgres-specific (TOAST is a Postgres storage
+/// concept), so it lives in this crate rather than `faucet-core`.
+pub const UNCHANGED_TOAST_FIELD: &str = "__unchanged_toast__";
+
 pub struct PostgresCdcSource {
     config: PostgresCdcSourceConfig,
     state_key_value: String,
@@ -741,7 +752,7 @@ fn record(
     fn to_value(row: TupleRow) -> Value {
         let mut o = row.values;
         if !row.unchanged_toast.is_empty() {
-            o.insert("__unchanged_toast__".into(), json!(row.unchanged_toast));
+            o.insert(UNCHANGED_TOAST_FIELD.into(), json!(row.unchanged_toast));
         }
         Value::Object(o)
     }
@@ -1229,6 +1240,14 @@ mod tests {
         assert!(out[0]["before"].get("name").is_none());
         assert_eq!(out[0]["before"]["id"], 1);
         assert_eq!(out[0]["after"]["name"], "alice2");
+    }
+
+    #[test]
+    fn unchanged_toast_field_name_is_pinned() {
+        // The name is part of the emitted record, so downstream configs (a sink
+        // column list, a contract, a drift allowlist) are written against this
+        // literal — renaming it is a wire-format change, not a refactor.
+        assert_eq!(UNCHANGED_TOAST_FIELD, "__unchanged_toast__");
     }
 
     // dataset_uri is a pure-config method; the source requires a live DB to

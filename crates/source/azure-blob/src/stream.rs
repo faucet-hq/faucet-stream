@@ -25,7 +25,7 @@ impl AzureBlobSource {
     /// Construct the source, building the object store eagerly so it is reused
     /// across calls.
     pub async fn new(config: AzureBlobSourceConfig) -> Result<Self, FaucetError> {
-        faucet_core::validate_batch_size(config.batch_size)?;
+        config.validate()?;
         let store = build_store(&config.connection)?;
         Ok(Self { config, store })
     }
@@ -97,11 +97,29 @@ impl AzureBlobSource {
             ))
         })?;
 
+        // Read the metadata BEFORE consuming the stream (which moves `result`),
+        // so a cleanly-truncated transfer is rejected rather than silently
+        // parsed as a complete object (#161).
+        let checks = length_checks(
+            result.meta.size,
+            content_encoding(&result.attributes),
+            self.config.verify_length,
+        );
+        if self.config.verify_length && checks.is_empty() {
+            tracing::debug!(
+                key = %key,
+                "azure object length verification skipped (transcoded Content-Encoding)"
+            );
+        }
+
         let byte_stream = result
             .into_stream()
             .map_err(|e| std::io::Error::other(e.to_string()));
         let reader = tokio_util::io::StreamReader::new(byte_stream);
-        let buffered = tokio::io::BufReader::new(reader);
+        // Wrap the RAW byte stream in the verifier first so the byte count
+        // covers the stored bytes (below any client-side decompression).
+        let verified = faucet_core::VerifyingReader::new(reader, checks);
+        let buffered = tokio::io::BufReader::new(verified);
         #[cfg(feature = "compression")]
         {
             let codec = self.config.compression.resolve(key);
@@ -163,6 +181,33 @@ pub(crate) fn parse_file_content(
             "content": text,
         })]),
     }
+}
+
+/// The [`IntegrityCheck`](faucet_core::IntegrityCheck) set for one blob read
+/// (#161). Pure so the decision is unit-testable without an Azure endpoint.
+///
+/// Empty when verification is off, or when the blob is served with a non-empty
+/// `Content-Encoding` — a store may decompressively transcode on read, so the
+/// received byte count would not match the stored `size`. Azure Blob exposes no
+/// body checksum through `object_store`, so the length check is the only one
+/// available here (`verify_checksum` is refused at config load).
+fn length_checks(
+    size: u64,
+    content_encoding: Option<&str>,
+    verify_length: bool,
+) -> Vec<Box<dyn faucet_core::IntegrityCheck>> {
+    if verify_length && content_encoding.is_none_or(str::is_empty) {
+        vec![Box::new(faucet_core::LengthCheck::new(size))]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The `Content-Encoding` an object-store `get` reported, if any.
+fn content_encoding(attributes: &object_store::Attributes) -> Option<&str> {
+    attributes
+        .get(&object_store::Attribute::ContentEncoding)
+        .map(AsRef::as_ref)
 }
 
 /// Truncate an explicit object-key list to the `max_objects` cap. `None` leaves
@@ -525,6 +570,87 @@ mod tests {
             None => format!("az://{}", config.container()),
         };
         assert_eq!(uri, "az://my-container/data/2026/");
+    }
+
+    // ---- read-integrity verification (#161) ----
+
+    /// Read `body` through the verifier with the checks `length_checks` picks
+    /// for `size`/`content_encoding`, returning whether the read succeeded.
+    async fn reads_ok(size: u64, content_encoding: Option<&str>, body: &[u8]) -> bool {
+        use tokio::io::AsyncReadExt as _;
+        let checks = length_checks(size, content_encoding, true);
+        let mut reader = faucet_core::VerifyingReader::new(body, checks);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn length_check_accepts_a_complete_body() {
+        assert!(reads_ok(5, None, b"hello").await);
+    }
+
+    #[tokio::test]
+    async fn length_check_rejects_a_truncated_body() {
+        assert!(
+            !reads_ok(10, None, b"hello").await,
+            "a cleanly-truncated transfer must fail, not parse as complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn length_check_rejects_an_overlong_body() {
+        assert!(!reads_ok(3, None, b"hello").await);
+    }
+
+    #[tokio::test]
+    async fn length_check_skipped_for_a_transcoded_blob() {
+        // A non-empty Content-Encoding means the received bytes need not match
+        // the stored size, so no check is installed and the read passes.
+        assert!(reads_ok(999, Some("gzip"), b"hello").await);
+    }
+
+    #[test]
+    fn length_checks_empty_when_disabled() {
+        assert!(length_checks(5, None, false).is_empty());
+    }
+
+    #[test]
+    fn length_checks_installed_for_empty_content_encoding() {
+        // An explicitly empty header is equivalent to absent.
+        assert_eq!(length_checks(5, Some(""), true).len(), 1);
+        assert_eq!(length_checks(5, None, true).len(), 1);
+    }
+
+    #[test]
+    fn content_encoding_reads_the_attribute() {
+        let mut attrs = object_store::Attributes::new();
+        assert_eq!(content_encoding(&attrs), None);
+        attrs.insert(object_store::Attribute::ContentEncoding, "gzip".into());
+        assert_eq!(content_encoding(&attrs), Some("gzip"));
+    }
+
+    #[tokio::test]
+    async fn new_rejects_verify_checksum() {
+        // Azure exposes no body checksum through object_store, so the switch is
+        // refused at load time rather than accepted and silently ignored.
+        let mut config = AzureBlobSourceConfig::new("c");
+        config.verify_checksum = true;
+        match AzureBlobSource::new(config).await {
+            Err(FaucetError::Config(m)) => {
+                assert!(m.contains("verify_checksum"), "got: {m}")
+            }
+            Ok(_) => panic!("expected a verify_checksum Config error, got Ok(source)"),
+            Err(e) => panic!("expected a verify_checksum Config error, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_rejects_empty_container() {
+        match AzureBlobSource::new(AzureBlobSourceConfig::new("   ")).await {
+            Err(FaucetError::Config(m)) => assert!(m.contains("container"), "got: {m}"),
+            Ok(_) => panic!("expected a container Config error, got Ok(source)"),
+            Err(e) => panic!("expected a container Config error, got {e:?}"),
+        }
     }
 
     #[tokio::test]

@@ -318,7 +318,11 @@ impl MongoSink {
 
     /// Staging collection used while an overwrite run is in flight.
     fn staging_collection(&self) -> String {
-        format!("{}__faucet_ovw", self.config.collection)
+        format!(
+            "{}{}",
+            self.config.collection,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+        )
     }
 
     /// The collection the append/insert path targets. For `write_mode:

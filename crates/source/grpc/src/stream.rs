@@ -27,7 +27,8 @@ pub struct GrpcStream {
 impl GrpcStream {
     /// Create a new gRPC stream. Loads the `FileDescriptorSet` from disk.
     pub fn new(config: GrpcStreamConfig) -> Result<Self, FaucetError> {
-        // A zero initial backoff makes `next_backoff(0, cap) == 0`, so a
+        // A zero initial backoff keeps every `reconnect_delay` at zero (the
+        // exponential and the jitter are both multiplicative), so a
         // server-streaming reconnect loop would busy-spin with no delay.
         if config.reconnect_initial_backoff.is_zero() {
             return Err(FaucetError::Config(
@@ -131,7 +132,7 @@ impl GrpcStream {
         let mut all: Vec<Value> = Vec::new();
         let mut messages_seen: usize = 0;
         let mut attempt: u32 = 0;
-        let mut backoff = self.config.reconnect_initial_backoff;
+        let initial_backoff = self.config.reconnect_initial_backoff;
         let max_backoff = self.config.reconnect_max_backoff;
 
         loop {
@@ -181,7 +182,6 @@ impl GrpcStream {
                     // after one early hiccup (audit #146 H8).
                     if consumed > 0 {
                         attempt = 0;
-                        backoff = self.config.reconnect_initial_backoff;
                     }
                     if let Some(max_attempts) = self.config.reconnect_max_attempts
                         && attempt >= max_attempts
@@ -190,6 +190,7 @@ impl GrpcStream {
                             "gRPC server-streaming exceeded reconnect_max_attempts={max_attempts}: {error}"
                         )));
                     }
+                    let backoff = reconnect_delay(initial_backoff, max_backoff, attempt);
                     attempt += 1;
                     tracing::warn!(
                         attempt,
@@ -198,7 +199,6 @@ impl GrpcStream {
                         "gRPC server-streaming transient error, reconnecting"
                     );
                     tokio::time::sleep(backoff).await;
-                    backoff = next_backoff(backoff, max_backoff);
                 }
             }
         }
@@ -560,7 +560,6 @@ impl GrpcStream {
         let terminate_on_error = self.config.terminate_on_error;
         let reconnect_max_attempts = self.config.reconnect_max_attempts;
         let reconnect_initial_backoff = self.config.reconnect_initial_backoff;
-        let mut backoff = reconnect_initial_backoff;
         let max_backoff = self.config.reconnect_max_backoff;
 
         Box::pin(async_stream::try_stream! {
@@ -670,7 +669,6 @@ impl GrpcStream {
                         // audit #146 H8.
                         if consumed > 0 {
                             attempt = 0;
-                            backoff = reconnect_initial_backoff;
                         }
                         if let Some(max_attempts) = reconnect_max_attempts
                             && attempt >= max_attempts
@@ -681,6 +679,8 @@ impl GrpcStream {
                             Err(final_err)?;
                             return;
                         }
+                        let backoff =
+                            reconnect_delay(reconnect_initial_backoff, max_backoff, attempt);
                         attempt += 1;
                         tracing::warn!(
                             attempt,
@@ -689,7 +689,6 @@ impl GrpcStream {
                             "gRPC server-streaming transient error, reconnecting"
                         );
                         tokio::time::sleep(backoff).await;
-                        backoff = next_backoff(backoff, max_backoff);
                     }
                 }
             }
@@ -783,8 +782,19 @@ fn serialize_and_extract(
     faucet_core::util::extract_records(&json_value, records_path)
 }
 
-fn next_backoff(current: Duration, cap: Duration) -> Duration {
-    current.saturating_mul(2).min(cap)
+/// Reconnect delay after `attempt` consecutive transient failures: the
+/// configured `reconnect_initial_backoff` doubled toward the configured
+/// `reconnect_max_backoff`, then jittered through core's shared helper.
+///
+/// `attempt` is the count of *consecutive* prior failures (reset whenever a
+/// stream made progress), so the exponential is derived rather than carried in a
+/// mutable variable — one less piece of state to keep in step with the counter.
+/// The jitter matters because every replica of a pipeline pointed at one gRPC
+/// endpoint reconnects off the same server-side fault: without it they all redial
+/// in the same instant and keep the endpoint down (#654 M13). Pure.
+fn reconnect_delay(base: Duration, cap: Duration, attempt: u32) -> Duration {
+    let exp = base.saturating_mul(2u32.saturating_pow(attempt)).min(cap);
+    faucet_core::retry::apply_jitter(exp)
 }
 
 /// Outcome of one server-streaming attempt. `Done` is a logical stop signal
@@ -866,22 +876,47 @@ mod tests {
 
     // ── Backoff ───────────────────────────────────────────────────────────────
 
+    /// Assert a jittered delay sits in core's documented `[0.5, 1.5)` band
+    /// around `expected` and never collapses to zero (a zero delay busy-spins
+    /// the reconnect loop — the hazard `reconnect_initial_backoff` validation
+    /// already guards at config load).
+    fn assert_jittered_around(actual: Duration, expected: Duration) {
+        let lo = expected.mul_f64(0.5);
+        let hi = expected.mul_f64(1.5);
+        assert!(
+            actual >= lo && actual < hi,
+            "delay {actual:?} outside jitter band [{lo:?}, {hi:?}) for {expected:?}"
+        );
+        assert!(!actual.is_zero(), "jittered delay collapsed to zero");
+    }
+
     #[test]
-    fn next_backoff_doubles_up_to_cap() {
+    fn reconnect_delay_doubles_up_to_the_configured_cap() {
+        let base = Duration::from_secs(1);
         let cap = Duration::from_secs(30);
-        let a = Duration::from_secs(1);
-        let b = next_backoff(a, cap);
-        let c = next_backoff(b, cap);
-        let d = next_backoff(c, cap);
-        let e = next_backoff(d, cap);
-        let f = next_backoff(e, cap);
-        let g = next_backoff(f, cap);
-        assert_eq!(b, Duration::from_secs(2));
-        assert_eq!(c, Duration::from_secs(4));
-        assert_eq!(d, Duration::from_secs(8));
-        assert_eq!(e, Duration::from_secs(16));
-        assert_eq!(f, Duration::from_secs(30));
-        assert_eq!(g, Duration::from_secs(30));
+        assert_jittered_around(reconnect_delay(base, cap, 0), Duration::from_secs(1));
+        assert_jittered_around(reconnect_delay(base, cap, 1), Duration::from_secs(2));
+        assert_jittered_around(reconnect_delay(base, cap, 2), Duration::from_secs(4));
+        assert_jittered_around(reconnect_delay(base, cap, 3), Duration::from_secs(8));
+        assert_jittered_around(reconnect_delay(base, cap, 4), Duration::from_secs(16));
+        // The *configured* cap wins — not core's own 60s ceiling — and holds
+        // even once `2^attempt` saturates.
+        assert_jittered_around(reconnect_delay(base, cap, 5), cap);
+        assert_jittered_around(reconnect_delay(base, cap, 40), cap);
+        assert_jittered_around(reconnect_delay(base, cap, u32::MAX), cap);
+    }
+
+    #[test]
+    fn reconnect_delay_is_decorrelated_across_calls() {
+        // Replicas reconnecting off one server-side fault must not redial in
+        // lockstep (#654 M13): identical inputs must not give identical delays.
+        let base = Duration::from_secs(1);
+        let cap = Duration::from_secs(30);
+        let delays: Vec<Duration> = (0..32).map(|_| reconnect_delay(base, cap, 2)).collect();
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "every delay identical — jitter is not being applied: {delays:?}"
+        );
     }
 
     // ── credential_to_auth mapping ────────────────────────────────────────────

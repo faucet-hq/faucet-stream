@@ -22,11 +22,13 @@ use futures_core::Stream;
 use serde_json::json;
 
 /// Field the conformance battery uses to flag a record as a delete when
-/// exercising an upsert sink's delete path (matches the `cdc_unwrap`
-/// convention). A sink under test must be configured with a
-/// `delete_marker { field: "__op", values: ["d"] }` for the delete branch of
+/// exercising an upsert sink's delete path. Aliases the `cdc_unwrap` marker
+/// default rather than re-spelling it, so the battery can never assert against
+/// a field the real transform stopped stamping (#654 M17). A sink under test
+/// must be configured with a `delete_marker { field: "__op", values: ["d"] }`
+/// for the delete branch of
 /// [`assert_write_modes_truthful`](crate::assert_write_modes_truthful) to run.
-pub const DELETE_MARKER_FIELD: &str = "__op";
+pub const DELETE_MARKER_FIELD: &str = faucet_core::stage::CDC_DEFAULT_MARKER_FIELD;
 /// Value of [`DELETE_MARKER_FIELD`] that means "this record is a delete".
 pub const DELETE_MARKER_VALUE: &str = "d";
 
@@ -804,6 +806,18 @@ mod tests {
     use futures::StreamExt;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn delete_marker_tracks_the_cdc_unwrap_default() {
+        // Connector authors configure their sink's `delete_marker` against these
+        // literals, so the aliasing must not silently change what they are.
+        assert_eq!(DELETE_MARKER_FIELD, "__op");
+        assert_eq!(DELETE_MARKER_VALUE, "d");
+        assert_eq!(
+            DELETE_MARKER_FIELD,
+            faucet_core::stage::CDC_DEFAULT_MARKER_FIELD
+        );
+    }
 
     #[tokio::test]
     async fn counting_source_resumes_and_ignores_when_non_resumable() {

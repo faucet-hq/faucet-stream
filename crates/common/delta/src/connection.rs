@@ -144,10 +144,19 @@ fn is_missing_table(e: &deltalake::DeltaTableError) -> bool {
         return true;
     }
     // A brand-new location surfaces as an object-store NotFound wrapped in a
-    // generic error; match on the rendered message so the create-if-missing
-    // path doesn't treat "empty prefix" as a hard failure.
-    let msg = e.to_string().to_lowercase();
-    msg.contains("not found") || msg.contains("no such file") || msg.contains("does not exist")
+    // generic error. Classify it **typed**: matching the rendered message
+    // instead would also swallow a 403 AccessDenied, an expired credential, or
+    // a transient listing failure on `_delta_log/` — every one of which
+    // renders "not found"-shaped text for object stores. Reading an *existing*
+    // table as absent makes the sink write a fresh `_delta_log/…0.json`,
+    // replacing the table's identity and orphaning its data files, so this is
+    // a data-loss boundary, not a diagnostic one.
+    matches!(
+        e,
+        deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::NotFound { .. }
+        }
+    )
 }
 
 /// Register every compiled-in cloud object-store handler exactly once.
@@ -233,5 +242,43 @@ mod tests {
         let c = conn("file:///tmp/t");
         c.register_handlers();
         c.register_handlers();
+    }
+}
+
+#[cfg(test)]
+mod missing_table_tests {
+    use super::is_missing_table;
+
+    #[test]
+    fn only_a_typed_object_store_not_found_means_no_table_here() {
+        // A genuinely absent table: object-store NotFound.
+        let absent = deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::NotFound {
+                path: "s3://b/t/_delta_log".into(),
+                source: "no such key".into(),
+            },
+        };
+        assert!(is_missing_table(&absent));
+
+        // The regression this pins (#654 C2): a permission failure whose
+        // rendered text contains "not found"-shaped wording must NOT be read
+        // as "no table here" — doing so made the sink write a fresh
+        // `_delta_log/…0.json` over an EXISTING table and orphan its data
+        // files. Only the typed variant counts now.
+        let denied = deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::Generic {
+                store: "S3",
+                source: "403 AccessDenied: The specified key does not exist".into(),
+            },
+        };
+        assert!(
+            !is_missing_table(&denied),
+            "a 403 must never be mistaken for an absent table"
+        );
+
+        // An explicit NotATable is still the other legitimate signal.
+        assert!(is_missing_table(&deltalake::DeltaTableError::NotATable(
+            "no log".into()
+        )));
     }
 }

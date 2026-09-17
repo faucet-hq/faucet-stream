@@ -117,8 +117,25 @@ impl OverwriteScope {
     }
 }
 
-/// Render a JSON scalar as a SQL literal (strings single-quoted + escaped).
-fn sql_literal(v: &Value) -> String {
+/// Render a JSON scalar as an **ANSI-standard** SQL literal: strings are
+/// single-quoted with embedded quotes doubled (`''`), numbers and booleans pass
+/// through in their canonical form, and anything else becomes `NULL`.
+///
+/// This is the house escaper for every dialect that follows the ANSI rule —
+/// Postgres (with `standard_conforming_strings`, the default since 9.1), BigQuery
+/// string literals built by the overwrite/cleanup planners, MySQL under
+/// `NO_BACKSLASH_ESCAPES`, SQL Server, and SQLite. **Public so connectors escape
+/// through one audited implementation instead of hand-rolling a third
+/// convention** (#654 M14): the copies that existed before it was exported each
+/// invented their own rules, so a fix to one reached none of the others.
+///
+/// A dialect whose string literals treat some *other* character as a
+/// meta-character cannot use this function — doubling quotes alone does not
+/// neutralise a trailing escape character. Such a dialect must keep its own
+/// escaper, and that escaper's doc comment must state which extra characters it
+/// escapes and why (see `faucet_common_clickhouse::sql_literal`, where a
+/// backslash is a literal meta-character).
+pub fn sql_literal(v: &Value) -> String {
     match v {
         Value::String(s) => format!("'{}'", s.replace('\'', "''")),
         Value::Number(n) => n.to_string(),
@@ -583,6 +600,42 @@ mod tests {
         assert_eq!(
             scope.render_where_literal("`seq`"),
             "`seq` >= 100 AND `seq` < 200"
+        );
+    }
+
+    #[test]
+    fn sql_literal_renders_each_scalar_kind_by_the_ansi_rule() {
+        // Strings: single-quoted, embedded quotes doubled — and *only* quotes,
+        // since a backslash is an ordinary character under the ANSI rule.
+        assert_eq!(sql_literal(&json!("plain")), "'plain'");
+        assert_eq!(sql_literal(&json!("O'Brien")), "'O''Brien'");
+        assert_eq!(sql_literal(&json!("a\\b")), "'a\\b'");
+        // Every quote is doubled, not just the first: 5 interior quotes → 10.
+        assert_eq!(sql_literal(&json!("'' ' ''")), "''''' '' '''''");
+        // An empty string stays a valid (empty) literal, not bare quotes-less text.
+        assert_eq!(sql_literal(&json!("")), "''");
+        // Numbers and booleans pass through in canonical form.
+        assert_eq!(sql_literal(&json!(42)), "42");
+        assert_eq!(sql_literal(&json!(-1.5)), "-1.5");
+        assert_eq!(sql_literal(&json!(true)), "true");
+        assert_eq!(sql_literal(&json!(false)), "false");
+        // Null and non-scalars degrade to NULL rather than injecting structure.
+        assert_eq!(sql_literal(&Value::Null), "NULL");
+        assert_eq!(sql_literal(&json!({"a": 1})), "NULL");
+        assert_eq!(sql_literal(&json!([1, 2])), "NULL");
+    }
+
+    #[test]
+    fn sql_literal_neutralises_a_quote_breakout_attempt() {
+        // The whole point of the escaper: a crafted value must stay one literal.
+        let out = sql_literal(&json!("x' OR 1=1 --"));
+        assert_eq!(out, "'x'' OR 1=1 --'");
+        // Exactly one opening and one closing quote delimit the literal: every
+        // interior quote is part of a doubled pair.
+        let interior = &out[1..out.len() - 1];
+        assert!(
+            interior.matches('\'').count().is_multiple_of(2),
+            "unpaired quote inside literal: {out}"
         );
     }
 

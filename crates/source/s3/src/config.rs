@@ -58,23 +58,23 @@ pub struct S3SourceConfig {
     /// that prefer one large request per file to many small ones.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-    /// Verify each object's byte length against the `Content-Length` the
-    /// store advertises, failing the read with [`FaucetError::Source`](faucet_core::FaucetError::Source)
-    /// on a short (truncated) or over-long transfer (#161). The check is
-    /// cheap (a byte counter over the body that is read anyway) and defaults
-    /// to `true`. Disable it only for an S3-compatible store that does not
-    /// return a reliable `Content-Length`. When the store reports no length,
-    /// the check is skipped (a debug log notes it) rather than failing.
+    /// Verify each object's byte length against the length the store
+    /// advertises, failing the read with
+    /// [`FaucetError::Source`](faucet_core::FaucetError::Source) on a short
+    /// (truncated) or over-long transfer (#161). Cheap — a byte counter over
+    /// a body that is read anyway — so it defaults to `true`.
+    ///
+    /// Skipped (with a debug log, not a failure) when the store advertises no
+    /// length, or when it reports a non-empty `Content-Encoding`: the body on
+    /// the wire is then transcoded and its length legitimately differs from
+    /// the stored object's.
     #[serde(default = "default_true")]
     pub verify_length: bool,
-    /// Verify each object's body against the checksum the store advertises —
-    /// an `x-amz-checksum-{crc32,crc32c,sha1,sha256}` header when present, or
-    /// the ETag as MD5 for a non-multipart upload (#161). Stronger than the
-    /// length check but costs a hash over the full body, so it defaults to
-    /// `false`. Enabling it sets `ChecksumMode::Enabled` on each `GetObject`
-    /// so the store returns its stored checksum. When the store advertises no
-    /// usable checksum for an object, verification is skipped for that object
-    /// (a debug log notes it); the length check still applies.
+    /// Verify each object's body against the checksum the store advertises
+    /// (#161). Stronger than the length check but costs a hash over the full
+    /// body, so it defaults to `false`. When the store advertises no usable
+    /// checksum for an object, verification is skipped for that object (a
+    /// debug log notes it); the length check still applies.
     #[serde(default)]
     pub verify_checksum: bool,
     /// Compression codec applied to each downloaded object. Defaults to
@@ -87,12 +87,13 @@ pub struct S3SourceConfig {
     pub compression: faucet_core::CompressionConfig,
 }
 
-fn default_batch_size() -> usize {
-    DEFAULT_BATCH_SIZE
-}
-
+/// Serde default for the integrity flags that default on.
 fn default_true() -> bool {
     true
+}
+
+fn default_batch_size() -> usize {
+    DEFAULT_BATCH_SIZE
 }
 
 impl S3SourceConfig {
@@ -161,14 +162,14 @@ impl S3SourceConfig {
     }
 
     /// Enable or disable the per-object `Content-Length` verification
-    /// (default `true`). See [`verify_length`](Self::verify_length).
+    /// (default `true`). Sets [`verify_length`](Self::verify_length).
     pub fn verify_length(mut self, verify: bool) -> Self {
         self.verify_length = verify;
         self
     }
 
     /// Enable or disable per-object checksum verification (default `false`).
-    /// See [`verify_checksum`](Self::verify_checksum).
+    /// Sets [`verify_checksum`](Self::verify_checksum).
     pub fn verify_checksum(mut self, verify: bool) -> Self {
         self.verify_checksum = verify;
         self
@@ -298,6 +299,28 @@ mod tests {
             .verify_checksum(true);
         assert!(!cfg.verify_length);
         assert!(cfg.verify_checksum);
+    }
+
+    /// The credentials block is `#[serde(flatten)]`ed, so the YAML/JSON surface must
+    /// be byte-identical to the pre-refactor two-sibling-keys shape — no
+    /// nested `verify:` block on the way in or out.
+    #[test]
+    fn verify_keys_stay_top_level_on_the_wire() {
+        let json = r#"{
+            "bucket": "my-bucket",
+            "file_format": "json_lines",
+            "concurrency": 10,
+            "verify_length": false,
+            "verify_checksum": true
+        }"#;
+        let config: S3SourceConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.verify_length);
+        assert!(config.verify_checksum);
+
+        let out = serde_json::to_value(&config).unwrap();
+        assert_eq!(out["verify_length"], serde_json::json!(false));
+        assert_eq!(out["verify_checksum"], serde_json::json!(true));
+        assert!(out.get("verify").is_none(), "no nested block: {out}");
     }
 
     #[cfg(feature = "compression")]

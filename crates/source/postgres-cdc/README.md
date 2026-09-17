@@ -163,7 +163,9 @@ Every change event is one JSON object:
 | `after` | Row image **after** the change. Present on `insert` and `update`; `null` on `delete` and `truncate`. |
 
 - A `truncate` emits one record per truncated relation with `before = after = null`.
-- **Unchanged TOAST:** Postgres elides large out-of-line values whose stored copy wasn't rewritten. Such columns are dropped from `before`/`after` and their names are recorded in `before.__unchanged_toast__` / `after.__unchanged_toast__` (a JSON array of column names).
+- **Unchanged TOAST:** Postgres elides large out-of-line values whose stored copy wasn't rewritten. Such columns are dropped from `before`/`after` and their names are recorded in `before.__unchanged_toast__` / `after.__unchanged_toast__` (a JSON array of column names) — meaning "this row image is partial: these columns still hold their previous value at the source."
+
+  `__unchanged_toast__` is a **reserved key that is part of the emitted record**, not out-of-band metadata: it is an ordinary field in the row image, so downstream consumers see it. After a `cdc_unwrap` it survives into the flat row, where an `auto_map` SQL sink treats it as a column (and a `schema:` drift policy as an added one). Drop it with a `drop` transform (`fields: ["__unchanged_toast__"]`) when the destination shouldn't carry it, or keep it to detect partial rows. The name is exported as `faucet_source_postgres_cdc::stream::UNCHANGED_TOAST_FIELD` for programmatic consumers.
 
 ### Column type mapping
 

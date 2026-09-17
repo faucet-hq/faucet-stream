@@ -650,6 +650,15 @@ impl CompiledExplode {
 
 // ── CDC unwrap spec ──
 
+/// Default field `cdc_unwrap` stamps the normalized op marker onto.
+///
+/// Reserved, and the value a `WriteSpec::delete_marker` must be pointed at for
+/// a CDC → upsert mirror to delete rather than insert — so it is defined here
+/// once and consumed by every surface that needs to agree on it (the serde
+/// default below, the CLI decoder, the conformance battery). Not feature-gated:
+/// consumers that never compile the transform still need the name (#654 M17).
+pub const CDC_DEFAULT_MARKER_FIELD: &str = "__op";
+
 /// Spec for [`TransformStage::CdcUnwrap`]. Normalizes a CDC change-event
 /// envelope (`{op, before, after, …}`) into a flat row plus a marker field,
 /// so a downstream upsert sink never needs to understand CDC. A 1→0|1 stage:
@@ -674,7 +683,10 @@ pub struct CdcUnwrapSpec {
     /// Field stamped on every emitted row. Default `"__op"`.
     #[serde(default = "cdc_default_marker_field")]
     pub marker_field: String,
-    /// `op` values that mean delete. Default covers all three CDC vocabularies.
+    /// `op` values that mean delete. Default `["d", "delete"]` — the two
+    /// spellings the built-in CDC sources emit (`postgres-cdc` uses the long
+    /// form, `mysql-cdc` / `mongodb-cdc` / `mssql-cdc` the short one). Override
+    /// for a feed that spells deletes differently.
     #[serde(default = "cdc_default_delete_ops")]
     pub delete_ops: Vec<String>,
     /// `op` values dropped entirely (1→0). Default `["ddl", "truncate"]`.
@@ -700,7 +712,7 @@ fn cdc_default_key_field() -> String {
 }
 #[cfg(feature = "transform-cdc-unwrap")]
 fn cdc_default_marker_field() -> String {
-    "__op".into()
+    CDC_DEFAULT_MARKER_FIELD.into()
 }
 #[cfg(feature = "transform-cdc-unwrap")]
 fn cdc_default_delete_ops() -> Vec<String> {
@@ -1957,6 +1969,36 @@ mod tests {
     }
 
     // ── CdcUnwrap ──
+
+    #[test]
+    fn cdc_default_marker_field_is_pinned() {
+        // A sink's `delete_marker.field` is configured against this literal, so
+        // moving it would make every existing CDC → upsert config stamp a
+        // marker the sink no longer looks for.
+        assert_eq!(CDC_DEFAULT_MARKER_FIELD, "__op");
+    }
+
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_spec_default_marker_uses_the_constant() {
+        assert_eq!(
+            CdcUnwrapSpec::default().marker_field,
+            CDC_DEFAULT_MARKER_FIELD
+        );
+        // An omitted `marker_field` must land on the same value as the `Default`
+        // impl — the serde path is the one real configs take.
+        let decoded: CdcUnwrapSpec = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(decoded.marker_field, CDC_DEFAULT_MARKER_FIELD);
+    }
+
+    /// Pins the documented `delete_ops` default: the short code emitted by
+    /// `mysql-cdc` / `mongodb-cdc` / `mssql-cdc` and the long one emitted by
+    /// `postgres-cdc`, and nothing else.
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_default_delete_ops_match_the_doc() {
+        assert_eq!(CdcUnwrapSpec::default().delete_ops, vec!["d", "delete"]);
+    }
 
     #[cfg(feature = "transform-cdc-unwrap")]
     fn cdc_unwrap_default() -> TransformStage {

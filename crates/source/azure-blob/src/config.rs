@@ -41,6 +41,24 @@ pub struct AzureBlobSourceConfig {
     /// sentinel and emits one page per object.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Verify each blob's byte length against the length the store
+    /// advertises, failing the read with
+    /// [`FaucetError::Source`](faucet_core::FaucetError::Source) on a short
+    /// (truncated) or over-long transfer. Cheap — a byte counter over a body
+    /// that is read anyway — so it defaults to `true`.
+    ///
+    /// Skipped (with a debug log, not a failure) when the store advertises no
+    /// length, or when it reports a non-empty `Content-Encoding`: the body on
+    /// the wire is then transcoded and its length legitimately differs from
+    /// the stored blob's.
+    #[serde(default = "default_true")]
+    pub verify_length: bool,
+    /// Not supported on Azure Blob: `object_store` exposes no `Content-MD5`
+    /// attribute and an Azure ETag is not a content hash, so there is nothing
+    /// to verify against. Setting it `true` is **rejected at config load**
+    /// rather than silently ignored — see `validate()`.
+    #[serde(default)]
+    pub verify_checksum: bool,
     /// Compression codec applied to each downloaded object. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the
     /// codec is resolved per-object-key, so a single source can read a mix of
@@ -49,6 +67,11 @@ pub struct AzureBlobSourceConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+}
+
+/// Serde default for the integrity flags that default on.
+fn default_true() -> bool {
+    true
 }
 
 fn default_batch_size() -> usize {
@@ -69,6 +92,8 @@ impl AzureBlobSourceConfig {
             max_objects: None,
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
+            verify_length: true,
+            verify_checksum: false,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
         }
@@ -138,6 +163,36 @@ impl AzureBlobSourceConfig {
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
+    }
+
+    /// Enable or disable the per-object length verification (default `true`).
+    /// Sets [`verify_length`](Self::verify_length).
+    pub fn verify_length(mut self, verify: bool) -> Self {
+        self.verify_length = verify;
+        self
+    }
+
+    /// Validate the config at load time so a bad config fails with a typed
+    /// [`FaucetError::Config`](faucet_core::FaucetError::Config) before the
+    /// first byte moves: rejects an out-of-range `batch_size`
+    /// (`> MAX_BATCH_SIZE`), an empty `container`, and `verify_checksum: true`
+    /// (unsupported here — see [`verify_checksum`](Self::verify_checksum)).
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        if self.connection.container.trim().is_empty() {
+            return Err(faucet_core::FaucetError::Config(
+                "azure-blob source requires a non-empty `container`".into(),
+            ));
+        }
+        if self.verify_checksum {
+            return Err(faucet_core::FaucetError::Config(
+                "azure-blob source: `verify_checksum` is not supported — Azure Blob does not \
+                 expose a body checksum through the object-store read API. Leave it unset and \
+                 rely on `verify_length`, which is enforced against the reported blob size."
+                    .into(),
+            ));
+        }
+        faucet_core::validate_batch_size(self.batch_size)?;
+        Ok(())
     }
 
     /// Set the compression codec. Available only with the `compression` feature.
@@ -247,6 +302,75 @@ mod tests {
     #[test]
     fn schema_generates_without_panicking() {
         let _ = faucet_core::schema_for!(AzureBlobSourceConfig);
+    }
+
+    #[test]
+    fn verify_defaults_length_on_checksum_off() {
+        let cfg = AzureBlobSourceConfig::new("c");
+        assert!(cfg.verify_length, "length verification defaults on");
+        assert!(!cfg.verify_checksum);
+    }
+
+    #[test]
+    fn verify_length_builder_overrides() {
+        let cfg = AzureBlobSourceConfig::new("c").verify_length(false);
+        assert!(!cfg.verify_length);
+    }
+
+    /// The connection block is `#[serde(flatten)]`ed, so both verify keys must
+    /// still land at the top level beside its own.
+    #[test]
+    fn verify_keys_stay_top_level_on_the_wire() {
+        let json = r#"{ "container": "c", "verify_length": false }"#;
+        let config: AzureBlobSourceConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.verify_length);
+
+        let out = serde_json::to_value(&config).unwrap();
+        assert_eq!(out["verify_length"], serde_json::json!(false));
+        assert_eq!(out["verify_checksum"], serde_json::json!(false));
+        assert!(out.get("verify").is_none(), "no nested block: {out}");
+    }
+
+    #[test]
+    fn verify_defaults_when_absent_from_json() {
+        let config: AzureBlobSourceConfig =
+            serde_json::from_str(r#"{ "container": "c" }"#).unwrap();
+        assert!(config.verify_length);
+        assert!(!config.verify_checksum);
+    }
+
+    #[test]
+    fn validate_accepts_a_default_config() {
+        assert!(AzureBlobSourceConfig::new("c").validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_verify_checksum() {
+        let mut cfg = AzureBlobSourceConfig::new("c");
+        cfg.verify_checksum = true;
+        match cfg.validate() {
+            Err(faucet_core::FaucetError::Config(m)) => {
+                assert!(m.contains("verify_checksum"), "got: {m}")
+            }
+            other => panic!("expected a verify_checksum Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_container() {
+        assert!(matches!(
+            AzureBlobSourceConfig::new("   ").validate(),
+            Err(faucet_core::FaucetError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_batch_size() {
+        let cfg = AzureBlobSourceConfig::new("c").with_batch_size(faucet_core::MAX_BATCH_SIZE + 1);
+        assert!(matches!(
+            cfg.validate(),
+            Err(faucet_core::FaucetError::Config(_))
+        ));
     }
 
     #[cfg(feature = "compression")]

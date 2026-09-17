@@ -38,6 +38,14 @@ pub struct SqsSinkConfig {
     pub message_deduplication_id_field: Option<String>,
 
     /// Max entries per `SendMessageBatch` request (1–10). Default 10.
+    ///
+    /// **The house `batch_size = 0` "no batching" sentinel does not apply
+    /// here** — `SendMessageBatch` caps a request at
+    /// [`MAX_ENTRIES_PER_REQUEST`](crate::MAX_ENTRIES_PER_REQUEST)
+    /// (10) entries, so an unbatched whole-page request is not expressible.
+    /// `0` (and anything above 10) is rejected at config load; pages larger
+    /// than `batch_size` are re-chunked into several requests (also
+    /// re-chunked to stay under the 256 KiB per-request payload limit).
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 

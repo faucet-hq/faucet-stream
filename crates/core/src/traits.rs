@@ -524,6 +524,28 @@ pub trait Sink: Send + Sync {
         }
     }
 
+    /// Whether a **plain [`write_batch`](Self::write_batch) is safe to replay**
+    /// — i.e. re-sending the same page after an ambiguous failure converges
+    /// instead of duplicating rows. Default: `false`.
+    ///
+    /// This is the property the pipeline needs before it may retry a
+    /// non-idempotent write, and it is **not** the same as
+    /// [`supports_idempotent_writes`](Self::supports_idempotent_writes), which
+    /// promises only that rows *and a commit token* can be committed in one
+    /// transaction (the [`write_batch_idempotent`](Self::write_batch_idempotent)
+    /// path). A sink can offer that token protocol and still have a plain
+    /// `write_batch` that is a bare multi-row `INSERT` — replaying it after the
+    /// server committed but the response was lost duplicates every row, which
+    /// is this repo's worst bug class (F29/F32).
+    ///
+    /// The default implementation is therefore conservative and derives from
+    /// the live config: a keyed upsert/delete converges on replay, anything
+    /// else does not. Override only for a sink whose plain write is genuinely
+    /// replay-safe by construction.
+    fn write_batch_is_replay_safe(&self) -> bool {
+        self.dedups_by_key()
+    }
+
     /// Whether this sink instance is **configured** to dedup by key — i.e.
     /// `write_mode: upsert` (or `delete`) with a non-empty `key`, so
     /// re-applying a record with the same key converges instead of

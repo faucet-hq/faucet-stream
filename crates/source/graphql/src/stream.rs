@@ -390,39 +390,32 @@ impl GraphqlStream {
             && let Some(arr) = errors.as_array()
             && !arr.is_empty()
         {
-            let msg = arr
-                .iter()
-                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
-                .collect::<Vec<_>>()
-                .join("; ");
-            // Surface "first: must be non-null" / similar variable validation
-            // errors as `FaucetError::Config` so callers can react to the
-            // `batch_size = 0` sentinel hitting a schema that requires a
-            // non-null page-size argument. Detect by message substring —
-            // GraphQL servers don't standardise an error-code field.
-            let lower = msg.to_lowercase();
-            if self.config.batch_size == 0
-                && let Some(GraphqlPaginationSpec::Cursor(pag)) = &self.config.pagination
-            {
-                let var_name = pag.page_size_variable.to_lowercase();
-                if lower.contains(&var_name)
-                    && (lower.contains("non-null")
-                        || lower.contains("non null")
-                        || lower.contains("must not be null")
-                        || lower.contains("cannot be null")
-                        || lower.contains("required"))
-                {
-                    return Err(FaucetError::Config(format!(
-                        "batch_size = 0 requires the upstream to accept a null {}: argument \
-                         (GraphQL errors: {msg})",
-                        pag.page_size_variable
-                    )));
+            let msg = join_error_messages(arr);
+            // The `batch_size = 0` sentinel omits the page-size variable, so a
+            // schema declaring it non-null rejects the request. Offer the hint
+            // only when that sentinel is actually in play.
+            let page_size_variable = match (&self.config.pagination, self.config.batch_size) {
+                (Some(GraphqlPaginationSpec::Cursor(pag)), 0) => {
+                    Some(pag.page_size_variable.as_str())
                 }
-            }
-            return Err(FaucetError::HttpStatus {
-                status: 200,
-                url: self.config.endpoint.clone(),
-                body: format!("GraphQL errors: {msg}"),
+                _ => None,
+            };
+            let verdict = classify_graphql_errors(arr, page_size_variable);
+            let hint = match (verdict.page_size_hint, page_size_variable) {
+                (true, Some(var)) => format!(
+                    " (hint: batch_size = 0 omits the {var}: argument — set an explicit \
+                     batch_size if the upstream requires a non-null value)"
+                ),
+                _ => String::new(),
+            };
+            let body = format!("GraphQL errors: {msg}{hint}");
+            return Err(match verdict.class {
+                GraphqlErrorClass::Config => FaucetError::Config(body),
+                GraphqlErrorClass::Transport => FaucetError::HttpStatus {
+                    status: 200,
+                    url: self.config.endpoint.clone(),
+                    body,
+                },
             });
         }
 
@@ -620,6 +613,90 @@ fn extract_string(body: &Value, path: &str) -> Option<String> {
 fn extract_bool(body: &Value, path: &str) -> Option<bool> {
     let results = body.query(path).ok()?;
     results.first()?.as_bool()
+}
+
+/// `extensions.code` values that mean "the request itself was rejected" — an
+/// operator-fixable fault rather than a server-side condition. The `extensions`
+/// map is part of the GraphQL spec and `code` is the de-facto standard key every
+/// major server implementation populates, so this is a *typed* classification,
+/// not a prose match (PRINCIPLES.md §6).
+const CONFIG_ERROR_CODES: &[&str] = &[
+    "BAD_REQUEST",
+    "BAD_USER_INPUT",
+    "GRAPHQL_PARSE_FAILED",
+    "GRAPHQL_VALIDATION_FAILED",
+];
+
+/// Which `FaucetError` variant a GraphQL `errors[]` payload maps to.
+#[derive(Debug, PartialEq, Eq)]
+enum GraphqlErrorClass {
+    /// A typed request-rejection code — the caller's config is wrong.
+    Config,
+    /// Everything else. Keeps the transport-shaped classification the source
+    /// has always used for a `200` carrying application errors.
+    Transport,
+}
+
+/// Verdict for a GraphQL `errors[]` payload.
+#[derive(Debug, PartialEq, Eq)]
+struct GraphqlErrorVerdict {
+    class: GraphqlErrorClass,
+    /// Append the `batch_size = 0` page-size hint to the error message.
+    page_size_hint: bool,
+}
+
+/// Concatenate the `message` field of every GraphQL error, in order.
+fn join_error_messages(errors: &[Value]) -> String {
+    errors
+        .iter()
+        .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Pure classification of a GraphQL `errors[]` array (#654 M3).
+///
+/// The variant is decided **only** from the typed `extensions.code`
+/// ([`CONFIG_ERROR_CODES`]); a server that ships no code keeps the transport
+/// classification. Error prose never flips the variant, because prose is not
+/// API — a reworded validator used to silently turn a server error into a
+/// config error (and vice versa).
+///
+/// `page_size_variable` is `Some` only when the `batch_size = 0` sentinel is
+/// live (cursor pagination, no page size sent). When the errors mention that
+/// variable, the caller appends a hint naming it. The variable name comes from
+/// our own config and GraphQL validation errors are specified to name the
+/// offending variable, so this is a stable signal — and because it only adds
+/// *context* to the message, a miss degrades the diagnostic instead of changing
+/// how the error is handled.
+fn classify_graphql_errors(
+    errors: &[Value],
+    page_size_variable: Option<&str>,
+) -> GraphqlErrorVerdict {
+    let class = if errors.iter().any(|e| {
+        e.get("extensions")
+            .and_then(|x| x.get("code"))
+            .and_then(|c| c.as_str())
+            .is_some_and(|code| {
+                CONFIG_ERROR_CODES
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(code))
+            })
+    }) {
+        GraphqlErrorClass::Config
+    } else {
+        GraphqlErrorClass::Transport
+    };
+    let page_size_hint = page_size_variable.is_some_and(|var| {
+        !var.is_empty()
+            && join_error_messages(errors)
+                .to_lowercase()
+                .contains(&var.to_lowercase())
+    });
+    GraphqlErrorVerdict {
+        class,
+        page_size_hint,
+    }
 }
 
 /// What to do after fetching a page.
@@ -967,6 +1044,150 @@ mod tests {
         assert_eq!(g.order.len(), CursorGuard::CAP);
         assert!(!g.seen.contains_key("c0"), "oldest cursor evicted");
         assert!(g.seen.contains_key("overflow"));
+    }
+
+    // ─── GraphQL error classification (#654 M3) ──────────────────────────────
+
+    fn errs(v: Value) -> Vec<Value> {
+        v.as_array().expect("array fixture").clone()
+    }
+
+    #[test]
+    fn join_error_messages_concatenates_and_skips_non_strings() {
+        let errors = errs(json!([
+            {"message": "first bad"},
+            {"extensions": {"code": "X"}},
+            {"message": 42},
+            {"message": "then worse"}
+        ]));
+        assert_eq!(join_error_messages(&errors), "first bad; then worse");
+    }
+
+    #[test]
+    fn classify_bad_user_input_code_is_config() {
+        let errors = errs(json!([
+            {"message": "unknown argument", "extensions": {"code": "BAD_USER_INPUT"}}
+        ]));
+        assert_eq!(
+            classify_graphql_errors(&errors, None),
+            GraphqlErrorVerdict {
+                class: GraphqlErrorClass::Config,
+                page_size_hint: false,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_recognises_every_config_code_case_insensitively() {
+        for code in CONFIG_ERROR_CODES {
+            let errors =
+                errs(json!([{"message": "nope", "extensions": {"code": code.to_lowercase()}}]));
+            assert_eq!(
+                classify_graphql_errors(&errors, None).class,
+                GraphqlErrorClass::Config,
+                "{code} must classify as config regardless of case"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_uses_a_config_code_from_any_position() {
+        let errors = errs(json!([
+            {"message": "transient", "extensions": {"code": "INTERNAL_SERVER_ERROR"}},
+            {"message": "bad arg", "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}
+        ]));
+        assert_eq!(
+            classify_graphql_errors(&errors, None).class,
+            GraphqlErrorClass::Config
+        );
+    }
+
+    #[test]
+    fn classify_non_config_code_stays_transport() {
+        let errors = errs(json!([
+            {"message": "boom", "extensions": {"code": "INTERNAL_SERVER_ERROR"}}
+        ]));
+        assert_eq!(
+            classify_graphql_errors(&errors, None).class,
+            GraphqlErrorClass::Transport
+        );
+    }
+
+    #[test]
+    fn classify_non_string_code_stays_transport() {
+        // A server that puts a non-string in `code` must not be mis-typed.
+        let errors = errs(json!([{"message": "boom", "extensions": {"code": 400}}]));
+        assert_eq!(
+            classify_graphql_errors(&errors, None).class,
+            GraphqlErrorClass::Transport
+        );
+    }
+
+    #[test]
+    fn classify_does_not_reclassify_non_null_prose_without_extensions() {
+        // The behaviour change: prose alone never flips the variant. The
+        // diagnostic survives as a hint instead.
+        let errors = errs(json!([
+            {"message": "Variable \"$first\" of required type \"Int!\" must not be null."}
+        ]));
+        assert_eq!(
+            classify_graphql_errors(&errors, Some("first")),
+            GraphqlErrorVerdict {
+                class: GraphqlErrorClass::Transport,
+                page_size_hint: true,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_unrelated_error_is_untouched() {
+        let errors = errs(json!([{"message": "upstream timed out talking to the database"}]));
+        assert_eq!(
+            classify_graphql_errors(&errors, Some("first")),
+            GraphqlErrorVerdict {
+                class: GraphqlErrorClass::Transport,
+                page_size_hint: false,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_omits_hint_when_sentinel_is_not_live() {
+        // `page_size_variable: None` means batch_size != 0 (or no cursor
+        // pagination) — the hint would be misleading there.
+        let errors = errs(json!([
+            {"message": "Variable \"$first\" of required type \"Int!\" must not be null."}
+        ]));
+        assert!(!classify_graphql_errors(&errors, None).page_size_hint);
+    }
+
+    #[test]
+    fn classify_hint_matches_variable_name_case_insensitively() {
+        let errors = errs(json!([{"message": "Variable \"$pageSize\" is required."}]));
+        assert!(classify_graphql_errors(&errors, Some("PAGESIZE")).page_size_hint);
+    }
+
+    #[test]
+    fn classify_empty_variable_name_never_hints() {
+        let errors = errs(json!([{"message": "anything at all"}]));
+        assert!(!classify_graphql_errors(&errors, Some("")).page_size_hint);
+    }
+
+    #[test]
+    fn classify_config_code_and_hint_compose() {
+        let errors = errs(json!([
+            {
+                "message": "Variable \"$first\" of required type \"Int!\" was not provided.",
+                "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}
+            }
+        ]));
+        assert_eq!(
+            classify_graphql_errors(&errors, Some("first")),
+            GraphqlErrorVerdict {
+                class: GraphqlErrorClass::Config,
+                page_size_hint: true,
+            }
+        );
     }
 }
 

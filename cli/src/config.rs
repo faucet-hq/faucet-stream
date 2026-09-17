@@ -799,6 +799,7 @@ pub enum OnError {
 
 /// Top-level observability block: Prometheus scrape endpoint and tracing level.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilitySpec {
     /// Prometheus metrics scrape endpoint configuration.
     #[serde(default)]
@@ -815,6 +816,7 @@ pub struct ObservabilitySpec {
 
 /// Configuration for the Prometheus metrics HTTP endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PrometheusSpec {
     /// Socket address to bind the scrape endpoint on (e.g. `"127.0.0.1:9464"`).
     pub listen: String,
@@ -827,6 +829,7 @@ pub struct PrometheusSpec {
 
 /// Tracing / log-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracingSpec {
     /// `tracing-subscriber` filter directive (e.g. `"info"`, `"debug"`,
     /// `"faucet=trace"`). Defaults to the value of `RUST_LOG` when `None`.
@@ -836,6 +839,7 @@ pub struct TracingSpec {
 
 /// OTLP export block under `observability.otel:`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OtelSpec {
     /// Collector endpoint URL. When empty, defaults to the protocol-specific
     /// localhost address (`http://localhost:4317` for gRPC, `:4318` for HTTP).

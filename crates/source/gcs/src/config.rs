@@ -53,21 +53,23 @@ pub struct GcsSourceConfig {
     /// emits one page per object.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-    /// Verify each object's byte length against the `size` GCS reports for it,
-    /// failing the read with [`FaucetError::Source`](faucet_core::FaucetError::Source)
-    /// on a short (truncated) or over-long transfer (#161). Cheap (a byte
-    /// counter over the body that is read anyway) and defaults to `true`.
-    /// The check is automatically skipped for an object served with a
-    /// non-empty `Content-Encoding` (GCS may decompressively transcode it on
-    /// read, so the received byte count would not match the stored `size`).
+    /// Verify each object's byte length against the length the store
+    /// advertises, failing the read with
+    /// [`FaucetError::Source`](faucet_core::FaucetError::Source) on a short
+    /// (truncated) or over-long transfer (#161). Cheap — a byte counter over
+    /// a body that is read anyway — so it defaults to `true`.
+    ///
+    /// Skipped (with a debug log, not a failure) when the store advertises no
+    /// length, or when it reports a non-empty `Content-Encoding`: the body on
+    /// the wire is then transcoded and its length legitimately differs from
+    /// the stored object's.
     #[serde(default = "default_true")]
     pub verify_length: bool,
-    /// Verify each object's body against the CRC32C (or MD5) checksum GCS
-    /// reports for it (#161). Stronger than the length check but costs a hash
-    /// over the full body, so it defaults to `false`. Skipped for an object
-    /// with no usable checksum or one served with a non-empty
-    /// `Content-Encoding` (the stored checksum covers the stored bytes, which
-    /// transcoding would not return).
+    /// Verify each object's body against the checksum the store advertises
+    /// (#161). Stronger than the length check but costs a hash over the full
+    /// body, so it defaults to `false`. When the store advertises no usable
+    /// checksum for an object, verification is skipped for that object (a
+    /// debug log notes it); the length check still applies.
     #[serde(default)]
     pub verify_checksum: bool,
     /// Optional storage-host override (e.g. `http://localhost:4443` for
@@ -83,14 +85,16 @@ pub struct GcsSourceConfig {
     pub compression: faucet_core::CompressionConfig,
 }
 
+/// Serde default for the integrity flags that default on.
+fn default_true() -> bool {
+    true
+}
+
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
 }
 fn default_concurrency() -> usize {
     10
-}
-fn default_true() -> bool {
-    true
 }
 
 impl GcsSourceConfig {
@@ -154,14 +158,14 @@ impl GcsSourceConfig {
     }
 
     /// Enable or disable the per-object length verification (default `true`).
-    /// See [`verify_length`](Self::verify_length).
+    /// Sets [`verify_length`](Self::verify_length).
     pub fn verify_length(mut self, verify: bool) -> Self {
         self.verify_length = verify;
         self
     }
 
     /// Enable or disable per-object checksum verification (default `false`).
-    /// See [`verify_checksum`](Self::verify_checksum).
+    /// Sets [`verify_checksum`](Self::verify_checksum).
     pub fn verify_checksum(mut self, verify: bool) -> Self {
         self.verify_checksum = verify;
         self
@@ -287,6 +291,25 @@ mod tests {
         let config: GcsSourceConfig = serde_json::from_str(json).unwrap();
         assert!(config.verify_length);
         assert!(!config.verify_checksum);
+    }
+
+    /// The credentials block is `#[serde(flatten)]`ed, so the wire shape must stay
+    /// exactly the two top-level sibling keys it always was.
+    #[test]
+    fn verify_keys_stay_top_level_on_the_wire() {
+        let json = r#"{
+            "bucket": "my-bucket",
+            "verify_length": false,
+            "verify_checksum": true
+        }"#;
+        let config: GcsSourceConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.verify_length);
+        assert!(config.verify_checksum);
+
+        let out = serde_json::to_value(&config).unwrap();
+        assert_eq!(out["verify_length"], serde_json::json!(false));
+        assert_eq!(out["verify_checksum"], serde_json::json!(true));
+        assert!(out.get("verify").is_none(), "no nested block: {out}");
     }
 
     #[test]

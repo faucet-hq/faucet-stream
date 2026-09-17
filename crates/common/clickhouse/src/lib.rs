@@ -230,12 +230,30 @@ pub fn build_json_each_row(records: &[Value]) -> Result<String, FaucetError> {
 
 /// Encode a JSON scalar as an injection-safe ClickHouse SQL literal.
 ///
-/// Strings are single-quoted with `\` and `'` backslash-escaped (ClickHouse
-/// accepts C-style escapes inside string literals), booleans map to `1` / `0`,
-/// numbers pass through, and `null` becomes `NULL`. Non-scalar values (arrays /
-/// objects) fall back to their quoted JSON string form. Used to push an
-/// incremental-replication bookmark down into a `WHERE` clause without
-/// interpolating attacker-influenced text unescaped.
+/// Strings are single-quoted with `\` and `'` backslash-escaped, booleans map to
+/// `1` / `0`, numbers pass through, and `null` becomes `NULL`. Non-scalar values
+/// (arrays / objects) fall back to their quoted JSON string form. Used to push
+/// an incremental-replication bookmark or a `{key}` context value down into a
+/// `WHERE` clause without interpolating attacker-influenced text unescaped.
+///
+/// # Why not [`faucet_core::sql_literal`]
+///
+/// Core's escaper implements the ANSI rule — double the single quotes and leave
+/// everything else alone — and is the right choice for every dialect that treats
+/// a backslash as an ordinary character. **ClickHouse does not.** Its string
+/// literals accept C-style escape sequences, and its syntax reference states you
+/// must escape *at least* `'` and `\`. So the ANSI rule is unsafe here in two
+/// distinct ways:
+///
+/// - a value ending in a backslash (`foo\`) would emit `'foo\'`, whose backslash
+///   escapes the closing quote and swallows the rest of the statement;
+/// - an interior `\'` would survive as an escaped quote rather than a literal
+///   one, shifting where the literal ends.
+///
+/// Doubling quotes on top of backslash-escaping is unnecessary (ClickHouse
+/// accepts either form for `'`), so this escapes both meta-characters the one
+/// way: `\\` and `\'`. Any future dialect helper that diverges from core must
+/// likewise name the extra meta-characters and say why.
 pub fn sql_literal(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
@@ -431,6 +449,43 @@ mod tests {
             sql_literal(&json!("x' OR '1'='1")),
             "'x\\' OR \\'1\\'=\\'1'"
         );
+    }
+
+    #[test]
+    fn sql_literal_escapes_the_cases_the_ansi_rule_would_miss() {
+        // These are exactly why this dialect keeps its own escaper instead of
+        // consuming `faucet_core::sql_literal` (#654 M14). Under the ANSI rule
+        // each of these emits a literal whose closing quote is neutered by a
+        // backslash, so the statement continues into attacker text.
+        //
+        // Trailing backslash: ANSI would emit `'foo\'` — quote escaped, literal
+        // never closes. Backslash-escaping doubles it, so the quote closes.
+        assert_eq!(sql_literal(&json!("foo\\")), "'foo\\\\'");
+        // Pre-escaped quote: ANSI would emit `'a\''` — `\'` is an escaped quote
+        // and the trailing `'` re-opens a literal, so the statement runs on.
+        assert_eq!(sql_literal(&json!("a\\'")), "'a\\\\\\''");
+        // Full breakout attempt riding a trailing backslash.
+        assert_eq!(
+            sql_literal(&json!("x\\' OR 1=1 --")),
+            "'x\\\\\\' OR 1=1 --'"
+        );
+        // Property: after escaping, every backslash in the body starts a
+        // two-character escape pair, so the final quote can never be consumed.
+        for probe in ["foo\\", "a\\'", "\\\\", "\\", "'\\"] {
+            let out = sql_literal(&json!(probe));
+            let body = &out[1..out.len() - 1];
+            let mut chars = body.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    assert!(
+                        matches!(chars.next(), Some('\\') | Some('\'')),
+                        "dangling escape in {out} for input {probe:?}"
+                    );
+                } else {
+                    assert_ne!(c, '\'', "unescaped quote in {out} for input {probe:?}");
+                }
+            }
+        }
     }
 
     #[test]

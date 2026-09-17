@@ -119,10 +119,19 @@ pub(crate) fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// Backtick-quoted identifier. BigQuery identifiers never contain a backtick
-/// (the schema came from BigQuery), so a stray one is stripped defensively.
+/// Backtick-quoted identifier, with backslash and backtick **escaped** — the
+/// representation BigQuery's quoted-identifier grammar defines.
+///
+/// This used to *strip* backticks "defensively, since the schema came from
+/// BigQuery". It does not: the same function quotes **user-supplied**
+/// identifiers — `write.key` columns in the `MERGE` predicates
+/// ([`crate::merge`]) and cleanup scope columns — so a key column named
+/// ``a`b`` was silently rewritten to `ab`, and the MERGE then matched a
+/// *different, real* column. Silently targeting the wrong column is the worst
+/// available outcome; escaping instead yields either the correct identifier or
+/// a loud BigQuery error (#654 M15).
 pub(crate) fn quote_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', ""))
+    format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
 }
 
 /// A single JSONPath member segment. Safe BigQuery identifiers use the `.name`
@@ -917,5 +926,20 @@ mod tests {
             build_drop_not_null_ddl("`p.d.t`", "created_at"),
             "ALTER TABLE `p.d.t` ALTER COLUMN `created_at` DROP NOT NULL"
         );
+    }
+
+    #[test]
+    fn quote_ident_escapes_rather_than_silently_rewriting() {
+        use super::quote_ident;
+        // Ordinary identifiers are untouched apart from the quotes.
+        assert_eq!(quote_ident("order_id"), "`order_id`");
+        assert_eq!(quote_ident("weird name"), "`weird name`");
+        // A backtick in a USER-supplied key column must not be dropped: the old
+        // behaviour turned `a`b` into `ab`, so the MERGE predicate matched a
+        // different, real column — silently writing to the wrong place.
+        assert_eq!(quote_ident("a`b"), "`a\\`b`");
+        // Backslashes escape first, so the escape itself cannot be forged.
+        assert_eq!(quote_ident("a\\b"), "`a\\\\b`");
+        assert_eq!(quote_ident("a\\`b"), "`a\\\\\\`b`");
     }
 }

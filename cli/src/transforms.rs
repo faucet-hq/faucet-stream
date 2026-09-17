@@ -259,61 +259,6 @@ fn get_dot_path(rec: &Value, path: &str) -> Option<Value> {
     Some(cur.clone())
 }
 
-#[cfg(feature = "transform-cdc-unwrap")]
-#[derive(Debug, Deserialize, JsonSchema)]
-struct CdcUnwrapConfig {
-    /// Envelope field holding the operation code. Default `"op"`.
-    #[serde(default = "cdc_op_field")]
-    op_field: String,
-    /// Envelope field holding the post-image row. Default `"after"`.
-    #[serde(default = "cdc_after_field")]
-    after_field: String,
-    /// Envelope field holding the pre-image row. Default `"before"`.
-    #[serde(default = "cdc_before_field")]
-    before_field: String,
-    /// Fallback key field for deletes when `before` is absent. Default `"document_key"`.
-    #[serde(default = "cdc_key_field")]
-    key_field: String,
-    /// Field stamped onto every emitted row with the op value. Default `"__op"`.
-    #[serde(default = "cdc_marker_field")]
-    marker_field: String,
-    /// Op values that mean delete. Default `["d", "delete"]`.
-    #[serde(default = "cdc_delete_ops")]
-    delete_ops: Vec<String>,
-    /// Op values that cause the record to be dropped (1→0). Default `["ddl", "truncate"]`.
-    #[serde(default = "cdc_drop_ops")]
-    drop_ops: Vec<String>,
-}
-
-#[cfg(feature = "transform-cdc-unwrap")]
-fn cdc_op_field() -> String {
-    "op".into()
-}
-#[cfg(feature = "transform-cdc-unwrap")]
-fn cdc_after_field() -> String {
-    "after".into()
-}
-#[cfg(feature = "transform-cdc-unwrap")]
-fn cdc_before_field() -> String {
-    "before".into()
-}
-#[cfg(feature = "transform-cdc-unwrap")]
-fn cdc_key_field() -> String {
-    "document_key".into()
-}
-#[cfg(feature = "transform-cdc-unwrap")]
-fn cdc_marker_field() -> String {
-    "__op".into()
-}
-#[cfg(feature = "transform-cdc-unwrap")]
-fn cdc_delete_ops() -> Vec<String> {
-    vec!["d".into(), "delete".into()]
-}
-#[cfg(feature = "transform-cdc-unwrap")]
-fn cdc_drop_ops() -> Vec<String> {
-    vec!["ddl".into(), "truncate".into()]
-}
-
 /// One row in the transform registry — the single source of truth for every
 /// built-in transform's kind, one-line description, JSON Schema, and
 /// `TransformSpec → TransformStage` decoder. `compile_one`,
@@ -846,18 +791,14 @@ fn registry() -> Vec<TransformDef> {
         defs.push(TransformDef {
             kind: "cdc_unwrap",
             description: "Normalize a CDC envelope into a flat row + delete marker (for upsert sinks).",
-            schema_fn: || schema::<CdcUnwrapConfig>(),
+            // Decoded straight into the core spec: a CLI-side mirror of the
+            // struct would let the reserved `__op` marker default drift out of
+            // step with the sink that matches on it (#654 M17).
+            schema_fn: || schema::<faucet_core::CdcUnwrapSpec>(),
             compile_fn: |kind, config| {
-                let cfg = decode::<CdcUnwrapConfig>(kind, config)?;
-                Ok(faucet_core::TransformStage::CdcUnwrap(faucet_core::CdcUnwrapSpec {
-                    op_field: cfg.op_field,
-                    after_field: cfg.after_field,
-                    before_field: cfg.before_field,
-                    key_field: cfg.key_field,
-                    marker_field: cfg.marker_field,
-                    delete_ops: cfg.delete_ops,
-                    drop_ops: cfg.drop_ops,
-                }))
+                Ok(faucet_core::TransformStage::CdcUnwrap(decode::<
+                    faucet_core::CdcUnwrapSpec,
+                >(kind, config)?))
             },
         });
     }
@@ -1916,6 +1857,33 @@ mod tests {
         let out = compile_transforms(&specs).unwrap();
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], faucet_core::TransformStage::CdcUnwrap(_)));
+    }
+
+    /// The CLI must not reintroduce its own defaults for this spec: the marker
+    /// field is what a sink's `delete_marker` matches on, so a CLI-side default
+    /// drifting from core's would silently turn deletes into inserts (#654 M17).
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_defaults_come_from_core() {
+        let specs = vec![TransformSpec {
+            kind: "cdc_unwrap".into(),
+            config: json!({ "op_field": "operation" }),
+        }];
+        let out = compile_transforms(&specs).unwrap();
+        let faucet_core::TransformStage::CdcUnwrap(spec) = &out[0] else {
+            panic!("expected a CdcUnwrap stage, got {:?}", out[0]);
+        };
+        assert_eq!(spec.op_field, "operation");
+        assert_eq!(
+            spec.marker_field,
+            faucet_core::stage::CDC_DEFAULT_MARKER_FIELD
+        );
+        let defaults = faucet_core::CdcUnwrapSpec::default();
+        assert_eq!(spec.after_field, defaults.after_field);
+        assert_eq!(spec.before_field, defaults.before_field);
+        assert_eq!(spec.key_field, defaults.key_field);
+        assert_eq!(spec.delete_ops, defaults.delete_ops);
+        assert_eq!(spec.drop_ops, defaults.drop_ops);
     }
 
     #[cfg(feature = "transform-cdc-unwrap")]
