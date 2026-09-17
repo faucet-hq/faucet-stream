@@ -347,12 +347,6 @@ impl MssqlSink {
             return Ok(0);
         }
         let cols_quoted = quote_columns(cols)?;
-        // Anything that is not a typed server rejection is infrastructure:
-        // propagate it, never blame a row for it, never blindly re-run it.
-        let infra = |err: FaucetError| ChunkError {
-            class: ChunkFailure::Infrastructure,
-            err,
-        };
         let per_insert = max_rows_per_insert(cols_quoted.len());
 
         // Wrap the chunk in a transaction when configured, OR whenever it spans
@@ -364,7 +358,7 @@ impl MssqlSink {
         // H6). Forcing a transaction makes the chunk atomic so re-running is safe.
         let txn = self.config.transaction_per_batch || rows.len() > per_insert;
         if txn {
-            control(conn, "BEGIN TRAN").await.map_err(infra)?;
+            control(conn, "BEGIN TRAN").await?;
         }
 
         for sub in rows.chunks(per_insert) {
@@ -395,10 +389,8 @@ impl MssqlSink {
                 Some(t) => match tokio::time::timeout(t, exec).await {
                     Ok(inner) => (inner, false),
                     Err(_) => (
-                        // A client-side timeout leaves the outcome unknown: the
-                        // server may have committed. Infrastructure, never a
-                        // retry candidate.
-                        Err(infra(FaucetError::Sink("MSSQL insert timed out".into()))),
+                        // Outcome unknown: the server may have committed.
+                        Err(FaucetError::Sink("MSSQL insert timed out".into()).into()),
                         true,
                     ),
                 },
@@ -413,8 +405,7 @@ impl MssqlSink {
         }
 
         if txn {
-            // A failed COMMIT is outcome-unknown by definition.
-            control(conn, "COMMIT TRAN").await.map_err(infra)?;
+            control(conn, "COMMIT TRAN").await?;
         }
         Ok(rows.len())
     }
@@ -883,6 +874,19 @@ pub(crate) struct ChunkError {
 impl From<ChunkError> for FaucetError {
     fn from(c: ChunkError) -> Self {
         c.err
+    }
+}
+
+impl From<FaucetError> for ChunkError {
+    /// Anything that is not a typed *server* rejection is infrastructure:
+    /// propagate it, never blame a row for it, never blindly re-run it. Having
+    /// this conversion means the I/O shim keeps using a bare `?` instead of a
+    /// hand-written `map_err` at every call site.
+    fn from(err: FaucetError) -> Self {
+        Self {
+            class: ChunkFailure::Infrastructure,
+            err,
+        }
     }
 }
 
