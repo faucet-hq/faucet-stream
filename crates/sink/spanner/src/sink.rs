@@ -1141,13 +1141,13 @@ impl faucet_core::Sink for SpannerSink {
             Ok(None) => Ok(None),
             // First exactly-once run: the watermark table hasn't been created
             // yet — that's "no token", not an error.
+            // The typed status is authoritative. A message-based fallback here
+            // would fire only for statuses that are NOT NotFound —
+            // PermissionDenied / Unavailable / DeadlineExceeded whose text
+            // happens to mention the table — and reporting those as "no token
+            // committed" re-writes already-committed pages, i.e. silent
+            // duplicate delivery under the one mode that promises otherwise.
             Err(status) if status.code() == gcloud_gax::grpc::Code::NotFound => Ok(None),
-            Err(status)
-                if status.message().to_ascii_lowercase().contains("not found")
-                    || status.message().contains(SPANNER_COMMIT_TOKEN_TABLE) =>
-            {
-                Ok(None)
-            }
             Err(status) => Err(sink_err("token read", status)),
         }
     }

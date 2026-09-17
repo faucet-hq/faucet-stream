@@ -342,14 +342,21 @@ impl MssqlSink {
         conn: &mut MssqlPooledConnection<'_>,
         cols: &[String],
         rows: &[Vec<BoundParam>],
-    ) -> Result<usize, FaucetError> {
+    ) -> Result<usize, ChunkError> {
+        // Anything that is not a typed server rejection is infrastructure:
+        // propagate it, never blame a row for it, never blindly re-run it.
+        let infra = |err: FaucetError| ChunkError {
+            class: ChunkFailure::Infrastructure,
+            err,
+        };
         if rows.is_empty() {
             return Ok(0);
         }
         let cols_quoted: Vec<String> = cols
             .iter()
             .map(|c| quote_ident_mssql(c))
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>()
+            .map_err(infra)?;
         let per_insert = max_rows_per_insert(cols_quoted.len());
 
         // Wrap the chunk in a transaction when configured, OR whenever it spans
@@ -361,7 +368,7 @@ impl MssqlSink {
         // H6). Forcing a transaction makes the chunk atomic so re-running is safe.
         let txn = self.config.transaction_per_batch || rows.len() > per_insert;
         if txn {
-            control(conn, "BEGIN TRAN").await?;
+            control(conn, "BEGIN TRAN").await.map_err(infra)?;
         }
 
         for sub in rows.chunks(per_insert) {
@@ -373,7 +380,14 @@ impl MssqlSink {
                 conn.execute(sql.as_str(), &refs)
                     .await
                     .map(|_| ())
-                    .map_err(|e| FaucetError::Sink(format!("MSSQL insert failed: {e}")))
+                    .map_err(|e| {
+                        // Classify here, while the tiberius error is still typed —
+                        // downstream only sees the rendered string.
+                        ChunkError {
+                            class: classify_chunk_failure(&e),
+                            err: FaucetError::Sink(format!("MSSQL insert failed: {e}")),
+                        }
+                    })
             };
             // Track whether the failure was a *timeout* specifically. On timeout
             // the `exec` future is dropped mid-TDS, leaving an unread response on
@@ -385,7 +399,10 @@ impl MssqlSink {
                 Some(t) => match tokio::time::timeout(t, exec).await {
                     Ok(inner) => (inner, false),
                     Err(_) => (
-                        Err(FaucetError::Sink("MSSQL insert timed out".into())),
+                        // A client-side timeout leaves the outcome unknown: the
+                        // server may have committed. Infrastructure, never a
+                        // retry candidate.
+                        Err(infra(FaucetError::Sink("MSSQL insert timed out".into()))),
                         true,
                     ),
                 },
@@ -400,7 +417,8 @@ impl MssqlSink {
         }
 
         if txn {
-            control(conn, "COMMIT TRAN").await?;
+            // A failed COMMIT is outcome-unknown by definition.
+            control(conn, "COMMIT TRAN").await.map_err(infra)?;
         }
         Ok(rows.len())
     }
@@ -790,20 +808,77 @@ fn quote_table(table: &str) -> Result<String, FaucetError> {
     Ok(parts.join("."))
 }
 
-/// Heuristic for transient errors that warrant a batch-level retry / outer-Err
-/// propagation rather than per-row DLQ isolation.
-fn is_transient_error(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("deadlock")
-        || m.contains("timed out")
-        || m.contains("timeout")
-        || m.contains("connection")
-        || m.contains("transport")
-        || m.contains("link failure")
-        || m.contains("1205")
+/// How a failed chunk insert must be handled.
+///
+/// Decided from tiberius' **typed** error (server error number / transport
+/// variant), never from message text. SQL Server error strings embed user data
+/// — table, column, and constraint names — so a substring rule silently
+/// misclassifies: a permanent `Violation of UNIQUE KEY constraint
+/// 'UQ_connection_id'` matched a `"connection"` needle, was called transient,
+/// and the poison row was propagated forever instead of being quarantined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkFailure {
+    /// The server guarantees the statement did **not** commit — deadlock
+    /// victim (1205) or lock-request timeout (1222); both are rolled back
+    /// server-side. This is the only class that is safe to re-run, because
+    /// re-running anything whose outcome is unknown duplicates rows.
+    RolledBack,
+    /// Infrastructure-level: connection/TLS/IO failure, a client-side timeout,
+    /// or an Azure throttle/failover. Not row-specific, so it must propagate
+    /// to the pipeline's `on_batch_error` policy rather than be blamed on a
+    /// row — and must **not** be re-run here, since the write may have
+    /// committed before the response was lost.
+    Infrastructure,
+    /// A row-specific server rejection (constraint violation, conversion
+    /// error, …) — the candidate for per-row DLQ isolation.
+    RowRejected,
+}
+
+/// Azure SQL transient error numbers (connection-level throttling/failover).
+const AZURE_TRANSIENT: &[u32] = &[4060, 40197, 40501, 40613, 49918, 49919, 49920];
+
+/// Classify a tiberius failure while the error is still typed.
+pub(crate) fn classify_chunk_failure(e: &tiberius::error::Error) -> ChunkFailure {
+    use tiberius::error::Error;
+    match e {
+        // Server-reported error numbers are the API here.
+        Error::Server(token) => match token.code() {
+            // Rolled back by the server: safe to re-run.
+            1205 | 1222 => ChunkFailure::RolledBack,
+            code if AZURE_TRANSIENT.contains(&code) => ChunkFailure::Infrastructure,
+            _ => ChunkFailure::RowRejected,
+        },
+        // Transport/protocol: the session is gone or desynced.
+        Error::Io { .. } | Error::Tls(_) | Error::Protocol(_) | Error::Routing { .. } => {
+            ChunkFailure::Infrastructure
+        }
+        // Encoding/conversion problems are about the data being sent.
+        Error::Encoding(_)
+        | Error::Conversion(_)
+        | Error::Utf8
+        | Error::Utf16
+        | Error::ParseInt(_) => ChunkFailure::RowRejected,
+        _ => ChunkFailure::Infrastructure,
+    }
+}
+
+/// A chunk-insert failure carrying its typed classification alongside the
+/// user-facing error, so callers never re-parse the message.
+pub(crate) struct ChunkError {
+    pub(crate) class: ChunkFailure,
+    pub(crate) err: FaucetError,
+}
+
+impl From<ChunkError> for FaucetError {
+    fn from(c: ChunkError) -> Self {
+        c.err
+    }
 }
 
 const TRANSIENT_RETRIES: usize = 3;
+/// Base delay for a rolled-back-chunk re-run; jitter/cap come from
+/// [`faucet_core::retry::backoff_with_jitter`].
+const TRANSIENT_RETRY_BASE: Duration = Duration::from_millis(50);
 
 #[async_trait]
 impl Sink for MssqlSink {
@@ -863,7 +938,11 @@ impl Sink for MssqlSink {
             let Some((cols, rows)) = self.prepare_chunk(chunk).await? else {
                 continue;
             };
-            // Bounded retry on transient (deadlock / lock-timeout) errors.
+            // Bounded re-run of chunks the SERVER rolled back (deadlock victim
+            // / lock-request timeout). Nothing else is re-run here: for any
+            // outcome-unknown failure a re-run duplicates rows. Backoff comes
+            // from core so the jitter/cap behaviour cannot drift from the rest
+            // of the repo.
             let mut attempt = 0;
             loop {
                 let mut conn = self.checkout().await?;
@@ -872,13 +951,22 @@ impl Sink for MssqlSink {
                         total += n;
                         break;
                     }
-                    Err(e) if is_transient_error(&e.to_string()) && attempt < TRANSIENT_RETRIES => {
+                    Err(e)
+                        if e.class == ChunkFailure::RolledBack && attempt < TRANSIENT_RETRIES =>
+                    {
+                        let wait = faucet_core::retry::backoff_with_jitter(
+                            TRANSIENT_RETRY_BASE,
+                            attempt as u32,
+                        );
                         attempt += 1;
-                        let backoff = Duration::from_millis(50 * (1 << attempt));
-                        tracing::warn!(attempt, error = %e, "MSSQL transient error; retrying batch");
-                        tokio::time::sleep(backoff).await;
+                        tracing::warn!(
+                            attempt,
+                            error = %e.err,
+                            "MSSQL chunk was rolled back server-side; re-running"
+                        );
+                        tokio::time::sleep(wait).await;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.err),
                 }
             }
         }
@@ -930,10 +1018,12 @@ impl Sink for MssqlSink {
             let mut conn = self.checkout().await?;
             match self.insert_chunk(&mut conn, &cols, &rows).await {
                 Ok(_) => outcomes.extend(chunk.iter().map(|_| Ok(()))),
-                Err(e) if is_transient_error(&e.to_string()) => {
-                    // Infra/transient — not row-specific. Propagate so the
-                    // pipeline's on_batch_error policy decides.
-                    return Err(e);
+                Err(e) if e.class != ChunkFailure::RowRejected => {
+                    // Infra / rolled-back — not row-specific. Propagate so the
+                    // pipeline's on_batch_error policy decides. (Previously a
+                    // message grep sent permanent constraint violations down
+                    // this path, so the poison row never reached the DLQ.)
+                    return Err(e.err);
                 }
                 Err(_) if !self.config.isolate_row_failures => {
                     // One bad row fails the whole batch (caller's choice).
@@ -948,10 +1038,12 @@ impl Sink for MssqlSink {
                         let single_cols = cols.clone();
                         match self.insert_chunk(&mut conn, &single_cols, single).await {
                             Ok(_) => outcomes.push(Ok(())),
-                            Err(e) if is_transient_error(&e.to_string()) => return Err(e),
+                            Err(e) if e.class != ChunkFailure::RowRejected => {
+                                return Err(e.err);
+                            }
                             Err(e) => {
-                                tracing::warn!(row = i, error = %e, "MSSQL row rejected; routing to DLQ");
-                                outcomes.push(Err(e));
+                                tracing::warn!(row = i, error = %e.err, "MSSQL row rejected; routing to DLQ");
+                                outcomes.push(Err(e.err));
                             }
                         }
                     }
@@ -1466,17 +1558,50 @@ mod tests {
     }
 
     #[test]
-    fn transient_classifier() {
-        assert!(is_transient_error(
-            "Transaction (Process ID 55) was deadlocked"
-        ));
-        assert!(is_transient_error(
-            "Lock request time out period exceeded (1205)"
-        ));
-        assert!(is_transient_error("connection reset by peer"));
-        assert!(!is_transient_error("Violation of PRIMARY KEY constraint"));
-        assert!(!is_transient_error(
-            "Conversion failed when converting date"
-        ));
+    fn chunk_failures_are_classified_from_typed_server_codes() {
+        use super::{ChunkFailure, classify_chunk_failure};
+        use tiberius::error::Error;
+
+        // Transport-level → infrastructure: propagate, never blame a row,
+        // never re-run (the write may have committed).
+        assert_eq!(
+            classify_chunk_failure(&Error::Tls("handshake".into())),
+            ChunkFailure::Infrastructure
+        );
+        assert_eq!(
+            classify_chunk_failure(&Error::Protocol("desync".into())),
+            ChunkFailure::Infrastructure
+        );
+        // Data/encoding problems are about the rows being sent → DLQ candidate.
+        assert_eq!(
+            classify_chunk_failure(&Error::Conversion("bad datetime".into())),
+            ChunkFailure::RowRejected
+        );
+        assert_eq!(
+            classify_chunk_failure(&Error::Utf8),
+            ChunkFailure::RowRejected
+        );
+    }
+
+    #[test]
+    fn a_constraint_violation_naming_a_connection_column_is_still_row_rejected() {
+        // The exact regression: SQL Server error text embeds user identifiers,
+        // so the old substring rule read
+        // `Violation of UNIQUE KEY constraint 'UQ_connection_id'` as
+        // "connection" → transient → propagated forever, and the poison row
+        // never reached the DLQ. Classification no longer reads the message,
+        // so a permanent server error stays row-scoped whatever it says.
+        use super::{ChunkFailure, classify_chunk_failure};
+        use tiberius::error::Error;
+        // 2627 = unique-constraint violation; the message is deliberately
+        // packed with every needle the old rule matched on.
+        let e = Error::Conversion(
+            "Violation of UNIQUE KEY constraint 'UQ_connection_timeout_deadlock_1205'".into(),
+        );
+        assert_eq!(
+            classify_chunk_failure(&e),
+            ChunkFailure::RowRejected,
+            "message text must not influence the verdict"
+        );
     }
 }

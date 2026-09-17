@@ -32,6 +32,24 @@ pub struct HttpSink {
     auth_provider: Option<SharedAuthProvider>,
 }
 
+/// Base delay for a retried request; the cap and jitter come from
+/// [`faucet_core::retry::backoff_with_jitter`], so this sink cannot drift from
+/// the rest of the repo's backoff behaviour.
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sleep before re-sending. A `RateLimited` error carries the server's own
+/// `Retry-After`, which always wins; everything else gets capped, jittered
+/// exponential backoff. Retrying with **no** delay (the previous behaviour)
+/// turned a brief upstream 503 into an amplifying burst of requests within
+/// microseconds — the thundering herd core's backoff exists to prevent.
+async fn retry_delay(err: &FaucetError, attempt: u32) {
+    let wait = match err {
+        FaucetError::RateLimited(d) => *d,
+        _ => faucet_core::retry::backoff_with_jitter(RETRY_BASE, attempt),
+    };
+    tokio::time::sleep(wait).await;
+}
+
 impl HttpSink {
     /// Create a new HTTP sink from the given configuration.
     pub fn new(config: HttpSinkConfig) -> Self {
@@ -135,6 +153,7 @@ impl HttpSink {
                                 error = %e,
                                 "retrying request"
                             );
+                            retry_delay(&e, attempt as u32).await;
                             last_error = Some(e);
                             continue;
                         }
@@ -150,6 +169,7 @@ impl HttpSink {
                             error = %faucet_err,
                             "retrying request"
                         );
+                        retry_delay(&faucet_err, attempt as u32).await;
                         last_error = Some(faucet_err);
                         continue;
                     }

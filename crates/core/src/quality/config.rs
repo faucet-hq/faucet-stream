@@ -92,6 +92,7 @@ fn default_true() -> bool {
 /// page into survivors + quarantined); per-batch checks then run over the
 /// survivors.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QualitySpec {
     /// Per-record checks, evaluated in declared order (first failure wins).
     #[serde(default)]
@@ -105,6 +106,7 @@ pub struct QualitySpec {
 /// (bare key, `dot.path`, `$['bracketed']`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum RecordCheck {
     /// Field present and non-null.
     NotNull {
@@ -172,6 +174,7 @@ pub enum RecordCheck {
 /// pass.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum BatchCheck {
     /// Survivor count is within `[min, max]` (at least one bound required).
     RowCount {

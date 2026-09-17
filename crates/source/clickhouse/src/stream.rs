@@ -2,7 +2,6 @@
 //! streaming JSONEachRow decode, and incremental-replication bookkeeping.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Mutex;
 
@@ -207,9 +206,12 @@ fn default_state_key(config: &ClickHouseSourceConfig) -> String {
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| "clickhouse".to_string());
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.query.hash(&mut hasher);
-    let fingerprint = hasher.finish();
+    // FNV-1a from core, NOT `DefaultHasher`: this value is part of a
+    // **durable** state-store key, and `DefaultHasher`'s output is explicitly
+    // not stable across Rust releases. A toolchain bump would silently re-key
+    // the bookmark, orphaning it and re-replicating the whole table on the
+    // next run with a green exit code.
+    let fingerprint = faucet_core::shard::shard_hash(&config.query);
     let host: String = host
         .chars()
         .map(|c| {
@@ -571,5 +573,22 @@ mod tests {
             ),
             "unreachable server must fail the connect probe"
         );
+    }
+
+    #[test]
+    fn default_state_key_is_stable_and_query_scoped() {
+        // The key is durable state: it must be a pure function of the config
+        // (stable across processes and toolchains — hence core's FNV-1a rather
+        // than `DefaultHasher`) and must differ per query so two sources on
+        // one host cannot collide on a single bookmark.
+        let mk = |q: &str| {
+            let mut c = ClickHouseSourceConfig::new("http://ch.example.com:8123", q);
+            c.state_key = None;
+            default_state_key(&c)
+        };
+        let a = mk("SELECT * FROM events");
+        assert_eq!(a, mk("SELECT * FROM events"), "stable for one query");
+        assert_ne!(a, mk("SELECT * FROM orders"), "scoped per query");
+        assert!(a.contains("ch.example.com"), "host-scoped: {a}");
     }
 }

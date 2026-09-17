@@ -144,10 +144,19 @@ fn is_missing_table(e: &deltalake::DeltaTableError) -> bool {
         return true;
     }
     // A brand-new location surfaces as an object-store NotFound wrapped in a
-    // generic error; match on the rendered message so the create-if-missing
-    // path doesn't treat "empty prefix" as a hard failure.
-    let msg = e.to_string().to_lowercase();
-    msg.contains("not found") || msg.contains("no such file") || msg.contains("does not exist")
+    // generic error. Classify it **typed**: matching the rendered message
+    // instead would also swallow a 403 AccessDenied, an expired credential, or
+    // a transient listing failure on `_delta_log/` — every one of which
+    // renders "not found"-shaped text for object stores. Reading an *existing*
+    // table as absent makes the sink write a fresh `_delta_log/…0.json`,
+    // replacing the table's identity and orphaning its data files, so this is
+    // a data-loss boundary, not a diagnostic one.
+    matches!(
+        e,
+        deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::NotFound { .. }
+        }
+    )
 }
 
 /// Register every compiled-in cloud object-store handler exactly once.

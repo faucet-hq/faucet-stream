@@ -1219,15 +1219,25 @@ where
     // `write_batch_partial`). A bare `write_batch` makes no atomicity promise:
     // if the request commits server-side but the response is lost, a
     // pipeline-level retry silently duplicates every row — the repo's #1 worst
-    // bug class (F29/F32). So we only apply the retry policy when the sink
-    // commits writes idempotently (`supports_idempotent_writes()`); otherwise
-    // we fall through to a bare `$op.await`, exactly as the pre-resilience code
-    // did. The idempotent exactly-once path (`write_batch_idempotent`) keeps
-    // using `with_retry!` — replaying a token-stamped write is a no-op, so it
-    // is always safe to retry.
+    // bug class (F29/F32). So we only apply the retry policy when replaying
+    // this sink's plain write actually converges
+    // (`write_batch_is_replay_safe()`, which defaults to "configured for keyed
+    // upsert/delete"); otherwise we fall through to a bare `$op.await`,
+    // exactly as the pre-resilience code did.
+    //
+    // This deliberately does NOT gate on `supports_idempotent_writes()`: that
+    // promises only that rows *and a commit token* commit together on the
+    // `write_batch_idempotent` path, which says nothing about a plain
+    // `write_batch`. Eleven sinks advertise the token protocol while their
+    // ordinary write is a multi-row `INSERT`, so gating on it re-opened the
+    // very duplication this wrapper exists to prevent.
+    //
+    // The idempotent exactly-once path (`write_batch_idempotent`) keeps using
+    // `with_retry!` — replaying a token-stamped write is a no-op, so it is
+    // always safe to retry.
     macro_rules! with_retry_write {
         ($op_label:literal, $op:expr) => {
-            if retry_policy.is_some() && sink.supports_idempotent_writes() {
+            if retry_policy.is_some() && sink.write_batch_is_replay_safe() {
                 with_retry!($op_label, $op)
             } else {
                 $op.await
@@ -5189,8 +5199,13 @@ mod tests {
             async fn flush(&self) -> Result<(), FaucetError> {
                 Ok(())
             }
-            // Idempotent so the pipeline retries its `write_batch` (F29 gate).
-            fn supports_idempotent_writes(&self) -> bool {
+            // Declares its plain write replay-safe, which is what now opens the
+            // F29 gate. (This used to say `supports_idempotent_writes`, but
+            // that promises only rows+token atomicity on the *idempotent*
+            // path — using it here is what let the pipeline retry ordinary
+            // INSERTs. The behaviour under test — retry a transient write and
+            // succeed — is unchanged.)
+            fn write_batch_is_replay_safe(&self) -> bool {
                 true
             }
         }
@@ -5226,6 +5241,149 @@ mod tests {
         assert_eq!(written.load(Ordering::SeqCst), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert_eq!(res.records_written, 1);
+    }
+
+    #[tokio::test]
+    async fn resilience_does_not_retry_a_token_capable_sink_with_a_plain_insert() {
+        // The regression this pins: gating the retry on
+        // `supports_idempotent_writes()` retried these sinks' plain
+        // `write_batch`. That method only promises rows+token commit together
+        // on the `write_batch_idempotent` path — eleven sinks advertise it
+        // while their ordinary write is a bare multi-row INSERT, so a
+        // lost-response retry duplicated every row. The gate is now
+        // `write_batch_is_replay_safe()`, which this sink leaves false.
+        use crate::resilience::{BackoffKind, ResiliencePolicy, RetryPolicy};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        struct TokenCapableButPlainInsertSink {
+            attempts: Arc<AtomicU32>,
+        }
+        #[async_trait::async_trait]
+        impl Sink for TokenCapableButPlainInsertSink {
+            async fn write_batch(&self, _r: &[Value]) -> Result<usize, FaucetError> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(FaucetError::HttpStatus {
+                    status: 503,
+                    url: "u".into(),
+                    body: String::new(),
+                })
+            }
+            async fn flush(&self) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            /// Advertises the commit-token protocol, like the SQL sinks do…
+            fn supports_idempotent_writes(&self) -> bool {
+                true
+            }
+            // …but its plain write is an INSERT, so replay is NOT safe and
+            // `write_batch_is_replay_safe()` stays at its conservative default.
+        }
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let sink = TokenCapableButPlainInsertSink {
+            attempts: attempts.clone(),
+        };
+        let pages = futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"a": 1})],
+            bookmark: None,
+        })]);
+        let policy = ResiliencePolicy {
+            retry: RetryPolicy {
+                max_attempts: 5,
+                backoff: BackoffKind::None,
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+                jitter: false,
+                ..RetryPolicy::default()
+            },
+            ..ResiliencePolicy::default()
+        };
+        let err = run_stream(
+            pages,
+            &sink,
+            RunStreamOptions::new().with_resilience(policy),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FaucetError::HttpStatus { status: 503, .. }));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a token-capable sink's PLAIN write must not be retried — replaying \
+             it after a server-side commit duplicates every row"
+        );
+    }
+
+    #[tokio::test]
+    async fn resilience_does_retry_a_replay_safe_write_batch() {
+        // The other half of the gate: a sink configured for keyed upsert
+        // converges on replay, so retrying is both safe and desirable — a
+        // transient 503 must not fail the run.
+        use crate::resilience::{BackoffKind, ResiliencePolicy, RetryPolicy};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        struct KeyedUpsertSink {
+            attempts: Arc<AtomicU32>,
+        }
+        #[async_trait::async_trait]
+        impl Sink for KeyedUpsertSink {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                // Fail once, then succeed.
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(FaucetError::HttpStatus {
+                        status: 503,
+                        url: "u".into(),
+                        body: String::new(),
+                    });
+                }
+                Ok(r.len())
+            }
+            async fn flush(&self) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            /// Configured `write_mode: upsert` + `key`, so a replayed page
+            /// converges on the same rows instead of duplicating them.
+            fn dedups_by_key(&self) -> bool {
+                true
+            }
+        }
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let sink = KeyedUpsertSink {
+            attempts: attempts.clone(),
+        };
+        let pages = futures::stream::iter(vec![Ok(StreamPage {
+            records: vec![json!({"a": 1})],
+            bookmark: None,
+        })]);
+        let policy = ResiliencePolicy {
+            retry: RetryPolicy {
+                max_attempts: 5,
+                backoff: BackoffKind::None,
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+                jitter: false,
+                ..RetryPolicy::default()
+            },
+            ..ResiliencePolicy::default()
+        };
+        let res = run_stream(
+            pages,
+            &sink,
+            RunStreamOptions::new().with_resilience(policy),
+        )
+        .await
+        .expect("a replay-safe write is retried through the transient error");
+        assert_eq!(res.records_written, 1);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one failure then one successful retry"
+        );
     }
 
     #[tokio::test]
@@ -5760,8 +5918,13 @@ mod tests {
             fn connector_name(&self) -> &'static str {
                 "retry-probe"
             }
-            // Idempotent so the pipeline retries its `write_batch` (F29 gate).
-            fn supports_idempotent_writes(&self) -> bool {
+            // Declares its plain write replay-safe, which is what now opens the
+            // F29 gate. (This used to say `supports_idempotent_writes`, but
+            // that promises only rows+token atomicity on the *idempotent*
+            // path — using it here is what let the pipeline retry ordinary
+            // INSERTs. The behaviour under test — retry a transient write and
+            // succeed — is unchanged.)
+            fn write_batch_is_replay_safe(&self) -> bool {
                 true
             }
         }

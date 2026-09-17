@@ -653,7 +653,8 @@
           },
           "default": []
         }
-      }
+      },
+      "additionalProperties": false
     },
     "RecordCheck": {
       "description": "A per-record check. Addressed field accepts the filter/explode path subset\n(bare key, `dot.path`, `$['bracketed']`).",
@@ -678,6 +679,7 @@
               "const": "not_null"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -699,6 +701,7 @@
               "const": "not_empty"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -723,6 +726,7 @@
               "const": "regex_match"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -749,6 +753,7 @@
               "const": "value_in_set"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -775,6 +780,7 @@
               "const": "not_in_set"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -801,6 +807,7 @@
               "const": "compare"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -827,6 +834,7 @@
               "const": "type_is"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -867,6 +875,7 @@
               "const": "string_length"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -886,6 +895,7 @@
               "const": "json_schema"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "schema",
@@ -1017,6 +1027,7 @@
               "const": "row_count"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "on_failure"
@@ -1042,6 +1053,7 @@
               "const": "null_rate"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -1067,6 +1079,7 @@
               "const": "unique"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "fields",
@@ -1106,6 +1119,7 @@
               "const": "distinct_count"
             }
           },
+          "additionalProperties": false,
           "required": [
             "type",
             "field",
@@ -2484,7 +2498,8 @@
           ],
           "default": null
         }
-      }
+      },
+      "additionalProperties": false
     },
     "PrometheusSpec": {
       "description": "Configuration for the Prometheus metrics HTTP endpoint.",
@@ -2507,6 +2522,7 @@
           "default": null
         }
       },
+      "additionalProperties": false,
       "required": [
         "listen"
       ]
@@ -2523,7 +2539,8 @@
           ],
           "default": null
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OtelSpec": {
       "description": "OTLP export block under `observability.otel:`.",
@@ -2583,7 +2600,8 @@
           "minimum": 0,
           "default": 60
         }
-      }
+      },
+      "additionalProperties": false
     },
     "OtelProtocol": {
       "description": "OTLP transport protocol.",

@@ -4,7 +4,14 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// All possible errors returned by faucet-stream.
+///
+/// `#[non_exhaustive]`: this enum demonstrably grows (`QualityFailure`,
+/// `CircuitOpen`, `SchemaDrift`, `ContractViolation` all arrived post-1.0) and
+/// it is the one type every third-party connector author touches. Marking it
+/// keeps the next variant a **minor** release instead of a forced major for
+/// `faucet-core` and everything downstream. Match with a `_` arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FaucetError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),

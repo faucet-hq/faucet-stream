@@ -95,7 +95,14 @@ fn jitter_factor(nanos: u32) -> f64 {
 /// Apply the same `[0.5, 1.5)` decorrelated jitter used by [`backoff_with_jitter`]
 /// to an already-computed delay. Used by the resilience runner, which computes
 /// the base delay from its own [`BackoffKind`](crate::resilience::BackoffKind).
-pub(crate) fn apply_jitter(delay: std::time::Duration) -> std::time::Duration {
+///
+/// **Public so connectors never have to re-derive it.** A connector that must
+/// compute its own base delay (a protocol-specific cadence, a server-supplied
+/// hint) should still jitter through this function rather than hand-rolling
+/// it: the copies that existed before it was exported all missed the
+/// range-bias and same-nanosecond-alignment fixes made here, so concurrent
+/// workers retried in lockstep.
+pub fn apply_jitter(delay: std::time::Duration) -> std::time::Duration {
     let nanos = delay.as_nanos() as u64;
     std::time::Duration::from_nanos((nanos as f64 * pseudo_random_factor()) as u64)
 }
