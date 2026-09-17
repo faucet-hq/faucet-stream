@@ -2718,6 +2718,83 @@ mod tests {
     use crate::expand::expand;
     use serde_json::json;
 
+    /// A source advertising both fast paths, so the per-row state-key wrapper
+    /// can be checked for forwarding rather than masking them.
+    struct FastPathSource;
+
+    #[async_trait]
+    impl Source for FastPathSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, faucet_core::FaucetError> {
+            Ok(vec![serde_json::json!({ "id": 1 })])
+        }
+        fn state_key(&self) -> Option<String> {
+            Some("natural".into())
+        }
+        fn native_output_formats(&self) -> &'static [faucet_core::NativeFormat] {
+            &[faucet_core::NativeFormat::NdJson]
+        }
+        fn stream_native<'a>(
+            &'a self,
+            _ctx: &'a HashMap<String, Value>,
+            format: faucet_core::NativeFormat,
+            _batch_size: usize,
+        ) -> std::pin::Pin<
+            Box<
+                dyn faucet_core::Stream<
+                        Item = Result<faucet_core::NativeBatch, faucet_core::FaucetError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            assert_eq!(format, faucet_core::NativeFormat::NdJson);
+            Box::pin(futures::stream::once(async move {
+                Ok(faucet_core::NativeBatch::bytes(
+                    faucet_core::NativeFormat::NdJson,
+                    b"{\"id\":1}\n".to_vec(),
+                ))
+            }))
+        }
+        #[cfg(feature = "arrow")]
+        fn supports_columnar(&self) -> bool {
+            true
+        }
+    }
+
+    /// Wrapping a source to override its state key must not disable the
+    /// negotiated fast paths — a wrapper that fell back to the trait defaults
+    /// would silently force every row onto the `Value` path (the #639 class of
+    /// regression), costing the memory win with no signal.
+    #[tokio::test]
+    async fn state_key_override_forwards_fast_path_capabilities() {
+        use futures::StreamExt as _;
+        let wrapped = StateKeyOverride {
+            inner: Box::new(FastPathSource),
+            key: "row-scoped".into(),
+        };
+        // The override itself still applies.
+        assert_eq!(wrapped.state_key().as_deref(), Some("row-scoped"));
+        // Native: format list forwarded, and the batch stream really comes from
+        // the inner source.
+        assert_eq!(
+            wrapped.native_output_formats(),
+            &[faucet_core::NativeFormat::NdJson]
+        );
+        let ctx: HashMap<String, Value> = HashMap::new();
+        let mut batches = wrapped.stream_native(&ctx, faucet_core::NativeFormat::NdJson, 10);
+        let batch = batches.next().await.expect("one batch").expect("ok");
+        match batch.payload {
+            faucet_core::NativePayload::Bytes(b) => {
+                assert_eq!(b, b"{\"id\":1}\n".to_vec())
+            }
+            faucet_core::NativePayload::Stream(_) => panic!("bytes expected"),
+        }
+        #[cfg(feature = "arrow")]
+        assert!(wrapped.supports_columnar(), "columnar must forward too");
+    }
+
     #[test]
     fn concurrency_permits_semantics() {
         // 0 = unlimited (all in parallel); 1 = serial; n = n; None = default cap.

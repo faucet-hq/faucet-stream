@@ -2872,4 +2872,57 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&p).expect("valid JSON");
         assert_eq!(v, json!([{"id": 1}, {"id": 2}]));
     }
+
+    #[test]
+    fn transient_classification_is_typed_never_message_based() {
+        use super::{is_table_not_found, is_transient_bq_error};
+        use gcp_bigquery_client::error::BQError;
+
+        fn response_err(code: i64) -> BQError {
+            BQError::ResponseError {
+                error: gcp_bigquery_client::error::ResponseError {
+                    error: gcp_bigquery_client::error::NestedResponseError {
+                        code,
+                        errors: Vec::new(),
+                        // Deliberately a message that mentions nothing about
+                        // retriability: classification must read the code only.
+                        message: "whatever the vendor says today".to_string(),
+                        status: String::new(),
+                    },
+                },
+            }
+        }
+
+        // Retriable statuses.
+        for code in [429, 500, 502, 503, 504] {
+            assert!(is_transient_bq_error(&response_err(code)), "{code}");
+        }
+        // Permanent statuses — a bad request or a missing table must fail fast.
+        for code in [400, 401, 403, 404, 409] {
+            assert!(!is_transient_bq_error(&response_err(code)), "{code}");
+        }
+        // 404 is the table-not-found probe signal (used to decide create-vs-use).
+        assert!(is_table_not_found(&response_err(404)));
+        assert!(!is_table_not_found(&response_err(500)));
+    }
+
+    #[test]
+    fn native_batch_columns_reads_a_csv_header_and_ignores_other_formats() {
+        use faucet_core::NativeFormat;
+        // CSV: the first line is the header, CR stripped, delimiter honored.
+        assert_eq!(
+            native_batch_columns(b"a;b;c\r\n1;2;3\n", NativeFormat::Csv, b';'),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+        // A format with no header line yields nothing to declare.
+        assert_eq!(
+            native_batch_columns(b"PAR1", NativeFormat::Parquet, b','),
+            None
+        );
+        // Non-UTF8 CSV bytes are not a panic, just "no columns".
+        assert_eq!(
+            native_batch_columns(&[0xff, 0xfe, b'\n'], NativeFormat::Csv, b','),
+            None
+        );
+    }
 }

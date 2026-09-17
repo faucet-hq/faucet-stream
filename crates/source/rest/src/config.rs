@@ -1398,4 +1398,52 @@ mod tests {
         let raw = serde_json::json!({ "partition_key": "SourceKey" });
         assert!(serde_json::from_value::<ODataConfig>(raw).is_err());
     }
+
+    #[test]
+    fn objects_all_sentinel_means_every_object() {
+        // `all` (any case) is the documented "discover everything" sentinel and
+        // deserializes to an empty list, distinct from a named single object.
+        #[derive(serde::Deserialize)]
+        struct W(#[serde(deserialize_with = "de_objects")] Vec<String>);
+        assert!(
+            serde_json::from_value::<W>(serde_json::json!("all"))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert!(
+            serde_json::from_value::<W>(serde_json::json!(" ALL "))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        // Comma strings split + trim + drop blanks; lists pass through.
+        assert_eq!(
+            serde_json::from_value::<W>(serde_json::json!(" A , ,B "))
+                .unwrap()
+                .0,
+            vec!["A".to_string(), "B".to_string()]
+        );
+        assert_eq!(
+            serde_json::from_value::<W>(serde_json::json!(["X", "Y"]))
+                .unwrap()
+                .0,
+            vec!["X".to_string(), "Y".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_delegates_to_the_discovery_recipe() {
+        // A malformed recipe must fail at config load, not on the first request.
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "/");
+        cfg.discovery = Some(
+            serde_json::from_value(serde_json::json!({
+                "list": { "get": "", "items": "$.x[*]", "name": "$.n" },
+                "emit": { "config": { "path": "/x" } }
+            }))
+            .unwrap(),
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("`list.get` must not be empty"), "{err}");
+    }
 }

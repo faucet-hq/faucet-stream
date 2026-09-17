@@ -564,6 +564,183 @@ mod tests {
 
     // ── token request encoding (json default vs form) ────────────────────────
 
+    /// The 9-arg compat wrapper (kept for the pre-`encoding` signature) must
+    /// still fetch and cache, defaulting to a JSON body.
+    #[tokio::test]
+    async fn get_or_refresh_compat_wrapper_sends_json_and_caches() {
+        use wiremock::matchers::{header, method as m, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(m("POST"))
+            .and(path("/token"))
+            .and(header("content-type", "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": "jtok", "expires_in": 3600})),
+            )
+            .expect(1) // second call is served from the cache
+            .mount(&server)
+            .await;
+        let cache = TokenEndpointCache::new();
+        let client = Client::new();
+        let body = json!({ "grant_type": "client_credentials" });
+        let url = format!("{}/token", server.uri());
+        for _ in 0..2 {
+            let tok = cache
+                .get_or_refresh(
+                    &client,
+                    &url,
+                    &reqwest::Method::POST,
+                    &HeaderMap::new(),
+                    Some(&body),
+                    "$.access_token",
+                    Some("$.expires_in"),
+                    0.9,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(tok, "jtok");
+        }
+        server.verify().await;
+    }
+
+    /// A transient status is retried (with backoff) and the later success is
+    /// returned — one 503 must not fail the run.
+    #[tokio::test]
+    async fn transient_status_is_retried_then_succeeds() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method as m, path};
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+        struct FailThenOk(Arc<AtomicUsize>);
+        impl Respond for FailThenOk {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503).set_body_string("upstream busy")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"access_token": "t2"}))
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(m("POST"))
+            .and(path("/token"))
+            .respond_with(FailThenOk(Arc::clone(&calls)))
+            .mount(&server)
+            .await;
+        let token = fetch_token_from_endpoint(
+            &format!("{}/token", server.uri()),
+            &reqwest::Method::POST,
+            &HeaderMap::new(),
+            Some(&json!({ "grant_type": "client_credentials" })),
+            "$.access_token",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(token, "t2");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry, then success");
+    }
+
+    /// A permanent failure is surfaced without retrying, and the error names
+    /// the status + body so the misconfiguration is actionable.
+    #[tokio::test]
+    async fn permanent_status_fails_fast_with_status_and_body() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method as m, path};
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl Respond for Counting {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(m("POST"))
+            .and(path("/token"))
+            .respond_with(Counting(Arc::clone(&calls)))
+            .mount(&server)
+            .await;
+        let err = fetch_token_from_endpoint(
+            &format!("{}/token", server.uri()),
+            &reqwest::Method::POST,
+            &HeaderMap::new(),
+            Some(&json!({ "grant_type": "x" })),
+            "$.access_token",
+            None,
+        )
+        .await
+        .expect_err("invalid_grant is permanent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HTTP 400") && msg.contains("invalid_grant"),
+            "{msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry for a permanent 400"
+        );
+    }
+
+    /// A 2xx whose body lacks the token path is an auth error naming the path.
+    #[tokio::test]
+    async fn missing_token_path_is_a_typed_auth_error() {
+        use wiremock::matchers::{method as m, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(m("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "nope": 1 })))
+            .mount(&server)
+            .await;
+        let err = fetch_token_from_endpoint(
+            &format!("{}/token", server.uri()),
+            &reqwest::Method::POST,
+            &HeaderMap::new(),
+            None,
+            "$.access_token",
+            None,
+        )
+        .await
+        .expect_err("token_path does not match");
+        assert!(err.to_string().contains("$.access_token"), "{err}");
+    }
+
+    /// The response validator overrides the default 2xx success rule.
+    #[tokio::test]
+    async fn response_validator_can_accept_a_non_2xx() {
+        use wiremock::matchers::{method as m, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(m("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(418).set_body_json(json!({"access_token": "tea"})))
+            .mount(&server)
+            .await;
+        let v = ResponseValidator::new(|s| s == 418);
+        let token = fetch_token_from_endpoint(
+            &format!("{}/token", server.uri()),
+            &reqwest::Method::POST,
+            &HeaderMap::new(),
+            None,
+            "$.access_token",
+            Some(&v),
+        )
+        .await
+        .unwrap();
+        assert_eq!(token, "tea");
+    }
+
     #[tokio::test]
     async fn token_endpoint_form_encoding_sends_urlencoded() {
         use wiremock::matchers::{body_string_contains, header, method as m, path};

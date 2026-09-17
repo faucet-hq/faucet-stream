@@ -6818,6 +6818,56 @@ mod cleanup_tests {
     }
 
     #[tokio::test]
+    async fn value_path_overwrite_runs_the_generic_staging_lifecycle() {
+        // An overwrite sink that ALSO dedups by key is refused by the native
+        // planner, so the run takes the `Value` path — where the generic
+        // begin → write → commit staging lifecycle applies.
+        let source = NativeCsvSource::new(1);
+        let sink = NativeRecordingSink {
+            overwrite: true,
+            dedups: true,
+            ..NativeRecordingSink::new(true)
+        };
+        let events = sink.events.clone();
+        Pipeline::new(&source, &sink).run().await.unwrap();
+        let seen = value_path_events(&events);
+        assert_eq!(seen.first().map(String::as_str), Some("begin"));
+        assert_eq!(seen.last().map(String::as_str), Some("commit"));
+        assert!(seen.iter().any(|e| e.starts_with("write:")));
+        assert!(!seen.iter().any(|e| e == "abort"));
+    }
+
+    #[tokio::test]
+    async fn value_path_overwrite_aborts_staging_when_the_source_fails() {
+        // A mid-run failure must discard staging (best-effort abort) and never
+        // commit — the prior destination stays intact.
+        struct FailingSource;
+        #[async_trait]
+        impl Source for FailingSource {
+            async fn fetch_with_context(
+                &self,
+                _context: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Err(FaucetError::Source("boom".into()))
+            }
+        }
+        let sink = NativeRecordingSink {
+            overwrite: true,
+            dedups: true,
+            ..NativeRecordingSink::new(true)
+        };
+        let events = sink.events.clone();
+        let err = Pipeline::new(&FailingSource, &sink)
+            .run()
+            .await
+            .expect_err("source failure propagates");
+        assert!(err.to_string().contains("boom"), "{err}");
+        let seen = value_path_events(&events);
+        assert!(seen.contains(&"abort".to_string()), "{seen:?}");
+        assert!(!seen.contains(&"commit".to_string()), "{seen:?}");
+    }
+
+    #[tokio::test]
     async fn native_path_falls_back_to_value_when_dlq_present() {
         // A DLQ trips the pipeline-owned gate → the planner returns None →
         // the pipeline uses the `Value` write path, never `load_native`.

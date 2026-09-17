@@ -513,4 +513,58 @@ mod tests {
         assert_eq!(cfg.submit.method, "GET"); // default; examples set POST explicitly
         assert_eq!(cfg.fetch.method, "GET");
     }
+
+    #[test]
+    fn lookback_is_validated_and_defaults_to_five_minutes() {
+        let mut cfg: AsyncJobConfig = serde_json::from_value(serde_json::json!({
+            "submit": { "url": "/jobs", "json": { "query": "SELECT Id FROM A" } },
+            "job_id": "$.id",
+            "poll": { "url": "/jobs/${job_id}" },
+            "status": { "path": "$.state", "success": ["done"] },
+            "fetch": { "url": "/jobs/${job_id}/result" }
+        }))
+        .unwrap();
+        // Default margin: 5 minutes.
+        assert_eq!(cfg.lookback_duration(), chrono::Duration::seconds(300));
+        assert!(cfg.supports_incremental_query());
+
+        // A valid duration parses and is honored.
+        cfg.lookback = Some("90s".into());
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.lookback_duration(), chrono::Duration::seconds(90));
+
+        // A malformed one is rejected at load time, naming the field.
+        cfg.lookback = Some("soon".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("`lookback` 'soon' is not a valid duration"),
+            "{err}"
+        );
+        // …and the accessor falls back to the default rather than panicking.
+        assert_eq!(cfg.lookback_duration(), chrono::Duration::seconds(300));
+    }
+
+    #[test]
+    fn supports_incremental_query_requires_a_top_level_string_query() {
+        let mk = |submit: serde_json::Value| -> AsyncJobConfig {
+            serde_json::from_value(serde_json::json!({
+                "submit": submit,
+                "job_id": "$.id",
+                "poll": { "url": "/j/${job_id}" },
+                "status": { "path": "$.s", "success": ["ok"] },
+                "fetch": { "url": "/j/${job_id}/r" }
+            }))
+            .unwrap()
+        };
+        assert!(!mk(serde_json::json!({ "url": "/jobs" })).supports_incremental_query());
+        assert!(
+            !mk(serde_json::json!({ "url": "/jobs", "json": { "report": "x" } }))
+                .supports_incremental_query()
+        );
+        // A non-string `query` is not amendable either.
+        assert!(
+            !mk(serde_json::json!({ "url": "/jobs", "json": { "query": 7 } }))
+                .supports_incremental_query()
+        );
+    }
 }

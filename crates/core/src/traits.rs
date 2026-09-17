@@ -868,6 +868,68 @@ mod tests {
         }
     }
 
+    // ── Native byte-passthrough defaults (#633) ──────────────────────────────
+
+    /// A source/sink pair that advertises nothing native, so the defaulted
+    /// trait methods are what answer.
+    struct PlainSink;
+
+    #[async_trait]
+    impl Sink for PlainSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_defaults_advertise_nothing_and_fail_loudly() {
+        use futures::StreamExt as _;
+
+        // A source that never overrides the native methods advertises no
+        // formats, so the pipeline can never negotiate the byte path…
+        let src = MockSource { records: vec![] };
+        assert!(src.native_output_formats().is_empty());
+        // …and calling it anyway yields one typed error rather than silently
+        // producing an empty stream (which would look like "no rows").
+        let ctx = std::collections::HashMap::new();
+        let mut batches = src.stream_native(&ctx, crate::native::NativeFormat::NdJson, 10);
+        let err = batches
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("default must error");
+        assert!(
+            err.to_string()
+                .contains("does not support native byte streaming"),
+            "{err}"
+        );
+        assert!(batches.next().await.is_none(), "exactly one item");
+
+        // Same on the sink side: no capabilities, and `load_native` is a typed
+        // error so a sink that advertises but forgets to implement is obvious.
+        let sink = PlainSink;
+        assert!(sink.native_load_capabilities().is_empty());
+        let err = sink
+            .load_native(
+                crate::native::NativeBatch::bytes(
+                    crate::native::NativeFormat::NdJson,
+                    b"{}\n".to_vec(),
+                ),
+                "scope",
+                crate::native::NativeLoadContext {
+                    write_mode: crate::write_mode::WriteMode::Append,
+                    first_batch: true,
+                },
+            )
+            .await
+            .expect_err("default must error");
+        assert!(
+            err.to_string()
+                .contains("does not support native byte loading"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn default_overwrite_methods_reject_or_noop() {
         // A sink that does not opt into overwrite (MockSink uses the defaults):

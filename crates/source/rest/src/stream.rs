@@ -3309,3 +3309,136 @@ mod mtls_tests {
         assert!(RestStream::new(cfg).is_err());
     }
 }
+
+#[cfg(test)]
+mod patch_edge_tests {
+    use super::*;
+    use crate::config::RestStreamConfig;
+    use serde_json::json;
+
+    fn bulk_job_json(submit_json: Option<Value>) -> crate::async_job::AsyncJobConfig {
+        let mut submit = json!({ "method": "POST", "url": "/jobs" });
+        if let Some(j) = submit_json {
+            submit["json"] = j;
+        }
+        serde_json::from_value(json!({
+            "submit": submit,
+            "job_id": "$.id",
+            "poll": { "url": "/jobs/${job_id}", "interval_secs": 0, "timeout_secs": 1 },
+            "status": { "path": "$.state", "success": ["ok"] },
+            "fetch": { "url": "/jobs/${job_id}/result" }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sql_from_object_empty_identifier_is_none() {
+        // The token after FROM strips to nothing → no driving object.
+        assert_eq!(sql_from_object("SELECT Id FROM ,"), None);
+    }
+
+    #[test]
+    fn top_level_tokens_honors_backslash_escaped_quotes() {
+        // The escaped quote must not close the literal: the quoted `limit`
+        // stays inside one dirty token and never surfaces as a clause keyword.
+        let q = r"SELECT Id FROM A WHERE n = 'a\'limit\'b' LIMIT 5";
+        let toks = top_level_tokens(q);
+        assert!(toks.iter().any(|(_, t)| *t == "LIMIT"));
+        assert!(toks.iter().all(|(_, t)| !t.contains('\'')));
+        // …and the injector places the predicate before the REAL clause.
+        assert_eq!(
+            inject_sql_predicate(q, "X > 1"),
+            r"SELECT Id FROM A WHERE (n = 'a\'limit\'b') AND (X > 1) LIMIT 5"
+        );
+    }
+
+    #[test]
+    fn sql_literal_bool_and_composite_values() {
+        assert_eq!(sql_literal(&json!(true)), "true");
+        assert_eq!(sql_literal(&json!(false)), "false");
+        // Non-scalars stringify quoted (defensive; bookmarks are scalars).
+        assert_eq!(sql_literal(&json!([1, 2])), "'[1,2]'");
+    }
+
+    #[test]
+    fn full_table_async_job_emits_no_bookmark() {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.async_job = Some(bulk_job_json(Some(json!({ "query": "SELECT Id FROM A" }))));
+        let s = RestStream::new(cfg).unwrap();
+        assert!(s.async_job_new_bookmark().is_none());
+    }
+
+    #[test]
+    fn dataset_uri_uses_object_or_stable_job_hash() {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.async_job = Some(bulk_job_json(Some(
+            json!({ "query": "SELECT Id FROM Lead" }),
+        )));
+        let s = RestStream::new(cfg).unwrap();
+        assert!(
+            faucet_core::Source::dataset_uri(&s).ends_with("/objects/Lead"),
+            "{}",
+            faucet_core::Source::dataset_uri(&s)
+        );
+
+        // No parseable object → a stable 16-hex job hash, deterministic across
+        // instances (it feeds persisted catalog/lineage identity).
+        let mk = || {
+            let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+            cfg.async_job = Some(bulk_job_json(Some(json!({ "report_type": "x" }))));
+            RestStream::new(cfg).unwrap()
+        };
+        let (a, b) = (
+            faucet_core::Source::dataset_uri(&mk()),
+            faucet_core::Source::dataset_uri(&mk()),
+        );
+        assert_eq!(a, b);
+        let suffix = a.rsplit("/job/").next().unwrap();
+        assert_eq!(suffix.len(), 16, "{a}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn auto_state_key_derives_from_dataset_identity() {
+        let mk = |query: &str| {
+            let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+            cfg.replication_method = ReplicationMethod::Incremental;
+            cfg.replication_key = Some("m".into());
+            cfg.async_job = Some(bulk_job_json(Some(json!({ "query": query }))));
+            faucet_core::Source::state_key(&RestStream::new(cfg).unwrap()).unwrap()
+        };
+        let (a, b) = (mk("SELECT Id FROM Lead"), mk("SELECT Id FROM Account"));
+        assert!(a.starts_with("rest:"), "{a}");
+        assert_ne!(a, b, "two sources must never collide on one bookmark key");
+        assert_eq!(a, mk("SELECT Id FROM Lead"), "stable across constructions");
+    }
+
+    #[test]
+    fn extract_page_strips_odata_control_fields() {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.odata = Some(serde_json::from_value(json!({ "entity": "Orders" })).unwrap());
+        cfg.records_path = Some("$.value[*]".into());
+        let s = RestStream::new(cfg).unwrap();
+        let body = json!({ "value": [
+            { "@odata.etag": "W/\"1\"", "Id": 1, "Name": "a" },
+        ]});
+        let recs = s.extract_page(&body).unwrap();
+        assert_eq!(recs, vec![json!({ "Id": 1, "Name": "a" })]);
+    }
+
+    #[test]
+    fn native_output_formats_gated_on_csv_async_job() {
+        // CSV async-job with no decode → NDJSON advertised.
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.async_job = Some(bulk_job_json(None));
+        cfg.response_format = crate::config::ResponseFormat::Csv;
+        let s = RestStream::new(cfg).unwrap();
+        assert_eq!(
+            faucet_core::Source::native_output_formats(&s),
+            &[faucet_core::NativeFormat::NdJson]
+        );
+        // Plain paginated source → no native formats.
+        let plain = RestStream::new(RestStreamConfig::new("https://api.example.com", "")).unwrap();
+        assert!(faucet_core::Source::native_output_formats(&plain).is_empty());
+    }
+}

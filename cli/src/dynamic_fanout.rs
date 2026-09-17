@@ -198,4 +198,143 @@ mod tests {
         );
         assert!(rows[0].sink.is_none()); // no sink_ref, no sink_patch
     }
+
+    // ── resolve_dynamic_fanout end-to-end (wiremock) ─────────────────────────
+
+    use wiremock::matchers::{method as m, path as wpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn catalog() -> crate::auth_catalog::AuthCatalog {
+        crate::auth_catalog::build_auth_catalog(None).unwrap()
+    }
+
+    /// A config whose single source template carries `source_config`.
+    fn cfg_with_source(source_config: Value, named: bool) -> PipelineConfig {
+        let src = json!({ "type": "rest", "config": source_config });
+        let pipeline = if named {
+            json!({
+                "sources": { "api": src },
+                "sink": { "type": "stdout", "config": {} }
+            })
+        } else {
+            json!({
+                "source": src,
+                "sink": { "type": "stdout", "config": {} }
+            })
+        };
+        serde_json::from_value(json!({ "version": 1, "name": "fo", "pipeline": pipeline })).unwrap()
+    }
+
+    /// A `discovery:` recipe listing `objects` from `/objects`, emitting a
+    /// per-dataset path + sink table_id. Built by serializing a real
+    /// `RestStreamConfig` so every required connector field is present.
+    fn recipe(base: &str, list_path: &str) -> Value {
+        let mut cfg = serde_json::to_value(faucet_source_rest::RestStreamConfig::new(base, "/"))
+            .expect("rest config serializes");
+        cfg["discovery"] = json!({
+            "list": { "get": list_path, "items": "$.items[*]", "name": "$.name" },
+            "emit": {
+                "config": { "path": "/${name_lower}" },
+                "table_id": "t_${name_snake}",
+                "sink_ref": "bq"
+            },
+            "fan_out": true
+        });
+        cfg
+    }
+
+    #[tokio::test]
+    async fn no_fanout_source_is_a_no_op() {
+        let plain = serde_json::to_value(faucet_source_rest::RestStreamConfig::new(
+            "https://api.example.com",
+            "/x",
+        ))
+        .unwrap();
+        let mut cfg = cfg_with_source(plain, false);
+        cfg.matrix = Vec::new();
+        resolve_dynamic_fanout(&mut cfg, &catalog()).await.unwrap();
+        assert!(cfg.matrix.is_empty(), "matrix untouched");
+    }
+
+    #[tokio::test]
+    async fn generates_one_row_per_discovered_dataset() {
+        let server = MockServer::start().await;
+        Mock::given(m("GET"))
+            .and(wpath("/objects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{ "name": "Account" }, { "name": "Lead" }]
+            })))
+            .mount(&server)
+            .await;
+
+        // Named template → the generated rows carry an explicit `source.ref`.
+        let mut cfg = cfg_with_source(recipe(&server.uri(), "/objects"), true);
+        resolve_dynamic_fanout(&mut cfg, &catalog()).await.unwrap();
+        assert_eq!(cfg.matrix.len(), 2);
+        let row = &cfg.matrix[0];
+        assert_eq!(row.id.as_deref(), Some("Account"));
+        let src = row.source.as_ref().unwrap();
+        assert_eq!(src.r#ref.as_deref(), Some("api"));
+        assert_eq!(src.config.as_ref().unwrap()["path"], "/account");
+        let sink = row.sink.as_ref().unwrap();
+        assert_eq!(sink.r#ref.as_deref(), Some("bq"));
+        assert_eq!(sink.config.as_ref().unwrap()["table_id"], "t_account");
+
+        // Singular `pipeline.source` → registered as `default`, so no ref.
+        let mut cfg = cfg_with_source(recipe(&server.uri(), "/objects"), false);
+        resolve_dynamic_fanout(&mut cfg, &catalog()).await.unwrap();
+        assert_eq!(cfg.matrix.len(), 2);
+        assert!(cfg.matrix[0].source.as_ref().unwrap().r#ref.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_returning_no_datasets_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(m("GET"))
+            .and(wpath("/objects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+            .mount(&server)
+            .await;
+        let mut cfg = cfg_with_source(recipe(&server.uri(), "/objects"), false);
+        let err = resolve_dynamic_fanout(&mut cfg, &catalog())
+            .await
+            .expect_err("an empty fan-out would silently sync nothing");
+        assert!(err.to_string().contains("returned no datasets"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_is_surfaced_with_context() {
+        let server = MockServer::start().await;
+        Mock::given(m("GET"))
+            .and(wpath("/objects"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut cfg = cfg_with_source(recipe(&server.uri(), "/objects"), false);
+        let err = resolve_dynamic_fanout(&mut cfg, &catalog())
+            .await
+            .expect_err("a 500 on the listing must fail the run");
+        assert!(err.to_string().contains("discovery failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_source_kind_that_cannot_discover_is_rejected() {
+        // `csv` has no discovery support; the fan-out opt-in lives in a block
+        // it ignores, so the error must name the kind rather than silently
+        // running a single un-fanned-out invocation.
+        let src = json!({
+            "type": "csv",
+            "config": { "path": "/tmp/x.csv", "odata": { "fan_out": true } }
+        });
+        let cfg_json = json!({
+            "version": 1,
+            "pipeline": { "source": src, "sink": { "type": "stdout", "config": {} } }
+        });
+        let mut cfg: PipelineConfig = serde_json::from_value(cfg_json).unwrap();
+        let err = resolve_dynamic_fanout(&mut cfg, &catalog())
+            .await
+            .expect_err("csv cannot fan out");
+        let msg = err.to_string();
+        assert!(msg.contains("dynamic fan-out"), "{msg}");
+    }
 }

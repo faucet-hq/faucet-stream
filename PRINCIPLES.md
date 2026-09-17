@@ -121,7 +121,7 @@ rigor as a Rust API.
 - I/O wraps the pure core thinly (`stream.rs`/`sink.rs` are the only modules
   that talk to the network). Integration tests (wiremock/testcontainers) cover
   the shim; unit tests cover the logic.
-- **≥90% patch coverage is the floor.** A new pure function without unit tests
+- **≥95% patch coverage is the floor.** A new pure function without unit tests
   does not merge. "It's exercised by the e2e path" is not coverage of its edges.
 
 ## 8. Vocabulary: generic verbs, one meaning each

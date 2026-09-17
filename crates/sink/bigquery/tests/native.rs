@@ -275,3 +275,107 @@ async fn load_native_empty_payload_is_a_noop() {
     assert_eq!(n, 0);
     assert!(upload_bodies(&server).await.is_empty());
 }
+
+// ── Capability advertisement (#633) ──────────────────────────────────────────
+
+/// A capability set is only honest if it matches what `load_native` can
+/// actually deliver: NDJSON feeds ONE resumable session finalized by the
+/// terminal flush (so it satisfies the atomic-overwrite contract), while CSV
+/// runs a discrete load job per batch (so a multi-batch overwrite would be
+/// truncate + partial appends — hence append-only).
+#[tokio::test]
+async fn native_capabilities_scope_overwrite_to_ndjson_only() {
+    use faucet_core::{NativeFormat, Sink as _, WriteMode};
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    let (sink, _guard) = build_sink(&server, native_config(&server)).await;
+
+    let caps = sink.native_load_capabilities();
+    assert_eq!(caps.len(), 2, "NDJSON + CSV");
+    let nd = caps
+        .iter()
+        .find(|c| c.format == NativeFormat::NdJson)
+        .expect("ndjson capability");
+    assert_eq!(nd.mechanism, "bigquery-load-job");
+    assert_eq!(nd.write_modes, &[WriteMode::Append, WriteMode::Overwrite]);
+    let csv = caps
+        .iter()
+        .find(|c| c.format == NativeFormat::Csv)
+        .expect("csv capability");
+    assert_eq!(
+        csv.write_modes,
+        &[WriteMode::Append],
+        "a per-batch-committing mechanism must not claim Overwrite"
+    );
+}
+
+/// Upsert/delete need per-row keys, which raw bytes never carry — the sink must
+/// advertise nothing rather than let the planner append duplicates.
+#[tokio::test]
+async fn native_capabilities_are_withdrawn_for_keyed_write_modes() {
+    use faucet_core::Sink as _;
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+
+    for mode in ["upsert", "delete"] {
+        let mut cfg = native_config(&server);
+        cfg.write = serde_json::from_value(serde_json::json!({
+            "write_mode": mode,
+            "key": ["id"]
+        }))
+        .unwrap();
+        let (sink, _guard) = build_sink(&server, cfg).await;
+        assert!(
+            sink.native_load_capabilities().is_empty(),
+            "{mode} must not advertise a byte-load path"
+        );
+    }
+}
+
+/// An empty payload is a successful no-op: sources emit a trailing empty batch
+/// to carry the final bookmark, and an error here would break bookmark
+/// persistence (the contract documented on `Sink::load_native`).
+#[tokio::test]
+async fn load_native_empty_payload_is_a_no_op() {
+    use faucet_core::{NativeBatch, NativeFormat, NativeLoadContext, Sink as _, WriteMode};
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    let (sink, _guard) = build_sink(&server, native_config(&server)).await;
+    let ctx = NativeLoadContext {
+        write_mode: WriteMode::Append,
+        first_batch: true,
+    };
+    for format in [NativeFormat::NdJson, NativeFormat::Csv] {
+        let rows = sink
+            .load_native(NativeBatch::bytes(format, Vec::new()), "scope", ctx)
+            .await
+            .expect("empty payload must not error");
+        assert_eq!(rows, 0);
+    }
+    assert!(
+        upload_bodies(&server).await.is_empty(),
+        "no upload for an empty batch"
+    );
+}
+
+/// An unsupported (format, payload) pair is a typed sink error rather than a
+/// silent zero-row success.
+#[tokio::test]
+async fn load_native_rejects_an_unsupported_format() {
+    use faucet_core::{NativeBatch, NativeFormat, NativeLoadContext, Sink as _, WriteMode};
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    let (sink, _guard) = build_sink(&server, native_config(&server)).await;
+    let err = sink
+        .load_native(
+            NativeBatch::bytes(NativeFormat::Parquet, b"PAR1".to_vec()),
+            "scope",
+            NativeLoadContext {
+                write_mode: WriteMode::Append,
+                first_batch: true,
+            },
+        )
+        .await
+        .expect_err("parquet is not a load_native format here");
+    assert!(err.to_string().contains("unsupported format"), "{err}");
+}

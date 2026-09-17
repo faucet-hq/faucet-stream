@@ -4,13 +4,13 @@ coverage:
   status:
     project:
       default:
-        target: 90%
+        target: 95%
         threshold: 1%         # tolerate a <=1% drop (e.g. a pure refactor) before failing
         informational: false  # enforced gate: a >1% drop in project coverage fails the
                               # `codecov/project` check, so a regression blocks the PR.
     patch:
       default:
-        target: 90%           # new/changed code must be >=90% covered
+        target: 95%           # new/changed code must be >=95% covered
         informational: false  # enforced gate: under-covered new code fails `codecov/patch`.
 
 # Exclude non-library code from the coverage denominator. Mirrors the lcov
