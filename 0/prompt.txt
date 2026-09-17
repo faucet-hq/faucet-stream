@@ -1422,3 +1422,50 @@ If this event is something the user would act on now, send a PushNotification. R
 https://github.com/faucet-hq/faucet-stream/issues/651
 
 Let's solve this now completely.
+
+---
+
+<task-notification>
+<task-id>bmexm1vw4</task-id>
+<summary>Monitor event: "CI checks landing on PR 660 (reliability program)"</summary>
+<event>Format: pass</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bmexm1vw4</task-id>
+<summary>Monitor event: "CI checks landing on PR 660 (reliability program)"</summary>
+<event>CLI build (observability,source-rest,sink-jsonl,sink-stdout,transforms): pass
+CLI build (source-rest,sink-jsonl,sink-stdout,transforms): pass</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bmexm1vw4</task-id>
+<summary>Monitor event: "CI checks landing on PR 660 (reliability program)"</summary>
+<event>API stability (cargo-semver-checks): pass
+CLI build (otel,source-rest,sink-jsonl,sink-stdout,transforms): pass</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bmexm1vw4</task-id>
+<summary>Monitor event: "CI checks landing on PR 660 (reliability program)"</summary>
+<event>CLI build (full): pass</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bmexm1vw4</task-id>
+<summary>Monitor event: "CI checks landing on PR 660 (reliability program)"</summary>
+<event>Reliability guarantees: pass</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
