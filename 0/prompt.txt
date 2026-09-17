@@ -1198,3 +1198,7 @@ Drift risk: P5's "double-underscore key smuggling" case exactly — a control-fl
 - `crates/source/mssql/src/stream.rs:80` `bracket_quote` — a local infallible quoter, but with an explicit doc comment stating the NUL-freeness was already validated by the shared `quote_ident_mssql` at enumeration time. Justified narrowing of a shared primitive, not a blind copy.</result>
 <usage><subagent_tokens>209329</subagent_tokens><tool_uses>41</tool_uses><duration_ms>390902</duration_ms></usage>
 </task-notification>
+
+---
+
+you are the expert, wear an expert hat and a expert maintainer of this world class repo. take the right call which you should be certain about and do it
