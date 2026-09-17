@@ -76,7 +76,7 @@ fn fanout_block(spec: &ConnectorSpec) -> Option<&Value> {
 
 /// Find a source template (named `sources.*`, or the singular `source`
 /// registered as `default`) whose config opts into fan-out via
-/// `salesforce.fan_out` or `odata.fan_out`.
+/// `discovery.fan_out` or `odata.fan_out`.
 fn find_fanout_source(cfg: &PipelineConfig) -> Option<(String, ConnectorSpec)> {
     // Prefer a named template; fall back to the singular default source.
     for (name, spec) in &cfg.pipeline.sources {

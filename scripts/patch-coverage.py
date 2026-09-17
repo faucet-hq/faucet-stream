@@ -10,7 +10,7 @@ the already-required `Coverage` job instead, where the result is deterministic
 and ours.
 
 Usage:
-    patch-coverage.py --lcov lcov.info --base origin/main [--min 90.0]
+    patch-coverage.py --lcov lcov.info --base origin/main [--min 95.0]
 
 Exits non-zero when coverage of added/modified lines is below `--min`, printing
 the uncovered lines so the failure is actionable rather than just a number.
@@ -85,7 +85,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lcov", default="lcov.info")
     ap.add_argument("--base", default="origin/main")
-    ap.add_argument("--min", type=float, default=90.0)
+    ap.add_argument("--min", type=float, default=95.0)
     ap.add_argument(
         "--report-only",
         action="store_true",
@@ -138,7 +138,7 @@ def main() -> int:
         for m in misses:
             print(f"  {m}")
         print(
-            "\nThe project standard is >=90% patch coverage. If a line is genuinely "
+            "\nThe project standard is >=95% patch coverage. If a line is genuinely "
             "untestable (a signal handler, a main() dispatch arm, an infinite "
             "supervisory loop), say so explicitly in the PR rather than lowering "
             "this floor."
