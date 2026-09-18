@@ -85,8 +85,7 @@ impl S3RangeReader {
         if wanted == 0 {
             return Ok(Bytes::new());
         }
-        // HTTP ranges are inclusive on both ends.
-        let header = format!("bytes={}-{}", range.start, range.end - 1);
+        let header = range_header(&range);
         let response = self
             .client
             .get_object()
@@ -95,31 +94,46 @@ impl S3RangeReader {
             .range(&header)
             .send()
             .await
-            .map_err(|e| {
-                ParquetError::External(Box::new(std::io::Error::other(format!(
-                    "S3 ranged get for '{}' ({header}) failed: {e}",
-                    self.key
-                ))))
-            })?;
-        let data = response.body.collect().await.map_err(|e| {
-            ParquetError::External(Box::new(std::io::Error::other(format!(
-                "S3 ranged read for '{}' ({header}) failed: {e}",
-                self.key
-            ))))
-        })?;
+            .map_err(|e| failed(&self.key, &header, "", e))?;
+        let data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| failed(&self.key, &header, " mid-stream", e))?;
         let bytes = data.into_bytes();
         if bytes.len() as u64 != wanted {
-            return Err(ParquetError::External(Box::new(std::io::Error::other(
-                format!(
-                    "S3 returned {} bytes for '{}' range {header} but {wanted} were requested — \
-                     the object is truncated or was replaced mid-read",
-                    bytes.len(),
-                    self.key
-                ),
-            ))));
+            return Err(short(&self.key, &header, bytes.len() as u64, wanted));
         }
         Ok(bytes)
     }
+}
+
+/// The inclusive-on-both-ends HTTP range header for `range`.
+///
+/// Its own function because an off-by-one here reads the wrong bytes rather
+/// than failing — the one arithmetic mistake in this file that would corrupt
+/// data instead of erroring.
+fn range_header(range: &Range<u64>) -> String {
+    format!("bytes={}-{}", range.start, range.end.saturating_sub(1))
+}
+
+/// A range read that failed outright.
+fn failed(key: &str, header: &str, when: &str, cause: impl std::fmt::Display) -> ParquetError {
+    ParquetError::External(Box::new(std::io::Error::other(format!(
+        "S3 ranged read for '{key}' ({header}) failed{when}: {cause}"
+    ))))
+}
+
+/// A range read that returned fewer bytes than were asked for.
+///
+/// Its own error rather than a truncated buffer handed to the Parquet decoder:
+/// silently short bytes read as corrupt column data, which is a wrong-value bug
+/// rather than a failure.
+fn short(key: &str, header: &str, got: u64, wanted: u64) -> ParquetError {
+    ParquetError::External(Box::new(std::io::Error::other(format!(
+        "S3 returned {got} bytes for '{key}' range {header} but {wanted} were requested — the \
+         object is truncated or was replaced mid-read"
+    ))))
 }
 
 impl AsyncFileReader for S3RangeReader {
@@ -142,5 +156,45 @@ impl AsyncFileReader for S3RangeReader {
             Ok(Arc::new(reader.load_and_finish(self, len).await?))
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_range_header_is_inclusive_on_both_ends() {
+        // `0..4` is four bytes: 0,1,2,3. Emitting `bytes=0-4` would read a
+        // fifth byte and shift every subsequent column value.
+        assert_eq!(range_header(&(0..4)), "bytes=0-3");
+        assert_eq!(range_header(&(1_000..1_001)), "bytes=1000-1000");
+    }
+
+    #[test]
+    fn a_failed_range_names_the_object_and_the_bytes() {
+        // Without both, a partial-read bug in a multi-gigabyte scan is
+        // undiagnosable.
+        let msg = failed("o.parquet", "bytes=128-255", "", "connection refused").to_string();
+        assert!(msg.contains("o.parquet"), "{msg}");
+        assert!(msg.contains("bytes=128-255"), "{msg}");
+        assert!(msg.contains("connection refused"), "{msg}");
+
+        let mid = failed("o.parquet", "bytes=0-63", " mid-stream", "reset").to_string();
+        assert!(
+            mid.contains("mid-stream"),
+            "a failure part-way through must say so: {mid}"
+        );
+    }
+
+    #[test]
+    fn a_short_range_reports_both_counts() {
+        let msg = short("o.parquet", "bytes=1000-1999", 400, 1_000).to_string();
+        assert!(msg.contains("400 bytes"), "{msg}");
+        assert!(msg.contains("1000 were requested"), "{msg}");
+        assert!(
+            msg.contains("truncated"),
+            "the message must say what it means: {msg}"
+        );
     }
 }
