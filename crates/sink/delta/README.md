@@ -30,7 +30,7 @@ running/billed compute and no Python.
 | `partition_by` | string[] | `[]` | Partition columns (applied only on create) |
 | `schema_sample_size` | int | `100` | Records sampled to infer the schema on create |
 | `batch_size` | int | `1000` | Arrow record-batch write size; `0` = no re-chunk |
-| `target_file_size` | int? | — | Advisory data-file size hint |
+| `target_file_size` | int? | *(unset)* | Commit early once the in-memory parquet buffer reaches this many bytes, which both caps output data-file size and bounds peak memory to roughly this value. Unset means one commit per run and a buffer that grows with the whole dataset — fine for small loads, an OOM risk on a large table, since a bulk source emits no bookmarks and so triggers no intermediate flush. Expect a few commits per run when set: that is the trade the knob exists to let you make. |
 
 Cloud backends require the matching crate feature: `s3`, `azure`, `gcs`.
 
