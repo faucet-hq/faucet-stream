@@ -9,7 +9,7 @@ pipeline:
       base_url: "https://jsonplaceholder.typicode.com"
       path: "/users"
       method: GET
-      pagination: {type: none}
+      pagination: {type: None}
 
   sink:
     type: kafka

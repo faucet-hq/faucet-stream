@@ -380,7 +380,7 @@ pipeline:
   source:
     type: rest
     config:
-      url: http://x
+      base_url: http://x
   sink:
     type: postgres
     config:
@@ -416,7 +416,7 @@ pipeline:
   source:
     type: rest
     config:
-      url: http://x
+      base_url: http://x
   sink:
     type: jsonl
     config:

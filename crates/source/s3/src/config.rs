@@ -26,22 +26,37 @@ pub enum S3FileFormat {
     Parquet,
 }
 
+fn default_concurrency() -> usize {
+    10
+}
+
 /// Configuration for the S3 source connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct S3SourceConfig {
     /// S3 bucket name.
     pub bucket: String,
     /// Object key prefix filter.
+    #[serde(default)]
     pub prefix: Option<String>,
     /// AWS region. `None` uses the SDK default.
+    #[serde(default)]
     pub region: Option<String>,
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO).
+    #[serde(default)]
     pub endpoint_url: Option<String>,
-    /// Format of the files to read.
+    /// Format of the files to read. Defaults to `json_lines`.
+    #[serde(default)]
     pub file_format: S3FileFormat,
     /// Maximum number of objects to read.
+    #[serde(default)]
     pub max_objects: Option<usize>,
     /// Maximum number of concurrent object reads (default: 10).
+    ///
+    /// These `#[serde(default)]`s are the same oversight the REST source
+    /// carried: without them every field here was **required**, so a config
+    /// naming only `bucket` could not deserialize at all (#609). `bucket` is
+    /// the one genuinely required field.
+    #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     /// Records per emitted [`StreamPage`](faucet_core::StreamPage). For
     /// `JsonLines` and `RawText` formats, the object body is decoded

@@ -11,7 +11,8 @@ pipeline:
   source:
     type: rest
     config:
-      endpoint: "https://api.example.com/v1/items"
+      base_url: "https://api.example.com"
+      path: /v1/items
   sink:
     type: jsonl
     config:

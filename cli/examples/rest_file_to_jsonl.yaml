@@ -20,7 +20,8 @@ pipeline:
       # A Microsoft Graph / OneDrive / SharePoint `…/content` endpoint, a signed
       # download URL, or any authed static host serving a file.
       path: /exports/contacts.csv
-      pagination: none            # file mode fetches a single response
+      pagination:
+        type: None
       response_format: csv        # json (default) | csv | excel
       # csv_delimiter: ","        # CSV delimiter byte
       # csv_has_headers: true     # first CSV row supplies field names

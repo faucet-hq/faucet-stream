@@ -22,7 +22,7 @@ pipeline:
       connection_url: mysql://user:pass@localhost/archive
       table_name: events_raw
       column_mapping:
-        type: json
-        column: payload
+        json:
+          column: payload
       batch_size: 1000
       max_connections: 10

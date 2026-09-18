@@ -32,7 +32,7 @@ pipeline:
       # Server-side incremental push-down: the bookmark becomes an OData
       # `$filter` (`OrderDate gt <bookmark>`). The client-side filter on
       # `replication_key` stays on as a safety net.
-      replication_method: { type: incremental }
+      replication_method: { type: Incremental }
       replication_key: OrderDate
       start_replication_value: "2024-01-01T00:00:00Z"
       replication_bind:
