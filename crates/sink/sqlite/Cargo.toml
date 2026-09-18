@@ -25,6 +25,10 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 serde_json.workspace = true
 tempfile = "3"
 futures.workspace = true
+# The drift-policy matrix drives the real pipeline, so it needs a source double
+# (async-stream) and a DLQ sink (jsonl) to exercise the quarantine arm.
+async-stream.workspace = true
+faucet-sink-jsonl = { workspace = true }
 async-trait.workspace = true
 faucet-core.workspace = true
 faucet-conformance.workspace = true

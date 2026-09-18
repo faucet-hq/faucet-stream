@@ -5167,9 +5167,11 @@ dependencies = [
 name = "faucet-sink-sqlite"
 version = "1.7.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "faucet-conformance",
  "faucet-core",
+ "faucet-sink-jsonl",
  "futures",
  "schemars 1.2.1",
  "serde",
