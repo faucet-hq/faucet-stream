@@ -35,3 +35,13 @@ tempfile = "3"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides — the workspace-wide
+# declared contract (see crates/core/Cargo.toml): struct-literal construction
+# and exhaustive matching of config types are NOT part of the stability
+# surface, so adding an optional field or variant is a MINOR bump. Construct
+# configs via serde / `new()` / the builder methods, not a struct literal.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"
