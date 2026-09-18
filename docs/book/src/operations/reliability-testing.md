@@ -30,8 +30,10 @@ test checks and which stays green through a real regression.
 | **Engine guarantees** | Bookmark ordering, exactly-once (both mechanisms), overwrite atomicity, cleanup safety, cancel-still-flushes | No | Every PR, **required** |
 | **State compatibility** | Bookmarks / exactly-once envelopes / commit tokens written by a release still load | No | Every PR, **required** |
 | **Connector conformance** | Per-connector battery (capabilities truthful, bounded memory, idempotent replay, …) | Per connector | Every PR |
+| **Drift policy matrix** | All five `on_drift` policies against a live evolving destination | No | Every PR, **required** |
 | **Containerized integration** | Real databases, Kafka, object stores; CDC replication | Yes | Every PR, reported |
 | **Fidelity round-trip** | Type-exact landing per source↔sink pair | Per pair | Every PR, reported |
+| **Container fault injection** | A real connection cut mid-cursor | Yes | Every PR, reported |
 
 The first two tiers are deliberately Docker-free and run in seconds. They are
 the required gate because a regression in them corrupts data *silently* — the
@@ -52,7 +54,21 @@ cargo test -p faucet-conformance --test reliability_bookmark_ordering
 cargo test -p faucet-conformance --test reliability_exactly_once
 cargo test -p faucet-conformance --test reliability_lifecycle
 cargo test -p faucet-conformance --test reliability_cleanup_safety
+cargo test -p faucet-conformance --test reliability_fault_injection
 cargo test -p faucet-conformance --test compat_state_format
+
+# The drift-policy matrix (Docker-free, required tier).
+cargo test -p faucet-sink-sqlite --test drift_policy_matrix
+
+# Fidelity pairs. jsonl + sqlite need no Docker; the rest boot a container.
+cargo test -p faucet-sink-jsonl   --test fidelity
+cargo test -p faucet-sink-sqlite  --test fidelity
+cargo test -p faucet-sink-postgres --test fidelity
+cargo test -p faucet-sink-mysql   --test fidelity
+cargo test -p faucet-sink-mongodb --test fidelity
+
+# Container fault injection: stops the database mid-cursor.
+cargo test -p faucet-source-postgres --test fault_injection
 ```
 
 Container-backed suites need a Docker socket. On macOS with
@@ -122,6 +138,43 @@ deserializes with the same code — both halves move together and the test stays
 green through a breaking change. If one of these fails, the fixture is not what
 is wrong: either the reader regressed, or the change needs an explicit
 migration.
+
+### Drift policies (`sink/sqlite/tests/drift_policy_matrix`)
+
+All five `on_drift` arms driven through the real pipeline against a destination
+that genuinely evolves. Each has a different silent wrong answer — `warn`
+dropping the page, `evolve` writing without the DDL, `quarantine` writing the
+drifting rows anyway, `fail` writing and *then* raising — so each is asserted
+separately, plus the control that a non-drifting page is untouched by every
+policy, and that `quarantine` without a DLQ is refused before any data moves.
+
+### Fidelity pairs (`sink/*/tests/fidelity`)
+
+Five destinations, one shared corpus. What they establish together is more than
+each does alone:
+
+| Destination | Result |
+|---|---|
+| **jsonl** | Exactly lossless, no tolerance. The control: no schema, so no excuse. |
+| **sqlite** | JSON mode lossless; auto-map loses booleans (`1`/`0`) and `-0.0`'s sign |
+| **postgres** | Typed columns fully faithful — including `-0.0` in `DOUBLE PRECISION`; JSONB normalises `-0.0` away via `numeric` |
+| **mysql** | Typed columns faithful; backslashes survive (bind params, not literals) |
+| **mongodb** | BSON fully faithful, `-0.0` included; large integers stored as Int64, not Double |
+
+The Postgres result is the instructive one: "Postgres loses negative zero" is
+**false in general** and **true for the JSONB document path**. A per-pair test is
+what makes that distinction visible instead of folklore.
+
+### Container fault injection (`source/postgres/tests/fault_injection`)
+
+Stops the database container while a cursor is open — a harder cut than a proxy
+toxic, since the socket dies with no FIN, and it needs no extra image. Asserts
+the run fails rather than reporting success on partial data, terminates inside a
+hard ceiling, and never hands back a bookmark it cannot back.
+
+The read is made slow deterministically with `pg_sleep` per row rather than by
+tuning a delay: the first version of this test raced, the table streamed in
+before the cut, and it "failed" on a perfectly healthy run.
 
 ## Adding to the program
 
