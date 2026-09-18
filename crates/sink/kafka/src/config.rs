@@ -69,10 +69,16 @@ pub struct KafkaSinkConfig {
     /// JSONPath to a flat JSON object whose entries become Kafka message
     /// headers (values are stringified). Unset by default.
     ///
-    /// **Not yet applied:** the extraction helper exists and is tested, but
-    /// the produce path does not attach the headers to the outgoing message,
-    /// so setting this currently has no effect on what reaches the broker.
-    /// Carry the values inside the record body until it is wired up.
+    /// Applied on both the at-least-once and the transactional (exactly-once)
+    /// produce paths. A JSON `null` becomes a **valueless** header rather than
+    /// the string `"null"`, which is what Kafka's header model actually
+    /// expresses. The commit-token record on the side-topic never carries these
+    /// — it is faucet's own watermark, not a user record.
+    ///
+    /// A path that resolves to nothing yields no headers; one that resolves to
+    /// a non-object fails the batch, matching [`Self::partition_path`]'s
+    /// strictness: a header map the operator asked for and did not get is not
+    /// something to paper over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers_path: Option<String>,
     /// What to do when [`Self::key_path`] resolves to nothing for a record:
