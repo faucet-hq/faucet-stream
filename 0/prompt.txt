@@ -1554,3 +1554,11 @@ If this event is something the user would act on now, send a PushNotification. R
 <status>completed</status>
 <summary>Background command "Wait for the run then rerun failed jobs" completed (exit code 0)</summary>
 </task-notification>
+
+---
+
+do all of it since we picked it already
+
+---
+
+dont leave anything else on the table
