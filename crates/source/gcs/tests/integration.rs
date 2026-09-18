@@ -223,3 +223,39 @@ async fn source_stream_pages_batch_size_zero_yields_one_page_per_object() {
     }
     assert_eq!(pages.len(), 2);
 }
+
+/// #619 — `concurrency` on the streaming path. `stream_pages` used to read
+/// objects strictly one at a time, so the field was accepted and ignored. The
+/// prefetch that fixed it is *ordered*, so records must still arrive in
+/// listing order — an unordered look-ahead would interleave objects by
+/// completion time and change the sequence a downstream sink writes.
+///
+/// Ignored for the same reason as the rest of this file: `fake-gcs-server`
+/// speaks REST while the connector uses the gRPC data plane.
+#[tokio::test]
+#[ignore = "requires a real GCS-compatible gRPC backend; see source_reads_json_lines."]
+async fn source_streams_objects_concurrently_in_listing_order() {
+    let Some((host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    for i in 1..=12i64 {
+        seed_object(
+            &host,
+            &bucket,
+            &format!("data/part-{i:04}.jsonl"),
+            &format!("{{\"id\":{i}}}\n"),
+            "application/x-ndjson",
+        )
+        .await;
+    }
+
+    let config = GcsSourceConfig::new(&bucket)
+        .prefix("data/")
+        .auth(GcsCredentials::Anonymous)
+        .storage_host(&host)
+        .concurrency(6);
+    let source = GcsSource::new(config).await.unwrap();
+    let records = source.fetch_with_context(&HashMap::new()).await.unwrap();
+    let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, (1..=12).collect::<Vec<i64>>());
+}

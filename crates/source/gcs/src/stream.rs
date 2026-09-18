@@ -13,6 +13,22 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use tokio::io::AsyncBufReadExt;
 
+/// One object's payload, fetched in the shape its `file_format` decodes from.
+///
+/// Prefetching these with a bounded look-ahead is what makes `concurrency`
+/// real on the streaming path (#619). The bound it promises differs by format
+/// and that difference is the point: `JsonLines` overlaps only the request
+/// round-trip — `open_object_reader` does not download the body, so the decode
+/// still streams line-by-line at O(batch) memory — while the whole-object
+/// formats hold at most `concurrency` bodies at once.
+enum Fetched {
+    Lines(Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>),
+    RawText(String),
+    JsonArray(String),
+    #[cfg(feature = "arrow")]
+    Parquet(bytes::Bytes),
+}
+
 /// A GCS source that lists and reads objects from a bucket.
 pub struct GcsSource {
     config: GcsSourceConfig,
@@ -93,6 +109,31 @@ impl GcsSource {
         // total object set (matching single-worker semantics) rather than
         // multiplying by the shard count.
         Ok(self.shard_filter(names))
+    }
+
+    /// Fetch one object in the shape its configured `file_format` needs.
+    async fn fetch(&self, key: &str) -> Result<Fetched, FaucetError> {
+        Ok(match self.config.file_format {
+            GcsFileFormat::JsonLines => Fetched::Lines(self.open_object_reader(key).await?),
+            GcsFileFormat::RawText => Fetched::RawText(self.read_object_text(key).await?),
+            GcsFileFormat::JsonArray => Fetched::JsonArray(self.read_object_text(key).await?),
+            #[cfg(feature = "arrow")]
+            GcsFileFormat::Parquet => Fetched::Parquet(self.read_object_bytes(key).await?),
+        })
+    }
+
+    /// Decode already-fetched Parquet bytes on a blocking thread.
+    #[cfg(feature = "arrow")]
+    async fn decode_parquet(
+        data: bytes::Bytes,
+        key: &str,
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
+        let key_owned = key.to_string();
+        tokio::task::spawn_blocking(move || decode_parquet_bytes(data, &key_owned))
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("parquet decode task for '{key}' panicked: {e}"))
+            })?
     }
 
     /// Read the full body of a single GCS object into a UTF-8 `String`.
@@ -220,13 +261,7 @@ impl GcsSource {
         &self,
         key: &str,
     ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
-        let data = self.read_object_bytes(key).await?;
-        let key_owned = key.to_string();
-        tokio::task::spawn_blocking(move || decode_parquet_bytes(data, &key_owned))
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!("parquet decode task for '{key}' panicked: {e}"))
-            })?
+        Self::decode_parquet(self.read_object_bytes(key).await?, key).await
     }
 }
 
@@ -401,10 +436,24 @@ impl faucet_core::Source for GcsSource {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            for key in &keys {
-                match self.config.file_format {
-                    GcsFileFormat::JsonLines => {
-                        let reader = self.open_object_reader(key).await?;
+            // Overlap the object reads (#619). `buffered` keeps listing order,
+            // so an object that fails surfaces at exactly the point it would
+            // have serially — concurrency changes throughput, not semantics.
+            // The key is moved into each future rather than borrowed: a closure
+            // returning a borrow-capturing async block is not higher-ranked
+            // enough for `buffered`.
+            let concurrency = self.config.concurrency.max(1);
+            let mut fetched = stream::iter(keys.iter().cloned())
+                .map(|key| async move {
+                    let payload = self.fetch(&key).await;
+                    (key, payload)
+                })
+                .buffered(concurrency);
+
+            while let Some((key, payload)) = fetched.next().await {
+                let key = &key;
+                match payload? {
+                    Fetched::Lines(reader) => {
                         let mut lines = reader.lines();
                         let mut line_num: usize = 0;
                         while let Some(line) = lines
@@ -438,8 +487,7 @@ impl faucet_core::Source for GcsSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    GcsFileFormat::RawText => {
-                        let text = self.read_object_text(key).await?;
+                    Fetched::RawText(text) => {
                         let record = serde_json::json!({ "key": key, "content": text });
                         buffer.push(record);
                         if batch_size == 0 {
@@ -456,13 +504,13 @@ impl faucet_core::Source for GcsSource {
                         }
                     }
                     #[cfg(feature = "arrow")]
-                    GcsFileFormat::Parquet => {
+                    Fetched::Parquet(data) => {
                         // Parquet objects are buffered and decoded to Arrow
                         // `RecordBatch`es, then converted to JSON rows for the
                         // row path. Rows accumulate across objects and chunk at
                         // `batch_size`; `batch_size == 0` emits one page per
                         // object.
-                        let (_schema, batches) = self.read_object_parquet(key).await?;
+                        let (_schema, batches) = Self::decode_parquet(data, key).await?;
                         for batch in &batches {
                             let rows = faucet_core::columnar::record_batch_to_values(batch)?;
                             for record in rows {
@@ -483,8 +531,7 @@ impl faucet_core::Source for GcsSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    GcsFileFormat::JsonArray => {
-                        let text = self.read_object_text(key).await?;
+                    Fetched::JsonArray(text) => {
                         let value: Value = serde_json::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("GCS JSON parse error in '{key}': {e}"))
                         })?;
@@ -587,8 +634,17 @@ impl faucet_core::Source for GcsSource {
             let mut reference: Option<arrow::datatypes::SchemaRef> = None;
             let mut total_records = 0usize;
             let mut total_pages = 0usize;
-            for key in &keys {
-                let (schema, batches) = self.read_object_parquet(key).await?;
+            let concurrency = self.config.concurrency.max(1);
+            let mut fetched = stream::iter(keys.iter().cloned())
+                .map(|key| async move {
+                    let data = self.read_object_bytes(&key).await;
+                    (key, data)
+                })
+                .buffered(concurrency);
+
+            while let Some((key, data)) = fetched.next().await {
+                let key = &key;
+                let (schema, batches) = Self::decode_parquet(data?, key).await?;
                 match &reference {
                     Some(first) if first != &schema => {
                         Err(FaucetError::Source(format!(

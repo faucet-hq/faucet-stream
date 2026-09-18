@@ -15,6 +15,20 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::config::{AzureBlobSourceConfig, AzureFileFormat};
 
+/// One blob's payload, fetched in the shape its `file_format` decodes from.
+///
+/// Prefetching these with a bounded look-ahead is what makes `concurrency`
+/// real on the streaming path (#619). The bound it promises differs by format
+/// and that difference is the point: `JsonLines` overlaps only the request
+/// round-trip — `open_object_reader` does not download the body, so the decode
+/// still streams line-by-line at O(batch) memory — while the whole-blob
+/// formats hold at most `concurrency` bodies at once.
+enum Fetched {
+    Lines(Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>),
+    RawText(String),
+    JsonArray(String),
+}
+
 /// An Azure Blob source that lists and reads objects from a container.
 pub struct AzureBlobSource {
     config: AzureBlobSourceConfig,
@@ -67,6 +81,15 @@ impl AzureBlobSource {
             }
         }
         Ok(names)
+    }
+
+    /// Fetch one blob in the shape its configured `file_format` needs.
+    async fn fetch(&self, key: &str) -> Result<Fetched, FaucetError> {
+        Ok(match self.config.file_format {
+            AzureFileFormat::JsonLines => Fetched::Lines(self.open_object_reader(key).await?),
+            AzureFileFormat::RawText => Fetched::RawText(self.read_object_text(key).await?),
+            AzureFileFormat::JsonArray => Fetched::JsonArray(self.read_object_text(key).await?),
+        })
     }
 
     /// Read the full body of a single object into a UTF-8 `String`.
@@ -303,10 +326,24 @@ impl faucet_core::Source for AzureBlobSource {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            for key in &keys {
-                match self.config.file_format {
-                    AzureFileFormat::JsonLines => {
-                        let reader = self.open_object_reader(key).await?;
+            // Overlap the blob reads (#619). `buffered` keeps listing order,
+            // so a blob that fails surfaces at exactly the point it would have
+            // serially — concurrency changes throughput, not semantics. The key
+            // is moved into each future rather than borrowed: a closure
+            // returning a borrow-capturing async block is not higher-ranked
+            // enough for `buffered`.
+            let concurrency = self.config.concurrency.max(1);
+            let mut fetched = stream::iter(keys.iter().cloned())
+                .map(|key| async move {
+                    let payload = self.fetch(&key).await;
+                    (key, payload)
+                })
+                .buffered(concurrency);
+
+            while let Some((key, payload)) = fetched.next().await {
+                let key = &key;
+                match payload? {
+                    Fetched::Lines(reader) => {
                         let mut lines = reader.lines();
                         let mut line_num: usize = 0;
                         while let Some(line) = lines
@@ -340,8 +377,7 @@ impl faucet_core::Source for AzureBlobSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    AzureFileFormat::RawText => {
-                        let text = self.read_object_text(key).await?;
+                    Fetched::RawText(text) => {
                         let record = serde_json::json!({ "key": key, "content": text });
                         buffer.push(record);
                         if batch_size == 0 {
@@ -357,8 +393,7 @@ impl faucet_core::Source for AzureBlobSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    AzureFileFormat::JsonArray => {
-                        let text = self.read_object_text(key).await?;
+                    Fetched::JsonArray(text) => {
                         let value: Value = serde_json::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("azure JSON parse error in '{key}': {e}"))
                         })?;

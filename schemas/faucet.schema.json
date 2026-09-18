@@ -12023,6 +12023,13 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "concurrency": {
+                      "description": "Maximum number of files read concurrently (default: 4).\n\nReads are overlapped with a bounded look-ahead in listing order, so\nthroughput improves without changing which file an error is attributed\nto. Lower than the object-store sources' default because every read\nshares one SSH channel, and many servers cap concurrent open handles.\n`0` is treated as `1`.",
+                      "type": "integer",
+                      "format": "uint",
+                      "default": 4,
+                      "minimum": 0
                     }
                   }
                 },

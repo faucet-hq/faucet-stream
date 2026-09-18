@@ -436,3 +436,212 @@ async fn discover_falls_back_to_objects_under_leaf_prefix() {
         assert_eq!(d.config_patch["prefix"], d.name.as_str());
     }
 }
+
+// ---------------------------------------------------------------------------
+// #619 — `concurrency` on the streaming path.
+//
+// Before this, `buffer_unordered(concurrency)` appeared only in the eager
+// `fetch_with_context` batch path; `stream_pages` — what every real run
+// drives — read objects strictly one at a time, so the knob was documented
+// but inert. These tests pin both halves of the fix: that the reads actually
+// overlap, and that overlapping them changed nothing an operator can observe
+// (order, contents, and which object an error is blamed on).
+// ---------------------------------------------------------------------------
+
+/// Collect every record a source streams, flattened in page order.
+async fn collect_all(source: &S3Source, batch_size: usize) -> Vec<serde_json::Value> {
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, batch_size);
+    let mut out = Vec::new();
+    while let Some(page) = pages.next().await {
+        out.extend(page.expect("page ok").records);
+    }
+    out
+}
+
+/// `n` single-record objects, one record per object, ids ascending with the
+/// (zero-padded, so lexicographic = numeric) listing order.
+fn one_record_objects(n: i64) -> Vec<(String, String)> {
+    (1..=n)
+        .map(|i| (format!("part-{i:04}.jsonl"), format!("{{\"id\":{i}}}\n")))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_overlaps_object_reads() {
+    // The regression this file exists to catch. 40 objects is enough that 40
+    // serialized round-trips are clearly separable from a 10-way overlap even
+    // on a loaded machine — per-object latency, not bandwidth, dominates when
+    // every object holds one line.
+    let (_container, endpoint) = start_minio().await;
+    let objects = one_record_objects(60);
+    seed_bucket(&endpoint, &objects).await;
+
+    let serial = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(1),
+    )
+    .await;
+    let concurrent = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(15),
+    )
+    .await;
+
+    // Warm both clients first: an untimed pass pays the SDK's credential
+    // resolution and connection setup, which otherwise lands entirely on
+    // whichever source is timed first and would bias the comparison.
+    let serial_records = collect_all(&serial, 1000).await;
+    let concurrent_records = collect_all(&concurrent, 1000).await;
+
+    let started = Instant::now();
+    collect_all(&serial, 1000).await;
+    let serial_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    collect_all(&concurrent, 1000).await;
+    let concurrent_elapsed = started.elapsed();
+
+    assert_eq!(serial_records.len(), 60);
+    assert_eq!(
+        serial_records, concurrent_records,
+        "concurrency must not change what the source yields, only how fast"
+    );
+    assert!(
+        concurrent_elapsed * 2 < serial_elapsed,
+        "reading 60 objects with concurrency=15 took {concurrent_elapsed:?} but \
+         concurrency=1 took {serial_elapsed:?} — the reads are not overlapping, \
+         which is exactly the #619 defect: the knob is accepted and ignored"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_preserves_listing_order_under_concurrency() {
+    // `buffered` (ordered) rather than `buffer_unordered` is a deliberate
+    // choice: pages must arrive in listing order so a downstream sink writes
+    // the same file sequence it would have serially.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(&endpoint, &one_record_objects(20)).await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(8),
+    )
+    .await;
+
+    let ids: Vec<i64> = collect_all(&source, 1000)
+        .await
+        .iter()
+        .map(|r| r["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=20).collect::<Vec<i64>>(),
+        "records must stay in listing order; an unordered prefetch would \
+         interleave objects by completion time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_concurrency_zero_reads_serially_rather_than_stalling() {
+    // A `buffered(0)` stream yields nothing forever, so a config of `0` has to
+    // be clamped. Asserting it here keeps the clamp from being refactored away
+    // into a silent hang.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(&endpoint, &one_record_objects(5)).await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(0),
+    )
+    .await;
+
+    let records = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        collect_all(&source, 1000),
+    )
+    .await
+    .expect("concurrency = 0 must read serially, not hang");
+    assert_eq!(records.len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_blames_the_failing_object_even_when_prefetched() {
+    // With a look-ahead, several objects are in flight when one fails. The
+    // error must still name the offending key — otherwise concurrency makes
+    // diagnostics worse than the serial path it replaced.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(
+        &endpoint,
+        &[
+            ("a-ok.jsonl".to_string(), jsonl_body(1, 3)),
+            ("b-bad.jsonl".to_string(), "not json at all\n".to_string()),
+            ("c-ok.jsonl".to_string(), jsonl_body(4, 6)),
+        ],
+    )
+    .await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(8),
+    )
+    .await;
+
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let mut err = None;
+    while let Some(page) = pages.next().await {
+        if let Err(e) = page {
+            err = Some(e);
+            break;
+        }
+    }
+    let err = err.expect("the malformed object must fail the stream");
+    assert!(
+        err.to_string().contains("b-bad.jsonl"),
+        "the failure must name the object it came from: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_json_array_objects_read_concurrently_and_stay_ordered() {
+    // The whole-object format: unlike JSONL, `concurrency` bodies really are
+    // resident at once here, which is the memory bound the knob advertises.
+    let (_container, endpoint) = start_minio().await;
+    let objects: Vec<(String, String)> = (0..12)
+        .map(|i| {
+            let base = i * 10;
+            let body: Vec<String> = (1..=10)
+                .map(|j| format!("{{\"id\":{}}}", base + j))
+                .collect();
+            (format!("arr-{i:04}.json"), format!("[{}]", body.join(",")))
+        })
+        .collect();
+    seed_bucket(&endpoint, &objects).await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .file_format(S3FileFormat::JsonArray)
+            .with_batch_size(DEFAULT_BATCH_SIZE)
+            .concurrency(6),
+    )
+    .await;
+
+    let ids: Vec<i64> = collect_all(&source, DEFAULT_BATCH_SIZE)
+        .await
+        .iter()
+        .map(|r| r["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(ids, (1..=120).collect::<Vec<i64>>());
+}

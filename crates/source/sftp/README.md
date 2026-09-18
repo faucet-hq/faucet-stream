@@ -7,7 +7,7 @@ Lists a remote directory (or reads a single file) over SFTP and streams the
 files as JSON Lines, JSON arrays, or raw text. JSON Lines and raw text are
 decoded incrementally, so memory stays bounded regardless of file size; JSON
 arrays are buffered per file (the closing `]` is needed to validate the
-structure) and then chunked.
+structure) and then chunked. Up to `concurrency` files are read at once.
 
 Connection, authentication, and host-key verification come from
 [`faucet-common-sftp`](https://crates.io/crates/faucet-common-sftp).
@@ -25,6 +25,7 @@ Connection, authentication, and host-key verification come from
 | `glob` | string | none | Filename glob (`*` / `?`) applied to basenames when `path` is a directory. |
 | `format` | enum | `jsonl` | `jsonl` \| `json_array` \| `raw_text`. |
 | `batch_size` | integer | `1000` | Records per page; `0` = one page per file. |
+| `concurrency` | integer | `4` | Files read concurrently. The prefetch is ordered, so records stay in listing order and a failing file is still blamed at its own position; `0` is clamped to 1. Lower than the object-store sources' default because every read shares one SSH channel. For `jsonl` it overlaps only the `open` round-trip (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole files are resident. |
 
 `raw_text` emits one record per file: `{ "path": <remote path>, "content": <file text> }`.
 

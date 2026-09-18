@@ -7,12 +7,26 @@
 
 use crate::config::{SftpFormat, SftpSourceConfig, glob_match};
 use async_trait::async_trait;
-use faucet_common_sftp::{SftpSession, connect};
+use faucet_common_sftp::{SftpFile, SftpSession, connect};
 use faucet_core::{FaucetError, Stream, StreamPage};
+use futures::stream::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 use tokio::io::AsyncBufReadExt;
+
+/// One remote file's payload, fetched in the shape its `format` decodes from.
+///
+/// Prefetching these with a bounded look-ahead is what makes `concurrency`
+/// real (#619). The bound differs by format and that difference is the point:
+/// `Jsonl` overlaps only the `open` round-trip — the handle is read
+/// line-by-line afterwards, so memory stays O(batch) — while the whole-file
+/// formats hold at most `concurrency` bodies at once.
+enum Fetched {
+    Lines(SftpFile),
+    RawText(String),
+    JsonArray(String),
+}
 
 /// An SFTP source that lists and reads remote files.
 pub struct SftpSource {
@@ -86,6 +100,23 @@ impl SftpSource {
         String::from_utf8(bytes)
             .map_err(|e| FaucetError::Source(format!("SFTP file '{path}' is not valid UTF-8: {e}")))
     }
+
+    /// Fetch one remote file in the shape its configured `format` needs.
+    async fn fetch(
+        sftp: &SftpSession,
+        path: &str,
+        format: SftpFormat,
+    ) -> Result<Fetched, FaucetError> {
+        Ok(match format {
+            SftpFormat::Jsonl => Fetched::Lines(
+                sftp.open(path)
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("SFTP open '{path}' failed: {e}")))?,
+            ),
+            SftpFormat::RawText => Fetched::RawText(Self::read_file_text(sftp, path).await?),
+            SftpFormat::JsonArray => Fetched::JsonArray(Self::read_file_text(sftp, path).await?),
+        })
+    }
 }
 
 #[async_trait]
@@ -133,12 +164,28 @@ impl faucet_core::Source for SftpSource {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            for file in &files {
-                match self.config.format {
-                    SftpFormat::Jsonl => {
-                        let handle = sftp.open(file.as_str()).await.map_err(|e| {
-                            FaucetError::Source(format!("SFTP open '{file}' failed: {e}"))
-                        })?;
+            // Overlap the file reads (#619). `buffered` keeps listing order,
+            // so a file that fails surfaces at exactly the point it would have
+            // serially — concurrency changes throughput, not semantics. The
+            // path is moved into each future rather than borrowed: a closure
+            // returning a borrow-capturing async block is not higher-ranked
+            // enough for `buffered`.
+            let format = self.config.format;
+            let concurrency = self.config.concurrency.max(1);
+            let mut fetched = futures::stream::iter(files.iter().cloned())
+                .map(|file| {
+                    let sftp = &sftp;
+                    async move {
+                        let payload = Self::fetch(sftp, &file, format).await;
+                        (file, payload)
+                    }
+                })
+                .buffered(concurrency);
+
+            while let Some((file, payload)) = fetched.next().await {
+                let file = &file;
+                match payload? {
+                    Fetched::Lines(handle) => {
                         let reader = tokio::io::BufReader::new(handle);
                         let mut lines = reader.lines();
                         let mut line_num = 0usize;
@@ -171,8 +218,7 @@ impl faucet_core::Source for SftpSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    SftpFormat::RawText => {
-                        let text = Self::read_file_text(&sftp, file).await?;
+                    Fetched::RawText(text) => {
                         buffer.push(serde_json::json!({ "path": file, "content": text }));
                         if batch_size == 0 {
                             let page = std::mem::take(&mut buffer);
@@ -187,8 +233,7 @@ impl faucet_core::Source for SftpSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    SftpFormat::JsonArray => {
-                        let text = Self::read_file_text(&sftp, file).await?;
+                    Fetched::JsonArray(text) => {
                         let value: Value = serde_json::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("SFTP JSON parse error in '{file}': {e}"))
                         })?;

@@ -47,10 +47,23 @@ pub struct SftpSourceConfig {
     /// file.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum number of files read concurrently (default: 4).
+    ///
+    /// Reads are overlapped with a bounded look-ahead in listing order, so
+    /// throughput improves without changing which file an error is attributed
+    /// to. Lower than the object-store sources' default because every read
+    /// shares one SSH channel, and many servers cap concurrent open handles.
+    /// `0` is treated as `1`.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
 }
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+fn default_concurrency() -> usize {
+    4
 }
 
 impl SftpSourceConfig {
@@ -63,6 +76,7 @@ impl SftpSourceConfig {
             glob: None,
             format: SftpFormat::default(),
             batch_size: DEFAULT_BATCH_SIZE,
+            concurrency: default_concurrency(),
         }
     }
 
@@ -81,6 +95,12 @@ impl SftpSourceConfig {
     /// Set the per-page record count.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Set the maximum number of files read concurrently.
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
         self
     }
 }
@@ -136,6 +156,23 @@ mod tests {
         assert!(cfg.glob.is_none());
         assert_eq!(cfg.format, SftpFormat::Jsonl);
         assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(cfg.concurrency, 4);
+    }
+
+    #[test]
+    fn concurrency_is_settable_and_defaults_when_omitted() {
+        // The field is new (#619); an existing config that does not mention it
+        // must keep working and pick up the default rather than landing at 0,
+        // which would mean "no reads in flight".
+        let cfg = SftpSourceConfig::new(conn(), "/data").concurrency(12);
+        assert_eq!(cfg.concurrency, 12);
+
+        let parsed: SftpSourceConfig = serde_json::from_str(
+            r#"{"host":"h","username":"u","type":"password",
+                "config":{"password":"p"},"path":"/data"}"#,
+        )
+        .expect("a config without `concurrency` must still deserialize");
+        assert_eq!(parsed.concurrency, 4);
     }
 
     #[test]
