@@ -593,7 +593,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 .with_name(name.clone())
                 .with_row(row.clone())
                 .with_run_id(run_id.clone());
-            if let (Some(store), Some(key)) = (wrapped_state_store.clone(), state_key) {
+            if let (Some(store), Some(key)) = (wrapped_state_store.clone(), state_key.clone()) {
                 opts = opts.with_state(store, key);
             }
             if let Some(dlq) = self.dlq.clone() {
@@ -713,7 +713,25 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             if overwriting {
                 let cancelled = self.cancel.as_ref().is_some_and(|c| c.is_cancelled());
                 match &run_result {
-                    Ok(_) if !cancelled => wrapped_sink.commit_overwrite().await?,
+                    Ok(_) if !cancelled => {
+                        wrapped_sink.commit_overwrite().await?;
+
+                        // The swap succeeded, so the run's data is finally
+                        // visible — only now may its bookmark become durable.
+                        // `run_stream` deliberately held it back (#652): had it
+                        // persisted per page, a commit that failed or aborted
+                        // would leave the destination untouched while the state
+                        // store claimed delivery, and the next incremental run
+                        // would resume past rows the refresh never wrote.
+                        if let (Some(store), Some(key), Ok(res)) = (
+                            wrapped_state_store.as_ref(),
+                            state_key.as_ref(),
+                            &run_result,
+                        ) && let Some(bm) = res.bookmark.as_ref()
+                        {
+                            store.put(key, bm).await?;
+                        }
+                    }
                     _ => {
                         if let Err(e) = wrapped_sink.abort_overwrite().await {
                             tracing::warn!(
@@ -1138,6 +1156,26 @@ where
     let mut records_written = 0usize;
     let mut last_bookmark: Option<Value> = None;
     let mut dlq_stats = DlqStats::default();
+
+    // Under `write_mode: overwrite` the destination does not become visible
+    // until the staging swap, which happens in `Pipeline::run` *after* this
+    // function returns. Persisting a per-page bookmark before then is silent
+    // data loss (#652): the swap can still fail or be aborted, leaving the
+    // destination untouched while the state store claims the data was
+    // delivered — so the next incremental run resumes past records the refresh
+    // never wrote, permanently, with green runs thereafter.
+    //
+    // So hold every bookmark here and return the last one in
+    // `PipelineResult.bookmark`; the caller persists it only once the swap has
+    // succeeded. The native runner already works this way (see
+    // `run_stream_native`'s `pending_bookmark`); this brings the value path in
+    // line.
+    //
+    // Erring this way is the safe asymmetry: not persisting costs a redundant
+    // re-read on the next run (at-least-once, which the destination's own
+    // dedup or the full refresh absorbs), while persisting early costs rows
+    // that are never read again.
+    let defer_bookmarks = sink.is_overwrite();
 
     let adaptive_cfg = options.adaptive.clone().filter(|c| c.enabled);
     // Validate at the core boundary so library callers of `run_stream` (not
@@ -1886,8 +1924,9 @@ where
                             let bm_labels =
                                 crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
                             crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            if let (Some(store), Some(key)) =
-                                (state_store.as_ref(), state_key.as_ref())
+                            if !defer_bookmarks
+                                && let (Some(store), Some(key)) =
+                                    (state_store.as_ref(), state_key.as_ref())
                             {
                                 with_retry!("state_put", store.put(key, &bookmark))?;
                             }
@@ -2008,8 +2047,9 @@ where
                             let bm_labels =
                                 crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
                             crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            if let (Some(store), Some(key)) =
-                                (state_store.as_ref(), state_key.as_ref())
+                            if !defer_bookmarks
+                                && let (Some(store), Some(key)) =
+                                    (state_store.as_ref(), state_key.as_ref())
                             {
                                 with_retry!("state_put", store.put(key, &bookmark))?;
                             }

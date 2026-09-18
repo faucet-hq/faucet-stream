@@ -15,7 +15,7 @@ Reach for it when you want to land any faucet-stream source — a REST API, a da
 - **Idempotent producer by default** — `idempotent: true` sets `enable.idempotence`, so retried produce calls within a session never duplicate. Combined with `acks: all`, that's no-loss, no-duplicate delivery per produce call.
 - **`QueueFull` retry** — when librdkafka's send queue is full, the sink backs off (`queue_full_backoff`) and retries up to `queue_full_max_retries` before surfacing the error.
 - **Multi-topic routing** — send everything to one `fixed` topic, or extract the destination topic from each record with a JSONPath (`from_path`).
-- **Per-record key / partition** — JSONPath-driven `key_path` and `partition_path`, with a configurable `on_key_error` policy (`fail` / `skip` / `round_robin`). (`headers_path` is accepted but **not yet applied** — see the note below.)
+- **Per-record key / partition / headers** — JSONPath-driven `key_path`, `partition_path` and `headers_path`, with a configurable `on_key_error` policy (`fail` / `skip` / `round_robin`).
 - **Producer compression** — `none` / `gzip` / `snappy` / `lz4` / `zstd`.
 - **Value & key encoding** — JSON, raw UTF-8 string, or base64 bytes out of the box; Confluent **Avro / Protobuf / JSON Schema** behind the `schema-registry` feature.
 - **SASL / SSL auth** — `none`, `sasl_plain`, `sasl_scram` (SHA-256/512), `ssl` (mTLS), and `sasl_ssl`, shared verbatim with the Kafka **source** via [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka).
@@ -90,7 +90,7 @@ All fields are keys under `sink.config`.
 |-------|------|---------|-------------|
 | `key_path` | string | *(unset)* | JSONPath into each record to extract the message key. Absent → no key (round-robin partitioning). |
 | `partition_path` | string | *(unset)* | JSONPath to extract the target partition number (integer). Absent → librdkafka chooses. |
-| `headers_path` | string | *(unset)* | JSONPath to a flat object of `header → string` pairs intended as Kafka headers. **Not yet applied** — the produce path does not attach them to the message, so setting this has no effect today. Carry the values in the record body instead. |
+| `headers_path` | string | *(unset)* | JSONPath to a flat object whose entries become Kafka message headers (values stringified). Applied on both the at-least-once and transactional produce paths. A JSON `null` becomes a **valueless** header rather than the string `"null"`. A path resolving to nothing yields no headers; one resolving to a non-object fails the batch (same strictness as `partition_path`). The exactly-once commit-token record never carries these. |
 | `on_key_error` | `"fail" \| "skip" \| "round_robin"` | `"fail"` | What to do when `key_path` / `partition_path` extraction fails. See [Key error policy](#key-error-policy). |
 
 ### Reliability
@@ -395,7 +395,7 @@ In a full pipeline, wire the sink into `faucet_core::Pipeline` (or `run_stream`)
 ## How it works
 
 1. `new()` resolves `KafkaAuth`, applies compression / acks / idempotence / timeout / `extra_client_config`, and builds the `FutureProducer` **once**.
-2. Each `write_batch` resolves the topic, key, and partition per record (JSONPath), encoding the value via `value_format`. (`headers_path` is parsed from config but not yet attached to the outgoing message.)
+2. Each `write_batch` resolves the topic, key, partition and headers per record (JSONPath), encoding the value via `value_format`.
 3. Records are enqueued into a `FuturesUnordered` up to the effective in-flight cap; `QueueFull` rejections back off and retry.
 4. `flush()` blocks until all in-flight deliveries are acknowledged (or `message_timeout` elapses) before the pipeline advances the bookmark.
 

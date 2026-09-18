@@ -330,8 +330,7 @@ pub(crate) async fn enqueue_in_txn(
     producer: &FutureProducer,
     topic: &str,
     value_bytes: Vec<u8>,
-    key_bytes: Option<Vec<u8>>,
-    partition: Option<i32>,
+    routing: crate::sink::RecordRouting,
     max_retries: u32,
     backoff: Duration,
 ) -> Result<(), FaucetError> {
@@ -339,11 +338,14 @@ pub(crate) async fn enqueue_in_txn(
     loop {
         let mut record: FutureRecord<'_, [u8], [u8]> =
             FutureRecord::to(topic).payload(value_bytes.as_slice());
-        if let Some(k) = key_bytes.as_deref() {
+        if let Some(k) = routing.key.as_deref() {
             record = record.key(k);
         }
-        if let Some(p) = partition {
+        if let Some(p) = routing.partition {
             record = record.partition(p);
+        }
+        if let Some(h) = routing.headers.as_ref() {
+            record = record.headers(crate::sink::owned_headers(h));
         }
         match producer.send_result(record) {
             Ok(_delivery_future) => return Ok(()),

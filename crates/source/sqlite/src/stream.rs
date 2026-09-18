@@ -45,6 +45,13 @@ impl SqliteSource {
             .max_connections(config.max_connections)
             .connect(&config.database_url)
             .await
+            // Connect-time, so `Config` is deliberate and stays: this runs in
+            // `new()` at registry-build time, before any data moves, which is
+            // what lets `faucet validate` / `doctor` surface an unreachable or
+            // misconfigured destination as a configuration problem. A failure
+            // *mid-query* is a different thing entirely and is reported as
+            // `FaucetError::Source` (#662) — the config was fine; the database
+            // went away.
             .map_err(|e| FaucetError::Config(format!("SQLite connection failed: {e}")))?;
 
         Ok(Self {
@@ -259,7 +266,7 @@ impl faucet_core::Source for SqliteSource {
         let rows = query
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| FaucetError::Config(format!("SQLite query failed: {e}")))?;
+            .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))?;
 
         let records: Vec<Value> = rows.iter().map(row_to_json).collect();
         tracing::info!(
@@ -305,7 +312,7 @@ impl faucet_core::Source for SqliteSource {
             while let Some(row) = rows
                 .try_next()
                 .await
-                .map_err(|e| FaucetError::Config(format!("SQLite query failed: {e}")))?
+                .map_err(|e| FaucetError::Source(format!("SQLite query failed: {e}")))?
             {
                 buffer.push(row_to_json(&row));
                 if buffer.len() >= chunk {
@@ -456,6 +463,60 @@ impl faucet_core::Source for SqliteSource {
 
 #[cfg(test)]
 mod tests {
+    /// #662 — a failure *mid-query* is a runtime fault, not a configuration
+    /// one. The distinction is load-bearing: `Config` means "your YAML is
+    /// wrong", so an operator seeing it during a database incident goes to
+    /// inspect their pipeline instead of their database. It also gates future
+    /// retriability — a dropped connection should eventually be retriable, and
+    /// `Config` is the one variant that must never be.
+    ///
+    /// Connect-time failures deliberately stay `Config`: those happen in
+    /// `new()` before any data moves, which is what lets `validate`/`doctor`
+    /// report an unreachable destination as a config problem.
+    #[tokio::test]
+    async fn a_bad_query_is_a_source_error_not_a_config_error() {
+        use faucet_core::{FaucetError, Source as _};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("t.db");
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .expect("connect");
+            sqlx::query("CREATE TABLE t (id INTEGER)")
+                .execute(&pool)
+                .await
+                .expect("create");
+            pool.close().await;
+        }
+
+        // The connection is fine; the statement is not. That is a runtime
+        // failure of this run, not a malformed config file.
+        let src = super::SqliteSource::new(crate::SqliteSourceConfig::new(
+            &url,
+            "SELECT * FROM does_not_exist",
+        ))
+        .await
+        .expect("the source connects — only the query is bad");
+
+        let err = src
+            .fetch_all()
+            .await
+            .expect_err("querying a missing table must fail");
+        assert!(
+            matches!(err, FaucetError::Source(_)),
+            "a query-time failure must be FaucetError::Source, got {err:?}"
+        );
+        assert!(
+            !matches!(err, FaucetError::Config(_)),
+            "and must NOT be Config — that sends an operator to their YAML \
+             during a database incident: {err:?}"
+        );
+    }
+
     use super::*;
     use faucet_core::Source;
 
