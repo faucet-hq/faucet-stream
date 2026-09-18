@@ -1,0 +1,24 @@
+{
+  "cli_version": "0.10.2",
+  "checkpoint_id": "01M2T2MEAMPPJRD0D1GS05BZ77",
+  "strategy": "manual-commit",
+  "branch": "fix/overwrite-bookmark-ordering",
+  "checkpoints_count": 1,
+  "files_touched": null,
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 16498,
+    "cache_creation_tokens": 53871909,
+    "cache_read_tokens": 4757795830,
+    "output_tokens": 9335599,
+    "api_call_count": 8284
+  }
+}
