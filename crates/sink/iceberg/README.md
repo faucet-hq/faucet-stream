@@ -218,7 +218,7 @@ For high-throughput pipelines, use a large **upstream** `batch_size` (e.g. `1000
 
 ### Concurrent writers & commit-conflict retry
 
-Iceberg commits use optimistic concurrency. If a competing writer commits between this sink's table load and its commit, `Transaction::commit` (iceberg-rust 0.9.1) **transparently retries**: it reloads the table metadata and re-applies the `fast_append` against the latest snapshot — *without re-uploading the data files* — with exponential backoff. A benign concurrent write therefore does **not** abort the run. Tune the retry budget with the standard Iceberg `commit.retry.*` table properties, set via `snapshot_properties` at table creation:
+Iceberg commits use optimistic concurrency. If a competing writer commits between this sink's table load and its commit, `Transaction::commit` (iceberg-rust 0.10.0) **transparently retries**: it reloads the table metadata and re-applies the `fast_append` against the latest snapshot — *without re-uploading the data files* — with exponential backoff. A benign concurrent write therefore does **not** abort the run. Tune the retry budget with the standard Iceberg `commit.retry.*` table properties, set via `snapshot_properties` at table creation:
 
 ```yaml
 snapshot_properties:

@@ -12026,10 +12026,13 @@
                     },
                     "concurrency": {
                       "description": "Maximum number of files read concurrently (default: 4).\n\nReads are overlapped with a bounded look-ahead in listing order, so\nthroughput improves without changing which file an error is attributed\nto. Lower than the object-store sources' default because every read\nshares one SSH channel, and many servers cap concurrent open handles.\n`0` is treated as `1`.",
-                      "type": "integer",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
                       "format": "uint",
-                      "default": 4,
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 4
                     }
                   }
                 },
@@ -16354,7 +16357,7 @@
                       ]
                     },
                     "headers_path": {
-                      "description": "JSONPath to a flat JSON object whose entries become Kafka message\nheaders (values are stringified). Unset by default.\n\nApplied on both the at-least-once and the transactional (exactly-once)\nproduce paths. A JSON `null` becomes a **valueless** header rather than\nthe string `\"null\"`, which is what Kafka's header model actually\nexpresses. The commit-token record on the side-topic never carries these\n— it is faucet's own watermark, not a user record.\n\nA path that resolves to nothing yields no headers; one that resolves to\na non-object fails the batch, matching [`Self::partition_path`]'s\nstrictness: a header map the operator asked for and did not get is not\nsomething to paper over.",
+                      "description": "JSONPath to a flat JSON object whose entries become Kafka message\nheaders (values are stringified). Unset by default.\n\n**Not yet applied:** the extraction helper exists and is tested, but\nthe produce path does not attach the headers to the outgoing message,\nso setting this currently has no effect on what reaches the broker.\nCarry the values inside the record body until it is wired up.",
                       "type": [
                         "string",
                         "null"
