@@ -5,6 +5,8 @@
 //! See the crate-level README for usage and config-field reference.
 
 mod config;
+#[cfg(feature = "arrow")]
+mod parquet_range;
 mod stream;
 mod verify;
 

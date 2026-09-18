@@ -8,6 +8,8 @@
 //! JSON arrays, or raw text.
 
 pub mod config;
+#[cfg(feature = "arrow")]
+mod parquet_range;
 pub mod stream;
 pub mod verify;
 
