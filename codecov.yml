@@ -30,6 +30,11 @@ ignore:
   # tested; excluding the files keeps the coverage denominator honest rather
   # than penalising provably-uncoverable I/O.
   - "crates/source/gcs/src/stream.rs"
+  # The ranged-read Parquet adapter (#619) is the same surface: every line that
+  # is not a pure helper issues a `read_object` against the gRPC data plane.
+  # Its arithmetic and its failure messages — the parts a bug would hide in —
+  # are unit-tested in the file itself.
+  - "crates/source/gcs/src/parquet_range.rs"
   - "crates/sink/gcs/src/sink.rs"
   # BigQuery Arrow columnar I/O (#380) is provably-uncoverable in CI for the
   # same reasons: the Storage Read API is gRPC with no emulator, and the load

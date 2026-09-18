@@ -690,6 +690,54 @@ pipeline:
         );
     }
 
+    /// A structurally wrong **sink** config is refused at register time (#609),
+    /// naming the row and the side it came from.
+    ///
+    /// This is the half that a source-only check would miss: a template could
+    /// be registered and launched with a destination that cannot deserialize,
+    /// and the failure would land on the first triggered run.
+    #[tokio::test]
+    async fn register_rejects_a_structurally_invalid_sink_config() {
+        let s = store();
+        // `path` is a string; a map cannot deserialize into it.
+        let mut bad = req(r#"
+version: 1
+name: tenant-sync
+pipeline:
+  source: { type: rest, config: { base_url: "https://x", path: /e } }
+  sink: { type: jsonl, config: { path: { nested: wrong } } }
+"#);
+        bad.description = None;
+        let err = register(&s, bad).await.unwrap_err().to_string();
+        assert!(err.contains("sink"), "must say which side is wrong: {err}");
+        assert!(err.contains("jsonl"), "must name the connector: {err}");
+        assert!(
+            s.template_versions("tenant-sync").await.unwrap().is_empty(),
+            "nothing is persisted when validation fails"
+        );
+    }
+
+    /// The source counterpart, for symmetry — and to pin that the message says
+    /// `source`, so an operator does not go looking at the wrong end.
+    #[tokio::test]
+    async fn register_rejects_a_structurally_invalid_source_config() {
+        let s = store();
+        let mut bad = req(r#"
+version: 1
+name: tenant-sync
+pipeline:
+  source: { type: rest, config: { base_url: { nested: wrong } } }
+  sink: { type: jsonl, config: { path: ./o.jsonl } }
+"#);
+        bad.description = None;
+        let err = register(&s, bad).await.unwrap_err().to_string();
+        assert!(
+            err.contains("source"),
+            "must say which side is wrong: {err}"
+        );
+        assert!(err.contains("rest"), "must name the connector: {err}");
+    }
+
     #[tokio::test]
     async fn a_description_carries_forward_across_registers() {
         let s = store();

@@ -344,4 +344,19 @@ mod tests {
         let cfg = S3SourceConfig::new("bucket");
         assert_eq!(cfg.compression, faucet_core::CompressionConfig::Auto);
     }
+
+    /// Only `bucket` is required (#609) — every other field defaults, so a
+    /// hand-written `s3` entry deserializes and `faucet validate` can read it.
+    #[test]
+    fn a_minimal_config_deserializes_and_omitted_fields_take_their_defaults() {
+        let cfg: S3SourceConfig =
+            serde_json::from_value(serde_json::json!({ "bucket": "b" })).expect("bucket suffices");
+        assert_eq!(cfg.bucket, "b");
+        assert!(cfg.prefix.is_none());
+        assert!(cfg.region.is_none());
+        assert!(cfg.endpoint_url.is_none());
+        assert!(cfg.max_objects.is_none());
+        assert_eq!(cfg.concurrency, 10);
+        assert!(matches!(cfg.file_format, S3FileFormat::JsonLines));
+    }
 }

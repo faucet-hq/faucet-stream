@@ -28,7 +28,8 @@ from collections import defaultdict
 # codecov.yml. Paths matching these are excluded from the denominator.
 IGNORE = re.compile(
     r"(/tests?/|/examples?/|/benches?/|build\.rs$"
-    r"|crates/source/gcs/src/stream\.rs$|crates/sink/gcs/src/sink\.rs$"
+    r"|crates/source/gcs/src/stream\.rs$|crates/source/gcs/src/parquet_range\.rs$"
+    r"|crates/sink/gcs/src/sink\.rs$"
     r"|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)"
 )
 

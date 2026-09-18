@@ -1529,4 +1529,58 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("`list.get` must not be empty"), "{err}");
     }
+
+    /// Only `base_url` is genuinely required (#609).
+    ///
+    /// Before the per-field defaults, this config demanded **22** fields, so a
+    /// hand-written `rest` entry could not deserialize at all — which is why
+    /// `faucet validate` never tried. Deserializing the minimum is therefore
+    /// the regression test, and asserting each defaulted value pins what a
+    /// user gets when they omit it.
+    #[test]
+    fn a_minimal_config_deserializes_and_every_omitted_field_takes_its_default() {
+        let cfg: RestStreamConfig =
+            serde_json::from_value(serde_json::json!({ "base_url": "https://api.example.com" }))
+                .expect("base_url alone must be enough");
+
+        assert_eq!(cfg.base_url, "https://api.example.com");
+        assert_eq!(cfg.method, reqwest::Method::GET);
+        assert_eq!(cfg.max_pages, Some(100));
+        assert_eq!(cfg.max_retries, 3);
+        assert_eq!(cfg.schema_sample_size, 100);
+        assert!(matches!(cfg.pagination, PaginationStyle::None));
+        assert!(matches!(
+            cfg.replication_method,
+            ReplicationMethod::FullTable
+        ));
+        assert!(cfg.timeout.is_some(), "a request must not hang forever");
+        assert!(cfg.retry_backoff > std::time::Duration::ZERO);
+        assert!(
+            cfg.query_params.is_empty(),
+            "query_params was accidentally required (#609); it must default to empty"
+        );
+        assert_eq!(cfg.csv_delimiter, b',');
+        assert!(cfg.csv_has_headers);
+        // The defaulted auth must be the inert one — a default that
+        // accidentally carried credentials-shaped state would be a security
+        // problem, not a convenience.
+        assert!(
+            serde_json::to_value(&cfg.auth)
+                .expect("auth serializes")
+                .to_string()
+                .contains("none"),
+            "the default auth must be `none`"
+        );
+
+        // And it must survive the validate() that `faucet validate` now runs.
+        cfg.validate().expect("a minimal config is valid");
+    }
+
+    #[test]
+    fn an_empty_base_url_is_refused() {
+        let cfg: RestStreamConfig =
+            serde_json::from_value(serde_json::json!({ "base_url": "" })).expect("deserializes");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.to_lowercase().contains("base_url"), "{err}");
+    }
 }

@@ -1893,6 +1893,79 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 mod tests {
     use super::*;
 
+    /// Every compiled source kind reaches a real deserializer (#609).
+    ///
+    /// Driven off `source_descriptions()` rather than a hand-written list, so a
+    /// connector added without a validation arm fails here instead of silently
+    /// accepting any config until its first triggered run — the exact defect
+    /// #609 was filed for.
+    ///
+    /// A non-object config is the one input that no connector config can
+    /// deserialize, whatever its fields, so it proves the arm is wired without
+    /// needing a valid fixture per kind. An arm that returned `Ok` (a stub, or
+    /// a copy-paste that dropped the `check`) fails.
+    #[test]
+    fn every_compiled_source_kind_validates_its_own_config_type() {
+        for (kind, _) in source_descriptions() {
+            let err = validate_source_config(kind, "row-a", serde_json::json!(42))
+                .expect_err("a non-object config cannot deserialize into any connector config");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(kind),
+                "the failure must name the connector kind so the operator knows which \
+                 entry is wrong: {msg}"
+            );
+            assert!(
+                msg.contains("row-a"),
+                "the failure must name the row/template entry: {msg}"
+            );
+        }
+    }
+
+    /// The sink half of the same guarantee.
+    #[test]
+    fn every_compiled_sink_kind_validates_its_own_config_type() {
+        for (kind, _) in sink_descriptions() {
+            let err = validate_sink_config(kind, "row-b", serde_json::json!("not an object"))
+                .expect_err("a non-object config cannot deserialize into any connector config");
+            let msg = err.to_string();
+            assert!(msg.contains(kind), "must name the kind: {msg}");
+            assert!(msg.contains("row-b"), "must name the entry: {msg}");
+        }
+    }
+
+    /// An empty object is the *other* half: it must be accepted by configs whose
+    /// every field is optional and rejected — by name — where something is
+    /// genuinely required. Either outcome is fine; a panic or a non-actionable
+    /// message is not.
+    #[test]
+    fn an_empty_config_object_is_never_a_panic_and_always_actionable() {
+        for (kind, _) in source_descriptions() {
+            if let Err(e) = validate_source_config(kind, "row-c", serde_json::json!({})) {
+                let msg = e.to_string();
+                assert!(msg.contains(kind) && msg.contains("row-c"), "{msg}");
+            }
+        }
+        for (kind, _) in sink_descriptions() {
+            if let Err(e) = validate_sink_config(kind, "row-d", serde_json::json!({})) {
+                let msg = e.to_string();
+                assert!(msg.contains(kind) && msg.contains("row-d"), "{msg}");
+            }
+        }
+    }
+
+    /// An unknown kind names the kind and lists what *is* available, rather
+    /// than reporting the config valid.
+    #[test]
+    fn an_unknown_kind_is_refused_with_the_available_kinds() {
+        let src = validate_source_config("not-a-connector", "row", serde_json::json!({}))
+            .expect_err("an unknown source kind must not validate");
+        assert!(src.to_string().contains("not-a-connector"), "{src}");
+        let sink = validate_sink_config("not-a-connector", "row", serde_json::json!({}))
+            .expect_err("an unknown sink kind must not validate");
+        assert!(sink.to_string().contains("not-a-connector"), "{sink}");
+    }
+
     #[test]
     fn staged_load_allowlist_matches_capable_sinks() {
         for k in ["redshift", "snowflake", "bigquery", "clickhouse", "mssql"] {
