@@ -54,8 +54,23 @@
 //!
 //! Each check has both a passing and a `#[should_panic]` failing test in this
 //! crate — a check that cannot fail is worthless.
+//!
+//! # Reliability suites
+//!
+//! Alongside the per-connector battery above, two modules support the
+//! engine-level reliability program (#651):
+//!
+//! - [`scripted`] — boundary-precise failure injection plus a shared ordered
+//!   [`EventLog`](scripted::EventLog), for asserting the *ordering* guarantees
+//!   (bookmark-after-confirm, swap-only-on-success, cancel-still-flushes) that
+//!   a pure-logic unit test cannot observe.
+//! - [`fidelity`] — the shared typed round-trip corpus and assertion helper, so
+//!   every source↔sink pair inherits a type-exactness test instead of
+//!   hand-rolling one.
 
 pub mod doubles;
+pub mod fidelity;
+pub mod scripted;
 
 use std::collections::HashMap;
 
