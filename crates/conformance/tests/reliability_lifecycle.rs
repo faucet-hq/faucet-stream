@@ -313,3 +313,194 @@ async fn an_uncancelled_run_is_the_control_and_consumes_everything() {
     assert_eq!(result.records_written, source.total_records());
     assert!(log.any(|e| matches!(e, Event::Flush)));
 }
+
+// ─── #652: an overwrite bookmark must not outrun its commit ──────────────────
+//
+// The `Value` write path used to checkpoint each bookmark-carrying page inside
+// `run_stream`, which happens *before* `Pipeline::run` decides the overwrite
+// outcome. So a run whose `commit_overwrite` then failed left the destination
+// untouched (correct) while the state store claimed the data was delivered
+// (wrong) — and the next incremental run resumed past records the refresh never
+// wrote. Permanently, with green runs thereafter.
+
+#[tokio::test]
+async fn a_successful_overwrite_persists_its_bookmark_only_after_the_swap() {
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone()).overwrite();
+    let store = Arc::new(sink.state_store());
+    let source = PagedSource::new(4, 3);
+
+    Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .expect("a clean overwrite run succeeds");
+
+    let events = log.events();
+    let commit = events
+        .iter()
+        .position(|e| matches!(e, Event::CommitOverwrite))
+        .expect("the swap happened");
+    let puts: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, Event::StatePut { .. }))
+        .map(|(i, _)| i)
+        .collect();
+
+    assert_eq!(
+        puts.len(),
+        1,
+        "an overwrite run must persist exactly one bookmark — its final one — not one \
+         per page: {events:?}"
+    );
+    assert!(
+        puts[0] > commit,
+        "the bookmark was persisted BEFORE the swap. If the swap then failed, the \
+         destination would be unchanged while the state store claimed delivery, and the \
+         next run would skip those rows forever: {events:?}"
+    );
+
+    // And it is the last page's bookmark, so nothing is left un-resumable.
+    assert_eq!(
+        store.stored("scripted:paged"),
+        Some(serde_json::json!({ "page": 3 })),
+        "the persisted bookmark must cover the whole refresh"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_commit_leaves_the_bookmark_exactly_where_it_was() {
+    // The headline case. Every page wrote and flushed fine; only the swap fails.
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone())
+        .overwrite()
+        .failing_at(Boundary::CommitOverwrite);
+    let store = Arc::new(sink.state_store());
+    let source = PagedSource::new(4, 3);
+
+    Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .expect_err("a failed swap must fail the run");
+
+    assert_eq!(
+        store.stored("scripted:paged"),
+        None,
+        "the destination was left untouched, so the bookmark must not have moved — \
+         otherwise the next incremental run resumes past rows this refresh never \
+         wrote: {:?}",
+        log.events()
+    );
+    assert!(
+        log.bookmarks().is_empty(),
+        "no bookmark may be persisted at all: {:?}",
+        log.events()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_write_during_an_overwrite_leaves_the_bookmark_alone() {
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone())
+        .overwrite()
+        .failing_at(Boundary::Write(2));
+    let store = Arc::new(sink.state_store());
+    let source = PagedSource::new(5, 3);
+
+    Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .expect_err("the write failure fails the run");
+
+    assert_eq!(
+        store.stored("scripted:paged"),
+        None,
+        "pages 0 and 1 were written and flushed, but the refresh never published, so \
+         none of their bookmarks may be durable: {:?}",
+        log.events()
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_overwrite_leaves_the_bookmark_alone() {
+    // A cancel returns `Ok`, so this is the case a naive "did the run succeed?"
+    // check would let through.
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone())
+        .overwrite()
+        .with_write_delay(Duration::from_millis(25));
+    let store = Arc::new(sink.state_store());
+    let source = PagedSource::new(50, 2);
+    let cancel = CancellationToken::new();
+
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(55)).await;
+        canceller.cancel();
+    });
+
+    let result = Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .with_cancel(cancel)
+        .run()
+        .await
+        .expect("a cancelled run returns Ok");
+
+    assert!(
+        result.records_written < source.total_records(),
+        "the run must have been cut short for this test to mean anything"
+    );
+    assert!(
+        !log.any(|e| matches!(e, Event::CommitOverwrite)),
+        "sanity: a cancelled overwrite does not swap"
+    );
+    assert_eq!(
+        store.stored("scripted:paged"),
+        None,
+        "and so it must not leave a bookmark behind: {:?}",
+        log.events()
+    );
+}
+
+#[tokio::test]
+async fn a_non_overwrite_run_still_checkpoints_every_page() {
+    // The deferral must be scoped to overwrite only. ADR 0002's per-page
+    // checkpoint ordering is what makes an ordinary incremental run resumable,
+    // so holding bookmarks there would trade one bug for a worse one: a long
+    // run that fails would restart from the beginning.
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone()); // no .overwrite()
+    let store = Arc::new(sink.state_store());
+    let source = PagedSource::new(4, 3);
+
+    Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .expect("a clean run succeeds");
+
+    assert_eq!(
+        log.bookmarks().len(),
+        4,
+        "a non-overwrite run must still persist one bookmark per page: {:?}",
+        log.events()
+    );
+    // Interleaved, not batched at the end — that interleaving is the resumability.
+    let events = log.events();
+    let first_put = events
+        .iter()
+        .position(|e| matches!(e, Event::StatePut { .. }))
+        .expect("a bookmark was persisted");
+    let last_write = events
+        .iter()
+        .rposition(|e| matches!(e, Event::Write(_)))
+        .expect("writes happened");
+    assert!(
+        first_put < last_write,
+        "the first checkpoint must land before the last write, or the run is not \
+         incrementally resumable: {events:?}"
+    );
+}
