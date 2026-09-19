@@ -7,7 +7,7 @@ use super::sql::{DDL, Dialect, Stmts, classify_backend_error_with_context, impl_
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 
-impl_sql_history!(PostgresHistory, sqlx::PgPool);
+impl_sql_history!(PostgresHistory, sqlx::PgPool, "BEGIN");
 
 impl PostgresHistory {
     /// Connect, create the schema if absent, and return the backend. `lease_ttl`

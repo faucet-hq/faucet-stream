@@ -8,7 +8,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::str::FromStr;
 use std::time::Duration;
 
-impl_sql_history!(SqliteHistory, sqlx::SqlitePool);
+impl_sql_history!(SqliteHistory, sqlx::SqlitePool, "BEGIN IMMEDIATE");
 
 impl SqliteHistory {
     /// Connect (creating the database file if missing), create the schema if
