@@ -16,6 +16,7 @@ fn opts(name: &str, max_concurrent: Option<usize>) -> ExecuteOptions {
         pipeline_name: name.into(),
         run_id: None,
         execution: max_concurrent.map(|n| faucet_cli::config::ExecutionSpec {
+            schedule: Default::default(),
             max_concurrent: Some(n),
             on_error: faucet_cli::config::OnError::Continue,
             adaptive_batch_size: None,

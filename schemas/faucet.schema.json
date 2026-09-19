@@ -2102,6 +2102,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "weight": {
+          "description": "Relative cost hint used by `execution.schedule: lpt` (#644) — higher is\ndispatched earlier. Ignored under the default `declared` order.\n\nThe useful proxy is **bytes moved**, not rows: a 970k-row × 3-column\ntable is lighter than a 122k-row × 100-column one, so ranking on row\ncount alone mis-orders wide-but-short objects. `faucet discover` fills\nthis in from each dataset's estimated rows and column widths; set it by\nhand when you know better.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
         }
       },
       "additionalProperties": false
@@ -2361,6 +2370,11 @@
             }
           ],
           "default": null
+        },
+        "schedule": {
+          "description": "Order in which ready sibling rows queue for a concurrency permit\n(#644). Defaults to `declared` — today's behaviour, byte for byte.",
+          "$ref": "#/$defs/DispatchOrder",
+          "default": "declared"
         }
       },
       "additionalProperties": false
@@ -19266,6 +19280,21 @@
         }
       },
       "additionalProperties": true
+    },
+    "DispatchOrder": {
+      "description": "How the executor orders ready sibling rows competing for permits (#644).\n\nOnly the *enqueue order* changes; the permit budget, the `JoinSet`, and the\n`on_error` cancellation are untouched.",
+      "oneOf": [
+        {
+          "description": "Matrix-declaration order (BFS). The default, and fully deterministic.",
+          "type": "string",
+          "const": "declared"
+        },
+        {
+          "description": "Longest-processing-time-first: heaviest rows claim permits first.\n\nWith heterogeneous row durations, makespan otherwise depends on the\norder the user happened to list rows in — a large object listed late\nbecomes an idle tail (measured: two big Salesforce objects finishing\n~9 min after the other 19, with 6 of 8 slots idle). LPT is provably\nwithin 4/3 of optimal for `P || Cmax`, and largest-*last* — which plain\ndeclaration order can accidentally produce — is the worst case.\n\nRows are ranked by [`MatrixRow::weight`]; ties and missing weights fall\nback to declaration order, so dispatch is never nondeterministic.",
+          "type": "string",
+          "const": "lpt"
+        }
+      ]
     }
   }
 }
