@@ -1275,7 +1275,16 @@ pub fn parse_status(s: &str) -> RunStatus {
 /// `$name` is the backend struct, `$pool` its `sqlx` pool type. The struct holds
 /// the pool, the idempotency retention window, and the dialect's [`Stmts`].
 macro_rules! impl_sql_history {
-    ($name:ident, $pool:ty) => {
+    // `$begin_write` is the statement that opens a transaction which will
+    // *write*. It is dialect-specific and load-bearing: SQLite's plain `BEGIN`
+    // is **deferred**, so a transaction that reads and then writes must upgrade
+    // its lock, and in WAL mode SQLite refuses that upgrade immediately with
+    // `SQLITE_BUSY_SNAPSHOT` (code 517) rather than waiting on `busy_timeout` —
+    // waiting could deadlock. `BEGIN IMMEDIATE` takes the write lock up front,
+    // so contention becomes a *wait* the busy timeout absorbs instead of an
+    // instant failure (#666). Postgres has no such distinction and passes
+    // `BEGIN`.
+    ($name:ident, $pool:ty, $begin_write:expr) => {
         /// SQL-backed [`RunHistory`](crate::serve::history::RunHistory). See
         /// [`crate::serve::history::sql`] for the shared schema + semantics.
         pub struct $name {
@@ -2880,7 +2889,7 @@ macro_rules! impl_sql_history {
                     // write-write overlap with `database is locked` immediately,
                     // since waiting would deadlock). Feed those failures into the
                     // same retry rather than aborting the register.
-                    let mut tx = match self.pool.begin().await {
+                    let mut tx = match self.pool.begin_with($begin_write).await {
                         Ok(tx) => tx,
                         Err(e) if attempt < sql::CLAIM_ATTEMPTS => {
                             tracing::debug!(
@@ -2933,7 +2942,26 @@ macro_rules! impl_sql_history {
                         .await;
                     match insert {
                         Ok(_) => {
-                            tx.commit().await.map_err(backend)?;
+                            // The commit is as contention-prone as every other
+                            // step and must retry with them. In WAL mode a
+                            // transaction that read and then wrote can be
+                            // refused at COMMIT with `database is locked` when
+                            // another writer committed in between — SQLite
+                            // answers that immediately rather than waiting on
+                            // `busy_timeout`, because waiting could deadlock.
+                            // Returning here (the previous behaviour) aborted a
+                            // register that the very next attempt would have
+                            // completed, which is what made #666 flake.
+                            if let Err(e) = tx.commit().await {
+                                if attempt < sql::CLAIM_ATTEMPTS {
+                                    tracing::debug!(
+                                        template = %id, attempt, error = %e,
+                                        "template version commit lost a race; retrying"
+                                    );
+                                    continue;
+                                }
+                                return Err(backend(e));
+                            }
                             // Bound the version history so a template
                             // re-registered on every deploy can't grow forever.
                             let keep = self.template_versions(&id).await?;

@@ -80,13 +80,27 @@ impl McpContext {
 
 /// Install a tracing subscriber that writes to **stderr** — stdout is reserved
 /// for the JSON-RPC message stream in `faucet mcp` (stdio) mode.
-pub fn install_stderr_tracing(level: &str) {
+pub fn install_stderr_tracing(level: &str, format: crate::cli::LogFormat) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
+    // Always stderr, whatever the format: stdout carries the MCP JSON-RPC
+    // stream, and two JSON streams on one pipe would corrupt the protocol.
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+        .with_writer(std::io::stderr);
+    match format {
+        crate::cli::LogFormat::Text => {
+            let _ = builder.try_init();
+        }
+        crate::cli::LogFormat::Json => {
+            let _ = builder
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(false)
+                .try_init();
+        }
+    }
 }
 
 /// Server identity reported in `initialize`.
@@ -329,8 +343,8 @@ mod tests {
     fn install_stderr_tracing_is_idempotent() {
         // Just exercises the installer (try_init, so a second global subscriber
         // is a no-op rather than a panic).
-        install_stderr_tracing("info");
-        install_stderr_tracing("debug");
+        install_stderr_tracing("info", crate::cli::LogFormat::Text);
+        install_stderr_tracing("debug", crate::cli::LogFormat::Json);
     }
 
     #[tokio::test]

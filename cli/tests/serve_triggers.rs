@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 fn test_config() -> ServeConfig {
     ServeConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
+        log_format: Default::default(),
         auth: AuthMode::None,
         max_concurrent_runs: 4,
         max_queued_runs: 16,

@@ -64,6 +64,34 @@ Never use high-cardinality values (record ids, URLs, query strings) as metric
 labels. `parent_record_key` in a DAG is a span attribute only. Connector authors
 must return a non-empty `&'static str` from `connector_name()`.
 
+## Structured (JSON) logs
+
+`--log-format json` (or `FAUCET_LOG_FORMAT=json`) renders every log record as
+one JSON object per line on stderr, so a k8s / ECS / Nomad log pipeline can
+ingest it without grok or regex:
+
+```console
+$ faucet run --log-format json pipeline.yaml
+{"timestamp":"2026-09-19T10:02:11.481Z","level":"INFO","target":"faucet_cli::executor","pipeline":"orders","row":"contact","records_written":4821,"message":"row completed"}
+```
+
+The span fields faucet already records — `pipeline`, `row`, `run_id`,
+`connector`, error `kind` — arrive as fields rather than being rendered into
+the message, so they are filterable at the collector.
+
+Two things follow from "every line is one object":
+
+- Under `json` the end-of-run human status block, per-row timing table, and
+  peak-RSS line are not printed; the same numbers leave as structured events
+  (`pipeline completed`, `row completed`, `process peak rss`).
+- `faucet mcp` keeps logs on stderr under either format, because stdout carries
+  the JSON-RPC stream and two JSON streams on one pipe would corrupt it.
+
+Secret redaction is unaffected: it operates on the serialized bytes, so a
+resolved `${vault:…}` value appearing in a field is still scrubbed.
+
+`text` remains the default.
+
 ## Tracing
 
 Spans carry `run_id`, `pipeline`, `row`, and per-operation timing. Point a

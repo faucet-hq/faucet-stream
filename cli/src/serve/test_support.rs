@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 pub fn test_config() -> ServeConfig {
     ServeConfig {
         listen: "127.0.0.1:0".parse().expect("loopback addr"),
+        log_format: crate::cli::LogFormat::Text,
         auth: AuthMode::None,
         max_concurrent_runs: 4,
         max_queued_runs: 8,

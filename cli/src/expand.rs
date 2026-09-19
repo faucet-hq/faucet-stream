@@ -44,6 +44,9 @@ pub const RESERVED_IDS: &[&str] = &[
 pub struct ExpandedNode {
     pub id: String,
     pub row_index: usize,
+    /// Relative dispatch cost for `execution.schedule: lpt` (#644); `None`
+    /// means unranked, which sorts after every weighted row.
+    pub weight: Option<f64>,
     pub role: NodeRole,
     pub source: ConnectorSpec,
     pub sink: ConnectorSpec,
@@ -315,6 +318,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         synthetic_row = [MatrixRow {
             id: None,
             parent: None,
+            weight: None,
             depends_on: Vec::new(),
             parent_key: "id".into(),
             source: None,
@@ -686,6 +690,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             out.push(ExpandedNode {
                 id: ids[i].clone(),
                 row_index: i,
+                // A discovery row enumerates a value set rather than moving
+                // data, so it carries no dispatch cost to rank by.
+                weight: None,
                 role: NodeRole::Discovery {
                     select: disc.select.clone(),
                     as_alias: disc.as_alias.clone(),
@@ -1341,6 +1348,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let base = ExpandedNode {
             id: ids[i].clone(),
             row_index: i,
+            weight: row.weight,
             role,
             source: merged_source,
             sink: merged_sink,

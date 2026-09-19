@@ -536,6 +536,17 @@ pub struct MatrixRow {
     #[serde(default)]
     pub parent: Option<String>,
 
+    /// Relative cost hint used by `execution.schedule: lpt` (#644) — higher is
+    /// dispatched earlier. Ignored under the default `declared` order.
+    ///
+    /// The useful proxy is **bytes moved**, not rows: a 970k-row × 3-column
+    /// table is lighter than a 122k-row × 100-column one, so ranking on row
+    /// count alone mis-orders wide-but-short objects. `faucet discover` fills
+    /// this in from each dataset's estimated rows and column widths; set it by
+    /// hand when you know better.
+    #[serde(default)]
+    pub weight: Option<f64>,
+
     /// Row ids this row waits for. The row starts only after every listed
     /// row (all of its invocations) finishes successfully; a failed or
     /// skipped dependency skips this row. Pure completion-ordering — unlike
@@ -773,6 +784,36 @@ pub struct ExecutionSpec {
     /// Adaptive batch-size controller (opt-in). See `faucet_core::AdaptiveBatchConfig`.
     #[serde(default)]
     pub adaptive_batch_size: Option<faucet_core::AdaptiveBatchConfig>,
+
+    /// Order in which ready sibling rows queue for a concurrency permit
+    /// (#644). Defaults to `declared` — today's behaviour, byte for byte.
+    #[serde(default)]
+    pub schedule: DispatchOrder,
+}
+
+/// How the executor orders ready sibling rows competing for permits (#644).
+///
+/// Only the *enqueue order* changes; the permit budget, the `JoinSet`, and the
+/// `on_error` cancellation are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DispatchOrder {
+    /// Matrix-declaration order (BFS). The default, and fully deterministic.
+    #[default]
+    Declared,
+    /// Longest-processing-time-first: heaviest rows claim permits first.
+    ///
+    /// With heterogeneous row durations, makespan otherwise depends on the
+    /// order the user happened to list rows in — a large object listed late
+    /// becomes an idle tail (measured: two big Salesforce objects finishing
+    /// ~9 min after the other 19, with 6 of 8 slots idle). LPT is provably
+    /// within 4/3 of optimal for `P || Cmax`, and largest-*last* — which plain
+    /// declaration order can accidentally produce — is the worst case.
+    ///
+    /// Rows are ranked by [`MatrixRow::weight`]; ties and missing weights fall
+    /// back to declaration order, so dispatch is never nondeterministic.
+    Lpt,
 }
 
 /// Source-shard distribution settings for clustered (Mode B) execution.

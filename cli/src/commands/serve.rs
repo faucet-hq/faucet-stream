@@ -5,7 +5,11 @@ use crate::cli::ServeArgs;
 use crate::error::CliResult;
 use crate::serve::{McpServeSettings, ServeConfig};
 
-pub async fn run(args: ServeArgs, log_level: String) -> CliResult<()> {
+pub async fn run(
+    args: ServeArgs,
+    log_level: String,
+    log_format: crate::cli::LogFormat,
+) -> CliResult<()> {
     let cwd = std::env::current_dir()?;
     let env_path =
         crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
@@ -21,5 +25,6 @@ pub async fn run(args: ServeArgs, log_level: String) -> CliResult<()> {
 
     let mut config = ServeConfig::from_args(args)?;
     config.log_level = log_level;
+    config.log_format = log_format;
     crate::serve::run_server(config, mcp).await
 }
