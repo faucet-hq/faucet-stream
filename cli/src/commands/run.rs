@@ -364,6 +364,22 @@ pub(crate) async fn execute(
         // Human status → stderr, so stdout belongs exclusively to the sink /
         // the machine-readable json|ndjson contract (#424). Piping a
         // stdout-sink run stays clean.
+        // Under `--log-format json` every stderr line must be one JSON object,
+        // or a strict consumer chokes on the human status block. The same
+        // numbers already left as the structured `pipeline completed` event
+        // above, so nothing is lost — and text mode is untouched (#634).
+        RunOutput::Text if crate::cli::log_format() == crate::cli::LogFormat::Json => {
+            for i in &summary.invocations {
+                tracing::info!(
+                    pipeline = %pipeline_name,
+                    row = %i.row_id,
+                    records_written = i.records_written,
+                    duration_ms = i.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
+                    failed = i.error.is_some(),
+                    "row completed"
+                );
+            }
+        }
         RunOutput::Text => {
             eprintln!(
                 "{}: {} invocation{}, {} ok, {} failed, wrote {} record{}",
@@ -423,11 +439,24 @@ pub(crate) async fn execute(
     }
 
     if matches!(args.output, RunOutput::Text)
+        && crate::cli::log_format() == crate::cli::LogFormat::Text
         && let Some(bytes) = peak_rss
     {
         eprintln!(
             "  peak process RSS {} (whole process; exact for a one-shot run)",
             crate::memstat::fmt_mb(bytes)
+        );
+    }
+
+    // Under JSON the same number travels as a field rather than a prose line,
+    // so nothing is lost and every stderr line stays one object (#634).
+    if crate::cli::log_format() == crate::cli::LogFormat::Json
+        && let Some(bytes) = peak_rss
+    {
+        tracing::info!(
+            pipeline = %pipeline_name,
+            peak_rss_bytes = bytes,
+            "process peak rss"
         );
     }
 
@@ -556,6 +585,10 @@ fn finish_topology_run(
     );
 
     match output {
+        // Under JSON the `topology completed` event above already carries these
+        // numbers as fields; emitting the prose line too would break a strict
+        // stderr consumer (#634).
+        RunOutput::Text if crate::cli::log_format() == crate::cli::LogFormat::Json => {}
         // Human status → stderr; stdout stays clean for the sink / json|ndjson (#424).
         RunOutput::Text => eprintln!(
             "{}: {} sink node{}, {} ok, {} failed, wrote {} record{}",

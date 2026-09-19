@@ -143,7 +143,8 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
     // `serve` installs its own (redacting, run-scoped) subscriber; every other
     // command uses the plain redacting fmt subscriber.
     if !is_serve && !is_tui && !is_mcp {
-        install_tracing(&cli.log_level);
+        crate::cli::set_log_format(cli.log_format);
+        install_tracing(&cli.log_level, cli.log_format);
     }
     #[cfg(feature = "cli-tui")]
     if is_tui {
@@ -151,7 +152,8 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
     }
     #[cfg(feature = "mcp")]
     if is_mcp {
-        mcp::install_stderr_tracing(&cli.log_level);
+        crate::cli::set_log_format(cli.log_format);
+        mcp::install_stderr_tracing(&cli.log_level, cli.log_format);
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -188,6 +190,7 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
 pub async fn run_command(cli: Cli) -> CliResult<()> {
     #[cfg(feature = "serve")]
     let serve_log_level = cli.log_level.clone();
+    let log_format = cli.log_format;
     match cli.command {
         Command::Run(args) => commands::run::run(args).await,
         Command::Backfill(args) => commands::backfill::run(args).await,
@@ -215,7 +218,7 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         #[cfg(feature = "schedule")]
         Command::Schedule(args) => commands::schedule::run(args).await,
         #[cfg(feature = "serve")]
-        Command::Serve(args) => commands::serve::run(args, serve_log_level).await,
+        Command::Serve(args) => commands::serve::run(args, serve_log_level, log_format).await,
         #[cfg(feature = "mcp")]
         Command::Mcp(args) => commands::mcp::run(args).await,
         #[cfg(feature = "notify")]
@@ -236,20 +239,39 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
 }
 
 #[cfg(feature = "observability")]
-fn install_tracing(level: &str) {
+fn install_tracing(level: &str, format: crate::cli::LogFormat) {
     use crate::secrets::registry::RedactingMakeWriter;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(RedactingMakeWriter)
-        .try_init();
+        // Redaction wraps the *serialized bytes*, so it keeps working under
+        // JSON: a resolved secret appearing in a field value is still scrubbed.
+        .with_writer(RedactingMakeWriter);
+    match format {
+        crate::cli::LogFormat::Text => {
+            let _ = builder.try_init();
+        }
+        crate::cli::LogFormat::Json => {
+            let _ = builder
+                .json()
+                // Event fields at the top level rather than nested under
+                // `fields`, which is what log pipelines index on.
+                .flatten_event(true)
+                // Span context (`pipeline`, `row`, `run_id`, …) as fields; the
+                // full ancestor list is noise once the current span's fields
+                // are present.
+                .with_current_span(true)
+                .with_span_list(false)
+                .try_init();
+        }
+    }
 }
 
 /// Stub used when the `observability` feature is disabled. Logging falls back to
 /// whatever the host environment has wired (or nothing).
 #[cfg(not(feature = "observability"))]
-fn install_tracing(_level: &str) {}
+fn install_tracing(_level: &str, _format: crate::cli::LogFormat) {}
 
 /// Convenience entry point for integration tests and custom hosts: parse a
 /// YAML config string, expand the matrix, and run all rows.

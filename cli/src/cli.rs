@@ -51,6 +51,36 @@ pub struct SelectionArgs {
     pub include_parents: Option<String>,
 }
 
+/// How log records are rendered (#634).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum LogFormat {
+    /// Human-readable text — the default, byte-identical to previous releases.
+    #[default]
+    Text,
+    /// Line-delimited JSON, one object per record.
+    Json,
+}
+
+/// The process-wide resolved log format, set once when the subscriber is
+/// installed (#634).
+///
+/// Output rendering is a process-level mode, exactly like the subscriber it
+/// accompanies, so it is read here rather than threaded through every command
+/// signature. Defaults to [`LogFormat::Text`] when nothing set it — which is
+/// what library callers and tests get.
+static RESOLVED_LOG_FORMAT: std::sync::OnceLock<LogFormat> = std::sync::OnceLock::new();
+
+/// Record the resolved format. First call wins, mirroring `try_init` on the
+/// subscriber.
+pub fn set_log_format(format: LogFormat) {
+    let _ = RESOLVED_LOG_FORMAT.set(format);
+}
+
+/// The resolved log format for this process.
+pub fn log_format() -> LogFormat {
+    RESOLVED_LOG_FORMAT.get().copied().unwrap_or_default()
+}
+
 /// `faucet` — config-driven runner for faucet-stream pipelines.
 #[derive(Debug, Parser)]
 #[command(name = "faucet", version, about, long_about = None)]
@@ -58,6 +88,15 @@ pub struct Cli {
     /// Override the global log level (also honors `FAUCET_LOG`).
     #[arg(long, global = true, env = "FAUCET_LOG", default_value = "info")]
     pub log_level: String,
+
+    /// Log output format (also honors `FAUCET_LOG_FORMAT`).
+    ///
+    /// `json` emits one object per line for ingestion by Datadog / Elastic /
+    /// Loki / CloudWatch without regex parsing; the span fields faucet already
+    /// records (`pipeline`, `row`, `run_id`, `connector`, …) become first-class
+    /// fields instead of being rendered into a message.
+    #[arg(long, global = true, env = "FAUCET_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
+    pub log_format: LogFormat,
 
     #[command(subcommand)]
     pub command: Command,

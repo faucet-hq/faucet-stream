@@ -94,8 +94,9 @@ pub struct BigQuerySinkConfig {
     /// is involved (unlike the Arrow `bulk_load` path). This mirrors how the
     /// legacy iPaaS loader wrote to BigQuery (`load_table_from_dataframe`,
     /// CSV/JSON media upload) and collapses a 60-page run into a handful of load
-    /// jobs. Only consulted on the `write_mode: overwrite` path; append /
-    /// upsert / delete / exactly-once are unaffected. Default `false`.
+    /// jobs. Consulted on the **overwrite** and **append** paths (append feeds
+    /// one `WRITE_APPEND` resumable session per run); upsert / delete /
+    /// exactly-once still take the per-page query path. Default `false`.
     #[serde(default)]
     pub media_load: bool,
     /// Internal: set by the CLI executor for a *grouped* overwrite fan-out
