@@ -10,6 +10,7 @@ use faucet_common_kafka::OnKeyError;
 use faucet_core::{FaucetError, Sink};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use serde_json::Value;
 use std::sync::Arc;
@@ -265,6 +266,15 @@ impl Sink for KafkaSink {
                 None => None,
             };
 
+            // Kafka headers (#657). A path that resolves to nothing yields no
+            // headers; one that resolves to a non-object fails the batch, which
+            // matches `partition_path`'s strictness — a header map the operator
+            // asked for and did not get is not something to paper over.
+            let headers = match &self.config.headers_path {
+                Some(p) => extract::headers_at(record, p)?,
+                None => None,
+            };
+
             let producer = self.producer.clone();
             let topic_owned = topic.clone();
             let message_timeout = self.config.message_timeout;
@@ -276,8 +286,11 @@ impl Sink for KafkaSink {
                     &producer,
                     &topic_owned,
                     value_bytes,
-                    key_bytes,
-                    partition,
+                    RecordRouting {
+                        key: key_bytes,
+                        partition,
+                        headers,
+                    },
                     message_timeout,
                     retries,
                     backoff,
@@ -378,12 +391,30 @@ impl Sink for KafkaSink {
                 None => None,
             };
 
+            let headers = match &self.config.headers_path {
+                Some(p) => match extract::headers_at(record, p) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = crate::idempotent::abort_txn(
+                            producer.clone(),
+                            self.config.message_timeout,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                },
+                None => None,
+            };
+
             if let Err(e) = crate::idempotent::enqueue_in_txn(
                 &producer,
                 &topic,
                 value_bytes,
-                key_bytes,
-                partition,
+                RecordRouting {
+                    key: key_bytes,
+                    partition,
+                    headers,
+                },
                 self.config.queue_full_max_retries,
                 self.config.queue_full_backoff,
             )
@@ -396,13 +427,17 @@ impl Sink for KafkaSink {
             produced += 1;
         }
 
-        // Enqueue the commit-token record (key = scope, value = token).
+        // Enqueue the commit-token record (key = scope, value = token). No
+        // headers: this is faucet's own watermark on its own side-topic, not a
+        // user record, so `headers_path` must not reach it.
         if let Err(e) = crate::idempotent::enqueue_in_txn(
             &producer,
             &self.config.commit_token_topic,
             token.as_bytes().to_vec(),
-            Some(scope.as_bytes().to_vec()),
-            None,
+            RecordRouting {
+                key: Some(scope.as_bytes().to_vec()),
+                ..RecordRouting::default()
+            },
             self.config.queue_full_max_retries,
             self.config.queue_full_backoff,
         )
@@ -502,6 +537,42 @@ impl Sink for KafkaSink {
 /// Send a single record, retrying on `QueueFull` up to `max_retries` times
 /// with `backoff` delay between attempts.
 ///
+/// Where one record goes and what travels with it: the key, an explicit
+/// partition, and the message headers, each resolved per record from its own
+/// JSONPath.
+///
+/// Grouped rather than passed as three more positional `Option`s — the senders
+/// were already at the edge of readability, and a caller that swapped two of
+/// them would be building a subtly wrong message.
+#[derive(Debug, Default)]
+pub(crate) struct RecordRouting {
+    pub key: Option<Vec<u8>>,
+    pub partition: Option<i32>,
+    pub headers: Option<serde_json::Map<String, Value>>,
+}
+
+/// Convert an extracted header map into librdkafka's `OwnedHeaders`.
+///
+/// `extract::headers_at` has already stringified every value, so the only
+/// decision left is `null`: Kafka headers permit a *valueless* header, and that
+/// is a truer rendering of JSON `null` than the four-character string
+/// `"null"` — which a consumer would have to know to special-case.
+pub(crate) fn owned_headers(map: &serde_json::Map<String, Value>) -> OwnedHeaders {
+    let mut out = OwnedHeaders::new_with_capacity(map.len());
+    for (k, v) in map {
+        let value = match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.as_str()),
+            // Unreachable today (`headers_at` stringifies), but leaving the
+            // match exhaustive means a change there cannot silently drop a
+            // header here.
+            _ => None,
+        };
+        out = out.insert(Header { key: k, value });
+    }
+    out
+}
+
 /// Uses `send_result()` (non-blocking enqueue) so we can apply our own retry
 /// schedule rather than the librdkafka built-in queue timeout.
 /// `_message_timeout` is kept in the signature for callers that track it but
@@ -511,8 +582,7 @@ async fn send_with_queue_full_retry(
     producer: &FutureProducer,
     topic: &str,
     value_bytes: Vec<u8>,
-    key_bytes: Option<Vec<u8>>,
-    partition: Option<i32>,
+    routing: RecordRouting,
     _message_timeout: Duration,
     max_retries: u32,
     backoff: Duration,
@@ -523,11 +593,14 @@ async fn send_with_queue_full_retry(
         // returns the record back on QueueFull so we can reconstruct it.
         let mut record: FutureRecord<'_, [u8], [u8]> =
             FutureRecord::to(topic).payload(value_bytes.as_slice());
-        if let Some(k) = key_bytes.as_deref() {
+        if let Some(k) = routing.key.as_deref() {
             record = record.key(k);
         }
-        if let Some(p) = partition {
+        if let Some(p) = routing.partition {
             record = record.partition(p);
+        }
+        if let Some(h) = routing.headers.as_ref() {
+            record = record.headers(owned_headers(h));
         }
 
         match producer.send_result(record) {

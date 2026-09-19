@@ -43,8 +43,13 @@ pub fn partition_at(record: &Value, path: &str) -> Result<Option<i32>, FaucetErr
     }
 }
 
-/// Extract a headers map. The path must resolve to a JSON object;
-/// non-string values are stringified.
+/// Extract a headers map. The path must resolve to a JSON object; non-string
+/// values are stringified, **except `null`, which is preserved**.
+///
+/// A Kafka header may legitimately have *no* value, and that is the honest
+/// rendering of JSON `null`. Stringifying it to `"null"` would be
+/// indistinguishable, to a consumer, from the four-character string — so the
+/// null survives here and the sink turns it into a valueless header (#657).
 pub fn headers_at(record: &Value, path: &str) -> Result<Option<Map<String, Value>>, FaucetError> {
     let Some(v) = first_match(record, path)? else {
         return Ok(None);
@@ -56,11 +61,12 @@ pub fn headers_at(record: &Value, path: &str) -> Result<Option<Map<String, Value
     })?;
     let mut out = Map::new();
     for (k, val) in obj {
-        let s = match val {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
+        let rendered = match val {
+            Value::Null => Value::Null,
+            Value::String(s) => Value::String(s.clone()),
+            other => Value::String(other.to_string()),
         };
-        out.insert(k.clone(), Value::String(s));
+        out.insert(k.clone(), rendered);
     }
     Ok(Some(out))
 }
@@ -138,6 +144,21 @@ mod tests {
         let h = headers_at(&r, "$.h").unwrap().unwrap();
         assert_eq!(h.get("x").and_then(|v| v.as_str()), Some("y"));
         assert_eq!(h.get("n").and_then(|v| v.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn headers_at_preserves_null_so_the_sink_can_emit_a_valueless_header() {
+        // Kafka headers permit no value at all, which is what `null` means. A
+        // stringified "null" would be indistinguishable from the literal text.
+        let r = json!({"h": {"present": "x", "absent": null, "number": 1}});
+        let h = headers_at(&r, "$.h").unwrap().unwrap();
+        assert_eq!(h.get("present").and_then(|v| v.as_str()), Some("x"));
+        assert!(
+            h.get("absent").expect("key present").is_null(),
+            "null must survive rather than becoming the string \"null\""
+        );
+        // Everything else still stringifies.
+        assert_eq!(h.get("number").and_then(|v| v.as_str()), Some("1"));
     }
 
     #[test]

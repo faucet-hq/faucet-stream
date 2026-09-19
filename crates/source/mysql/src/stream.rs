@@ -39,6 +39,13 @@ impl MysqlSource {
             .max_connections(config.max_connections)
             .connect(&config.connection_url)
             .await
+            // Connect-time, so `Config` is deliberate and stays: this runs in
+            // `new()` at registry-build time, before any data moves, which is
+            // what lets `faucet validate` / `doctor` surface an unreachable or
+            // misconfigured destination as a configuration problem. A failure
+            // *mid-query* is a different thing entirely and is reported as
+            // `FaucetError::Source` (#662) — the config was fine; the database
+            // went away.
             .map_err(|e| FaucetError::Config(format!("MySQL connection failed: {e}")))?;
 
         Ok(Self {
@@ -298,7 +305,7 @@ impl faucet_core::Source for MysqlSource {
         let rows = query
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| FaucetError::Config(format!("MySQL query failed: {e}")))?;
+            .map_err(|e| FaucetError::Source(format!("MySQL query failed: {e}")))?;
 
         let records: Vec<Value> = rows.iter().map(row_to_json).collect();
         tracing::info!(rows = records.len(), query = %self.config.query, "MySQL source fetch complete");
@@ -338,7 +345,7 @@ impl faucet_core::Source for MysqlSource {
             while let Some(row) = rows
                 .try_next()
                 .await
-                .map_err(|e| FaucetError::Config(format!("MySQL query failed: {e}")))?
+                .map_err(|e| FaucetError::Source(format!("MySQL query failed: {e}")))?
             {
                 buffer.push(row_to_json(&row));
                 if buffer.len() >= chunk {
