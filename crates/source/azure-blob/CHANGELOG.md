@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.0.6](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-azure-blob-v1.0.5...faucet-source-azure-blob-v1.0.6) - 2026-09-19
+
+### Bug Fixes
+
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
 ## [1.0.5](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-azure-blob-v1.0.4...faucet-source-azure-blob-v1.0.5) - 2026-08-23
 
 ### Miscellaneous

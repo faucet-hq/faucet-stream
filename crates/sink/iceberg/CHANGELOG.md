@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-iceberg-v1.4.0...faucet-sink-iceberg-v1.4.1) - 2026-09-19
+
+### Bug Fixes
+
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+
+### Testing
+
+- Pull MinIO from quay.io — the Docker Hub repository was withdrawn ([#653](https://github.com/faucet-hq/faucet-stream/pull/653))
+
 ## [1.4.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-iceberg-v1.3.4...faucet-sink-iceberg-v1.4.0) - 2026-08-23
 
 ### Features

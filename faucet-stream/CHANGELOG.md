@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.9.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.8.0...faucet-stream-v1.9.0) - 2026-09-19
+
+### Features
+
+- Generic REST discovery, partitioned typed OData, byte-passthrough loads + BigQuery/serve upgrades ([#650](https://github.com/faucet-hq/faucet-stream/pull/650))
+
 ## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.7.5...faucet-stream-v1.8.0) - 2026-08-23
 
 ### Features

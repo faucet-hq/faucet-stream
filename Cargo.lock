@@ -4167,7 +4167,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "assert_cmd",
  "async-stream",
@@ -4330,7 +4330,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-clickhouse"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "faucet-core",
  "reqwest 0.13.3",
@@ -4341,7 +4341,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-delta"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-sftp"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "async-trait",
  "faucet-core",
@@ -4537,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-conformance"
-version = "1.3.3"
+version = "1.3.4"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4599,7 +4599,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-lineage"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4691,7 +4691,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-csv"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "async-trait",
  "csv",
@@ -4707,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-delta"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4786,7 +4786,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-http"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "async-trait",
  "faucet-conformance",
@@ -4803,7 +4803,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-iceberg"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4836,7 +4836,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-jsonl"
-version = "1.3.6"
+version = "1.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4852,7 +4852,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-kafka"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4874,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-kinesis"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4898,7 +4898,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-mongodb"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "async-trait",
  "faucet-conformance",
@@ -4916,7 +4916,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-mssql"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "async-trait",
  "bb8",
@@ -4939,7 +4939,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-mysql"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "async-trait",
  "faucet-conformance",
@@ -4976,7 +4976,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-parquet"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4999,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-postgres"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "async-trait",
  "faucet-conformance",
@@ -5016,7 +5016,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-pubsub"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5144,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-spanner"
-version = "1.1.2"
+version = "1.1.3"
 dependencies = [
  "async-trait",
  "faucet-common-spanner",
@@ -5165,7 +5165,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-sqlite"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5184,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-sqs"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "async-trait",
  "aws-sdk-sqs",
@@ -5219,7 +5219,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-azure-blob"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5266,7 +5266,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-clickhouse"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5305,7 +5305,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-databricks"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "arrow",
  "async-stream",
@@ -5385,7 +5385,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-gcs"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "arrow",
  "async-stream",
@@ -5413,7 +5413,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-graphql"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5433,7 +5433,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-grpc"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5481,7 +5481,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-kinesis"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5592,7 +5592,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-mysql"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5676,7 +5676,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-postgres"
-version = "1.7.1"
+version = "1.7.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5696,7 +5696,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-postgres-cdc"
-version = "1.3.7"
+version = "1.3.8"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5817,7 +5817,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-s3"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "arrow",
  "async-stream",
@@ -5844,7 +5844,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-sftp"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5925,7 +5925,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-sqlite"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5982,7 +5982,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-websocket"
-version = "1.1.10"
+version = "1.1.11"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6000,7 +6000,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-xml"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6054,7 +6054,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-stream"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "faucet-auth",
  "faucet-common-azure",
@@ -6148,7 +6148,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-transform-sql"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arrow",
  "arrow-json",

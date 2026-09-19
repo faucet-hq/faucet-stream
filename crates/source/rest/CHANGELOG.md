@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.7.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-rest-v1.6.0...faucet-source-rest-v1.7.0) - 2026-09-19
+
+### Bug Fixes
+
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Features
+
+- Generic REST discovery, partitioned typed OData, byte-passthrough loads + BigQuery/serve upgrades ([#650](https://github.com/faucet-hq/faucet-stream/pull/650))
+
 ## [1.6.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-rest-v1.5.0...faucet-source-rest-v1.6.0) - 2026-08-24
 
 ### Features

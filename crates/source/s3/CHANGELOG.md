@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-s3-v1.8.1...faucet-source-s3-v1.8.2) - 2026-09-19
+
+### Bug Fixes
+
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Testing
+
+- Pull MinIO from quay.io — the Docker Hub repository was withdrawn ([#653](https://github.com/faucet-hq/faucet-stream/pull/653))
+
 ## [1.8.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-s3-v1.8.0...faucet-source-s3-v1.8.1) - 2026-08-23
 
 ### Miscellaneous
