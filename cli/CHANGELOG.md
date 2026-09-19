@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.13.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.12.0...faucet-cli-v1.13.0) - 2026-09-19
+
+### Bug Fixes
+
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+- *(serve)* Bound the unlimited preview path; refuse external outputs ([#643](https://github.com/faucet-hq/faucet-stream/pull/643))
+- *(serve-ui)* Wider schemas page, no timestamp wrap, single-dash tz label ([#607](https://github.com/faucet-hq/faucet-stream/pull/607))
+- *(serve-ui)* Repair templates UI — actions row, search, sortable header ([#598](https://github.com/faucet-hq/faucet-stream/pull/598))
+
+### Documentation
+
+- Add the canonical verb registry and finish the coverage-policy change ([#655](https://github.com/faucet-hq/faucet-stream/pull/655))
+
+### Features
+
+- Generic REST discovery, partitioned typed OData, byte-passthrough loads + BigQuery/serve upgrades ([#650](https://github.com/faucet-hq/faucet-stream/pull/650))
+- *(serve,serve-ui)* Source-backed dataset preview for local sink outputs ([#642](https://github.com/faucet-hq/faucet-stream/pull/642))
+- *(serve)* Retention GC for local sink outputs + Datasets-page cleanup controls ([#596](https://github.com/faucet-hq/faucet-stream/pull/596))
+- *(serve-ui)* Timezone selector, templates sort/filter, inline-markdown descriptions + polish ([#603](https://github.com/faucet-hq/faucet-stream/pull/603))
+- *(serve-ui)* Themed date picker, dropdown chevrons, and schema/template polish ([#601](https://github.com/faucet-hq/faucet-stream/pull/601))
+
+### Testing
+
+- Cover the three pure decisions that were only reachable through I/O ([#659](https://github.com/faucet-hq/faucet-stream/pull/659))
+
 ## [1.12.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.11.0...faucet-cli-v1.12.0) - 2026-08-24
 
 ### Features

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-jsonl-v1.3.6...faucet-sink-jsonl-v1.4.0) - 2026-09-19
+
+### Features
+
+- *(serve)* Retention GC for local sink outputs + Datasets-page cleanup controls ([#596](https://github.com/faucet-hq/faucet-stream/pull/596))
+
+### Testing
+
+- Engine-level reliability program — guarantee suites, fidelity corpus, state-format gates ([#660](https://github.com/faucet-hq/faucet-stream/pull/660))
+
 ## [1.3.6](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-jsonl-v1.3.5...faucet-sink-jsonl-v1.3.6) - 2026-08-23
 
 ### Miscellaneous

@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.4](https://github.com/faucet-hq/faucet-stream/compare/faucet-conformance-v1.3.3...faucet-conformance-v1.3.4) - 2026-09-19
+
+### Bug Fixes
+
+- Three reliability bugs — overwrite bookmark ordering, kafka headers, source error typing ([#664](https://github.com/faucet-hq/faucet-stream/pull/664))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Testing
+
+- Engine-level reliability program — guarantee suites, fidelity corpus, state-format gates ([#660](https://github.com/faucet-hq/faucet-stream/pull/660))
+
 ## [1.3.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-conformance-v1.3.2...faucet-conformance-v1.3.3) - 2026-08-23
 
 ### Miscellaneous
