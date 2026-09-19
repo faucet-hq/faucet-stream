@@ -1988,3 +1988,16 @@ If this event is something the user would act on now, send a PushNotification. R
 <event>665=OPEN pending=76 failing=[]</event>
 If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
 </task-notification>
+
+---
+
+<task-notification>
+<task-id>bgic5g8eu</task-id>
+<summary>Monitor event: "PR 665 failures or merge only"</summary>
+<event>FAILING: Test, Coverage</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+now
