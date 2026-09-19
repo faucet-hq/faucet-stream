@@ -43,7 +43,7 @@ arrow = ["faucet-core/arrow", "dep:arrow", "dep:parquet", "dep:bytes"]
 
 [dev-dependencies]
 faucet-conformance.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
 serde_json.workspace = true
 schemars.workspace = true
 futures = { workspace = true }

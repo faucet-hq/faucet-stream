@@ -12,9 +12,12 @@ use faucet_core::{DEFAULT_BATCH_SIZE, Source};
 use faucet_source_s3::{S3FileFormat, S3Source, S3SourceConfig};
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::minio::MinIO;
+use tokio::net::TcpListener;
 
 /// MinIO's Docker Hub repository was withdrawn (September 2026): pulling
 /// `minio/minio` fails with "repository does not exist / access denied". The
@@ -467,55 +470,109 @@ fn one_record_objects(n: i64) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A TCP proxy that records the high-water mark of *simultaneously open*
+/// connections passing through it.
+///
+/// Overlap was originally asserted by wall clock — concurrent must beat
+/// serial by 2x — and that was the wrong instrument: on a CI runner the
+/// per-request latency this fix hides is small next to the fixed decode cost,
+/// so a genuinely-overlapping read only reached ~1.6x and the test failed on
+/// working code. How *fast* the overlap makes a run is a property of the
+/// machine; *that* the reads overlap is a property of the source, and this
+/// measures exactly that: HTTP/1.1 cannot multiplex, so N requests in flight
+/// need N sockets.
+struct CountingProxy {
+    /// `http://127.0.0.1:<port>` to point the source at.
+    endpoint: String,
+    peak: Arc<AtomicUsize>,
+}
+
+impl CountingProxy {
+    async fn start(upstream: &str) -> Self {
+        let target = upstream.trim_start_matches("http://").to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let port = listener.local_addr().expect("proxy addr").port();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+
+        let (peak_task, live_task) = (peak.clone(), live.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                let now = live_task.fetch_add(1, Ordering::SeqCst) + 1;
+                peak_task.fetch_max(now, Ordering::SeqCst);
+                let (live_conn, target) = (live_task.clone(), target.clone());
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                    live_conn.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        Self {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            peak,
+        }
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_pages_overlaps_object_reads() {
-    // The regression this file exists to catch. 40 objects is enough that 40
-    // serialized round-trips are clearly separable from a 10-way overlap even
-    // on a loaded machine — per-object latency, not bandwidth, dominates when
-    // every object holds one line.
+    // The regression this file exists to catch: before #619 the streaming path
+    // read objects strictly one at a time, so `concurrency` was accepted and
+    // ignored. Measured by how many connections are open at once rather than
+    // by elapsed time — see `CountingProxy` for why.
     let (_container, endpoint) = start_minio().await;
-    let objects = one_record_objects(60);
-    seed_bucket(&endpoint, &objects).await;
+    seed_bucket(&endpoint, &one_record_objects(60)).await;
 
+    let serial_proxy = CountingProxy::start(&endpoint).await;
     let serial = build_source(
-        &endpoint,
+        &serial_proxy.endpoint,
         S3SourceConfig::new(TEST_BUCKET)
             .with_batch_size(1000)
             .concurrency(1),
     )
     .await;
+    let serial_records = collect_all(&serial, 1000).await;
+
+    let concurrent_proxy = CountingProxy::start(&endpoint).await;
     let concurrent = build_source(
-        &endpoint,
+        &concurrent_proxy.endpoint,
         S3SourceConfig::new(TEST_BUCKET)
             .with_batch_size(1000)
             .concurrency(15),
     )
     .await;
-
-    // Warm both clients first: an untimed pass pays the SDK's credential
-    // resolution and connection setup, which otherwise lands entirely on
-    // whichever source is timed first and would bias the comparison.
-    let serial_records = collect_all(&serial, 1000).await;
     let concurrent_records = collect_all(&concurrent, 1000).await;
-
-    let started = Instant::now();
-    collect_all(&serial, 1000).await;
-    let serial_elapsed = started.elapsed();
-
-    let started = Instant::now();
-    collect_all(&concurrent, 1000).await;
-    let concurrent_elapsed = started.elapsed();
 
     assert_eq!(serial_records.len(), 60);
     assert_eq!(
         serial_records, concurrent_records,
         "concurrency must not change what the source yields, only how fast"
     );
+
     assert!(
-        concurrent_elapsed * 2 < serial_elapsed,
-        "reading 60 objects with concurrency=15 took {concurrent_elapsed:?} but \
-         concurrency=1 took {serial_elapsed:?} — the reads are not overlapping, \
-         which is exactly the #619 defect: the knob is accepted and ignored"
+        concurrent_proxy.peak() > 1,
+        "reading 60 objects with concurrency=15 never had more than \
+         {} connection open at once — the reads are not overlapping, which is \
+         exactly the #619 defect: the knob is accepted and ignored",
+        concurrent_proxy.peak()
+    );
+    // The serial control. Without it, a proxy that miscounted (or an SDK that
+    // opened spare sockets on its own) would make the assertion above pass on
+    // a serial reader.
+    assert_eq!(
+        serial_proxy.peak(),
+        1,
+        "concurrency = 1 must keep exactly one connection open at a time"
     );
 }
 
