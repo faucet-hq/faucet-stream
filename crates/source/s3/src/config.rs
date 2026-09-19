@@ -26,22 +26,37 @@ pub enum S3FileFormat {
     Parquet,
 }
 
+fn default_concurrency() -> usize {
+    10
+}
+
 /// Configuration for the S3 source connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct S3SourceConfig {
     /// S3 bucket name.
     pub bucket: String,
     /// Object key prefix filter.
+    #[serde(default)]
     pub prefix: Option<String>,
     /// AWS region. `None` uses the SDK default.
+    #[serde(default)]
     pub region: Option<String>,
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO).
+    #[serde(default)]
     pub endpoint_url: Option<String>,
-    /// Format of the files to read.
+    /// Format of the files to read. Defaults to `json_lines`.
+    #[serde(default)]
     pub file_format: S3FileFormat,
     /// Maximum number of objects to read.
+    #[serde(default)]
     pub max_objects: Option<usize>,
     /// Maximum number of concurrent object reads (default: 10).
+    ///
+    /// These `#[serde(default)]`s are the same oversight the REST source
+    /// carried: without them every field here was **required**, so a config
+    /// naming only `bucket` could not deserialize at all (#609). `bucket` is
+    /// the one genuinely required field.
+    #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     /// Records per emitted [`StreamPage`](faucet_core::StreamPage). For
     /// `JsonLines` and `RawText` formats, the object body is decoded
@@ -328,5 +343,20 @@ mod tests {
     fn compression_default_is_auto() {
         let cfg = S3SourceConfig::new("bucket");
         assert_eq!(cfg.compression, faucet_core::CompressionConfig::Auto);
+    }
+
+    /// Only `bucket` is required (#609) — every other field defaults, so a
+    /// hand-written `s3` entry deserializes and `faucet validate` can read it.
+    #[test]
+    fn a_minimal_config_deserializes_and_omitted_fields_take_their_defaults() {
+        let cfg: S3SourceConfig =
+            serde_json::from_value(serde_json::json!({ "bucket": "b" })).expect("bucket suffices");
+        assert_eq!(cfg.bucket, "b");
+        assert!(cfg.prefix.is_none());
+        assert!(cfg.region.is_none());
+        assert!(cfg.endpoint_url.is_none());
+        assert!(cfg.max_objects.is_none());
+        assert_eq!(cfg.concurrency, 10);
+        assert!(matches!(cfg.file_format, S3FileFormat::JsonLines));
     }
 }

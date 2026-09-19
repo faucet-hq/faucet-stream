@@ -12,7 +12,7 @@ pipeline:
       base_url: "https://api.example.com"
       path: /reports/latest
       auth: { type: bearer, config: { token: "${env:AUTH_TOKEN}" } }
-      pagination: { type: none }
+      pagination: { type: None }
       decode:
         - extract: "$.d.reportBytes"   # pull the encoded blob out of the envelope
         - base64

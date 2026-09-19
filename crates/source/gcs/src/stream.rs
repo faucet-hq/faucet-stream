@@ -13,6 +13,35 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use tokio::io::AsyncBufReadExt;
 
+/// One object's payload, fetched in the shape its `file_format` decodes from.
+///
+/// Prefetching these with a bounded look-ahead is what makes `concurrency`
+/// real on the streaming path (#619). The bound it promises differs by format
+/// and that difference is the point: `JsonLines` overlaps only the request
+/// round-trip — `open_object_reader` does not download the body, so the decode
+/// still streams line-by-line at O(batch) memory — while the whole-object
+/// formats hold at most `concurrency` bodies at once.
+enum Fetched {
+    Lines(Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>),
+    RawText(String),
+    JsonArray(String),
+    /// A Parquet object being read row group at a time over byte ranges — the
+    /// memory-bounded path (#619).
+    #[cfg(feature = "arrow")]
+    ParquetStream(
+        Box<
+            parquet::arrow::async_reader::ParquetRecordBatchStream<
+                crate::parquet_range::GcsRangeReader,
+            >,
+        >,
+    ),
+    /// A Parquet object buffered whole, for the configurations a ranged read
+    /// cannot serve: a compressed object is not randomly addressable, and a
+    /// whole-object checksum can only be verified by reading the whole object.
+    #[cfg(feature = "arrow")]
+    Parquet(bytes::Bytes),
+}
+
 /// A GCS source that lists and reads objects from a bucket.
 pub struct GcsSource {
     config: GcsSourceConfig,
@@ -93,6 +122,119 @@ impl GcsSource {
         // total object set (matching single-worker semantics) rather than
         // multiplying by the shard count.
         Ok(self.shard_filter(names))
+    }
+
+    /// Fetch one object in the shape its configured `file_format` needs.
+    async fn fetch(&self, key: &str) -> Result<Fetched, FaucetError> {
+        Ok(match self.config.file_format {
+            GcsFileFormat::JsonLines => Fetched::Lines(self.open_object_reader(key).await?),
+            GcsFileFormat::RawText => Fetched::RawText(self.read_object_text(key).await?),
+            GcsFileFormat::JsonArray => Fetched::JsonArray(self.read_object_text(key).await?),
+            #[cfg(feature = "arrow")]
+            GcsFileFormat::Parquet => match self.parquet_row_group_stream(key).await? {
+                Some(stream) => Fetched::ParquetStream(Box::new(stream)),
+                None => Fetched::Parquet(self.read_object_bytes(key).await?),
+            },
+        })
+    }
+
+    /// Whether this object can be read row group at a time, and a reader for it
+    /// if so (#619).
+    ///
+    /// Two configurations rule it out, and both are guarantees worth more than
+    /// the memory saving:
+    ///
+    /// - `verify_checksum` — GCS's CRC32C/MD5 covers the whole object, so
+    ///   honouring it means reading the object as one stream;
+    /// - `compression` — a gzip / zstd member is not randomly addressable, so
+    ///   the Parquet footer cannot be located without inflating everything.
+    ///
+    /// In either case the whole-object path still runs, unchanged.
+    /// `verify_length` needs no exception: it guards a truncated *transfer*,
+    /// and the ranged reader enforces exactly that per fetch.
+    #[cfg(feature = "arrow")]
+    async fn parquet_row_group_stream(
+        &self,
+        key: &str,
+    ) -> Result<
+        Option<
+            parquet::arrow::async_reader::ParquetRecordBatchStream<
+                crate::parquet_range::GcsRangeReader,
+            >,
+        >,
+        FaucetError,
+    > {
+        use parquet::arrow::ParquetRecordBatchStreamBuilder;
+
+        if self.config.verify_checksum {
+            return Ok(None);
+        }
+        #[cfg(feature = "compression")]
+        if self.config.compression.resolve(key) != faucet_core::compression::Compression::None {
+            return Ok(None);
+        }
+
+        // The footer's position is only knowable from the object's size, which
+        // the control plane reports without transferring any data.
+        let meta = self
+            .control
+            .get_object()
+            .set_bucket(self.bucket_path())
+            .set_object(key.to_string())
+            .send()
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("GCS get object metadata for '{key}' failed: {e}"))
+            })?;
+        let len = u64::try_from(meta.size).map_err(|_| {
+            FaucetError::Source(format!(
+                "GCS object '{key}' reports a negative size ({})",
+                meta.size
+            ))
+        })?;
+
+        let reader = crate::parquet_range::GcsRangeReader::open(
+            &self.storage,
+            &self.bucket_path(),
+            key,
+            len,
+        )
+        .await?;
+        let object_len = reader.len();
+        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("failed to read parquet metadata for '{key}': {e}"))
+            })?;
+        // Cap the Arrow batch size to the page size so a single huge row group
+        // is still decoded in bounded steps — the row-group bound alone is not
+        // enough when one row group holds millions of rows.
+        if self.config.batch_size > 0 {
+            builder = builder.with_batch_size(self.config.batch_size);
+        }
+        let stream = builder.build().map_err(|e| {
+            FaucetError::Source(format!("failed to build parquet reader for '{key}': {e}"))
+        })?;
+        tracing::debug!(
+            key = %key,
+            object_bytes = object_len,
+            "streaming parquet object by row group"
+        );
+        Ok(Some(stream))
+    }
+
+    /// Decode already-fetched Parquet bytes on a blocking thread.
+    #[cfg(feature = "arrow")]
+    async fn decode_parquet(
+        data: bytes::Bytes,
+        key: &str,
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
+        let key_owned = key.to_string();
+        tokio::task::spawn_blocking(move || decode_parquet_bytes(data, &key_owned))
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("parquet decode task for '{key}' panicked: {e}"))
+            })?
     }
 
     /// Read the full body of a single GCS object into a UTF-8 `String`.
@@ -220,13 +362,7 @@ impl GcsSource {
         &self,
         key: &str,
     ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
-        let data = self.read_object_bytes(key).await?;
-        let key_owned = key.to_string();
-        tokio::task::spawn_blocking(move || decode_parquet_bytes(data, &key_owned))
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!("parquet decode task for '{key}' panicked: {e}"))
-            })?
+        Self::decode_parquet(self.read_object_bytes(key).await?, key).await
     }
 }
 
@@ -283,6 +419,29 @@ pub(crate) fn parse_file_content(
             "GCS parquet object '{key}' cannot be parsed as text (internal error: \
              parquet must use the binary decode path)"
         ))),
+    }
+}
+
+/// Hold every object in a columnar scan to the first object's schema.
+///
+/// A divergent *later* object aborts after earlier objects' pages have already
+/// been written — the same non-atomic multi-object semantics the row path has.
+#[cfg(feature = "arrow")]
+fn check_schema(
+    reference: &mut Option<arrow::datatypes::SchemaRef>,
+    schema: &arrow::datatypes::SchemaRef,
+    key: &str,
+) -> Result<(), FaucetError> {
+    match reference {
+        Some(first) if first != schema => Err(FaucetError::Source(format!(
+            "GCS source: parquet schema mismatch — object '{key}' diverges from the first \
+             object's schema"
+        ))),
+        None => {
+            *reference = Some(schema.clone());
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -401,10 +560,24 @@ impl faucet_core::Source for GcsSource {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            for key in &keys {
-                match self.config.file_format {
-                    GcsFileFormat::JsonLines => {
-                        let reader = self.open_object_reader(key).await?;
+            // Overlap the object reads (#619). `buffered` keeps listing order,
+            // so an object that fails surfaces at exactly the point it would
+            // have serially — concurrency changes throughput, not semantics.
+            // The key is moved into each future rather than borrowed: a closure
+            // returning a borrow-capturing async block is not higher-ranked
+            // enough for `buffered`.
+            let concurrency = self.config.concurrency.max(1);
+            let mut fetched = stream::iter(keys.iter().cloned())
+                .map(|key| async move {
+                    let payload = self.fetch(&key).await;
+                    (key, payload)
+                })
+                .buffered(concurrency);
+
+            while let Some((key, payload)) = fetched.next().await {
+                let key = &key;
+                match payload? {
+                    Fetched::Lines(reader) => {
                         let mut lines = reader.lines();
                         let mut line_num: usize = 0;
                         while let Some(line) = lines
@@ -438,8 +611,7 @@ impl faucet_core::Source for GcsSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    GcsFileFormat::RawText => {
-                        let text = self.read_object_text(key).await?;
+                    Fetched::RawText(text) => {
                         let record = serde_json::json!({ "key": key, "content": text });
                         buffer.push(record);
                         if batch_size == 0 {
@@ -456,13 +628,41 @@ impl faucet_core::Source for GcsSource {
                         }
                     }
                     #[cfg(feature = "arrow")]
-                    GcsFileFormat::Parquet => {
+                    Fetched::ParquetStream(mut batches) => {
+                        // Row groups arrive one at a time, so peak memory is
+                        // one batch rather than the whole object (#619).
+                        while let Some(batch) = batches.next().await {
+                            let batch = batch.map_err(|e| {
+                                FaucetError::Source(format!(
+                                    "parquet decode error in '{key}': {e}"
+                                ))
+                            })?;
+                            for record in faucet_core::columnar::record_batch_to_values(&batch)? {
+                                buffer.push(record);
+                                if batch_size != 0 && buffer.len() >= chunk {
+                                    let page = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(initial_capacity),
+                                    );
+                                    total += page.len();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                        }
+                        if batch_size == 0 && !buffer.is_empty() {
+                            let page = std::mem::take(&mut buffer);
+                            total += page.len();
+                            yield StreamPage { records: page, bookmark: None };
+                        }
+                    }
+                    #[cfg(feature = "arrow")]
+                    Fetched::Parquet(data) => {
                         // Parquet objects are buffered and decoded to Arrow
                         // `RecordBatch`es, then converted to JSON rows for the
                         // row path. Rows accumulate across objects and chunk at
                         // `batch_size`; `batch_size == 0` emits one page per
                         // object.
-                        let (_schema, batches) = self.read_object_parquet(key).await?;
+                        let (_schema, batches) = Self::decode_parquet(data, key).await?;
                         for batch in &batches {
                             let rows = faucet_core::columnar::record_batch_to_values(batch)?;
                             for record in rows {
@@ -483,8 +683,7 @@ impl faucet_core::Source for GcsSource {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    GcsFileFormat::JsonArray => {
-                        let text = self.read_object_text(key).await?;
+                    Fetched::JsonArray(text) => {
                         let value: Value = serde_json::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("GCS JSON parse error in '{key}': {e}"))
                         })?;
@@ -587,19 +786,50 @@ impl faucet_core::Source for GcsSource {
             let mut reference: Option<arrow::datatypes::SchemaRef> = None;
             let mut total_records = 0usize;
             let mut total_pages = 0usize;
-            for key in &keys {
-                let (schema, batches) = self.read_object_parquet(key).await?;
-                match &reference {
-                    Some(first) if first != &schema => {
-                        Err(FaucetError::Source(format!(
-                            "GCS source: parquet schema mismatch — object '{key}' diverges from \
-                             the first object's schema"
-                        )))?;
+            // Prefetch readers, not bodies: opening one costs a metadata lookup
+            // plus a footer read, so `concurrency` overlaps those round trips
+            // while the row groups of the object in hand are still decoding
+            // (#619).
+            let concurrency = self.config.concurrency.max(1);
+            let mut fetched = stream::iter(keys.iter().cloned())
+                .map(|key| async move {
+                    let opened = self.fetch(&key).await;
+                    (key, opened)
+                })
+                .buffered(concurrency);
+
+            while let Some((key, opened)) = fetched.next().await {
+                let key = &key;
+                let mut pending: Vec<arrow::array::RecordBatch> = Vec::new();
+                let mut streaming = None;
+                match opened? {
+                    Fetched::ParquetStream(s) => streaming = Some(s),
+                    Fetched::Parquet(data) => {
+                        let (schema, batches) = Self::decode_parquet(data, key).await?;
+                        check_schema(&mut reference, &schema, key)?;
+                        pending = batches;
                     }
-                    None => reference = Some(schema),
-                    _ => {}
+                    _ => Err(FaucetError::Source(format!(
+                        "GCS source: stream_batches reached a non-parquet payload for '{key}'"
+                    )))?,
                 }
-                for batch in batches {
+
+                if let Some(mut batches) = streaming {
+                    check_schema(&mut reference, &batches.schema().clone(), key)?;
+                    while let Some(batch) = batches.next().await {
+                        let batch = batch.map_err(|e| {
+                            FaucetError::Source(format!("parquet decode error in '{key}': {e}"))
+                        })?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        total_records += batch.num_rows();
+                        total_pages += 1;
+                        yield faucet_core::columnar::ColumnarPage { batch, bookmark: None };
+                    }
+                }
+
+                for batch in pending {
                     if batch.num_rows() == 0 {
                         continue;
                     }

@@ -21,7 +21,7 @@ pipeline:
       method: GET
       records_path: "products"
       pagination:
-        type: offset
+        type: Offset
         limit_param: limit
         offset_param: skip
         limit: 30

@@ -12,9 +12,12 @@ use faucet_core::{DEFAULT_BATCH_SIZE, Source};
 use faucet_source_s3::{S3FileFormat, S3Source, S3SourceConfig};
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::minio::MinIO;
+use tokio::net::TcpListener;
 
 /// MinIO's Docker Hub repository was withdrawn (September 2026): pulling
 /// `minio/minio` fails with "repository does not exist / access denied". The
@@ -435,4 +438,267 @@ async fn discover_falls_back_to_objects_under_leaf_prefix() {
         assert_eq!(d.kind, "object");
         assert_eq!(d.config_patch["prefix"], d.name.as_str());
     }
+}
+
+// ---------------------------------------------------------------------------
+// #619 — `concurrency` on the streaming path.
+//
+// Before this, `buffer_unordered(concurrency)` appeared only in the eager
+// `fetch_with_context` batch path; `stream_pages` — what every real run
+// drives — read objects strictly one at a time, so the knob was documented
+// but inert. These tests pin both halves of the fix: that the reads actually
+// overlap, and that overlapping them changed nothing an operator can observe
+// (order, contents, and which object an error is blamed on).
+// ---------------------------------------------------------------------------
+
+/// Collect every record a source streams, flattened in page order.
+async fn collect_all(source: &S3Source, batch_size: usize) -> Vec<serde_json::Value> {
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, batch_size);
+    let mut out = Vec::new();
+    while let Some(page) = pages.next().await {
+        out.extend(page.expect("page ok").records);
+    }
+    out
+}
+
+/// `n` single-record objects, one record per object, ids ascending with the
+/// (zero-padded, so lexicographic = numeric) listing order.
+fn one_record_objects(n: i64) -> Vec<(String, String)> {
+    (1..=n)
+        .map(|i| (format!("part-{i:04}.jsonl"), format!("{{\"id\":{i}}}\n")))
+        .collect()
+}
+
+/// A TCP proxy that records the high-water mark of *simultaneously open*
+/// connections passing through it.
+///
+/// Overlap was originally asserted by wall clock — concurrent must beat
+/// serial by 2x — and that was the wrong instrument: on a CI runner the
+/// per-request latency this fix hides is small next to the fixed decode cost,
+/// so a genuinely-overlapping read only reached ~1.6x and the test failed on
+/// working code. How *fast* the overlap makes a run is a property of the
+/// machine; *that* the reads overlap is a property of the source, and this
+/// measures exactly that: HTTP/1.1 cannot multiplex, so N requests in flight
+/// need N sockets.
+struct CountingProxy {
+    /// `http://127.0.0.1:<port>` to point the source at.
+    endpoint: String,
+    peak: Arc<AtomicUsize>,
+}
+
+impl CountingProxy {
+    async fn start(upstream: &str) -> Self {
+        let target = upstream.trim_start_matches("http://").to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let port = listener.local_addr().expect("proxy addr").port();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+
+        let (peak_task, live_task) = (peak.clone(), live.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                let now = live_task.fetch_add(1, Ordering::SeqCst) + 1;
+                peak_task.fetch_max(now, Ordering::SeqCst);
+                let (live_conn, target) = (live_task.clone(), target.clone());
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                    live_conn.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        Self {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            peak,
+        }
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_overlaps_object_reads() {
+    // The regression this file exists to catch: before #619 the streaming path
+    // read objects strictly one at a time, so `concurrency` was accepted and
+    // ignored. Measured by how many connections are open at once rather than
+    // by elapsed time — see `CountingProxy` for why.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(&endpoint, &one_record_objects(60)).await;
+
+    let serial_proxy = CountingProxy::start(&endpoint).await;
+    let serial = build_source(
+        &serial_proxy.endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(1),
+    )
+    .await;
+    let serial_records = collect_all(&serial, 1000).await;
+
+    let concurrent_proxy = CountingProxy::start(&endpoint).await;
+    let concurrent = build_source(
+        &concurrent_proxy.endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(15),
+    )
+    .await;
+    let concurrent_records = collect_all(&concurrent, 1000).await;
+
+    assert_eq!(serial_records.len(), 60);
+    assert_eq!(
+        serial_records, concurrent_records,
+        "concurrency must not change what the source yields, only how fast"
+    );
+
+    assert!(
+        concurrent_proxy.peak() > 1,
+        "reading 60 objects with concurrency=15 never had more than \
+         {} connection open at once — the reads are not overlapping, which is \
+         exactly the #619 defect: the knob is accepted and ignored",
+        concurrent_proxy.peak()
+    );
+    // The serial control. Without it, a proxy that miscounted (or an SDK that
+    // opened spare sockets on its own) would make the assertion above pass on
+    // a serial reader.
+    assert_eq!(
+        serial_proxy.peak(),
+        1,
+        "concurrency = 1 must keep exactly one connection open at a time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_preserves_listing_order_under_concurrency() {
+    // `buffered` (ordered) rather than `buffer_unordered` is a deliberate
+    // choice: pages must arrive in listing order so a downstream sink writes
+    // the same file sequence it would have serially.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(&endpoint, &one_record_objects(20)).await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(8),
+    )
+    .await;
+
+    let ids: Vec<i64> = collect_all(&source, 1000)
+        .await
+        .iter()
+        .map(|r| r["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=20).collect::<Vec<i64>>(),
+        "records must stay in listing order; an unordered prefetch would \
+         interleave objects by completion time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_concurrency_zero_reads_serially_rather_than_stalling() {
+    // A `buffered(0)` stream yields nothing forever, so a config of `0` has to
+    // be clamped. Asserting it here keeps the clamp from being refactored away
+    // into a silent hang.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(&endpoint, &one_record_objects(5)).await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(0),
+    )
+    .await;
+
+    let records = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        collect_all(&source, 1000),
+    )
+    .await
+    .expect("concurrency = 0 must read serially, not hang");
+    assert_eq!(records.len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_blames_the_failing_object_even_when_prefetched() {
+    // With a look-ahead, several objects are in flight when one fails. The
+    // error must still name the offending key — otherwise concurrency makes
+    // diagnostics worse than the serial path it replaced.
+    let (_container, endpoint) = start_minio().await;
+    seed_bucket(
+        &endpoint,
+        &[
+            ("a-ok.jsonl".to_string(), jsonl_body(1, 3)),
+            ("b-bad.jsonl".to_string(), "not json at all\n".to_string()),
+            ("c-ok.jsonl".to_string(), jsonl_body(4, 6)),
+        ],
+    )
+    .await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .with_batch_size(1000)
+            .concurrency(8),
+    )
+    .await;
+
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let mut err = None;
+    while let Some(page) = pages.next().await {
+        if let Err(e) = page {
+            err = Some(e);
+            break;
+        }
+    }
+    let err = err.expect("the malformed object must fail the stream");
+    assert!(
+        err.to_string().contains("b-bad.jsonl"),
+        "the failure must name the object it came from: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_pages_json_array_objects_read_concurrently_and_stay_ordered() {
+    // The whole-object format: unlike JSONL, `concurrency` bodies really are
+    // resident at once here, which is the memory bound the knob advertises.
+    let (_container, endpoint) = start_minio().await;
+    let objects: Vec<(String, String)> = (0..12)
+        .map(|i| {
+            let base = i * 10;
+            let body: Vec<String> = (1..=10)
+                .map(|j| format!("{{\"id\":{}}}", base + j))
+                .collect();
+            (format!("arr-{i:04}.json"), format!("[{}]", body.join(",")))
+        })
+        .collect();
+    seed_bucket(&endpoint, &objects).await;
+
+    let source = build_source(
+        &endpoint,
+        S3SourceConfig::new(TEST_BUCKET)
+            .file_format(S3FileFormat::JsonArray)
+            .with_batch_size(DEFAULT_BATCH_SIZE)
+            .concurrency(6),
+    )
+    .await;
+
+    let ids: Vec<i64> = collect_all(&source, DEFAULT_BATCH_SIZE)
+        .await
+        .iter()
+        .map(|r| r["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(ids, (1..=120).collect::<Vec<i64>>());
 }

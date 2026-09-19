@@ -1024,6 +1024,402 @@ pub fn sink_supported_write_modes(kind: &str) -> &'static [faucet_core::WriteMod
 }
 
 /// Return the JSON Schema for the named source's config struct.
+/// Deserialize a connector config and discard it — the point is the error.
+fn check<T: DeserializeOwned>(kind: &'static str, name: &str, config: Value) -> CliResult<()> {
+    decode::<T>(kind, name, config).map(|_| ())
+}
+
+/// Deserialize, then let the config check its own invariants.
+///
+/// Separate from [`check`] because `validate()` is an **inherent** method on
+/// each config type, not a trait one, so it cannot be reached generically — the
+/// caller passes it as a closure. Generic over the error so the few configs
+/// returning `Result<(), String>` work alongside the majority returning
+/// `Result<(), FaucetError>`.
+///
+/// This distinction is load-bearing rather than cosmetic. Deserialization alone
+/// does **not** catch the case that motivated #609: `MssqlConnectionConfig` is
+/// `#[serde(flatten)]`, so nesting it under a `connection:` key deserializes
+/// cleanly into a config carrying no connection string at all — only
+/// `validate()` notices. Most connector configs also do not set
+/// `deny_unknown_fields`, so a typo'd field name is invisible to serde too
+/// (tracked as the config-strictness debt in #654).
+fn check_with<T, E, F>(kind: &'static str, name: &str, config: Value, validate: F) -> CliResult<()>
+where
+    T: DeserializeOwned,
+    E: std::fmt::Display,
+    F: Fn(&T) -> Result<(), E>,
+{
+    let cfg = decode::<T>(kind, name, config)?;
+    validate(&cfg).map_err(|e| CliError::InvalidConnectorConfig {
+        kind,
+        name: name.to_owned(),
+        message: e.to_string(),
+    })
+}
+
+/// Validate a source's `config` **without building it**: deserialize the raw
+/// `Value` into the connector's typed config and discard the result.
+///
+/// This exists because a structurally wrong `config` used to survive
+/// `faucet validate` and `faucet template register` and only fail on the first
+/// triggered run (#609) — the config stayed an opaque `Value` until
+/// [`build_source`] ran at execution time. A template could be registered,
+/// launched, and only then discovered to be broken.
+///
+/// Deserialization alone catches the whole reported class: wrong nesting under
+/// a `#[serde(flatten)]` block, an unknown field under `deny_unknown_fields`, a
+/// wrong scalar type, a missing required field, a typo'd name. It needs no
+/// credentials, opens no connections and builds no pools, so it is safe to run
+/// at register/validate time — live reachability stays `faucet doctor`'s job.
+///
+/// A kind whose connector is **not compiled into this build** cannot be
+/// checked. That returns [`CliError::Config`] naming the feature rather than
+/// passing silently, so a slim build never reports a config valid that it
+/// simply could not read.
+pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResult<()> {
+    // A plugin-registered connector is validated by building it — the factory
+    // is the only thing that knows its config shape.
+    if let Some(entry) = global().sources.get(kind) {
+        return (entry.factory)(config).map(|_| ());
+    }
+    match kind {
+        #[cfg(feature = "source-rest")]
+        "rest" => {
+            check_with::<faucet_source_rest::RestStreamConfig, _, _>("rest", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "source-graphql")]
+        "graphql" => check_with::<faucet_source_graphql::GraphqlStreamConfig, _, _>(
+            "graphql",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-xml")]
+        "xml" => check_with::<faucet_source_xml::XmlStreamConfig, _, _>("xml", name, config, |c| {
+            c.validate()
+        }),
+        #[cfg(feature = "source-grpc")]
+        "grpc" => check::<faucet_source_grpc::GrpcStreamConfig>("grpc", name, config),
+        #[cfg(feature = "source-postgres")]
+        "postgres" => {
+            check::<faucet_source_postgres::PostgresSourceConfig>("postgres", name, config)
+        }
+        #[cfg(feature = "source-postgres-cdc")]
+        "postgres-cdc" => check_with::<faucet_source_postgres_cdc::PostgresCdcSourceConfig, _, _>(
+            "postgres-cdc",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-mysql")]
+        "mysql" => check::<faucet_source_mysql::MysqlSourceConfig>("mysql", name, config),
+        #[cfg(feature = "source-mssql")]
+        "mssql" => {
+            check_with::<faucet_source_mssql::MssqlSourceConfig, _, _>("mssql", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "source-sqlite")]
+        "sqlite" => check::<faucet_source_sqlite::SqliteSourceConfig>("sqlite", name, config),
+        #[cfg(feature = "source-duckdb")]
+        "duckdb" => check_with::<faucet_source_duckdb::DuckdbSourceConfig, _, _>(
+            "duckdb",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-sqs")]
+        "sqs" => check_with::<faucet_source_sqs::SqsSourceConfig, _, _>("sqs", name, config, |c| {
+            c.validate()
+        }),
+        #[cfg(feature = "source-nats")]
+        "nats" => {
+            check_with::<faucet_source_nats::NatsSourceConfig, _, _>("nats", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "source-sftp")]
+        "sftp" => check::<faucet_source_sftp::SftpSourceConfig>("sftp", name, config),
+        #[cfg(feature = "source-s3")]
+        "s3" => check::<faucet_source_s3::S3SourceConfig>("s3", name, config),
+        #[cfg(feature = "source-mongodb")]
+        "mongodb" => check::<faucet_source_mongodb::MongoSourceConfig>("mongodb", name, config),
+        #[cfg(feature = "source-mongodb-cdc")]
+        "mongodb-cdc" => check_with::<faucet_source_mongodb_cdc::MongoCdcSourceConfig, _, _>(
+            "mongodb-cdc",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-mysql-cdc")]
+        "mysql-cdc" => check_with::<faucet_source_mysql_cdc::MysqlCdcSourceConfig, _, _>(
+            "mysql-cdc",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-redis")]
+        "redis" => check::<faucet_source_redis::RedisSourceConfig>("redis", name, config),
+        #[cfg(feature = "source-webhook")]
+        "webhook" => check::<faucet_source_webhook::WebhookSourceConfig>("webhook", name, config),
+        #[cfg(feature = "source-websocket")]
+        "websocket" => check_with::<faucet_source_websocket::WebsocketSourceConfig, _, _>(
+            "websocket",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-csv")]
+        "csv" => check_with::<faucet_source_csv::CsvSourceConfig, _, _>("csv", name, config, |c| {
+            c.validate()
+        }),
+        #[cfg(feature = "source-singer")]
+        "singer" => check::<faucet_source_singer::SingerSourceConfig>("singer", name, config),
+        #[cfg(feature = "source-elasticsearch")]
+        "elasticsearch" => check::<faucet_source_elasticsearch::ElasticsearchSourceConfig>(
+            "elasticsearch",
+            name,
+            config,
+        ),
+        #[cfg(feature = "source-kafka")]
+        "kafka" => {
+            check_with::<faucet_source_kafka::KafkaSourceConfig, _, _>("kafka", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "source-kinesis")]
+        "kinesis" => check_with::<faucet_source_kinesis::KinesisSourceConfig, _, _>(
+            "kinesis",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-spanner")]
+        "spanner" => check_with::<faucet_source_spanner::SpannerSourceConfig, _, _>(
+            "spanner",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-parquet")]
+        "parquet" => check::<faucet_source_parquet::ParquetSourceConfig>("parquet", name, config),
+        #[cfg(feature = "source-delta")]
+        "delta" => {
+            check_with::<faucet_source_delta::DeltaSourceConfig, _, _>("delta", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "source-databricks")]
+        "databricks" => check_with::<faucet_source_databricks::DatabricksSourceConfig, _, _>(
+            "databricks",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-gcs")]
+        "gcs" => check_with::<faucet_source_gcs::GcsSourceConfig, _, _>("gcs", name, config, |c| {
+            c.validate()
+        }),
+        #[cfg(feature = "source-bigquery")]
+        "bigquery" => {
+            check::<faucet_source_bigquery::BigQuerySourceConfig>("bigquery", name, config)
+        }
+        #[cfg(feature = "source-snowflake")]
+        "snowflake" => {
+            check::<faucet_source_snowflake::SnowflakeSourceConfig>("snowflake", name, config)
+        }
+        #[cfg(feature = "source-mssql-cdc")]
+        "mssql-cdc" => check_with::<faucet_source_mssql_cdc::MssqlCdcSourceConfig, _, _>(
+            "mssql-cdc",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-redshift")]
+        "redshift" => check_with::<faucet_source_redshift::RedshiftSourceConfig, _, _>(
+            "redshift",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-pubsub")]
+        "pubsub" => check_with::<faucet_source_pubsub::PubsubSourceConfig, _, _>(
+            "pubsub",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-clickhouse")]
+        "clickhouse" => check_with::<faucet_source_clickhouse::ClickHouseSourceConfig, _, _>(
+            "clickhouse",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-azure-blob")]
+        "azure-blob" => check_with::<faucet_source_azure_blob::AzureBlobSourceConfig, _, _>(
+            "azure-blob",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        other => Err(unknown(other, "source", source_kinds())),
+    }
+}
+
+/// Validate a sink's `config` **without building it**: deserialize the raw
+/// `Value` into the connector's typed config and discard the result.
+///
+/// This exists because a structurally wrong `config` used to survive
+/// `faucet validate` and `faucet template register` and only fail on the first
+/// triggered run (#609) — the config stayed an opaque `Value` until
+/// [`build_sink`] ran at execution time. A template could be registered,
+/// launched, and only then discovered to be broken.
+///
+/// Deserialization alone catches the whole reported class: wrong nesting under
+/// a `#[serde(flatten)]` block, an unknown field under `deny_unknown_fields`, a
+/// wrong scalar type, a missing required field, a typo'd name. It needs no
+/// credentials, opens no connections and builds no pools, so it is safe to run
+/// at register/validate time — live reachability stays `faucet doctor`'s job.
+///
+/// A kind whose connector is **not compiled into this build** cannot be
+/// checked. That returns [`CliError::Config`] naming the feature rather than
+/// passing silently, so a slim build never reports a config valid that it
+/// simply could not read.
+pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<()> {
+    // A plugin-registered connector is validated by building it — the factory
+    // is the only thing that knows its config shape.
+    if let Some(entry) = global().sinks.get(kind) {
+        return (entry.factory)(config).map(|_| ());
+    }
+    match kind {
+        #[cfg(feature = "sink-bigquery")]
+        "bigquery" => check::<faucet_sink_bigquery::BigQuerySinkConfig>("bigquery", name, config),
+        #[cfg(feature = "sink-iceberg")]
+        "iceberg" => check_with::<faucet_sink_iceberg::IcebergSinkConfig, _, _>(
+            "iceberg",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-delta")]
+        "delta" => {
+            check_with::<faucet_sink_delta::DeltaSinkConfig, _, _>("delta", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "sink-postgres")]
+        "postgres" => check::<faucet_sink_postgres::PostgresSinkConfig>("postgres", name, config),
+        #[cfg(feature = "sink-jsonl")]
+        "jsonl" => check::<faucet_sink_jsonl::JsonlSinkConfig>("jsonl", name, config),
+        #[cfg(feature = "sink-snowflake")]
+        "snowflake" => {
+            check::<faucet_sink_snowflake::SnowflakeSinkConfig>("snowflake", name, config)
+        }
+        #[cfg(feature = "sink-mysql")]
+        "mysql" => check::<faucet_sink_mysql::MysqlSinkConfig>("mysql", name, config),
+        #[cfg(feature = "sink-mssql")]
+        "mssql" => {
+            check_with::<faucet_sink_mssql::MssqlSinkConfig, _, _>("mssql", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "sink-sqlite")]
+        "sqlite" => check::<faucet_sink_sqlite::SqliteSinkConfig>("sqlite", name, config),
+        #[cfg(feature = "sink-duckdb")]
+        "duckdb" => check::<faucet_sink_duckdb::DuckdbSinkConfig>("duckdb", name, config),
+        #[cfg(feature = "sink-sqs")]
+        "sqs" => check_with::<faucet_sink_sqs::SqsSinkConfig, _, _>("sqs", name, config, |c| {
+            c.validate()
+        }),
+        #[cfg(feature = "sink-nats")]
+        "nats" => check_with::<faucet_sink_nats::NatsSinkConfig, _, _>("nats", name, config, |c| {
+            c.validate()
+        }),
+        #[cfg(feature = "sink-sftp")]
+        "sftp" => check::<faucet_sink_sftp::SftpSinkConfig>("sftp", name, config),
+        #[cfg(feature = "sink-s3")]
+        "s3" => {
+            check_with::<faucet_sink_s3::S3SinkConfig, _, _>("s3", name, config, |c| c.validate())
+        }
+        #[cfg(feature = "sink-mongodb")]
+        "mongodb" => check::<faucet_sink_mongodb::MongoSinkConfig>("mongodb", name, config),
+        #[cfg(feature = "sink-redis")]
+        "redis" => check::<faucet_sink_redis::RedisSinkConfig>("redis", name, config),
+        #[cfg(feature = "sink-csv")]
+        "csv" => check::<faucet_sink_csv::CsvSinkConfig>("csv", name, config),
+        #[cfg(feature = "sink-elasticsearch")]
+        "elasticsearch" => check::<faucet_sink_elasticsearch::ElasticsearchSinkConfig>(
+            "elasticsearch",
+            name,
+            config,
+        ),
+        #[cfg(feature = "sink-kafka")]
+        "kafka" => {
+            check_with::<faucet_sink_kafka::KafkaSinkConfig, _, _>("kafka", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "sink-kinesis")]
+        "kinesis" => check_with::<faucet_sink_kinesis::KinesisSinkConfig, _, _>(
+            "kinesis",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-spanner")]
+        "spanner" => check_with::<faucet_sink_spanner::SpannerSinkConfig, _, _>(
+            "spanner",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-http")]
+        "http" => check::<faucet_sink_http::HttpSinkConfig>("http", name, config),
+        #[cfg(feature = "sink-stdout")]
+        "stdout" => check::<faucet_sink_stdout::StdoutSinkConfig>("stdout", name, config),
+        #[cfg(feature = "sink-parquet")]
+        "parquet" => check_with::<faucet_sink_parquet::ParquetSinkConfig, _, _>(
+            "parquet",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-gcs")]
+        "gcs" => check_with::<faucet_sink_gcs::GcsSinkConfig, _, _>("gcs", name, config, |c| {
+            c.validate()
+        }),
+        #[cfg(feature = "sink-redshift")]
+        "redshift" => check_with::<faucet_sink_redshift::RedshiftSinkConfig, _, _>(
+            "redshift",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-pubsub")]
+        "pubsub" => {
+            check_with::<faucet_sink_pubsub::PubsubSinkConfig, _, _>("pubsub", name, config, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(feature = "sink-clickhouse")]
+        "clickhouse" => check_with::<faucet_sink_clickhouse::ClickHouseSinkConfig, _, _>(
+            "clickhouse",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-azure-blob")]
+        "azure-blob" => {
+            check::<faucet_sink_azure_blob::AzureBlobSinkConfig>("azure-blob", name, config)
+        }
+        other => Err(unknown(other, "sink", sink_kinds())),
+    }
+}
+
 pub fn source_schema(kind: &str) -> CliResult<Value> {
     if let Some(entry) = global().sources.get(kind) {
         return Ok((entry.schema)());
@@ -1496,6 +1892,79 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every compiled source kind reaches a real deserializer (#609).
+    ///
+    /// Driven off `source_descriptions()` rather than a hand-written list, so a
+    /// connector added without a validation arm fails here instead of silently
+    /// accepting any config until its first triggered run — the exact defect
+    /// #609 was filed for.
+    ///
+    /// A non-object config is the one input that no connector config can
+    /// deserialize, whatever its fields, so it proves the arm is wired without
+    /// needing a valid fixture per kind. An arm that returned `Ok` (a stub, or
+    /// a copy-paste that dropped the `check`) fails.
+    #[test]
+    fn every_compiled_source_kind_validates_its_own_config_type() {
+        for (kind, _) in source_descriptions() {
+            let err = validate_source_config(kind, "row-a", serde_json::json!(42))
+                .expect_err("a non-object config cannot deserialize into any connector config");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(kind),
+                "the failure must name the connector kind so the operator knows which \
+                 entry is wrong: {msg}"
+            );
+            assert!(
+                msg.contains("row-a"),
+                "the failure must name the row/template entry: {msg}"
+            );
+        }
+    }
+
+    /// The sink half of the same guarantee.
+    #[test]
+    fn every_compiled_sink_kind_validates_its_own_config_type() {
+        for (kind, _) in sink_descriptions() {
+            let err = validate_sink_config(kind, "row-b", serde_json::json!("not an object"))
+                .expect_err("a non-object config cannot deserialize into any connector config");
+            let msg = err.to_string();
+            assert!(msg.contains(kind), "must name the kind: {msg}");
+            assert!(msg.contains("row-b"), "must name the entry: {msg}");
+        }
+    }
+
+    /// An empty object is the *other* half: it must be accepted by configs whose
+    /// every field is optional and rejected — by name — where something is
+    /// genuinely required. Either outcome is fine; a panic or a non-actionable
+    /// message is not.
+    #[test]
+    fn an_empty_config_object_is_never_a_panic_and_always_actionable() {
+        for (kind, _) in source_descriptions() {
+            if let Err(e) = validate_source_config(kind, "row-c", serde_json::json!({})) {
+                let msg = e.to_string();
+                assert!(msg.contains(kind) && msg.contains("row-c"), "{msg}");
+            }
+        }
+        for (kind, _) in sink_descriptions() {
+            if let Err(e) = validate_sink_config(kind, "row-d", serde_json::json!({})) {
+                let msg = e.to_string();
+                assert!(msg.contains(kind) && msg.contains("row-d"), "{msg}");
+            }
+        }
+    }
+
+    /// An unknown kind names the kind and lists what *is* available, rather
+    /// than reporting the config valid.
+    #[test]
+    fn an_unknown_kind_is_refused_with_the_available_kinds() {
+        let src = validate_source_config("not-a-connector", "row", serde_json::json!({}))
+            .expect_err("an unknown source kind must not validate");
+        assert!(src.to_string().contains("not-a-connector"), "{src}");
+        let sink = validate_sink_config("not-a-connector", "row", serde_json::json!({}))
+            .expect_err("an unknown sink kind must not validate");
+        assert!(sink.to_string().contains("not-a-connector"), "{sink}");
+    }
 
     #[test]
     fn staged_load_allowlist_matches_capable_sinks() {

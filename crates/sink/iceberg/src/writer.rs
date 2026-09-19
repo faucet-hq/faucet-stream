@@ -87,7 +87,7 @@ impl TableWriter {
             .build();
 
         // `ParquetWriterBuilder::new` takes an iceberg `SchemaRef`, NOT an
-        // Arrow `SchemaRef`. The iceberg 0.9.1 API uses the table's current
+        // Arrow `SchemaRef`. The iceberg 0.10.0 API uses the table's current
         // schema as returned by `Table::metadata().current_schema()`.
         let parquet_builder =
             ParquetWriterBuilder::new(props, table.metadata().current_schema().clone());

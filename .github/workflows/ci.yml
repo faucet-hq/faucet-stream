@@ -702,11 +702,12 @@ jobs:
       - name: Generate lcov report
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: |
-          # The two GCS data-plane I/O files are untestable in CI (no
+          # The GCS data-plane I/O files are untestable in CI (no
           # gRPC-compatible GCS emulator; integration tests are #[ignore]d, #220)
-          # so they are excluded here and in codecov.yml (kept in sync).
+          # so they are excluded here, in codecov.yml, and in
+          # scripts/patch-coverage.py (all three kept in sync).
           cargo llvm-cov report --lcov --output-path lcov.info \
-            --ignore-filename-regex '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/source/gcs/src/stream\.rs$|crates/sink/gcs/src/sink\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
+            --ignore-filename-regex '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/source/gcs/src/stream\.rs$|crates/source/gcs/src/parquet_range\.rs$|crates/sink/gcs/src/sink\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
       - name: Enforce >=95% patch coverage
         # The project standard is >=95% coverage of changed lines. `codecov/patch`
         # reports the same number but posts unreliably — of the eight PRs merged

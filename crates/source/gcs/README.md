@@ -14,7 +14,7 @@ Reach for it when your data already lives in GCS — event exports, log dumps, a
 - **Three file formats** — `json_lines` (one record per line), `json_array` (one array per object), and `raw_text` (each object becomes a `{key, content}` record).
 - **Apache Parquet (Arrow columnar)** — behind the `arrow` feature, a fourth format `file_format: parquet` decodes each object via the Arrow Parquet reader and, when the sink is also Arrow-native (Parquet / Delta), moves records end-to-end as Arrow `RecordBatch`es with no `serde_json::Value` in between. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).
 - **List or explicit keys** — scan a bucket by `prefix`, or skip listing entirely by passing an exact `object_keys` list.
-- **Concurrent reads** — objects are fetched in parallel via `buffer_unordered(concurrency)` (default 10), so wall-clock time is bounded by your slowest objects, not their sum.
+- **Concurrent reads** — objects are fetched in parallel (default 10) on the streaming path as well as the batch one, so wall-clock time is bounded by your slowest objects, not their sum. The streaming prefetch is *ordered*, so records still arrive in listing order and a failing object is still blamed at its own position. For `json_lines` the look-ahead holds only open body readers and for `parquet` only footer metadata, so peak memory stays `O(batch_size)`; `json_array` / `raw_text` hold up to `concurrency` whole bodies.
 - **Bounded-memory streaming** — `json_lines` and `raw_text` decode straight off the GCS body reader, so peak memory is `O(batch_size)` regardless of total file size.
 - **Compression auto-detect** — behind the `compression` feature, `.gz` / `.zst` objects are transparently decompressed; the codec resolves *per object key*, so one run can mix compressed and uncompressed objects.
 - **Read-integrity verification** — every object's byte length is checked against the `size` GCS reports (`verify_length`, default on), so a cleanly-truncated transfer is rejected instead of silently parsed as a complete object. Opt into CRC-32C / MD5 checksum verification with `verify_checksum`. Both checks auto-skip GCS-transcoded (`Content-Encoding: gzip`) objects.
@@ -210,6 +210,9 @@ For a non-zero `batch_size`, records from multiple objects can share a page (cro
 
 > **Memory ceiling — `raw_text` / `json_array`.** Both hold one whole decoded object in memory at a time (inherent: a raw-text record *is* the whole file, and a JSON array isn't valid until its closing `]`). Because objects are fetched concurrently, peak memory is bounded by roughly **`concurrency` × (largest object's decoded size)**, not by `batch_size`. For large `raw_text` / `json_array` objects, lower `concurrency` to cap peak memory, or re-emit the data as `json_lines` upstream so it streams at `O(batch_size)`.
 
+> **Parquet streams row groups.** A `file_format: parquet` object is read over byte ranges — its footer locates every row group, so peak memory is one Arrow batch (capped at `batch_size`), not the object. Two settings fall back to reading the whole object, because each is a guarantee worth more than the memory saving: `verify_checksum: true` (the checksum covers the whole object, so verifying it means streaming all of it) and a resolved `compression` codec (a compressed member is not randomly addressable). Records are identical either way.
+
+
 This is a one-shot scan source — it has no incremental bookmark / resume support, so each run re-lists and re-reads the matching objects. For incremental loads, advance the `prefix` between runs (e.g. a dated `events/dt=${now.date}/` prefix) so each run reads only fresh objects.
 
 ## Arrow columnar (Parquet) mode
@@ -321,7 +324,7 @@ println!("records: {}", records.len());
 1. `new()` resolves `GcsCredentials` and builds both a data-plane `Storage` client and a control-plane `StorageControl` client **once**, reusing them across calls.
 2. Listing uses the control-plane `list_objects` paginator (page size 1000), filtered by `prefix` and capped at `max_objects`. An explicit `object_keys` list skips listing entirely.
 3. Each object's body is opened as an async buffered reader; with the `compression` feature it is wrapped in a per-key decompressor.
-4. Objects are read concurrently via `buffer_unordered(concurrency)` and parsed per `file_format`.
+4. Objects are read concurrently — `stream_pages` uses an ordered `buffered(concurrency)` look-ahead (so up to `concurrency` reads overlap the current object's decode), the eager batch path uses `buffer_unordered(concurrency)` — and parsed per `file_format`. `concurrency: 0` is clamped to 1. For `json_lines` the look-ahead holds only open body readers, keeping peak memory `O(batch_size)`; for `json_array` / `raw_text` / `parquet` it holds up to `concurrency` whole bodies.
 5. `stream_pages` re-frames the decoded records into `batch_size` pages and yields them to the pipeline, keeping peak memory bounded for the streaming formats.
 
 ## Dataset discovery

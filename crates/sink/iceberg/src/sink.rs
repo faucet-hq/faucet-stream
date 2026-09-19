@@ -14,7 +14,7 @@
 //! ## Commit failure & conflict handling
 //!
 //! Iceberg commits use optimistic concurrency. `Transaction::commit` in
-//! iceberg-rust 0.9.1 already handles benign races: on a retryable conflict it
+//! iceberg-rust 0.10.0 already handles benign races: on a retryable conflict it
 //! reloads the table metadata and re-applies the `fast_append` against the
 //! latest snapshot **without re-uploading the data files**, retrying with
 //! exponential backoff. The retry budget is tunable via the standard
@@ -370,7 +370,7 @@ impl IcebergSink {
 
     /// Commit all pending data files as a single `fast_append` snapshot.
     ///
-    /// `Transaction::commit` in iceberg-rust 0.9.1 already includes an internal
+    /// `Transaction::commit` in iceberg-rust 0.10.0 already includes an internal
     /// retry loop (reload metadata + re-apply the append against the latest
     /// snapshot, exponential back-off on retryable commit conflicts), so we do
     /// not add an outer retry. Returns `Ok(())` when the commit succeeds.

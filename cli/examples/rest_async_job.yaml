@@ -11,7 +11,7 @@ pipeline:
     config:
       base_url: "https://api.example.com"
       auth: { type: bearer, config: { token: "${env:AUTH_TOKEN}" } }
-      pagination: { type: none }
+      pagination: { type: None }
       async_job:
         submit: { method: POST, url: /jobs, json: { query: "SELECT id, name FROM contacts" } }
         job_id: "$.id"

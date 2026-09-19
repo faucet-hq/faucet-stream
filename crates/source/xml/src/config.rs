@@ -218,7 +218,13 @@ pub struct XmlStreamConfig {
     pub pagination: Option<XmlPagination>,
     /// Maximum number of pages to fetch.
     pub max_pages: Option<usize>,
-    /// Query parameters to include in every request.
+    /// Query parameters to include in every request. Empty by default.
+    ///
+    /// The `#[serde(default)]` is load-bearing: without it the field was
+    /// **required**, so any config omitting it failed to deserialize — the same
+    /// oversight the REST source carried, and invisible until `faucet validate`
+    /// started deserializing connector configs (#609).
+    #[serde(default)]
     pub query_params: std::collections::HashMap<String, String>,
     /// Response-decode pipeline (#540): a declarative chain applied to the raw
     /// response body before record extraction (`extract` an element's text →

@@ -212,7 +212,74 @@ impl DeltaSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("delta: write failed: {e}")))?;
         state.pending = true;
+        self.roll_if_over_target(state).await?;
         Ok(rows)
+    }
+
+    /// Commit whatever the writer has buffered, then drop it so the next write
+    /// rebuilds a fresh writer against the advanced table.
+    ///
+    /// Shared by `flush` and [`roll_if_over_target`](Self::roll_if_over_target)
+    /// — the two differ only in *when* they fire, not in what a commit is.
+    async fn commit_buffered(&self, state: &mut SinkState) -> Result<(), FaucetError> {
+        if !state.pending {
+            return Ok(());
+        }
+        // Take the writer + table out to satisfy the borrow checker, commit,
+        // then put the table back and drop the (now-flushed) writer so the next
+        // page rebuilds a fresh writer against the advanced table.
+        let mut writer = match state.writer.take() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let mut table = state
+            .table
+            .take()
+            .ok_or_else(|| FaucetError::Sink("delta: flush without an open table".to_string()))?;
+        let version = writer
+            .flush_and_commit(&mut table)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("delta: commit failed: {e}")))?;
+        tracing::debug!(version, uri = %self.config.connection.redacted_uri(), "delta commit");
+        state.table = Some(table);
+        state.pending = false;
+        Ok(())
+    }
+
+    /// Commit early once the writer's in-memory parquet buffer reaches
+    /// `target_file_size`, bounding peak memory and sizing the output files.
+    ///
+    /// This is what makes `target_file_size` mean anything (#620). It was
+    /// declared and validated but **never read**, because delta-rs's
+    /// `RecordBatchWriter` has no target-size knob: it writes exactly one file
+    /// per `flush_and_commit`, so file size is governed entirely by *flush
+    /// cadence*. Wiring the knob and bounding memory are therefore the same
+    /// change.
+    ///
+    /// Before this, the only flush was at end-of-run — and a bulk source emits
+    /// no bookmarks, so peak memory was O(whole dataset) and a large table
+    /// could OOM. The cost is a few commits per run instead of one, which is
+    /// the trade the knob exists to let an operator make.
+    ///
+    /// Unset means unbounded, preserving the previous single-commit behaviour
+    /// for anyone relying on it.
+    async fn roll_if_over_target(&self, state: &mut SinkState) -> Result<(), FaucetError> {
+        let Some(target) = self.config.target_file_size else {
+            return Ok(());
+        };
+        let buffered = match state.writer.as_ref() {
+            Some(w) => w.buffer_len(),
+            None => return Ok(()),
+        };
+        if buffered >= target {
+            tracing::debug!(
+                buffered,
+                target,
+                "delta: buffered parquet reached target_file_size; committing early"
+            );
+            self.commit_buffered(state).await?;
+        }
+        Ok(())
     }
 }
 
@@ -313,33 +380,13 @@ impl faucet_core::Sink for DeltaSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("delta: columnar write failed: {e}")))?;
         state.pending = true;
+        self.roll_if_over_target(&mut state).await?;
         Ok(rows)
     }
 
     async fn flush(&self) -> Result<(), FaucetError> {
         let mut state = self.state.lock().await;
-        if !state.pending {
-            return Ok(());
-        }
-        // Take the writer + table out to satisfy the borrow checker, commit,
-        // then put the table back and drop the (now-flushed) writer so the next
-        // page rebuilds a fresh writer against the advanced table.
-        let mut writer = match state.writer.take() {
-            Some(w) => w,
-            None => return Ok(()),
-        };
-        let mut table = state
-            .table
-            .take()
-            .ok_or_else(|| FaucetError::Sink("delta: flush without an open table".to_string()))?;
-        let version = writer
-            .flush_and_commit(&mut table)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("delta: commit failed: {e}")))?;
-        tracing::debug!(version, uri = %self.config.connection.redacted_uri(), "delta commit");
-        state.table = Some(table);
-        state.pending = false;
-        Ok(())
+        self.commit_buffered(&mut state).await
     }
 }
 

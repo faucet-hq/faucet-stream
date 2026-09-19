@@ -249,6 +249,7 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
     // Transform *kinds* are checked above; this compiles each chain so a bad
     // transform *config* fails validation too.
     check_transforms(&nodes)?;
+    check_connector_configs(&nodes)?;
 
     // "children" = per-parent-record fan-out rows; discovery / product rows run
     // independently (no parent), so they count as top-level like roots.
@@ -425,6 +426,30 @@ fn row_line(node: &crate::expand::ExpandedNode) -> String {
     )
 }
 
+/// Deserialize every row's connector `config` into its typed struct.
+///
+/// `expand` leaves `config` an opaque `Value`, so a structurally wrong
+/// connector block — the wrong nesting under a `#[serde(flatten)]` section, an
+/// unknown field under `deny_unknown_fields`, a wrong scalar type, a typo'd
+/// name — used to pass `faucet validate` and fail on the first real run
+/// (#609). Offline: no credentials are resolved, no pool is built, no
+/// connection is opened. Live reachability remains `faucet doctor`'s job.
+fn check_connector_configs(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
+    for n in nodes {
+        crate::registry::validate_source_config(&n.source.kind, &n.id, n.source.config.clone())
+            .map_err(|e| CliError::Config(format!("row '{}' source: {e}", n.id)))?;
+        // A discovery row has no sink (`NodeRole::Discovery` — it runs its
+        // source, projects `select`, and publishes a value set), so the sink
+        // slot holds a placeholder. Validating it would reject a perfectly good
+        // config for a connector the row never writes to.
+        if !matches!(n.role, crate::expand::NodeRole::Discovery { .. }) {
+            crate::registry::validate_sink_config(&n.sink.kind, &n.id, n.sink.config.clone())
+                .map_err(|e| CliError::Config(format!("row '{}' sink: {e}", n.id)))?;
+        }
+    }
+    Ok(())
+}
+
 /// Compile every row's transform chain.
 ///
 /// `expand` only checks the *shape* of a `transforms:` entry, so a misspelled
@@ -444,7 +469,7 @@ fn check_transforms(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_transforms, row_line};
+    use super::{check_connector_configs, check_transforms, row_line};
     use crate::expand::expand;
 
     #[test]
@@ -580,5 +605,97 @@ pipeline:
         )
         .unwrap();
         check_transforms(&expand(&cfg).unwrap()).unwrap();
+    }
+
+    /// #609 — the exact reported shape: `MssqlConnectionConfig` is
+    /// `#[serde(flatten)]`, so nesting it under a `connection:` key is wrong.
+    /// This used to register, launch, and only fail on the first triggered run
+    /// with "MSSQL config requires either connection_url or connection_string".
+    #[cfg(feature = "source-mssql")]
+    #[test]
+    fn a_wrongly_nested_connector_config_is_rejected_at_validate_time() {
+        let cfg = crate::config::parse_with_extension(
+            r#"
+version: 1
+pipeline:
+  source:
+    type: mssql
+    config:
+      connection:
+        connection_string: "Server=tcp:h,1433;Database=d;User Id=u;Password=p;"
+      query: "SELECT 1"
+  sink: { type: jsonl, config: { path: ./o } }
+matrix:
+  - id: rowA
+"#,
+            "yaml",
+        )
+        .expect("the document parses — only the connector block is wrong");
+
+        let err = check_connector_configs(&expand(&cfg).expect("expand"))
+            .expect_err("a wrongly-nested connector config must be rejected")
+            .to_string();
+        assert!(err.contains("rowA"), "names the row: {err}");
+        assert!(err.contains("source"), "names the side: {err}");
+    }
+
+    #[test]
+    fn a_well_formed_config_passes() {
+        let cfg = crate::config::parse_with_extension(
+            r#"
+version: 1
+pipeline:
+  source: { type: csv, config: { path: ./in.csv } }
+  sink:   { type: jsonl, config: { path: ./o } }
+matrix:
+  - id: rowA
+"#,
+            "yaml",
+        )
+        .unwrap();
+        check_connector_configs(&expand(&cfg).unwrap()).expect("a valid config must pass");
+    }
+
+    #[test]
+    fn a_wrong_scalar_type_is_rejected() {
+        // Serde catches this one on its own — `concurrency` is a number.
+        let cfg = crate::config::parse_with_extension(
+            r#"
+version: 1
+pipeline:
+  source: { type: s3, config: { bucket: b, concurrency: "ten" } }
+  sink:   { type: jsonl, config: { path: ./o } }
+matrix:
+  - id: rowA
+"#,
+            "yaml",
+        )
+        .unwrap();
+        let err = check_connector_configs(&expand(&cfg).unwrap())
+            .expect_err("a string where a number belongs must be rejected")
+            .to_string();
+        assert!(err.contains("rowA"), "names the row: {err}");
+    }
+
+    /// Most connector configs do **not** set `deny_unknown_fields`, so a typo'd
+    /// field name still slips past both serde and `validate()`. Pinned here so
+    /// the limitation is explicit rather than assumed fixed — closing it is the
+    /// config-strictness work tracked in #654.
+    #[test]
+    fn an_unknown_field_is_still_accepted_where_the_config_permits_them() {
+        let cfg = crate::config::parse_with_extension(
+            r#"
+version: 1
+pipeline:
+  source: { type: csv, config: { path: ./in.csv, no_such_field: 1 } }
+  sink:   { type: jsonl, config: { path: ./o } }
+matrix:
+  - id: rowA
+"#,
+            "yaml",
+        )
+        .unwrap();
+        check_connector_configs(&expand(&cfg).unwrap())
+            .expect("csv does not deny unknown fields, so this passes — see #654");
     }
 }

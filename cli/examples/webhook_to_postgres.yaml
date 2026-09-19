@@ -18,7 +18,7 @@ pipeline:
       connection_url: postgres://user:pass@localhost/inbox
       table_name: webhook_events
       column_mapping:
-        type: jsonb
-        column: body
+        jsonb:
+          column: body
       batch_size: 500
       max_connections: 8

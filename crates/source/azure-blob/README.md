@@ -30,7 +30,7 @@ Source-specific fields:
 | `object_keys` | list | — | Explicit object names; skips listing. |
 | `file_format` | enum | `json_lines` | `json_lines` / `json_array` / `raw_text`. |
 | `max_objects` | int | — | Hard cap on objects read. |
-| `concurrency` | int | `10` | Max concurrent object reads. |
+| `concurrency` | int | `10` | Max concurrent object reads, on the streaming path as well as the batch one. The streaming prefetch is ordered, so records stay in listing order; `0` is clamped to 1. For `json_lines` it overlaps only the request setup (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole bodies are resident. |
 | `batch_size` | int | `1000` | Records per `StreamPage`; `0` = one page per object. |
 | `verify_length` | bool | `true` | Verify each object's byte count against the `size` Azure reports; a short (truncated) or over-long transfer fails with `FaucetError::Source`. See [Read-integrity verification](#read-integrity-verification). |
 | `verify_checksum` | bool | `false` | **Not supported on Azure Blob** — `true` is rejected at config load. See [Read-integrity verification](#read-integrity-verification). |

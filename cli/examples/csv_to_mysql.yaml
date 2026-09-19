@@ -17,7 +17,6 @@ pipeline:
     config:
       connection_url: mysql://user:pass@localhost/crm
       table_name: customers_imported
-      column_mapping:
-        type: auto_map
+      column_mapping: auto_map
       batch_size: 1000
       max_connections: 10

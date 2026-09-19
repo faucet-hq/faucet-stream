@@ -12,8 +12,7 @@ pipeline:
     config:
       bucket: my-data-lake
       prefix: events/2026/
-      file_format:
-        type: json_lines
+      file_format: json_lines
       region: us-east-1
 
   sink:

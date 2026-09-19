@@ -121,7 +121,7 @@ individual tap — pair it with a keyed/upsert sink for clean, effectively-once
 > backend (the emulator is REST-only); the **GCS** sink cannot be durably counted
 > against the emulator; the **webhook** source is buffer-shaped (no bounded-memory
 > page check); and the **Iceberg** sink is append-only with a terminal `flush`
-> that does not fit the effectively-once replay check on iceberg-rust 0.9.1. The
+> that does not fit the effectively-once replay check on iceberg-rust 0.10.0. The
 > **Singer bridge ⚠️** passes the battery but is additionally **experimental
 > (v0, single-stream)**.
 

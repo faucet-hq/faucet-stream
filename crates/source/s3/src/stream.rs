@@ -11,6 +11,35 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use tokio::io::AsyncBufReadExt;
 
+/// One object's payload, fetched in the shape its `file_format` decodes from.
+///
+/// Prefetching these with a bounded look-ahead is what makes `concurrency`
+/// real on the streaming path (#619). The bound it promises differs by format
+/// and that difference is the point: `JsonLines` overlaps only the request
+/// round-trip — `open_object_reader` does not download the body, so the decode
+/// still streams line-by-line at O(batch) memory — while the whole-object
+/// formats hold at most `concurrency` bodies at once.
+enum Fetched {
+    Lines(Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>),
+    RawText(String),
+    JsonArray(String),
+    /// A Parquet object being read row group at a time over byte ranges — the
+    /// memory-bounded path (#619).
+    #[cfg(feature = "arrow")]
+    ParquetStream(
+        Box<
+            parquet::arrow::async_reader::ParquetRecordBatchStream<
+                crate::parquet_range::S3RangeReader,
+            >,
+        >,
+    ),
+    /// A Parquet object buffered whole, for the configurations a ranged read
+    /// cannot serve: a compressed object is not randomly addressable, and a
+    /// whole-object checksum can only be verified by reading the whole object.
+    #[cfg(feature = "arrow")]
+    Parquet(bytes::Bytes),
+}
+
 /// An S3 source that lists and reads objects from a bucket.
 pub struct S3Source {
     config: S3SourceConfig,
@@ -157,7 +186,92 @@ impl S3Source {
         &self,
         key: &str,
     ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
-        let data = self.read_object_bytes(key).await?;
+        Self::decode_parquet(self.read_object_bytes(key).await?, key).await
+    }
+
+    /// Fetch one object in the shape its configured `file_format` needs.
+    async fn fetch(&self, key: &str) -> Result<Fetched, FaucetError> {
+        Ok(match self.config.file_format {
+            S3FileFormat::JsonLines => Fetched::Lines(self.open_object_reader(key).await?),
+            S3FileFormat::RawText => Fetched::RawText(self.read_object_text(key).await?),
+            S3FileFormat::JsonArray => Fetched::JsonArray(self.read_object_text(key).await?),
+            #[cfg(feature = "arrow")]
+            S3FileFormat::Parquet => match self.parquet_row_group_stream(key).await? {
+                Some(stream) => Fetched::ParquetStream(Box::new(stream)),
+                None => Fetched::Parquet(self.read_object_bytes(key).await?),
+            },
+        })
+    }
+
+    /// Whether this object can be read row group at a time, and a reader for it
+    /// if so (#619).
+    ///
+    /// Two configurations rule it out, and both are guarantees worth more than
+    /// the memory saving:
+    ///
+    /// - `verify_checksum` — S3's checksum covers the whole object (a ranged
+    ///   response carries at most a checksum for that range), so honouring it
+    ///   means reading the object as one stream;
+    /// - `compression` — a gzip / zstd member is not randomly addressable, so
+    ///   the Parquet footer cannot be located without inflating everything.
+    ///
+    /// In either case the whole-object path still runs, unchanged. `verify_length`
+    /// needs no exception: it guards a truncated *transfer*, and the ranged
+    /// reader enforces exactly that per fetch.
+    #[cfg(feature = "arrow")]
+    async fn parquet_row_group_stream(
+        &self,
+        key: &str,
+    ) -> Result<
+        Option<
+            parquet::arrow::async_reader::ParquetRecordBatchStream<
+                crate::parquet_range::S3RangeReader,
+            >,
+        >,
+        FaucetError,
+    > {
+        use parquet::arrow::ParquetRecordBatchStreamBuilder;
+
+        if self.config.verify_checksum {
+            return Ok(None);
+        }
+        #[cfg(feature = "compression")]
+        if self.config.compression.resolve(key) != faucet_core::compression::Compression::None {
+            return Ok(None);
+        }
+
+        let reader =
+            crate::parquet_range::S3RangeReader::open(&self.client, &self.config.bucket, key)
+                .await?;
+        let object_len = reader.len();
+        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("failed to read parquet metadata for '{key}': {e}"))
+            })?;
+        // Cap the Arrow batch size to the page size so a single huge row group
+        // is still decoded in bounded steps — the row-group bound alone is not
+        // enough when one row group holds millions of rows.
+        if self.config.batch_size > 0 {
+            builder = builder.with_batch_size(self.config.batch_size);
+        }
+        let stream = builder.build().map_err(|e| {
+            FaucetError::Source(format!("failed to build parquet reader for '{key}': {e}"))
+        })?;
+        tracing::debug!(
+            key = %key,
+            object_bytes = object_len,
+            "streaming parquet object by row group"
+        );
+        Ok(Some(stream))
+    }
+
+    /// Decode already-fetched Parquet bytes on a blocking thread.
+    #[cfg(feature = "arrow")]
+    async fn decode_parquet(
+        data: bytes::Bytes,
+        key: &str,
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
         let key_owned = key.to_string();
         tokio::task::spawn_blocking(move || decode_parquet_bytes(data, &key_owned))
             .await
@@ -402,10 +516,24 @@ impl faucet_core::Source for S3Source {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
 
-            for key in &keys {
-                match self.config.file_format {
-                    S3FileFormat::JsonLines => {
-                        let reader = self.open_object_reader(key).await?;
+            // Overlap the object reads (#619). `buffered` keeps listing order,
+            // so an object that fails surfaces at exactly the point it would
+            // have serially — concurrency changes throughput, not semantics.
+            let concurrency = self.config.concurrency.max(1);
+            // The key is moved into each future rather than borrowed: a
+            // closure returning a borrow-capturing async block is not
+            // higher-ranked enough for `buffered`.
+            let mut fetched = stream::iter(keys.iter().cloned())
+                .map(|key| async move {
+                    let payload = self.fetch(&key).await;
+                    (key, payload)
+                })
+                .buffered(concurrency);
+
+            while let Some((key, payload)) = fetched.next().await {
+                let key = &key;
+                match payload? {
+                    Fetched::Lines(reader) => {
                         let mut lines = reader.lines();
                         let mut line_num: usize = 0;
                         while let Some(line) = lines
@@ -442,12 +570,11 @@ impl faucet_core::Source for S3Source {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    S3FileFormat::RawText => {
+                    Fetched::RawText(text) => {
                         // RawText emits a single record per object; the
                         // `key` + `content` shape is unchanged so we
                         // continue to buffer the body fully. This still
                         // streams *across* objects.
-                        let text = self.read_object_text(key).await?;
                         let record = serde_json::json!({
                             "key": key,
                             "content": text,
@@ -467,13 +594,41 @@ impl faucet_core::Source for S3Source {
                         }
                     }
                     #[cfg(feature = "arrow")]
-                    S3FileFormat::Parquet => {
+                    Fetched::ParquetStream(mut batches) => {
+                        // Row groups arrive one at a time, so peak memory is
+                        // one batch rather than the whole object (#619).
+                        while let Some(batch) = batches.next().await {
+                            let batch = batch.map_err(|e| {
+                                FaucetError::Source(format!(
+                                    "parquet decode error in '{key}': {e}"
+                                ))
+                            })?;
+                            for record in faucet_core::columnar::record_batch_to_values(&batch)? {
+                                buffer.push(record);
+                                if batch_size != 0 && buffer.len() >= chunk {
+                                    let page = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(initial_capacity),
+                                    );
+                                    total += page.len();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                        }
+                        if batch_size == 0 && !buffer.is_empty() {
+                            let page = std::mem::take(&mut buffer);
+                            total += page.len();
+                            yield StreamPage { records: page, bookmark: None };
+                        }
+                    }
+                    #[cfg(feature = "arrow")]
+                    Fetched::Parquet(data) => {
                         // Parquet objects are buffered and decoded to Arrow
                         // `RecordBatch`es, then converted to JSON rows for the
                         // row path. Rows accumulate across objects and chunk at
                         // `batch_size`; `batch_size == 0` emits one page per
                         // object.
-                        let (_schema, batches) = self.read_object_parquet(key).await?;
+                        let (_schema, batches) = Self::decode_parquet(data, key).await?;
                         for batch in &batches {
                             let rows = faucet_core::columnar::record_batch_to_values(batch)?;
                             for record in rows {
@@ -494,13 +649,12 @@ impl faucet_core::Source for S3Source {
                             yield StreamPage { records: page, bookmark: None };
                         }
                     }
-                    S3FileFormat::JsonArray => {
+                    Fetched::JsonArray(text) => {
                         // JSON-array files cannot be parsed incrementally
                         // (the closing `]` is required to validate the
                         // structure), so each object is buffered fully and
                         // then chunked. The caveat is documented in the
                         // crate README.
-                        let text = self.read_object_text(key).await?;
                         let value: Value = serde_json::from_str(&text).map_err(|e| {
                             FaucetError::Source(format!("S3 JSON parse error in '{key}': {e}"))
                         })?;
@@ -613,19 +767,52 @@ impl faucet_core::Source for S3Source {
             let mut reference: Option<arrow::datatypes::SchemaRef> = None;
             let mut total_records = 0usize;
             let mut total_pages = 0usize;
-            for key in &keys {
-                let (schema, batches) = self.read_object_parquet(key).await?;
-                match &reference {
-                    Some(first) if first != &schema => {
-                        Err(FaucetError::Source(format!(
-                            "S3 source: parquet schema mismatch — object '{key}' diverges from \
-                             the first object's schema"
-                        )))?;
+            // Prefetch readers, not bodies: opening one costs a HeadObject plus
+            // a footer read, so `concurrency` overlaps those round trips while
+            // the row groups of the object in hand are still decoding (#619).
+            let concurrency = self.config.concurrency.max(1);
+            let mut fetched = stream::iter(keys.iter().cloned())
+                .map(|key| async move {
+                    let opened = self.fetch(&key).await;
+                    (key, opened)
+                })
+                .buffered(concurrency);
+
+            while let Some((key, opened)) = fetched.next().await {
+                let key = &key;
+                // One object at a time, but never the whole object at once:
+                // each row group is fetched, decoded, and yielded before the
+                // next is requested.
+                let mut pending: Vec<arrow::array::RecordBatch> = Vec::new();
+                let mut streaming = None;
+                match opened? {
+                    Fetched::ParquetStream(s) => streaming = Some(s),
+                    Fetched::Parquet(data) => {
+                        let (schema, batches) = Self::decode_parquet(data, key).await?;
+                        check_schema(&mut reference, &schema, key)?;
+                        pending = batches;
                     }
-                    None => reference = Some(schema),
-                    _ => {}
+                    _ => Err(FaucetError::Source(format!(
+                        "S3 source: stream_batches reached a non-parquet payload for '{key}'"
+                    )))?,
                 }
-                for batch in batches {
+
+                if let Some(mut batches) = streaming {
+                    check_schema(&mut reference, &batches.schema().clone(), key)?;
+                    while let Some(batch) = batches.next().await {
+                        let batch = batch.map_err(|e| {
+                            FaucetError::Source(format!("parquet decode error in '{key}': {e}"))
+                        })?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        total_records += batch.num_rows();
+                        total_pages += 1;
+                        yield faucet_core::columnar::ColumnarPage { batch, bookmark: None };
+                    }
+                }
+
+                for batch in pending {
                     if batch.num_rows() == 0 {
                         continue;
                     }
@@ -760,6 +947,29 @@ fn descriptors_from_listing(
             faucet_core::DatasetDescriptor::new(k, "object", patch)
         })
         .collect()
+}
+
+/// Hold every object in a columnar scan to the first object's schema.
+///
+/// A divergent *later* object aborts after earlier objects' pages have already
+/// been written — the same non-atomic multi-object semantics the row path has.
+#[cfg(feature = "arrow")]
+fn check_schema(
+    reference: &mut Option<arrow::datatypes::SchemaRef>,
+    schema: &arrow::datatypes::SchemaRef,
+    key: &str,
+) -> Result<(), FaucetError> {
+    match reference {
+        Some(first) if first != schema => Err(FaucetError::Source(format!(
+            "S3 source: parquet schema mismatch — object '{key}' diverges from the first \
+             object's schema"
+        ))),
+        None => {
+            *reference = Some(schema.clone());
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Decode a fully-buffered Parquet object into its Arrow schema and batches.

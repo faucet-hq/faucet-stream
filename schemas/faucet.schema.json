@@ -10364,14 +10364,19 @@
                     },
                     "path": {
                       "description": "URL path, relative to `base_url`. May contain `{key}` placeholders that\nare substituted per-partition (e.g. `\"/orgs/{org_id}/users\"`).",
-                      "type": "string"
+                      "type": "string",
+                      "default": ""
                     },
                     "method": {
-                      "type": "string"
+                      "type": "string",
+                      "default": "GET"
                     },
                     "auth": {
                       "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
-                      "$ref": "#/$defs/source_rest__AuthSpec"
+                      "$ref": "#/$defs/source_rest__AuthSpec",
+                      "default": {
+                        "type": "none"
+                      }
                     },
                     "headers": {
                       "description": "Static request headers sent on **every** request (data pages, async-job\nsubmit/poll/fetch requests, and OData `$metadata` discovery probes).\nApplied *before* the auth provider's header placements, so an auth\nheader of the same name always wins on a clash. Values honor\n`${env:}` / `${param.*}` load-time interpolation and pass through the\nsecrets/redaction boundary like other config strings. Invalid header\nnames/values are rejected at config load\n([`FaucetError::Config`](faucet_core::FaucetError::Config)), never a\nmid-run panic.\n\n```yaml\nheaders:\n  Prefer: transient\n  Accept: application/json\n```",
@@ -10381,6 +10386,7 @@
                       }
                     },
                     "query_params": {
+                      "description": "Static query-string parameters, rendered as `?k=v`. Values honor\n`{placeholder}` context substitution for child sources. Empty by\ndefault.\n\nThe `#[serde(default)]` here is load-bearing: without it this field was\n**required**, so any config omitting it failed to deserialize — while\nits siblings `headers` and `query_params_multi` both defaulted. Several\nshipped examples omitted it and could not run at all, which nothing\ncaught because `faucet validate` did not deserialize connector configs\nuntil #609.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -10396,15 +10402,21 @@
                         }
                       }
                     },
-                    "body": true,
+                    "body": {
+                      "default": null
+                    },
                     "pagination": {
-                      "$ref": "#/$defs/source_rest__PaginationStyle"
+                      "$ref": "#/$defs/source_rest__PaginationStyle",
+                      "default": {
+                        "type": "None"
+                      }
                     },
                     "records_path": {
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "default": null
                     },
                     "max_pages": {
                       "type": [
@@ -10413,7 +10425,8 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 100
                     },
                     "request_delay": {
                       "type": [
@@ -10433,7 +10446,7 @@
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": null
+                      "default": 30
                     },
                     "max_retries": {
                       "description": "Number of retries (after the first attempt) for transient request\nfailures. Default `3`.\n\n**Precedence note:** the REST source predates the unified pipeline\n`resilience:` policy. When this field (or [`retry_backoff`](Self::retry_backoff))\nis left at its default, an injected `RetryPolicy` (e.g. from a\npipeline-level `resilience:` block, via\n[`RestStream::with_retry_policy`](crate::RestStream::with_retry_policy))\ngoverns the retry budget. Setting this field away from its default makes\nit win — an explicit per-connector value is never silently overridden by\na pipeline-wide default.",
@@ -10442,7 +10455,8 @@
                         "string"
                       ],
                       "format": "uint32",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 3
                     },
                     "retry_backoff": {
                       "description": "Base exponential-backoff delay between retries. Default `1s`. Shares the\nlegacy-field precedence rule documented on [`max_retries`](Self::max_retries).",
@@ -10451,7 +10465,8 @@
                         "string"
                       ],
                       "format": "uint64",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 1
                     },
                     "tolerated_http_errors": {
                       "description": "HTTP status codes that should **not** cause an error. Responses with\nthese codes are treated as empty pages (no records, no further pages).",
@@ -10464,44 +10479,54 @@
                         "format": "uint16",
                         "minimum": 0,
                         "maximum": 65535
-                      }
+                      },
+                      "default": []
                     },
                     "replication_method": {
-                      "$ref": "#/$defs/source_rest__ReplicationMethod"
+                      "$ref": "#/$defs/source_rest__ReplicationMethod",
+                      "default": {
+                        "type": "FullTable"
+                      }
                     },
                     "replication_key": {
                       "description": "Field name (not a JSONPath) used for incremental replication bookmarking.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "default": null
                     },
                     "start_replication_value": {
-                      "description": "Bookmark value: records where `record[replication_key] <= start_replication_value`\nare filtered out when `replication_method` is `Incremental`."
+                      "description": "Bookmark value: records where `record[replication_key] <= start_replication_value`\nare filtered out when `replication_method` is `Incremental`.",
+                      "default": null
                     },
                     "state_key": {
                       "description": "Opt-in identifier used by [`Pipeline::with_state_store`](faucet_core::Pipeline::with_state_store)\nto persist this stream's bookmark across runs. When set, the pipeline\nwill load any previously-stored bookmark before fetching and write the\nnew bookmark only after the sink confirms the batch.\n\nKeys must satisfy [`faucet_core::state::validate_state_key`].",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "default": null
                     },
                     "name": {
                       "description": "Human-readable stream name (used in logging and Singer SCHEMA messages).",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "default": null
                     },
                     "primary_keys": {
                       "description": "Field names that uniquely identify a record (Singer `key_properties`).",
                       "type": "array",
                       "items": {
                         "type": "string"
-                      }
+                      },
+                      "default": []
                     },
                     "schema": {
-                      "description": "JSON Schema describing the structure of each record."
+                      "description": "JSON Schema describing the structure of each record.",
+                      "default": null
                     },
                     "schema_sample_size": {
                       "description": "Maximum number of records to sample when inferring the schema via\n[`crate::stream::RestStream::infer_schema`].  `0` means sample all\navailable records (up to `max_pages`).  Defaults to `100`.",
@@ -10510,7 +10535,8 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 100
                     },
                     "partitions": {
                       "description": "Each entry is a context map whose values are substituted into `path`\nplaceholders. The stream is executed once per partition and results are\nconcatenated.  Empty means run once with no substitution.",
@@ -10518,7 +10544,8 @@
                       "items": {
                         "type": "object",
                         "additionalProperties": true
-                      }
+                      },
+                      "default": []
                     },
                     "partition_concurrency": {
                       "description": "Maximum number of partitions to fetch concurrently.\n`None` means sequential processing (backward compatible default).",
@@ -10528,7 +10555,8 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": null
                     },
                     "tls": {
                       "description": "Optional client-certificate (mutual TLS) config. When set, the source\npresents a client certificate on **every** request — data requests and\nany inline auth token request (both go through the same HTTP client).\nRequires the crate's `mtls` feature; a `tls` block on a build without it\nis a load-time error rather than being silently ignored.",
@@ -10680,7 +10708,7 @@
                     }
                   },
                   "title": "RestStreamConfig",
-                  "description": "Configuration for a RestStream.",
+                  "description": "Configuration for a RestStream.\n\n`#[serde(default)]` at the container level: every field falls back to its\nvalue from the [`Default`] impl below when omitted. Without it, **22 fields\nwere required** — a config had to spell out `max_retries`, `retry_backoff`,\n`tolerated_http_errors`, `primary_keys`, `partitions`,\n`schema_sample_size` and more before it would deserialize at all. That is\nwhy the shipped examples are so verbose, and several of them still omitted\none field and could not run; nothing caught it because `faucet validate`\ndid not deserialize connector configs until #609.\n\n`base_url` stays required — in serde *and* in the generated JSON Schema, so\n`faucet init` still marks it `# REQUIRED`. Everything else defaults to the\nvalue in the [`Default`] impl below.",
                   "type": "object"
                 },
                 true
@@ -10875,11 +10903,12 @@
                       "minimum": 0
                     },
                     "query_params": {
-                      "description": "Query parameters to include in every request.",
+                      "description": "Query parameters to include in every request. Empty by default.\n\nThe `#[serde(default)]` is load-bearing: without it the field was\n**required**, so any config omitting it failed to deserialize — the same\noversight the REST source carried, and invisible until `faucet validate`\nstarted deserializing connector configs (#609).",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
-                      }
+                      },
+                      "default": {}
                     },
                     "decode": {
                       "description": "Response-decode pipeline (#540): a declarative chain applied to the raw\nresponse body before record extraction (`extract` an element's text →\n`base64`/`gunzip`/`unzip` → `parse` csv/xlsx/xml/json). When non-empty,\nrecords come from the decoded output instead of `records_element_path`.",
@@ -11994,6 +12023,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "concurrency": {
+                      "description": "Maximum number of files read concurrently (default: 4).\n\nReads are overlapped with a bounded look-ahead in listing order, so\nthroughput improves without changing which file an error is attributed\nto. Lower than the object-store sources' default because every read\nshares one SSH channel, and many servers cap concurrent open handles.\n`0` is treated as `1`.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 4
                     }
                   }
                 },
@@ -12035,25 +12074,29 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "default": null
                     },
                     "region": {
                       "description": "AWS region. `None` uses the SDK default.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "default": null
                     },
                     "endpoint_url": {
                       "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO).",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "default": null
                     },
                     "file_format": {
-                      "description": "Format of the files to read.",
-                      "$ref": "#/$defs/source_s3__S3FileFormat"
+                      "description": "Format of the files to read. Defaults to `json_lines`.",
+                      "$ref": "#/$defs/source_s3__S3FileFormat",
+                      "default": "json_lines"
                     },
                     "max_objects": {
                       "description": "Maximum number of objects to read.",
@@ -12063,16 +12106,18 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": null
                     },
                     "concurrency": {
-                      "description": "Maximum number of concurrent object reads (default: 10).",
+                      "description": "Maximum number of concurrent object reads (default: 10).\n\nThese `#[serde(default)]`s are the same oversight the REST source\ncarried: without them every field here was **required**, so a config\nnaming only `bucket` could not deserialize at all (#609). `bucket` is\nthe one genuinely required field.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 10
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). For\n`JsonLines` and `RawText` formats, the object body is decoded\nline-by-line via [`tokio::io::AsyncBufReadExt`] and a page is yielded\nwhenever the buffer reaches this size; multi-object scans flatten so\na single page may contain lines from any object. For `JsonArray`,\neach object is buffered fully before its records are chunked into\npages of this size (see the README \"Streaming and batching\" section\nfor the caveat). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: every page is one\ncomplete object — no within-object chunking. Useful for small\nlookup files, or for sinks (e.g. SQL `COPY`, BigQuery load jobs)\nthat prefer one large request per file to many small ones.",
@@ -18902,7 +18947,8 @@
       "properties": {
         "path": {
           "description": "JSONPath selecting an array of records (e.g. `\"$.added[*]\"`).",
-          "type": "string"
+          "type": "string",
+          "default": ""
         },
         "op": {
           "description": "Op marker stamped onto each record from `path` under\n[`RestStreamConfig::op_field`] (e.g. `upsert` / `delete`, or `u` / `d`).",

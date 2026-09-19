@@ -35,6 +35,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use russh_sftp::client::SftpSession;
+/// The open-file handle `SftpSession::open` returns, re-exported so
+/// connector crates can name it without depending on `russh-sftp`.
+pub use russh_sftp::client::fs::File as SftpFile;
 // Re-exported so callers can open files for writing with explicit flags. The
 // `SftpSession::write` convenience opens with `WRITE` only (no `CREATE`), so it
 // cannot create a new file — writing one requires

@@ -21,7 +21,8 @@ pipeline:
       path: /reports/usage
       auth: { type: bearer, config: { token: "${env:AUTH_TOKEN}" } }
       records_path: "$.data[*]"
-      replication_method: incremental
+      replication_method:
+        type: Incremental
       replication_key: date
       # Anchor the first window. On later runs the persisted bookmark wins.
       start_replication_value: "2024-01-01"

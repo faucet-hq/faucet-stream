@@ -322,3 +322,101 @@ async fn source_reads_gzip_object() {
     ids.sort_unstable();
     assert_eq!(ids, vec![10, 11]);
 }
+
+// ── #619: `concurrency` is real on the streaming path ────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_streams_blobs_concurrently_in_listing_order() {
+    // `stream_pages` used to read blobs strictly one at a time, so the
+    // `concurrency` field was accepted and ignored. The prefetch that fixed
+    // that is *ordered*, so records must still arrive in listing order — an
+    // unordered look-ahead would interleave blobs by completion time and
+    // change the sequence a downstream sink writes.
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+    let store = seed_store(port);
+
+    // Zero-padded names so lexicographic listing order is numeric order.
+    for i in 1..=12i64 {
+        put_object(
+            &store,
+            &format!("data/part-{i:04}.jsonl"),
+            format!("{{\"id\":{i}}}\n").into_bytes(),
+        )
+        .await;
+    }
+
+    let source = AzureBlobSource::new(source_config(port).prefix("data/").concurrency(6))
+        .await
+        .expect("source new");
+
+    let (records, _sizes) = drain_pages(&source).await;
+    let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(
+        ids,
+        (1..=12).collect::<Vec<i64>>(),
+        "a concurrent read must preserve listing order"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_streams_raw_text_concurrently_without_losing_blobs() {
+    // The whole-blob path: `concurrency` bodies really are resident at once
+    // here, which is the memory bound the knob advertises. One record per
+    // blob makes a dropped or duplicated prefetch immediately visible.
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+    let store = seed_store(port);
+
+    for i in 1..=10i64 {
+        put_object(
+            &store,
+            &format!("raw/f-{i:04}.txt"),
+            format!("body-{i}").into_bytes(),
+        )
+        .await;
+    }
+
+    let source = AzureBlobSource::new(
+        source_config(port)
+            .prefix("raw/")
+            .file_format(AzureFileFormat::RawText)
+            .concurrency(5),
+    )
+    .await
+    .expect("source new");
+
+    let (records, _sizes) = drain_pages(&source).await;
+    let bodies: Vec<&str> = records
+        .iter()
+        .map(|r| r["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        (1..=10).map(|i| format!("body-{i}")).collect::<Vec<_>>(),
+        "every blob must appear exactly once, in order"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_concurrency_zero_reads_serially_rather_than_stalling() {
+    // A `buffered(0)` stream yields nothing forever, so a config of `0` has to
+    // be clamped. Pinned here so the clamp is never refactored into a hang.
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+    let store = seed_store(port);
+    put_object(&store, "z/a.jsonl", b"{\"id\":1}\n{\"id\":2}\n".to_vec()).await;
+
+    let source = AzureBlobSource::new(source_config(port).prefix("z/").concurrency(0))
+        .await
+        .expect("source new");
+
+    let (records, _sizes) =
+        tokio::time::timeout(std::time::Duration::from_secs(60), drain_pages(&source))
+            .await
+            .expect("concurrency = 0 must read serially, not hang");
+    assert_eq!(records.len(), 2);
+}

@@ -122,6 +122,30 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
         // shape, so without this a template with a misspelled transform field
         // registers cleanly and fails at trigger time instead.
         for node in crate::expand::expand(&cfg)? {
+            // Deserialize each connector's `config` into its typed struct
+            // (#609). `expand` leaves it an opaque `Value`, so without this a
+            // structurally wrong config — the wrong nesting under a flattened
+            // block, an unknown field, a typo'd name — registers cleanly,
+            // launches, and only fails on the first triggered run. No
+            // credentials are resolved and no connection is opened.
+            crate::registry::validate_source_config(
+                &node.source.kind,
+                &node.id,
+                node.source.config.clone(),
+            )
+            .map_err(|e| CliError::Config(format!("row '{}' source: {e}", node.id)))?;
+            // A discovery row has no sink (`NodeRole::Discovery`), so its sink
+            // slot holds a placeholder — validating it would reject a good
+            // config for a connector the row never writes to.
+            if !matches!(node.role, crate::expand::NodeRole::Discovery { .. }) {
+                crate::registry::validate_sink_config(
+                    &node.sink.kind,
+                    &node.id,
+                    node.sink.config.clone(),
+                )
+                .map_err(|e| CliError::Config(format!("row '{}' sink: {e}", node.id)))?;
+            }
+
             if node.transforms.is_empty() {
                 continue;
             }
@@ -588,7 +612,8 @@ pipeline:
   source:
     type: rest
     config:
-      url: \"https://api.example.com/${param.tenant_id}/events?since=${param.since}\"
+      base_url: \"https://api.example.com\"
+      path: \"/${param.tenant_id}/events?since=${param.since}\"
   sink:
     type: jsonl
     config:
@@ -650,7 +675,7 @@ pipeline:
 version: 1
 name: tenant-sync
 pipeline:
-  source: { type: rest, config: {} }
+  source: { type: rest, config: { base_url: "https://x", path: /e } }
   transforms:
     - type: set
       config: { fields: { a: 1 } }
@@ -663,6 +688,54 @@ pipeline:
             s.template_versions("tenant-sync").await.unwrap().is_empty(),
             "nothing is persisted when validation fails"
         );
+    }
+
+    /// A structurally wrong **sink** config is refused at register time (#609),
+    /// naming the row and the side it came from.
+    ///
+    /// This is the half that a source-only check would miss: a template could
+    /// be registered and launched with a destination that cannot deserialize,
+    /// and the failure would land on the first triggered run.
+    #[tokio::test]
+    async fn register_rejects_a_structurally_invalid_sink_config() {
+        let s = store();
+        // `path` is a string; a map cannot deserialize into it.
+        let mut bad = req(r#"
+version: 1
+name: tenant-sync
+pipeline:
+  source: { type: rest, config: { base_url: "https://x", path: /e } }
+  sink: { type: jsonl, config: { path: { nested: wrong } } }
+"#);
+        bad.description = None;
+        let err = register(&s, bad).await.unwrap_err().to_string();
+        assert!(err.contains("sink"), "must say which side is wrong: {err}");
+        assert!(err.contains("jsonl"), "must name the connector: {err}");
+        assert!(
+            s.template_versions("tenant-sync").await.unwrap().is_empty(),
+            "nothing is persisted when validation fails"
+        );
+    }
+
+    /// The source counterpart, for symmetry — and to pin that the message says
+    /// `source`, so an operator does not go looking at the wrong end.
+    #[tokio::test]
+    async fn register_rejects_a_structurally_invalid_source_config() {
+        let s = store();
+        let mut bad = req(r#"
+version: 1
+name: tenant-sync
+pipeline:
+  source: { type: rest, config: { base_url: { nested: wrong } } }
+  sink: { type: jsonl, config: { path: ./o.jsonl } }
+"#);
+        bad.description = None;
+        let err = register(&s, bad).await.unwrap_err().to_string();
+        assert!(
+            err.contains("source"),
+            "must say which side is wrong: {err}"
+        );
+        assert!(err.contains("rest"), "must name the connector: {err}");
     }
 
     #[tokio::test]
@@ -968,10 +1041,16 @@ pipeline:
         assert_eq!(out.name.as_deref(), Some("tenant-sync"));
         assert_eq!(out.format(), ConfigFormat::Json);
         let doc: Value = serde_json::from_str(&out.body).unwrap();
-        assert_eq!(
-            doc["pipeline"]["source"]["config"]["url"],
-            "https://api.example.com/acme/events?since=1970-01-01"
-        );
+        // The fixture's `${param.*}` tokens are bound across all three places
+        // they appear — the path segment and the query value — which is the
+        // point of this test. (The shape is `base_url` + `path` +
+        // `query_params`; `url` was never a REST config field.)
+        // Both `${param.*}` tokens in the path are bound — the required one
+        // from the supplied value, `since` from its declared default. (The
+        // shape is `base_url` + `path`; `url` was never a REST config field.)
+        let src = &doc["pipeline"]["source"]["config"];
+        assert_eq!(src["base_url"], "https://api.example.com");
+        assert_eq!(src["path"], "/acme/events?since=1970-01-01");
         assert_eq!(out.params_redacted["tenant_id"], json!("acme"));
         assert_eq!(out.params_redacted["page"], json!(100));
         assert!(!out.used_secret_params);
@@ -1052,7 +1131,7 @@ pipeline:
 version: 1
 name: env-template
 pipeline:
-  source: { type: rest, config: { url: \"https://x/${env:FAUCET_TPL_REGION}\" } }
+  source: { type: rest, config: { base_url: \"https://x\", path: \"/${env:FAUCET_TPL_REGION}\" } }
   sink: { type: jsonl, config: { path: ./o.jsonl } }
 ";
         unsafe { std::env::set_var("FAUCET_TPL_REGION", "from-process") };
@@ -1069,10 +1148,7 @@ pipeline:
         .await
         .unwrap();
         let doc: Value = serde_json::from_str(&out.body).unwrap();
-        assert_eq!(
-            doc["pipeline"]["source"]["config"]["url"],
-            "https://x/from-process"
-        );
+        assert_eq!(doc["pipeline"]["source"]["config"]["path"], "/from-process");
 
         let overrides: BTreeMap<String, String> =
             [("FAUCET_TPL_REGION".to_string(), "from-request".to_string())].into();
@@ -1087,10 +1163,7 @@ pipeline:
         .await
         .unwrap();
         let doc: Value = serde_json::from_str(&out.body).unwrap();
-        assert_eq!(
-            doc["pipeline"]["source"]["config"]["url"],
-            "https://x/from-request"
-        );
+        assert_eq!(doc["pipeline"]["source"]["config"]["path"], "/from-request");
         assert_eq!(std::env::var("FAUCET_TPL_REGION").unwrap(), "from-process");
         unsafe { std::env::remove_var("FAUCET_TPL_REGION") };
     }
@@ -1107,7 +1180,8 @@ pipeline:
   source:
     type: rest
     config:
-      url: https://api.example.com/events
+      base_url: https://api.example.com
+      path: /events
       auth: { type: bearer, config: { token: \"${param.api_token}\" } }
   sink: { type: jsonl, config: { path: ./o.jsonl } }
 ";

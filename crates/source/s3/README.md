@@ -13,7 +13,7 @@ Built on the official `aws-sdk-s3` client (built once, reused across every read)
 
 - **Three file formats** — `json_lines` (one record per line), `json_array` (one record per array element), and `raw_text` (one `{key, content}` record per object).
 - **Apache Parquet (Arrow columnar)** — behind the `arrow` feature, a fourth format `file_format: parquet` decodes each object via the Arrow Parquet reader and, when the sink is also Arrow-native (Parquet / Delta), moves records end-to-end as Arrow `RecordBatch`es with no `serde_json::Value` in between. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).
-- **Parallel object reads** — up to `concurrency` objects fetched at once via `futures::buffer_unordered` (default 10).
+- **Parallel object reads** — up to `concurrency` objects fetched at once (default 10), on the streaming path as well as the batch one. The streaming prefetch is *ordered*, so records still arrive in listing order and a failing object is still blamed at its own position.
 - **True line-level streaming** — for `json_lines` / `raw_text`, object bodies are decoded line-by-line via `tokio::io::AsyncBufReadExt`, so client memory is bounded at `O(batch_size)` regardless of file or scan size.
 - **Prefix listing with pagination** — handles truncated `ListObjectsV2` responses transparently and honours an optional `max_objects` cap.
 - **S3-compatible** — custom `endpoint_url` for MinIO, LocalStack, R2, and other S3-API services.
@@ -245,6 +245,9 @@ Behaviour by format:
 
 > **Memory ceiling — `raw_text` / `json_array`.** Both formats hold one whole decoded object in memory at a time (inherent: `raw_text`'s record *is* the file, and a JSON array isn't valid until its closing `]`). Because objects are fetched concurrently, peak memory is roughly **`concurrency` × (largest object's decoded size)**, not `batch_size`. For large `raw_text` / `json_array` objects, lower `concurrency` to cap peak memory, or re-emit the data as `json_lines` upstream so it streams line-by-line.
 
+> **Parquet streams row groups.** A `file_format: parquet` object is read over byte ranges — its footer locates every row group, so peak memory is one Arrow batch (capped at `batch_size`), not the object. Two settings fall back to reading the whole object, because each is a guarantee worth more than the memory saving: `verify_checksum: true` (the checksum covers the whole object, so verifying it means streaming all of it) and a resolved `compression` codec (a compressed member is not randomly addressable). Records are identical either way.
+
+
 The S3 source has **no incremental-replication mode** today, so every emitted page carries `bookmark: None`. It does not implement resume/state, effectively-once, write modes, or a dead-letter queue (those are sink- or CDC-source-specific capabilities).
 
 ## Arrow columnar (Parquet) mode
@@ -353,7 +356,8 @@ To run a full pipeline, wrap the source with any sink in `faucet_core::Pipeline`
 
 - **Client reuse** — the `aws-sdk-s3` `Client` is built once in `S3Source::new()` (resolving region and `endpoint_url`) and reused for every list and get. No per-object client construction.
 - **Paginated listing** — `list_objects_v2` follows `next_continuation_token` until the response is no longer truncated, stopping early once `max_objects` is reached.
-- **Parallel reads** — listed keys are read through `futures::stream::buffer_unordered(concurrency)`, so up to `concurrency` `GetObject` calls are in flight at once.
+- **Parallel reads** — `stream_pages` fetches listed keys through an ordered `futures::stream::buffered(concurrency)` look-ahead, so up to `concurrency` `GetObject` calls are in flight while the current object is being decoded; the eager batch path uses `buffer_unordered(concurrency)`. `concurrency: 0` is clamped to 1.
+- **What the look-ahead holds** — for `json_lines` it is only the open body readers (opening an object does not download it), and for `parquet` only the footer metadata, so peak memory stays `O(batch_size)`; for `json_array` / `raw_text` it is up to `concurrency` whole object bodies, which is the memory bound the knob advertises.
 - **Streaming decode** — `json_lines` / `raw_text` open each body as an `AsyncBufRead` and decode line-by-line; only `json_array` buffers a full object before parsing.
 
 Throughput scales with `concurrency` and is ultimately bounded by S3 / network bandwidth — benchmark with your own object sizes and parallelism.

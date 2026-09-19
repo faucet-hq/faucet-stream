@@ -29,6 +29,33 @@ pub enum ResponseFormat {
     Excel,
 }
 
+fn default_method() -> Method {
+    Method::GET
+}
+fn default_auth() -> AuthSpec<Auth> {
+    AuthSpec::Inline(Auth::None)
+}
+fn default_pagination() -> PaginationStyle {
+    PaginationStyle::None
+}
+fn default_max_pages() -> Option<usize> {
+    Some(100)
+}
+fn default_timeout() -> Option<Duration> {
+    Some(Duration::from_secs(30))
+}
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_retry_backoff() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_replication_method() -> ReplicationMethod {
+    ReplicationMethod::FullTable
+}
+fn default_schema_sample_size() -> usize {
+    100
+}
 fn default_csv_delimiter() -> u8 {
     b','
 }
@@ -37,18 +64,34 @@ fn default_csv_has_headers() -> bool {
 }
 
 /// Configuration for a RestStream.
+///
+/// `#[serde(default)]` at the container level: every field falls back to its
+/// value from the [`Default`] impl below when omitted. Without it, **22 fields
+/// were required** — a config had to spell out `max_retries`, `retry_backoff`,
+/// `tolerated_http_errors`, `primary_keys`, `partitions`,
+/// `schema_sample_size` and more before it would deserialize at all. That is
+/// why the shipped examples are so verbose, and several of them still omitted
+/// one field and could not run; nothing caught it because `faucet validate`
+/// did not deserialize connector configs until #609.
+///
+/// `base_url` stays required — in serde *and* in the generated JSON Schema, so
+/// `faucet init` still marks it `# REQUIRED`. Everything else defaults to the
+/// value in the [`Default`] impl below.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestStreamConfig {
     // ── Core request ──────────────────────────────────────────────────────────
     pub base_url: String,
     /// URL path, relative to `base_url`. May contain `{key}` placeholders that
     /// are substituted per-partition (e.g. `"/orgs/{org_id}/users"`).
+    #[serde(default)]
     pub path: String,
     #[serde(with = "crate::serde_helpers::http_method")]
     #[schemars(with = "String")]
+    #[serde(default = "default_method")]
     pub method: Method,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
+    #[serde(default = "default_auth")]
     pub auth: AuthSpec<Auth>,
     /// Static request headers sent on **every** request (data pages, async-job
     /// submit/poll/fetch requests, and OData `$metadata` discovery probes).
@@ -68,6 +111,18 @@ pub struct RestStreamConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(with = "std::collections::HashMap<String, String>")]
     pub headers: HashMap<String, String>,
+    /// Static query-string parameters, rendered as `?k=v`. Values honor
+    /// `{placeholder}` context substitution for child sources. Empty by
+    /// default.
+    ///
+    /// The `#[serde(default)]` here is load-bearing: without it this field was
+    /// **required**, so any config omitting it failed to deserialize — while
+    /// its siblings `headers` and `query_params_multi` both defaulted. Several
+    /// shipped examples omitted it and could not run at all, which nothing
+    /// caught because `faucet validate` did not deserialize connector configs
+    /// until #609.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[schemars(with = "std::collections::HashMap<String, String>")]
     pub query_params: HashMap<String, String>,
     /// Repeated / array-valued query params (#536), rendered as repeated keys —
     /// e.g. `{ "group_by[]": ["api_key_id", "model"] }` → `?group_by[]=api_key_id&group_by[]=model`.
@@ -77,18 +132,25 @@ pub struct RestStreamConfig {
     /// substitution for child sources, like `query_params`. Empty by default.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub query_params_multi: HashMap<String, Vec<String>>,
+    #[serde(default)]
     pub body: Option<Value>,
 
     // ── Pagination ────────────────────────────────────────────────────────────
+    #[serde(default = "default_pagination")]
     pub pagination: PaginationStyle,
+    #[serde(default)]
     pub records_path: Option<String>,
+    #[serde(default = "default_max_pages")]
     pub max_pages: Option<usize>,
     #[serde(with = "faucet_core::config::duration_secs_option", default)]
     #[schemars(with = "Option<u64>")]
     pub request_delay: Option<Duration>,
 
     // ── Reliability ───────────────────────────────────────────────────────────
-    #[serde(with = "faucet_core::config::duration_secs_option", default)]
+    #[serde(
+        with = "faucet_core::config::duration_secs_option",
+        default = "default_timeout"
+    )]
     #[schemars(with = "Option<u64>")]
     pub timeout: Option<Duration>,
     /// Number of retries (after the first attempt) for transient request
@@ -102,22 +164,28 @@ pub struct RestStreamConfig {
     /// governs the retry budget. Setting this field away from its default makes
     /// it win — an explicit per-connector value is never silently overridden by
     /// a pipeline-wide default.
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Base exponential-backoff delay between retries. Default `1s`. Shares the
     /// legacy-field precedence rule documented on [`max_retries`](Self::max_retries).
     #[serde(with = "faucet_core::config::duration_secs")]
     #[schemars(with = "u64")]
+    #[serde(default = "default_retry_backoff")]
     pub retry_backoff: Duration,
     /// HTTP status codes that should **not** cause an error. Responses with
     /// these codes are treated as empty pages (no records, no further pages).
+    #[serde(default)]
     pub tolerated_http_errors: Vec<u16>,
 
     // ── Replication ───────────────────────────────────────────────────────────
+    #[serde(default = "default_replication_method")]
     pub replication_method: ReplicationMethod,
     /// Field name (not a JSONPath) used for incremental replication bookmarking.
+    #[serde(default)]
     pub replication_key: Option<String>,
     /// Bookmark value: records where `record[replication_key] <= start_replication_value`
     /// are filtered out when `replication_method` is `Incremental`.
+    #[serde(default)]
     pub start_replication_value: Option<Value>,
     /// Opt-in identifier used by [`Pipeline::with_state_store`](faucet_core::Pipeline::with_state_store)
     /// to persist this stream's bookmark across runs. When set, the pipeline
@@ -125,27 +193,34 @@ pub struct RestStreamConfig {
     /// new bookmark only after the sink confirms the batch.
     ///
     /// Keys must satisfy [`faucet_core::state::validate_state_key`].
+    #[serde(default)]
     pub state_key: Option<String>,
 
     // ── Singer / Meltano metadata ─────────────────────────────────────────────
     /// Human-readable stream name (used in logging and Singer SCHEMA messages).
+    #[serde(default)]
     pub name: Option<String>,
     /// Field names that uniquely identify a record (Singer `key_properties`).
+    #[serde(default)]
     pub primary_keys: Vec<String>,
     /// JSON Schema describing the structure of each record.
+    #[serde(default)]
     pub schema: Option<Value>,
     /// Maximum number of records to sample when inferring the schema via
     /// [`crate::stream::RestStream::infer_schema`].  `0` means sample all
     /// available records (up to `max_pages`).  Defaults to `100`.
+    #[serde(default = "default_schema_sample_size")]
     pub schema_sample_size: usize,
 
     // ── Partitions ────────────────────────────────────────────────────────────
     /// Each entry is a context map whose values are substituted into `path`
     /// placeholders. The stream is executed once per partition and results are
     /// concatenated.  Empty means run once with no substitution.
+    #[serde(default)]
     pub partitions: Vec<HashMap<String, Value>>,
     /// Maximum number of partitions to fetch concurrently.
     /// `None` means sequential processing (backward compatible default).
+    #[serde(default)]
     pub partition_concurrency: Option<usize>,
 
     // ── Mutual TLS ─────────────────────────────────────────────────────────────
@@ -297,6 +372,7 @@ pub struct RestStreamConfig {
 #[serde(deny_unknown_fields)]
 pub struct RecordsMultiSpec {
     /// JSONPath selecting an array of records (e.g. `"$.added[*]"`).
+    #[serde(default)]
     pub path: String,
     /// Op marker stamped onto each record from `path` under
     /// [`RestStreamConfig::op_field`] (e.g. `upsert` / `delete`, or `u` / `d`).
@@ -601,6 +677,13 @@ impl RestStreamConfig {
     /// parse the whole body, so paginated / JSONPath-extracted requests are
     /// rejected rather than silently ignored.
     pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        // The one field with no sensible default. Checked here rather than left
+        // to serde so the message names the knob and the connector.
+        if self.base_url.trim().is_empty() {
+            return Err(faucet_core::FaucetError::Config(
+                "rest: `base_url` is required (e.g. `base_url: https://api.example.com`)".into(),
+            ));
+        }
         // Static custom headers: reject an invalid header name/value at load
         // time rather than panicking on the first request (#539).
         build_header_map(&self.headers)?;
@@ -1445,5 +1528,59 @@ mod tests {
         );
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("`list.get` must not be empty"), "{err}");
+    }
+
+    /// Only `base_url` is genuinely required (#609).
+    ///
+    /// Before the per-field defaults, this config demanded **22** fields, so a
+    /// hand-written `rest` entry could not deserialize at all — which is why
+    /// `faucet validate` never tried. Deserializing the minimum is therefore
+    /// the regression test, and asserting each defaulted value pins what a
+    /// user gets when they omit it.
+    #[test]
+    fn a_minimal_config_deserializes_and_every_omitted_field_takes_its_default() {
+        let cfg: RestStreamConfig =
+            serde_json::from_value(serde_json::json!({ "base_url": "https://api.example.com" }))
+                .expect("base_url alone must be enough");
+
+        assert_eq!(cfg.base_url, "https://api.example.com");
+        assert_eq!(cfg.method, reqwest::Method::GET);
+        assert_eq!(cfg.max_pages, Some(100));
+        assert_eq!(cfg.max_retries, 3);
+        assert_eq!(cfg.schema_sample_size, 100);
+        assert!(matches!(cfg.pagination, PaginationStyle::None));
+        assert!(matches!(
+            cfg.replication_method,
+            ReplicationMethod::FullTable
+        ));
+        assert!(cfg.timeout.is_some(), "a request must not hang forever");
+        assert!(cfg.retry_backoff > std::time::Duration::ZERO);
+        assert!(
+            cfg.query_params.is_empty(),
+            "query_params was accidentally required (#609); it must default to empty"
+        );
+        assert_eq!(cfg.csv_delimiter, b',');
+        assert!(cfg.csv_has_headers);
+        // The defaulted auth must be the inert one — a default that
+        // accidentally carried credentials-shaped state would be a security
+        // problem, not a convenience.
+        assert!(
+            serde_json::to_value(&cfg.auth)
+                .expect("auth serializes")
+                .to_string()
+                .contains("none"),
+            "the default auth must be `none`"
+        );
+
+        // And it must survive the validate() that `faucet validate` now runs.
+        cfg.validate().expect("a minimal config is valid");
+    }
+
+    #[test]
+    fn an_empty_base_url_is_refused() {
+        let cfg: RestStreamConfig =
+            serde_json::from_value(serde_json::json!({ "base_url": "" })).expect("deserializes");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.to_lowercase().contains("base_url"), "{err}");
     }
 }
