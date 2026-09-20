@@ -31,6 +31,12 @@ pub struct RedshiftSink {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// Records accumulated across `write_batch` calls (#617).
+    ///
+    /// `COPY` wants millions of rows per load; one `COPY` per 1000-row page
+    /// produced many small commits, small unsorted blocks, and VACUUM
+    /// pressure.
+    pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
     config: RedshiftSinkConfig,
     pool: PgPool,
     /// S3 client, built only for the `copy` strategy.
@@ -38,6 +44,31 @@ pub struct RedshiftSink {
 }
 
 impl RedshiftSink {
+    /// Load one accumulated group, still re-chunked to `batch_size` so a
+    /// single staged object / `INSERT` statement stays a reasonable size
+    /// (#617).
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
+        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
+            vec![rows]
+        } else {
+            rows.chunks(self.config.batch_size).collect()
+        };
+        let mut total = 0;
+        for chunk in chunks {
+            total += match self.config.write_strategy {
+                RedshiftWriteStrategy::Copy => self.copy_chunk(chunk).await?,
+                RedshiftWriteStrategy::Insert => self.insert_chunk(chunk).await?,
+            };
+        }
+        tracing::info!(
+            table = %self.config.table_name,
+            rows = total,
+            strategy = self.config.write_strategy.as_str(),
+            "Redshift write complete"
+        );
+        Ok(())
+    }
+
     /// Make sure the target table exists before the first write (#580).
     ///
     /// Runs once per sink instance. With `create_table: true` (the default) a
@@ -104,6 +135,10 @@ impl RedshiftSink {
         };
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+                config.commit_rows,
+                config.commit_bytes,
+            )),
             config,
             pool,
             s3,
@@ -357,32 +392,39 @@ impl faucet_core::Sink for RedshiftSink {
         )
     }
 
+    /// Commit whatever the cross-page accumulator holds (#617).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so a buffered group is always loaded before the bookmark
+    /// advances — records left in the accumulator after a "successful" run
+    /// would be data loss with a green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let group = {
+            let mut open = self.pending.lock().await;
+            open.finish()
+        };
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
+        }
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
         self.ensure_table_ready(records).await?;
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
+        // Accumulate across calls and load once per threshold (#617): `COPY`
+        // wants millions of rows per load, and `batch_size` could only ever
+        // split a page — never merge two small ones.
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.push_page(records)
         };
-
-        let mut total = 0;
-        for chunk in chunks {
-            total += match self.config.write_strategy {
-                RedshiftWriteStrategy::Copy => self.copy_chunk(chunk).await?,
-                RedshiftWriteStrategy::Insert => self.insert_chunk(chunk).await?,
-            };
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
         }
-
-        tracing::info!(
-            table = %self.config.table_name,
-            rows = total,
-            strategy = self.config.write_strategy.as_str(),
-            "Redshift write complete"
-        );
-        Ok(total)
+        Ok(records.len())
     }
 
     /// Preflight connectivity probe (`faucet doctor`): acquire a connection and
@@ -429,6 +471,8 @@ mod tests {
             connection: RedshiftConnection::new("host", "db", "user", "pw"),
             table_name: "events".into(),
             create_table: true,
+            commit_rows: None,
+            commit_bytes: None,
             schema: Some("public".into()),
             write_strategy: RedshiftWriteStrategy::Insert,
             copy: None,

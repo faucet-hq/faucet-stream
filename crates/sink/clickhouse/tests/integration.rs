@@ -72,6 +72,17 @@ async fn read_rows(base: &str, sql: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Read a single `count()` back. ClickHouse serialises `UInt64` as a JSON
+/// **string** in `JSONEachRow`, so accept either shape rather than silently
+/// reading `-1`.
+async fn count_of(base: &str, sql: &str) -> i64 {
+    let rows = read_rows(base, sql).await;
+    let v = &rows[0]["n"];
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("count came back as {v}"))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn write_batch_inserts_rows_and_rechunks() {
     let _serial = SERIAL.lock().await;
@@ -114,6 +125,8 @@ async fn write_batch_inserts_rows_and_rechunks() {
         .expect("sink");
     let nums: Vec<Value> = (1..=5).map(|n| json!({ "n": n })).collect();
     assert_eq!(sink2.write_batch(&nums).await.expect("chunked write"), 5);
+    // Since #617 the accumulated group inserts at `flush`.
+    sink2.flush().await.expect("flush");
     let back = read_rows(&base, "SELECT n FROM nums ORDER BY n").await;
     let got: Vec<i64> = back.iter().map(|r| r["n"].as_i64().unwrap()).collect();
     assert_eq!(got, vec![1, 2, 3, 4, 5]);
@@ -160,9 +173,58 @@ async fn write_batch_with_async_insert_lands_rows() {
         json!({"id": 20, "name": "y"}),
     ];
     assert_eq!(sink.write_batch(&rows).await.expect("async write"), 2);
+    sink.flush().await.expect("flush");
 
     let back = read_rows(&base, "SELECT id, name FROM async_events ORDER BY id").await;
     let ids: Vec<i64> = back.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![10, 20]);
     assert_eq!(back[0]["name"], json!("x"));
+}
+
+/// #617 — small pages must merge into one insert.
+///
+/// ClickHouse creates a MergeTree part per insert, so one insert per small
+/// page is not merely slow: it trips "too many parts", a hard failure. This is
+/// what makes the engine's own guidance ("insert in large batches") reachable
+/// from a source that pages small.
+#[tokio::test(flavor = "multi_thread")]
+async fn small_pages_merge_into_one_insert() {
+    let _serial = SERIAL.lock().await;
+    let (_c, base) = start_clickhouse().await;
+    http_exec(
+        &base,
+        "CREATE TABLE merged (id Int64, name String) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+
+    let sink = ClickHouseSink::new(
+        ClickHouseSinkConfig::new(&base, "merged")
+            .with_batch_size(0)
+            .with_create_table(false),
+    )
+    .expect("sink");
+
+    // Ten pages of 10 — the shape that used to be ten inserts, ten parts.
+    for page in 0..10 {
+        let rows: Vec<Value> = (0..10)
+            .map(|i| json!({ "id": page * 10 + i, "name": "x" }))
+            .collect();
+        sink.write_batch(&rows).await.expect("write");
+    }
+    sink.flush().await.expect("flush");
+
+    assert_eq!(
+        count_of(&base, "SELECT count() AS n FROM merged").await,
+        100,
+        "every row must land"
+    );
+
+    // One insert ⇒ one part. `system.parts` is the engine's own view of the
+    // thing that actually fails, so assert on it rather than a request count.
+    let parts = count_of(
+        &base,
+        "SELECT count() AS n FROM system.parts WHERE table = 'merged' AND active",
+    )
+    .await;
+    assert_eq!(parts, 1, "ten pages must produce ONE part, not ten");
 }

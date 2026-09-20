@@ -114,7 +114,7 @@ pub use native::{
     CsvDialect, NativeBatch, NativeFormat, NativeLoadCapability, NativeLoadContext, NativePayload,
     NativePlan, NativePlanInputs, plan_native_transfer,
 };
-pub use object_rollover::{CompletedObject, ObjectAccumulator};
+pub use object_rollover::{CompletedObject, ObjectAccumulator, PageAccumulator};
 #[cfg(feature = "contract")]
 pub use observability::instrumented_apply_contract;
 #[cfg(feature = "masking")]

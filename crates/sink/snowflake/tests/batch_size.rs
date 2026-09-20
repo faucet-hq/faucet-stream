@@ -23,6 +23,9 @@ fn sample_config() -> SnowflakeSinkConfig {
             token: "tok".into(),
         },
     )
+    // These tests count REST requests to measure insert re-chunking, so the
+    // #580 `CREATE TABLE IF NOT EXISTS` (a request of its own) is pinned off.
+    .with_create_table(false)
 }
 
 async fn mock_server_with_success() -> MockServer {
@@ -52,6 +55,9 @@ async fn write_batch_rechunks_into_batch_size_requests() {
         .with_endpoint(endpoint(&server));
 
     let written = sink.write_batch(&make_records(2_500)).await.unwrap();
+    // Since #617 the accumulated group commits at `flush`, which the
+    // pipeline calls at every bookmark-carrying page and at the end.
+    sink.flush().await.unwrap();
     assert_eq!(written, 2_500);
 
     let requests = server.received_requests().await.unwrap();
@@ -70,6 +76,7 @@ async fn write_batch_emits_single_request_for_exact_multiple() {
         .with_endpoint(endpoint(&server));
 
     sink.write_batch(&make_records(1_000)).await.unwrap();
+    sink.flush().await.unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -84,6 +91,7 @@ async fn write_batch_with_sentinel_zero_sends_single_request() {
         .with_endpoint(endpoint(&server));
 
     sink.write_batch(&make_records(5_000)).await.unwrap();
+    sink.flush().await.unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
@@ -115,6 +123,7 @@ async fn write_batch_smaller_than_batch_size_makes_one_request() {
         .with_endpoint(endpoint(&server));
 
     sink.write_batch(&make_records(42)).await.unwrap();
+    sink.flush().await.unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);

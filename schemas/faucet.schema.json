@@ -17306,6 +17306,26 @@
                       ],
                       "default": true
                     },
+                    "commit_rows": {
+                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\n`None` (the default) accumulates the **whole run** into one commit.\nSet it to bound how much is buffered, or to commit progressively on a\nlong run. `0` means the same as `None`.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "commit_bytes": {
+                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `None` (the default) removes the byte\nthreshold.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
                     "auth": {
                       "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.\nA shared provider must yield a `Bearer` or `Token` credential, which\nmaps onto [`SnowflakeAuth::OAuth`]; key-pair JWT is always inline.",
                       "$ref": "#/$defs/sink_snowflake__AuthSpec"
@@ -19435,6 +19455,26 @@
                       ],
                       "default": true
                     },
+                    "commit_rows": {
+                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\n`None` (the default) accumulates the **whole run** into one commit.\nSet it to bound how much is buffered, or to commit progressively on a\nlong run. `0` means the same as `None`.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "commit_bytes": {
+                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `None` (the default) removes the byte\nthreshold.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
                     "schema": {
                       "description": "Optional schema (namespace) qualifying [`table_name`](Self::table_name).",
                       "type": [
@@ -19710,6 +19750,26 @@
                         "string"
                       ],
                       "default": true
+                    },
+                    "commit_rows": {
+                      "description": "Commit-group size for the cross-page accumulator (#617).\n\nWarehouse loads are dominated by per-operation overhead, and\n`batch_size` can only ever *split* a page — it can never merge\nundersized ones, so a small source page meant one expensive warehouse\noperation per small page. Records now accumulate across `write_batch`\ncalls and commit once per threshold, plus once at `flush`.\n\n`None` (the default) accumulates the **whole run** into one commit.\nSet it to bound how much is buffered, or to commit progressively on a\nlong run. `0` means the same as `None`.\n\nOnly the append path accumulates: `delivery: exactly_once` and the DLQ\npath commit per page, because a watermark must land with its own page\nand a DLQ must report which rows of *this* page failed.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "commit_bytes": {
+                      "description": "Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)\n(#617). Rows are a poor proxy for how much work a warehouse commit is;\nthis bounds the buffered size. `None` (the default) removes the byte\nthreshold.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
                     },
                     "async_insert": {
                       "description": "Enable ClickHouse [asynchronous inserts](https://clickhouse.com/docs/en/optimize/asynchronous-inserts)\n(`async_insert=1`): the server buffers rows and flushes them in the\nbackground, which greatly improves throughput for many small inserts.\nDefaults to `false`.",

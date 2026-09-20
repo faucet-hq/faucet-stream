@@ -170,6 +170,17 @@ closed at `flush`. The byte cap is what bounds buffered memory (rows are a poor
 proxy for size), and `s3`/`azure-blob` additionally stream large objects
 through **multipart** so peak memory is O(part size), not O(object size).
 
+**Commit accumulation (`commit_rows` / `commit_bytes`, #617).** The warehouse
+sinks — `snowflake`, `clickhouse`, `redshift` — accumulate records across
+`write_batch` calls and commit once per threshold, plus once at `flush`. The
+commit unit used to be the page unit and `batch_size` could only *split* a
+page, never merge two, so a small source page meant one expensive warehouse
+operation per page — and on ClickHouse, one MergeTree part per page, which
+fails outright once they accumulate. Only the **append** path accumulates:
+`delivery: exactly_once` and the DLQ path commit per page, because a watermark
+must land with its own page and a DLQ must name which rows of *this* page
+failed.
+
 **Auto-create (`create_table`, #580).** Every **table-based** sink —
 `bigquery`, `postgres`, `mysql`, `sqlite`, `mssql`, `duckdb`, `snowflake`,
 `redshift`, `clickhouse`, `spanner`, `delta`, `iceberg` — takes

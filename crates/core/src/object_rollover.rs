@@ -373,3 +373,199 @@ mod tests {
         assert!(matches!(acc.push_record(&rec(1)).unwrap(), Emit::Object(_)));
     }
 }
+
+/// Cross-page record accumulation for **warehouse** sinks (#617).
+///
+/// The object-store sinks above accumulate encoded bytes; a warehouse sink
+/// needs the records themselves, because its commit is a statement it builds
+/// from them (`INSERT … SELECT FROM UNNEST`, `COPY`, `INSERT … FORMAT
+/// JSONEachRow`). The problem is the same one: the commit unit was the *page*
+/// unit, so a small `batch_size` meant one expensive warehouse operation per
+/// small page — slow and costly everywhere, and a hard "too many parts"
+/// failure on ClickHouse.
+///
+/// ## Why this is append-only
+///
+/// Accumulation is applied to the plain `write_batch` path and **not** to
+/// `write_batch_idempotent` or `write_batch_partial`:
+///
+/// - a commit token must land atomically with *its own* page, so deferring the
+///   write past the page the token names would make the watermark a lie;
+/// - a DLQ needs to know which rows of *this* page failed, which a deferred,
+///   merged commit cannot report.
+///
+/// This is the same carve-out the BigQuery sink makes for `write_batch_partial`
+/// (#612), for the same reasons.
+#[derive(Debug)]
+pub struct PageAccumulator {
+    rows: Vec<Value>,
+    bytes: usize,
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
+}
+
+impl PageAccumulator {
+    /// `max_rows`/`max_bytes` of `None` or `0` mean "no limit on this axis".
+    /// With neither set, the whole run commits once at `flush`.
+    pub fn new(max_rows: Option<usize>, max_bytes: Option<usize>) -> Self {
+        Self {
+            rows: Vec::new(),
+            bytes: 0,
+            max_rows: max_rows.filter(|n| *n > 0),
+            max_bytes: max_bytes.filter(|n| *n > 0),
+        }
+    }
+
+    /// Records held for the next commit.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether nothing is buffered.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Estimated serialized size of the buffered records.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Add a page and return the group to commit, if one is now full.
+    ///
+    /// The whole page is added before the check, so a group can overshoot by
+    /// at most one page — splitting a page across two commits would break the
+    /// DLQ's per-page row indices for any caller that later wants them, and
+    /// buys nothing when the threshold is a soft target.
+    pub fn push_page(&mut self, page: &[Value]) -> Option<Vec<Value>> {
+        for r in page {
+            // An estimate, not a measurement: serializing every record twice
+            // (once to size it, once to commit it) would cost more than the
+            // precision is worth for a rollover threshold.
+            self.bytes += estimate_size(r);
+            self.rows.push(r.clone());
+        }
+        let full = self.max_rows.is_some_and(|m| self.rows.len() >= m)
+            || self.max_bytes.is_some_and(|m| self.bytes >= m);
+        full.then(|| self.take())
+    }
+
+    /// Take whatever is buffered, for the `flush`-time commit.
+    pub fn finish(&mut self) -> Option<Vec<Value>> {
+        (!self.is_empty()).then(|| self.take())
+    }
+
+    fn take(&mut self) -> Vec<Value> {
+        self.bytes = 0;
+        std::mem::take(&mut self.rows)
+    }
+}
+
+/// Rough serialized size of a JSON value, without serializing it.
+///
+/// Used only to decide when a commit group is big enough, so it trades
+/// accuracy for not walking every value twice. Numbers and booleans are
+/// charged a flat width; strings their length plus quoting.
+fn estimate_size(v: &Value) -> usize {
+    match v {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(_) => 8,
+        Value::String(s) => s.len() + 2,
+        Value::Array(a) => 2 + a.iter().map(estimate_size).sum::<usize>() + a.len(),
+        Value::Object(m) => {
+            2 + m
+                .iter()
+                .map(|(k, v)| k.len() + 3 + estimate_size(v))
+                .sum::<usize>()
+        }
+    }
+}
+
+#[cfg(test)]
+mod page_accumulator_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn page(n: usize) -> Vec<Value> {
+        (0..n).map(|i| json!({ "id": i })).collect()
+    }
+
+    #[test]
+    fn small_pages_merge_into_one_commit_group() {
+        // The headline fix: `batch_size` could only ever *split* a page, so
+        // ten 10-row pages meant ten warehouse operations.
+        let mut acc = PageAccumulator::new(Some(100), None);
+        let mut commits = Vec::new();
+        for _ in 0..10 {
+            if let Some(g) = acc.push_page(&page(10)) {
+                commits.push(g);
+            }
+        }
+        assert_eq!(commits.len(), 1, "ten small pages → one commit");
+        assert_eq!(commits[0].len(), 100);
+        assert!(acc.finish().is_none(), "nothing left over");
+    }
+
+    #[test]
+    fn a_group_overshoots_by_at_most_one_page() {
+        // Pages are never split across commits, so the threshold is a soft
+        // target — pinned so a future "exact" rewrite has to justify itself.
+        let mut acc = PageAccumulator::new(Some(10), None);
+        let g = acc
+            .push_page(&page(25))
+            .expect("one page over the cap commits");
+        assert_eq!(g.len(), 25);
+    }
+
+    #[test]
+    fn the_byte_cap_rolls_independently_of_rows() {
+        let mut acc = PageAccumulator::new(None, Some(200));
+        let mut commits = 0;
+        for _ in 0..20 {
+            if acc.push_page(&page(5)).is_some() {
+                commits += 1;
+            }
+        }
+        assert!(commits > 0, "a byte cap must roll");
+    }
+
+    #[test]
+    fn no_cap_means_one_commit_for_the_whole_run() {
+        let mut acc = PageAccumulator::new(None, None);
+        for _ in 0..50 {
+            assert!(acc.push_page(&page(10)).is_none());
+        }
+        assert_eq!(acc.finish().expect("flush commits").len(), 500);
+    }
+
+    #[test]
+    fn a_zero_cap_means_no_limit() {
+        // `0` is the house "no limit" sentinel; reading it as "commit always"
+        // would restore the per-page behaviour this exists to remove.
+        let mut acc = PageAccumulator::new(Some(0), Some(0));
+        assert!(acc.push_page(&page(10)).is_none());
+        assert_eq!(acc.finish().expect("remainder").len(), 10);
+    }
+
+    #[test]
+    fn counters_track_the_open_group() {
+        let mut acc = PageAccumulator::new(Some(100), None);
+        assert!(acc.is_empty());
+        acc.push_page(&page(3));
+        assert_eq!(acc.len(), 3);
+        assert!(acc.bytes() > 0);
+        acc.finish();
+        assert!(acc.is_empty());
+        assert_eq!(acc.bytes(), 0, "finish resets the size estimate too");
+    }
+
+    #[test]
+    fn size_estimate_grows_with_real_content() {
+        // It only has to be monotonic in the data to be useful as a threshold.
+        let small = estimate_size(&json!({ "a": 1 }));
+        let big = estimate_size(&json!({ "a": 1, "b": "x".repeat(1000) }));
+        assert!(big > small + 900, "{small} vs {big}");
+        assert!(estimate_size(&json!([1, 2, 3])) > estimate_size(&json!([])));
+    }
+}

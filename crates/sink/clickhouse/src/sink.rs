@@ -15,6 +15,12 @@ pub struct ClickHouseSink {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     pub(crate) table_ready: std::sync::atomic::AtomicBool,
+    /// Records accumulated across `write_batch` calls (#617).
+    ///
+    /// ClickHouse creates one MergeTree part per insert, so an insert per
+    /// small page is not merely slow — it trips "too many parts", a hard
+    /// failure. Merging pages is the fix the engine actually wants.
+    pub(crate) pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
     pub(crate) config: ClickHouseSinkConfig,
     pub(crate) client: reqwest::Client,
     /// Resolved once in [`ClickHouseSink::new`] so the hot path never re-parses.
@@ -100,6 +106,21 @@ fn insert_params(
 }
 
 impl ClickHouseSink {
+    /// Insert one accumulated group, still re-chunked to `batch_size` so a
+    /// single HTTP request stays a reasonable size (#617).
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
+        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
+            vec![rows]
+        } else {
+            rows.chunks(self.config.batch_size).collect()
+        };
+        for chunk in chunks {
+            self.send_insert(chunk).await?;
+            tracing::debug!(records = chunk.len(), "ClickHouse insert chunk written");
+        }
+        Ok(())
+    }
+
     /// Make sure the target table exists before the first write (#580).
     async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
         use std::sync::atomic::Ordering;
@@ -127,9 +148,17 @@ impl ClickHouseSink {
 
     /// Run one DDL/DML statement through the HTTP interface.
     async fn execute_statement(&self, sql: &str) -> Result<(), FaucetError> {
-        let mut params: Vec<(String, String)> = vec![("query".into(), sql.to_string())];
-        params.push(("database".into(), self.config.connection.database.clone()));
-        let req = self.client.post(&self.base_url).query(&params);
+        // The statement rides the **body**, not the `query` param: a POST with
+        // no body has neither `Content-Length` nor chunked encoding, which
+        // ClickHouse rejects with HTTP 411. Sending the SQL as the body is
+        // also the shape that avoids URL-length limits on a long statement.
+        let params: Vec<(String, String)> =
+            vec![("database".into(), self.config.connection.database.clone())];
+        let req = self
+            .client
+            .post(&self.base_url)
+            .query(&params)
+            .body(sql.to_string());
         let req = apply_auth(req, &self.config.connection);
         let resp = req.send().await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
@@ -143,6 +172,10 @@ impl ClickHouseSink {
         let client = build_client(&config.connection)?;
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+                config.commit_rows,
+                config.commit_bytes,
+            )),
             config,
             client,
             base_url,
@@ -226,6 +259,23 @@ impl Sink for ClickHouseSink {
     /// When `batch_size > 0` and the page is larger, it is split into
     /// `batch_size`-row chunks, each sent as its own request. `batch_size = 0`
     /// forwards the whole page as a single request.
+    /// Commit whatever the cross-page accumulator holds (#617).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so a buffered group is always committed before the bookmark
+    /// advances — records left in the accumulator after a "successful" run
+    /// would be data loss with a green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let group = {
+            let mut open = self.pending.lock().await;
+            open.finish()
+        };
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
+        }
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
@@ -247,19 +297,17 @@ impl Sink for ClickHouseSink {
             ));
         }
 
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
+        // Accumulate across calls and insert once per threshold (#617): one
+        // insert per small page creates one MergeTree part per page, which
+        // ClickHouse rejects outright once they pile up.
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.push_page(records)
         };
-
-        let mut total = 0;
-        for chunk in chunks {
-            self.send_insert(chunk).await?;
-            total += chunk.len();
-            tracing::debug!(records = chunk.len(), "ClickHouse insert chunk written");
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
         }
-        Ok(total)
+        Ok(records.len())
     }
 
     fn config_schema(&self) -> Value {

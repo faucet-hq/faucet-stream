@@ -107,6 +107,29 @@ pub struct RedshiftSinkConfig {
     /// for any table you intend to query at scale.
     #[serde(default = "default_create_table")]
     pub create_table: bool,
+    /// Commit-group size for the cross-page accumulator (#617).
+    ///
+    /// Warehouse loads are dominated by per-operation overhead, and
+    /// `batch_size` can only ever *split* a page — it can never merge
+    /// undersized ones, so a small source page meant one expensive warehouse
+    /// operation per small page. Records now accumulate across `write_batch`
+    /// calls and commit once per threshold, plus once at `flush`.
+    ///
+    /// `None` (the default) accumulates the **whole run** into one commit.
+    /// Set it to bound how much is buffered, or to commit progressively on a
+    /// long run. `0` means the same as `None`.
+    ///
+    /// Only the append path accumulates: `delivery: exactly_once` and the DLQ
+    /// path commit per page, because a watermark must land with its own page
+    /// and a DLQ must report which rows of *this* page failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_rows: Option<usize>,
+    /// Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)
+    /// (#617). Rows are a poor proxy for how much work a warehouse commit is;
+    /// this bounds the buffered size. `None` (the default) removes the byte
+    /// threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_bytes: Option<usize>,
     /// Optional schema (namespace) qualifying [`table_name`](Self::table_name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
@@ -228,6 +251,8 @@ mod tests {
             connection: RedshiftConnection::new("host", "db", "user", "pw"),
             table_name: "events".into(),
             create_table: true,
+            commit_rows: None,
+            commit_bytes: None,
             schema: None,
             write_strategy: RedshiftWriteStrategy::Copy,
             copy: None,

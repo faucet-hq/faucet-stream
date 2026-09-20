@@ -32,7 +32,12 @@ pub(crate) fn redshift_type(t: faucet_core::SqlBaseType) -> &'static str {
         Integer => "BIGINT",
         Double => "DOUBLE PRECISION",
         Boolean => "BOOLEAN",
-        Text | Json => "VARCHAR(MAX)",
+        // `VARCHAR(65535)` rather than Redshift's `VARCHAR(MAX)` alias: they
+        // mean the same thing on Redshift, and the explicit width is also
+        // valid standard SQL — which is what lets the integration suite
+        // exercise this DDL against a Postgres stand-in rather than skipping
+        // it (there is no Redshift container).
+        Text | Json => "VARCHAR(65535)",
     }
 }
 
@@ -380,12 +385,12 @@ mod tests {
         .expect("a plan");
         let sql = build_create_table_sql(r#""public"."events""#, &cols);
         assert!(sql.contains(r#""id" BIGINT"#), "{sql}");
-        assert!(sql.contains(r#""name" VARCHAR(MAX)"#), "{sql}");
+        assert!(sql.contains(r#""name" VARCHAR(65535)"#), "{sql}");
         assert!(sql.contains(r#""amount" DOUBLE PRECISION"#), "{sql}");
         assert!(sql.contains(r#""ok" BOOLEAN"#), "{sql}");
         // Redshift has no JSON type; nested values land as the text the
         // writer already serialises them to.
-        assert!(sql.contains(r#""meta" VARCHAR(MAX)"#), "{sql}");
+        assert!(sql.contains(r#""meta" VARCHAR(65535)"#), "{sql}");
         assert!(sql.contains("IF NOT EXISTS"), "{sql}");
     }
 

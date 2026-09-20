@@ -99,6 +99,27 @@ the field (narrowing later is the `schema:` drift policy's job). The table is cr
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.
 
+
+## Commit accumulation (`commit_rows` / `commit_bytes`)
+
+Records **accumulate across `write_batch` calls** and commit once per
+threshold, plus once at `flush` (#617). Before this the commit unit was the
+page unit, and `batch_size` could only ever *split* an oversized page — it
+could never merge two undersized ones, so a small source page meant one
+expensive warehouse operation per small page. ClickHouse creates a MergeTree **part per insert**, so one insert per small page is not merely slow — it trips "too many parts", a hard failure. Merging pages is what the engine's own "insert in large batches" guidance asks for.
+
+- `commit_rows` — records per commit. `None` (the default) accumulates the
+  **whole run** into one commit.
+- `commit_bytes` — estimated-bytes counterpart, bounding how much is buffered.
+
+`batch_size` still bounds an individual request inside a commit group, so a
+very large group is split into reasonably-sized requests.
+
+**Only the append path accumulates.** `delivery: exactly_once` and the DLQ
+path commit per page, because a commit token must land atomically with its own
+page, and a DLQ must report which rows of *this* page failed — neither is
+expressible once pages are merged.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your
