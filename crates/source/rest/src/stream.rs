@@ -697,6 +697,23 @@ impl RestStream {
         }
     }
 
+    /// Page size for the whole-file tabular formats, or `None` when this is
+    /// not file mode (#624).
+    ///
+    /// `response_format: csv | excel` fetches one body that is the entire
+    /// table — `validate()` guarantees `pagination: none` — so the only place
+    /// a page boundary can come from is here. `0` is the house "no batching"
+    /// sentinel and keeps the single-page behaviour.
+    fn file_mode_page_size(&self, csv_page_size: usize) -> Option<usize> {
+        use crate::config::ResponseFormat;
+        matches!(
+            self.config.response_format,
+            ResponseFormat::Csv | ResponseFormat::Excel
+        )
+        .then_some(csv_page_size)
+        .filter(|n| *n > 0)
+    }
+
     fn drop_key_prefixes(&self) -> Vec<String> {
         let mut out = self.config.drop_key_prefixes.clone();
         if self.config.odata.is_some() && !out.iter().any(|p| p == "@odata.") {
@@ -1130,7 +1147,31 @@ impl RestStream {
                             running_max.clone()
                         };
                         bookmark_emitted = bookmark.is_some();
-                        yield faucet_core::StreamPage { records, bookmark };
+                        // File mode (`response_format: csv | excel`) downloads
+                        // the whole tabular body in one response, so without
+                        // this the entire sheet lands in a single page and the
+                        // pipeline holds every record at once (#624). The
+                        // bytes are still whole — there is no ranged parse of
+                        // a CSV over HTTP — but the *parsed* page is bounded.
+                        let chunk = self.file_mode_page_size(csv_page_size);
+                        if let Some(size) = chunk.filter(|s| records.len() > *s) {
+                            let total = records.len();
+                            let mut emitted = 0usize;
+                            for part in records.chunks(size) {
+                                emitted += part.len();
+                                let last = emitted == total;
+                                yield faucet_core::StreamPage {
+                                    records: part.to_vec(),
+                                    // Only the final chunk carries the
+                                    // bookmark: a mid-file checkpoint would
+                                    // claim progress the sink has not been
+                                    // handed yet.
+                                    bookmark: if last { bookmark.clone() } else { None },
+                                };
+                            }
+                        } else {
+                            yield faucet_core::StreamPage { records, bookmark };
+                        }
                         break;
                     }
 
@@ -2426,27 +2467,63 @@ impl faucet_core::Source for RestStream {
                 merged
             })
             .collect();
+        // `partition_concurrency` used to be honoured only by the buffering
+        // `fetch_all`, so the documented knob did nothing on the path the
+        // pipeline actually drives (#624 — the same no-op class as the
+        // object-store `concurrency` in #619). `1`, `0` and `None` all mean
+        // "one at a time", which is the pre-#624 behaviour.
+        let concurrency = self.config.partition_concurrency.unwrap_or(1).max(1);
         Box::pin(async_stream::try_stream! {
             // Per-partition streams each emit their own final bookmark; we
             // suppress those and emit a single consolidated (max) bookmark after
             // the last partition, so the persisted state is the global high-water
             // mark rather than whichever partition happened to finish last.
             let mut max_bookmark: Option<Value> = None;
-            for ctx in &contexts {
-                let mut inner = self.stream_pages_inner(Some(ctx), None, batch_size);
-                loop {
-                    let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
-                    match page {
-                        Some(Ok(p)) => {
-                            if let Some(bm) = p.bookmark {
-                                max_bookmark = value_max(max_bookmark.take(), bm);
-                                yield faucet_core::StreamPage { records: p.records, bookmark: None };
-                            } else {
-                                yield p;
+            if concurrency <= 1 {
+                for ctx in &contexts {
+                    let mut inner = self.stream_pages_inner(Some(ctx), None, batch_size);
+                    loop {
+                        let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
+                        match page {
+                            Some(Ok(p)) => {
+                                if let Some(bm) = p.bookmark {
+                                    max_bookmark = value_max(max_bookmark.take(), bm);
+                                    yield faucet_core::StreamPage { records: p.records, bookmark: None };
+                                } else {
+                                    yield p;
+                                }
                             }
+                            Some(Err(e)) => Err(e)?,
+                            None => break,
                         }
-                        Some(Err(e)) => Err(e)?,
-                        None => break,
+                    }
+                }
+            } else {
+                // Interleaved, not ordered: `flatten_unordered` polls up to
+                // `concurrency` partition streams at once, so pages arrive as
+                // each partition produces them. Partitions are disjoint by
+                // construction and the consolidated bookmark is a max over all
+                // of them, so interleaving changes throughput, not the
+                // persisted position — but a downstream that assumed
+                // partition-at-a-time page order no longer gets it.
+                use futures::StreamExt as _;
+                // Built eagerly into a `Vec` rather than mapped lazily: a
+                // closure returning a borrow-capturing stream is not
+                // higher-ranked enough for the combinator, and forcing it
+                // here costs one allocation per partition.
+                let mut inners = Vec::with_capacity(contexts.len());
+                for ctx in &contexts {
+                    inners.push(self.stream_pages_inner(Some(ctx), None, batch_size));
+                }
+                let mut merged =
+                    futures::stream::iter(inners).flatten_unordered(Some(concurrency));
+                while let Some(page) = merged.next().await {
+                    let p = page?;
+                    if let Some(bm) = p.bookmark {
+                        max_bookmark = value_max(max_bookmark.take(), bm);
+                        yield faucet_core::StreamPage { records: p.records, bookmark: None };
+                    } else {
+                        yield p;
                     }
                 }
             }

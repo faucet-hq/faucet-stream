@@ -219,7 +219,16 @@ pub struct RestStreamConfig {
     #[serde(default)]
     pub partitions: Vec<HashMap<String, Value>>,
     /// Maximum number of partitions to fetch concurrently.
-    /// `None` means sequential processing (backward compatible default).
+    /// `None` (and `0`/`1`) means sequential processing — the default.
+    ///
+    /// Honoured on **both** read paths since #624: the buffering `fetch_all`
+    /// and the `stream_pages` path the pipeline actually drives, where it used
+    /// to be silently ignored. Above 1, partition pages **interleave**: the
+    /// streams are polled together, so a page from partition 3 can arrive
+    /// before partition 1 has finished. Partitions are disjoint and the
+    /// persisted bookmark is a max across all of them, so this changes
+    /// throughput rather than the resume position — but a downstream that
+    /// assumed partition-at-a-time page order no longer gets it.
     #[serde(default)]
     pub partition_concurrency: Option<usize>,
 

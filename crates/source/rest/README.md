@@ -535,7 +535,7 @@ exactly-once delivery falls back to the ordinary record path.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `partitions` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per partition and concatenates results. Empty = run once with no substitution. |
-| `partition_concurrency` | int / null | `null` | Max partitions fetched concurrently. `null` = sequential. |
+| `partition_concurrency` | int / null | `null` | Max partitions fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the partitions' pages **interleave** — partitions are disjoint and the bookmark is a max across them, so only page order changes. |
 
 ## Authentication
 
@@ -826,7 +826,7 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 ## How it works
 
 1. `new()` resolves the auth method and builds the `reqwest` client **once**, reusing it for every request and partition.
-2. For each partition, `{key}` placeholders in `path` are substituted from the context map; with `partition_concurrency` set, partitions run concurrently.
+2. For each partition, `{key}` placeholders in `path` are substituted from the context map; with `partition_concurrency > 1`, partitions run concurrently and their pages interleave.
 3. Each page request is wrapped in the retry layer: transient failures back off exponentially with jitter (capped at 60 s); `429` honours `Retry-After`.
 4. Records are extracted from the response body via `records_path` (JSONPath); the pagination style decides the next request and when to stop.
 5. In `Incremental` mode, records at or before the bookmark are filtered out and the max replication-key value becomes the new bookmark, carried on the final page.

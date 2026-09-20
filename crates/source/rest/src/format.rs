@@ -211,8 +211,11 @@ pub fn parse_excel(
     sheet: Option<&str>,
     header_row: usize,
 ) -> Result<Vec<Value>, FaucetError> {
-    use calamine::{Data, Reader, Xlsx};
-    let cursor = std::io::Cursor::new(bytes.to_vec());
+    use calamine::{Reader, Xlsx};
+    // Borrow the body rather than copying it: `&[u8]` is `Read + Seek`, so the
+    // `to_vec()` here was a second whole-file allocation before calamine made
+    // its own (#624).
+    let cursor = std::io::Cursor::new(bytes);
     let mut wb: Xlsx<_> = calamine::open_workbook_from_rs(cursor)
         .map_err(|e| FaucetError::Source(format!("rest: opening Excel workbook: {e}")))?;
     let names = wb.sheet_names().to_vec();
@@ -237,16 +240,24 @@ pub fn parse_excel(
     let range = wb
         .worksheet_range(&name)
         .map_err(|e| FaucetError::Source(format!("rest: reading Excel sheet '{name}': {e}")))?;
-    let rows: Vec<&[Data]> = range.rows().collect();
-    let header = rows.get(header_row).ok_or_else(|| {
-        FaucetError::Source(format!(
-            "rest: Excel header_row {header_row} is beyond the sheet ({} rows)",
-            rows.len()
-        ))
-    })?;
-    let headers: Vec<String> = header.iter().map(cell_to_string).collect();
+    // Iterate the range twice rather than collecting every row into a `Vec`
+    // first (#624): `rows()` is a cheap iterator over the already-parsed
+    // range, so the collect bought nothing and cost one pointer per row on
+    // top of a sheet that is already fully in memory.
+    let headers: Vec<String> = range
+        .rows()
+        .nth(header_row)
+        .ok_or_else(|| {
+            FaucetError::Source(format!(
+                "rest: Excel header_row {header_row} is beyond the sheet ({} rows)",
+                range.rows().count()
+            ))
+        })?
+        .iter()
+        .map(cell_to_string)
+        .collect();
     let mut out = Vec::new();
-    for row in rows.iter().skip(header_row + 1) {
+    for row in range.rows().skip(header_row + 1) {
         let mut obj = Map::new();
         for (i, cell) in row.iter().enumerate() {
             let key = headers
