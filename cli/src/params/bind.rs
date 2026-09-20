@@ -137,7 +137,25 @@ pub fn resolve(
         let value = match supplied.get(name) {
             Some(raw) => {
                 reject_directives(name, raw)?;
-                spec::coerce(name, p.kind, raw)?
+                let coerced = spec::coerce(name, p.kind, raw)?;
+                // A closed `values:` set is checked here, at bind, so a typo'd
+                // value fails naming the alternatives rather than producing a
+                // config that is merely wrong (#648).
+                if !p.values.is_empty()
+                    && !p
+                        .values
+                        .iter()
+                        .any(|v| spec::values_match(p.kind, v, &coerced))
+                {
+                    let allowed: Vec<String> =
+                        p.values.iter().map(|v| value_to_string(v)).collect();
+                    return Err(CliError::Config(format!(
+                        "param '{name}': {} is not one of the allowed values ({})",
+                        value_to_string(&coerced),
+                        allowed.join(", ")
+                    )));
+                }
+                coerced
             }
             None => match &p.default {
                 // A default is authored in the config and already went through

@@ -30,6 +30,7 @@ pub async fn run(args: TemplateArgs) -> CliResult<()> {
         TemplateCommand::Promote(a) => promote(a).await,
         TemplateCommand::Delete(a) => delete(a).await,
         TemplateCommand::Run(a) => run_template(a).await,
+        TemplateCommand::Test(a) => test_suite(a).await,
     }
 }
 
@@ -801,6 +802,7 @@ pipeline:
                 secret: false,
                 description: None,
                 computed: None,
+                values: Vec::new(),
             },
         );
         params.insert(
@@ -811,6 +813,7 @@ pipeline:
                 default: Some(serde_json::json!(5)),
                 secret: false,
                 computed: None,
+                values: Vec::new(),
                 description: None,
             },
         );
@@ -869,4 +872,88 @@ pipeline:
         .await
         .expect("empty list is not an error");
     }
+}
+
+/// `faucet template test` — run a suite across a template's parameter space
+/// (#648).
+///
+/// Offline by default and by design: the validation tier materializes every
+/// combination and checks it expands and compiles, which catches the whole
+/// "param X breaks the config" class with no data, no network, and no credits.
+async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
+    use crate::templates::suite::{SuiteFile, Target, report::SuiteReport};
+
+    let cwd = std::env::current_dir()?;
+    let env_path =
+        crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
+    crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
+
+    let file = SuiteFile::from_path(&args.suite)?;
+    let select = args.select.as_deref().or(file.select.as_deref());
+
+    // A `template:` that names an existing file is tested straight from disk —
+    // no registry needed, which is the point at which most of these failures
+    // are cheapest to fix.
+    let as_path = std::path::Path::new(&file.template);
+    let (outcome, version) = if as_path.is_file() {
+        let body = std::fs::read_to_string(as_path).map_err(|e| {
+            CliError::Config(format!("template test: reading {}: {e}", as_path.display()))
+        })?;
+        (
+            crate::templates::suite::run(&file, Target::Document { body }, args.filter.as_deref())
+                .await?,
+            None,
+        )
+    } else {
+        let store_url = args.store.as_deref().ok_or_else(|| {
+            CliError::Config(format!(
+                "template test: `{}` is neither a readable config path nor usable without a \
+                 registry — pass --store (or FAUCET_TEMPLATE_STORE) to test a registered template",
+                file.template
+            ))
+        })?;
+        let store = crate::templates::resolve_store_url(store_url).await?;
+        let version =
+            crate::templates::suite::resolve_target_version(&store, &file.template, select).await?;
+        (
+            crate::templates::suite::run(
+                &file,
+                Target::Registered {
+                    store: &store,
+                    id: &file.template,
+                    version,
+                },
+                args.filter.as_deref(),
+            )
+            .await?,
+            Some(version),
+        )
+    };
+
+    if outcome.cases.is_empty() {
+        return Err(CliError::Config(match &args.filter {
+            Some(f) => format!("no cases match --filter '{f}'"),
+            None => "the suite produced no cases".into(),
+        }));
+    }
+
+    let report = SuiteReport::new(&file.template, version, &outcome);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|e| CliError::Internal(format!("template test report: {e}")))?
+        );
+    } else {
+        print!("{}", report.render_human());
+    }
+
+    // Exit code is the failed-case count, mirroring `faucet test`, so CI can
+    // gate on it without parsing output.
+    if report.failed > 0 {
+        return Err(CliError::TestsFailed {
+            failed: report.failed,
+        });
+    }
+    Ok(())
 }

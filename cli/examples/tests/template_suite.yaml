@@ -1,0 +1,70 @@
+# A parameter-combination test suite for a pipeline template (#648).
+#
+# A template fans out across a parameter space, and a change to one version can
+# silently break one corner of it — a param that no longer interpolates, a
+# value that yields an invalid config, a required param whose failure stopped
+# being clean. This turns that sweep into a red/green artifact:
+#
+#   faucet template test cli/examples/tests/template_suite.yaml
+#
+# The `template:` here is a **path**, so the suite runs with no registry at all
+# — which is when these failures are cheapest to fix. Point it at a registered
+# id instead (plus `--store`) to test what is actually live:
+#
+#   faucet template test suite.yaml --store sqlite:./faucet-templates.db
+#
+# Exit code is the failed-case count, so CI gates on it without parsing output.
+version: 1
+template: cli/examples/rest_to_jsonl_templated.yaml
+
+suite:
+  # Derived from the template's own `params:` block, so these stay correct as
+  # the template gains params rather than going stale the way a hand-written
+  # list does.
+  auto:
+    # One case per declared value of every param carrying a closed `values:`
+    # set — here, each of the three regions.
+    enum_coverage: true
+    # One case per `required` param, omitting it, asserting it fails *and* that
+    # the error names the param. Pins that a missing value fails cleanly
+    # instead of producing a config with a hole in it.
+    required_omitted: true
+    # The all-defaults combination — what most callers actually trigger, and
+    # the one most easily forgotten in a hand-written suite.
+    defaults_baseline: true
+
+  cases:
+    - name: eu-small-pages
+      params:
+        tenant_id: acme
+        api_token: t0ken
+        region: eu
+        page_size: 50
+
+    # A negative case. `error:` implies the combination must fail, and the
+    # message must mention the substring — so this stays a real assertion
+    # rather than "it failed somehow", which would also pass on an unrelated
+    # break.
+    - name: rejects-an-undeclared-region
+      params:
+        tenant_id: acme
+        api_token: t0ken
+        region: antarctica
+      expect:
+        error: region
+
+  # A generated sweep. Required params the sweep does not name (`tenant_id`,
+  # `api_token`) are filled automatically, so the cases test the axes below and
+  # nothing else.
+  combine:
+    params:
+      region: [us, eu, apac]
+      page_size: [1, 500]
+    exclude:
+      # A genuinely-invalid pairing is dropped here rather than hand-writing
+      # every valid one.
+      - { region: apac, page_size: 1 }
+    # Most param-interaction bugs involve two params, so all-pairs keeps the
+    # coverage that matters while holding the case count down. Leave it false
+    # while the product is small, as it is here.
+    pairwise: false

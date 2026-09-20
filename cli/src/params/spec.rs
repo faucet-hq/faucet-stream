@@ -91,6 +91,23 @@ pub struct ParamSpec {
     /// `accounts_domain: { computed: "${map:region|ca=zohocloud|*=zoho}" }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computed: Option<String>,
+
+    /// Closed set of acceptable values (#648).
+    ///
+    /// Without this a typo'd param value — `sink: jsonlines` — binds happily
+    /// and fails somewhere downstream, or worse produces a config that is
+    /// merely *wrong*. With it, the bind refuses and names the alternatives.
+    ///
+    /// It is also what makes a template's parameter space enumerable: the
+    /// `auto.enum_coverage` case generator in `faucet template test` derives
+    /// one case per listed value, so "does this template still work for every
+    /// sink it advertises?" is a red/green check rather than a manual sweep.
+    ///
+    /// Values are held to the declared `type` and compared after the same
+    /// coercion a supplied value gets, so `values: [1, 2]` on an `int` param
+    /// accepts the string `"1"` from a query string. Empty means unconstrained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<Value>,
 }
 
 impl ParamSpec {
@@ -104,6 +121,7 @@ impl ParamSpec {
             secret: false,
             description: None,
             computed: None,
+            values: Vec::new(),
         }
     }
 }
@@ -189,8 +207,47 @@ pub fn validate(spec: &ParamsSpec) -> CliResult<()> {
                 )));
             }
         }
+        if !p.values.is_empty() {
+            if p.computed.is_some() {
+                return Err(CliError::Config(format!(
+                    "param '{name}' is `computed` and cannot also declare `values` — its value \
+                     comes from the expression, not from a caller"
+                )));
+            }
+            // Every listed value must be a legal literal for the declared
+            // type, and the default (when there is one) must be in the set —
+            // otherwise the all-defaults case would fail its own constraint.
+            for v in &p.values {
+                if !default_matches(p.kind, v) {
+                    return Err(CliError::Config(format!(
+                        "param '{name}': value {v} in `values` is not a valid {} value",
+                        p.kind.as_str()
+                    )));
+                }
+            }
+            if let Some(d) = &p.default
+                && !p.values.iter().any(|v| values_match(p.kind, v, d))
+            {
+                return Err(CliError::Config(format!(
+                    "param '{name}': default {d} is not one of the declared `values`"
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether two literals name the same value for `kind`, after the coercion a
+/// caller-supplied value would get.
+///
+/// Compared post-coercion so `values: [1, 2]` on an `int` param accepts the
+/// string `"1"` a query string or `--param` delivers — otherwise the
+/// constraint would reject exactly the inputs it exists to guard.
+pub(crate) fn values_match(kind: ParamType, a: &Value, b: &Value) -> bool {
+    match (coerce("_", kind, a), coerce("_", kind, b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Coerce a caller-supplied value to the declared type.
@@ -259,6 +316,7 @@ mod tests {
             secret: false,
             description: None,
             computed: None,
+            values: Vec::new(),
         }
     }
 

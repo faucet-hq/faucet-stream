@@ -51,6 +51,8 @@
 //! distinction is enforced.
 
 pub mod store;
+#[cfg(feature = "templates")]
+pub mod suite;
 
 pub use store::{
     LaunchOutcome, Materialize, MaterializedConfig, RegisterRequest, TemplateStore, launch,

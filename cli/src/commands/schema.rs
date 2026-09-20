@@ -138,6 +138,13 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
             let s = faucet_core::schema_for!(crate::pipeline_test::spec::TestSpecFile);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
         }
+        #[cfg(feature = "templates")]
+        SchemaTarget::TemplateTest => {
+            serde_json::to_value(faucet_core::schema_for!(
+                crate::templates::suite::spec::SuiteFile
+            ))
+            .expect("schema serialization")
+        }
         #[cfg(feature = "notify")]
         SchemaTarget::Notifications => {
             // The `notifications:` block is a list; emit the per-rule schema.

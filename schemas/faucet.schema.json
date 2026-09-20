@@ -276,6 +276,11 @@
             "string",
             "null"
           ]
+        },
+        "values": {
+          "description": "Closed set of acceptable values (#648).\n\nWithout this a typo'd param value — `sink: jsonlines` — binds happily\nand fails somewhere downstream, or worse produces a config that is\nmerely *wrong*. With it, the bind refuses and names the alternatives.\n\nIt is also what makes a template's parameter space enumerable: the\n`auto.enum_coverage` case generator in `faucet template test` derives\none case per listed value, so \"does this template still work for every\nsink it advertises?\" is a red/green check rather than a manual sweep.\n\nValues are held to the declared `type` and compared after the same\ncoercion a supplied value gets, so `values: [1, 2]` on an `int` param\naccepts the string `\"1\"` from a query string. Empty means unconstrained.",
+          "type": "array",
+          "items": true
         }
       },
       "additionalProperties": false

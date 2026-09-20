@@ -34,6 +34,10 @@ params:
     type: string
     required: true
     secret: true
+  region:
+    type: string
+    default: us
+    values: [us, eu, apac]
 
 pipeline:
   source:
@@ -59,9 +63,24 @@ Fields per entry:
 | `default` | Value when the caller supplies none. An ordinary config scalar, so `default: "${env:SINCE}"` works. |
 | `secret` | Registered for redaction the instant it is bound — never reaches a log, an error message, an API response, the audit log, or the registry. |
 | `description` | Shown by `faucet template list` / `show`, `GET /v1/templates`, and the MCP `get_template` tool. |
+| `values` | Closed set of acceptable values. Anything else is rejected at bind time, naming the set. A `default` must be one of them. |
 
 Reference a param anywhere in the config as `${param.NAME}`. Write `$${param.x}`
 for a literal `${param.x}`.
+
+### Closed value sets
+
+`values:` turns a param into an **enumerable axis**. Without it a typo'd value —
+`region: ue` — binds happily and surfaces as a 404 halfway through a run; with it
+the bind fails up front and names the three it will accept:
+
+```
+param 'region': 'ue' is not one of the allowed values: apac, eu, us
+```
+
+Being enumerable is the other half: a
+[test suite](#testing-the-parameter-space) can sweep every declared value
+without being told what they are, so the sweep stays correct as the set grows.
 
 ### Types are real
 
@@ -350,6 +369,106 @@ keep `rollback` one command away. Point scheduled jobs at a channel
 (`--version prod`) when they must be pinned to a specific promotion train, and
 leave everything else unpinned so `launch` is your single release lever.
 
+## Testing the parameter space
+
+A template fans out across a parameter space, and a change to one version can
+silently break one corner of it — a param that no longer interpolates, a value
+that yields an invalid config, a required param whose failure stopped being
+clean. `faucet template test` turns that sweep into a red/green artifact:
+
+```bash
+faucet template test suite.yaml                                    # template: is a path
+faucet template test suite.yaml --store sqlite:./faucet-templates.db --select prod
+```
+
+```yaml
+version: 1
+# A registered id, or — as here — a path, so a template can be tested *before*
+# it is ever registered, which is when these failures are cheapest to fix.
+template: ./tenant-sync.yaml
+
+suite:
+  # Derived from the template's own `params:`, so these stay correct as the
+  # template gains params instead of going stale like a hand-written list.
+  auto:
+    enum_coverage: true      # one case per declared value of every `values:` param
+    required_omitted: true   # one per required param, omitted, expecting a named failure
+    defaults_baseline: true  # the all-defaults combination
+
+  cases:
+    - name: eu-small-pages
+      params: { tenant_id: acme, api_token: t0ken, region: eu, page_size: 50 }
+
+    # `error:` implies the case must fail *and* that the message mentions the
+    # substring — a real assertion rather than "it failed somehow", which would
+    # also pass on an unrelated break.
+    - name: rejects-an-undeclared-region
+      params: { tenant_id: acme, api_token: t0ken, region: antarctica }
+      expect: { error: region }
+
+  combine:
+    params:
+      region: [us, eu, apac]
+      page_size: [1, 500]
+    exclude:
+      - { region: apac, page_size: 1 }   # a genuinely-invalid pairing
+    pairwise: false                      # all-pairs instead of the full product
+
+  # Optional second tier: fixture records through the real pipeline, using
+  # `faucet test`'s matchers.
+  behavioral:
+    - name: shapes-a-record
+      params: { tenant_id: acme, api_token: t0ken }
+      input: [{ "Id": "1", "Name": "Acme" }]
+      expect: { records_written: 1 }
+```
+
+```
+template ./tenant-sync.yaml
+  ok   [explicit] eu-small-pages
+  ok   [explicit] rejects-an-undeclared-region
+  ok   [combine] page_size=1,region=us
+  …
+  ok   [auto] auto:missing-api_token
+  ok   [auto] auto:missing-tenant_id
+
+13 case(s): 13 passed, 0 failed
+```
+
+**Two tiers, both offline.** The default *validation* tier materializes the
+template for a combination exactly as a real trigger would, then expands it and
+compiles each row's transform chain (in topology mode it validates the graph
+instead — skipping that would let a broken graph pass). No network, no data, no
+sink, which is what makes it cheap enough to run on every change. The
+*behavioural* tier feeds fixture records through the real pipeline via the
+[`faucet test`](./testing.md) harness, reusing its matchers rather than
+reimplementing them.
+
+**Case origins.** Every case is labelled `explicit`, `combine`, `auto`, or
+`behavioral` in the report, because a red case nobody wrote is otherwise a
+mystery. Required params a `combine:` sweep does not name are filled
+automatically, so generated cases test the axes you listed and nothing else.
+
+**Guard rails.**
+
+- A cartesian product explodes quietly, so generation stops at **512 cases** with
+  an error rather than a truncation — a report covering a third of the space
+  would read green.
+- Set `pairwise: true` to reduce to an **all-pairs** set: most param-interaction
+  bugs involve two params, so this keeps the coverage that matters while turning
+  a multiplicative count into roughly the product of the two largest lists.
+- An `exclude:` entry naming no swept param is rejected — it can never match, and
+  it silently *widens* the tested space rather than narrowing it.
+- An empty suite is rejected. A suite with no cases reports green, which is worse
+  than no suite.
+- Duplicate case names are rejected (they make `--filter` ambiguous).
+
+`--filter '<pattern>'` runs a subset (`*` wildcards; a bare name is an exact
+match, so `--filter auto` does *not* match `auto:defaults`). `--json` emits the
+machine-readable report. The exit code is the failed-case count, mirroring
+`faucet test`, so CI gates on it without parsing output. `faucet schema
+template-test` prints the suite schema.
+
 ## Triggering over HTTP
 
 Point `faucet serve --history` at the same store and the same templates become
@@ -449,6 +568,7 @@ server). Non-clustered servers store no config body and are unaffected.
 ## See also
 
 - Runnable example: [`cli/examples/rest_to_jsonl_templated.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/rest_to_jsonl_templated.yaml)
+  and its suite [`cli/examples/tests/template_suite.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/tests/template_suite.yaml)
 - [`params:` reference](../reference/config.md#params) · [CLI reference](../reference/cli.md) · [HTTP API](../reference/http-api.md)
 - [Config composition](./composition.md) — `extends` / `profiles` / `!include`, for
   variation that is *static* rather than per-run

@@ -491,6 +491,36 @@ pub enum TemplateCommand {
     Delete(TemplateDeleteArgs),
     /// Materialize a template with the given params and run it locally.
     Run(TemplateRunArgs),
+    /// Run a parameter-combination test suite against a template (#648).
+    Test(TemplateTestArgs),
+}
+
+/// `faucet template test` — run a suite across a template's parameter space.
+#[cfg(feature = "templates")]
+#[derive(Debug, Parser)]
+pub struct TemplateTestArgs {
+    /// Suite file (YAML or JSON). See `faucet schema template-test`.
+    pub suite: PathBuf,
+    /// Registry store URL. Omit when the suite's `template:` is a path to a
+    /// config file — that form needs no registry, which is what lets a
+    /// template be tested before it is ever registered.
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    pub store: Option<String>,
+    /// Override the suite's `select:` version selector.
+    #[arg(long)]
+    pub select: Option<String>,
+    /// Run only cases whose name matches this pattern (`*` wildcards).
+    #[arg(long)]
+    pub filter: Option<String>,
+    /// Emit machine-readable JSON instead of the human checklist.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file to load for `${env:VAR}` interpolation.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
 }
 
 /// Where the template registry lives — shared by every `faucet template`
@@ -1569,6 +1599,9 @@ pub enum SchemaTarget {
     Masking,
     /// JSON Schema for the `faucet test` spec file.
     Test,
+    /// JSON Schema for a `faucet template test` suite file (#648).
+    #[cfg(feature = "templates")]
+    TemplateTest,
     /// Grammar reference for secrets-manager interpolation directives.
     Secrets,
     /// JSON Schema for the `schedule:` block.

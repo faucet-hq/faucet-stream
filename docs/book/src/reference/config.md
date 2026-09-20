@@ -239,6 +239,7 @@ params:
   since:     { default: "1970-01-01" }
   page_size: { type: int, default: 500 }
   api_token: { required: true, secret: true }
+  region:    { default: us, values: [us, eu, apac] }
 ```
 
 | Field | Default | Meaning |
@@ -249,6 +250,15 @@ params:
 | `secret` | `false` | Registered for redaction the instant it is bound — never reaches a log, error, API response, audit record, or the template registry. |
 | `description` | — | Surfaced by `faucet template list`/`show`, `GET /v1/templates`, and the MCP `get_template` tool. |
 | `computed` | — | A **derived** value (see below). Mutually exclusive with `required`, `default`, and `secret`; excluded from the trigger surface. |
+| `values` | — | Closed set of acceptable values. Anything else is rejected at bind time, naming the allowed set. Mutually exclusive with `computed`; a `default` must be one of them. |
+
+**Closed value sets.** `values:` turns a param into an enumerable axis. Without
+it a typo'd value — `region: ue` — binds happily and surfaces as a 404 mid-run;
+with it the bind fails up front naming the three allowed values. It also makes
+the axis machine-enumerable, which is what a
+[template test suite's](../cookbook/templates.md#testing-the-parameter-space)
+`auto.enum_coverage` sweeps. Each listed value must match the declared `type`,
+and a `default` must be one of them.
 
 **Computed params & `${map:…}`.** A param can be *derived* from other params
 instead of supplied, via `computed:` — resolved after the ordinary params bind

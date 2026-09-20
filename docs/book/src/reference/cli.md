@@ -669,6 +669,8 @@ faucet template deprecate tenant-sync --reason "superseded"      # retire (`--un
 faucet template run       tenant-sync --store sqlite:./faucet-templates.db \
   --version prod --param tenant_id=acme --param-env API_HOST=eu.example.com
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
+faucet template test      suite.yaml                            # suite names a config path — no registry
+faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
 ```
 
 Register a config declaring [`params:`](config.md#params) **once**, then trigger
@@ -689,6 +691,9 @@ runs by id — the register-once / trigger-by-id model. See the
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
 | `--dry-run` | *(run)* Materialize and validate without writing to any sink. |
 | `--limit <n>` | *(run)* Stop after writing this many records. |
+| `--suite <path>` | *(test)* Positional: the suite file (YAML or JSON). `faucet schema template-test` prints its schema. |
+| `--select <n\|channel>` | *(test)* Override the suite's own `select:`. Ignored when the suite's `template:` is a path. |
+| `--filter <pattern>` | *(test)* Run only cases whose name matches; `*` wildcards, otherwise an exact match. |
 | `--json` | Machine-readable output for every subcommand. |
 
 Every `register` appends a new **numeric version** (auto-incrementing from 1) and
@@ -718,6 +723,19 @@ a file (`… --clean > template.yaml`); `${param.…}` placeholders are preserve
 observability, lineage, notifications, the catalog, and SLA evaluation all behave
 the same. The stored body is verbatim — `${env:…}` / `${vault:…}` resolve at
 trigger time, never at registration.
+
+`faucet template test` sweeps a template's **parameter space** offline: each case
+materializes the template exactly as a real trigger would, then expands it and
+compiles each row's transform chain (or validates the graph, in topology mode).
+No network, no data, no sink. Cases come from three places — hand-written
+`cases:`, a generated `combine:` product (with `exclude:` and an all-pairs
+`pairwise:` reduction), and `auto:` cases derived from the template's own
+`params:` — and a `behavioral:` block runs fixture records through the real
+pipeline with `faucet test`'s matchers. When the suite's `template:` names a
+readable config path, no registry is involved at all, so a template can be tested
+before it is ever registered. The exit code is the failed-case count, mirroring
+`faucet test`. See
+[Testing the parameter space](../cookbook/templates.md#testing-the-parameter-space).
 
 ## `notify`
 
