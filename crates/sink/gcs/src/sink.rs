@@ -43,18 +43,6 @@ impl GcsSink {
         format!("projects/_/buckets/{}", self.config.bucket)
     }
 
-    /// Serialize a slice of records as a JSON Lines byte buffer.
-    fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
-        let mut buf: Vec<u8> = Vec::new();
-        for record in records {
-            let line = serde_json::to_vec(record)
-                .map_err(|e| FaucetError::Sink(format!("JSON serialization failed: {e}")))?;
-            buf.extend_from_slice(&line);
-            buf.push(b'\n');
-        }
-        Ok(buf)
-    }
-
     /// Generate a time-sortable UUIDv7 object name.
     fn generate_key(&self) -> String {
         generate_object_key(&self.config.prefix, &self.config.file_extension)
@@ -96,13 +84,6 @@ impl GcsSink {
         Ok(())
     }
 
-    /// Compute the effective chunk size combining `batch_size` and
-    /// `max_records_per_file`. `batch_size = 0` removes the batch-size
-    /// limit; `max_records_per_file = None` removes the file-rollover
-    /// limit. When both are unlimited, returns `usize::MAX` (single chunk).
-    fn effective_chunk_size(&self) -> usize {
-        resolve_effective_chunk_size(&self.config)
-    }
 }
 
 #[async_trait]
@@ -134,13 +115,16 @@ impl faucet_core::Sink for GcsSink {
         if records.is_empty() {
             return Ok(0);
         }
-        let chunk = self.effective_chunk_size();
         let concurrency = self.config.concurrency.max(1);
         let written = records.len();
 
         // Parquet path: encode each chunk as a self-contained Parquet object.
+        // Parquet objects are self-describing and carry their own footer, so
+        // they are not accumulated across pages — a rolled-over half-file
+        // would not be readable.
         #[cfg(feature = "arrow")]
         if matches!(self.config.format, GcsSinkFormat::Parquet) {
+            let chunk = resolve_effective_chunk_size(&self.config);
             let uploads: Vec<(String, Vec<u8>)> = records
                 .chunks(chunk)
                 .map(|slice| {
@@ -203,7 +187,7 @@ impl faucet_core::Sink for GcsSink {
         }
 
         let n = batch.num_rows();
-        let cap = self.effective_chunk_size().min(n).max(1);
+        let cap = resolve_effective_chunk_size(&self.config).min(n).max(1);
         let concurrency = self.config.concurrency.max(1);
         let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         let mut offset = 0usize;
@@ -350,8 +334,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn serialize_jsonl_two_records() {
-        let body = GcsSink::serialize_jsonl(&[json!({"a": 1}), json!({"b": 2})]).unwrap();
+    fn records_encode_as_ndjson() {
+        // The encoding moved into `faucet_core::ObjectAccumulator` with the
+        // cross-page accumulation (#618) — pinned here too, because this is
+        // what lands in the bucket.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        acc.push_record(&json!({"a": 1})).unwrap();
+        let faucet_core::object_rollover::Emit::Object(obj) =
+            acc.push_record(&json!({"b": 2})).unwrap()
+        else {
+            panic!("rolled at 2 records");
+        };
+        let body = obj.body;
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
             "{\"a\":1}\n{\"b\":2}\n"
@@ -359,9 +353,11 @@ mod tests {
     }
 
     #[test]
-    fn serialize_jsonl_empty_is_empty() {
-        let body = GcsSink::serialize_jsonl(&[]).unwrap();
-        assert!(body.is_empty());
+    fn an_empty_accumulator_writes_no_object() {
+        // An empty page must not mint a zero-byte object — a listing full of
+        // those is the small-files problem in its purest form.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        assert!(acc.finish().is_none());
     }
 
     #[test]

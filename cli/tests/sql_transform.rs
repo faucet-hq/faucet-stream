@@ -32,7 +32,7 @@ pipeline:
     type: csv
     config:
       path: "{orders}"
-      has_header: true
+      has_headers: true
       batch_size: 0
   transforms:
     - type: sql

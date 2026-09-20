@@ -6,7 +6,8 @@ use crate::config::S3SinkFormat;
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use faucet_core::FaucetError;
-use futures::stream::{self, StreamExt, TryStreamExt};
+#[cfg(feature = "arrow")]
+use futures::stream::{StreamExt, TryStreamExt};
 use serde_json::Value;
 
 /// A sink that writes JSON records to S3 as JSON Lines files (or, with the
@@ -89,18 +90,6 @@ impl S3Sink {
         let sdk_config = config_loader.load().await;
         let client = Client::new(&sdk_config);
         Ok(client)
-    }
-
-    /// Serialize a slice of records as JSON Lines bytes.
-    fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
-        let mut buf: Vec<u8> = Vec::new();
-        for record in records {
-            let line = serde_json::to_vec(record)
-                .map_err(|e| FaucetError::Sink(format!("JSON serialization failed: {e}")))?;
-            buf.extend_from_slice(&line);
-            buf.push(b'\n');
-        }
-        Ok(buf)
     }
 
     /// Generate a unique S3 key for a file.
@@ -247,7 +236,7 @@ impl S3Sink {
         prepared: Vec<(String, Vec<u8>)>,
     ) -> Result<(), FaucetError> {
         let concurrency = self.config.concurrency.max(1);
-        stream::iter(prepared)
+        futures::stream::iter(prepared)
             .map(|(key, body)| async move {
                 self.client
                     .put_object()
@@ -480,12 +469,22 @@ mod tests {
     }
 
     #[test]
-    fn serialize_jsonl_produces_newline_delimited() {
+    fn records_encode_as_ndjson() {
         let records = vec![
             json!({"id": 1, "name": "Alice"}),
             json!({"id": 2, "name": "Bob"}),
         ];
-        let result = S3Sink::serialize_jsonl(&records).unwrap();
+        // The encoding moved into `faucet_core::ObjectAccumulator` with the
+        // cross-page accumulation (#618) — pinned here too, because this is
+        // what lands in the bucket.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(records.len()), None);
+        let mut body = Vec::new();
+        for r in &records {
+            if let faucet_core::object_rollover::Emit::Object(obj) = acc.push_record(r).unwrap() {
+                body = obj.body;
+            }
+        }
+        let result = body;
         let text = String::from_utf8(result).unwrap();
         let lines: Vec<&str> = text.trim().split('\n').collect();
         assert_eq!(lines.len(), 2);
@@ -495,8 +494,11 @@ mod tests {
     }
 
     #[test]
-    fn serialize_jsonl_empty() {
-        let result = S3Sink::serialize_jsonl(&[]).unwrap();
+    fn an_empty_accumulator_writes_no_object() {
+        // An empty page must not mint a zero-byte object.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        assert!(acc.finish().is_none());
+        let result: Vec<u8> = Vec::new();
         assert!(result.is_empty());
     }
 
