@@ -1195,6 +1195,62 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Connector config keys that mean "how many concurrent connections/fetches",
+/// in the order they are preferred when a run-level override is applied (#610).
+///
+/// Ordered rather than a per-kind table so a third-party connector that names
+/// its knob one of these gets the override for free, and so the choice is
+/// deterministic for a connector that declares more than one.
+const CONCURRENCY_KNOBS: [&str; 4] = [
+    "max_connections",
+    "partition_concurrency",
+    "shard_concurrency",
+    "concurrency",
+];
+
+/// Apply a run-level concurrency override to one connector's config (#610).
+///
+/// Multi-tenant reality: the same template drives a customer with beefy read
+/// replicas and one with a small instance, and the pool size is otherwise
+/// baked into the config. This rewrites whichever knob the connector actually
+/// **declares in its own JSON Schema** — so it is a no-op, not a config error,
+/// for a connector that has no such knob (schemaless file sinks, stdout), and
+/// it can never introduce a key that H9's unknown-key gate would then reject.
+///
+/// Returns the key it set, for logging and tests.
+pub fn apply_concurrency_override(
+    schema: &Value,
+    config: &mut Value,
+    n: usize,
+) -> Option<&'static str> {
+    let declared = schema.get("properties")?.as_object()?;
+    let knob = CONCURRENCY_KNOBS
+        .into_iter()
+        .find(|k| declared.contains_key(*k))?;
+    config.as_object_mut()?.insert(
+        knob.to_string(),
+        Value::Number(serde_json::Number::from(n as u64)),
+    );
+    Some(knob)
+}
+
+/// Apply [`apply_concurrency_override`] to a **source** config, resolving the
+/// schema by kind. No-op when the kind is unknown to this build.
+pub fn override_source_concurrency(
+    kind: &str,
+    config: &mut Value,
+    n: usize,
+) -> Option<&'static str> {
+    let schema = source_schema(kind).ok()?;
+    apply_concurrency_override(&schema, config, n)
+}
+
+/// Apply [`apply_concurrency_override`] to a **sink** config.
+pub fn override_sink_concurrency(kind: &str, config: &mut Value, n: usize) -> Option<&'static str> {
+    let schema = sink_schema(kind).ok()?;
+    apply_concurrency_override(&schema, config, n)
+}
+
 fn check<T: DeserializeOwned>(kind: &'static str, name: &str, config: Value) -> CliResult<()> {
     decode::<T>(kind, name, config).map(|_| ())
 }
@@ -2957,5 +3013,90 @@ mod tests {
         let err = validate_sink_config("bigquery", "row", bad)
             .expect_err("a typo'd flattened key must be rejected");
         assert!(err.to_string().contains("write_modes"), "{err}");
+    }
+
+    #[test]
+    fn concurrency_override_sets_the_first_declared_knob() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "connection_url": {}, "max_connections": {}, "batch_size": {} }
+        });
+        let mut cfg = json!({ "connection_url": "postgres://u@h/db", "max_connections": 10 });
+        assert_eq!(
+            apply_concurrency_override(&schema, &mut cfg, 20),
+            Some("max_connections")
+        );
+        assert_eq!(
+            cfg["max_connections"], 20,
+            "the override must win over the config"
+        );
+        assert_eq!(
+            cfg["connection_url"], "postgres://u@h/db",
+            "nothing else touched"
+        );
+    }
+
+    #[test]
+    fn concurrency_override_is_a_no_op_without_a_knob() {
+        // A schemaless file sink has nothing to override. Silently adding a key
+        // would also be caught by the unknown-key gate, so this must not write.
+        let schema = json!({ "type": "object", "properties": { "path": {} } });
+        let mut cfg = json!({ "path": "./out.jsonl" });
+        assert_eq!(apply_concurrency_override(&schema, &mut cfg, 20), None);
+        assert_eq!(cfg, json!({ "path": "./out.jsonl" }));
+    }
+
+    #[test]
+    fn concurrency_override_prefers_knobs_in_a_fixed_order() {
+        // A connector declaring two must resolve deterministically, or the same
+        // request would tune different things on different builds.
+        let schema = json!({
+            "type": "object",
+            "properties": { "concurrency": {}, "max_connections": {} }
+        });
+        let mut cfg = json!({});
+        assert_eq!(
+            apply_concurrency_override(&schema, &mut cfg, 3),
+            Some("max_connections")
+        );
+        assert!(cfg.get("concurrency").is_none());
+    }
+
+    #[cfg(feature = "source-postgres")]
+    #[test]
+    fn a_real_source_schema_resolves_to_its_pool_knob() {
+        let mut cfg = json!({ "connection_url": "postgres://u@h/db", "query": "SELECT 1" });
+        assert_eq!(
+            override_source_concurrency("postgres", &mut cfg, 20),
+            Some("max_connections")
+        );
+        assert_eq!(cfg["max_connections"], 20);
+        // The result must still deserialize — an override that produced an
+        // invalid config would fail only at run time.
+        validate_source_config("postgres", "row", cfg).expect("overridden config stays valid");
+    }
+
+    #[cfg(feature = "source-rest")]
+    #[test]
+    fn the_rest_source_resolves_to_its_partition_knob() {
+        let mut cfg = json!({ "base_url": "https://api.example.com", "path": "/x" });
+        assert_eq!(
+            override_source_concurrency("rest", &mut cfg, 6),
+            Some("partition_concurrency")
+        );
+        assert_eq!(cfg["partition_concurrency"], 6);
+    }
+
+    #[test]
+    fn an_unknown_connector_kind_is_ignored_rather_than_erroring() {
+        let mut cfg = json!({ "a": 1 });
+        assert_eq!(
+            override_source_concurrency("not-a-connector", &mut cfg, 4),
+            None
+        );
+        assert_eq!(
+            override_sink_concurrency("not-a-connector", &mut cfg, 4),
+            None
+        );
     }
 }

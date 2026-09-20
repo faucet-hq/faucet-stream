@@ -21,6 +21,7 @@ fn opts(name: &str, max_concurrent: Option<usize>) -> ExecuteOptions {
             on_error: faucet_cli::config::OnError::Continue,
             adaptive_batch_size: None,
         }),
+        concurrency: None,
         dry_run: false,
         limit: None,
         state_path_override: None,

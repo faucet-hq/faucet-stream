@@ -220,6 +220,7 @@ pub async fn submit_backfill(
             callback: None,
             idempotency_key: Some(format!("backfill:{hash}:{}", unit.id)),
             clock: Some(unit.start.to_rfc3339()),
+            concurrency: None,
         };
         match runner::submit(state.clone(), submit, actor.clone()).await {
             Ok(resp) => {

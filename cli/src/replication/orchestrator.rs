@@ -92,6 +92,7 @@ fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> Ex
         pipeline_name: opts.pipeline_name.clone(),
         run_id: None,
         execution: opts.execution.clone(),
+        concurrency: None,
         dry_run: false,
         limit: None,
         state_path_override: None,

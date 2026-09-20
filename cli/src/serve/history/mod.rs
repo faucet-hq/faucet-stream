@@ -127,6 +127,12 @@ pub struct RunRecord {
     pub timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock: Option<String>,
+    /// Run-level connector-concurrency override (#610). Persisted alongside
+    /// `clock` because a cluster peer re-runs from this record and must apply
+    /// the same override — otherwise a failover would silently run at the
+    /// config's default pool size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
     /// Failover re-run count (cluster mode). 0 on first submit.
     #[serde(default)]
     pub attempt: u32,
@@ -173,6 +179,7 @@ impl RunRecord {
             config_format: None,
             timeout_secs: None,
             clock: None,
+            concurrency: None,
             attempt: 0,
             replay_of: None,
             callback: None,

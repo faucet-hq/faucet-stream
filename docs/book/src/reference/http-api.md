@@ -121,6 +121,19 @@ Request body:
   submit returns `422` with the doctor report in `error.details`.
 - **`idempotency_key`** — replay protection (see cookbook).
 - **`clock`** — overrides the `${now.*}` clock for backfills (default: submit time).
+- **`concurrency`** — overrides this run's **connector** concurrency: how many
+  concurrent connections/fetches the source and sink may use, whatever the
+  config says. This is the multi-tenant knob — one template driving a customer
+  with beefy read replicas and one with a small instance, without per-customer
+  config copies or the template author pre-declaring a `${param.*}`. It maps
+  onto whichever knob the connector declares (`max_connections` /
+  `partition_concurrency` / `shard_concurrency` / `concurrency`), so a
+  connector with none ignores it. It does **not** change matrix parallelism
+  (`execution.max_concurrent`) or the server's `--max-concurrent` slots, and it
+  caps only the *client* side — it cannot raise what the upstream will accept.
+  Per-shard for a sharded run. `0` is rejected. It is part of the idempotency
+  fingerprint, so replaying a key with a different value is a 409, not a
+  replay.
 - **`callback`** — a per-run completion callback; see below.
 
 Response (`202`):
@@ -432,7 +445,7 @@ second request. Use `?version=newest` to read a `draft` template.
 
 The trigger body's `params` / `env` / `version` are template-specific; every other
 field (`name`, `labels`, `timeout_secs`, `doctor_first`, `idempotency_key`,
-`clock`) behaves exactly as in `POST /v1/runs`, because the run is submitted
+`clock`, `concurrency`) behaves exactly as in `POST /v1/runs`, because the run is submitted
 through the same path. The run is labelled `template` and `template_version`.
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing

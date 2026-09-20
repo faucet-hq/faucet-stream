@@ -1211,6 +1211,14 @@ pub struct RunArgs {
     /// Override the state-store directory (file backend only).
     #[arg(long)]
     pub state_path: Option<PathBuf>,
+    /// Override this run's **connector** concurrency — how many concurrent
+    /// connections/fetches the source and sink may use — whatever the config
+    /// says. Maps onto whichever knob the connector declares
+    /// (`max_connections` / `partition_concurrency` / `shard_concurrency` /
+    /// `concurrency`); a connector with none ignores it. Does not change
+    /// matrix parallelism (`execution.max_concurrent`). Must be > 0.
+    #[arg(long, value_name = "N")]
+    pub concurrency: Option<usize>,
     /// Override the `${now.*}` interpolation clock (RFC3339 like
     /// `2026-01-31T00:00:00Z`, or a date `2026-01-31`). Default: process start (UTC).
     /// Use for backfills.

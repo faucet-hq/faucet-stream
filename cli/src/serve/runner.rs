@@ -44,6 +44,21 @@ pub struct SubmitRequest {
     #[serde(default)]
     pub doctor_first: bool,
     pub idempotency_key: Option<String>,
+    /// Override this run's **connector** concurrency (#610): how many
+    /// concurrent connections/fetches the source and sink may use, whatever
+    /// the config says.
+    ///
+    /// The multi-tenant knob — the same template driving a customer with beefy
+    /// read replicas and one with a small instance, without per-customer
+    /// copies of the config or the template author having to pre-declare a
+    /// `${param.*}` for it. Mapped onto whichever knob the connector declares
+    /// (`max_connections` / `partition_concurrency` / `shard_concurrency` /
+    /// `concurrency`); a connector with none ignores it. Does **not** change
+    /// matrix parallelism or the server's own `--max-concurrent` slots, and it
+    /// caps only the *client* side — it cannot exceed what the upstream will
+    /// actually accept. Must be > 0. Per-shard for a sharded run.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
     pub clock: Option<String>,
     /// Optional completion callback fired when this run reaches a terminal
     /// state (#481). Validated at submit time so a bad destination is a 422 on
@@ -167,6 +182,7 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             rec.submitted_at,
             rec.timeout_secs,
             rec.clock.clone(),
+            rec.concurrency,
             false,
         )
         .await;
@@ -349,6 +365,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             coop,
             run.timeout_secs,
             run.clock.clone(),
+            run.concurrency,
             run.submitted_at,
         )
         .await;
@@ -383,6 +400,7 @@ async fn execute_shard(
     coop: CancellationToken,
     timeout_secs: Option<u64>,
     clock_flag: Option<String>,
+    concurrency: Option<usize>,
     submitted_at: DateTime<Utc>,
 ) -> bool {
     let LoadedSubmission { cfg, nodes } = loaded;
@@ -435,6 +453,7 @@ async fn execute_shard(
         // sharded run reports the same `run_id`; they differ by `invocation_id`.
         run_id: Some(run_id.to_string()),
         execution: cfg.execution.clone(),
+        concurrency,
         dry_run: false,
         limit: None,
         state_path_override: None,
@@ -650,6 +669,17 @@ pub async fn submit(
     req: SubmitRequest,
     actor: AuthContext,
 ) -> Result<SubmitResponse, ServeError> {
+    // `0` is rejected rather than clamped: under the house sentinel it reads as
+    // "unlimited", but here it would mean "no connections" — far enough apart
+    // that guessing either way would be wrong (#610).
+    if req.concurrency == Some(0) {
+        return Err(ServeError::Unprocessable {
+            message: "concurrency must be greater than 0 — it is a connection/fetch count,                       not a `0 = unlimited` sentinel"
+                .into(),
+            details: None,
+        });
+    }
+
     let format: ConfigFormat = req.config_format.into();
     let loaded = load_submission(&req.config, format, state.default_base().as_ref()).await?;
 
@@ -713,6 +743,7 @@ pub async fn submit(
             &fp_config,
             req.clock.as_deref(),
             req.timeout_secs,
+            req.concurrency,
             &req.labels,
         );
         match state
@@ -772,6 +803,7 @@ pub async fn submit(
         rec.config_format = Some(req.config_format.into());
         rec.timeout_secs = req.timeout_secs;
         rec.clock = req.clock.clone();
+        rec.concurrency = req.concurrency;
         if let Err(e) = state.history().upsert(&rec).await {
             // The record write that should follow a `Fresh` claim failed — release
             // the orphaned claim so a replay starts fresh instead of 404-ing for
@@ -1100,6 +1132,7 @@ fn spawn_run(
             submitted_at,
             req.timeout_secs,
             req.clock,
+            req.concurrency,
             true,
         )
         .await;
@@ -1121,6 +1154,7 @@ async fn execute_run(
     submitted_at: DateTime<Utc>,
     timeout_secs: Option<u64>,
     clock_flag: Option<String>,
+    concurrency: Option<usize>,
     from_queue: bool,
 ) {
     let server_shutdown = state.shutdown_token();
@@ -1247,6 +1281,7 @@ async fn execute_run(
         // matched back to the submission (#480).
         run_id: Some(run_id.clone()),
         execution: cfg.execution.clone(),
+        concurrency,
         dry_run: false,
         limit: None,
         state_path_override: None,
@@ -1575,6 +1610,7 @@ mod tests {
             callback: None,
             idempotency_key: Some("k".into()),
             clock: None,
+            concurrency: None,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -1648,6 +1684,7 @@ mod tests {
             callback: None,
             idempotency_key: None,
             clock: None,
+            concurrency: None,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -1843,6 +1880,7 @@ mod tests {
             callback: None,
             idempotency_key: None,
             clock: None,
+            concurrency: None,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(
@@ -2184,6 +2222,7 @@ mod tests {
                 CancellationToken::new(),
                 None,
                 None,
+                None,
                 Utc::now(),
             )
             .await;
@@ -2321,6 +2360,7 @@ mod tests {
                 "0",
                 ShardSpec::whole(),
                 CancellationToken::new(),
+                None,
                 None,
                 None,
                 Utc::now(),

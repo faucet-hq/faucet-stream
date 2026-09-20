@@ -24,6 +24,7 @@ fn args(config: PathBuf, row: Option<String>, json: bool) -> HistoryArgs {
 fn record(id: &str, row_id: &str) -> RunRecord {
     let t = Utc::now();
     RunRecord {
+        concurrency: None,
         run_id: id.into(),
         name: Some("demo".into()),
         labels: Default::default(),

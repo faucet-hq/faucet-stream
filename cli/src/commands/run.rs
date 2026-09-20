@@ -50,6 +50,16 @@ async fn drive_progress_or_plain<T>(
 
 /// Execute the `run` subcommand.
 pub async fn run(args: RunArgs) -> CliResult<()> {
+    // Rejected up front rather than silently clamped: `--concurrency 0` reads
+    // as "unlimited" under the house `0` sentinel but would mean "no
+    // connections" here, and the two readings are far enough apart that
+    // guessing would be wrong either way (#610).
+    if args.concurrency == Some(0) {
+        return Err(CliError::Config(
+            "--concurrency must be greater than 0 (it is a connection/fetch count,              not a `0 = unlimited` sentinel)"
+                .into(),
+        ));
+    }
     let cwd = std::env::current_dir()?;
     let env_path =
         crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
@@ -257,6 +267,7 @@ pub(crate) async fn execute(
             pipeline_name: pipeline_name.clone(),
             run_id: None,
             execution: cfg.execution.clone(),
+            concurrency: args.concurrency,
             dry_run: args.dry_run,
             limit: args.limit,
             state_path_override: args.state_path.clone(),
