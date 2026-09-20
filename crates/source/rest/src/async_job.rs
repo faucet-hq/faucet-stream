@@ -192,6 +192,54 @@ pub struct AsyncJobConfig {
     /// dataset name.
     #[serde(default = "default_query_path")]
     pub query_path: String,
+    /// Skip the job entirely and read through the source's **ordinary
+    /// paginated path** when a cheap probe says the object is small (#629).
+    ///
+    /// An async bulk API has a fixed async floor — job queue plus processing,
+    /// measured at ~14s of a 22s 701-row Salesforce `User` run — that is paid
+    /// whatever the row count. A synchronous query API answers the same
+    /// request immediately. Bulk is still right for the large objects it was
+    /// designed for, so the choice is per-run and made from data rather than
+    /// from a guess baked into the config.
+    ///
+    /// Requires [`count`](Self::count). The source's own `path` / `params` /
+    /// `pagination` describe the synchronous read, so a config that opts in
+    /// carries both shapes and faucet picks between them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_below_rows: Option<u64>,
+    /// Row-count probe for [`sync_below_rows`](Self::sync_below_rows) — a
+    /// request plus a JSONPath to the count in its response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<RowCountProbe>,
+}
+
+/// A cheap row-count request, used to decide between the async-job and the
+/// synchronous read paths (#629).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RowCountProbe {
+    /// The probe request (e.g. `SELECT COUNT() FROM Account` through a
+    /// synchronous query endpoint).
+    #[serde(flatten)]
+    pub request: JobRequest,
+    /// JSONPath to the count in the probe response. The match must be a
+    /// number, or a string parsing as one.
+    pub count_path: String,
+}
+
+impl AsyncJobConfig {
+    /// Whether this config can route small objects to the synchronous path.
+    ///
+    /// Both halves are required: a threshold with no probe could never fire,
+    /// and a probe with no threshold has nothing to compare against. Rather
+    /// than silently ignoring a half-configured pair — the inert-config class
+    /// this project treats as a defect — `validate()` rejects it.
+    pub fn sync_routing(&self) -> Option<(u64, &RowCountProbe)> {
+        match (self.sync_below_rows, self.count.as_ref()) {
+            (Some(n), Some(p)) => Some((n, p)),
+            _ => None,
+        }
+    }
 }
 
 fn default_query_path() -> String {
@@ -249,6 +297,35 @@ impl AsyncJobConfig {
             return Err(faucet_core::FaucetError::Config(
                 "async_job: `submit.url` must not be empty".into(),
             ));
+        }
+        // A half-configured pair is rejected rather than ignored: a threshold
+        // with no probe can never fire and a probe with no threshold is never
+        // read, so either alone is a config that reads as doing something and
+        // does nothing (#629).
+        match (self.sync_below_rows, self.count.as_ref()) {
+            (Some(_), None) => {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `sync_below_rows` needs a `count:` probe to compare against".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `count:` is only read by `sync_below_rows`, which is unset".into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(p) = self.count.as_ref() {
+            if p.request.url.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `count.url` must not be empty".into(),
+                ));
+            }
+            if p.count_path.trim().is_empty() {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `count.count_path` must not be empty".into(),
+                ));
+            }
         }
         // `fetch` needs exactly one of `url` (templated) or `url_from` (JSONPath
         // into the poll body, #543).

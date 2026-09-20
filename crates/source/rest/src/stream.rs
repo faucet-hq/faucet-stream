@@ -697,6 +697,61 @@ impl RestStream {
         }
     }
 
+    /// Run the row-count probe and read the count out of its response (#629).
+    ///
+    /// A probe that fails is **not** fatal: falling back to the async job is
+    /// the pre-#629 behaviour and always correct, just slower — failing the
+    /// run because an optimisation's probe 404'd would be the worse trade.
+    async fn probe_row_count(
+        &self,
+        probe: &crate::async_job::RowCountProbe,
+    ) -> Result<u64, FaucetError> {
+        let base = &self.config.base_url;
+        let url =
+            crate::async_job::resolve_url(base, probe.request.url.as_deref().unwrap_or_default());
+        let body = match self
+            .job_request_json(
+                "count",
+                &probe.request.method,
+                &url,
+                &probe.request.headers,
+                &probe.request.query,
+                probe.request.json.as_ref(),
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "rest: row-count probe failed; using the async job path"
+                );
+                return Ok(u64::MAX);
+            }
+        };
+        let found = jsonpath_first_value(&body, &probe.count_path);
+        match found {
+            Some(Value::Number(n)) => Ok(n.as_u64().unwrap_or(u64::MAX)),
+            // A count arriving as a string is common enough (and unambiguous)
+            // to accept; anything else means the path is wrong, which is a
+            // config error worth surfacing rather than silently guessing.
+            Some(Value::String(t)) => t.trim().parse::<u64>().map_err(|_| {
+                FaucetError::Config(format!(
+                    "async_job: count_path '{}' matched '{t}', which is not a row count",
+                    probe.count_path
+                ))
+            }),
+            Some(other) => Err(FaucetError::Config(format!(
+                "async_job: count_path '{}' matched {other}, which is not a row count",
+                probe.count_path
+            ))),
+            None => Err(FaucetError::Config(format!(
+                "async_job: count_path '{}' matched nothing in the probe response",
+                probe.count_path
+            ))),
+        }
+    }
+
     /// Page size for the whole-file tabular formats, or `None` when this is
     /// not file mode (#624).
     ///
@@ -771,7 +826,29 @@ impl RestStream {
             // Async-job lifecycle (#514/#623): submit → poll → resolve the fetch
             // URL once, then stream one `StreamPage` per locator-paged result set
             // (#557) instead of buffering the entire extract into a single page.
-            if let Some(job) = self.config.async_job.as_ref() {
+            // Size-based routing (#629): when the object is small enough, skip
+            // the job's async floor entirely and fall through to the ordinary
+            // paginated read below. Decided per run from a probe rather than
+            // from a guess baked into the config, because which objects are
+            // "small" changes.
+            let take_async_job = match self.config.async_job.as_ref() {
+                None => false,
+                Some(job) => match job.sync_routing() {
+                    None => true,
+                    Some((threshold, probe)) => {
+                        let rows = self.probe_row_count(probe).await?;
+                        let small = rows < threshold;
+                        tracing::info!(
+                            rows,
+                            threshold,
+                            path = %if small { "synchronous" } else { "async job" },
+                            "rest: routed by row count"
+                        );
+                        !small
+                    }
+                },
+            };
+            if let Some(job) = self.config.async_job.as_ref().filter(|_| take_async_job) {
                 // Capture the incremental bookmark (#630) BEFORE submitting, so it
                 // reflects the query's start time (conservative — a small re-read
                 // overlap next run, deduped by an upsert sink). `None` for full-table.

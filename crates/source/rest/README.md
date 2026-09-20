@@ -474,6 +474,37 @@ Records are appended across pages; the loop stops when the locator header/body i
     locator_terminal_values: ["EOF", "-1"]   # replaces the default, does not extend it
 ```
 
+#### Routing small objects off the async job (`sync_below_rows`)
+
+A bulk API pays a fixed async floor — job queue plus processing — whatever the
+row count; measured at ~14s of a 22s, 701-row run. A synchronous query answers
+the same request immediately. Bulk stays right for the large objects it exists
+for, so make the choice per run from a cheap count probe rather than from a
+guess baked into the config:
+
+```yaml
+pagination: { style: none }          # or whatever the *synchronous* read needs
+records_path: "$.records[*]"
+path: /services/data/v60.0/query
+params: { q: "SELECT Id, Name FROM Account" }
+
+async_job:
+  # …submit / poll / status / fetch, used for large objects…
+  sync_below_rows: 50000
+  count:
+    url: /services/data/v60.0/query
+    query: { q: "SELECT COUNT() FROM Account" }
+    count_path: "$.totalSize"
+```
+
+Below the threshold the job is **never submitted** — the point is not paying
+its latency, which a submitted-then-discarded job would still cost — and the
+source's own `path` / `params` / `pagination` describe the read instead. Both
+keys are required together: a threshold with no probe can never fire and a
+probe with no threshold is never read, so either alone is rejected at config
+load. A probe that *fails* is not fatal — it logs and uses the job, which is
+always correct, just slower.
+
 #### Incremental replication with `async_job`
 
 Set `replication_method: { type: Incremental }` + `replication_key` and the

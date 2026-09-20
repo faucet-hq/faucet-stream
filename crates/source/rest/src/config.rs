@@ -760,10 +760,15 @@ impl RestStreamConfig {
         }
         if let Some(job) = &self.async_job {
             job.validate()?;
-            if !matches!(self.pagination, PaginationStyle::None) {
+            // Size-based routing (#629) is the one shape that legitimately
+            // carries both: the job for large objects, and the ordinary
+            // paginated read — which needs its own pagination style — for
+            // small ones.
+            if !matches!(self.pagination, PaginationStyle::None) && job.sync_routing().is_none() {
                 return Err(faucet_core::FaucetError::Config(
                     "rest: an `async_job:` lifecycle fetches a single result — set \
-                     `pagination: none`"
+                     `pagination: none` (or add `sync_below_rows` + `count:` to route \
+                     small objects to the paginated path, #629)"
                         .into(),
                 ));
             }

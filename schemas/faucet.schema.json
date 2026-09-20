@@ -4905,6 +4905,27 @@
           "description": "Where the bulk **statement** sits inside the [`submit`](Self::submit)\nbody, as an RFC 6901 JSON Pointer (#654 M23). Defaults to `/query` — the\ntop-level `query` key that used to be hardcoded, so an API putting its\nstatement at `sql`, `statement`, or a nested path silently lost\nincremental push-down and collapsed every object onto one dataset\nidentity. Three behaviours read it: the incremental predicate\ninjection, `validate()`'s incremental gate, and the catalog/lineage\ndataset name.",
           "type": "string",
           "default": "/query"
+        },
+        "sync_below_rows": {
+          "description": "Skip the job entirely and read through the source's **ordinary\npaginated path** when a cheap probe says the object is small (#629).\n\nAn async bulk API has a fixed async floor — job queue plus processing,\nmeasured at ~14s of a 22s 701-row Salesforce `User` run — that is paid\nwhatever the row count. A synchronous query API answers the same\nrequest immediately. Bulk is still right for the large objects it was\ndesigned for, so the choice is per-run and made from data rather than\nfrom a guess baked into the config.\n\nRequires [`count`](Self::count). The source's own `path` / `params` /\n`pagination` describe the synchronous read, so a config that opts in\ncarries both shapes and faucet picks between them.",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "count": {
+          "description": "Row-count probe for [`sync_below_rows`](Self::sync_below_rows) — a\nrequest plus a JSONPath to the count in its response.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__RowCountProbe"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": true
@@ -5061,6 +5082,91 @@
           "items": {
             "type": "string"
           }
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__RowCountProbe": {
+      "description": "A cheap row-count request, used to decide between the async-job and the\nsynchronous read paths (#629).",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "HTTP method (default `GET`; set `POST` for `submit`).",
+          "type": "string",
+          "default": "GET"
+        },
+        "url": {
+          "description": "URL — absolute, or a `base_url`-relative path. `${job_id}` is substituted.\n\nRequired for `submit`. For `fetch`, set **exactly one** of `url` (a fixed\ntemplate) or [`url_from`](Self::url_from) (a JSONPath into the poll body).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url_from": {
+          "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a Stripe report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers": {
+          "description": "Extra headers.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "query": {
+          "description": "Extra query params.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "json": {
+          "description": "JSON request body."
+        },
+        "locator_header": {
+          "description": "`fetch` only (#557): result-set continuation. Response header carrying a\npagination locator (e.g. Salesforce Bulk `Sforce-Locator`). While present\n(and not empty / `\"null\"`), the fetch is repeated with the locator sent as\n[`locator_param`](Self::locator_param), appending records across pages.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locator_body": {
+          "description": "`fetch` only (#557): JSONPath into the fetch response **body** for the\ncontinuation locator, when it rides the body rather than a header.\nAlternative to [`locator_header`](Self::locator_header).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locator_param": {
+          "description": "`fetch` only (#557): query-param name the locator is sent as on each\ncontinuation request. Required when a locator source is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "records_path": {
+          "description": "`fetch` only (#557): JSONPath for extracting records from each fetch page,\noverriding the source-level `records_path`. Applies to a JSON result body.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locator_terminal_values": {
+          "description": "`fetch` only (#654 M24): locator values that mean **no more pages**,\ncompared case-insensitively after trimming. Defaults to `[\"null\"]` — one\nvendor's sentinel, which used to be hardcoded in the pagination loop, so\nan API signalling completion with `none` / `-1` / `EOF` needed a code\nchange. An empty/whitespace locator is always terminal regardless of\nthis list; set it to `[]` to make *only* emptiness terminal.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "null"
+          ]
+        },
+        "count_path": {
+          "description": "JSONPath to the count in the probe response. The match must be a\nnumber, or a string parsing as one.",
+          "type": "string"
         }
       },
       "additionalProperties": true
@@ -12496,7 +12602,7 @@
                       "default": []
                     },
                     "partition_concurrency": {
-                      "description": "Maximum number of partitions to fetch concurrently.\n`None` means sequential processing (backward compatible default).",
+                      "description": "Maximum number of partitions to fetch concurrently.\n`None` (and `0`/`1`) means sequential processing — the default.\n\nHonoured on **both** read paths since #624: the buffering `fetch_all`\nand the `stream_pages` path the pipeline actually drives, where it used\nto be silently ignored. Above 1, partition pages **interleave**: the\nstreams are polled together, so a page from partition 3 can arrive\nbefore partition 1 has finished. Partitions are disjoint and the\npersisted bookmark is a max across all of them, so this changes\nthroughput rather than the resume position — but a downstream that\nassumed partition-at-a-time page order no longer gets it.",
                       "type": [
                         "integer",
                         "null",
