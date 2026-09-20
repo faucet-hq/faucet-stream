@@ -189,6 +189,53 @@ impl RbacConfig {
         Self::new(file.principals)
     }
 
+    /// Build an in-memory config from the `--read-token` / `--write-token` /
+    /// `--admin-token` trio (#608).
+    ///
+    /// The ergonomic form of the common split — dashboards read, operators
+    /// write, one admin — with no file to author. Returns `None` when none of
+    /// the three is set, so the caller falls through to the other auth modes.
+    ///
+    /// Any subset may be set: a deployment that only ever hands out a read
+    /// token and an admin token should not have to invent an operator one.
+    /// The same validation as a file config applies, so an empty or reused
+    /// token is rejected at startup rather than silently granting the wrong
+    /// role.
+    pub fn from_token_trio(
+        read: Option<&str>,
+        write: Option<&str>,
+        admin: Option<&str>,
+    ) -> CliResult<Option<Self>> {
+        let wanted = [
+            ("read", read, Role::Viewer),
+            ("write", write, Role::Operator),
+            ("admin", admin, Role::Admin),
+        ];
+        let principals: Vec<PrincipalSpec> = wanted
+            .iter()
+            .filter_map(|(name, token, role)| {
+                token.map(|t| PrincipalSpec {
+                    name: (*name).to_string(),
+                    token: t.to_string(),
+                    role: *role,
+                })
+            })
+            .collect();
+        if principals.is_empty() {
+            return Ok(None);
+        }
+        for p in &principals {
+            if p.token.trim().is_empty() {
+                return Err(CliError::Serve(format!(
+                    "--{}-token must not be empty (omit the flag to not issue that token, \
+                     or use --no-auth to disable authentication entirely)",
+                    p.name
+                )));
+            }
+        }
+        Self::new(principals).map(Some)
+    }
+
     /// Build from an already-parsed principal list, validating invariants.
     pub fn new(principals: Vec<PrincipalSpec>) -> CliResult<Self> {
         if principals.is_empty() {

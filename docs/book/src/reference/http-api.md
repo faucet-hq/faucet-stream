@@ -43,6 +43,62 @@ principals:
 faucet serve --auth-config auth.yaml
 ```
 
+### The read / write / admin token trio
+
+For the common split — dashboards read, operators write, one admin — there is
+no file to author. Pass any subset of three flags (or their env vars) and the
+server synthesizes the equivalent RBAC config:
+
+```bash
+faucet serve \
+  --read-token  "$READ_TOKEN" \   # FAUCET_SERVE_READ_TOKEN  → viewer
+  --write-token "$WRITE_TOKEN" \  # FAUCET_SERVE_WRITE_TOKEN → operator
+  --admin-token "$ADMIN_TOKEN"     # FAUCET_SERVE_ADMIN_TOKEN → admin
+```
+
+Prefer the env vars: a flag value is visible in `ps`. The trio is mutually
+exclusive with `--auth-token` / `--auth-config` / `--no-auth`, an empty token
+is rejected at startup, and reusing one token for two roles is refused (the
+role would otherwise depend on scan order).
+
+### Role × route matrix
+
+The contract, enforced by a table-driven test over **every** registered route
+(`cli/tests/serve_rbac.rs`): a read token cannot reach anything that changes
+state, and a route nobody classified stays admin-only and fails the test until
+someone does.
+
+| Route | viewer | operator | admin |
+|---|:--:|:--:|:--:|
+| `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs` | ✓ | ✓ | ✓ |
+| `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
+| `POST /v1/backfill` | — | ✓ | ✓ |
+| `GET /v1/schemas`, `/v1/schemas/{kind}/{name}` | ✓ | ✓ | ✓ |
+| `POST /v1/doctor` | — | ✓ | ✓ |
+| `POST /v1/dlq/inspect` | ✓ | ✓ | ✓ |
+| `POST /v1/dlq/replay`, `/v1/dlq/discard` | — | ✓ | ✓ |
+| `POST`/`PUT /v1/triggers/{name}` | — | ✓ | ✓ |
+| `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
+| `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
+| `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
+| `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
+| `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | ✓ | ✓ |
+| `POST /v1/templates/{id}/{runs,tags,launch,rollback,deprecate}` | — | ✓ | ✓ |
+| `POST /mcp` | ✓ | ✓ | ✓ |
+| `GET /v1/audit` | — | — | ✓ |
+| `POST /v1/reload` | — | — | ✓ |
+| *any unclassified `/v1` route* | — | — | ✓ |
+
+Two entries are POSTs a **read** token can reach, because they change nothing:
+
+- `POST /mcp` — the MCP transport's baseline is a read scope; its one mutating
+  tool (`run_pipeline`) re-checks `RunWrite` inside the handler.
+- `POST /v1/dlq/inspect` — summarises a DLQ location. The location is
+  caller-supplied, so a read token can ask the server to read a path on its
+  filesystem. That is the same trust boundary as run logs (which carry record
+  data), and the reason the control plane is not meant to face the public
+  internet.
+
 A request whose role lacks the route's required permission gets `403 forbidden`
 (and a `denied` audit record). `--auth-config` is mutually exclusive with
 `--auth-token` / `--no-auth`. Every token is registered for log redaction at

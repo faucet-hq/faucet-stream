@@ -997,6 +997,36 @@ pub struct ServeArgs {
     /// `--auth-token` / `--no-auth`.
     #[arg(long, conflicts_with_all = ["auth_token", "no_auth"])]
     pub auth_config: Option<std::path::PathBuf>,
+    /// Bearer token granting the **read-only** `viewer` role (#608). The
+    /// ergonomic form of an `--auth-config` with one `viewer` principal: hand
+    /// this to dashboards and people who must never be able to change
+    /// anything. Any subset of the three token flags may be set; together they
+    /// synthesize an in-memory RBAC config. Prefer the env var over the flag
+    /// (a flag value is visible in `ps`).
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_READ_TOKEN",
+        conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
+    )]
+    pub read_token: Option<String>,
+    /// Bearer token granting the `operator` role (#608): everything a viewer
+    /// can do, plus submitting/cancelling runs, firing triggers, and
+    /// registering or launching templates — but **not** the audit log.
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_WRITE_TOKEN",
+        conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
+    )]
+    pub write_token: Option<String>,
+    /// Bearer token granting the `admin` role (#608): everything, including the
+    /// audit log and any route not explicitly classified (which stays
+    /// admin-only by design).
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_ADMIN_TOKEN",
+        conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
+    )]
+    pub admin_token: Option<String>,
     /// Max pipeline runs executing at once. Default: min(16, cpu count).
     #[arg(long)]
     pub max_concurrent_runs: Option<usize>,
