@@ -86,18 +86,32 @@ pub struct BigQuerySinkConfig {
     /// job's default location. Ignored once the dataset exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
-    /// Bucket-free bulk load for the **overwrite** write path: instead of one
-    /// `jobs.query` `INSERT … SELECT FROM UNNEST(@payload)` per page (job-latency
-    /// bound — dozens of sequential jobs for a large table), stream each page
-    /// straight into the staging table with a single BigQuery **load job** via a
-    /// `multipart/related` media upload of newline-delimited JSON. No GCS bucket
-    /// is involved (unlike the Arrow `bulk_load` path). This mirrors how the
-    /// legacy iPaaS loader wrote to BigQuery (`load_table_from_dataframe`,
-    /// CSV/JSON media upload) and collapses a 60-page run into a handful of load
-    /// jobs. Consulted on the **overwrite** and **append** paths (append feeds
-    /// one `WRITE_APPEND` resumable session per run); upsert / delete /
-    /// exactly-once still take the per-page query path. Default `false`.
-    #[serde(default)]
+    /// Bucket-free bulk load for the **append** and **overwrite** write paths
+    /// (default **`true`**, #612).
+    ///
+    /// The alternative — one `jobs.query`
+    /// `INSERT … SELECT FROM UNNEST(@payload)` per page — is job-latency bound,
+    /// not volume bound: a 59,358-row overwrite at the default `batch_size`
+    /// issued ~60 sequential query jobs and took **6m44s**, and a
+    /// million-row table would issue thousands. A load job fed by a resumable
+    /// `multipart/related` upload of newline-delimited JSON moves the whole run
+    /// in **one** job, so time scales with data rather than page count. No GCS
+    /// bucket is involved (unlike the Arrow `bulk_load` path).
+    ///
+    /// It is the default because it is better on every axis this sink is
+    /// measured on: **fewer** BigQuery jobs (one per run against BigQuery's
+    /// 1,500 load-jobs-per-table-per-day budget, versus one query job per
+    /// page), atomic on its own for overwrite (a failed `WRITE_TRUNCATE` load
+    /// leaves the prior data intact), and bounded memory — pages feed the
+    /// session and are dropped, so peak is O(chunk), not O(table) (#614).
+    ///
+    /// Set `false` to take the per-page query path. `upsert` / `delete` /
+    /// `delivery: exactly_once` ignore this field entirely: their writes commit
+    /// with a watermark or a `MERGE` in one transaction, which a load job
+    /// cannot express. `insert_id_field` likewise wins over this default —
+    /// only `insertAll` implements BigQuery's best-effort `insertId` dedup, so
+    /// asking for it keeps appends on the streaming path.
+    #[serde(default = "default_true")]
     pub media_load: bool,
     /// Internal: set by the CLI executor for a *grouped* overwrite fan-out
     /// (several matrix rows → one physical table), where a shared staging table
@@ -180,6 +194,10 @@ fn default_write_disposition() -> String {
     "WRITE_APPEND".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
 }
@@ -207,7 +225,7 @@ impl BigQuerySinkConfig {
             scope: None,
             create_table: default_create_table(),
             location: None,
-            media_load: false,
+            media_load: true,
             schema: None,
             overwrite_staging: false,
             upload_base_url: None,
@@ -476,16 +494,18 @@ mod tests {
     }
 
     #[test]
-    fn media_load_defaults_false_and_builder_sets_it() {
+    fn media_load_defaults_true_and_builder_can_opt_out() {
+        // #612: the bulk load path is the default — the per-page query path is
+        // job-latency bound (a 59k-row overwrite took 6m44s across ~60 jobs).
         let config =
             BigQuerySinkConfig::new("p", "d", "t", BigQueryCredentials::ApplicationDefault);
-        assert!(!config.media_load);
-        let config = config.with_media_load(true);
-        assert!(config.media_load);
+        assert!(config.media_load, "the load path is the default");
+        let config = config.with_media_load(false);
+        assert!(!config.media_load, "and it can still be turned off");
     }
 
     #[test]
-    fn media_load_deserializes_from_json_and_defaults_false() {
+    fn media_load_deserializes_from_json_and_defaults_true() {
         let with = r#"{
             "project_id": "p", "dataset_id": "d", "table_id": "t",
             "auth": {"type": "application_default"}, "media_load": true
@@ -498,6 +518,17 @@ mod tests {
             "auth": {"type": "application_default"}
         }"#;
         let config: BigQuerySinkConfig = serde_json::from_str(without).unwrap();
+        assert!(
+            config.media_load,
+            "an omitted `media_load` must take the load path (#612)"
+        );
+
+        // And it is still explicitly disableable from YAML.
+        let off = r#"{
+            "project_id": "p", "dataset_id": "d", "table_id": "t",
+            "auth": {"type": "application_default"}, "media_load": false
+        }"#;
+        let config: BigQuerySinkConfig = serde_json::from_str(off).unwrap();
         assert!(!config.media_load);
     }
 

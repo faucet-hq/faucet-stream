@@ -119,7 +119,12 @@ async fn build_sink(
         TABLE_ID,
         BigQueryCredentials::ApplicationDefault, // unused: from_parts bypasses auth
     )
-    .with_batch_size(batch_size);
+    .with_batch_size(batch_size)
+    // These tests are about the **per-page `jobs.query` path's** chunking, so
+    // they pin it explicitly: since #612 the bulk load path is the default, and
+    // it feeds a whole page into one resumable session (chunked by bytes
+    // internally) rather than issuing one insert per `batch_size` slice.
+    .with_media_load(false);
 
     (BigQuerySink::from_parts(config, client), sa_file)
 }

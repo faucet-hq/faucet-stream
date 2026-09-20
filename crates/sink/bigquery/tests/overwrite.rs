@@ -64,6 +64,11 @@ fn config_overwrite() -> BigQuerySinkConfig {
         BigQueryCredentials::ApplicationDefault,
     );
     c.write.write_mode = WriteMode::Overwrite;
+    // Since #612 the bulk load path is the default. The tests below assert the
+    // **`jobs.query` staging path's** mechanics (LIKE clone, INSERT … SELECT
+    // swap, insertAll), so they pin it; the load-path tests opt back in with
+    // `config.media_load = true`.
+    c.media_load = false;
     c
 }
 
@@ -471,13 +476,16 @@ async fn append_creates_table_when_missing_by_default() {
         .mount(&server)
         .await;
 
-    // Default config = append mode, create_table defaults true.
+    // Append mode, `create_table` defaults true. `media_load` is pinned off so
+    // this exercises the `insertAll` write; the load-path counterpart is
+    // `append_creates_table_when_missing_under_the_default_load_path`.
     let config = BigQuerySinkConfig::new(
         PROJECT_ID,
         DATASET_ID,
         TABLE_ID,
         BigQueryCredentials::ApplicationDefault,
-    );
+    )
+    .with_media_load(false);
     let (sink, _sa) = build_sink(&server, config).await;
 
     let n = sink
@@ -1460,14 +1468,33 @@ async fn access_token_service_account_key_path_streams() {
     );
 }
 
-/// Append via `write_batch_partial` + `media_load` streams and returns one `Ok`
-/// per row.
+/// A **DLQ run keeps per-row isolation even under `media_load`** (#612).
+///
+/// `write_batch_partial` is only called when a DLQ is configured, and a
+/// BigQuery load job is all-or-nothing — it cannot say which rows were
+/// rejected. This method therefore takes the per-row `insertAll` path whatever
+/// `media_load` says: the operator asked for row isolation by configuring a
+/// DLQ, and silently turning "three bad rows quarantined, the rest written"
+/// into "the whole page failed" would be a data-routing change they never see.
+///
+/// This test previously asserted the opposite (the load path being taken here,
+/// returning a blanket `Ok` per row). Making `media_load` the default made that
+/// behaviour reachable by everyone rather than only by opt-in, which is what
+/// turned it from a documented quirk into a regression worth fixing.
 #[tokio::test]
-async fn write_batch_partial_media_append_streams() {
+async fn write_batch_partial_keeps_row_isolation_under_media_load() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
+    // A resumable session is mounted but must go *unused*.
     mount_resumable(&server, "/rz/pa", "load-pa").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}/insertAll"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
     let mut config = BigQuerySinkConfig::new(
         PROJECT_ID,
         DATASET_ID,
@@ -1478,14 +1505,20 @@ async fn write_batch_partial_media_append_streams() {
     config.upload_base_url = Some(server.uri());
     let config = with_sa_auth(config, &server);
     let (sink, _sa) = build_sink(&server, config).await;
+
     let outcomes = sink
         .write_batch_partial(&[json!({"id": 1}), json!({"id": 2})])
         .await
         .expect("partial append");
     assert_eq!(outcomes.len(), 2);
     assert!(outcomes.iter().all(|o| o.is_ok()));
-    sink.flush().await.expect("flush finalizes");
-    assert_eq!(session_puts(&server, "/rz/pa").await.len(), 1);
+
+    sink.flush().await.expect("flush");
+    assert!(
+        session_puts(&server, "/rz/pa").await.is_empty(),
+        "the DLQ path must not route through a load session — per-row outcomes \
+         are impossible there"
+    );
 }
 
 // ── Coverage: malformed load/finalize responses + non-404 probe ─────────────
@@ -1639,4 +1672,63 @@ async fn overwrite_target_probe_non_404_errors() {
         .await
         .expect_err("non-404 probe must surface");
     assert!(err.to_string().contains("schema probe"), "got: {err}");
+}
+
+/// The append counterpart of `append_creates_table_when_missing`, on the load
+/// path that #612 made the default: a missing table is still created from the
+/// first page's inferred schema, and the rows then go through one resumable
+/// load rather than `insertAll`.
+#[tokio::test]
+async fn append_creates_table_when_missing_under_the_default_load_path() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_missing(&server, None).await;
+    mount_query_and_job(&server, "job-create").await;
+    mount_resumable(&server, "/resumable/append-default", "load-append-default").await;
+
+    // No `with_media_load(false)` — this is the shipped default.
+    let mut config = BigQuerySinkConfig::new(
+        PROJECT_ID,
+        DATASET_ID,
+        TABLE_ID,
+        BigQueryCredentials::ApplicationDefault,
+    );
+    config.upload_base_url = Some(server.uri());
+    let config = with_sa_auth(config, &server);
+    let (sink, _sa) = build_sink(&server, config).await;
+
+    let n = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("write");
+    assert_eq!(n, 1);
+    sink.flush().await.expect("flush finalizes the load");
+
+    assert!(
+        queries(&server)
+            .await
+            .iter()
+            .any(|q| q.starts_with("CREATE OR REPLACE TABLE `p.d.t` (")),
+        "create_table must still run before the load: {:?}",
+        queries(&server).await
+    );
+
+    let puts = session_puts(&server, "/resumable/append-default").await;
+    assert_eq!(puts.len(), 1, "one finalize PUT for the page");
+    assert!(
+        gunzip(&puts[0]).contains("\"id\":1"),
+        "the row must ride the load job"
+    );
+
+    let insert_alls = server
+        .received_requests()
+        .await
+        .expect("recording enabled")
+        .into_iter()
+        .filter(|r| r.url.path().ends_with("/insertAll"))
+        .count();
+    assert_eq!(
+        insert_alls, 0,
+        "the default append must not fall back to streaming inserts"
+    );
 }

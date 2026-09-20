@@ -162,7 +162,7 @@ file/append sinks (`jsonl`, `csv`, `stdout`) it's a no-op — they write per rec
 
 | Connector | Tier¹¹ | Feature | `batch_size` | Compression | Upsert⁸ | Effectively-once⁷ | Write unit |
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|------------|
-| BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | `tabledata.insertAll` streaming; in-place `MERGE` for upsert + effectively-once |
+| BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
 | PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
 | JSON Lines | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | buffered file append |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
@@ -196,7 +196,7 @@ file/append sinks (`jsonl`, `csv`, `stdout`) it's a no-op — they write per rec
 level, so the file-level `compression` feature doesn't apply to either.
 ⁷ **Effectively-once** = commits data and a watermark token atomically; required for
 `delivery: exactly_once`. The BigQuery sink does this via a multi-statement
-`MERGE` transaction (distinct from its default streaming `insertAll` path); the
+`MERGE` transaction (distinct from its default bulk-load append path); the
 Kafka sink uses a transactional producer that writes each page's records plus a
 commit-token record into a compacted side-topic in one Kafka transaction; the
 Snowflake sink runs one multi-statement `BEGIN;INSERT;MERGE;COMMIT` request; the
