@@ -154,6 +154,56 @@ where
     }
 }
 
+/// Decode CSV from an `AsyncRead` into **bounded pages** of records (#626).
+///
+/// The `Value`-path twin of [`csv_reader_to_ndjson_stream`]: the reader is fed
+/// straight from the HTTP body, and records are emitted in `page_size` chunks,
+/// so peak memory is one page rather than the whole result set. The buffering
+/// [`parse_csv`] keeps its exact per-record semantics — `flexible(true)`,
+/// header-derived keys, `column_<i>` fallback, all-`String` values — so a
+/// config that switches onto this path sees identical records.
+///
+/// `page_size == 0` means "no batching" (the house sentinel): everything lands
+/// in one page, matching [`parse_csv`].
+pub fn csv_reader_to_value_pages<R>(
+    reader: R,
+    delimiter: u8,
+    has_headers: bool,
+    page_size: usize,
+) -> impl futures::Stream<Item = Result<Vec<Value>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use futures::StreamExt as _;
+    async_stream::try_stream! {
+        let mut rdr = csv_async::AsyncReaderBuilder::new()
+            .has_headers(false)
+            .delimiter(delimiter)
+            .flexible(true)
+            .create_reader(reader);
+        let mut records = rdr.records();
+        let mut headers: Option<Vec<String>> = None;
+        let mut page: Vec<Value> = Vec::with_capacity(if page_size == 0 { 1024 } else { page_size });
+        while let Some(rec) = records.next().await {
+            let rec =
+                rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
+            if has_headers && headers.is_none() {
+                headers = Some(rec.iter().map(str::to_string).collect());
+                continue;
+            }
+            page.push(Value::Object(csv_record_to_object(&rec, headers.as_deref())));
+            if page_size != 0 && page.len() >= page_size {
+                yield std::mem::replace(&mut page, Vec::with_capacity(page_size));
+            }
+        }
+        // A trailing partial page, and the empty-result case: a header-only (or
+        // zero-byte) body must yield nothing rather than an error.
+        if !page.is_empty() {
+            yield page;
+        }
+    }
+}
+
 /// Parse Excel bytes into records. Requires the `excel` feature.
 #[cfg(feature = "excel")]
 pub fn parse_excel(
@@ -255,6 +305,108 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// #626 — the bounded-memory CSV page decoder.
+    mod value_pages {
+        use super::*;
+        use futures::StreamExt as _;
+
+        async fn pages(body: &'static str, page_size: usize) -> Vec<Vec<Value>> {
+            let reader = std::io::Cursor::new(body.as_bytes());
+            csv_reader_to_value_pages(reader, b',', true, page_size)
+                .map(|p| p.expect("decodes"))
+                .collect()
+                .await
+        }
+
+        #[tokio::test]
+        async fn records_are_split_into_bounded_pages() {
+            // The property the whole change exists for: peak memory is a page,
+            // not the result set.
+            let body = "id,name\n1,a\n2,b\n3,c\n4,d\n5,e\n";
+            let got = pages(body, 2).await;
+            assert_eq!(
+                got.iter().map(Vec::len).collect::<Vec<_>>(),
+                vec![2, 2, 1],
+                "pages must cap at page_size, with a partial final page"
+            );
+            let ids: Vec<&str> = got
+                .iter()
+                .flatten()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["1", "2", "3", "4", "5"],
+                "no record lost at a boundary"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_page_size_of_zero_means_one_page() {
+            // The house "no batching" sentinel, matching `parse_csv`.
+            let got = pages("id\n1\n2\n3\n", 0).await;
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].len(), 3);
+        }
+
+        #[tokio::test]
+        async fn the_header_is_carried_across_pages() {
+            // The header arrives in the first chunk only; every later page must
+            // still get named fields rather than `column_0`.
+            let got = pages("id,name\n1,a\n2,b\n3,c\n", 1).await;
+            assert_eq!(got.len(), 3);
+            for page in &got {
+                assert!(
+                    page[0].get("name").is_some(),
+                    "later pages lost the header: {page:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_quoted_field_with_newlines_is_one_record() {
+            // A record straddling a read-chunk edge must not be split. The
+            // embedded newline is the case that would break a line-splitting
+            // decoder.
+            let body = "id,note\n1,\"line one\nline two\"\n2,plain\n";
+            let got = pages(body, 10).await;
+            let flat: Vec<&Value> = got.iter().flatten().collect();
+            assert_eq!(flat.len(), 2, "two records, not three");
+            assert_eq!(
+                flat[0]["note"].as_str().unwrap(),
+                "line one\nline two",
+                "the embedded newline survives"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_empty_body_yields_no_pages() {
+            assert!(pages("", 100).await.is_empty());
+            // Header-only is also zero records, not an error.
+            assert!(pages("id,name\n", 100).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_ragged_row_is_tolerated_like_the_buffered_decoder() {
+            // `flexible(true)` parity with `parse_csv` — a short row must not
+            // fail the stream.
+            let got = pages("a,b\n1\n2,3\n", 100).await;
+            let flat: Vec<&Value> = got.iter().flatten().collect();
+            assert_eq!(flat.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn streamed_pages_match_the_buffered_decoder_exactly() {
+            // The equivalence that lets a config switch paths silently.
+            let body = "id,name\n1,ada\n2,grace\n3,\"quoted, comma\"\n";
+            let streamed: Vec<Value> = pages(body, 2).await.into_iter().flatten().collect();
+            let buffered = parse_csv(body.as_bytes(), b',', true)
+                .await
+                .expect("parses");
+            assert_eq!(streamed, buffered);
+        }
+    }
     use super::*;
 
     #[tokio::test]

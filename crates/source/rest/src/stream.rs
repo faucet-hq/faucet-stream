@@ -658,7 +658,7 @@ impl RestStream {
     pub fn stream_pages(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + '_>> {
-        let mut inner = self.stream_pages_inner(None, None);
+        let mut inner = self.stream_pages_inner(None, None, faucet_core::DEFAULT_BATCH_SIZE);
         Box::pin(async_stream::try_stream! {
             loop {
                 let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
@@ -709,6 +709,10 @@ impl RestStream {
         &self,
         context: Option<&HashMap<String, Value>>,
         range_filter: Option<String>,
+        // Records per emitted page for the bounded-memory CSV path (#626).
+        // `0` is the house "no batching" sentinel. Ignored by the HTTP-paged
+        // paths, which chunk on upstream page boundaries.
+        csv_page_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
         // Clone the context into an owned map so it can live inside the
         // `async_stream` generator without borrowing from the caller.
@@ -731,20 +735,78 @@ impl RestStream {
                     if let (Some(loc), Some(param)) = (&locator, &job.fetch.locator_param) {
                         query.insert(param.clone(), loc.clone());
                     }
-                    let (bytes, resp_headers) = self
-                        .job_request_bytes(
-                            &job.fetch.method,
-                            &fetch_url,
-                            &job.fetch.headers,
-                            &query,
-                            job.fetch.json.as_ref(),
-                        )
-                        .await?;
-                    let (records, body_value) = self.parse_fetch_page(&bytes, job).await?;
-                    // Stream this locator page immediately — peak memory is
-                    // O(one page), not O(whole extract). Per-page bookmark stays
-                    // `None`; the incremental bookmark is emitted once at the end.
-                    yield faucet_core::StreamPage { records, bookmark: None };
+                    // Bounded-memory CSV (#626). A locator page is one HTTP
+                    // response, and for a Bulk extract that response *is* the
+                    // whole object — 3.96 GB peak for 838k rows once it is
+                    // buffered and turned into one `Vec<Value>`. When the decode
+                    // chain is a bare `parse: csv`, decode straight off the body
+                    // and emit `batch_size` pages, so peak memory is one page.
+                    //
+                    // Requires the locator to come from a **header**: reading it
+                    // from the body would need the parsed document this path
+                    // deliberately never materializes.
+                    let plan = crate::decode::csv_stream_plan(&self.config.decode)
+                        .filter(|_| job.fetch.locator_body.is_none());
+                    // Each branch returns the response headers (for the locator
+                    // advance) and, for the buffered path only, the parsed body.
+                    let (body_value, resp_headers) = if let Some(plan) = plan {
+                        let resp = self
+                            .job_request_response(
+                                &job.fetch.method,
+                                &fetch_url,
+                                &job.fetch.headers,
+                                &query,
+                                job.fetch.json.as_ref(),
+                            )
+                            .await?;
+                        // Read the locator before the body is consumed.
+                        let resp_headers_streamed = resp.headers().clone();
+                        use futures::TryStreamExt as _;
+                        let body = resp.bytes_stream().map_err(std::io::Error::other);
+                        let reader = tokio_util::io::StreamReader::new(body);
+                        let mut pages = Box::pin(crate::format::csv_reader_to_value_pages(
+                            reader,
+                            plan.delimiter,
+                            plan.has_headers,
+                            csv_page_size,
+                        ));
+                        use futures::StreamExt as _;
+                        let mut emitted = false;
+                        while let Some(page) = pages.next().await {
+                            let records = page?;
+                            emitted = true;
+                            yield faucet_core::StreamPage { records, bookmark: None };
+                        }
+                        // A header-only (or empty) result still produces one
+                        // page, matching the buffered path: every locator fetch
+                        // yields at least one `StreamPage`, so a downstream that
+                        // counts pages per fetch sees the same thing either way.
+                        if !emitted {
+                            yield faucet_core::StreamPage {
+                                records: Vec::new(),
+                                bookmark: None,
+                            };
+                        }
+                        (None, resp_headers_streamed)
+                    } else {
+                        let (bytes, resp_headers_buffered) = self
+                            .job_request_bytes(
+                                &job.fetch.method,
+                                &fetch_url,
+                                &job.fetch.headers,
+                                &query,
+                                job.fetch.json.as_ref(),
+                            )
+                            .await?;
+                        let (records, body_value) =
+                            self.parse_fetch_page(&bytes, job).await?;
+                        // Stream this locator page immediately — peak memory is
+                        // O(one page), not O(whole extract). Per-page bookmark
+                        // stays `None`; the incremental bookmark is emitted once
+                        // at the end.
+                        yield faucet_core::StreamPage { records, bookmark: None };
+                        (body_value, resp_headers_buffered)
+                    };
 
                     // Advance to the next locator; stop when it is absent, empty,
                     // `"null"`, or repeats (loop guard) — matching the previous
@@ -1082,7 +1144,7 @@ impl RestStream {
     ) -> Result<Vec<Value>, FaucetError> {
         let mut all_records = Vec::new();
         let mut pages_fetched = 0usize;
-        let mut pages = self.stream_pages_inner(context, None);
+        let mut pages = self.stream_pages_inner(context, None, faucet_core::DEFAULT_BATCH_SIZE);
 
         // Poll the stream without requiring StreamExt (avoids extra dependency).
         loop {
@@ -2273,11 +2335,12 @@ impl faucet_core::Source for RestStream {
     fn stream_pages<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
-        _batch_size: usize,
+        batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
-        // RestStream chunks by upstream-API page boundaries, not by an
-        // in-memory `batch_size` knob. The arg is accepted for trait
-        // conformance and reserved for a future `page_size` mapping.
+        // RestStream chunks by upstream-API page boundaries for the HTTP-paged
+        // modes. The hint *is* honoured by the bounded-memory CSV path (#626),
+        // where there is no upstream page to chunk on and the whole result set
+        // would otherwise land in one page.
         //
         // Key-range partitioning (#479): when an integer PK is configured, tile the
         // key space and stream the tiles concurrently (the fix for a huge OData
@@ -2289,7 +2352,7 @@ impl faucet_core::Source for RestStream {
             .and_then(|o| o.partition.as_ref())
             .and_then(|p| p.key.clone())
         {
-            return self.stream_key_range_partitions(context, key);
+            return self.stream_key_range_partitions(context, key, batch_size);
         }
         // Partition fan-out (#535): when `partitions` are configured the stream
         // must run once per partition — mirroring `fetch_all` / `fetch_with_context`
@@ -2297,7 +2360,7 @@ impl faucet_core::Source for RestStream {
         // (the pipeline drives this method). Any parent `context` is merged into
         // each partition context, exactly as `fetch_with_context` does.
         if self.config.partitions.is_empty() {
-            return self.stream_pages_inner(Some(context), None);
+            return self.stream_pages_inner(Some(context), None, batch_size);
         }
         let contexts: Vec<HashMap<String, Value>> = self
             .config
@@ -2316,7 +2379,7 @@ impl faucet_core::Source for RestStream {
             // mark rather than whichever partition happened to finish last.
             let mut max_bookmark: Option<Value> = None;
             for ctx in &contexts {
-                let mut inner = self.stream_pages_inner(Some(ctx), None);
+                let mut inner = self.stream_pages_inner(Some(ctx), None, batch_size);
                 loop {
                     let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
                     match page {
@@ -2677,6 +2740,7 @@ impl RestStream {
         &'a self,
         context: &'a HashMap<String, Value>,
         key: String,
+        batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
         use futures::StreamExt as _;
         let odata = self.config.odata.as_ref().expect("odata configured");
@@ -2701,7 +2765,7 @@ impl RestStream {
                 .filter_map(faucet_core::shard::PkShardBounds::from_spec)
                 .map(|bounds| {
                     let filter = crate::odata::key_range_filter(&bounds);
-                    self.stream_pages_inner(Some(&parent), filter)
+                    self.stream_pages_inner(Some(&parent), filter, batch_size)
                 })
                 .collect();
             let mut merged = futures::stream::iter(streams).flatten_unordered(workers);
