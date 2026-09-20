@@ -760,6 +760,44 @@ pipelines that share a `key`. A malformed policy (empty rules, an empty
   fan-outs.
 - `on_error` — `continue` (siblings finish; failed subtree skipped) or `stop`
   (abort pending and in-flight work on first failure).
+- `schedule` — the order ready sibling rows queue for a permit: `declared`
+  (default, matrix order) or `lpt`.
+
+### Dispatch order (`schedule: lpt`)
+
+With rows of very different sizes, total wall-clock depends on the order you
+happened to list them in: a large object listed late becomes an idle tail while
+the other slots sit empty. `schedule: lpt` (longest-processing-time-first)
+starts the heaviest rows first, which is provably within 4/3 of the optimal
+makespan — whereas largest-*last*, which declaration order can produce by
+accident, is the worst case.
+
+```yaml
+execution:
+  max_concurrent: 8
+  schedule: lpt
+matrix:
+  - id: contact
+    weight: 15500000      # optional; `faucet discover` fills this in
+```
+
+Rows are ranked by `weight`, highest first. **Ties and rows without a weight
+keep declaration order**, so dispatch stays deterministic and predictable from
+the config alone; unweighted rows sort after weighted ones.
+
+`faucet discover` writes a `weight` per generated row automatically, estimated
+as *rows × row width* from each dataset's row estimate and column types —
+**bytes moved, not row count**, because a 970k-row × 3-column table is lighter
+than a 122k-row × 100-column one. Set `weight` by hand when you know better.
+
+The win depends on duration correlating with weight. For sources whose runtime
+is dominated by a server-side queue (Salesforce Bulk, say), the estimate is a
+proxy rather than a prediction — LPT still cannot do worse than declared order,
+but it may not help as much.
+
+Only the enqueue order changes: the same permit budget, the same `on_error`
+behaviour, and children / `depends_on` rows keep their completion-gated
+ordering.
 
 ### Adaptive batch sizing
 

@@ -276,6 +276,66 @@ fn yaml_seq_item(value: &Value) -> CliResult<String> {
 /// Build the generated config document: the raw composed input with the
 /// `matrix:` block replaced by one row per dataset (schema summaries as
 /// comments). Pure — unit-testable without a live source.
+/// Estimate a dataset's relative dispatch cost for `execution.schedule: lpt`
+/// (#644): roughly the **bytes** it will move, not its row count.
+///
+/// Row count alone mis-orders real workloads — a 970k-row × 3-column history
+/// table is lighter than a 122k-row × 100-column object — so rows are scaled by
+/// a width derived from the inferred schema's column types. The absolute number
+/// is meaningless; only the ordering between rows matters.
+///
+/// `None` when there is no row estimate: an unranked row sorts after every
+/// ranked one rather than being guessed at.
+fn estimate_weight(rows: Option<u64>, schema: Option<&Value>) -> Option<f64> {
+    let rows = rows? as f64;
+    Some(rows * row_width(schema))
+}
+
+/// Approximate bytes per row from an `infer_schema`-shaped object.
+///
+/// Per-type widths are deliberately coarse — this feeds a comparison, not a
+/// capacity plan. With no schema, every row costs the same, which degrades to
+/// ranking on row count.
+fn row_width(schema: Option<&Value>) -> f64 {
+    const DEFAULT_ROW_WIDTH: f64 = 32.0;
+    let Some(props) = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(Value::as_object)
+    else {
+        return DEFAULT_ROW_WIDTH;
+    };
+    if props.is_empty() {
+        return DEFAULT_ROW_WIDTH;
+    }
+    props
+        .values()
+        .map(|col| match column_type(col) {
+            Some("boolean") => 1.0,
+            Some("integer") => 8.0,
+            Some("number") => 8.0,
+            // Strings dominate real tables and vary wildly; a single coarse
+            // figure keeps wide text objects ranked above narrow numeric ones.
+            Some("string") => 32.0,
+            // A nested object/array is at least as heavy as a string.
+            Some("object") | Some("array") => 64.0,
+            _ => 16.0,
+        })
+        .sum()
+}
+
+/// A column's JSON-Schema type, tolerating the `["string", "null"]` nullable
+/// form `infer_schema` emits.
+fn column_type(col: &Value) -> Option<&str> {
+    match col.get("type")? {
+        Value::String(s) => Some(s.as_str()),
+        Value::Array(types) => types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|t| *t != "null"),
+        _ => None,
+    }
+}
+
 fn render_discovered_config(
     raw_composed: &str,
     template: &str,
@@ -319,6 +379,12 @@ fn render_discovered_config(
             doc.push_str(&format!("  #   columns: {summary}\n"));
         }
         let mut row = json!({ "id": id, "source": { "config": d.config_patch } });
+        // Cost hint for `execution.schedule: lpt` (#644). Discovery is the one
+        // place that knows both halves, so it is where the estimate belongs —
+        // the executor just ranks by it.
+        if let Some(w) = estimate_weight(d.estimated_rows, d.schema.as_ref()) {
+            row["weight"] = json!(w);
+        }
         if template != "default" {
             row["source"]["ref"] = json!(template);
         }
@@ -342,6 +408,133 @@ fn render_discovered_config(
 
 #[cfg(test)]
 mod tests {
+
+    /// #644 — the cost estimate `faucet discover` writes into each row.
+    mod weight {
+        use super::*;
+
+        fn schema(cols: &[(&str, &str)]) -> Value {
+            let props: serde_json::Map<String, Value> = cols
+                .iter()
+                .map(|(n, t)| ((*n).to_string(), json!({ "type": t })))
+                .collect();
+            json!({ "type": "object", "properties": props })
+        }
+
+        #[test]
+        fn a_wide_short_table_outranks_a_narrow_tall_one() {
+            // The whole reason the estimate is bytes rather than rows: ranking
+            // on row count alone dispatches these two in the wrong order.
+            let wide_short = estimate_weight(
+                Some(122_000),
+                Some(&schema(
+                    &(0..100)
+                        .map(|i| {
+                            (
+                                Box::leak(format!("c{i}").into_boxed_str()) as &str,
+                                "string",
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            )
+            .expect("weighted");
+            let narrow_tall = estimate_weight(
+                Some(970_000),
+                Some(&schema(&[
+                    ("a", "integer"),
+                    ("b", "integer"),
+                    ("c", "integer"),
+                ])),
+            )
+            .expect("weighted");
+            assert!(
+                wide_short > narrow_tall,
+                "122k x 100 string columns ({wide_short}) must outrank 970k x 3 \
+                 integer columns ({narrow_tall})"
+            );
+        }
+
+        #[test]
+        fn no_row_estimate_means_unranked_rather_than_guessed() {
+            assert_eq!(
+                estimate_weight(None, Some(&schema(&[("a", "string")]))),
+                None
+            );
+        }
+
+        #[test]
+        fn without_a_schema_it_degrades_to_row_count() {
+            let small = estimate_weight(Some(10), None).expect("weighted");
+            let big = estimate_weight(Some(1_000), None).expect("weighted");
+            assert!(big > small);
+            assert_eq!(big / small, 100.0, "ordering is linear in rows");
+        }
+
+        #[test]
+        fn a_nullable_column_is_typed_by_its_non_null_half() {
+            // `infer_schema` emits `["string", "null"]` for a nullable column;
+            // reading that as "unknown" would flatten every nullable table to
+            // the same width.
+            let nullable = json!({
+                "type": "object",
+                "properties": { "a": { "type": ["string", "null"] } }
+            });
+            assert_eq!(
+                estimate_weight(Some(1), Some(&nullable)),
+                estimate_weight(Some(1), Some(&schema(&[("a", "string")]))),
+            );
+        }
+
+        #[test]
+        fn a_nested_column_weighs_more_than_a_scalar_one() {
+            // An object/array column carries a whole subtree, so a table of
+            // them moves far more bytes per row than one of integers — if both
+            // scored the same, a nested-heavy object would be dispatched last.
+            let nested =
+                estimate_weight(Some(100), Some(&schema(&[("a", "object")]))).expect("weighted");
+            let scalar =
+                estimate_weight(Some(100), Some(&schema(&[("a", "integer")]))).expect("weighted");
+            assert!(
+                nested > scalar,
+                "a nested column ({nested}) must outweigh an integer one ({scalar})"
+            );
+            let array =
+                estimate_weight(Some(100), Some(&schema(&[("a", "array")]))).expect("weighted");
+            assert_eq!(array, nested, "array and object columns weigh the same");
+        }
+
+        #[test]
+        fn a_column_of_unknown_type_still_contributes_weight() {
+            // A schema faucet did not infer (or one using a type we do not
+            // enumerate) must not make the column free — that would rank a
+            // wide table of them as empty.
+            let unknown = json!({
+                "type": "object",
+                "properties": { "a": { "type": "geography" } }
+            });
+            let w = estimate_weight(Some(10), Some(&unknown)).expect("weighted");
+            assert!(w > 0.0, "an unknown column type must still cost something");
+
+            // A `type` that is neither a string nor an array (malformed, or a
+            // schema shape we do not model) takes the same fallback rather
+            // than panicking.
+            let odd = json!({
+                "type": "object",
+                "properties": { "a": { "type": 7 } }
+            });
+            assert_eq!(estimate_weight(Some(10), Some(&odd)), Some(w));
+        }
+
+        #[test]
+        fn an_empty_property_set_falls_back_to_the_default_width() {
+            let empty = json!({ "type": "object", "properties": {} });
+            assert_eq!(
+                estimate_weight(Some(5), Some(&empty)),
+                estimate_weight(Some(5), None),
+            );
+        }
+    }
     use super::*;
 
     fn ds(name: &str, kind: &str, patch: Value) -> DatasetDescriptor {

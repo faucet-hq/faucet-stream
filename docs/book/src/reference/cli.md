@@ -1,7 +1,25 @@
 # CLI commands
 
 The `faucet` binary exposes these commands. Pass `--log-level <level>` (or set
-`FAUCET_LOG`) to control logging.
+`FAUCET_LOG`) to control logging, and `--log-format text|json` (or
+`FAUCET_LOG_FORMAT`) to control how it is rendered.
+
+**`--log-format json`** emits one JSON object per line on stderr, so an
+orchestrator's log pipeline (Datadog, Elastic, Loki, CloudWatch, Splunk) can
+ingest it without regex parsing. The span fields faucet already records —
+`pipeline`, `row`, `run_id`, `connector`, `records_written`, error `kind` —
+become first-class fields instead of being rendered into a message.
+
+Under `json`, the end-of-run human status block (`…: 1 invocation, 1 ok, …`,
+the per-row timing table, the peak-RSS line) is **not** printed: the same
+numbers already leave as structured events, and a prose line in the middle
+would break a strict consumer. `text` is the default and is byte-identical to
+previous releases.
+
+This is separate from `faucet run --output json|ndjson`, which is a
+machine-readable *result* contract on **stdout**; logs are always on stderr.
+For `faucet mcp`, logs stay on stderr under either format — stdout carries the
+JSON-RPC stream.
 
 | Command | What it does |
 |---------|--------------|

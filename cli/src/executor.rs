@@ -22,7 +22,7 @@
 //!   `CliError::DuplicateStateKey`.
 
 use crate::auth_catalog::AuthCatalog;
-use crate::config::{ExecutionSpec, OnError};
+use crate::config::{DispatchOrder, ExecutionSpec, OnError};
 use crate::error::{CliError, CliResult};
 use crate::expand::{ExpandedNode, NodeRole};
 use crate::interpolate::interpolate_record;
@@ -163,6 +163,40 @@ pub enum InvocationErrorKind {
     Other,
 }
 
+/// Order the ready set for permit acquisition (#644).
+///
+/// `Declared` returns the input untouched — the BFS order the caller built.
+/// `Lpt` sorts by [`ExpandedNode::weight`] descending, **stably**, so ties and
+/// unweighted rows keep declaration order and dispatch is never
+/// nondeterministic. Unweighted rows sort last: a row nobody costed should not
+/// displace one somebody did.
+///
+/// Pure, so the policy is testable without standing up a pipeline.
+fn order_ready(
+    ready: Vec<String>,
+    nodes_by_id: &HashMap<String, ExpandedNode>,
+    order: DispatchOrder,
+) -> Vec<String> {
+    if order == DispatchOrder::Declared || ready.len() < 2 {
+        return ready;
+    }
+    let mut ranked = ready;
+    // `sort_by` is stable, so equal keys keep their relative (declared) order.
+    ranked.sort_by(|a, b| {
+        let w = |id: &String| nodes_by_id.get(id).and_then(|n| n.weight);
+        match (w(a), w(b)) {
+            // Heaviest first. `total_cmp` rather than `partial_cmp` so a NaN
+            // weight (a config can carry one) orders deterministically instead
+            // of silently making the sort inconsistent.
+            (Some(x), Some(y)) => y.total_cmp(&x),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    ranked
+}
+
 /// One pipeline invocation's outcome.
 #[derive(Debug)]
 pub struct InvocationOutcome {
@@ -281,6 +315,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
         .unwrap_or_default();
     let max_concurrent =
         concurrency_permits(opts.execution.as_ref().and_then(|e| e.max_concurrent));
+    let dispatch_order = opts
+        .execution
+        .as_ref()
+        .map(|e| e.schedule)
+        .unwrap_or_default();
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
     // A `local_outputs:` block with nowhere to record to is inert (#587). Say so
@@ -387,6 +426,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             })
             .cloned()
             .collect();
+
+        // Heaviest-first when asked (#644). Only the order in which ready
+        // siblings queue for a permit changes — same budget, same JoinSet,
+        // same cancellation.
+        let ready = order_ready(ready, &nodes_by_id, dispatch_order);
 
         if ready.is_empty() {
             // No node is ready but some remain — an expand.rs invariant was
@@ -2756,6 +2800,141 @@ fn value_to_string_brief(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #644 — dispatch order.
+    ///
+    /// `order_ready` is the whole policy, so it is tested directly rather than
+    /// through a running pipeline: what matters is that the heaviest row claims
+    /// a permit first and that everything else stays deterministic.
+    mod dispatch_order {
+        use super::*;
+
+        fn node(id: &str, weight: Option<f64>) -> ExpandedNode {
+            ExpandedNode {
+                id: id.into(),
+                row_index: 0,
+                weight,
+                role: NodeRole::Root,
+                source: ConnectorSpec {
+                    kind: "csv".into(),
+                    config: json!({}),
+                    transforms: None,
+                    inherit_transforms: true,
+                    status: None,
+                    tags: Vec::new(),
+                    complete_for: None,
+                },
+                sink: ConnectorSpec {
+                    kind: "jsonl".into(),
+                    config: json!({}),
+                    transforms: None,
+                    inherit_transforms: true,
+                    status: None,
+                    tags: Vec::new(),
+                    complete_for: None,
+                },
+                transforms: Vec::new(),
+                state: None,
+                dlq: None,
+                delivery: faucet_core::DeliveryMode::AtLeastOnce,
+                delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
+                #[cfg(feature = "quality")]
+                quality: None,
+                #[cfg(feature = "contract")]
+                contract: None,
+                #[cfg(feature = "masking")]
+                masking: None,
+                sink_ref: "default".into(),
+                schema: None,
+                depends_on: Vec::new(),
+                status: crate::config::SourceStatus::Active,
+                tags: Vec::new(),
+                cleanup_scope: None,
+                metadata_columns: None,
+                #[cfg(feature = "catalog")]
+                local_outputs: None,
+                deferred_refs: Vec::new(),
+                source_override: None,
+            }
+        }
+
+        fn map(nodes: Vec<ExpandedNode>) -> HashMap<String, ExpandedNode> {
+            nodes.into_iter().map(|n| (n.id.clone(), n)).collect()
+        }
+
+        #[test]
+        fn declared_order_is_returned_untouched() {
+            let by_id = map(vec![
+                node("a", Some(1.0)),
+                node("b", Some(900.0)),
+                node("c", None),
+            ]);
+            let ready = vec!["a".into(), "b".into(), "c".into()];
+            assert_eq!(
+                order_ready(ready.clone(), &by_id, DispatchOrder::Declared),
+                ready,
+                "the default must not reorder anything"
+            );
+        }
+
+        #[test]
+        fn lpt_dispatches_the_heaviest_row_first() {
+            // The reported shape: the big objects are listed last, so plain
+            // declaration order leaves them as an idle tail.
+            let by_id = map(vec![
+                node("small", Some(10.0)),
+                node("medium", Some(500.0)),
+                node("huge", Some(9_000.0)),
+            ]);
+            let ready = vec!["small".into(), "medium".into(), "huge".into()];
+            assert_eq!(
+                order_ready(ready, &by_id, DispatchOrder::Lpt),
+                vec!["huge", "medium", "small"]
+            );
+        }
+
+        #[test]
+        fn ties_and_unweighted_rows_keep_declaration_order() {
+            // Determinism is the constraint: an operator must be able to
+            // predict dispatch from the config alone.
+            let by_id = map(vec![
+                node("a", Some(5.0)),
+                node("b", None),
+                node("c", Some(5.0)),
+                node("d", None),
+            ]);
+            let ready = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+            assert_eq!(
+                order_ready(ready, &by_id, DispatchOrder::Lpt),
+                vec!["a", "c", "b", "d"],
+                "equal weights keep their order, and unweighted rows sort last"
+            );
+        }
+
+        #[test]
+        fn a_nan_weight_does_not_make_the_sort_inconsistent() {
+            // A config can carry a NaN; `partial_cmp` would return `None` and
+            // leave the comparator inconsistent, which is UB-adjacent for a
+            // sort. `total_cmp` orders it definitely.
+            let by_id = map(vec![node("nan", Some(f64::NAN)), node("real", Some(1.0))]);
+            let out = order_ready(
+                vec!["nan".into(), "real".into()],
+                &by_id,
+                DispatchOrder::Lpt,
+            );
+            assert_eq!(out.len(), 2, "no row is dropped");
+            assert!(out.contains(&"real".to_string()));
+        }
+
+        #[test]
+        fn a_single_ready_row_short_circuits() {
+            let by_id = map(vec![node("only", Some(1.0))]);
+            assert_eq!(
+                order_ready(vec!["only".into()], &by_id, DispatchOrder::Lpt),
+                vec!["only"]
+            );
+        }
+    }
     use crate::config::{ConnectorSpec, PipelineConfig, PipelineSpec};
     use crate::expand::expand;
     use serde_json::json;
@@ -4170,6 +4349,7 @@ matrix:
             ExpandedNode {
                 id: id.into(),
                 row_index: 0,
+                weight: None,
                 role: NodeRole::Child {
                     parent_id: parent.into(),
                     parent_key: parent_key.into(),
@@ -4253,6 +4433,7 @@ matrix:
         let c = ExpandedNode {
             id: "c".into(),
             row_index: 0,
+            weight: None,
             role: NodeRole::Child {
                 parent_id: "p".into(),
                 parent_key: "id".into(),
@@ -4581,6 +4762,7 @@ matrix:
         ExpandedNode {
             id: "n".into(),
             row_index: 0,
+            weight: None,
             role: NodeRole::Root,
             source: ConnectorSpec {
                 kind: "csv".into(),
@@ -4804,6 +4986,7 @@ matrix:
         let orphan = ExpandedNode {
             id: "orphan".into(),
             row_index: 0,
+            weight: None,
             role: NodeRole::Child {
                 parent_id: "missing-parent".into(),
                 parent_key: "id".into(),

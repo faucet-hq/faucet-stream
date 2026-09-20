@@ -20,7 +20,7 @@ static LOG_HUB: OnceLock<LogHub> = OnceLock::new();
 /// handle (when this call installed the recorder; `None` if one was already
 /// present) and the process-global [`LogHub`] wired into the subscriber's
 /// `RunLogLayer`.
-pub fn install(level: &str) -> (Option<PrometheusHandle>, LogHub) {
+pub fn install(level: &str, format: crate::cli::LogFormat) -> (Option<PrometheusHandle>, LogHub) {
     let handle = match PrometheusBuilder::new().install_recorder() {
         Ok(h) => Some(h),
         Err(e) => {
@@ -34,12 +34,12 @@ pub fn install(level: &str) -> (Option<PrometheusHandle>, LogHub) {
     let hub = LOG_HUB.get_or_init(LogHub::new).clone();
     // Only the first call's `try_init` succeeds; subsequent calls leave the
     // already-installed subscriber (which holds this same hub) in place.
-    install_subscriber(level, hub.clone());
+    install_subscriber(level, format, hub.clone());
     (handle, hub)
 }
 
 #[cfg(feature = "observability")]
-fn install_subscriber(level: &str, hub: LogHub) {
+fn install_subscriber(level: &str, format: crate::cli::LogFormat, hub: LogHub) {
     use crate::secrets::registry::RedactingMakeWriter;
     use crate::serve::logs::RunLogLayer;
     use tracing_subscriber::EnvFilter;
@@ -47,14 +47,32 @@ fn install_subscriber(level: &str, hub: LogHub) {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-    let registry = tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter))
-        .with(RunLogLayer::new(hub));
-    if registry.try_init().is_err() {
+    // `RunLogLayer` is unaffected by the format: it captures the run's records
+    // into the SSE ring with its own structured columns, which the console
+    // renders. This flag governs the *stderr* stream an orchestrator ingests.
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(RedactingMakeWriter);
+    let initialised = match format {
+        crate::cli::LogFormat::Text => tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .with(RunLogLayer::new(hub))
+            .try_init(),
+        crate::cli::LogFormat::Json => tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                stderr_layer
+                    .json()
+                    .flatten_event(true)
+                    .with_current_span(true)
+                    .with_span_list(false),
+            )
+            .with(RunLogLayer::new(hub))
+            .try_init(),
+    };
+    if initialised.is_err() {
         tracing::warn!("tracing subscriber already installed; continuing");
     }
 }
 
 #[cfg(not(feature = "observability"))]
-fn install_subscriber(_level: &str, _hub: LogHub) {}
+fn install_subscriber(_level: &str, _format: crate::cli::LogFormat, _hub: LogHub) {}

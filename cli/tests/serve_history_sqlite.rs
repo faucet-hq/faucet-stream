@@ -898,6 +898,52 @@ mod templates {
         assert!(s.template_launches("orders").await.unwrap().is_empty());
     }
 
+    /// #666 — heavy contention on the register path.
+    ///
+    /// The six-way test below was flaky rather than broken: every step of the
+    /// version-assignment retry loop was retried *except* `tx.commit()`, and in
+    /// WAL mode a transaction that read and then wrote can be refused at COMMIT
+    /// with `database is locked` when another writer committed in between —
+    /// SQLite answers that immediately rather than honouring `busy_timeout`,
+    /// because waiting could deadlock. Whether a given run tripped it was luck.
+    ///
+    /// Sixteen writers make the overlap near-certain, so this fails reliably
+    /// without the fix and passes with it — and it asserts the *guarantee*
+    /// (sixteen distinct versions, none lost) rather than merely "no error".
+    #[tokio::test]
+    async fn heavy_concurrent_registers_assign_distinct_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(store(&dir, "tpl-contention.db").await);
+
+        const WRITERS: u32 = 64;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..WRITERS {
+            let s = s.clone();
+            set.spawn(async move { s.template_register(&draft("orders", None)).await });
+        }
+
+        let mut versions: Vec<u32> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined.expect("task panicked") {
+                Ok(rec) => versions.push(rec.version),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "every register must survive contention — a transient lock is the \
+             backend's problem, not the caller's: {errors:?}"
+        );
+
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            (1..=WRITERS).collect::<Vec<u32>>(),
+            "each writer must get its own version, with none lost or reused"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_registers_and_launches_never_lose_a_write() {
         let dir = tempfile::tempdir().unwrap();

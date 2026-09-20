@@ -113,6 +113,9 @@ pub struct ServeConfig {
     /// Tracing filter directive for serve's own subscriber. Set from the
     /// clap-resolved `--log-level` / `FAUCET_LOG`; defaults to `"info"`.
     pub log_level: String,
+    /// Rendering for serve's own stderr log stream (#634). Set from
+    /// `--log-format` / `FAUCET_LOG_FORMAT`; defaults to text.
+    pub log_format: crate::cli::LogFormat,
     /// Whether to serve the embedded web console. Built only when the `serve-ui`
     /// feature is on; this gates serving at runtime (`--no-ui`).
     #[cfg_attr(not(feature = "serve-ui"), allow(dead_code))]
@@ -297,6 +300,7 @@ impl ServeConfig {
             env_file: args.env_file,
             no_env_file: args.no_env_file,
             log_level: "info".to_string(),
+            log_format: crate::cli::LogFormat::Text,
             ui_enabled: !args.no_ui,
             cluster,
             triggers_path: args.triggers,

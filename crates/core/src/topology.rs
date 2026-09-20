@@ -315,6 +315,36 @@ impl TopologyOptions {
     }
 }
 
+/// Typed class of a node's failure, for callers that react to a *kind* of
+/// failure rather than report it (PRINCIPLES §6 — never recover a class by
+/// grepping a message).
+///
+/// Non-exhaustive: new classes are additive, so matching must carry a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NodeErrorKind {
+    /// [`FaucetError::CircuitOpen`] — the resilience circuit breaker tripped.
+    /// `faucet schedule` delays its next tick by the policy cooldown rather
+    /// than re-firing immediately at a destination that just tripped.
+    CircuitOpen,
+    /// Any other failure. Deliberately distinct from `None`, which means the
+    /// node did not fail at all.
+    Other,
+}
+
+impl NodeErrorKind {
+    /// Classify a node's failure while the typed error is still intact.
+    ///
+    /// One table, at the boundary where the error is stringified — the whole
+    /// point of the field is that no consumer has to re-derive this from prose.
+    pub fn classify(error: &FaucetError) -> Self {
+        match error {
+            FaucetError::CircuitOpen { .. } => Self::CircuitOpen,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// What one node did, for callers that need per-node attribution (the CLI emits
 /// notifications and evaluates SLAs per **sink node**, which needs to know which
 /// node failed — [`TopologyResult::errors`] is a flat list of messages).
@@ -331,6 +361,12 @@ pub struct NodeReport {
     pub bookmark: Option<Value>,
     /// The node's failure, if it failed.
     pub error: Option<String>,
+    /// Typed class of [`error`](Self::error), for callers that react to a kind
+    /// of failure rather than render it. `None` when the node succeeded.
+    ///
+    /// Additive on a `#[non_exhaustive]` struct, so a minor bump under the
+    /// declared semver contract.
+    pub error_kind: Option<NodeErrorKind>,
 }
 
 /// A topology run with per-node attribution.
@@ -832,7 +868,7 @@ impl Topology {
                 let coop = opts.cancel.clone().unwrap_or_default().child_token();
                 let first_err: Arc<std::sync::Mutex<Option<FaucetError>>> =
                     Arc::new(std::sync::Mutex::new(None));
-                let failures: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+                let failures: Arc<std::sync::Mutex<Vec<(String, String, NodeErrorKind)>>> =
                     Arc::new(std::sync::Mutex::new(Vec::new()));
                 let wrapped = joined.zip(order.clone()).map(|(f, (node_id, _))| {
                     let coop = coop.clone();
@@ -842,10 +878,11 @@ impl Topology {
                         match f.await {
                             Ok(o) => Some(o),
                             Err(e) => {
-                                failed
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .push((node_id, e.to_string()));
+                                failed.lock().unwrap_or_else(|p| p.into_inner()).push((
+                                    node_id,
+                                    e.to_string(),
+                                    NodeErrorKind::classify(&e),
+                                ));
                                 tracing::error!(
                                     error = %e,
                                     "topology node failed; cancelling siblings so they flush"
@@ -900,7 +937,7 @@ impl Topology {
                 let results = futures::future::join_all(joined).await;
                 let mut ok = Vec::new();
                 let mut errs = Vec::new();
-                let mut failed: Vec<(String, String)> = Vec::new();
+                let mut failed: Vec<(String, String, NodeErrorKind)> = Vec::new();
                 for (r, (node_id, _)) in results.into_iter().zip(order.clone()) {
                     match r {
                         Ok(o) => ok.push(o),
@@ -911,7 +948,7 @@ impl Topology {
                                 "topology node failed (on_error: continue)"
                             );
                             errs.push(e.to_string());
-                            failed.push((node_id, e.to_string()));
+                            failed.push((node_id, e.to_string(), NodeErrorKind::classify(&e)));
                         }
                     }
                 }
@@ -933,7 +970,7 @@ fn reports(
     order: &[(String, &'static str)],
     sinks: &TopologyResult,
     per_source: &HashMap<String, usize>,
-    errors: &[(String, String)],
+    errors: &[(String, String, NodeErrorKind)],
 ) -> Vec<NodeReport> {
     order
         .iter()
@@ -949,8 +986,12 @@ fn reports(
             bookmark: sinks.bookmarks.get(id).cloned().flatten(),
             error: errors
                 .iter()
-                .find(|(nid, _)| nid == id)
-                .map(|(_, e)| e.clone()),
+                .find(|(nid, _, _)| nid == id)
+                .map(|(_, e, _)| e.clone()),
+            error_kind: errors
+                .iter()
+                .find(|(nid, _, _)| nid == id)
+                .map(|(_, _, k)| *k),
         })
         .collect()
 }
@@ -1594,6 +1635,19 @@ mod tests {
     impl Sink for FailingSink {
         async fn write_batch(&self, _records: &[Value]) -> Result<usize, FaucetError> {
             Err(FaucetError::Sink("sink boom".into()))
+        }
+    }
+
+    /// A sink that fails the way the resilience circuit breaker does, so a test
+    /// can check the *class* survives rather than just the message (#658).
+    pub(super) struct BreakerSink;
+    #[async_trait]
+    impl Sink for BreakerSink {
+        async fn write_batch(&self, _records: &[Value]) -> Result<usize, FaucetError> {
+            Err(FaucetError::CircuitOpen {
+                failures: 3,
+                cooldown: std::time::Duration::from_secs(30),
+            })
         }
     }
 
@@ -2291,7 +2345,7 @@ mod tests {
 
 #[cfg(test)]
 mod delivery_and_report_tests {
-    use super::tests::{CollectSink, FailingSink, VecSource, recs};
+    use super::tests::{BreakerSink, CollectSink, FailingSink, VecSource, recs};
     use super::*;
     use crate::Stream;
     use crate::idempotency::{DeliveryMode, format_token_with_bookmark, wrap_state};
@@ -2429,6 +2483,77 @@ mod delivery_and_report_tests {
         assert!(t.contains('#'), "token embeds the bookmark: {t}");
     }
 
+    /// #658: the class of a node failure travels typed, not as prose.
+    #[test]
+    fn node_error_kind_classifies_only_the_breaker() {
+        // The table is one line, but it is the whole point of the field: the
+        // class comes from the typed error, so no consumer has to read prose.
+        assert_eq!(
+            NodeErrorKind::classify(&FaucetError::CircuitOpen {
+                failures: 3,
+                cooldown: std::time::Duration::from_secs(30),
+            }),
+            NodeErrorKind::CircuitOpen
+        );
+        // A message that merely *reads* like a trip is not one.
+        assert_eq!(
+            NodeErrorKind::classify(&FaucetError::Sink(
+                "Circuit open after 3 consecutive failures".into()
+            )),
+            NodeErrorKind::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn a_breaker_trip_is_reported_on_the_node_that_raised_it_only() {
+        // The edge case #658 names: when one node trips and its siblings are
+        // cancelled so they can flush, only the node that actually raised
+        // `CircuitOpen` may carry that kind — otherwise the scheduler would
+        // apply a breaker cooldown for an unrelated cancellation.
+        let (healthy, _) = CollectSink::new();
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(4)))
+            .tee("t", 4, Some(2))
+            .sink("tripped", Box::new(BreakerSink))
+            .sink("healthy", Box::new(healthy))
+            .edge("s", "t")
+            .edge("t", "tripped")
+            .edge("t", "healthy")
+            .build()
+            .unwrap();
+
+        let run = topo
+            .run_reported(
+                TopologyOptions::new("p").with_on_error(TopologyOnError::Continue),
+                TopologyGovernance::new(),
+            )
+            .await
+            .unwrap();
+
+        let tripped = run.nodes.iter().find(|n| n.node_id == "tripped").unwrap();
+        assert_eq!(
+            tripped.error_kind,
+            Some(NodeErrorKind::CircuitOpen),
+            "the node that raised the trip must carry the class that earns the cooldown"
+        );
+
+        let classified: Vec<&str> = run
+            .nodes
+            .iter()
+            .filter(|n| n.error_kind == Some(NodeErrorKind::CircuitOpen))
+            .map(|n| n.node_id.as_str())
+            .collect();
+        assert_eq!(
+            classified,
+            vec!["tripped"],
+            "exactly one node may be classified as the breaker trip"
+        );
+        // A node that did not fail carries no kind at all — `None` is
+        // "did not fail", never "failed, unclassified".
+        let healthy = run.nodes.iter().find(|n| n.node_id == "healthy").unwrap();
+        assert_eq!(healthy.error_kind, None);
+    }
+
     /// #459: the CLI needs to know *which* sink node failed to notify per node.
     #[tokio::test]
     async fn run_reported_attributes_failures_to_their_node() {
@@ -2453,6 +2578,11 @@ mod delivery_and_report_tests {
 
         let bad = run.nodes.iter().find(|n| n.node_id == "bad").unwrap();
         assert!(bad.error.is_some(), "the failing sink is attributed");
+        assert_eq!(
+            bad.error_kind,
+            Some(NodeErrorKind::Other),
+            "an ordinary sink failure is classified, just not as a breaker trip"
+        );
         let good = run.nodes.iter().find(|n| n.node_id == "good").unwrap();
         assert!(good.error.is_none(), "the healthy sink is not");
         assert_eq!(good.records, 4);
