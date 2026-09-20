@@ -487,6 +487,46 @@ mod tests {
         }
 
         #[test]
+        fn a_nested_column_weighs_more_than_a_scalar_one() {
+            // An object/array column carries a whole subtree, so a table of
+            // them moves far more bytes per row than one of integers — if both
+            // scored the same, a nested-heavy object would be dispatched last.
+            let nested =
+                estimate_weight(Some(100), Some(&schema(&[("a", "object")]))).expect("weighted");
+            let scalar =
+                estimate_weight(Some(100), Some(&schema(&[("a", "integer")]))).expect("weighted");
+            assert!(
+                nested > scalar,
+                "a nested column ({nested}) must outweigh an integer one ({scalar})"
+            );
+            let array =
+                estimate_weight(Some(100), Some(&schema(&[("a", "array")]))).expect("weighted");
+            assert_eq!(array, nested, "array and object columns weigh the same");
+        }
+
+        #[test]
+        fn a_column_of_unknown_type_still_contributes_weight() {
+            // A schema faucet did not infer (or one using a type we do not
+            // enumerate) must not make the column free — that would rank a
+            // wide table of them as empty.
+            let unknown = json!({
+                "type": "object",
+                "properties": { "a": { "type": "geography" } }
+            });
+            let w = estimate_weight(Some(10), Some(&unknown)).expect("weighted");
+            assert!(w > 0.0, "an unknown column type must still cost something");
+
+            // A `type` that is neither a string nor an array (malformed, or a
+            // schema shape we do not model) takes the same fallback rather
+            // than panicking.
+            let odd = json!({
+                "type": "object",
+                "properties": { "a": { "type": 7 } }
+            });
+            assert_eq!(estimate_weight(Some(10), Some(&odd)), Some(w));
+        }
+
+        #[test]
         fn an_empty_property_set_falls_back_to_the_default_width() {
             let empty = json!({ "type": "object", "properties": {} });
             assert_eq!(
