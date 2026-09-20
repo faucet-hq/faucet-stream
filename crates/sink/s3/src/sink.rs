@@ -1,7 +1,7 @@
 //! S3 sink executor.
 
 use crate::config::S3SinkConfig;
-#[cfg(feature = "arrow")]
+#[cfg(any(feature = "arrow", test))]
 use crate::config::S3SinkFormat;
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
@@ -36,6 +36,12 @@ const MIN_PART_BYTES: usize = 5 * 1024 * 1024;
 /// leaves nothing abandoned if the run dies before the object is finished.
 struct OpenObject {
     acc: faucet_core::ObjectAccumulator,
+    /// Records held for a **whole-object** format (#604). CSV has a header,
+    /// XML a document element, a workbook a container index and a JSON array
+    /// its brackets — none can be appended a record at a time, so their
+    /// records are buffered and encoded together at the rollover. Unused (and
+    /// always empty) for JSON Lines, which streams through `acc`.
+    pending: faucet_core::object_rollover::PageAccumulator,
     /// Key and upload id of the multipart upload, once one has been started.
     upload: Option<(String, String)>,
     parts: Vec<aws_sdk_s3::types::CompletedPart>,
@@ -54,6 +60,10 @@ impl OpenObject {
                 config.max_bytes_per_file,
             )
             .with_part_size(MIN_PART_BYTES),
+            pending: faucet_core::object_rollover::PageAccumulator::new(
+                config.effective_chunk_cap(),
+                config.max_bytes_per_file,
+            ),
             upload: None,
             parts: Vec::new(),
         }
@@ -110,10 +120,12 @@ impl S3Sink {
         {
             let codec = self.config.compression.resolve(&self.config.file_extension);
             faucet_core::compression::warn_mismatch(&self.config.file_extension, codec);
-            return faucet_core::compression::compress_buf(&body, codec);
+            faucet_core::compression::compress_buf(&body, codec)
         }
         #[cfg(not(feature = "compression"))]
-        Ok(body)
+        {
+            Ok(body)
+        }
     }
 
     /// Upload one multipart part, starting the upload if this is the first.
@@ -209,6 +221,30 @@ impl S3Sink {
         Ok(())
     }
 
+    /// Encode one buffered group in the configured whole-object format and
+    /// upload it as a single object (#604).
+    ///
+    /// A plain `put_object`, never multipart: these formats are encoded from a
+    /// bounded in-memory group, so there is no stream to split into parts —
+    /// and a header or container index written across parts would not be
+    /// readable anyway.
+    async fn write_encoded_object(&self, group: Vec<Value>) -> Result<(), FaucetError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let format = self.config.format.shared().ok_or_else(|| {
+            FaucetError::Sink(
+                "S3 sink: parquet is written by the Arrow path, not the record encoder".into(),
+            )
+        })?;
+        let rows = group.len();
+        let body = faucet_core::file_format::encode(&group, format, &self.config.format_options())?;
+        let key = self.generate_key();
+        self.upload_file(&key, body).await?;
+        tracing::info!(key = %key, records = rows, format = format.as_str(), "S3 object written");
+        Ok(())
+    }
+
     /// Upload a single JSONL file to S3.
     async fn upload_file(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
         let body = self.encode_body(body)?;
@@ -271,6 +307,9 @@ impl faucet_core::Sink for S3Sink {
         let mut open = self.open.lock().await;
         if let Some(obj) = open.acc.finish() {
             self.finish_object(&mut open, obj).await?;
+        }
+        if let Some(group) = open.pending.finish() {
+            self.write_encoded_object(group).await?;
         }
         Ok(())
     }
@@ -341,6 +380,19 @@ impl faucet_core::Sink for S3Sink {
                 files = chunks.len(),
                 "S3 parquet batch write complete"
             );
+            return Ok(records.len());
+        }
+
+        // Whole-object formats (#604): a CSV header, an XML document element,
+        // a workbook index and a JSON array's brackets all need every record
+        // before any byte is final, so records are buffered and encoded
+        // together. The same row/byte caps decide the rollover, so object
+        // sizing means the same thing whatever the format.
+        if !self.config.format.appends_per_record() {
+            let mut open = self.open.lock().await;
+            if let Some(group) = open.pending.push_page(records) {
+                self.write_encoded_object(group).await?;
+            }
             return Ok(records.len());
         }
 
@@ -460,6 +512,77 @@ mod tests {
             client,
             open,
         }
+    }
+
+    /// #604 — a whole-object format buffers records and encodes them together
+    /// at the rollover, rather than appending a record at a time.
+    #[tokio::test]
+    async fn a_whole_object_format_buffers_until_the_cap() {
+        let cfg = S3SinkConfig::new("b")
+            .prefix("out/")
+            .format(S3SinkFormat::Csv)
+            .file_extension(".csv")
+            .max_records_per_file(3);
+        assert!(!cfg.format.appends_per_record());
+        let sink = test_sink(cfg);
+        let _ = &sink;
+        // Two pages of two: the first rollover happens on the fourth record,
+        // so nothing is emitted by the first page alone.
+        {
+            let mut open = sink.open.lock().await;
+            assert!(
+                open.pending
+                    .push_page(&[json!({"a": 1}), json!({"a": 2})])
+                    .is_none(),
+                "under the cap, nothing rolls"
+            );
+            let group = open
+                .pending
+                .push_page(&[json!({"a": 3}), json!({"a": 4})])
+                .expect("the cap is reached");
+            assert_eq!(group.len(), 4, "a group overshoots by at most one page");
+        }
+    }
+
+    #[cfg(feature = "file-format-csv")]
+    #[test]
+    fn a_csv_object_carries_a_header_and_the_configured_delimiter() {
+        let cfg = S3SinkConfig::new("b")
+            .format(S3SinkFormat::Csv)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: true,
+            });
+        let body = faucet_core::file_format::encode(
+            &[json!({"a": 1, "b": 2})],
+            cfg.format
+                .shared()
+                .expect("csv maps onto the shared format"),
+            &cfg.format_options(),
+        )
+        .expect("encode");
+        assert_eq!(String::from_utf8(body).unwrap(), "a;b\n1;2\n");
+    }
+
+    #[test]
+    fn json_array_is_one_array_per_object_not_one_per_line() {
+        let cfg = S3SinkConfig::new("b").format(S3SinkFormat::JsonArray);
+        assert!(!cfg.format.appends_per_record());
+        let body = faucet_core::file_format::encode(
+            &[json!({"a": 1}), json!({"a": 2})],
+            cfg.format
+                .shared()
+                .expect("json_array maps onto the shared format"),
+            &cfg.format_options(),
+        )
+        .expect("encode");
+        assert_eq!(String::from_utf8(body).unwrap(), r#"[{"a":1},{"a":2}]"#);
+    }
+
+    #[test]
+    fn json_lines_is_the_one_format_that_still_streams() {
+        assert!(S3SinkFormat::JsonLines.appends_per_record());
+        assert!(!S3SinkFormat::JsonArray.appends_per_record());
     }
 
     #[test]

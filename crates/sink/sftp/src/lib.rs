@@ -15,6 +15,6 @@ pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};
 
-pub use config::SftpSinkConfig;
+pub use config::{SftpSinkConfig, SftpSinkFormat};
 pub use faucet_common_sftp::{HostKeyPolicy, SftpAuth, SftpConnectionConfig};
 pub use sink::SftpSink;

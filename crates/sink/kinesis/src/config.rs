@@ -176,7 +176,7 @@ impl KinesisSinkConfig {
     pub fn retry_spec(&self) -> faucet_core::retry::PartialRetrySpec {
         self.retry
             .clone()
-            .unwrap_or_else(|| faucet_core::retry::PartialRetrySpec {
+            .unwrap_or(faucet_core::retry::PartialRetrySpec {
                 max_attempts: self.retry_max_attempts,
                 initial_backoff_ms: self.retry_initial_backoff_ms,
                 max_backoff_ms: self.retry_max_backoff_ms,

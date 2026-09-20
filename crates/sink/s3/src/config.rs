@@ -19,6 +19,49 @@ pub enum S3SinkFormat {
     /// (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     Parquet,
+    /// A single JSON array per object.
+    JsonArray,
+    /// Delimited text. Columns are the union of every record's keys; dialect
+    /// from [`csv`](S3SinkConfig::csv). Requires `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, one element per record. Framing from
+    /// [`xml`](S3SinkConfig::xml). Requires `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet name from [`excel`](S3SinkConfig::excel).
+    /// Requires `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl S3SinkFormat {
+    /// The shared format this variant maps onto, or `None` for Parquet, which
+    /// is columnar and has its own Arrow writer.
+    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            #[cfg(feature = "arrow")]
+            Self::Parquet => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
+
+    /// Whether an object of this format can be built one record at a time.
+    ///
+    /// Only JSON Lines can: every other format has a header, a wrapper, or a
+    /// container index, so its records must be buffered and encoded together.
+    /// This is what decides between the byte accumulator (streaming, multipart)
+    /// and the record accumulator (buffered, single `put_object`).
+    pub(crate) fn appends_per_record(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
 }
 
 /// Configuration for the S3 sink connector.
@@ -90,6 +133,15 @@ pub struct S3SinkConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet name, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_batch_size() -> usize {
@@ -97,6 +149,16 @@ fn default_batch_size() -> usize {
 }
 
 impl S3SinkConfig {
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::encode`] wants.
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
+        }
+    }
+
     /// Create a new config with the required bucket name and sensible defaults.
     pub fn new(bucket: impl Into<String>) -> Self {
         Self {
@@ -112,6 +174,9 @@ impl S3SinkConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::Auto,
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
         }
     }
 
@@ -125,6 +190,24 @@ impl S3SinkConfig {
     /// `parquet`).
     pub fn format(mut self, format: S3SinkFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Set the CSV dialect used when `format: csv` (#604).
+    pub fn csv(mut self, csv: faucet_core::CsvOptions) -> Self {
+        self.csv = csv;
+        self
+    }
+
+    /// Set the worksheet name used when `format: xlsx` (#604).
+    pub fn excel(mut self, excel: faucet_core::ExcelOptions) -> Self {
+        self.excel = excel;
+        self
+    }
+
+    /// Set the record framing used when `format: xml` (#604).
+    pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
+        self.xml = xml;
         self
     }
 

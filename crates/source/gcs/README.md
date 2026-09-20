@@ -11,7 +11,7 @@ Reach for it when your data already lives in GCS — event exports, log dumps, a
 
 ## Feature highlights
 
-- **Three file formats** — `json_lines` (one record per line), `json_array` (one array per object), and `raw_text` (each object becomes a `{key, content}` record).
+- **Seven file formats** — `json_lines`, `json_array`, `raw_text`, `parquet`, plus `csv`, `xml` and `xlsx` via [file formats](#file-formats-604).
 - **Apache Parquet (Arrow columnar)** — behind the `arrow` feature, a fourth format `file_format: parquet` decodes each object via the Arrow Parquet reader and, when the sink is also Arrow-native (Parquet / Delta), moves records end-to-end as Arrow `RecordBatch`es with no `serde_json::Value` in between. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).
 - **List or explicit keys** — scan a bucket by `prefix`, or skip listing entirely by passing an exact `object_keys` list.
 - **Concurrent reads** — objects are fetched in parallel (default 10) on the streaming path as well as the batch one, so wall-clock time is bounded by your slowest objects, not their sum. The streaming prefetch is *ordered*, so records still arrive in listing order and a failing object is still blamed at its own position. For `json_lines` the look-ahead holds only open body readers and for `parquet` only footer metadata, so peak memory stays `O(batch_size)`; `json_array` / `raw_text` hold up to `concurrency` whole bodies.
@@ -71,7 +71,7 @@ faucet run pipeline.yaml
 | `prefix` | string | *(unset)* | Object-name prefix filter for listing. Ignored when `object_keys` is set. Supports `${field.path}` placeholders resolved against the parent-record context at runtime. |
 | `object_keys` | array of string | *(unset)* | Explicit object names to read. When set, listing is skipped and `prefix` is ignored. |
 | `auth` | `GcsCredentials` | `application_default` | Authentication — see [Authentication](#authentication). |
-| `file_format` | enum | `json_lines` | `json_lines`, `json_array`, or `raw_text` — see [File formats](#file-formats). |
+| `file_format` | enum | `json_lines` | `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx` — see [File formats](#file-formats-604). |
 | `max_objects` | int | *(unset)* | Hard cap on the number of objects read (applied after listing, and to an explicit `object_keys` list). |
 
 ### Performance
@@ -125,16 +125,46 @@ auth:
 
 HMAC-key auth, signed-URL generation, and KMS/CMEK encryption configuration are out of scope.
 
-## File formats
+## File formats (#604)
 
 | `file_format` | Behaviour | Streaming |
 |---------------|-----------|-----------|
 | `json_lines` *(default)* | One JSON record per line; blank lines are skipped. | Streams line-by-line — `O(batch_size)` memory. |
 | `json_array` | The entire object is a single JSON array of records. | Buffered fully per object (the closing `]` is required to parse), then chunked. |
 | `raw_text` | The whole object becomes one record `{"key": <name>, "content": <utf-8>}`. | Streamed into one `String` per object. |
+| `csv` / `xml` / `xlsx` | Decoded through `faucet_core::file_format` (below). | Buffered fully per object, then chunked. |
 | `parquet` | One record per Parquet row (Arrow-decoded). *(Requires the `arrow` feature — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).)* | Batches decoded via the Arrow Parquet reader. |
 
 Parse errors are precise: a JSONL failure carries the object key **and** the 1-based line number; a JSON-array failure carries the key. A `json_array` object whose top-level value isn't an array fails with an `"expected JSON array"` message. Non-UTF-8 bodies surface as `FaucetError::Source` with a `"not valid UTF-8"` hint.
+
+Beyond JSON Lines, JSON array and raw text, this source reads **CSV**, **XML**
+and **Excel** through `faucet_core::file_format`, so the records it produces
+match what every other file connector produces for the same bytes.
+
+```yaml
+source:
+  type: gcs
+  config:
+    bucket: feeds
+    file_format: xml
+    xml: { record_element: order }
+```
+
+| Option block | Applies to | Fields |
+|---|---|---|
+| `csv` | `csv` | `delimiter` (one byte; `"\t"` for tabs), `has_headers` (default `true`; `false` names fields `column_0`, `column_1`, …) |
+| `xml` | `xml` | `record_element` (the repeated element that delimits a record) |
+| `excel` | `xlsx` | `sheet` (name, or an index as a string; default first), `header_row` (0-based) |
+
+Enable with `--features file-formats` (or one of `file-format-csv` /
+`file-format-xml` / `file-format-excel`), so a build that reads CSV does not
+link an Excel reader. Format composes with `compression`.
+
+**Memory:** these three are read **whole** and decoded before their records are
+chunked into pages — a workbook is a zip container whose directory sits at the
+end, and an XML document is a tree. `csv` and `xml` are text formats: every
+value comes back a string. See the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
 ## Examples
 

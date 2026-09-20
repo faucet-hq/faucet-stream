@@ -59,10 +59,7 @@ impl SuiteReport {
     /// Human checklist.
     pub fn render_human(&self) -> String {
         let mut out = String::new();
-        let version = self
-            .version
-            .map(|v| format!(" v{v}"))
-            .unwrap_or_default();
+        let version = self.version.map(|v| format!(" v{v}")).unwrap_or_default();
         out.push_str(&format!("template {}{version}\n", self.template));
         for c in &self.cases {
             let mark = if c.status == "pass" { "ok  " } else { "FAIL" };

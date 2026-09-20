@@ -89,14 +89,14 @@ impl SpannerSinkConfig {
         }
     }
 
-    /// Set the per-commit row count. Pass `0` to opt out of row-count
-    /// re-chunking (the ~60,000-cell budget still applies).
-
     /// Opt out of auto-creating a missing target table (#580).
     pub fn with_create_table(mut self, create: bool) -> Self {
         self.create_table = create;
         self
     }
+
+    /// Set the per-commit row count. Pass `0` to opt out of row-count
+    /// re-chunking (the ~60,000-cell budget still applies).
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self

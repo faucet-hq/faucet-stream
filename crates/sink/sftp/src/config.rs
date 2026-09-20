@@ -5,6 +5,54 @@ use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// On-the-wire format of files written by the SFTP sink (#604).
+///
+/// Only [`JsonLines`](Self::JsonLines) can be built a record at a time; every
+/// other format has a header, a wrapper, or a container index, so its records
+/// are buffered and encoded together at the rollover.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SftpSinkFormat {
+    /// Newline-delimited JSON — one JSON record per line (the default).
+    #[default]
+    JsonLines,
+    /// A single JSON array per file.
+    JsonArray,
+    /// Delimited text. Columns are the union of every record's keys; dialect
+    /// from `csv`. Requires `file-format-csv`.
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, one element per record. Framing from `xml`. Requires
+    /// `file-format-xml`.
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet name from `excel`. Requires
+    /// `file-format-excel`.
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl SftpSinkFormat {
+    /// The shared format this variant maps onto.
+    pub(crate) fn shared(self) -> faucet_core::FileFormat {
+        match self {
+            Self::JsonLines => faucet_core::FileFormat::JsonLines,
+            Self::JsonArray => faucet_core::FileFormat::JsonArray,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => faucet_core::FileFormat::Csv,
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => faucet_core::FileFormat::Xml,
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => faucet_core::FileFormat::Xlsx,
+        }
+    }
+
+    /// Whether a file of this format can be built one record at a time.
+    pub(crate) fn appends_per_record(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
+}
+
 /// Configuration for the SFTP sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SftpSinkConfig {
@@ -14,6 +62,9 @@ pub struct SftpSinkConfig {
     pub connection: SftpConnectionConfig,
     /// Remote directory prefix under which JSON Lines objects are written.
     pub path: String,
+    /// File format (default `json_lines`) (#604).
+    #[serde(default)]
+    pub format: SftpSinkFormat,
     /// File extension for written objects (default: `.jsonl`).
     #[serde(default = "default_file_extension")]
     pub file_extension: String,
@@ -37,6 +88,15 @@ pub struct SftpSinkConfig {
     /// larger than the cap still gets its own file rather than being split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes_per_file: Option<usize>,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet name, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_file_extension() -> String {
@@ -53,10 +113,48 @@ impl SftpSinkConfig {
         Self {
             connection,
             path: path.into(),
+            format: SftpSinkFormat::default(),
             file_extension: default_file_extension(),
             batch_size: DEFAULT_BATCH_SIZE,
             max_records_per_file: None,
             max_bytes_per_file: None,
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
+        }
+    }
+
+    /// Set the file format (#604).
+    pub fn format(mut self, format: SftpSinkFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Set the CSV dialect used when `format: csv` (#604).
+    pub fn csv(mut self, csv: faucet_core::CsvOptions) -> Self {
+        self.csv = csv;
+        self
+    }
+
+    /// Set the worksheet name used when `format: xlsx` (#604).
+    pub fn excel(mut self, excel: faucet_core::ExcelOptions) -> Self {
+        self.excel = excel;
+        self
+    }
+
+    /// Set the record framing used when `format: xml` (#604).
+    pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
+        self.xml = xml;
+        self
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::encode`] wants.
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
         }
     }
 

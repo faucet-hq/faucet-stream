@@ -23,7 +23,7 @@ Connection, authentication, and host-key verification come from
 | `known_hosts` | policy | `{ mode: accept_new }` | Host-key verification policy. |
 | `path` | string | — | Remote directory to list, or a single file. |
 | `glob` | string | none | Filename glob (`*` / `?`) applied to basenames when `path` is a directory. |
-| `format` | enum | `jsonl` | `jsonl` \| `json_array` \| `raw_text`. |
+| `format` | enum | `jsonl` | `jsonl` \| `json_array` \| `raw_text` \| `csv` \| `xml` \| `xlsx`. |
 | `batch_size` | integer | `1000` | Records per page; `0` = one page per file. |
 | `concurrency` | integer | `4` | Files read concurrently. The prefetch is ordered, so records stay in listing order and a failing file is still blamed at its own position; `0` is clamped to 1. Lower than the object-store sources' default because every read shares one SSH channel. For `jsonl` it overlaps only the `open` round-trip (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole files are resident. |
 
@@ -57,3 +57,38 @@ pipeline:
 ```
 
 Licensed under MIT OR Apache-2.0.
+
+## File formats (#604)
+
+Beyond JSON Lines, JSON array and raw text, this source reads **CSV**, **XML**
+and **Excel** through `faucet_core::file_format`, so the records it produces
+match what every other file connector produces for the same bytes.
+
+```yaml
+source:
+  type: sftp
+  config:
+    host: files.example.com
+    username: svc
+    path: /exports
+    glob: "*.csv"
+    format: csv
+    csv: { delimiter: ";" }
+```
+
+| Option block | Applies to | Fields |
+|---|---|---|
+| `csv` | `csv` | `delimiter` (one byte; `"\t"` for tabs), `has_headers` (default `true`; `false` names fields `column_0`, `column_1`, …) |
+| `xml` | `xml` | `record_element` (the repeated element that delimits a record) |
+| `excel` | `xlsx` | `sheet` (name, or an index as a string; default first), `header_row` (0-based) |
+
+Enable with `--features file-formats` (or one of `file-format-csv` /
+`file-format-xml` / `file-format-excel`), so a build that reads CSV does not
+link an Excel reader. Format composes with `compression`.
+
+**Memory:** these three are read **whole** and decoded before their records are
+chunked into pages — a workbook is a zip container whose directory sits at the
+end, and an XML document is a tree. `csv` and `xml` are text formats: every
+value comes back a string. See the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+

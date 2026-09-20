@@ -184,7 +184,7 @@ fn build_create_table_sql(
             quote_ident_sqlite("id"),
             quote_ident_sqlite(col)
         ),
-        None => faucet_core::render_columns(columns, |n| quote_ident_sqlite(n), sqlite_keyword),
+        None => faucet_core::render_columns(columns, quote_ident_sqlite, sqlite_keyword),
     };
     format!(
         "CREATE TABLE IF NOT EXISTS {} ({cols})",

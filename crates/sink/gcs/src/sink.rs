@@ -1,7 +1,7 @@
 //! GCS sink executor.
 
 use crate::config::GcsSinkConfig;
-#[cfg(feature = "arrow")]
+#[cfg(any(feature = "arrow", test))]
 use crate::config::GcsSinkFormat;
 use async_trait::async_trait;
 use faucet_common_gcs::{build_storage, build_storage_control};
@@ -21,6 +21,12 @@ pub struct GcsSink {
     /// `batch_size` produced a swarm of tiny objects — the small-files problem
     /// that dominates read time on a data lake.
     open: tokio::sync::Mutex<faucet_core::ObjectAccumulator>,
+    /// Records held for a **whole-object** format (#604). CSV has a header,
+    /// XML a document element, a workbook a container index and a JSON array
+    /// its brackets — none can be appended a record at a time, so their
+    /// records are buffered and encoded together at the rollover. Always empty
+    /// for JSON Lines, which streams through `open`.
+    pending: tokio::sync::Mutex<faucet_core::object_rollover::PageAccumulator>,
 }
 
 impl GcsSink {
@@ -31,11 +37,35 @@ impl GcsSink {
             Some(resolve_effective_chunk_size(&config)),
             config.max_bytes_per_file,
         ));
+        let pending = tokio::sync::Mutex::new(faucet_core::object_rollover::PageAccumulator::new(
+            Some(resolve_effective_chunk_size(&config)),
+            config.max_bytes_per_file,
+        ));
         Ok(Self {
             config,
             storage,
             open,
+            pending,
         })
+    }
+
+    /// Encode one buffered group in the configured whole-object format and
+    /// upload it as a single object (#604).
+    async fn write_encoded_object(&self, group: Vec<Value>) -> Result<(), FaucetError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let format = self.config.format.shared().ok_or_else(|| {
+            FaucetError::Sink(
+                "GCS sink: parquet is written by the Arrow path, not the record encoder".into(),
+            )
+        })?;
+        let rows = group.len();
+        let body = faucet_core::file_format::encode(&group, format, &self.config.format_options())?;
+        let key = self.generate_key();
+        self.upload_file(&key, body).await?;
+        tracing::info!(key = %key, records = rows, format = format.as_str(), "GCS object written");
+        Ok(())
     }
 
     /// Bucket as a GCS resource path: `projects/_/buckets/{bucket}`.
@@ -83,7 +113,6 @@ impl GcsSink {
         tracing::debug!(key = %key, "Uploaded GCS parquet object");
         Ok(())
     }
-
 }
 
 #[async_trait]
@@ -107,6 +136,13 @@ impl faucet_core::Sink for GcsSink {
             let key = self.generate_key();
             self.upload_file(&key, obj.body).await?;
             tracing::info!(key = %key, records = obj.rows, "GCS object closed");
+        }
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.finish()
+        };
+        if let Some(group) = group {
+            self.write_encoded_object(group).await?;
         }
         Ok(())
     }
@@ -138,6 +174,22 @@ impl faucet_core::Sink for GcsSink {
                 .buffer_unordered(concurrency)
                 .try_collect::<Vec<()>>()
                 .await?;
+            return Ok(written);
+        }
+
+        // Whole-object formats (#604): a CSV header, an XML document element,
+        // a workbook index and a JSON array's brackets all need every record
+        // before any byte is final, so records are buffered and encoded
+        // together. The same row/byte caps decide the rollover, so object
+        // sizing means the same thing whatever the format.
+        if !self.config.format.appends_per_record() {
+            let group = {
+                let mut pending = self.pending.lock().await;
+                pending.push_page(records)
+            };
+            if let Some(group) = group {
+                self.write_encoded_object(group).await?;
+            }
             return Ok(written);
         }
 
@@ -320,6 +372,40 @@ mod tests {
     // dataset_uri test is skipped: GcsSink::new() requires Google Cloud
     // credentials (build_storage errors without auth), and no offline
     // constructor exists.
+
+    /// #604 — only JSON Lines can be appended a record at a time; every other
+    /// format has a header, a wrapper or a container index, so its records are
+    /// buffered and encoded together.
+    #[test]
+    fn json_lines_is_the_one_format_that_still_streams() {
+        assert!(GcsSinkFormat::JsonLines.appends_per_record());
+        assert!(!GcsSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(
+            GcsSinkFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+    }
+
+    #[cfg(feature = "file-format-csv")]
+    #[test]
+    fn a_csv_object_carries_a_header_and_the_configured_delimiter() {
+        let cfg = GcsSinkConfig::new("b")
+            .format(GcsSinkFormat::Csv)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: true,
+            });
+        assert!(!cfg.format.appends_per_record());
+        let body = faucet_core::file_format::encode(
+            &[serde_json::json!({"a": 1, "b": 2})],
+            cfg.format
+                .shared()
+                .expect("csv maps onto the shared format"),
+            &cfg.format_options(),
+        )
+        .expect("encode");
+        assert_eq!(String::from_utf8(body).unwrap(), "a;b\n1;2\n");
+    }
 
     #[tokio::test]
     async fn new_rejects_out_of_range_batch_size() {

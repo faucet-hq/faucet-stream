@@ -220,7 +220,7 @@ fn build_create_table_sql(
             quote_ident_mysql("id"),
             quote_ident_mysql(col)
         ),
-        None => faucet_core::render_columns(columns, |n| quote_ident_mysql(n), mysql_keyword),
+        None => faucet_core::render_columns(columns, quote_ident_mysql, mysql_keyword),
     };
     format!(
         "CREATE TABLE IF NOT EXISTS {} ({cols})",

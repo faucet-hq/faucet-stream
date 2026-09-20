@@ -193,10 +193,7 @@ async fn run_validation_case(case: &GeneratedCase, target: &Target<'_>) -> CaseO
 }
 
 /// Materialize for `supplied`, then expand + compile.
-async fn materialize_and_check(
-    supplied: &SuppliedParams,
-    target: &Target<'_>,
-) -> CliResult<()> {
+async fn materialize_and_check(supplied: &SuppliedParams, target: &Target<'_>) -> CliResult<()> {
     let body = materialize_body(supplied, target).await?;
 
     let cfg = crate::config::PipelineConfig::from_text(&body, std::path::Path::new("suite.json"))?;
@@ -252,12 +249,12 @@ async fn behavioral_inner(
         ))
     })?;
 
-    let input =
-        crate::pipeline_test::fixtures::load_input(std::path::Path::new("."), &parse_input(&b.input)?)?;
-    let expect: crate::pipeline_test::spec::Expectation =
-        serde_json::from_value(b.expect.clone()).map_err(|e| {
-            CliError::Config(format!("behavioral case '{}': `expect`: {e}", b.name))
-        })?;
+    let input = crate::pipeline_test::fixtures::load_input(
+        std::path::Path::new("."),
+        &parse_input(&b.input)?,
+    )?;
+    let expect: crate::pipeline_test::spec::Expectation = serde_json::from_value(b.expect.clone())
+        .map_err(|e| CliError::Config(format!("behavioral case '{}': `expect`: {e}", b.name)))?;
 
     // The same resolved-case shape `faucet test` runs, so the matchers and
     // their semantics are shared rather than reimplemented here.
@@ -280,10 +277,7 @@ async fn behavioral_inner(
 }
 
 /// Materialize the template body for one param combination.
-async fn materialize_body(
-    supplied: &SuppliedParams,
-    target: &Target<'_>,
-) -> CliResult<String> {
+async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> CliResult<String> {
     match target {
         // `Materialize::Local` (not `Persisted`): a suite runs in this
         // process, so load-time directives resolve here exactly as they would

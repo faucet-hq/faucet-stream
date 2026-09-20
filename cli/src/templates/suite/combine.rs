@@ -116,12 +116,7 @@ fn from_combine(cb: &Combine, params: &ParamsSpec) -> CliResult<Vec<GeneratedCas
     // name or value, and it silently widens the tested space rather than
     // narrowing it — the opposite of what the author asked for.
     for ex in &cb.exclude {
-        if !ex.is_empty()
-            && !cb
-                .params
-                .keys()
-                .any(|k| ex.contains_key(k))
-        {
+        if !ex.is_empty() && !cb.params.keys().any(|k| ex.contains_key(k)) {
             return Err(CliError::Config(format!(
                 "template test suite: `exclude` entry {} names no param in `combine.params` — \
                  it can never match",
@@ -190,12 +185,7 @@ fn all_pairs(
         for j in (i + 1)..axes.len() {
             for a in axes[i].1 {
                 for b in axes[j].1 {
-                    needed.insert((
-                        axes[i].0.clone(),
-                        key_of(a),
-                        axes[j].0.clone(),
-                        key_of(b),
-                    ));
+                    needed.insert((axes[i].0.clone(), key_of(a), axes[j].0.clone(), key_of(b)));
                 }
             }
         }
@@ -352,8 +342,8 @@ fn placeholder_for(p: &crate::params::ParamSpec) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::spec::Case;
+    use super::*;
     use crate::params::{ParamSpec, ParamType};
     use serde_json::json;
 
@@ -437,9 +427,11 @@ mod tests {
             ],
             false,
         );
-        cb.exclude = vec![[("sink".to_string(), json!("bigquery"))]
-            .into_iter()
-            .collect()];
+        cb.exclude = vec![
+            [("sink".to_string(), json!("bigquery"))]
+                .into_iter()
+                .collect(),
+        ];
         let cases = generate(&suite_of(cb), &ParamsSpec::new()).expect("generate");
         assert_eq!(cases.len(), 2, "both bigquery rows dropped");
         assert!(cases.iter().all(|c| c.params["sink"] == json!("jsonl")));
@@ -660,11 +652,7 @@ mod tests {
         // than reporting nothing.
         let big: Vec<Value> = (0..10).map(|i| json!(i)).collect();
         let cb = combine(
-            &[
-                ("a", big.clone()),
-                ("b", big.clone()),
-                ("c", big.clone()),
-            ],
+            &[("a", big.clone()), ("b", big.clone()), ("c", big.clone())],
             false,
         );
         let err = generate(&suite_of(cb), &ParamsSpec::new()).expect_err("1000 cases");

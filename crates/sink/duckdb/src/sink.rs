@@ -54,7 +54,7 @@ fn build_create_table_sql(
         // JSON mode stores the whole record in one column, so the page's own
         // shape is irrelevant — the table is the same whatever arrives.
         Some(col) => format!("{} TEXT NOT NULL", quote_ident(col)),
-        None => faucet_core::render_columns(columns, |n| quote_ident(n), duckdb_keyword),
+        None => faucet_core::render_columns(columns, quote_ident, duckdb_keyword),
     };
     format!("CREATE TABLE IF NOT EXISTS {} ({cols})", quote_table(table))
 }

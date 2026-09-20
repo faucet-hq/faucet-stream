@@ -37,10 +37,10 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | DuckDB | T2 | `source-duckdb` | ✓ | ✗ | ✗ | ✗ | ✗ | SQL query (file or `:memory:`), rows as JSON; blocking-task + channel streaming |
 | AWS SQS | T2 | `source-sqs` | ✓ | ✗ | ✗ | ✗ | ✗ | long-poll ReceiveMessage, delete-after-emit (at-least-once), idle/max-messages termination |
 | NATS | T2 | `source-nats` | ✓ | ✗ | ✗ | ✗ | ✗ | subject subscription or JetStream durable consumer; idle/max-messages termination |
-| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text |
-| AWS S3 | T1 ✅ | `source-s3` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text |
-| Google Cloud Storage | T2 | `source-gcs` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text |
-| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text |
+| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `source-s3` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Google Cloud Storage | T2 | `source-gcs` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
 | MongoDB | T1 ✅ | `source-mongodb` | ✓ | ✗ | ✗ | ✗ | ✓ | `find()` with filter/projection/sort |
 | MongoDB CDC | T1 ✅ | `source-mongodb-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | Change Streams, resumeToken bookmarks; `max_staged_records` buffer cap |
 | Redis | T1 ✅ | `source-redis` | ✓ | ✗ | ✗ | ✗ | ✗ | streams, lists, key patterns |
@@ -228,10 +228,10 @@ config this project treats as a defect.
 | DuckDB | T2 | `sink-duckdb` | ✓ | ✗ | ✗ | ✗ | transaction-wrapped multi-row `INSERT` (JSON column or auto-mapped); append-only |
 | AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
 | NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | publish to a subject (optional subject-per-record), flush per batch |
-| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | JSONL files over SSH; atomic temp-then-rename upload |
-| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | JSONL objects, parallel uploads |
-| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | JSONL objects |
-| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | JSONL blobs (object_store), batch/byte rollover |
+| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | JSONL objects, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
 | MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | `insert_many`; multi-document transaction for effectively-once (replica set required) |
 | Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
 | CSV | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |

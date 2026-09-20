@@ -402,6 +402,11 @@ jobs:
           - auth
           - full
           - compression
+          # Uniform file formats on every file connector (#604)
+          - file-format-csv
+          - file-format-xml
+          - file-format-excel
+          - file-formats
           # Mutual-TLS client-certificate auth on the HTTP sources (#495)
           - mtls
           # OAuth1 request-signing auth provider (#496)

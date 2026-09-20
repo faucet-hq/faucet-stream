@@ -187,10 +187,7 @@ impl SuiteFile {
     /// Load a suite from a file.
     pub fn from_path(path: &std::path::Path) -> CliResult<Self> {
         let text = std::fs::read_to_string(path).map_err(|e| {
-            CliError::Config(format!(
-                "template test suite {}: {e}",
-                path.display()
-            ))
+            CliError::Config(format!("template test suite {}: {e}", path.display()))
         })?;
         Self::parse(&text)
     }
@@ -204,8 +201,7 @@ impl SuiteFile {
         }
         if self.template.trim().is_empty() {
             return Err(CliError::Config(
-                "template test suite: `template` must name a registered id or a config path"
-                    .into(),
+                "template test suite: `template` must name a registered id or a config path".into(),
             ));
         }
         let auto_on = self
@@ -320,10 +316,8 @@ suite:
 
     #[test]
     fn an_unknown_key_is_rejected() {
-        let err = SuiteFile::parse(
-            "version: 1\ntemplate: t\nsuit: { cases: [] }\n",
-        )
-        .expect_err("typo");
+        let err =
+            SuiteFile::parse("version: 1\ntemplate: t\nsuit: { cases: [] }\n").expect_err("typo");
         assert!(err.to_string().contains("suit"), "{err}");
     }
 

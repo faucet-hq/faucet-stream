@@ -6607,8 +6607,84 @@
           "description": "Each file becomes a single record with `\"path\"` and `\"content\"` fields.",
           "type": "string",
           "const": "raw_text"
+        },
+        {
+          "description": "Delimited text, decoded through [`faucet_core::file_format`] so the\nrecords match what every other connector produces for the same file.\nDialect from [`csv`](SftpSourceConfig::csv). Requires\n`file-format-csv` (#604).",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, decoded to the compact element→object mapping. The repeated\nelement is named by [`xml`](SftpSourceConfig::xml). Requires\n`file-format-xml` (#604).",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet and header row from\n[`excel`](SftpSourceConfig::excel). **Buffered whole** — a workbook is\na zip container whose directory sits at the end. Requires\n`file-format-excel` (#604).",
+          "type": "string",
+          "const": "xlsx"
         }
       ]
+    },
+    "source_sftp__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_sftp__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_sftp__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
     },
     "source_s3__S3FileFormat": {
       "description": "Format of files stored in S3.",
@@ -6632,6 +6708,21 @@
           "description": "Apache Parquet objects. Each object is decoded via the Arrow Parquet\nreader; its `RecordBatch`es feed both the row path (converted to JSON\nrecords) and the **columnar** fast path\n([`Source::stream_batches`](faucet_core::Source::stream_batches)) so an\n`s3(parquet) → parquet`/`delta` chain never materializes\n`serde_json::Value`. Requires the crate-local `arrow` feature\n(RFC 0002 / #375).",
           "type": "string",
           "const": "parquet"
+        },
+        {
+          "description": "Delimited text, decoded through\n[`faucet_core::file_format`] so the records match what every other\nconnector produces for the same file. Dialect from\n[`csv`](S3SourceConfig::csv). Requires `file-format-csv` (#604).",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, decoded to the compact element→object mapping. The repeated\nelement is named by [`xml`](S3SourceConfig::xml). Requires\n`file-format-xml` (#604).",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet and header row from\n[`excel`](S3SourceConfig::excel). **Buffered whole** — a workbook is a\nzip container whose directory sits at the end, so peak memory is the\nobject, not the page. Requires `file-format-excel` (#604).",
+          "type": "string",
+          "const": "xlsx"
         }
       ]
     },
@@ -6652,6 +6743,67 @@
           "const": "auto"
         }
       ]
+    },
+    "source_s3__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_s3__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_s3__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
     },
     "source_mongodb-cdc__Scope": {
       "description": "Which change stream to open.",
@@ -7375,6 +7527,21 @@
           "description": "Each object becomes a single record with `\"key\"` and `\"content\"` fields.",
           "type": "string",
           "const": "raw_text"
+        },
+        {
+          "description": "Delimited text, decoded through [`faucet_core::file_format`] so the\nrecords match what every other connector produces for the same file.\nDialect from [`csv`](AzureBlobSourceConfig::csv). Requires\n`file-format-csv` (#604).",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, decoded to the compact element→object mapping. The repeated\nelement is named by [`xml`](AzureBlobSourceConfig::xml). Requires\n`file-format-xml` (#604).",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet and header row from\n[`excel`](AzureBlobSourceConfig::excel). **Buffered whole** — a\nworkbook is a zip container whose directory sits at the end. Requires\n`file-format-excel` (#604).",
+          "type": "string",
+          "const": "xlsx"
         }
       ]
     },
@@ -7395,6 +7562,67 @@
           "const": "auto"
         }
       ]
+    },
+    "source_azure-blob__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_azure-blob__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_azure-blob__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
     },
     "source_redis__RedisSourceType": {
       "description": "The type of Redis data structure to read from.",
@@ -8719,6 +8947,21 @@
           "description": "Apache Parquet objects. Decoded via the Arrow Parquet reader; the\nresulting `RecordBatch`es feed both the row path (converted to JSON)\nand the **columnar** fast path\n([`Source::stream_batches`](faucet_core::Source::stream_batches)) so a\n`gcs(parquet) → parquet`/`delta` chain never materializes\n`serde_json::Value`. Requires the crate-local `arrow` feature\n(RFC 0002 / #375).",
           "type": "string",
           "const": "parquet"
+        },
+        {
+          "description": "Delimited text, decoded through [`faucet_core::file_format`] so the\nrecords match what every other connector produces for the same file.\nDialect from [`csv`](GcsSourceConfig::csv). Requires\n`file-format-csv` (#604).",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, decoded to the compact element→object mapping. The repeated\nelement is named by [`xml`](GcsSourceConfig::xml). Requires\n`file-format-xml` (#604).",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet and header row from\n[`excel`](GcsSourceConfig::excel). **Buffered whole** — a workbook is a\nzip container whose directory sits at the end. Requires\n`file-format-excel` (#604).",
+          "type": "string",
+          "const": "xlsx"
         }
       ]
     },
@@ -8739,6 +8982,67 @@
           "const": "auto"
         }
       ]
+    },
+    "source_gcs__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_gcs__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_gcs__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
     },
     "source_bigquery__BigQueryCredentials": {
       "description": "How to authenticate with Google BigQuery.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by\nevery faucet connector.",
@@ -10266,6 +10570,97 @@
         }
       ]
     },
+    "sink_sftp__SftpSinkFormat": {
+      "description": "On-the-wire format of files written by the SFTP sink (#604).\n\nOnly [`JsonLines`](Self::JsonLines) can be built a record at a time; every\nother format has a header, a wrapper, or a container index, so its records\nare buffered and encoded together at the rollover.",
+      "oneOf": [
+        {
+          "description": "Newline-delimited JSON — one JSON record per line (the default).",
+          "type": "string",
+          "const": "json_lines"
+        },
+        {
+          "description": "A single JSON array per file.",
+          "type": "string",
+          "const": "json_array"
+        },
+        {
+          "description": "Delimited text. Columns are the union of every record's keys; dialect\nfrom `csv`. Requires `file-format-csv`.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, one element per record. Framing from `xml`. Requires\n`file-format-xml`.",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet name from `excel`. Requires\n`file-format-excel`.",
+          "type": "string",
+          "const": "xlsx"
+        }
+      ]
+    },
+    "sink_sftp__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_sftp__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_sftp__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_s3__S3SinkFormat": {
       "description": "On-the-wire format of objects written by the S3 sink.",
       "oneOf": [
@@ -10278,6 +10673,26 @@
           "description": "Apache Parquet. Each written object is a complete, self-contained\nParquet file. Enables the **columnar** fast path\n([`Sink::write_batch_columnar`](faucet_core::Sink::write_batch_columnar))\nso a `parquet`/`delta` → `s3(parquet)` chain never materializes\n`serde_json::Value`. Requires the crate-local `arrow` feature\n(RFC 0002 / #375).",
           "type": "string",
           "const": "parquet"
+        },
+        {
+          "description": "A single JSON array per object.",
+          "type": "string",
+          "const": "json_array"
+        },
+        {
+          "description": "Delimited text. Columns are the union of every record's keys; dialect\nfrom [`csv`](S3SinkConfig::csv). Requires `file-format-csv` (#604).",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, one element per record. Framing from\n[`xml`](S3SinkConfig::xml). Requires `file-format-xml` (#604).",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet name from [`excel`](S3SinkConfig::excel).\nRequires `file-format-excel` (#604).",
+          "type": "string",
+          "const": "xlsx"
         }
       ]
     },
@@ -10298,6 +10713,67 @@
           "const": "auto"
         }
       ]
+    },
+    "sink_s3__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_s3__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_s3__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
     },
     "sink_mongodb__WriteMode": {
       "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
@@ -11752,6 +12228,26 @@
           "description": "Apache Parquet. Each written object is a complete, self-contained\nParquet file. Enables the **columnar** fast path\n([`Sink::write_batch_columnar`](faucet_core::Sink::write_batch_columnar))\nso a `parquet`/`delta` → `gcs(parquet)` chain never materializes\n`serde_json::Value`. Requires the crate-local `arrow` feature\n(RFC 0002 / #375).",
           "type": "string",
           "const": "parquet"
+        },
+        {
+          "description": "A single JSON array per object.",
+          "type": "string",
+          "const": "json_array"
+        },
+        {
+          "description": "Delimited text. Columns are the union of every record's keys; dialect\nfrom [`csv`](GcsSinkConfig::csv). Requires `file-format-csv` (#604).",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, one element per record. Framing from\n[`xml`](GcsSinkConfig::xml). Requires `file-format-xml` (#604).",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet name from [`excel`](GcsSinkConfig::excel).\nRequires `file-format-excel` (#604).",
+          "type": "string",
+          "const": "xlsx"
         }
       ]
     },
@@ -11833,6 +12329,67 @@
           "const": "auto"
         }
       ]
+    },
+    "sink_gcs__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_gcs__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_gcs__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
     },
     "sink_redshift__RedshiftCredentials": {
       "description": "How to authenticate with Amazon Redshift.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by every\nfaucet connector.\n\nv1 implements only [`RedshiftCredentials::Password`]. The [`Iam`] and\n[`RedshiftDataApi`] variants are accepted by the config parser (so a future\nversion can add them without a breaking change) but currently return a typed\n[`FaucetError::Config`](faucet_core::FaucetError::Config) at client-build\ntime.\n\n[`Iam`]: RedshiftCredentials::Iam\n[`RedshiftDataApi`]: RedshiftCredentials::RedshiftDataApi",
@@ -12387,6 +12944,36 @@
         }
       ]
     },
+    "sink_azure-blob__AzureSinkFormat": {
+      "description": "On-the-wire format of objects written by the Azure Blob sink (#604).\n\nOnly [`JsonLines`](Self::JsonLines) can be built a record at a time; every\nother format has a header, a wrapper, or a container index, so its records\nare buffered and encoded together at the rollover.",
+      "oneOf": [
+        {
+          "description": "Newline-delimited JSON — one JSON record per line (the default).",
+          "type": "string",
+          "const": "json_lines"
+        },
+        {
+          "description": "A single JSON array per object.",
+          "type": "string",
+          "const": "json_array"
+        },
+        {
+          "description": "Delimited text. Columns are the union of every record's keys; dialect\nfrom `csv`. Requires `file-format-csv`.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML, one element per record. Framing from `xml`. Requires\n`file-format-xml`.",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook. Sheet name from `excel`. Requires\n`file-format-excel`.",
+          "type": "string",
+          "const": "xlsx"
+        }
+      ]
+    },
     "sink_azure-blob__CompressionConfig": {
       "description": "User-facing compression config. Defaults to [`Auto`](Self::Auto).",
       "oneOf": [
@@ -12404,6 +12991,67 @@
           "const": "auto"
         }
       ]
+    },
+    "sink_azure-blob__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
     },
     "SourceConnector": {
       "oneOf": [
@@ -14107,6 +14755,29 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 4
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `format: csv` (#604).",
+                      "$ref": "#/$defs/source_sftp__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_sftp__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `format: xml` (#604).",
+                      "$ref": "#/$defs/source_sftp__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   }
                 },
@@ -14223,6 +14894,29 @@
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
                       "$ref": "#/$defs/source_s3__CompressionConfig",
                       "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_s3__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_s3__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_s3__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   },
                   "title": "S3SourceConfig",
@@ -15179,6 +15873,29 @@
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the\ncodec is resolved per-object-key, so a single source can read a mix of\ncompressed and uncompressed objects. Requires the crate-local\n`compression` feature.",
                       "$ref": "#/$defs/source_azure-blob__CompressionConfig",
                       "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   },
                   "title": "AzureBlobSourceConfig",
@@ -16565,6 +17282,29 @@
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
                       "$ref": "#/$defs/source_gcs__CompressionConfig",
                       "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_gcs__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_gcs__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_gcs__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   },
                   "title": "GcsSourceConfig",
@@ -18084,6 +18824,11 @@
                       "description": "Remote directory prefix under which JSON Lines objects are written.",
                       "type": "string"
                     },
+                    "format": {
+                      "description": "File format (default `json_lines`) (#604).",
+                      "$ref": "#/$defs/sink_sftp__SftpSinkFormat",
+                      "default": "json_lines"
+                    },
                     "file_extension": {
                       "description": "File extension for written objects (default: `.jsonl`).",
                       "type": "string",
@@ -18118,6 +18863,29 @@
                       ],
                       "format": "uint",
                       "minimum": 0
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `format: csv` (#604).",
+                      "$ref": "#/$defs/sink_sftp__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet name, used when `format: xlsx` (#604).",
+                      "$ref": "#/$defs/sink_sftp__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `format: xml` (#604).",
+                      "$ref": "#/$defs/sink_sftp__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   }
                 },
@@ -18219,6 +18987,29 @@
                       "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the S3 `Content-Encoding` header, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_s3__CompressionConfig",
                       "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `format: csv` (#604).",
+                      "$ref": "#/$defs/sink_s3__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet name, used when `format: xlsx` (#604).",
+                      "$ref": "#/$defs/sink_s3__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `format: xml` (#604).",
+                      "$ref": "#/$defs/sink_s3__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   }
                 },
@@ -19410,6 +20201,29 @@
                       "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_gcs__CompressionConfig",
                       "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `format: csv` (#604).",
+                      "$ref": "#/$defs/sink_gcs__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet name, used when `format: xlsx` (#604).",
+                      "$ref": "#/$defs/sink_gcs__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `format: xml` (#604).",
+                      "$ref": "#/$defs/sink_gcs__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   }
                 },
@@ -19894,6 +20708,11 @@
                       "type": "string",
                       "default": ""
                     },
+                    "format": {
+                      "description": "Object format (default `json_lines`) (#604).",
+                      "$ref": "#/$defs/sink_azure-blob__AzureSinkFormat",
+                      "default": "json_lines"
+                    },
                     "file_extension": {
                       "description": "File extension for written objects (default `.jsonl`).",
                       "type": "string",
@@ -19943,6 +20762,29 @@
                       "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set any `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
                       "$ref": "#/$defs/sink_azure-blob__CompressionConfig",
                       "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `format: csv` (#604).",
+                      "$ref": "#/$defs/sink_azure-blob__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet name, used when `format: xlsx` (#604).",
+                      "$ref": "#/$defs/sink_azure-blob__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `format: xml` (#604).",
+                      "$ref": "#/$defs/sink_azure-blob__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
                     }
                   },
                   "title": "AzureBlobSinkConfig",

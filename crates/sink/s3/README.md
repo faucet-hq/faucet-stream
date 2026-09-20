@@ -75,7 +75,7 @@ This writes `s3://my-data-lake/events/raw/<uuid>.jsonl` objects, each holding up
 | `prefix` | string | `""` | Key prefix for written objects (e.g. `"data/events/"`). Combined as `{prefix}{uuid}{file_extension}`. |
 | `region` | string | *(SDK default)* | AWS region. When unset, the AWS SDK resolves it from the environment / config. |
 | `endpoint_url` | string | *(unset)* | Custom endpoint for S3-compatible services (MinIO, LocalStack, R2, …). |
-| `format` | `json_lines` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode). |
+| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
 | `file_extension` | string | `".jsonl"` | Extension appended to each object key. Append `.gz` / `.zst` here when using compression so consumers can detect the codec. |
 
 ### Batching & file splitting
@@ -379,6 +379,41 @@ abandoned if the run dies early. With a `compression` codec configured each
 part is compressed independently — gzip and zstd both concatenate, so the
 object decodes transparently, and compressing the whole body instead would
 mean buffering it, which is the bound multipart exists to remove.
+
+## File formats (#604)
+
+Beyond JSON Lines this sink writes **JSON array**, **CSV**, **XML** and
+**Excel** through `faucet_core::file_format`, so what it writes is exactly what
+the file *sources* can read back.
+
+```yaml
+sink:
+  type: s3
+  config:
+    bucket: reports
+    prefix: monthly/
+    format: xlsx
+    file_extension: .xlsx
+    excel: { sheet: Orders }
+```
+
+| Option block | Applies to | Fields |
+|---|---|---|
+| `csv` | `csv` | `delimiter` (one byte; `"\t"` for tabs), `has_headers` (default `true`) |
+| `xml` | `xml` | `record_element`, `root_element` |
+| `excel` | `xlsx` | `sheet` (worksheet name) |
+
+Enable with `--features file-formats` (or one of `file-format-csv` /
+`file-format-xml` / `file-format-excel`). Format composes with `compression`.
+
+**Only `json_lines` can be built a record at a time.** Every other format has a
+header, a document element, a container index or a pair of brackets, so its
+records are buffered and encoded together at the rollover — bounded by the same
+`max_records_per_file` / `max_bytes_per_file` caps, so object sizing means the
+same thing whatever the format. Columns are the union of every record's keys in
+the group, so a record that gains a field mid-page widens the file rather than
+losing it. See the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
 ## License
 

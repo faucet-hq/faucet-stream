@@ -28,7 +28,7 @@ Source-specific fields:
 |---|---|---|---|
 | `prefix` | string | — | Object-name prefix filter. Ignored when `object_keys` is set. |
 | `object_keys` | list | — | Explicit object names; skips listing. |
-| `file_format` | enum | `json_lines` | `json_lines` / `json_array` / `raw_text`. |
+| `file_format` | enum | `json_lines` | `json_lines` / `json_array` / `raw_text` / `csv` / `xml` / `xlsx`. |
 | `max_objects` | int | — | Hard cap on objects read. |
 | `concurrency` | int | `10` | Max concurrent object reads, on the streaming path as well as the batch one. The streaming prefetch is ordered, so records stay in listing order; `0` is clamped to 1. For `json_lines` it overlaps only the request setup (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole bodies are resident. |
 | `batch_size` | int | `1000` | Records per `StreamPage`; `0` = one page per object. |
@@ -61,11 +61,41 @@ at EOF.
 Both keys are named and behave identically across the S3, GCS, and Azure Blob
 sources.
 
-## File formats
+## File formats (#604)
 
 - **`json_lines`** — one JSON record per line; streamed line-by-line (bounded memory).
 - **`json_array`** — the whole object is a JSON array; buffered then chunked.
 - **`raw_text`** — each object becomes one record `{ "key", "content" }`.
+- **`csv` / `xml` / `xlsx`** — decoded through `faucet_core::file_format` (below); buffered then chunked.
+
+Beyond JSON Lines, JSON array and raw text, this source reads **CSV**, **XML**
+and **Excel** through `faucet_core::file_format`, so the records it produces
+match what every other file connector produces for the same bytes.
+
+```yaml
+source:
+  type: azure-blob
+  config:
+    container: exports
+    file_format: xlsx
+    excel: { sheet: "Q3", header_row: 0 }
+```
+
+| Option block | Applies to | Fields |
+|---|---|---|
+| `csv` | `csv` | `delimiter` (one byte; `"\t"` for tabs), `has_headers` (default `true`; `false` names fields `column_0`, `column_1`, …) |
+| `xml` | `xml` | `record_element` (the repeated element that delimits a record) |
+| `excel` | `xlsx` | `sheet` (name, or an index as a string; default first), `header_row` (0-based) |
+
+Enable with `--features file-formats` (or one of `file-format-csv` /
+`file-format-xml` / `file-format-excel`), so a build that reads CSV does not
+link an Excel reader. Format composes with `compression`.
+
+**Memory:** these three are read **whole** and decoded before their records are
+chunked into pages — a workbook is a zip container whose directory sits at the
+end, and an XML document is a tree. `csv` and `xml` are text formats: every
+value comes back a string. See the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
 ## Example
 

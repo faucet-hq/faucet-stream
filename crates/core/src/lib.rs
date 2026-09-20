@@ -31,6 +31,7 @@ pub mod drift;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 pub mod error;
+pub mod file_format;
 pub mod idempotency;
 pub mod join;
 pub mod local_outputs;
@@ -98,6 +99,7 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
 pub use error::FaucetError;
+pub use file_format::{CsvOptions, ExcelOptions, FileFormat, FormatOptions, XmlOptions};
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,
     SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,

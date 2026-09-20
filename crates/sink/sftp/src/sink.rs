@@ -27,6 +27,12 @@ pub struct SftpSink {
     /// Without this the sink wrote one file per upstream page, so a small
     /// `batch_size` produced a directory of tiny files.
     open: Mutex<faucet_core::ObjectAccumulator>,
+    /// Records held for a **whole-file** format (#604). CSV has a header, XML
+    /// a document element, a workbook a container index and a JSON array its
+    /// brackets — none can be appended a record at a time, so their records
+    /// are buffered and encoded together at the rollover. Always empty for
+    /// JSON Lines, which streams through `open`.
+    pending: Mutex<faucet_core::object_rollover::PageAccumulator>,
 }
 
 impl SftpSink {
@@ -41,10 +47,18 @@ impl SftpSink {
             }),
             config.max_bytes_per_file,
         ));
+        let pending = Mutex::new(faucet_core::object_rollover::PageAccumulator::new(
+            config.max_records_per_file.or(match config.batch_size {
+                0 => None,
+                n => Some(n),
+            }),
+            config.max_bytes_per_file,
+        ));
         Ok(Self {
             config,
             session: Mutex::new(None),
             open,
+            pending,
         })
     }
 
@@ -64,6 +78,30 @@ impl SftpSink {
     fn final_key(&self) -> String {
         let id = uuid::Uuid::new_v4();
         self.join_path(&format!("{id}{}", self.config.file_extension))
+    }
+
+    /// Encode one buffered group in the configured whole-file format and
+    /// write it as a single file (#604).
+    async fn write_encoded_file(&self, group: Vec<Value>) -> Result<(), FaucetError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let format = self.config.format.shared();
+        let rows = group.len();
+        let body = faucet_core::file_format::encode(&group, format, &self.config.format_options())?;
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            let sftp = connect(&self.config.connection).await?;
+            if let Err(e) = sftp.create_dir(self.config.path.as_str()).await {
+                tracing::debug!(path = %self.config.path, error = %e, "SFTP create_dir (best-effort)");
+            }
+            *guard = Some(sftp);
+        }
+        let sftp = guard.as_ref().expect("session initialized above");
+        let key = self.final_key();
+        Self::upload_atomic(sftp, &key, &body).await?;
+        tracing::info!(path = %key, records = rows, format = format.as_str(), "SFTP file written");
+        Ok(())
     }
 
     /// Upload `body` to `final_key` atomically: write a temporary object and
@@ -121,6 +159,13 @@ impl faucet_core::Sink for SftpSink {
             let mut open = self.open.lock().await;
             open.finish()
         };
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.finish()
+        };
+        if let Some(group) = group {
+            self.write_encoded_file(group).await?;
+        }
         let Some(obj) = finished else {
             return Ok(());
         };
@@ -142,6 +187,22 @@ impl faucet_core::Sink for SftpSink {
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
+        }
+
+        // Whole-file formats (#604): a CSV header, an XML document element, a
+        // workbook index and a JSON array's brackets all need every record
+        // before any byte is final, so records are buffered and encoded
+        // together. The same row/byte caps decide the rollover, so file sizing
+        // means the same thing whatever the format.
+        if !self.config.format.appends_per_record() {
+            let group = {
+                let mut pending = self.pending.lock().await;
+                pending.push_page(records)
+            };
+            if let Some(group) = group {
+                self.write_encoded_file(group).await?;
+            }
+            return Ok(records.len());
         }
 
         let mut guard = self.session.lock().await;

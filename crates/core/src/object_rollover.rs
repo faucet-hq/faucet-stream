@@ -304,7 +304,6 @@ mod tests {
         assert!(acc.is_empty());
         acc.push_record(&rec(1)).unwrap();
         assert_eq!(acc.rows(), 1);
-        assert!(acc.len() > 0);
         assert!(!acc.is_empty());
         acc.finish();
         assert!(acc.is_empty(), "finish resets the open object");

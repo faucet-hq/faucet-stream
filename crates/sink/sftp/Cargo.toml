@@ -22,6 +22,15 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "sync"] }
 uuid.workspace = true
 
+[features]
+# Uniform file formats (#604): write CSV, XML and Excel files through
+# `faucet_core::file_format`, so what this sink can write matches what the file
+# sources can read. `file-formats` is the aggregate.
+file-format-csv = ["faucet-core/file-format-csv"]
+file-format-xml = ["faucet-core/file-format-xml"]
+file-format-excel = ["faucet-core/file-format-excel"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
+
 [dev-dependencies]
 faucet-conformance.workspace = true
 faucet-common-sftp.workspace = true
@@ -49,3 +58,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+enum_variant_added = "allow"

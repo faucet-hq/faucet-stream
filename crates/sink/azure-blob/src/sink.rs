@@ -28,6 +28,12 @@ pub struct AzureBlobSink {
 /// the run dies before the object is finished.
 struct OpenObject {
     acc: faucet_core::ObjectAccumulator,
+    /// Records held for a **whole-object** format (#604). CSV has a header,
+    /// XML a document element, a workbook a container index and a JSON array
+    /// its brackets — none can be appended a record at a time, so their
+    /// records are buffered and encoded together at the rollover. Always empty
+    /// for JSON Lines, which streams through `acc`.
+    pending: faucet_core::object_rollover::PageAccumulator,
     upload: Option<(String, Box<dyn object_store::MultipartUpload>)>,
 }
 
@@ -46,6 +52,10 @@ impl AzureBlobSink {
         faucet_core::validate_batch_size(config.batch_size)?;
         let store = build_store(&config.connection)?;
         let open = tokio::sync::Mutex::new(OpenObject {
+            pending: faucet_core::object_rollover::PageAccumulator::new(
+                Some(resolve_effective_chunk_size(&config)),
+                config.max_bytes_per_file,
+            ),
             acc: faucet_core::ObjectAccumulator::new(
                 Some(resolve_effective_chunk_size(&config)),
                 config.max_bytes_per_file,
@@ -128,13 +138,30 @@ impl AzureBlobSink {
         {
             let codec = self.config.compression.resolve(&self.config.file_extension);
             faucet_core::compression::warn_mismatch(&self.config.file_extension, codec);
-            return faucet_core::compression::compress_buf(&body, codec);
+            faucet_core::compression::compress_buf(&body, codec)
         }
         #[cfg(not(feature = "compression"))]
-        Ok(body)
+        {
+            Ok(body)
+        }
     }
 
     /// Upload a single JSONL object.
+    /// Encode one buffered group in the configured whole-object format and
+    /// upload it as a single object (#604).
+    async fn write_encoded_object(&self, group: Vec<Value>) -> Result<(), FaucetError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let format = self.config.format.shared();
+        let rows = group.len();
+        let body = faucet_core::file_format::encode(&group, format, &self.config.format_options())?;
+        let key = self.generate_key();
+        self.upload_file(&key, body).await?;
+        tracing::info!(key = %key, records = rows, format = format.as_str(), "Azure object written");
+        Ok(())
+    }
+
     async fn upload_file(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
         let body = self.encode_body(body)?;
         let path = ObjectPath::from(key);
@@ -164,6 +191,9 @@ impl faucet_core::Sink for AzureBlobSink {
         if let Some(obj) = open.acc.finish() {
             self.finish_object(&mut open, obj).await?;
         }
+        if let Some(group) = open.pending.finish() {
+            self.write_encoded_object(group).await?;
+        }
         Ok(())
     }
 
@@ -180,6 +210,19 @@ impl faucet_core::Sink for AzureBlobSink {
         // across `write_batch` calls would mean carrying a `!Send`-shaped
         // writer in the sink's mutex, and the memory win is already had — the
         // accumulator hands the buffer over at `PART_BYTES` and drops it.
+        // Whole-object formats (#604): a CSV header, an XML document element,
+        // a workbook index and a JSON array's brackets all need every record
+        // before any byte is final, so records are buffered and encoded
+        // together. The same row/byte caps decide the rollover, so object
+        // sizing means the same thing whatever the format.
+        if !self.config.format.appends_per_record() {
+            let mut open = self.open.lock().await;
+            if let Some(group) = open.pending.push_page(records) {
+                self.write_encoded_object(group).await?;
+            }
+            return Ok(records.len());
+        }
+
         let mut files = 0usize;
         let mut open = self.open.lock().await;
         for record in records {

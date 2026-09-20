@@ -20,6 +20,47 @@ pub enum GcsSinkFormat {
     /// (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     Parquet,
+    /// A single JSON array per object.
+    JsonArray,
+    /// Delimited text. Columns are the union of every record's keys; dialect
+    /// from [`csv`](GcsSinkConfig::csv). Requires `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, one element per record. Framing from
+    /// [`xml`](GcsSinkConfig::xml). Requires `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet name from [`excel`](GcsSinkConfig::excel).
+    /// Requires `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl GcsSinkFormat {
+    /// The shared format this variant maps onto, or `None` for Parquet, which
+    /// is columnar and has its own Arrow writer.
+    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            #[cfg(feature = "arrow")]
+            Self::Parquet => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
+
+    /// Whether an object of this format can be built one record at a time.
+    ///
+    /// Only JSON Lines can: every other format has a header, a wrapper, or a
+    /// container index, so its records must be buffered and encoded together.
+    pub(crate) fn appends_per_record(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
 }
 
 /// Configuration for the GCS sink connector.
@@ -75,6 +116,15 @@ pub struct GcsSinkConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet name, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_file_extension() -> String {
@@ -102,7 +152,38 @@ impl GcsSinkConfig {
             storage_host: None,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::Auto,
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
         }
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::encode`] wants.
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
+        }
+    }
+
+    /// Set the CSV dialect used when `format: csv` (#604).
+    pub fn csv(mut self, csv: faucet_core::CsvOptions) -> Self {
+        self.csv = csv;
+        self
+    }
+
+    /// Set the worksheet name used when `format: xlsx` (#604).
+    pub fn excel(mut self, excel: faucet_core::ExcelOptions) -> Self {
+        self.excel = excel;
+        self
+    }
+
+    /// Set the record framing used when `format: xml` (#604).
+    pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
+        self.xml = xml;
+        self
     }
 
     pub fn prefix(mut self, p: impl Into<String>) -> Self {

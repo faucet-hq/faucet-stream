@@ -197,13 +197,13 @@ impl SnowflakeSinkConfig {
         }
     }
 
-    /// Enable Arrow columnar bulk-load via an external Parquet stage (#381).
-
     /// Opt out of auto-creating a missing target table (#580).
     pub fn with_create_table(mut self, create: bool) -> Self {
         self.create_table = create;
         self
     }
+
+    /// Enable Arrow columnar bulk-load via an external Parquet stage (#381).
     pub fn with_bulk_load(mut self, stage: SnowflakeStageConfig) -> Self {
         self.bulk_load = Some(stage);
         self

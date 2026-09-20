@@ -27,6 +27,16 @@ enum Fetched {
     Lines(Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>),
     RawText(String),
     JsonArray(String),
+    /// A whole object already decoded into records by
+    /// [`faucet_core::file_format`] (#604) — CSV, XML and Excel. Decoding at
+    /// fetch time keeps the per-format work in one place; the page loop then
+    /// chunks these exactly as it chunks a JSON array's.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    Records(Vec<Value>),
 }
 
 /// An Azure Blob source that lists and reads objects from a container.
@@ -89,7 +99,42 @@ impl AzureBlobSource {
             AzureFileFormat::JsonLines => Fetched::Lines(self.open_object_reader(key).await?),
             AzureFileFormat::RawText => Fetched::RawText(self.read_object_text(key).await?),
             AzureFileFormat::JsonArray => Fetched::JsonArray(self.read_object_text(key).await?),
+            #[cfg(feature = "file-format-csv")]
+            AzureFileFormat::Csv => self.fetch_decoded(key).await?,
+            #[cfg(feature = "file-format-xml")]
+            AzureFileFormat::Xml => self.fetch_decoded(key).await?,
+            #[cfg(feature = "file-format-excel")]
+            AzureFileFormat::Xlsx => self.fetch_decoded(key).await?,
         })
+    }
+
+    /// Read one blob whole and decode it through the shared format layer.
+    ///
+    /// Whole-object for all three: a workbook's directory sits at the end of a
+    /// zip container, an XML document is a tree, and a CSV's records are
+    /// chunked by the same page loop either way.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    async fn fetch_decoded(&self, key: &str) -> Result<Fetched, FaucetError> {
+        use tokio::io::AsyncReadExt as _;
+        let mut reader = self.open_object_reader(key).await?;
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| FaucetError::Source(format!("azure read error for key '{key}': {e}")))?;
+        let format =
+            self.config.file_format.shared().ok_or_else(|| {
+                FaucetError::Source(format!("azure '{key}': format has no decoder"))
+            })?;
+        let records =
+            faucet_core::file_format::decode(&bytes, format, &self.config.format_options())
+                .await
+                .map_err(|e| FaucetError::Source(format!("azure '{key}': {e}")))?;
+        Ok(Fetched::Records(records))
     }
 
     /// Read the full body of a single object into a UTF-8 `String`.
@@ -164,6 +209,19 @@ impl AzureBlobSource {
 /// Parse object content into records for a given format. Free function (vs. an
 /// `AzureBlobSource` method) so it is unit-testable without an Azure client —
 /// the parsing logic is pure.
+/// The shared-format decoders run at fetch time, not through the text parser.
+#[cfg(any(
+    feature = "file-format-csv",
+    feature = "file-format-xml",
+    feature = "file-format-excel"
+))]
+fn shared_format_via_text(key: &str, format: &str) -> FaucetError {
+    FaucetError::Source(format!(
+        "azure {format} object '{key}' reached the text parser (internal error: {format} is \
+         decoded at fetch time)"
+    ))
+}
+
 pub(crate) fn parse_file_content(
     format: &AzureFileFormat,
     key: &str,
@@ -199,6 +257,15 @@ pub(crate) fn parse_file_content(
                 ))),
             }
         }
+        // The shared-format objects (#604) are decoded at fetch time by
+        // `fetch_decoded`, so this synchronous text parser is never on their
+        // path — an arm here is an internal invariant violation.
+        #[cfg(feature = "file-format-csv")]
+        AzureFileFormat::Csv => Err(shared_format_via_text(key, "csv")),
+        #[cfg(feature = "file-format-xml")]
+        AzureFileFormat::Xml => Err(shared_format_via_text(key, "xml")),
+        #[cfg(feature = "file-format-excel")]
+        AzureFileFormat::Xlsx => Err(shared_format_via_text(key, "xlsx")),
         AzureFileFormat::RawText => Ok(vec![serde_json::json!({
             "key": key,
             "content": text,
@@ -414,6 +481,36 @@ impl faucet_core::Source for AzureBlobSource {
                             yield StreamPage { records: array, bookmark: None };
                         } else {
                             for record in array {
+                                buffer.push(record);
+                                if buffer.len() >= chunk {
+                                    let page = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(initial_capacity),
+                                    );
+                                    total += page.len();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(any(
+                        feature = "file-format-csv",
+                        feature = "file-format-xml",
+                        feature = "file-format-excel"
+                    ))]
+                    Fetched::Records(records) => {
+                        // CSV / XML / Excel (#604): already decoded at fetch
+                        // time, so chunk exactly as a JSON array is chunked.
+                        if batch_size == 0 {
+                            if !buffer.is_empty() {
+                                let page = std::mem::take(&mut buffer);
+                                total += page.len();
+                                yield StreamPage { records: page, bookmark: None };
+                            }
+                            total += records.len();
+                            yield StreamPage { records, bookmark: None };
+                        } else {
+                            for record in records {
                                 buffer.push(record);
                                 if buffer.len() >= chunk {
                                     let page = std::mem::replace(

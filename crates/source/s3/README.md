@@ -11,7 +11,7 @@ Built on the official `aws-sdk-s3` client (built once, reused across every read)
 
 ## Feature highlights
 
-- **Three file formats** — `json_lines` (one record per line), `json_array` (one record per array element), and `raw_text` (one `{key, content}` record per object).
+- **Seven file formats** — `json_lines`, `json_array`, `raw_text`, `parquet`, plus `csv`, `xml` and `xlsx` via [file formats](#file-formats-604).
 - **Apache Parquet (Arrow columnar)** — behind the `arrow` feature, a fourth format `file_format: parquet` decodes each object via the Arrow Parquet reader and, when the sink is also Arrow-native (Parquet / Delta), moves records end-to-end as Arrow `RecordBatch`es with no `serde_json::Value` in between. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).
 - **Parallel object reads** — up to `concurrency` objects fetched at once (default 10), on the streaming path as well as the batch one. The streaming prefetch is *ordered*, so records still arrive in listing order and a failing object is still blamed at its own position.
 - **True line-level streaming** — for `json_lines` / `raw_text`, object bodies are decoded line-by-line via `tokio::io::AsyncBufReadExt`, so client memory is bounded at `O(batch_size)` regardless of file or scan size.
@@ -84,7 +84,7 @@ faucet run pipeline.yaml
 | `prefix` | string | *(none)* | Object-key prefix filter. Only objects whose key starts with this prefix are read. |
 | `region` | string | *(SDK chain)* | AWS region. `None` defers to the SDK default (env vars, profile, or instance metadata). |
 | `endpoint_url` | string | *(none)* | Custom endpoint URL for S3-compatible services (MinIO, LocalStack, R2). |
-| `file_format` | enum | `json_lines` | How object bodies are parsed — `json_lines`, `json_array`, or `raw_text`. See below. |
+| `file_format` | enum | `json_lines` | How object bodies are parsed — `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx`. See below. |
 | `max_objects` | int | *(all)* | Cap on the number of objects read. `None` reads every matching object. |
 | `concurrency` | int | `10` | Maximum number of objects fetched concurrently. Clamped to `≥ 1` at runtime. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. See [Streaming & batching](#streaming--batching). Rejected above `MAX_BATCH_SIZE` (1,000,000) by `faucet_core::validate_batch_size`. |
@@ -413,6 +413,39 @@ objects whose key hashes to its shard index (stable FNV-1a modulo `count`),
 so the partition is disjoint and complete: every object is read by exactly one
 worker, and the partition stays stable as new objects appear. Outside the
 cluster coordinator a run reads every object, unchanged.
+
+## File formats (#604)
+
+Beyond JSON Lines, JSON array and raw text, this source reads **CSV**, **XML**
+and **Excel** through `faucet_core::file_format`, so the records it produces
+match what every other file connector produces for the same bytes.
+
+```yaml
+source:
+  type: s3
+  config:
+    bucket: exports
+    prefix: daily/
+    file_format: csv
+    compression: auto
+    csv: { delimiter: ",", has_headers: true }
+```
+
+| Option block | Applies to | Fields |
+|---|---|---|
+| `csv` | `csv` | `delimiter` (one byte; `"\t"` for tabs), `has_headers` (default `true`; `false` names fields `column_0`, `column_1`, …) |
+| `xml` | `xml` | `record_element` (the repeated element that delimits a record) |
+| `excel` | `xlsx` | `sheet` (name, or an index as a string; default first), `header_row` (0-based) |
+
+Enable with `--features file-formats` (or one of `file-format-csv` /
+`file-format-xml` / `file-format-excel`), so a build that reads CSV does not
+link an Excel reader. Format composes with `compression`.
+
+**Memory:** these three are read **whole** and decoded before their records are
+chunked into pages — a workbook is a zip container whose directory sits at the
+end, and an XML document is a tree. `csv` and `xml` are text formats: every
+value comes back a string. See the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
 ## License
 

@@ -8,9 +8,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
-use faucet_core::Source as _;
 use faucet_source_rest::{AsyncJobConfig, PaginationStyle, RestStream, RestStreamConfig};
 use futures::StreamExt as _;
 use serde_json::{Value, json};

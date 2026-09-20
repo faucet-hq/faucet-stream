@@ -9,6 +9,6 @@
 mod config;
 mod sink;
 
-pub use config::AzureBlobSinkConfig;
+pub use config::{AzureBlobSinkConfig, AzureSinkFormat};
 pub use faucet_common_azure::{AzureConnection, AzureCredentials};
 pub use sink::AzureBlobSink;

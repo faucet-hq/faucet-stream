@@ -147,8 +147,7 @@ pub fn resolve(
                         .iter()
                         .any(|v| spec::values_match(p.kind, v, &coerced))
                 {
-                    let allowed: Vec<String> =
-                        p.values.iter().map(|v| value_to_string(v)).collect();
+                    let allowed: Vec<String> = p.values.iter().map(value_to_string).collect();
                     return Err(CliError::Config(format!(
                         "param '{name}': {} is not one of the allowed values ({})",
                         value_to_string(&coerced),

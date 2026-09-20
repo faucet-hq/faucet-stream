@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Format of objects stored in the container.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AzureFileFormat {
     /// Each line in the object is a separate JSON record.
@@ -16,6 +16,46 @@ pub enum AzureFileFormat {
     JsonArray,
     /// Each object becomes a single record with `"key"` and `"content"` fields.
     RawText,
+    /// Delimited text, decoded through [`faucet_core::file_format`] so the
+    /// records match what every other connector produces for the same file.
+    /// Dialect from [`csv`](AzureBlobSourceConfig::csv). Requires
+    /// `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, decoded to the compact element→object mapping. The repeated
+    /// element is named by [`xml`](AzureBlobSourceConfig::xml). Requires
+    /// `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet and header row from
+    /// [`excel`](AzureBlobSourceConfig::excel). **Buffered whole** — a
+    /// workbook is a zip container whose directory sits at the end. Requires
+    /// `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl AzureFileFormat {
+    /// The shared format this variant maps onto, or `None` for `RawText`,
+    /// whose `{key, content}` envelope is the connector's own shape.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            Self::RawText => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
 }
 
 /// Configuration for the Azure Blob source connector.
@@ -67,6 +107,15 @@ pub struct AzureBlobSourceConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `file_format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet selection, used when `file_format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `file_format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 /// Serde default for the integrity flags that default on.
@@ -96,6 +145,24 @@ impl AzureBlobSourceConfig {
             verify_checksum: false,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
+        }
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::decode`] wants.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
         }
     }
 

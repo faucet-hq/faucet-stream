@@ -1755,6 +1755,10 @@ mod tests {
 
     #[test]
     fn clone_transform_stage_all_variants() {
+        #[cfg_attr(
+            not(any(feature = "transform-filter", feature = "transform-explode")),
+            allow(unused_mut)
+        )]
         let mut stages: Vec<TransformStage> = vec![
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
@@ -1789,6 +1793,10 @@ mod tests {
 
     #[test]
     fn clone_compiled_stage_all_variants() {
+        #[cfg_attr(
+            not(any(feature = "transform-filter", feature = "transform-explode")),
+            allow(unused_mut)
+        )]
         let mut specs: Vec<TransformStage> = vec![
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,

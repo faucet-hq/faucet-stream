@@ -105,7 +105,7 @@ fn build_create_table_sql(
             quote_ident("id"),
             quote_ident(col)
         ),
-        None => faucet_core::render_columns(columns, |n| quote_ident(n), pg_keyword),
+        None => faucet_core::render_columns(columns, quote_ident, pg_keyword),
     };
     format!("CREATE TABLE IF NOT EXISTS {table_ref} ({cols})")
 }

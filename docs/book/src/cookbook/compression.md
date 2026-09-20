@@ -19,8 +19,11 @@ connectors you've already opted into; it doesn't pull in connectors by itself.
 
 ## Connectors that support it
 
-`source-csv`, `source-s3`, `source-gcs`, `sink-jsonl`, `sink-csv`, `sink-s3`,
-`sink-gcs`.
+`source-csv`, `source-s3`, `source-gcs`, `source-azure-blob`, `sink-jsonl`,
+`sink-csv`, `sink-s3`, `sink-gcs`, `sink-azure-blob`.
+
+Compression is independent of [file format](./file-formats.md): pick the format,
+pick the codec.
 
 ## Config
 
