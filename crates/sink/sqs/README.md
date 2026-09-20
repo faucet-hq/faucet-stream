@@ -38,8 +38,7 @@ sink:
 | `message_deduplication_id_field` | — | Record field whose stringified value is the `MessageDeduplicationId`. Missing / non-scalar → per-record failure (DLQ-routable). |
 | `batch_size` | `10` | Entries per `SendMessageBatch` (1–10, the API cap). The house `batch_size: 0` "no batching" sentinel does **not** apply — `0` is rejected at config load, since a whole-page request cannot exceed the 10-entry API cap. |
 | `concurrency` | `4` | Bounded concurrent in-flight requests. |
-| `retry_max_attempts` | `5` | Per-record retry budget for partial failures. |
-| `retry_initial_backoff_ms` / `retry_max_backoff_ms` | `100` / `30000` | Exponential backoff bounds. |
+| `retry` | `{}` | Per-record partial-failure retry, grouped: `max_attempts` (`5`), `initial_backoff_ms` (`100`), `max_backoff_ms` (`30000`). The flat `retry_max_attempts` / `retry_initial_backoff_ms` / `retry_max_backoff_ms` keys are still accepted (**deprecated** since #654) and are superseded wholesale when `retry:` is present. |
 
 Each record is serialized to a JSON string as the message body. A body over
 256 KiB (the SQS limit) fails per-record (never sent) rather than panicking.

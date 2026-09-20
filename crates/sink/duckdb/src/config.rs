@@ -25,6 +25,7 @@ impl Default for DuckdbColumnMapping {
 
 /// Configuration for the DuckDB sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DuckdbSinkConfig {
     /// Path to the DuckDB database file, or `:memory:`. A `duckdb://` /
     /// `duckdb:` scheme prefix is accepted and stripped. The target table must

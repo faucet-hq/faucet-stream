@@ -2111,6 +2111,17 @@
           ],
           "format": "double",
           "default": null
+        },
+        "fan_out": {
+          "description": "**Fan-out axis** (#501), spelled `fan_out:` on the wire. When set, this\nrow enumerates a value-set at runtime: it builds `fan_out.source`,\ndrains it, projects `select` (JSONPath) from each record, and dedups\n(first-seen order). The row has no sink and writes nothing — its\nvalue-set is exposed to `for_each` rows as `${<id>.<as>}`. Runs once\nper pipeline run, cached across dependents.\n\nThe historical spelling `discover:` is accepted as an alias (#654 M21).\nIt collided with the other, unrelated `discover` in the vocabulary —\n`Source::discover`, which enumerates a connection's **datasets** — and\nthe canonical verb for \"turn a listed set into one matrix row per\nmember\" is `fan_out` (see the Vocabulary table in\n`.claude/rules/architecture.md`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscoverSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -4435,7 +4446,8 @@
           ],
           "default": true
         }
-      }
+      },
+      "additionalProperties": true
     },
     "source_xml__SoapVersion": {
       "description": "SOAP protocol version. Controls the envelope namespace and the HTTP\nheader shape used to carry the SOAP action.\n\nDeserializes from the wire strings `\"1.1\"` / `\"1.2\"`.",
@@ -4612,7 +4624,8 @@
         "value": {
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": true
     },
     "source_grpc__AuthReference": {
       "description": "A `{ ref: <name> }` pointer to a named provider in the top-level `auth:`\ncatalog. The only permitted key is `ref`.",
@@ -4648,7 +4661,8 @@
           "description": "Integer column to range-partition on. Quoted as an identifier before use,\nso it is safe against injection but must name a real output column.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": true
     },
     "source_postgres-cdc__SlotType": {
       "description": "Lifetime of a newly-created replication slot.",
@@ -4730,7 +4744,8 @@
           "description": "Integer column to range-partition on. Quoted as an identifier (backticks)\nbefore use, so it is safe against injection but must name a real output\ncolumn.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": true
     },
     "source_mssql__MssqlTls": {
       "description": "TLS configuration for an MSSQL connection.\n\nMatches the YAML shape `tls: { type: <mode>, ca_cert_path: <path> }`.",
@@ -4825,7 +4840,8 @@
           "description": "Integer column to range-partition on. Quoted as an identifier before use,\nso it is safe against injection but must name a real output column.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": true
     },
     "source_sqs__SqsCredentials": {
       "description": "How to authenticate with AWS SQS.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by\nevery faucet connector.",
@@ -6802,12 +6818,48 @@
           "description": "An S3 location — either a single object key, or a prefix that\nexpands to multiple objects.",
           "type": "object",
           "properties": {
+            "bucket": {
+              "description": "S3 bucket name.",
+              "type": "string"
+            },
+            "key": {
+              "description": "A single object key (mutually exclusive with `prefix`).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "prefix": {
+              "description": "An object key prefix to list and read (mutually exclusive with `key`).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "region": {
+              "description": "AWS region. `None` uses the default-region resolution chain.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "endpoint_url": {
+              "description": "Custom endpoint URL for S3-compatible services (MinIO, LocalStack, …).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
             "type": {
               "type": "string",
               "const": "s3"
             }
           },
-          "$ref": "#/$defs/source_parquet__ParquetS3Config"
+          "additionalProperties": true
         }
       ]
     },
@@ -7089,7 +7141,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": true
     },
     "source_databricks__DatabricksReplication": {
       "description": "How the source replicates rows across runs.\n\nSerializes as `{ type: full }` or\n`{ type: incremental, column: \"...\", initial_value: ... }`.",
@@ -7547,45 +7600,173 @@
           "description": "Apache Iceberg REST catalog. `uri` is the catalog endpoint; `credential`\nbecomes the REST bearer token.",
           "type": "object",
           "properties": {
+            "uri": {
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "warehouse": {
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "credential": {
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "properties": {
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
             "type": {
               "type": "string",
               "const": "rest"
             }
           },
-          "$ref": "#/$defs/sink_iceberg__CatalogInner"
+          "additionalProperties": true
         },
         {
           "description": "AWS Glue catalog. `warehouse` is the S3 root; AWS credentials are\nsupplied via `properties` or the default AWS credential chain.",
           "type": "object",
           "properties": {
+            "uri": {
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "warehouse": {
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "credential": {
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "properties": {
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
             "type": {
               "type": "string",
               "const": "glue"
             }
           },
-          "$ref": "#/$defs/sink_iceberg__CatalogInner"
+          "additionalProperties": true
         },
         {
           "description": "SQL-backed catalog (e.g. JDBC/postgres). `uri` is the connection string.",
           "type": "object",
           "properties": {
+            "uri": {
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "warehouse": {
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "credential": {
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "properties": {
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
             "type": {
               "type": "string",
               "const": "sql"
             }
           },
-          "$ref": "#/$defs/sink_iceberg__CatalogInner"
+          "additionalProperties": true
         },
         {
           "description": "Hive Metastore catalog. `uri` is the Thrift endpoint\n(`thrift://hms:9083`).",
           "type": "object",
           "properties": {
+            "uri": {
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "warehouse": {
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "credential": {
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "properties": {
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
             "type": {
               "type": "string",
               "const": "hms"
             }
           },
-          "$ref": "#/$defs/sink_iceberg__CatalogInner"
+          "additionalProperties": true
         }
       ]
     },
@@ -7639,7 +7820,8 @@
           "description": "Iceberg partition transform. One of: `identity`, `year`, `month`,\n`day`, `hour`, `void`, `bucket[N]`, `truncate[N]`.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": true
     },
     "sink_iceberg__WriteMode": {
       "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
@@ -7675,7 +7857,8 @@
           "type": "string",
           "default": "snappy"
         }
-      }
+      },
+      "additionalProperties": true
     },
     "sink_postgres__PostgresColumnMapping": {
       "description": "How to map JSON records to table columns.",
@@ -7912,7 +8095,8 @@
           ],
           "default": false
         }
-      }
+      },
+      "additionalProperties": true
     },
     "sink_mysql__MysqlColumnMapping": {
       "description": "How to map JSON records to table columns.",
@@ -9619,12 +9803,45 @@
           "description": "S3 bucket. Each written object is `<prefix><uuid>.parquet`.",
           "type": "object",
           "properties": {
+            "bucket": {
+              "description": "S3 bucket name.",
+              "type": "string"
+            },
+            "prefix": {
+              "description": "Key prefix for written objects. Empty string writes to the bucket root.",
+              "type": "string",
+              "default": ""
+            },
+            "region": {
+              "description": "AWS region. `None` uses the SDK default.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "endpoint_url": {
+              "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO, LocalStack).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "allow_http": {
+              "description": "Allow non-HTTPS endpoints. Required when `endpoint_url` is an `http://`\nURL (e.g. for LocalStack).",
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "default": false
+            },
             "type": {
               "type": "string",
               "const": "s3"
             }
           },
-          "$ref": "#/$defs/sink_parquet__ParquetS3Destination"
+          "additionalProperties": true
         }
       ]
     },
@@ -10648,6 +10865,13 @@
                         }
                       ]
                     },
+                    "drop_key_prefixes": {
+                      "description": "Drop per-record keys starting with any of these prefixes (#654 M24).\n\nProtocol control fields — OData's `@odata.etag` / `@odata.editLink`,\nJSON:API's `links`, HAL's `_links` — are metadata, not data, and are\noften invalid column names downstream. An `odata:` block implies\n`@odata.` (the prefix that used to be hardcoded), so existing configs\nneed no change; list prefixes here for any other protocol envelope.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
                     "decode": {
                       "description": "Decode the response body before record extraction: a chain of\n`extract` (JSONPath) / `base64` / `gunzip` / `unzip` / `parse`\n(json|csv|xlsx|xml) steps. Lets a source consume base64/compressed/file\npayloads (e.g. a base64 XLSX inside a SOAP body, or a gzipped-CSV export).\nWhen set, it replaces the `response_format` body parsing, and pagination\nmust be `none`. See [`DecodeStep`](crate::decode::DecodeStep).",
                       "type": "array",
@@ -10852,6 +11076,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "XmlStreamConfig",
+                  "description": "Configuration for the XML source.",
+                  "type": "object",
                   "properties": {
                     "base_url": {
                       "description": "Base URL of the API.",
@@ -10953,10 +11181,7 @@
                       ],
                       "default": null
                     }
-                  },
-                  "title": "XmlStreamConfig",
-                  "description": "Configuration for the XML source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -10986,6 +11211,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "GrpcStreamConfig",
+                  "description": "Configuration for the gRPC source.",
+                  "type": "object",
                   "properties": {
                     "endpoint": {
                       "description": "gRPC endpoint URL (e.g. `\"http://localhost:50051\"`).",
@@ -11080,7 +11309,7 @@
                       "default": 30
                     },
                     "reconnect_max_attempts": {
-                      "description": "For [`RpcKind::ServerStreaming`] reconnect: maximum reconnect attempts\nbefore surfacing the error. `None` (the default) means unlimited\nretries.",
+                      "description": "For [`RpcKind::ServerStreaming`] reconnect: maximum reconnect attempts\nbefore surfacing the error. `None` (the default) means unlimited\nretries.\n\nThe historical WebSocket-source spelling `max_reconnect_attempts` is\naccepted as an alias (#654 M20) — the prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
                       "type": [
                         "integer",
                         "null",
@@ -11120,10 +11349,7 @@
                       "minimum": 0,
                       "default": null
                     }
-                  },
-                  "title": "GrpcStreamConfig",
-                  "description": "Configuration for the gRPC source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -11153,6 +11379,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "PostgresSourceConfig",
+                  "description": "Configuration for the PostgreSQL query source.",
+                  "type": "object",
                   "properties": {
                     "connection_url": {
                       "description": "PostgreSQL connection URL (e.g. `postgres://user:pass@host/db`).",
@@ -11199,10 +11429,7 @@
                         }
                       ]
                     }
-                  },
-                  "title": "PostgresSourceConfig",
-                  "description": "Configuration for the PostgreSQL query source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -11232,6 +11459,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "PostgresCdcSourceConfig",
+                  "description": "Configuration for [`PostgresCdcSource`](crate::PostgresCdcSource).",
+                  "type": "object",
                   "properties": {
                     "connection_url": {
                       "description": "Connection URL pointing at the database whose WAL we want to read.\nThe crate internally upgrades the connection to `replication=database`\n— callers do **not** need to add it themselves.",
@@ -11257,6 +11488,16 @@
                       "description": "Whether a newly-created slot is `permanent` (survives disconnect) or\n`temporary` (auto-dropped when the replication connection closes).\n\nDefault `permanent` (back-compatible). **A permanent slot pins WAL on\nthe server until it is consumed or dropped** — an abandoned permanent\nslot fills `pg_wal` and can take the whole instance down. Use\n`temporary` for ephemeral / test runs (note: a temporary slot resets on\nreconnect, so bookmark-based resume across runs requires a permanent\nslot). Drop an unused permanent slot explicitly with\n[`PostgresCdcSource::drop_slot`](crate::PostgresCdcSource::drop_slot).",
                       "$ref": "#/$defs/source_postgres-cdc__SlotType",
                       "default": "permanent"
+                    },
+                    "slot_acquire_retries": {
+                      "description": "Number of times to retry acquiring the replication slot when the server\nreports it is still **active** (held by a not-yet-released prior\nconnection). On a rapid restart — a scheduler or `serve` re-running the\npipeline before the previous backend has dropped the slot — both the\npre-stream `pg_replication_slot_advance` and `START_REPLICATION` fail\nwith *\"replication slot … is active for PID …\"*. Each retry waits an\nexponentially increasing backoff (250 ms, doubling, capped at 4 s).\n`0` disables retries (fail fast). Defaults to 10.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 10
                     },
                     "tls": {
                       "description": "TLS settings for the replication connection. Default `disable`\n(plaintext) for back-compatibility, but credentials and all WAL data\nthen travel unencrypted — set `require`/`verify_ca`/`verify_full` in\nproduction.",
@@ -11344,21 +11585,8 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
-                    },
-                    "slot_acquire_retries": {
-                      "description": "Number of times to retry acquiring the replication slot when the server\nreports it is still **active** (held by a not-yet-released prior\nconnection). On a rapid restart — a scheduler or `serve` re-running the\npipeline before the previous backend has dropped the slot — both the\npre-stream `pg_replication_slot_advance` and `START_REPLICATION` fail\nwith *\"replication slot … is active for PID …\"*. Each retry waits an\nexponentially increasing backoff (250 ms, doubling, capped at 4 s).\n`0` disables retries (fail fast). Defaults to 10.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint32",
-                      "minimum": 0,
-                      "default": 10
                     }
-                  },
-                  "title": "PostgresCdcSourceConfig",
-                  "description": "Configuration for [`PostgresCdcSource`](crate::PostgresCdcSource).",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -11388,6 +11616,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "MysqlSourceConfig",
+                  "description": "Configuration for the MySQL query source.",
+                  "type": "object",
                   "properties": {
                     "connection_url": {
                       "description": "MySQL connection URL (e.g. `mysql://user:pass@host/db`).",
@@ -11428,10 +11660,7 @@
                         }
                       ]
                     }
-                  },
-                  "title": "MysqlSourceConfig",
-                  "description": "Configuration for the MySQL query source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -11581,6 +11810,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "SqliteSourceConfig",
+                  "description": "Configuration for the SQLite query source.",
+                  "type": "object",
                   "properties": {
                     "database_url": {
                       "description": "SQLite database URL (file path or `sqlite::memory:`).",
@@ -11621,10 +11854,7 @@
                         }
                       ]
                     }
-                  },
-                  "title": "SqliteSourceConfig",
-                  "description": "Configuration for the SQLite query source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -11654,6 +11884,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "DuckdbSourceConfig",
+                  "description": "Configuration for the DuckDB query source.",
+                  "type": "object",
                   "properties": {
                     "database": {
                       "description": "Path to the DuckDB database file, or `:memory:` for an in-memory\ndatabase. A `duckdb://` / `duckdb:` scheme prefix is accepted and\nstripped.",
@@ -11681,10 +11915,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "DuckdbSourceConfig",
-                  "description": "Configuration for the DuckDB query source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -11714,6 +11945,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "SqsSourceConfig",
+                  "description": "Configuration for [`SqsSource`](crate::SqsSource).",
+                  "type": "object",
                   "properties": {
                     "queue_url": {
                       "description": "SQS queue URL (e.g. `https://sqs.us-east-1.amazonaws.com/1234/my-q`).",
@@ -11779,10 +12014,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "SqsSourceConfig",
-                  "description": "Configuration for [`SqsSource`](crate::SqsSource).",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -12197,6 +12429,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "MongoSourceConfig",
+                  "description": "Configuration for the MongoDB source connector.\n\n# Example\n\n```\nuse faucet_source_mongodb::MongoSourceConfig;\nuse serde_json::json;\n\nlet config = MongoSourceConfig::new(\n    \"mongodb://localhost:27017\",\n    \"my_database\",\n    \"my_collection\",\n)\n.filter(json!({\"status\": \"active\"}))\n.projection(json!({\"_id\": 0, \"name\": 1, \"email\": 1}))\n.sort(json!({\"created_at\": -1}))\n.limit(1000)\n.cursor_batch_size(200)\n.with_batch_size(500);\n```",
+                  "type": "object",
                   "properties": {
                     "connection_uri": {
                       "description": "MongoDB connection URI (e.g. `mongodb://localhost:27017`).",
@@ -12248,10 +12484,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "MongoSourceConfig",
-                  "description": "Configuration for the MongoDB source connector.\n\n# Example\n\n```\nuse faucet_source_mongodb::MongoSourceConfig;\nuse serde_json::json;\n\nlet config = MongoSourceConfig::new(\n    \"mongodb://localhost:27017\",\n    \"my_database\",\n    \"my_collection\",\n)\n.filter(json!({\"status\": \"active\"}))\n.projection(json!({\"_id\": 0, \"name\": 1, \"email\": 1}))\n.sort(json!({\"created_at\": -1}))\n.limit(1000)\n.cursor_batch_size(200)\n.with_batch_size(500);\n```",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -12281,6 +12514,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "MongoCdcSourceConfig",
+                  "description": "Configuration for [`MongoCdcSource`](crate::MongoCdcSource).",
+                  "type": "object",
                   "properties": {
                     "connection_uri": {
                       "description": "MongoDB connection URI. Must point at a replica set or sharded cluster.",
@@ -12365,10 +12602,7 @@
                       "minimum": 0,
                       "default": null
                     }
-                  },
-                  "title": "MongoCdcSourceConfig",
-                  "description": "Configuration for [`MongoCdcSource`](crate::MongoCdcSource).",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -12398,6 +12632,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "MysqlCdcSourceConfig",
+                  "description": "Configuration for the MySQL CDC (binlog) source.",
+                  "type": "object",
                   "properties": {
                     "connection_url": {
                       "description": "Connection URL, e.g. `mysql://repl:pass@host:3306/db`.",
@@ -12489,10 +12727,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "MysqlCdcSourceConfig",
-                  "description": "Configuration for the MySQL CDC (binlog) source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13150,6 +13385,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "RedisSourceConfig",
+                  "description": "Configuration for the Redis source connector.",
+                  "type": "object",
                   "properties": {
                     "url": {
                       "description": "Redis connection URL (e.g. `\"redis://127.0.0.1:6379\"`).",
@@ -13179,10 +13418,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "RedisSourceConfig",
-                  "description": "Configuration for the Redis source connector.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13212,6 +13448,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "WebhookSourceConfig",
+                  "description": "Configuration for the webhook receiver source.",
+                  "type": "object",
                   "properties": {
                     "listen_addr": {
                       "description": "Address to bind the HTTP server to (default: `\"127.0.0.1:8080\"`).\n\n**Security:** the default binds to loopback only. Binding to\n`0.0.0.0` exposes the receiver to the whole network — only do so\nbehind a trusted gateway, and set `auth_token` to require a shared\nsecret on every request.",
@@ -13272,10 +13512,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "WebhookSourceConfig",
-                  "description": "Configuration for the webhook receiver source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13305,6 +13542,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "WebsocketSourceConfig",
+                  "description": "Configuration for the WebSocket source.",
+                  "type": "object",
                   "properties": {
                     "url": {
                       "description": "WebSocket endpoint, `ws://` or `wss://`. Supports `{placeholder}`\nparent-matrix context substitution.",
@@ -13382,7 +13623,7 @@
                       "default": false
                     },
                     "reconnect_backoff": {
-                      "description": "Base wait (seconds) for reconnect backoff. Default 1s.\n\nRetries grow **exponentially with jitter** from this base and are\ncapped, so a dead endpoint is not dialled at a fixed rate forever.\nSet it to the delay you want before the *first* retry.",
+                      "description": "Base wait (seconds) for reconnect backoff. Default 1s.\n\nRetries grow **exponentially with jitter** from this base and are\ncapped, so a dead endpoint is not dialled at a fixed rate forever.\nSet it to the delay you want before the *first* retry.\nAlso accepted as `reconnect_initial_backoff` — the gRPC source's\nspelling for the same knob (#654 M20).",
                       "type": [
                         "integer",
                         "string"
@@ -13391,8 +13632,8 @@
                       "minimum": 0,
                       "default": 1
                     },
-                    "max_reconnect_attempts": {
-                      "description": "Cap on *consecutive* failed reconnects (resets on any received\nmessage). `None` = unlimited (then `idle_timeout` is the natural cap).",
+                    "reconnect_max_attempts": {
+                      "description": "Cap on *consecutive* failed reconnects (resets on any received\nmessage). `None` = unlimited (then `idle_timeout` is the natural cap).\n\nSpelled `reconnect_max_attempts` on the wire, matching the gRPC\nsource's `reconnect_*` prefix; the historical `max_reconnect_attempts`\nstays accepted as an alias (#654 M20). The prefix used to be reversed\nbetween the two connectors, so a user who learned one spelling had the\nother silently ignored and reconnected without a bound.",
                       "type": [
                         "integer",
                         "null",
@@ -13421,10 +13662,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "WebsocketSourceConfig",
-                  "description": "Configuration for the WebSocket source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13454,6 +13692,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "CsvSourceConfig",
+                  "description": "Configuration for the CSV file source.",
+                  "type": "object",
                   "properties": {
                     "path": {
                       "description": "Path to the CSV file.",
@@ -13512,10 +13754,7 @@
                       "$ref": "#/$defs/source_csv__CompressionConfig",
                       "default": "auto"
                     }
-                  },
-                  "title": "CsvSourceConfig",
-                  "description": "Configuration for the CSV file source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13545,6 +13784,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "SingerSourceConfig",
+                  "description": "Configuration for the Singer tap bridge source.\n\nRuns an external [Singer](https://www.singer.io/) tap executable and adapts\nits stdout message stream into faucet records. **v0 is single-stream only**:\nexactly the stream named by [`stream`](Self::stream) is emitted; RECORD\nmessages for other streams are ignored.",
+                  "type": "object",
                   "properties": {
                     "executable": {
                       "description": "The tap executable to run (looked up on `PATH`, or an absolute path),\ne.g. `tap-github` or `/opt/taps/tap-csv`.",
@@ -13602,10 +13845,7 @@
                       "$ref": "#/$defs/source_singer__MalformedPolicy",
                       "default": "skip"
                     }
-                  },
-                  "title": "SingerSourceConfig",
-                  "description": "Configuration for the Singer tap bridge source.\n\nRuns an external [Singer](https://www.singer.io/) tap executable and adapts\nits stdout message stream into faucet records. **v0 is single-stream only**:\nexactly the stream named by [`stream`](Self::stream) is emitted; RECORD\nmessages for other streams are ignored.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13635,6 +13875,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "ElasticsearchSourceConfig",
+                  "description": "Configuration for the Elasticsearch search source.",
+                  "type": "object",
                   "properties": {
                     "base_url": {
                       "description": "Base URL of the Elasticsearch cluster (e.g. `\"http://localhost:9200\"`).",
@@ -13675,10 +13919,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "ElasticsearchSourceConfig",
-                  "description": "Configuration for the Elasticsearch search source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13708,6 +13949,9 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "KafkaSourceConfig",
+                  "type": "object",
                   "properties": {
                     "brokers": {
                       "description": "Comma-separated bootstrap server list, e.g. `\"broker1:9092,broker2:9092\"`.",
@@ -13812,9 +14056,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "KafkaSourceConfig",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -13844,6 +14086,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "KinesisSourceConfig",
+                  "description": "Configuration for [`KinesisSource`](crate::KinesisSource).",
+                  "type": "object",
                   "properties": {
                     "stream_name": {
                       "description": "Kinesis Data Stream name.",
@@ -13958,10 +14204,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "KinesisSourceConfig",
-                  "description": "Configuration for [`KinesisSource`](crate::KinesisSource).",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -14116,6 +14359,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "ParquetSourceConfig",
+                  "description": "Configuration for the Parquet source connector.",
+                  "type": "object",
                   "properties": {
                     "source": {
                       "description": "Where to read Parquet from — a local file, a local glob pattern, or S3.",
@@ -14152,10 +14399,7 @@
                       "minimum": 0,
                       "default": 4
                     }
-                  },
-                  "title": "ParquetSourceConfig",
-                  "description": "Configuration for the Parquet source connector.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -14273,6 +14517,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "DatabricksSourceConfig",
+                  "description": "Configuration for the Databricks SQL query source.\n\nRuns `sql` against a Databricks SQL Warehouse via the Statement Execution\nREST API and streams the result rows as typed JSON objects.",
+                  "type": "object",
                   "properties": {
                     "workspace_url": {
                       "description": "Workspace base URL, e.g. `https://dbc-abc123.cloud.databricks.com`.",
@@ -14364,10 +14612,7 @@
                         "null"
                       ]
                     }
-                  },
-                  "title": "DatabricksSourceConfig",
-                  "description": "Configuration for the Databricks SQL query source.\n\nRuns `sql` against a Databricks SQL Warehouse via the Statement Execution\nREST API and streams the result rows as typed JSON objects.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -14522,6 +14767,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "BigQuerySourceConfig",
+                  "description": "Configuration for the BigQuery query source.",
+                  "type": "object",
                   "properties": {
                     "project_id": {
                       "description": "GCP project ID against which the query is billed and run.",
@@ -14633,10 +14882,7 @@
                       "format": "int32",
                       "default": 1
                     }
-                  },
-                  "title": "BigQuerySourceConfig",
-                  "description": "Configuration for the BigQuery query source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -14666,6 +14912,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "SnowflakeSourceConfig",
+                  "description": "Configuration for the Snowflake query source.",
+                  "type": "object",
                   "properties": {
                     "account": {
                       "description": "Snowflake account identifier (e.g. `\"xy12345.us-east-1\"`).",
@@ -14734,10 +14984,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "SnowflakeSourceConfig",
-                  "description": "Configuration for the Snowflake query source.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -14901,6 +15148,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "IcebergSinkConfig",
+                  "description": "Configuration for the Apache Iceberg sink.\n\nRecords are buffered into Arrow batches, written as Parquet data files via\nthe iceberg-rust writer pipeline, and committed as a single snapshot per\n`flush()` call using `Transaction::fast_append`.\n\n## Append-only (v1)\n\nOnly `write_mode: append` is supported at runtime. The `write_mode` field\naccepts the shared [`faucet_core::WriteMode`] enum, so `upsert` and\n`delete` deserialise without error but are rejected by\n[`IcebergSink::new`](crate::sink::IcebergSink::new) with a `FaucetError::Config`. Configuring\n`write_mode: overwrite` still produces a deserialization error (it is not\na recognised variant). Equality-delete upsert is tracked in #179.\n\n## Catalog feature gates\n\nThe REST catalog is included in the default build (`catalog-rest`). Glue,\nSQL, and HMS each require their own Cargo feature (`catalog-glue`,\n`catalog-sql`, `catalog-hms`). Configuring a disabled catalog type returns\n`FaucetError::Config` at startup.",
+                  "type": "object",
                   "properties": {
                     "catalog": {
                       "description": "Iceberg catalog connection settings.",
@@ -14981,10 +15232,7 @@
                       ],
                       "default": false
                     }
-                  },
-                  "title": "IcebergSinkConfig",
-                  "description": "Configuration for the Apache Iceberg sink.\n\nRecords are buffered into Arrow batches, written as Parquet data files via\nthe iceberg-rust writer pipeline, and committed as a single snapshot per\n`flush()` call using `Transaction::fast_append`.\n\n## Append-only (v1)\n\nOnly `write_mode: append` is supported at runtime. The `write_mode` field\naccepts the shared [`faucet_core::WriteMode`] enum, so `upsert` and\n`delete` deserialise without error but are rejected by\n[`IcebergSink::new`](crate::sink::IcebergSink::new) with a `FaucetError::Config`. Configuring\n`write_mode: overwrite` still produces a deserialization error (it is not\na recognised variant). Equality-delete upsert is tracked in #179.\n\n## Catalog feature gates\n\nThe REST catalog is included in the default build (`catalog-rest`). Glue,\nSQL, and HMS each require their own Cargo feature (`catalog-glue`,\n`catalog-sql`, `catalog-hms`). Configuring a disabled catalog type returns\n`FaucetError::Config` at startup.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -15115,6 +15363,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "JsonlSinkConfig",
+                  "description": "Configuration for the JSON Lines file sink.",
+                  "type": "object",
                   "properties": {
                     "path": {
                       "description": "Path to the output file.",
@@ -15162,10 +15414,7 @@
                         }
                       ]
                     }
-                  },
-                  "title": "JsonlSinkConfig",
-                  "description": "Configuration for the JSON Lines file sink.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -15186,6 +15435,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "SnowflakeSinkConfig",
+                  "description": "Configuration for the Snowflake sink.",
+                  "type": "object",
                   "properties": {
                     "account": {
                       "description": "Snowflake account identifier (e.g. `\"xy12345.us-east-1\"`).",
@@ -15242,10 +15495,7 @@
                         }
                       ]
                     }
-                  },
-                  "title": "SnowflakeSinkConfig",
-                  "description": "Configuration for the Snowflake sink.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -15580,6 +15830,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "DuckdbSinkConfig",
+                  "description": "Configuration for the DuckDB sink.",
+                  "type": "object",
                   "properties": {
                     "database": {
                       "description": "Path to the DuckDB database file, or `:memory:`. A `duckdb://` /\n`duckdb:` scheme prefix is accepted and stripped. The target table must\nalready exist.",
@@ -15608,10 +15862,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "DuckdbSinkConfig",
-                  "description": "Configuration for the DuckDB sink.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -15632,6 +15883,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "SqsSinkConfig",
+                  "description": "Configuration for [`SqsSink`](crate::SqsSink).",
+                  "type": "object",
                   "properties": {
                     "queue_url": {
                       "description": "SQS queue URL (e.g. `https://sqs.us-east-1.amazonaws.com/1234/my-q`).",
@@ -15692,8 +15947,19 @@
                       "minimum": 0,
                       "default": 4
                     },
+                    "retry": {
+                      "description": "Per-record retry for partial failures, grouped (#654 M20). When\npresent it supersedes the three deprecated flat `retry_*` keys below.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_sqs__PartialRetrySpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "retry_max_attempts": {
-                      "description": "Per-record retry budget for partial failures. Default 5.",
+                      "description": "**Deprecated** — use `retry.max_attempts`.\n\nPer-record retry budget for partial failures. Default 5.",
                       "type": [
                         "integer",
                         "string"
@@ -15703,7 +15969,7 @@
                       "default": 5
                     },
                     "retry_initial_backoff_ms": {
-                      "description": "Initial retry backoff (milliseconds). Default 100.",
+                      "description": "**Deprecated** — use `retry.initial_backoff_ms`.\n\nInitial retry backoff (milliseconds). Default 100.",
                       "type": [
                         "integer",
                         "string"
@@ -15713,7 +15979,7 @@
                       "default": 100
                     },
                     "retry_max_backoff_ms": {
-                      "description": "Backoff ceiling (milliseconds). Default 30000.",
+                      "description": "**Deprecated** — use `retry.max_backoff_ms`.\n\nBackoff ceiling (milliseconds). Default 30000.",
                       "type": [
                         "integer",
                         "string"
@@ -15722,10 +15988,7 @@
                       "minimum": 0,
                       "default": 30000
                     }
-                  },
-                  "title": "SqsSinkConfig",
-                  "description": "Configuration for [`SqsSink`](crate::SqsSink).",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -15942,6 +16205,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "S3SinkConfig",
+                  "description": "Configuration for the S3 sink connector.",
+                  "type": "object",
                   "properties": {
                     "bucket": {
                       "description": "S3 bucket name.",
@@ -16008,10 +16275,7 @@
                       "$ref": "#/$defs/sink_s3__CompressionConfig",
                       "default": "auto"
                     }
-                  },
-                  "title": "S3SinkConfig",
-                  "description": "Configuration for the S3 sink connector.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -16111,6 +16375,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "RedisSinkConfig",
+                  "description": "Configuration for the Redis sink connector.",
+                  "type": "object",
                   "properties": {
                     "url": {
                       "description": "Redis connection URL (e.g. `\"redis://127.0.0.1:6379\"`).",
@@ -16130,10 +16398,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "RedisSinkConfig",
-                  "description": "Configuration for the Redis sink connector.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -16154,6 +16419,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "CsvSinkConfig",
+                  "description": "Configuration for the CSV file sink.",
+                  "type": "object",
                   "properties": {
                     "path": {
                       "description": "Path to the output CSV file.",
@@ -16206,10 +16475,7 @@
                       "$ref": "#/$defs/sink_csv__CompressionConfig",
                       "default": "auto"
                     }
-                  },
-                  "title": "CsvSinkConfig",
-                  "description": "Configuration for the CSV file sink.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -16308,6 +16574,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "KafkaSinkConfig",
+                  "description": "Configuration for the Kafka sink connector.\n\nOnly [`brokers`](Self::brokers) and [`topic`](Self::topic) are required;\neverything else has a safe default (`acks: all` + `idempotent: true`).\nValidated at config load by [`validate`](Self::validate).",
+                  "type": "object",
                   "properties": {
                     "brokers": {
                       "description": "Comma-separated `host:port` bootstrap brokers, passed straight through\nas librdkafka's `bootstrap.servers` (e.g. `\"b1:9092,b2:9092\"`).\nRequired; a blank value is rejected at config load.",
@@ -16460,20 +16730,31 @@
                       "minimum": 0,
                       "default": 3
                     },
+                    "exactly_once": {
+                      "description": "Exactly-once knobs, grouped (#654 M20). Only consulted under\n`delivery: exactly_once`; when present it supersedes the four\ndeprecated flat keys below.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_kafka__KafkaExactlyOnceSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "transactional_id_prefix": {
-                      "description": "Optional namespace prefix for the producer's auto-derived\n`transactional.id` (exactly-once mode only). The id is\n`\"{prefix}.{sanitized_scope}\"`; `prefix` defaults to `\"faucet\"` when\nunset. Set this to isolate transactional ids across clusters or\nenvironments that share a pipeline scope namespace.",
+                      "description": "**Deprecated** — use `exactly_once.transactional_id_prefix`.\n\nOptional namespace prefix for the producer's auto-derived\n`transactional.id` (exactly-once mode only). The id is\n`\"{prefix}.{sanitized_scope}\"`; `prefix` defaults to `\"faucet\"` when\nunset. Set this to isolate transactional ids across clusters or\nenvironments that share a pipeline scope namespace.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
                     "commit_token_topic": {
-                      "description": "Compacted side-topic that holds one commit-token record per pipeline\nscope (exactly-once mode only). Auto-created with\n`cleanup.policy=compact` if absent.",
+                      "description": "**Deprecated** — use `exactly_once.commit_token_topic`.\n\nCompacted side-topic that holds one commit-token record per pipeline\nscope (exactly-once mode only). Auto-created with\n`cleanup.policy=compact` if absent.",
                       "type": "string",
                       "default": "__faucet_commit_token"
                     },
                     "commit_token_topic_partitions": {
-                      "description": "Partition count used when auto-creating [`Self::commit_token_topic`].",
+                      "description": "**Deprecated** — use `exactly_once.commit_token_topic_partitions`.\n\nPartition count used when auto-creating the commit-token topic.",
                       "type": [
                         "integer",
                         "string"
@@ -16482,7 +16763,7 @@
                       "default": 1
                     },
                     "commit_token_topic_replication": {
-                      "description": "Replication factor used when auto-creating\n[`Self::commit_token_topic`]. `-1` means \"use the broker default\".",
+                      "description": "**Deprecated** — use `exactly_once.commit_token_topic_replication`.\n\nReplication factor used when auto-creating the commit-token topic.\n`-1` means \"use the broker default\".",
                       "type": [
                         "integer",
                         "string"
@@ -16497,10 +16778,7 @@
                         "type": "string"
                       }
                     }
-                  },
-                  "title": "KafkaSinkConfig",
-                  "description": "Configuration for the Kafka sink connector.\n\nOnly [`brokers`](Self::brokers) and [`topic`](Self::topic) are required;\neverything else has a safe default (`acks: all` + `idempotent: true`).\nValidated at config load by [`validate`](Self::validate).",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -16521,6 +16799,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "KinesisSinkConfig",
+                  "description": "Configuration for [`KinesisSink`](crate::KinesisSink).",
+                  "type": "object",
                   "properties": {
                     "stream_name": {
                       "description": "Kinesis Data Stream name.",
@@ -16606,8 +16888,19 @@
                       "minimum": 0,
                       "default": 4
                     },
+                    "retry": {
+                      "description": "Per-record retry for partial failures, grouped (#654 M20). When\npresent it supersedes the three deprecated flat `retry_*` keys below.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_kinesis__PartialRetrySpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "retry_max_attempts": {
-                      "description": "Per-record retry budget for partial failures. Default 5.",
+                      "description": "**Deprecated** — use `retry.max_attempts`.\n\nPer-record retry budget for partial failures. Default 5.",
                       "type": [
                         "integer",
                         "string"
@@ -16617,7 +16910,7 @@
                       "default": 5
                     },
                     "retry_initial_backoff_ms": {
-                      "description": "Initial retry backoff (milliseconds). Default 100.",
+                      "description": "**Deprecated** — use `retry.initial_backoff_ms`.\n\nInitial retry backoff (milliseconds). Default 100.",
                       "type": [
                         "integer",
                         "string"
@@ -16627,7 +16920,7 @@
                       "default": 100
                     },
                     "retry_max_backoff_ms": {
-                      "description": "Backoff ceiling (milliseconds). Default 30000.",
+                      "description": "**Deprecated** — use `retry.max_backoff_ms`.\n\nBackoff ceiling (milliseconds). Default 30000.",
                       "type": [
                         "integer",
                         "string"
@@ -16636,10 +16929,7 @@
                       "minimum": 0,
                       "default": 30000
                     }
-                  },
-                  "title": "KinesisSinkConfig",
-                  "description": "Configuration for [`KinesisSink`](crate::KinesisSink).",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -16769,6 +17059,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "HttpSinkConfig",
+                  "description": "Configuration for the HTTP sink connector.",
+                  "type": "object",
                   "properties": {
                     "url": {
                       "description": "Target endpoint URL.",
@@ -16814,10 +17108,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "HttpSinkConfig",
-                  "description": "Configuration for the HTTP sink connector.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -16838,6 +17129,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "StdoutSinkConfig",
+                  "description": "Configuration for the stdout/stderr sink.",
+                  "type": "object",
                   "properties": {
                     "destination": {
                       "description": "Which standard stream to write to.",
@@ -16878,10 +17173,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "StdoutSinkConfig",
-                  "description": "Configuration for the stdout/stderr sink.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -16902,6 +17194,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "ParquetSinkConfig",
+                  "description": "Configuration for the Parquet sink connector.",
+                  "type": "object",
                   "properties": {
                     "destination": {
                       "description": "Where to write the Parquet files (local filesystem or S3).",
@@ -16966,10 +17262,7 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  },
-                  "title": "ParquetSinkConfig",
-                  "description": "Configuration for the Parquet sink connector.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -17080,6 +17373,10 @@
             "config": {
               "anyOf": [
                 {
+                  "additionalProperties": true,
+                  "title": "GcsSinkConfig",
+                  "description": "Configuration for the GCS sink connector.",
+                  "type": "object",
                   "properties": {
                     "bucket": {
                       "description": "GCS bucket name.",
@@ -17148,10 +17445,7 @@
                       "$ref": "#/$defs/sink_gcs__CompressionConfig",
                       "default": "auto"
                     }
-                  },
-                  "title": "GcsSinkConfig",
-                  "description": "Configuration for the GCS sink connector.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -17224,39 +17518,50 @@
                       "$ref": "#/$defs/sink_redshift__RedshiftWriteStrategy",
                       "default": "copy"
                     },
+                    "copy": {
+                      "description": "`COPY`-path settings, grouped (#654 M20). Applies only to\n`write_strategy: copy`; when present it supersedes the six deprecated\nflat keys below. This mirrors the BigQuery sink's `bulk_load:` block,\nwhich is the house shape for a staged-load configuration.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_redshift__RedshiftCopySpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "copy_format": {
-                      "description": "Staged-file format for the `COPY` path. Defaults to\n[`RedshiftCopyFormat::Jsonl`]. Ignored by the `insert` strategy.",
+                      "description": "**Deprecated** — use `copy.format`.\n\nStaged-file format for the `COPY` path. Defaults to\n[`RedshiftCopyFormat::Jsonl`]. Ignored by the `insert` strategy.",
                       "$ref": "#/$defs/sink_redshift__RedshiftCopyFormat",
                       "default": "jsonl"
                     },
                     "staging_bucket": {
-                      "description": "S3 bucket used to stage `COPY` files. **Required** when\n`write_strategy: copy`.",
+                      "description": "**Deprecated** — use `copy.staging_bucket`.\n\nS3 bucket used to stage `COPY` files. **Required** when\n`write_strategy: copy`.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
                     "staging_prefix": {
-                      "description": "Key prefix for staged objects (e.g. `redshift-staging/`). Defaults to\nempty.",
+                      "description": "**Deprecated** — use `copy.staging_prefix`.\n\nKey prefix for staged objects (e.g. `redshift-staging/`). Defaults to\nempty.",
                       "type": "string",
                       "default": ""
                     },
                     "iam_role": {
-                      "description": "IAM role ARN Redshift assumes to read the staged file\n(`COPY … IAM_ROLE '<arn>'`). **Required** when `write_strategy: copy`.",
+                      "description": "**Deprecated** — use `copy.iam_role`.\n\nIAM role ARN Redshift assumes to read the staged file\n(`COPY … IAM_ROLE '<arn>'`). **Required** when `write_strategy: copy`.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
                     "region": {
-                      "description": "AWS region of the staging bucket (used for both the S3 client and the\n`COPY … REGION '<region>'` clause). `None` uses the SDK default.",
+                      "description": "**Deprecated** — use `copy.region`.\n\nAWS region of the staging bucket (used for both the S3 client and the\n`COPY … REGION '<region>'` clause). `None` uses the SDK default.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
                     "endpoint_url": {
-                      "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO) — testing\naid; production loads use real S3.",
+                      "description": "**Deprecated** — use `copy.endpoint_url`.\n\nCustom endpoint URL for S3-compatible services (e.g. MinIO) — testing\naid; production loads use real S3.",
                       "type": [
                         "string",
                         "null"
@@ -18177,6 +18482,11 @@
             "string",
             "null"
           ]
+        },
+        "query_path": {
+          "description": "Where the bulk **statement** sits inside the [`submit`](Self::submit)\nbody, as an RFC 6901 JSON Pointer (#654 M23). Defaults to `/query` — the\ntop-level `query` key that used to be hardcoded, so an API putting its\nstatement at `sql`, `statement`, or a nested path silently lost\nincremental push-down and collapsed every object onto one dataset\nidentity. Three behaviours read it: the incremental predicate\ninjection, `validate()`'s incremental gate, and the catalog/lineage\ndataset name.",
+          "type": "string",
+          "default": "/query"
         }
       },
       "additionalProperties": true
@@ -18285,6 +18595,16 @@
           "description": "`fetch` only (#557): JSONPath for extracting records from each fetch page,\noverriding the source-level `records_path`. Applies to a JSON result body.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "locator_terminal_values": {
+          "description": "`fetch` only (#654 M24): locator values that mean **no more pages**,\ncompared case-insensitively after trimming. Defaults to `[\"null\"]` — one\nvendor's sentinel, which used to be hardcoded in the pagination loop, so\nan API signalling completion with `none` / `-1` / `EOF` needed a code\nchange. An empty/whitespace locator is always terminal regardless of\nthis list; set it to `[]` to make *only* emptiness terminal.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
             "null"
           ]
         }
@@ -19295,6 +19615,162 @@
           "const": "lpt"
         }
       ]
+    },
+    "sink_sqs__PartialRetrySpec": {
+      "description": "Per-record retry budget for a sink whose bulk API reports **partial**\nfailures (#654 M20).\n\nAWS batch APIs (`PutRecords`, `SendMessageBatch`) return a 200 whose body\nmarks individual entries as failed; the sink retries just those entries with\njittered exponential backoff. The three knobs that describe it used to sit\nflat and byte-identical in two connector configs, beside unrelated sizing\nkeys — one block, one definition, per Principle 4.",
+      "type": "object",
+      "properties": {
+        "max_attempts": {
+          "description": "Attempts per record before it is reported failed (DLQ-routable).\nDefault 5; `1` means \"no retry\".",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 5
+        },
+        "initial_backoff_ms": {
+          "description": "First backoff, in milliseconds. Doubles per attempt, jittered by the\nshared [`apply_jitter`]. Default 100.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 100
+        },
+        "max_backoff_ms": {
+          "description": "Backoff ceiling in milliseconds, applied before jitter. Default 30000.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30000
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_kafka__KafkaExactlyOnceSpec": {
+      "description": "Exactly-once delivery knobs for the Kafka sink (#654 M20).\n\nThese four apply **only** under `delivery: exactly_once` — the transactional\nproducer and its compacted commit-token side-topic. They used to sit flat\nbeside `brokers` / `linger_ms`, where nothing said they were inert in the\ndefault at-least-once mode; grouping them is what makes that legible.",
+      "type": "object",
+      "properties": {
+        "transactional_id_prefix": {
+          "description": "Namespace prefix for the producer's auto-derived `transactional.id`.\nThe id is `\"{prefix}.{sanitized_scope}\"`; defaults to `\"faucet\"`. Set it\nto isolate transactional ids across clusters or environments that share\na pipeline scope namespace.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_token_topic": {
+          "description": "Compacted side-topic holding one commit-token record per pipeline\nscope. Auto-created with `cleanup.policy=compact` if absent.",
+          "type": "string",
+          "default": "__faucet_commit_token"
+        },
+        "commit_token_topic_partitions": {
+          "description": "Partition count used when auto-creating the commit-token topic.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "int32",
+          "default": 1
+        },
+        "commit_token_topic_replication": {
+          "description": "Replication factor used when auto-creating the commit-token topic.\n`-1` means \"use the broker default\".",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "int32",
+          "default": -1
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_kinesis__PartialRetrySpec": {
+      "description": "Per-record retry budget for a sink whose bulk API reports **partial**\nfailures (#654 M20).\n\nAWS batch APIs (`PutRecords`, `SendMessageBatch`) return a 200 whose body\nmarks individual entries as failed; the sink retries just those entries with\njittered exponential backoff. The three knobs that describe it used to sit\nflat and byte-identical in two connector configs, beside unrelated sizing\nkeys — one block, one definition, per Principle 4.",
+      "type": "object",
+      "properties": {
+        "max_attempts": {
+          "description": "Attempts per record before it is reported failed (DLQ-routable).\nDefault 5; `1` means \"no retry\".",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 5
+        },
+        "initial_backoff_ms": {
+          "description": "First backoff, in milliseconds. Doubles per attempt, jittered by the\nshared [`apply_jitter`]. Default 100.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 100
+        },
+        "max_backoff_ms": {
+          "description": "Backoff ceiling in milliseconds, applied before jitter. Default 30000.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30000
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_redshift__RedshiftCopySpec": {
+      "description": "`COPY`-path settings for the Redshift sink (#654 M20).\n\nSix keys that only mean anything under `write_strategy: copy` used to sit\nflat beside `table_name` and `batch_size`, with nothing saying they were\ninert for `insert`. Grouping them is what makes that legible — the same\nshape the BigQuery sink already uses for `bulk_load:`.",
+      "type": "object",
+      "properties": {
+        "format": {
+          "description": "Staged-file format. Defaults to [`RedshiftCopyFormat::Jsonl`].",
+          "$ref": "#/$defs/sink_redshift__RedshiftCopyFormat",
+          "default": "jsonl"
+        },
+        "staging_bucket": {
+          "description": "S3 bucket used to stage `COPY` files. **Required** for `copy`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "staging_prefix": {
+          "description": "Key prefix for staged objects (e.g. `redshift-staging/`). Empty by\ndefault.",
+          "type": "string",
+          "default": ""
+        },
+        "iam_role": {
+          "description": "IAM role ARN Redshift assumes to read the staged file\n(`COPY … IAM_ROLE '<arn>'`). **Required** for `copy`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "description": "AWS region of the staging bucket, used for both the S3 client and the\n`COPY … REGION '<region>'` clause. `None` uses the SDK default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint_url": {
+          "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO) — a testing\naid; production loads use real S3.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
     }
   }
 }

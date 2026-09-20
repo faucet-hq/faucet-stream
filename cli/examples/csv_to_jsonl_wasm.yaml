@@ -19,7 +19,7 @@ pipeline:
     type: csv
     config:
       path: cli/examples/data/orders.csv
-      has_header: true
+      has_headers: true
 
   transforms:
     - type: wasm

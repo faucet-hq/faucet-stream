@@ -1511,18 +1511,21 @@ fn collect_flow_capture_names(cfg: &PipelineConfig) -> Vec<String> {
 
 /// Whether a source config carries a discovery recipe whose naming-template
 /// tokens (`${name}` / `${name_snake}` / `${name_lower}` / `${field_names}`)
-/// are resolved by the source's discovery engine at `discover()` time: a
-/// `discovery:` block, or an `odata:` block using fan-out / emit templating.
+/// are resolved by the source's discovery engine at `discover()` time.
+///
+/// Recognised by *shape*, not by block name (#654 M22): an explicit
+/// `discovery:` recipe, or any connector-config block using the fan-out / emit
+/// vocabulary. Naming one protocol's block here made a third discovery-capable
+/// source silently fail this check.
 fn has_discovery_recipe(config: &Value) -> bool {
     if config.get("discovery").is_some() {
         return true;
     }
-    config
-        .get("odata")
-        .and_then(Value::as_object)
-        .is_some_and(|o| {
+    config.as_object().is_some_and(|cfg| {
+        cfg.values().filter_map(Value::as_object).any(|o| {
             o.contains_key("fan_out") || o.contains_key("emit") || o.contains_key("objects")
         })
+    })
 }
 
 fn check_refs(

@@ -69,6 +69,7 @@ fn insert_config(port: u16, table: &str, batch_size: usize) -> RedshiftSinkConfi
         table_name: table.into(),
         schema: None,
         write_strategy: RedshiftWriteStrategy::Insert,
+        copy: None,
         copy_format: RedshiftCopyFormat::Jsonl,
         staging_bucket: None,
         staging_prefix: String::new(),

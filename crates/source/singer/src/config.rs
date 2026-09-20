@@ -25,6 +25,7 @@ pub enum MalformedPolicy {
 /// exactly the stream named by [`stream`](Self::stream) is emitted; RECORD
 /// messages for other streams are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SingerSourceConfig {
     /// The tap executable to run (looked up on `PATH`, or an absolute path),
     /// e.g. `tap-github` or `/opt/taps/tap-csv`.

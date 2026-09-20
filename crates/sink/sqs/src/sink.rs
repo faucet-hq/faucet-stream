@@ -164,6 +164,7 @@ impl SqsSink {
         &self,
         mut pending: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
+        let retry_cfg = self.config.retry_spec();
         let mut outcomes: BTreeMap<usize, Result<(), FaucetError>> = BTreeMap::new();
         let mut attempt = 0usize;
         loop {
@@ -206,7 +207,7 @@ impl SqsSink {
                         };
                         // sender_fault ⇒ a client-side problem that will not
                         // succeed on retry; treat as permanent.
-                        if f.sender_fault() || attempt + 1 >= self.config.retry_max_attempts {
+                        if f.sender_fault() || attempt + 1 >= retry_cfg.max_attempts {
                             outcomes.insert(
                                 idx,
                                 Err(FaucetError::Sink(format!(
@@ -226,8 +227,8 @@ impl SqsSink {
                     pending.retain(|e| retry_indices.contains(&e.index));
                     attempt += 1;
                     let delay = backoff_delay(
-                        self.config.retry_initial_backoff_ms,
-                        self.config.retry_max_backoff_ms,
+                        retry_cfg.initial_backoff_ms,
+                        retry_cfg.max_backoff_ms,
                         attempt,
                     );
                     tracing::debug!(
@@ -242,15 +243,15 @@ impl SqsSink {
                 Err(err) => {
                     attempt += 1;
                     let service = err.into_service_error();
-                    if attempt >= self.config.retry_max_attempts {
+                    if attempt >= retry_cfg.max_attempts {
                         return Err(FaucetError::Sink(format!(
                             "sqs: SendMessageBatch to '{}' failed after {} attempt(s): {service}",
-                            self.config.queue_url, self.config.retry_max_attempts
+                            self.config.queue_url, retry_cfg.max_attempts
                         )));
                     }
                     let delay = backoff_delay(
-                        self.config.retry_initial_backoff_ms,
-                        self.config.retry_max_backoff_ms,
+                        retry_cfg.initial_backoff_ms,
+                        retry_cfg.max_backoff_ms,
                         attempt,
                     );
                     tracing::warn!(

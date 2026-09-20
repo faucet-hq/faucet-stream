@@ -12,6 +12,7 @@ use std::time::Duration;
 /// Use a `Vec<MetadataEntry>` rather than a map because gRPC allows duplicate
 /// keys and order is occasionally observable.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataEntry {
     pub key: String,
     pub value: String,
@@ -48,6 +49,7 @@ pub enum RpcKind {
 
 /// Configuration for the gRPC source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GrpcStreamConfig {
     /// gRPC endpoint URL (e.g. `"http://localhost:50051"`).
     pub endpoint: String,
@@ -120,7 +122,12 @@ pub struct GrpcStreamConfig {
     /// For [`RpcKind::ServerStreaming`] reconnect: maximum reconnect attempts
     /// before surfacing the error. `None` (the default) means unlimited
     /// retries.
-    #[serde(default)]
+    ///
+    /// The historical WebSocket-source spelling `max_reconnect_attempts` is
+    /// accepted as an alias (#654 M20) — the prefix used to be reversed
+    /// between the two connectors, so a user who learned one spelling had the
+    /// other silently ignored and reconnected without a bound.
+    #[serde(default, alias = "max_reconnect_attempts")]
     pub reconnect_max_attempts: Option<u32>,
     /// For [`RpcKind::ServerStreaming`] reconnect: whether the server replays
     /// the response stream from the beginning when the identical request is
@@ -507,5 +514,30 @@ mod tests {
         assert_eq!(config.reconnect_initial_backoff, Duration::from_secs(5));
         assert_eq!(config.reconnect_max_backoff, Duration::from_secs(120));
         assert_eq!(config.reconnect_max_attempts, Some(10));
+    }
+
+    #[test]
+    fn both_reconnect_attempt_spellings_deserialize() {
+        // Mirror of the WebSocket source's test: either prefix order resolves
+        // to the same knob (#654 M20).
+        let canonical: GrpcStreamConfig = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://localhost:50051",
+            "descriptor_set_path": "/tmp/d.bin",
+            "service_name": "S", "method_name": "M", "request": {},
+            "auth": { "type": "none" },
+            "reconnect_max_attempts": 4
+        }))
+        .unwrap();
+        assert_eq!(canonical.reconnect_max_attempts, Some(4));
+
+        let historical: GrpcStreamConfig = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://localhost:50051",
+            "descriptor_set_path": "/tmp/d.bin",
+            "service_name": "S", "method_name": "M", "request": {},
+            "auth": { "type": "none" },
+            "max_reconnect_attempts": 4
+        }))
+        .unwrap();
+        assert_eq!(historical.reconnect_max_attempts, Some(4));
     }
 }

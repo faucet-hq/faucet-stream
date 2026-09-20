@@ -27,6 +27,7 @@ pub enum RedisSinkType {
 
 /// Configuration for the Redis sink connector.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RedisSinkConfig {
     /// Redis connection URL (e.g. `"redis://127.0.0.1:6379"`).
     pub url: String,

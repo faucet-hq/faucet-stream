@@ -31,6 +31,7 @@ fn default_batch_size() -> usize {
 
 /// Configuration for the BigQuery query source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BigQuerySourceConfig {
     /// GCP project ID against which the query is billed and run.
     pub project_id: String,

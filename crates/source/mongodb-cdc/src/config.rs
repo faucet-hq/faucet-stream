@@ -78,6 +78,7 @@ pub enum FullDocumentBeforeChange {
 
 /// Configuration for [`MongoCdcSource`](crate::MongoCdcSource).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MongoCdcSourceConfig {
     /// MongoDB connection URI. Must point at a replica set or sharded cluster.
     pub connection_uri: String,

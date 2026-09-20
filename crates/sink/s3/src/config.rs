@@ -23,6 +23,7 @@ pub enum S3SinkFormat {
 
 /// Configuration for the S3 sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct S3SinkConfig {
     /// S3 bucket name.
     pub bucket: String,

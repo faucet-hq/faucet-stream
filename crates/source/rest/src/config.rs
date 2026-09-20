@@ -275,6 +275,15 @@ pub struct RestStreamConfig {
     /// time (explicit values still win). See [`ODataConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub odata: Option<ODataConfig>,
+    /// Drop per-record keys starting with any of these prefixes (#654 M24).
+    ///
+    /// Protocol control fields — OData's `@odata.etag` / `@odata.editLink`,
+    /// JSON:API's `links`, HAL's `_links` — are metadata, not data, and are
+    /// often invalid column names downstream. An `odata:` block implies
+    /// `@odata.` (the prefix that used to be hardcoded), so existing configs
+    /// need no change; list prefixes here for any other protocol envelope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_key_prefixes: Vec<String>,
 
     // ── Response-decode pipeline (#515) ─────────────────────────────────────────
     /// Decode the response body before record extraction: a chain of
@@ -628,6 +637,7 @@ impl Default for RestStreamConfig {
             path: String::new(),
             method: Method::GET,
             auth: AuthSpec::Inline(Auth::None),
+            drop_key_prefixes: Vec::new(),
             headers: HashMap::new(),
             query_params: HashMap::new(),
             query_params_multi: HashMap::new(),

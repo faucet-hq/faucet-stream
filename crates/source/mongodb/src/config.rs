@@ -27,6 +27,7 @@ use std::fmt;
 /// .with_batch_size(500);
 /// ```
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MongoSourceConfig {
     /// MongoDB connection URI (e.g. `mongodb://localhost:27017`).
     pub connection_uri: String,

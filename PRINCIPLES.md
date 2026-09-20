@@ -85,9 +85,21 @@ rigor as a Rust API.
 - **Sentinels are conventions, documented per field.** `0` = "no limit /
   unbatched" is the house sentinel (`batch_size: 0`, `max_concurrent: 0`); any
   field using it says so in its doc comment. No other magic values.
-- Every config struct: `deny_unknown_fields`, doc comments on every field
-  (they become `faucet schema` output), defaults that are safe, and validation
-  at load time — a bad config must fail before the first byte moves.
+- Every config struct: **unknown keys are rejected**, doc comments on every
+  field (they become `faucet schema` output), defaults that are safe, and
+  validation at load time — a bad config must fail before the first byte moves.
+- **`deny_unknown_fields` vs `#[serde(flatten)]` — the ruling.** serde refuses
+  the two together, and the clause above mandates `flatten` for shared blocks,
+  so the two clauses collide on ~a third of the connector configs. The rule:
+  put `#[serde(deny_unknown_fields)]` on every config struct that *can* take it
+  (it also protects library callers, who never pass through the CLI), and let
+  the **registry boundary** cover the rest — `registry::reject_unknown_config_keys`
+  checks a connector's `config` object against the key set its own JSON Schema
+  declares, walking `allOf`/`anyOf`/`oneOf`/`$ref` so a flattened tagged enum's
+  variant keys count as declared. Neither half is optional: the attribute
+  catches nested typos serde sees, the boundary catches what `flatten` hides.
+  A config that genuinely accepts arbitrary keys says so with a catch-all
+  `additionalProperties` in its schema, and is skipped.
 
 ## 5. No hidden state, no magic strings
 

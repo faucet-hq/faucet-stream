@@ -119,10 +119,13 @@ These fields apply only under `delivery: exactly_once` (ignored otherwise). See 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `transactional_id_prefix` | string | `"faucet"` | Namespace prefix for the producer's auto-derived `transactional.id` (`"{prefix}.{sanitized_scope}"`). Set it to isolate transactional ids across clusters/environments that share a pipeline-scope namespace. |
-| `commit_token_topic` | string | `"__faucet_commit_token"` | Compacted side-topic that holds one commit-token record per pipeline scope. Auto-created with `cleanup.policy=compact` if absent. |
-| `commit_token_topic_partitions` | int | `1` | Partition count used when auto-creating `commit_token_topic`. Must be ≥ 1. |
-| `commit_token_topic_replication` | int | `-1` | Replication factor used when auto-creating `commit_token_topic`. `-1` means "use the broker default". |
+| `exactly_once` | block | *(unset)* | Exactly-once knobs, grouped — see below. Only consulted under `delivery: exactly_once`. |
+| `exactly_once.transactional_id_prefix` | string | `"faucet"` | Namespace prefix for the producer's auto-derived `transactional.id` (`"{prefix}.{sanitized_scope}"`). Set it to isolate transactional ids across clusters/environments that share a pipeline-scope namespace. |
+| `exactly_once.commit_token_topic` | string | `"__faucet_commit_token"` | Compacted side-topic that holds one commit-token record per pipeline scope. Auto-created with `cleanup.policy=compact` if absent. |
+| `exactly_once.commit_token_topic_partitions` | int | `1` | Partition count used when auto-creating the commit-token topic. Must be ≥ 1. |
+| `exactly_once.commit_token_topic_replication` | int | `-1` | Replication factor used when auto-creating the commit-token topic. `-1` means "use the broker default". |
+
+The same four keys are still accepted flat at the config top level (`transactional_id_prefix`, `commit_token_topic`, …) — **deprecated** since #654, and superseded wholesale when an `exactly_once:` block is present.
 
 ## Topic routing
 
@@ -337,14 +340,15 @@ pipeline:
       value_format: { type: json }
       # effectively-once: transactional producer + compacted watermark side-topic
       # (auto-created). transactional.id is auto-derived from the pipeline scope.
-      commit_token_topic: __faucet_commit_token
+      exactly_once:
+        commit_token_topic: __faucet_commit_token
   state:
     type: file
     config:
       path: ./.faucet-state/pg_cdc_to_kafka_eo
 ```
 
-The four new config fields ([`transactional_id_prefix`](#effectively-once), `commit_token_topic`, `commit_token_topic_partitions`, `commit_token_topic_replication`) tune the transactional id namespace and the side-topic. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for the cross-connector picture, and the runnable [`cli/examples/postgres_cdc_to_kafka_exactly_once.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/postgres_cdc_to_kafka_exactly_once.yaml).
+The `exactly_once:` block (`transactional_id_prefix`, `commit_token_topic`, `commit_token_topic_partitions`, `commit_token_topic_replication`) tunes the transactional id namespace and the side-topic. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for the cross-connector picture, and the runnable [`cli/examples/postgres_cdc_to_kafka_exactly_once.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/postgres_cdc_to_kafka_exactly_once.yaml).
 
 ## Config loading & schema
 

@@ -210,3 +210,73 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
+
+/// Per-record retry budget for a sink whose bulk API reports **partial**
+/// failures (#654 M20).
+///
+/// AWS batch APIs (`PutRecords`, `SendMessageBatch`) return a 200 whose body
+/// marks individual entries as failed; the sink retries just those entries with
+/// jittered exponential backoff. The three knobs that describe it used to sit
+/// flat and byte-identical in two connector configs, beside unrelated sizing
+/// keys — one block, one definition, per Principle 4.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct PartialRetrySpec {
+    /// Attempts per record before it is reported failed (DLQ-routable).
+    /// Default 5; `1` means "no retry".
+    #[serde(default = "default_partial_retry_max_attempts")]
+    pub max_attempts: usize,
+    /// First backoff, in milliseconds. Doubles per attempt, jittered by the
+    /// shared [`apply_jitter`]. Default 100.
+    #[serde(default = "default_partial_retry_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Backoff ceiling in milliseconds, applied before jitter. Default 30000.
+    #[serde(default = "default_partial_retry_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+}
+
+fn default_partial_retry_max_attempts() -> usize {
+    5
+}
+fn default_partial_retry_initial_backoff_ms() -> u64 {
+    100
+}
+fn default_partial_retry_max_backoff_ms() -> u64 {
+    30_000
+}
+
+impl Default for PartialRetrySpec {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_partial_retry_max_attempts(),
+            initial_backoff_ms: default_partial_retry_initial_backoff_ms(),
+            max_backoff_ms: default_partial_retry_max_backoff_ms(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod partial_retry_tests {
+    use super::PartialRetrySpec;
+
+    #[test]
+    fn defaults_match_the_documented_values() {
+        let s = PartialRetrySpec::default();
+        assert_eq!(s.max_attempts, 5);
+        assert_eq!(s.initial_backoff_ms, 100);
+        assert_eq!(s.max_backoff_ms, 30_000);
+        // An empty block deserializes to the same thing, so `retry: {}` is a
+        // no-op rather than a silent zeroing.
+        let from_json: PartialRetrySpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_json, s);
+    }
+
+    #[test]
+    fn an_unknown_key_is_rejected() {
+        let err = serde_json::from_str::<PartialRetrySpec>(r#"{"max_attempt": 3}"#)
+            .expect_err("a typo'd key must not be silently ignored");
+        assert!(err.to_string().contains("max_attempt"), "{err}");
+    }
+}

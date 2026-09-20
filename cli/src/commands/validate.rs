@@ -677,12 +677,11 @@ matrix:
         assert!(err.contains("rowA"), "names the row: {err}");
     }
 
-    /// Most connector configs do **not** set `deny_unknown_fields`, so a typo'd
-    /// field name still slips past both serde and `validate()`. Pinned here so
-    /// the limitation is explicit rather than assumed fixed — closing it is the
-    /// config-strictness work tracked in #654.
+    /// A key the connector does not declare is a config that reads as doing
+    /// something and does nothing — the worst failure shape, because the run
+    /// is green. Rejected at validate time since #654 H9, naming the row.
     #[test]
-    fn an_unknown_field_is_still_accepted_where_the_config_permits_them() {
+    fn an_unknown_connector_field_fails_validation() {
         let cfg = crate::config::parse_with_extension(
             r#"
 version: 1
@@ -695,7 +694,29 @@ matrix:
             "yaml",
         )
         .unwrap();
-        check_connector_configs(&expand(&cfg).unwrap())
-            .expect("csv does not deny unknown fields, so this passes — see #654");
+        let err = check_connector_configs(&expand(&cfg).unwrap())
+            .expect_err("an undeclared connector key must not pass validate")
+            .to_string();
+        assert!(err.contains("rowA"), "names the row: {err}");
+        assert!(err.contains("no_such_field"), "names the key: {err}");
+    }
+
+    /// The counterpart: a config using only declared keys still passes. Without
+    /// this, a bug that rejected everything would leave the test above green.
+    #[test]
+    fn a_config_using_only_declared_keys_passes() {
+        let cfg = crate::config::parse_with_extension(
+            r#"
+version: 1
+pipeline:
+  source: { type: csv, config: { path: ./in.csv, has_headers: true } }
+  sink:   { type: jsonl, config: { path: ./o } }
+matrix:
+  - id: rowA
+"#,
+            "yaml",
+        )
+        .unwrap();
+        check_connector_configs(&expand(&cfg).unwrap()).expect("a declared-key config must pass");
     }
 }

@@ -10,7 +10,7 @@ use crate::error::{CliError, CliResult};
 use faucet_core::{Sink, Source};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 /// A factory that builds a [`Source`] trait object from its JSON/YAML config
@@ -267,7 +267,15 @@ pub async fn build_source(
     // raw config and manage their own auth (the shared `auth:` catalog is not
     // injected into custom connectors).
     if let Some(entry) = global().sources.get(kind) {
+        reject_unknown_config_keys("source", kind, kind, &config, &(entry.schema)())?;
         return (entry.factory)(config);
+    }
+    // Unknown keys are rejected here too, not only in `faucet validate`: a
+    // config can reach a run without passing through validate (serve
+    // submission, a template trigger, `run --from-env`), and a silently-ignored
+    // key is the failure this gate exists to stop (#654 H9).
+    if let Ok(schema) = source_schema(kind) {
+        reject_unknown_config_keys("source", kind, kind, &config, &schema)?;
     }
     let auth_ref = auth_catalog::auth_ref(&config);
     match kind {
@@ -598,7 +606,11 @@ pub async fn build_source(
 /// (the catalog) and injected into the connector.
 pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliResult<Box<dyn Sink>> {
     if let Some(entry) = global().sinks.get(kind) {
+        reject_unknown_config_keys("sink", kind, kind, &config, &(entry.schema)())?;
         return (entry.factory)(config);
+    }
+    if let Ok(schema) = sink_schema(kind) {
+        reject_unknown_config_keys("sink", kind, kind, &config, &schema)?;
     }
     let auth_ref = auth_catalog::auth_ref(&config);
     match kind {
@@ -1025,6 +1037,164 @@ pub fn sink_supported_write_modes(kind: &str) -> &'static [faucet_core::WriteMod
 
 /// Return the JSON Schema for the named source's config struct.
 /// Deserialize a connector config and discard it — the point is the error.
+/// Reject connector-config keys the connector does not declare (#654 H9).
+///
+/// `deny_unknown_fields` closes this at the serde layer, but serde refuses it
+/// on any struct carrying a `#[serde(flatten)]` — which is the house pattern
+/// for shared connection / `WriteSpec` blocks, so 25 of 66 connector configs
+/// cannot use the attribute. Without a check, `verify_checksums` (one letter
+/// off `verify_checksum`) silently runs with integrity checking **off**, and a
+/// misspelled `batch_size` silently takes the default: the worst failure shape,
+/// a green run doing the wrong thing.
+///
+/// The connector's own JSON Schema is the key list, so it stays correct by
+/// construction — flattened members are inlined into `properties` by schemars,
+/// and a third-party plugin gets the same treatment from its `config_schema`.
+/// Skipped when the schema declares a genuine catch-all (`additionalProperties`
+/// set to anything but `false`), which is how a config with a keyless
+/// `flatten`-map says "any key is mine".
+fn reject_unknown_config_keys(
+    role: &'static str,
+    kind: &str,
+    name: &str,
+    config: &Value,
+    schema: &Value,
+) -> CliResult<()> {
+    let Some(given) = config.as_object() else {
+        return Ok(());
+    };
+    let mut known = BTreeSet::new();
+    if !collect_schema_keys(schema, schema, &mut known, 0) {
+        // Somewhere in the schema a genuine catch-all is declared, or the
+        // shape is one we don't model — say nothing rather than reject a
+        // legitimate config.
+        return Ok(());
+    }
+    if known.is_empty() {
+        return Ok(());
+    }
+    let unknown: Vec<&str> = given
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.contains(*k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let suggestions: Vec<String> = unknown
+        .iter()
+        .filter_map(|u| {
+            nearest_key(u, known.iter()).map(|k| format!("`{u}` — did you mean `{k}`?"))
+        })
+        .collect();
+    let hint = if suggestions.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", suggestions.join("; "))
+    };
+    Err(CliError::InvalidConnectorConfig {
+        kind: if role == "source" { "source" } else { "sink" },
+        name: name.to_owned(),
+        message: format!(
+            "unknown {role} `{kind}` config key(s): {}{hint}. A key the connector does not \
+             declare is silently ignored, so an integrity or batching knob would read as set \
+             while doing nothing — run `faucet schema {role} {kind}` for the full list.",
+            unknown
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
+/// Collect every top-level key `schema` can accept into `out`.
+///
+/// Returns `false` when the schema declares a catch-all (`additionalProperties`
+/// as anything but `false`) or recurses too deep — the caller then skips the
+/// check entirely rather than rejecting a config the connector would accept.
+///
+/// Subschema branches (`allOf` / `anyOf` / `oneOf`, and `$ref` into `$defs`)
+/// are **unioned**, not intersected: a `#[serde(flatten)]` of an adjacently-
+/// tagged enum renders as a `oneOf` of variant objects, and each variant's
+/// keys are legitimate at the top level. Unioning keeps this a typo check, not
+/// a validator — picking the wrong variant is serde's job to report.
+fn collect_schema_keys(
+    schema: &Value,
+    root: &Value,
+    out: &mut BTreeSet<String>,
+    depth: usize,
+) -> bool {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    match obj.get("additionalProperties") {
+        None | Some(Value::Bool(false)) => {}
+        Some(_) => return false,
+    }
+    if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+        out.extend(props.keys().cloned());
+    }
+    if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
+        let Some(target) = resolve_local_ref(root, r) else {
+            return false;
+        };
+        if !collect_schema_keys(target, root, out, depth + 1) {
+            return false;
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = obj.get(key).and_then(Value::as_array) {
+            for b in branches {
+                if !collect_schema_keys(b, root, out, depth + 1) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Resolve a `#/$defs/Name` pointer against the schema root. Only local `$defs`
+/// refs are understood; anything else returns `None` (→ check skipped).
+fn resolve_local_ref<'a>(root: &'a Value, r: &str) -> Option<&'a Value> {
+    let name = r.strip_prefix("#/$defs/")?;
+    root.get("$defs")?.get(name)
+}
+
+/// The declared key closest to `given`, when it is close enough to be a likely
+/// typo (edit distance ≤ 2, or ≤ 1/3 of the key's length for longer names).
+fn nearest_key<'a, I: Iterator<Item = &'a String>>(given: &str, known: I) -> Option<&'a str> {
+    let budget = (given.len() / 3).max(2);
+    known
+        .map(|k| (edit_distance(given, k), k.as_str()))
+        .filter(|(d, _)| *d <= budget)
+        .min_by_key(|(d, k)| (*d, k.len()))
+        .map(|(_, k)| k)
+}
+
+/// Levenshtein distance, two-row DP. Byte-wise: config keys are ASCII
+/// identifiers, and a multi-byte key just yields a slightly larger distance
+/// (it never panics or mis-slices, since we never index into the strings).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ac) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &bc) in b.iter().enumerate() {
+            let cost = usize::from(ac != bc);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 fn check<T: DeserializeOwned>(kind: &'static str, name: &str, config: Value) -> CliResult<()> {
     decode::<T>(kind, name, config).map(|_| ())
 }
@@ -1081,7 +1251,11 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
     // A plugin-registered connector is validated by building it — the factory
     // is the only thing that knows its config shape.
     if let Some(entry) = global().sources.get(kind) {
+        reject_unknown_config_keys("source", kind, name, &config, &(entry.schema)())?;
         return (entry.factory)(config).map(|_| ());
+    }
+    if let Ok(schema) = source_schema(kind) {
+        reject_unknown_config_keys("source", kind, name, &config, &schema)?;
     }
     match kind {
         #[cfg(feature = "source-rest")]
@@ -1293,7 +1467,11 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
     // A plugin-registered connector is validated by building it — the factory
     // is the only thing that knows its config shape.
     if let Some(entry) = global().sinks.get(kind) {
+        reject_unknown_config_keys("sink", kind, name, &config, &(entry.schema)())?;
         return (entry.factory)(config).map(|_| ());
+    }
+    if let Ok(schema) = sink_schema(kind) {
+        reject_unknown_config_keys("sink", kind, name, &config, &schema)?;
     }
     match kind {
         #[cfg(feature = "sink-bigquery")]
@@ -1892,6 +2070,7 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Every compiled source kind reaches a real deserializer (#609).
     ///
@@ -2605,5 +2784,178 @@ mod tests {
         assert!(sink_supports_schema_evolution("iceberg"));
         assert!(!sink_supports_schema_evolution("jsonl"));
         assert!(!sink_supports_schema_evolution("kafka"));
+    }
+
+    #[test]
+    fn edit_distance_is_levenshtein() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("abc", "abc"), 0);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("batch_size", "batch_size"), 0);
+        assert_eq!(edit_distance("batch_sizes", "batch_size"), 1);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn nearest_key_only_suggests_a_plausible_typo() {
+        let known: Vec<String> = ["batch_size", "verify_checksum", "prefix"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            nearest_key("verify_checksums", known.iter()),
+            Some("verify_checksum")
+        );
+        assert_eq!(nearest_key("batch_sze", known.iter()), Some("batch_size"));
+        // Not a typo of anything here — better to say nothing than to guess.
+        assert_eq!(nearest_key("region", known.iter()), None);
+    }
+
+    #[test]
+    fn unknown_connector_keys_are_rejected_with_the_declared_list() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "bucket": {}, "prefix": {}, "verify_checksum": {} }
+        });
+        let ok = json!({ "bucket": "b", "verify_checksum": true });
+        assert!(reject_unknown_config_keys("source", "s3", "row", &ok, &schema).is_ok());
+
+        // The motivating case: one letter off, so integrity checking silently
+        // stayed OFF while the config reads as if it were on.
+        let typo = json!({ "bucket": "b", "verify_checksums": true });
+        let err = reject_unknown_config_keys("source", "s3", "row", &typo, &schema)
+            .expect_err("a typo'd key must not be silently ignored");
+        let msg = err.to_string();
+        assert!(msg.contains("verify_checksums"), "{msg}");
+        assert!(
+            msg.contains("did you mean `verify_checksum`"),
+            "the near-miss must be named, or the user re-reads the whole schema: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_declared_catch_all_schema_accepts_any_key() {
+        // A config with a keyless `flatten`-map says "every key is mine";
+        // rejecting there would break a legitimate passthrough config.
+        let schema = json!({
+            "type": "object",
+            "properties": { "url": {} },
+            "additionalProperties": { "type": "string" }
+        });
+        let cfg = json!({ "url": "u", "anything_at_all": "x" });
+        assert!(reject_unknown_config_keys("sink", "http", "row", &cfg, &schema).is_ok());
+
+        // An explicit `false` is the opposite claim and still rejects.
+        let strict = json!({
+            "type": "object",
+            "properties": { "url": {} },
+            "additionalProperties": false
+        });
+        assert!(reject_unknown_config_keys("sink", "http", "row", &cfg, &strict).is_err());
+    }
+
+    #[test]
+    fn a_non_object_config_or_schema_is_left_alone() {
+        // `config: "${vars.x}"` is resolved elsewhere; a schema with no
+        // `properties` (a `oneOf` wrapper, a plugin that declines to describe
+        // itself) carries no key list to check against.
+        let schema = json!({ "type": "object", "properties": { "a": {} } });
+        assert!(
+            reject_unknown_config_keys("source", "k", "row", &json!("${vars.x}"), &schema).is_ok()
+        );
+        assert!(
+            reject_unknown_config_keys("source", "k", "row", &json!({"zzz": 1}), &json!({}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_flattened_tagged_enum_contributes_its_variant_keys() {
+        // `#[serde(flatten)] auth: SftpAuth` renders as a root-level `oneOf`
+        // of variant objects, not as inlined `properties` — so `type` and
+        // `config` are legitimate top-level keys even though the struct never
+        // names them. Intersecting the branches would reject a correct config;
+        // unioning keeps this a typo check.
+        let schema = json!({
+            "type": "object",
+            "properties": { "host": {}, "username": {} },
+            "oneOf": [
+                { "type": "object", "properties": { "type": {}, "config": {} } },
+                { "type": "object", "properties": { "type": {}, "key_path": {} } }
+            ]
+        });
+        let cfg = json!({ "host": "h", "username": "u", "type": "password", "config": {} });
+        assert!(reject_unknown_config_keys("source", "sftp", "row", &cfg, &schema).is_ok());
+        // A key in no branch is still caught.
+        let bad = json!({ "host": "h", "usernme": "u" });
+        assert!(reject_unknown_config_keys("source", "sftp", "row", &bad, &schema).is_err());
+    }
+
+    #[test]
+    fn a_ref_into_defs_is_followed() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "a": {} },
+            "allOf": [ { "$ref": "#/$defs/Extra" } ],
+            "$defs": { "Extra": { "type": "object", "properties": { "b": {} } } }
+        });
+        assert!(
+            reject_unknown_config_keys("sink", "k", "row", &json!({"a": 1, "b": 2}), &schema)
+                .is_ok()
+        );
+        assert!(reject_unknown_config_keys("sink", "k", "row", &json!({"c": 3}), &schema).is_err());
+        // An unresolvable ref means we don't know the key set → skip, never
+        // reject.
+        let dangling = json!({
+            "type": "object",
+            "properties": { "a": {} },
+            "allOf": [ { "$ref": "#/$defs/Missing" } ]
+        });
+        assert!(
+            reject_unknown_config_keys("sink", "k", "row", &json!({"c": 3}), &dangling).is_ok()
+        );
+    }
+
+    #[cfg(feature = "source-sftp")]
+    #[test]
+    fn the_shipped_sftp_shape_with_flattened_auth_is_accepted() {
+        // Guards the real schema, not a hand-written stand-in: a shipped
+        // example used exactly this shape and the first version of this check
+        // rejected it.
+        let cfg = json!({
+            "host": "sftp.example.com", "port": 22, "username": "reporting",
+            "type": "password", "config": { "password": "x" },
+            "known_hosts": { "mode": "accept_new" },
+            "path": "/exports/daily", "glob": "*.jsonl",
+            "format": "jsonl", "batch_size": 1000
+        });
+        assert!(validate_source_config("sftp", "row", cfg).is_ok());
+    }
+
+    #[cfg(feature = "sink-bigquery")]
+    #[test]
+    fn a_flattened_config_still_declares_its_flattened_keys() {
+        // The whole reason for the boundary check: `deny_unknown_fields` is
+        // refused on a struct with `#[serde(flatten)]`, and 25 configs flatten.
+        // schemars inlines the flattened members, so the key list stays right.
+        let schema = sink_schema("bigquery").expect("bigquery schema");
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(props.contains_key("write_mode"), "flattened WriteSpec key");
+        assert!(props.contains_key("project_id"), "own key");
+
+        let good = json!({
+            "project_id": "p", "dataset_id": "d", "table_id": "t",
+            "auth": {"type": "application_default"}, "write_mode": "append"
+        });
+        assert!(validate_sink_config("bigquery", "row", good).is_ok());
+
+        let bad = json!({
+            "project_id": "p", "dataset_id": "d", "table_id": "t",
+            "auth": {"type": "application_default"}, "write_modes": "append"
+        });
+        let err = validate_sink_config("bigquery", "row", bad)
+            .expect_err("a typo'd flattened key must be rejected");
+        assert!(err.to_string().contains("write_modes"), "{err}");
     }
 }

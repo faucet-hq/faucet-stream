@@ -203,19 +203,21 @@ fn jsonpath_first_value(v: &Value, path: &str) -> Option<Value> {
     v.query(path).ok()?.first().map(|x| (*x).clone())
 }
 
-/// A locator value counts as "no more pages" when it is empty or the literal
-/// string `null` (Salesforce Bulk sends `Sforce-Locator: null` when done).
-fn is_terminal_locator(value: &str) -> bool {
+/// A locator value counts as "no more pages" when it is empty, or when it
+/// matches one of the configured `locator_terminal_values` (default `["null"]`
+/// — Salesforce Bulk sends `Sforce-Locator: null` when done). Comparison is
+/// case-insensitive after trimming.
+fn is_terminal_locator(value: &str, terminal: &[String]) -> bool {
     let v = value.trim();
-    v.is_empty() || v.eq_ignore_ascii_case("null")
+    v.is_empty() || terminal.iter().any(|t| v.eq_ignore_ascii_case(t.trim()))
 }
 
 /// Derive the queried object name for an async-job source's `dataset_uri` (#640).
 /// Looks for a `query` string in the submit body (Salesforce Bulk SOQL, etc.) and
 /// returns its `FROM <object>`. `None` when there's no query or it can't be parsed
 /// (the caller then falls back to a hash of the submit body).
-fn async_job_object(submit_json: Option<&Value>) -> Option<String> {
-    let query = submit_json?.get("query")?.as_str()?;
+fn async_job_object(submit_json: Option<&Value>, query_path: &str) -> Option<String> {
+    let query = submit_json?.pointer(query_path)?.as_str()?;
     sql_from_object(query)
 }
 
@@ -392,16 +394,17 @@ fn next_locator(
     body: Option<&Value>,
     job: &crate::async_job::AsyncJobConfig,
 ) -> Option<String> {
+    let terminal = &job.fetch.locator_terminal_values;
     if let Some(name) = &job.fetch.locator_header
         && let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok())
-        && !is_terminal_locator(raw)
+        && !is_terminal_locator(raw, terminal)
     {
         return Some(raw.trim().to_string());
     }
     if let Some(path) = &job.fetch.locator_body
         && let Some(body) = body
         && let Some(raw) = jsonpath_first_string(body, path)
-        && !is_terminal_locator(&raw)
+        && !is_terminal_locator(&raw, terminal)
     {
         return Some(raw.trim().to_string());
     }
@@ -677,6 +680,16 @@ impl RestStream {
     /// configured extraction mode: `records_multi` (#548, op-stamped multi-array
     /// fan-out), `record_ancestors` (#549, nested path with lifted ancestor
     /// fields), or the classic single `records_path`.
+    /// The per-record key prefixes to drop. An `odata:` block implies
+    /// `@odata.`; explicit `drop_key_prefixes` are added to it.
+    fn drop_key_prefixes(&self) -> Vec<String> {
+        let mut out = self.config.drop_key_prefixes.clone();
+        if self.config.odata.is_some() && !out.iter().any(|p| p == "@odata.") {
+            out.push("@odata.".to_string());
+        }
+        out
+    }
+
     fn extract_page(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
         let mut records = extract::extract_configured(
             body,
@@ -685,13 +698,17 @@ impl RestStream {
             &self.config.records_multi,
             self.config.op_field.as_deref().unwrap_or("_op"),
         )?;
-        // OData responses stamp per-record protocol control fields (`@odata.etag`,
-        // `@odata.editLink`, …) that are metadata, not data, and are invalid column
-        // names downstream. Drop them so records carry only the entity's own fields.
-        if self.config.odata.is_some() {
+        // Protocol control fields stamped per record (`@odata.etag`, JSON:API's
+        // `links`, HAL's `_links`, …) are metadata, not data, and are often
+        // invalid column names downstream. Drop them so records carry only the
+        // entity's own fields. The prefix list is configurable
+        // (`drop_key_prefixes`); an `odata:` block implies `@odata.` so existing
+        // configs keep working without naming it (#654 M24).
+        let prefixes = self.drop_key_prefixes();
+        if !prefixes.is_empty() {
             for rec in &mut records {
                 if let Value::Object(map) = rec {
-                    map.retain(|k, _| !k.starts_with("@odata."));
+                    map.retain(|k, _| !prefixes.iter().any(|p| k.starts_with(p.as_str())));
                 }
             }
         }
@@ -1444,10 +1461,11 @@ impl RestStream {
                 .or_else(|| self.config.start_replication_value.clone())
         }?;
         let submit = job.submit.json.as_ref()?;
-        let query = submit.get("query")?.as_str()?;
+        let query = job.submit_query()?;
         let predicate = format!("{key} > {}", sql_literal(&start));
         let mut cloned = submit.clone();
-        cloned["query"] = Value::String(inject_sql_predicate(query, &predicate));
+        *cloned.pointer_mut(&job.query_path)? =
+            Value::String(inject_sql_predicate(query, &predicate));
         Some(cloned)
     }
 
@@ -2292,7 +2310,7 @@ impl faucet_core::Source for RestStream {
         // dataset either way).
         if let Some(job) = &self.config.async_job {
             let sep = if base.ends_with('/') { "" } else { "/" };
-            if let Some(obj) = async_job_object(job.submit.json.as_ref()) {
+            if let Some(obj) = async_job_object(job.submit.json.as_ref(), &job.query_path) {
                 return format!("{base}{sep}objects/{obj}");
             }
             if let Some(j) = &job.submit.json {
@@ -3176,18 +3194,66 @@ mod tests {
     #[test]
     fn async_job_object_reads_query_field() {
         assert_eq!(
-            async_job_object(Some(&serde_json::json!({
-                "operation": "queryAll",
-                "query": "SELECT Id FROM Lead"
-            }))),
+            async_job_object(
+                Some(&serde_json::json!({
+                    "operation": "queryAll",
+                    "query": "SELECT Id FROM Lead"
+                })),
+                "/query"
+            ),
             Some("Lead".to_string())
         );
         // Missing query / missing body → None.
         assert_eq!(
-            async_job_object(Some(&serde_json::json!({"operation": "queryAll"}))),
+            async_job_object(
+                Some(&serde_json::json!({"operation": "queryAll"})),
+                "/query"
+            ),
             None
         );
-        assert_eq!(async_job_object(None), None);
+        assert_eq!(async_job_object(None, "/query"), None);
+    }
+
+    #[test]
+    fn async_job_object_follows_a_non_default_query_path() {
+        // The statement need not sit at top-level `query`: a nested or
+        // differently-named key used to silently collapse every object onto
+        // one dataset identity (#654 M23).
+        assert_eq!(
+            async_job_object(
+                Some(&serde_json::json!({"request": {"sql": "SELECT Id FROM Account"}})),
+                "/request/sql"
+            ),
+            Some("Account".to_string())
+        );
+        // The default pointer finds nothing in that body.
+        assert_eq!(
+            async_job_object(
+                Some(&serde_json::json!({"request": {"sql": "SELECT Id FROM Account"}})),
+                "/query"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_locator_honours_the_configured_sentinels() {
+        let default = vec!["null".to_string()];
+        // Empty is always terminal, whatever the list says.
+        assert!(is_terminal_locator("", &default));
+        assert!(is_terminal_locator("   ", &[]));
+        // The default sentinel, case-insensitively and after trimming.
+        assert!(is_terminal_locator(" NULL ", &default));
+        assert!(!is_terminal_locator("abc123", &default));
+        // A vendor signalling with its own sentinel is now expressible; the
+        // default one stops being special once replaced.
+        let custom = vec!["EOF".to_string(), "-1".to_string()];
+        assert!(is_terminal_locator("eof", &custom));
+        assert!(is_terminal_locator("-1", &custom));
+        assert!(
+            !is_terminal_locator("null", &custom),
+            "replacing the list must replace it, not extend it"
+        );
     }
 
     #[test]
@@ -3488,6 +3554,38 @@ mod patch_edge_tests {
         ]});
         let recs = s.extract_page(&body).unwrap();
         assert_eq!(recs, vec![json!({ "Id": 1, "Name": "a" })]);
+    }
+
+    #[test]
+    fn extract_page_drops_configured_prefixes_for_any_protocol() {
+        // The need is generic; only the prefix was OData's. A JSON:API / HAL
+        // envelope can now be stripped without a code change (#654 M24).
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.drop_key_prefixes = vec!["_".to_string(), "links".to_string()];
+        cfg.records_path = Some("$.data[*]".into());
+        let s = RestStream::new(cfg).unwrap();
+        let body = json!({ "data": [
+            { "_links": {"self": "/x"}, "links": {"next": "/y"}, "id": 1, "name": "a" },
+        ]});
+        assert_eq!(
+            s.extract_page(&body).unwrap(),
+            vec![json!({ "id": 1, "name": "a" })]
+        );
+    }
+
+    #[test]
+    fn an_odata_block_still_implies_the_odata_prefix_alongside_explicit_ones() {
+        // Existing `odata:` configs must keep stripping `@odata.` without
+        // naming it, even once the list is used for something else.
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.odata = Some(serde_json::from_value(json!({ "entity": "Orders" })).unwrap());
+        cfg.drop_key_prefixes = vec!["x-".to_string()];
+        cfg.records_path = Some("$.value[*]".into());
+        let s = RestStream::new(cfg).unwrap();
+        let body = json!({ "value": [
+            { "@odata.etag": "W/\"1\"", "x-trace": "t", "Id": 1 },
+        ]});
+        assert_eq!(s.extract_page(&body).unwrap(), vec![json!({ "Id": 1 })]);
     }
 
     #[test]

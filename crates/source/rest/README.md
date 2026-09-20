@@ -117,6 +117,7 @@ the secrets/redaction boundary like any other config string.
 |-------|------|---------|-------------|
 | `pagination` | `PaginationStyle` | `None` | Pagination strategy. See [Pagination](#pagination). |
 | `records_path` | string / null | `null` | JSONPath expression to extract the record array from each response body (e.g. `$.data[*]`). When unset, the whole body is treated as the record set. |
+| `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | `100` | Hard cap on pages fetched, across **all** pagination styles. `null` removes the cap (rely on the style's own termination). |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
@@ -467,15 +468,22 @@ async_job:
     records_path: "$.records[*]"
 ```
 
-Records are appended across pages; the loop stops when the locator header/body is missing, empty, or `"null"`.
+Records are appended across pages; the loop stops when the locator header/body is missing, empty, or matches one of `locator_terminal_values` (default `["null"]` — the Salesforce Bulk sentinel). An API that signals completion differently sets its own list, without a code change:
+
+```yaml
+    locator_terminal_values: ["EOF", "-1"]   # replaces the default, does not extend it
+```
 
 #### Incremental replication with `async_job`
 
 Set `replication_method: { type: Incremental }` + `replication_key` and the
 source pushes the bookmark down into the job itself: the resumed bookmark is
-injected as `WHERE <replication_key> > <bookmark>` into the **top-level string
-`query` of `submit.json`** (wrapping any existing `WHERE`, before trailing
-clauses; subqueries and quoted literals are left alone). That `query` field is
+injected as `WHERE <replication_key> > <bookmark>` into the **statement inside
+`submit.json`** (wrapping any existing `WHERE`, before trailing clauses;
+subqueries and quoted literals are left alone). `query_path` says where that
+statement lives — an RFC 6901 JSON Pointer, default `/query`, so an API whose
+body reads `{"request": {"sql": "…"}}` sets `query_path: /request/sql` instead
+of losing push-down silently. A statement at the configured path is
 **required** for this mode — without one the predicate could never apply, so
 the config is rejected at validate time rather than silently exporting
 full-table on every run. `replication_bind` is mutually exclusive with
@@ -496,7 +504,12 @@ async_job:
   submit: { method: POST, url: /jobs, json: { operation: query, query: "SELECT Id FROM Lead" } }
   # …job_id / poll / status / fetch…
   lookback: 15m        # optional; default 5m
+  query_path: /query   # optional; where the statement sits in submit.json
 ```
+
+The same pointer names the dataset for catalog and lineage, so pointing it at
+the real statement is what keeps one object per dataset rather than every
+object collapsing onto one.
 
 #### Native byte passthrough (#633)
 

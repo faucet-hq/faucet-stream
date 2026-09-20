@@ -82,6 +82,18 @@ pub struct JobRequest {
     /// overriding the source-level `records_path`. Applies to a JSON result body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub records_path: Option<String>,
+    /// `fetch` only (#654 M24): locator values that mean **no more pages**,
+    /// compared case-insensitively after trimming. Defaults to `["null"]` — one
+    /// vendor's sentinel, which used to be hardcoded in the pagination loop, so
+    /// an API signalling completion with `none` / `-1` / `EOF` needed a code
+    /// change. An empty/whitespace locator is always terminal regardless of
+    /// this list; set it to `[]` to make *only* emptiness terminal.
+    #[serde(default = "default_locator_terminal_values")]
+    pub locator_terminal_values: Vec<String>,
+}
+
+fn default_locator_terminal_values() -> Vec<String> {
+    vec!["null".to_string()]
 }
 
 /// The poll request + cadence.
@@ -170,6 +182,20 @@ pub struct AsyncJobConfig {
     /// that loss into a bounded re-read (deduped by an upsert sink).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookback: Option<String>,
+    /// Where the bulk **statement** sits inside the [`submit`](Self::submit)
+    /// body, as an RFC 6901 JSON Pointer (#654 M23). Defaults to `/query` — the
+    /// top-level `query` key that used to be hardcoded, so an API putting its
+    /// statement at `sql`, `statement`, or a nested path silently lost
+    /// incremental push-down and collapsed every object onto one dataset
+    /// identity. Three behaviours read it: the incremental predicate
+    /// injection, `validate()`'s incremental gate, and the catalog/lineage
+    /// dataset name.
+    #[serde(default = "default_query_path")]
+    pub query_path: String,
+}
+
+fn default_query_path() -> String {
+    "/query".to_string()
 }
 
 /// Default bookmark re-read margin (seconds) when `lookback` is unset: wide
@@ -185,11 +211,18 @@ impl AsyncJobConfig {
     /// `replication_method: incremental` in that shape — otherwise a bookmark
     /// would advance while the export silently stays full-table.
     pub fn supports_incremental_query(&self) -> bool {
+        self.submit_query().is_some()
+    }
+
+    /// The bulk statement in the submit body, resolved through
+    /// [`query_path`](Self::query_path). `None` when there is no submit body,
+    /// the pointer matches nothing, or the match is not a string.
+    pub fn submit_query(&self) -> Option<&str> {
         self.submit
             .json
-            .as_ref()
-            .and_then(|j| j.get("query"))
-            .is_some_and(serde_json::Value::is_string)
+            .as_ref()?
+            .pointer(&self.query_path)?
+            .as_str()
     }
 
     /// The parsed `lookback` margin (default 5 minutes — see the field docs).

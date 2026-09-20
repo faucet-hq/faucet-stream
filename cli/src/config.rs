@@ -609,12 +609,25 @@ pub struct MatrixRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<crate::partition::PartitionSpec>,
 
-    /// **Discovery dimension** (#501). When set, this row enumerates a value-set
-    /// at runtime: it builds `discover.source`, drains it, projects `select`
-    /// (JSONPath) from each record, and dedups (first-seen order). The row has
-    /// no sink and writes nothing — its value-set is exposed to `for_each` rows
-    /// as `${<id>.<as>}`. Runs once per pipeline run, cached across dependents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **Fan-out axis** (#501), spelled `fan_out:` on the wire. When set, this
+    /// row enumerates a value-set at runtime: it builds `fan_out.source`,
+    /// drains it, projects `select` (JSONPath) from each record, and dedups
+    /// (first-seen order). The row has no sink and writes nothing — its
+    /// value-set is exposed to `for_each` rows as `${<id>.<as>}`. Runs once
+    /// per pipeline run, cached across dependents.
+    ///
+    /// The historical spelling `discover:` is accepted as an alias (#654 M21).
+    /// It collided with the other, unrelated `discover` in the vocabulary —
+    /// `Source::discover`, which enumerates a connection's **datasets** — and
+    /// the canonical verb for "turn a listed set into one matrix row per
+    /// member" is `fan_out` (see the Vocabulary table in
+    /// `.claude/rules/architecture.md`).
+    #[serde(
+        default,
+        rename = "fan_out",
+        alias = "discover",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub discover: Option<DiscoverSpec>,
 
     /// Fan this row out over the **cartesian product** of the named discovery

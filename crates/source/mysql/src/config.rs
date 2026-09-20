@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for the MySQL query source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MysqlSourceConfig {
     /// MySQL connection URL (e.g. `mysql://user:pass@host/db`).
     pub connection_url: String,
@@ -48,6 +49,7 @@ pub struct MysqlSourceConfig {
 /// one shard (the last) additionally matches ``` `key` IS NULL ```, so NULL-key
 /// rows are covered by precisely one shard with no loss and no duplication.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ShardConfig {
     /// Integer column to range-partition on. Quoted as an identifier (backticks)
     /// before use, so it is safe against injection but must name a real output

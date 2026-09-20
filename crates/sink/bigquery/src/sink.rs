@@ -2536,10 +2536,9 @@ impl faucet_core::Sink for BigQuerySink {
 #[cfg(test)]
 mod tests {
     use super::{
-        BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema,
-        appends_via_media_load, build_load_job_json,
-        build_load_job_json_fmt, build_load_job_json_full, build_multipart_related,
-        deletes_to_payload, dml_affected_rows, gzip, is_direct_overwrite,
+        BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load,
+        build_load_job_json, build_load_job_json_fmt, build_load_job_json_full,
+        build_multipart_related, deletes_to_payload, dml_affected_rows, gzip, is_direct_overwrite,
         json_schema_to_load_schema, media_boundary, multipart_boundary, native_batch_columns,
         records_to_ndjson, scope_to_payload,
     };

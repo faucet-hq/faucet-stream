@@ -65,6 +65,7 @@ pub(crate) fn warehouse_scheme(warehouse: &str) -> WarehouseScheme {
 /// the JSON Schema less readable).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub struct CatalogInner {
     /// Catalog endpoint URI.
     ///
@@ -172,6 +173,7 @@ impl fmt::Debug for CatalogConfig {
 /// `truncate[8]`). Used only when `create_if_missing: true` and the table
 /// does not yet exist.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PartitionField {
     /// Source column name in the table schema.
     pub source: String,
@@ -185,6 +187,7 @@ pub struct PartitionField {
 
 /// Parquet-level compression and encoding options.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetOpts {
     /// Parquet compression codec. Supported: `snappy` (default), `zstd`,
     /// `gzip`, `lz4`, `none`.
@@ -228,6 +231,7 @@ impl Default for ParquetOpts {
 /// `catalog-sql`, `catalog-hms`). Configuring a disabled catalog type returns
 /// `FaucetError::Config` at startup.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IcebergSinkConfig {
     /// Iceberg catalog connection settings.
     pub catalog: CatalogConfig,

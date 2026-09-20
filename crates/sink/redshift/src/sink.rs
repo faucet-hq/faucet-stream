@@ -52,10 +52,11 @@ impl RedshiftSink {
     /// Build an S3 client honouring the optional region / endpoint overrides.
     async fn build_s3_client(config: &RedshiftSinkConfig) -> S3Client {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(region) = &config.region {
+        let copy_cfg = config.copy_spec();
+        if let Some(region) = &copy_cfg.region {
             loader = loader.region(aws_config::Region::new(region.clone()));
         }
-        if let Some(endpoint) = &config.endpoint_url {
+        if let Some(endpoint) = &copy_cfg.endpoint_url {
             loader = loader.endpoint_url(endpoint);
         }
         let sdk_config = loader.load().await;
@@ -69,7 +70,7 @@ impl RedshiftSink {
     /// Generate a unique staging object key for one page.
     fn staging_key(&self, ext: &str) -> String {
         let id = uuid::Uuid::new_v4();
-        format!("{}{}.{}", self.config.staging_prefix, id, ext)
+        format!("{}{}.{}", self.config.copy_spec().staging_prefix, id, ext)
     }
 
     /// Discover the destination table's column names in ordinal order via
@@ -108,22 +109,23 @@ impl RedshiftSink {
         let s3 = self.s3.as_ref().ok_or_else(|| {
             FaucetError::Sink("redshift: S3 client not initialized for copy strategy".into())
         })?;
-        let bucket = self.config.staging_bucket.as_deref().ok_or_else(|| {
+        let copy_cfg = self.config.copy_spec();
+        let bucket = copy_cfg.staging_bucket.as_deref().ok_or_else(|| {
             FaucetError::Sink("redshift: staging_bucket is required for copy strategy".into())
         })?;
-        let iam_role = self.config.iam_role.as_deref().ok_or_else(|| {
+        let iam_role = copy_cfg.iam_role.as_deref().ok_or_else(|| {
             FaucetError::Sink("redshift: iam_role is required for copy strategy".into())
         })?;
 
         // Serialize the page and, for CSV, learn the destination column order.
-        let (body, columns): (Vec<u8>, Option<Vec<String>>) = match self.config.copy_format {
+        let (body, columns): (Vec<u8>, Option<Vec<String>>) = match copy_cfg.format {
             RedshiftCopyFormat::Jsonl => (serialize_jsonl(records)?, None),
             RedshiftCopyFormat::Csv => {
                 let cols = self.discover_columns().await?;
                 (serialize_csv(records, &cols)?, Some(cols))
             }
         };
-        let ext = match self.config.copy_format {
+        let ext = match copy_cfg.format {
             RedshiftCopyFormat::Jsonl => "jsonl",
             RedshiftCopyFormat::Csv => "csv",
         };
@@ -146,8 +148,8 @@ impl RedshiftSink {
             columns.as_deref(),
             &s3_uri(bucket, &key),
             iam_role,
-            self.config.region.as_deref(),
-            self.config.copy_format,
+            copy_cfg.region.as_deref(),
+            copy_cfg.format,
         );
         let copy_result = sqlx::query(&sql).execute(&self.pool).await;
 
@@ -366,6 +368,7 @@ mod tests {
             table_name: "events".into(),
             schema: Some("public".into()),
             write_strategy: RedshiftWriteStrategy::Insert,
+            copy: None,
             copy_format: RedshiftCopyFormat::Jsonl,
             staging_bucket: None,
             staging_prefix: String::new(),

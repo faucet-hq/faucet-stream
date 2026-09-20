@@ -13,6 +13,7 @@ use std::time::Duration;
 /// everything else has a safe default (`acks: all` + `idempotent: true`).
 /// Validated at config load by [`validate`](Self::validate).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KafkaSinkConfig {
     /// Comma-separated `host:port` bootstrap brokers, passed straight through
     /// as librdkafka's `bootstrap.servers` (e.g. `"b1:9092,b2:9092"`).
@@ -181,6 +182,13 @@ pub struct KafkaSinkConfig {
     /// lowering [`Self::batch_size`] treats the cause rather than the symptom.
     #[serde(default = "default_queue_full_max_retries")]
     pub queue_full_max_retries: u32,
+    /// Exactly-once knobs, grouped (#654 M20). Only consulted under
+    /// `delivery: exactly_once`; when present it supersedes the four
+    /// deprecated flat keys below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exactly_once: Option<KafkaExactlyOnceSpec>,
+    /// **Deprecated** — use `exactly_once.transactional_id_prefix`.
+    ///
     /// Optional namespace prefix for the producer's auto-derived
     /// `transactional.id` (exactly-once mode only). The id is
     /// `"{prefix}.{sanitized_scope}"`; `prefix` defaults to `"faucet"` when
@@ -188,16 +196,22 @@ pub struct KafkaSinkConfig {
     /// environments that share a pipeline scope namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transactional_id_prefix: Option<String>,
+    /// **Deprecated** — use `exactly_once.commit_token_topic`.
+    ///
     /// Compacted side-topic that holds one commit-token record per pipeline
     /// scope (exactly-once mode only). Auto-created with
     /// `cleanup.policy=compact` if absent.
     #[serde(default = "default_commit_token_topic")]
     pub commit_token_topic: String,
-    /// Partition count used when auto-creating [`Self::commit_token_topic`].
+    /// **Deprecated** — use `exactly_once.commit_token_topic_partitions`.
+    ///
+    /// Partition count used when auto-creating the commit-token topic.
     #[serde(default = "default_commit_token_topic_partitions")]
     pub commit_token_topic_partitions: i32,
-    /// Replication factor used when auto-creating
-    /// [`Self::commit_token_topic`]. `-1` means "use the broker default".
+    /// **Deprecated** — use `exactly_once.commit_token_topic_replication`.
+    ///
+    /// Replication factor used when auto-creating the commit-token topic.
+    /// `-1` means "use the broker default".
     #[serde(default = "default_commit_token_topic_replication")]
     pub commit_token_topic_replication: i32,
     /// Raw librdkafka producer properties, applied **last** so they override
@@ -297,6 +311,45 @@ fn default_queue_full_max_retries() -> u32 {
 // Double leading underscore mirrors Kafka's own internal-topic convention
 // (__consumer_offsets / __transaction_state); intentionally distinct from the
 // SQL sinks' `_faucet_commit_token` table constant in faucet_core::idempotency.
+/// Exactly-once delivery knobs for the Kafka sink (#654 M20).
+///
+/// These four apply **only** under `delivery: exactly_once` — the transactional
+/// producer and its compacted commit-token side-topic. They used to sit flat
+/// beside `brokers` / `linger_ms`, where nothing said they were inert in the
+/// default at-least-once mode; grouping them is what makes that legible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaExactlyOnceSpec {
+    /// Namespace prefix for the producer's auto-derived `transactional.id`.
+    /// The id is `"{prefix}.{sanitized_scope}"`; defaults to `"faucet"`. Set it
+    /// to isolate transactional ids across clusters or environments that share
+    /// a pipeline scope namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transactional_id_prefix: Option<String>,
+    /// Compacted side-topic holding one commit-token record per pipeline
+    /// scope. Auto-created with `cleanup.policy=compact` if absent.
+    #[serde(default = "default_commit_token_topic")]
+    pub commit_token_topic: String,
+    /// Partition count used when auto-creating the commit-token topic.
+    #[serde(default = "default_commit_token_topic_partitions")]
+    pub commit_token_topic_partitions: i32,
+    /// Replication factor used when auto-creating the commit-token topic.
+    /// `-1` means "use the broker default".
+    #[serde(default = "default_commit_token_topic_replication")]
+    pub commit_token_topic_replication: i32,
+}
+
+impl Default for KafkaExactlyOnceSpec {
+    fn default() -> Self {
+        Self {
+            transactional_id_prefix: None,
+            commit_token_topic: default_commit_token_topic(),
+            commit_token_topic_partitions: default_commit_token_topic_partitions(),
+            commit_token_topic_replication: default_commit_token_topic_replication(),
+        }
+    }
+}
+
 fn default_commit_token_topic() -> String {
     "__faucet_commit_token".to_string()
 }
@@ -308,6 +361,23 @@ fn default_commit_token_topic_replication() -> i32 {
 }
 
 impl KafkaSinkConfig {
+    /// The effective exactly-once knobs: the `exactly_once:` block when
+    /// present, otherwise the four deprecated flat keys (#654 M20).
+    ///
+    /// The block wins wholesale rather than field-by-field — a flat key has a
+    /// default, so "was it set?" is not observable, and a per-field merge would
+    /// silently mix two spellings of the same setting.
+    pub fn exactly_once_spec(&self) -> KafkaExactlyOnceSpec {
+        self.exactly_once
+            .clone()
+            .unwrap_or_else(|| KafkaExactlyOnceSpec {
+                transactional_id_prefix: self.transactional_id_prefix.clone(),
+                commit_token_topic: self.commit_token_topic.clone(),
+                commit_token_topic_partitions: self.commit_token_topic_partitions,
+                commit_token_topic_replication: self.commit_token_topic_replication,
+            })
+    }
+
     pub fn validate(&self) -> Result<(), FaucetError> {
         if self.brokers.trim().is_empty() {
             return Err(FaucetError::Config(
@@ -359,17 +429,18 @@ impl KafkaSinkConfig {
                     .into(),
             ));
         }
-        if self.commit_token_topic.trim().is_empty() {
+        let eo = self.exactly_once_spec();
+        if eo.commit_token_topic.trim().is_empty() {
             return Err(FaucetError::Config(
                 "kafka sink: commit_token_topic must not be empty".into(),
             ));
         }
-        if self.commit_token_topic_partitions < 1 {
+        if eo.commit_token_topic_partitions < 1 {
             return Err(FaucetError::Config(
                 "kafka sink: commit_token_topic_partitions must be at least 1".into(),
             ));
         }
-        if self.commit_token_topic_replication < 1 && self.commit_token_topic_replication != -1 {
+        if eo.commit_token_topic_replication < 1 && eo.commit_token_topic_replication != -1 {
             return Err(FaucetError::Config(
                 "kafka sink: commit_token_topic_replication must be -1 (broker default) or at least 1"
                     .into(),
@@ -418,6 +489,7 @@ mod tests {
             max_in_flight: 100,
             queue_full_backoff: Duration::from_millis(100),
             queue_full_max_retries: 3,
+            exactly_once: None,
             transactional_id_prefix: None,
             commit_token_topic: "__faucet_commit_token".into(),
             commit_token_topic_partitions: 1,
@@ -616,5 +688,49 @@ mod tests {
         }"#;
         let parsed: KafkaSinkConfig = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.batch_size, 250);
+    }
+
+    #[test]
+    fn exactly_once_block_supersedes_the_deprecated_flat_keys() {
+        // Flat-only (the pre-#654 shape) still works.
+        let flat: KafkaSinkConfig = serde_json::from_value(serde_json::json!({
+            "brokers": "b:9092", "topic": {"type": "fixed", "name": "t"},
+            "transactional_id_prefix": "acme",
+            "commit_token_topic": "wm",
+            "commit_token_topic_partitions": 3
+        }))
+        .unwrap();
+        let eo = flat.exactly_once_spec();
+        assert_eq!(eo.transactional_id_prefix.as_deref(), Some("acme"));
+        assert_eq!(eo.commit_token_topic, "wm");
+        assert_eq!(eo.commit_token_topic_partitions, 3);
+
+        // The block wins wholesale — including resetting a flat key to the
+        // block's default, which is the point of "wholesale" rather than a
+        // per-field merge that would mix two spellings of one setting.
+        let blocked: KafkaSinkConfig = serde_json::from_value(serde_json::json!({
+            "brokers": "b:9092", "topic": {"type": "fixed", "name": "t"},
+            "commit_token_topic": "flat-wm",
+            "exactly_once": { "commit_token_topic": "block-wm" }
+        }))
+        .unwrap();
+        let eo = blocked.exactly_once_spec();
+        assert_eq!(eo.commit_token_topic, "block-wm");
+        assert!(eo.transactional_id_prefix.is_none());
+        assert_eq!(eo.commit_token_topic_partitions, 1, "block default");
+        blocked.validate().expect("the grouped shape validates");
+    }
+
+    #[test]
+    fn validate_reads_the_block_not_the_flat_key() {
+        let bad: KafkaSinkConfig = serde_json::from_value(serde_json::json!({
+            "brokers": "b:9092", "topic": {"type": "fixed", "name": "t"},
+            "exactly_once": { "commit_token_topic": "  " }
+        }))
+        .unwrap();
+        let err = bad
+            .validate()
+            .expect_err("an empty topic in the block must fail");
+        assert!(err.to_string().contains("commit_token_topic"), "{err}");
     }
 }

@@ -54,6 +54,7 @@ pub enum CdcTls {
 
 /// Configuration for the MySQL CDC (binlog) source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MysqlCdcSourceConfig {
     /// Connection URL, e.g. `mysql://repl:pass@host:3306/db`.
     pub connection_url: String,

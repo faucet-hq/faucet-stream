@@ -24,6 +24,7 @@ pub enum GcsSinkFormat {
 
 /// Configuration for the GCS sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GcsSinkConfig {
     /// GCS bucket name.
     pub bucket: String,

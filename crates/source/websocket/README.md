@@ -13,7 +13,7 @@ Reach for it when you want to tap a live feed — market-data tickers, chat/even
 
 - **Native streaming** — `stream_pages` yields a `StreamPage` every `batch_size` records, so the sink receives data continuously throughout the run. Peak memory is `O(batch_size)` no matter how long the feed runs.
 - **Subscription frames** — send any number of `subscribe_messages` (in order) immediately after every connect *and* every reconnect, so subscribe-on-open APIs work without manual steps.
-- **Automatic reconnect** — opt-in `reconnect` with jittered exponential backoff from `reconnect_backoff` and an optional cap on *consecutive* failures (`max_reconnect_attempts`). The idle clock spans reconnect gaps, so a long outage still trips `idle_timeout`.
+- **Automatic reconnect** — opt-in `reconnect` with jittered exponential backoff from `reconnect_backoff` and an optional cap on *consecutive* failures (`reconnect_max_attempts`). The idle clock spans reconnect gaps, so a long outage still trips `idle_timeout`.
 - **Three message formats** — `json` (parse each frame into a JSON value), `raw_string` (UTF-8 string), or `binary` (base64-encoded string) — covering text and binary frames alike.
 - **Lenient or strict JSON parsing** — `on_parse_error: fail` aborts on a non-JSON frame; `skip` logs and drops it (handy for feeds that interleave protocol noise with data).
 - **Optional envelope** — wrap each record as `{ data, received_at, url }` to keep provenance and an arrival timestamp.
@@ -85,7 +85,7 @@ This connects to the Binance trade stream, captures the first 100 trade messages
 | `ping_interval` | int (seconds) | *(unset)* | If set, send a WebSocket Ping frame on this interval to keep the connection alive through proxies / load balancers. |
 | `reconnect` | bool | `false` | Reconnect on transport error or a non-`1000` close. |
 | `reconnect_backoff` | int (seconds) | `1` | Base wait before the first retry; subsequent retries grow exponentially with jitter, capped. |
-| `max_reconnect_attempts` | int | *(unlimited)* | Cap on *consecutive* failed reconnects (resets on any received message). Unset = unlimited (then `idle_timeout` is the natural cap). |
+| `reconnect_max_attempts` | int | *(unlimited)* | Cap on *consecutive* failed reconnects (resets on any received message). Unset = unlimited (then `idle_timeout` is the natural cap). The historical spelling `max_reconnect_attempts` is still accepted — the prefix order used to be reversed against the gRPC source, so whichever you learned first was silently dropped on the other (#654). |
 | `max_message_bytes` | int | *(tungstenite default)* | Bound the max message/frame size (bytes) to prevent runaway memory. Unset = tungstenite default (64 MiB message / 16 MiB frame). |
 
 ### Termination
@@ -204,7 +204,7 @@ source:
       - '{"action":"subscribe","topic":"events"}'
     reconnect: true
     reconnect_backoff: 5         # 5s before the first retry, then exponential
-    max_reconnect_attempts: 10   # give up after 10 consecutive failures
+    reconnect_max_attempts: 10   # give up after 10 consecutive failures
     idle_timeout: 300            # also caps a total outage at 5 min
     batch_size: 500
 ```
@@ -293,7 +293,7 @@ To attach a shared auth provider (re-resolved on every reconnect), build the sou
 2. `stream_pages` calls `connect()`, which builds the upgrade request, resolves the effective auth (shared provider first, then inline), applies any `max_message_bytes` limit, opens the socket, and sends every `subscribe_messages` frame.
 3. The receive loop decodes each data frame per `message_format`, optionally wraps it in the envelope, and buffers it; a page is flushed every `batch_size` records.
 4. Auth is resolved **per connect**, not once at construction — so reconnects pick up a freshly rotated token from a shared provider.
-5. On a transport error or non-`1000` close with `reconnect: true`, the loop waits a jittered exponential delay based on `reconnect_backoff`, reconnects, re-subscribes, and continues — counting consecutive failures against `max_reconnect_attempts`.
+5. On a transport error or non-`1000` close with `reconnect: true`, the loop waits a jittered exponential delay based on `reconnect_backoff`, reconnects, re-subscribes, and continues — counting consecutive failures against `reconnect_max_attempts`.
 
 ## Lineage dataset URI
 
@@ -316,7 +316,7 @@ This crate has no optional features of its own; enable it in the CLI / umbrella 
 | `Source: websocket json parse: …` | A frame wasn't valid JSON in `json` mode. Set `on_parse_error: skip` to drop such frames, or use `message_format: raw_string`. |
 | Connection drops periodically through a proxy / LB | Set `ping_interval` to send keepalive pings, and enable `reconnect` for resilience. |
 | Run aborts on a huge frame / memory spikes | Set `max_message_bytes` to cap frame size. |
-| Reconnect loops forever after the server goes away | Set `max_reconnect_attempts` (consecutive cap) and/or `idle_timeout` to bound the outage. |
+| Reconnect loops forever after the server goes away | Set `reconnect_max_attempts` (consecutive cap) and/or `idle_timeout` to bound the outage. |
 
 ## See also
 

@@ -12,6 +12,7 @@ pub use faucet_common_snowflake::SnowflakeAuth;
 
 /// Configuration for the Snowflake sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SnowflakeSinkConfig {
     /// Snowflake account identifier (e.g. `"xy12345.us-east-1"`).
     pub account: String,
@@ -74,6 +75,7 @@ pub struct SnowflakeSinkConfig {
 /// cloud location as `url`; the sink uploads Parquet files to `url` (via
 /// `object_store`) and then references them as `@stage/<file>` in `COPY INTO`.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SnowflakeStageConfig {
     /// Named **external** stage in Snowflake — `MY_DB.MY_SCHEMA.MY_STAGE` or a
     /// schema-relative `MY_STAGE`. Must already exist and reference `url`.

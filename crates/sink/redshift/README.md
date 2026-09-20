@@ -27,12 +27,12 @@ Append-only: Redshift has no `ON CONFLICT`, and `COPY` cannot upsert, so
 | `table_name` | yes | Target table. |
 | `schema` | no | Namespace qualifying the table. |
 | `write_strategy` | no | `copy` (default) or `insert`. |
-| `copy_format` | no | `jsonl` (default, `FORMAT AS JSON 'auto'`) or `csv` (`FORMAT AS CSV`). |
-| `staging_bucket` | copy only | S3 bucket for staged files. |
-| `staging_prefix` | no | Key prefix for staged objects. |
-| `iam_role` | copy only | IAM role ARN Redshift assumes to read the staged file. |
-| `region` | no | AWS region (S3 client + `COPY … REGION`). |
-| `endpoint_url` | no | S3-compatible endpoint override (testing). |
+| `copy.format` | no | `jsonl` (default, `FORMAT AS JSON 'auto'`) or `csv` (`FORMAT AS CSV`). |
+| `copy.staging_bucket` | copy only | S3 bucket for staged files. |
+| `copy.staging_prefix` | no | Key prefix for staged objects. |
+| `copy.iam_role` | copy only | IAM role ARN Redshift assumes to read the staged file. |
+| `copy.region` | no | AWS region (S3 client + `COPY … REGION`). |
+| `copy.endpoint_url` | no | S3-compatible endpoint override (testing). |
 | `batch_size` | no | Rows per load unit (default `1000`; `0` = whole page). |
 | `max_connections` | no | Pool size (default `5`). |
 
@@ -46,12 +46,19 @@ credentials:
     password: ${env:REDSHIFT_PASSWORD}
 table_name: events
 write_strategy: copy
-copy_format: jsonl
-staging_bucket: my-redshift-staging
-staging_prefix: faucet/
-iam_role: arn:aws:iam::123456789012:role/redshift-copy
-region: us-east-1
+copy:
+  format: jsonl
+  staging_bucket: my-redshift-staging
+  staging_prefix: faucet/
+  iam_role: arn:aws:iam::123456789012:role/redshift-copy
+  region: us-east-1
 ```
+
+The six `copy.*` keys are also still accepted flat at the config top level
+(`copy_format`, `staging_bucket`, `staging_prefix`, `iam_role`, `region`,
+`endpoint_url`) — **deprecated** since #654, and superseded wholesale when a
+`copy:` block is present. They only ever applied to `write_strategy: copy`,
+which is what the block now makes visible.
 
 ## Testing
 

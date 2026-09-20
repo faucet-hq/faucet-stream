@@ -12,6 +12,7 @@ pub const DEFAULT_ROW_GROUP_SIZE: usize = 1024 * 1024;
 
 /// Configuration for the Parquet sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetSinkConfig {
     /// Where to write the Parquet files (local filesystem or S3).
     pub destination: ParquetDestination,
@@ -176,6 +177,7 @@ pub enum ParquetDestination {
 
 /// S3 destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetS3Destination {
     /// S3 bucket name.
     pub bucket: String,

@@ -629,12 +629,16 @@ jobs:
         with:
           toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
-      - name: Check faucet-core public API for breaking changes
+      - name: Check every published crate's public API for breaking changes
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          # `faucet-core` at minimum — the required connector-author dependency.
-          package: faucet-core
+          # No `package:` — check the whole workspace. Gating only `faucet-core`
+          # left 89 crates unguarded, so a genuine removal or signature change in
+          # a connector could publish in a minor and break dependents silently
+          # (#654 H10). Every published crate now also declares the additive-is-
+          # minor lint contract in its own `[package.metadata.cargo-semver-checks.lints]`,
+          # so this gate fails only on real breaks.
           # Use the 1.96.0 toolchain installed above, not the action's default.
           rust-toolchain: manual
 

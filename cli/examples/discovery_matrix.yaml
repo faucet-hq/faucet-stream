@@ -4,7 +4,7 @@
 #
 #   faucet validate cli/examples/discovery_matrix.yaml
 #
-# A `discover:` row runs its source once, projects `select` from each record,
+# A `fan_out:` row runs its source once, projects `select` from each record,
 # dedups, and publishes the value-set under `as`. A `for_each: [dims]` row then
 # runs once per tuple of the cartesian product, with `${dim.alias}` substituted
 # into the source URL and sink path. Discovery + fan-out rows share one
@@ -38,7 +38,7 @@ pipeline:
 matrix:
   # ── Discovery dimensions (run once each, deduped, cached) ──
   - id: subsidiaries
-    discover:
+    fan_out:
       source:
         ref: api
         config: { path: /subsidiaries, records_path: "$.subsidiaries[*]" }
@@ -46,7 +46,7 @@ matrix:
       as: subsidiary_id
 
   - id: fields
-    discover:
+    fan_out:
       source:
         ref: api
         config: { path: /custom-fields, records_path: "$.fields[*]" }

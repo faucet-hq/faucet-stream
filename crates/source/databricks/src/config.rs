@@ -77,6 +77,7 @@ impl DatabricksAuth {
 
 /// A named SQL parameter passed to the statement (`:name` markers in the SQL).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DatabricksParam {
     /// Parameter name (the `:name` marker in the SQL, without the colon).
     pub name: String,
@@ -95,6 +96,7 @@ pub struct DatabricksParam {
 /// Runs `sql` against a Databricks SQL Warehouse via the Statement Execution
 /// REST API and streams the result rows as typed JSON objects.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DatabricksSourceConfig {
     /// Workspace base URL, e.g. `https://dbc-abc123.cloud.databricks.com`.
     pub workspace_url: String,

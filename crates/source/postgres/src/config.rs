@@ -7,6 +7,7 @@ use serde_json::Value;
 
 /// Configuration for the PostgreSQL query source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PostgresSourceConfig {
     /// PostgreSQL connection URL (e.g. `postgres://user:pass@host/db`).
     pub connection_url: String,
@@ -52,6 +53,7 @@ pub struct PostgresSourceConfig {
 /// one shard (the last) additionally matches `<key> IS NULL`, so NULL-key rows
 /// are covered by precisely one shard with no loss and no duplication.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ShardConfig {
     /// Integer column to range-partition on. Quoted as an identifier before use,
     /// so it is safe against injection but must name a real output column.

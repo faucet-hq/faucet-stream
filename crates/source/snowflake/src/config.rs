@@ -23,6 +23,7 @@ fn default_batch_size() -> usize {
 
 /// Configuration for the Snowflake query source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SnowflakeSourceConfig {
     /// Snowflake account identifier (e.g. `"xy12345.us-east-1"`).
     pub account: String,

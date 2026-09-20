@@ -53,6 +53,39 @@ fn default_max_connections() -> u32 {
     5
 }
 
+/// `COPY`-path settings for the Redshift sink (#654 M20).
+///
+/// Six keys that only mean anything under `write_strategy: copy` used to sit
+/// flat beside `table_name` and `batch_size`, with nothing saying they were
+/// inert for `insert`. Grouping them is what makes that legible — the same
+/// shape the BigQuery sink already uses for `bulk_load:`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedshiftCopySpec {
+    /// Staged-file format. Defaults to [`RedshiftCopyFormat::Jsonl`].
+    #[serde(default)]
+    pub format: RedshiftCopyFormat,
+    /// S3 bucket used to stage `COPY` files. **Required** for `copy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_bucket: Option<String>,
+    /// Key prefix for staged objects (e.g. `redshift-staging/`). Empty by
+    /// default.
+    #[serde(default)]
+    pub staging_prefix: String,
+    /// IAM role ARN Redshift assumes to read the staged file
+    /// (`COPY … IAM_ROLE '<arn>'`). **Required** for `copy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iam_role: Option<String>,
+    /// AWS region of the staging bucket, used for both the S3 client and the
+    /// `COPY … REGION '<region>'` clause. `None` uses the SDK default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Custom endpoint URL for S3-compatible services (e.g. MinIO) — a testing
+    /// aid; production loads use real S3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_url: Option<String>,
+}
+
 /// Configuration for the Amazon Redshift sink.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RedshiftSinkConfig {
@@ -68,26 +101,44 @@ pub struct RedshiftSinkConfig {
     /// How rows are loaded. Defaults to [`RedshiftWriteStrategy::Copy`].
     #[serde(default)]
     pub write_strategy: RedshiftWriteStrategy,
+    /// `COPY`-path settings, grouped (#654 M20). Applies only to
+    /// `write_strategy: copy`; when present it supersedes the six deprecated
+    /// flat keys below. This mirrors the BigQuery sink's `bulk_load:` block,
+    /// which is the house shape for a staged-load configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<RedshiftCopySpec>,
+    /// **Deprecated** — use `copy.format`.
+    ///
     /// Staged-file format for the `COPY` path. Defaults to
     /// [`RedshiftCopyFormat::Jsonl`]. Ignored by the `insert` strategy.
     #[serde(default)]
     pub copy_format: RedshiftCopyFormat,
+    /// **Deprecated** — use `copy.staging_bucket`.
+    ///
     /// S3 bucket used to stage `COPY` files. **Required** when
     /// `write_strategy: copy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staging_bucket: Option<String>,
+    /// **Deprecated** — use `copy.staging_prefix`.
+    ///
     /// Key prefix for staged objects (e.g. `redshift-staging/`). Defaults to
     /// empty.
     #[serde(default)]
     pub staging_prefix: String,
+    /// **Deprecated** — use `copy.iam_role`.
+    ///
     /// IAM role ARN Redshift assumes to read the staged file
     /// (`COPY … IAM_ROLE '<arn>'`). **Required** when `write_strategy: copy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iam_role: Option<String>,
+    /// **Deprecated** — use `copy.region`.
+    ///
     /// AWS region of the staging bucket (used for both the S3 client and the
     /// `COPY … REGION '<region>'` clause). `None` uses the SDK default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// **Deprecated** — use `copy.endpoint_url`.
+    ///
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO) — testing
     /// aid; production loads use real S3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +154,23 @@ pub struct RedshiftSinkConfig {
 }
 
 impl RedshiftSinkConfig {
+    /// The effective `COPY` settings: the `copy:` block when present,
+    /// otherwise the six deprecated flat keys (#654 M20).
+    ///
+    /// The block wins wholesale — several flat keys have defaults, so "was it
+    /// set?" is not observable and a per-field merge would silently mix two
+    /// spellings of one setting.
+    pub fn copy_spec(&self) -> RedshiftCopySpec {
+        self.copy.clone().unwrap_or_else(|| RedshiftCopySpec {
+            format: self.copy_format,
+            staging_bucket: self.staging_bucket.clone(),
+            staging_prefix: self.staging_prefix.clone(),
+            iam_role: self.iam_role.clone(),
+            region: self.region.clone(),
+            endpoint_url: self.endpoint_url.clone(),
+        })
+    }
+
     /// Validate the config. Enforces that the `copy` strategy has a staging
     /// bucket and IAM role.
     pub fn validate(&self) -> Result<(), FaucetError> {
@@ -145,6 +213,7 @@ mod tests {
             table_name: "events".into(),
             schema: None,
             write_strategy: RedshiftWriteStrategy::Copy,
+            copy: None,
             copy_format: RedshiftCopyFormat::Jsonl,
             staging_bucket: Some("stage".into()),
             staging_prefix: String::new(),
@@ -225,5 +294,29 @@ mod tests {
     fn write_strategy_round_trips() {
         assert_eq!(RedshiftWriteStrategy::Copy.as_str(), "copy");
         assert_eq!(RedshiftWriteStrategy::Insert.as_str(), "insert");
+    }
+
+    #[test]
+    fn copy_block_supersedes_the_deprecated_flat_keys() {
+        // Flat-only (the pre-#654 shape) still works.
+        let mut flat = base();
+        flat.copy = None;
+        flat.staging_bucket = Some("flat-bucket".into());
+        flat.staging_prefix = "flat/".into();
+        let c = flat.copy_spec();
+        assert_eq!(c.staging_bucket.as_deref(), Some("flat-bucket"));
+        assert_eq!(c.staging_prefix, "flat/");
+
+        // The block wins wholesale, so an unset block field falls back to the
+        // block's own default rather than silently inheriting the flat key —
+        // a per-field merge would mix two spellings of one setting.
+        let mut blocked = flat.clone();
+        blocked.copy = Some(RedshiftCopySpec {
+            staging_bucket: Some("block-bucket".into()),
+            ..RedshiftCopySpec::default()
+        });
+        let c = blocked.copy_spec();
+        assert_eq!(c.staging_bucket.as_deref(), Some("block-bucket"));
+        assert_eq!(c.staging_prefix, "", "block default, not the flat value");
     }
 }

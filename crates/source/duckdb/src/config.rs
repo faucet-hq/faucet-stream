@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for the DuckDB query source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DuckdbSourceConfig {
     /// Path to the DuckDB database file, or `:memory:` for an in-memory
     /// database. A `duckdb://` / `duckdb:` scheme prefix is accepted and

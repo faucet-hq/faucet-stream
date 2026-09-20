@@ -22,6 +22,7 @@ fn default_concurrency() -> usize {
 
 /// Configuration for the Parquet source connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetSourceConfig {
     /// Where to read Parquet from — a local file, a local glob pattern, or S3.
     pub source: ParquetLocation,
@@ -142,6 +143,7 @@ pub enum ParquetLocation {
 ///
 /// Exactly one of `key` or `prefix` must be set.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetS3Config {
     /// S3 bucket name.
     pub bucket: String,

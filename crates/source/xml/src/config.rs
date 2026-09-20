@@ -60,6 +60,7 @@ impl SoapVersion {
 /// resolves [`XmlStreamConfig::records_element_path`] relative to
 /// `Envelope.Body` and surfaces SOAP `<Fault>` responses as errors.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SoapConfig {
     /// SOAP protocol version (default `1.1`).
     #[serde(default)]
@@ -187,6 +188,7 @@ pub enum XmlPagination {
 
 /// Configuration for the XML source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct XmlStreamConfig {
     /// Base URL of the API.
     pub base_url: String,

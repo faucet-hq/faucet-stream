@@ -9,6 +9,7 @@ pub use faucet_common_elasticsearch::ElasticsearchAuth;
 
 /// Configuration for the Elasticsearch search source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ElasticsearchSourceConfig {
     /// Base URL of the Elasticsearch cluster (e.g. `"http://localhost:9200"`).
     pub base_url: String,
