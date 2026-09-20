@@ -340,6 +340,25 @@ pub trait Source: Send + Sync {
         crate::observability::strip_type_name(std::any::type_name::<Self>())
     }
 
+    /// Receive a pre-labelled handle for counting **upstream round trips**
+    /// (#638) — calls this connector makes to its own backend.
+    ///
+    /// The pipeline calls this once before streaming, because it is the only
+    /// place that knows the `pipeline` / `row` / `connector` labels every other
+    /// metric carries. A connector opts in by storing the handle behind
+    /// interior mutability (the pattern the REST source already uses for
+    /// `runtime_start`) and calling `recorder.record("<op>")` at each real
+    /// backend call — including retries, which are real round trips.
+    ///
+    /// Defaulted to a no-op: an uninstrumented connector emits nothing, so
+    /// instrumentation lands connector by connector with no behaviour change
+    /// in between, and a third-party connector is unaffected.
+    fn set_roundtrip_recorder(
+        &self,
+        _recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+    }
+
     /// Logical dataset identity for lineage emission, following OpenLineage
     /// naming conventions (<https://openlineage.io/docs/spec/naming>).
     ///
@@ -745,6 +764,14 @@ pub trait Sink: Send + Sync {
     /// `connector` attribute on spans. See `Source::connector_name`.
     fn connector_name(&self) -> &'static str {
         crate::observability::strip_type_name(std::any::type_name::<Self>())
+    }
+
+    /// Receive a pre-labelled handle for counting **upstream round trips**
+    /// (#638). See [`Source::set_roundtrip_recorder`]; defaulted to a no-op.
+    fn set_roundtrip_recorder(
+        &self,
+        _recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
     }
 
     /// Logical dataset identity for lineage emission, following OpenLineage

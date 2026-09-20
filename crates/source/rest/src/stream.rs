@@ -70,6 +70,11 @@ pub struct RestStream {
     /// (see [`metadata_xml`](Self::metadata_xml)). Instance-owned by design —
     /// no process-global cache state.
     metadata_xml_cache: tokio::sync::OnceCell<Arc<String>>,
+    /// Upstream round-trip counter (#638), installed once by the pipeline via
+    /// [`Source::set_roundtrip_recorder`]. `OnceLock` rather than a field on
+    /// the config because the labels are only known at run time, and because
+    /// the hook takes `&self`.
+    roundtrips: std::sync::OnceLock<Arc<faucet_core::observability::RoundtripRecorder>>,
 }
 
 /// Default value of [`RestStreamConfig::max_retries`]. When the user leaves this
@@ -486,6 +491,7 @@ impl RestStream {
             retry_policy,
             static_headers,
             metadata_xml_cache: tokio::sync::OnceCell::new(),
+            roundtrips: std::sync::OnceLock::new(),
         })
     }
 
@@ -682,6 +688,15 @@ impl RestStream {
     /// fields), or the classic single `records_path`.
     /// The per-record key prefixes to drop. An `odata:` block implies
     /// `@odata.`; explicit `drop_key_prefixes` are added to it.
+    /// Count one upstream round trip, when the pipeline installed a recorder
+    /// (#638). `op` is drawn from this connector's closed set:
+    /// `submit` / `poll` / `fetch` / `page`.
+    fn roundtrip(&self, op: &'static str) {
+        if let Some(r) = self.roundtrips.get() {
+            r.record(op);
+        }
+    }
+
     fn drop_key_prefixes(&self) -> Vec<String> {
         let mut out = self.config.drop_key_prefixes.clone();
         if self.config.odata.is_some() && !out.iter().any(|p| p == "@odata.") {
@@ -769,6 +784,7 @@ impl RestStream {
                     let (body_value, resp_headers) = if let Some(plan) = plan {
                         let resp = self
                             .job_request_response(
+                                "fetch",
                                 &job.fetch.method,
                                 &fetch_url,
                                 &job.fetch.headers,
@@ -808,6 +824,7 @@ impl RestStream {
                     } else {
                         let (bytes, resp_headers_buffered) = self
                             .job_request_bytes(
+                                "fetch",
                                 &job.fetch.method,
                                 &fetch_url,
                                 &job.fetch.headers,
@@ -1321,6 +1338,7 @@ impl RestStream {
     /// json). Returns the raw response bytes; errors on non-2xx.
     async fn job_request_bytes(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1337,7 +1355,7 @@ impl RestStream {
             self.retry_policy.base,
             || async {
                 let resp = self
-                    .job_request_response_once(method, url, headers, query, json)
+                    .job_request_response_once(op, method, url, headers, query, json)
                     .await?;
                 let resp_headers = resp.headers().clone();
                 let bytes = resp.bytes().await.map_err(FaucetError::Http)?;
@@ -1356,6 +1374,7 @@ impl RestStream {
     /// (never fetched, expires server-side) and at-least-once-consistent.
     async fn job_request_response(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1365,7 +1384,7 @@ impl RestStream {
         retry::execute_with_retry(
             self.retry_policy.max_attempts.saturating_sub(1),
             self.retry_policy.base,
-            || self.job_request_response_once(method, url, headers, query, json),
+            || self.job_request_response_once(op, method, url, headers, query, json),
         )
         .await
     }
@@ -1375,6 +1394,7 @@ impl RestStream {
     /// [`job_request_response`](Self::job_request_response).
     async fn job_request_response_once(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1404,6 +1424,9 @@ impl RestStream {
         if let Some(j) = json {
             req = req.json(j);
         }
+        // Counted here, at the one unretried attempt, so a retried call counts
+        // again — a retry is a real round trip against the API's quota (#638).
+        self.roundtrip(op);
         // Transport errors stay typed (`FaucetError::Http`) so the shared retry
         // runner's `is_retriable` classification sees connect/timeout failures —
         // stringifying them into `Source(...)` would silently make every
@@ -1422,6 +1445,7 @@ impl RestStream {
 
     async fn job_request_json(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1429,7 +1453,7 @@ impl RestStream {
         json: Option<&Value>,
     ) -> Result<Value, FaucetError> {
         let (bytes, _headers) = self
-            .job_request_bytes(method, url, headers, query, json)
+            .job_request_bytes(op, method, url, headers, query, json)
             .await?;
         serde_json::from_slice(&bytes)
             .map_err(|e| FaucetError::Source(format!("async_job: {url} returned non-JSON: {e}")))
@@ -1515,6 +1539,7 @@ impl RestStream {
         let submit_json = injected.as_ref().or(job.submit.json.as_ref());
         let submit_body = self
             .job_request_json(
+                "submit",
                 &job.submit.method,
                 &submit_url,
                 &job.submit.headers,
@@ -1548,6 +1573,7 @@ impl RestStream {
         let last_poll_body: Value = loop {
             let body = self
                 .job_request_json(
+                    "poll",
                     &job.poll.method,
                     &poll_url,
                     &job.poll.headers,
@@ -2070,6 +2096,9 @@ impl RestStream {
             req = req.json(body);
         }
 
+        // One data-page request against the API (#638). Counted per attempt,
+        // so a 429-then-retry counts twice — it consumed two calls of quota.
+        self.roundtrip("page");
         let resp = req.send().await?;
         let status = resp.status();
 
@@ -2291,6 +2320,13 @@ impl faucet_core::Source for RestStream {
         "rest"
     }
 
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        // First install wins; the pipeline installs exactly once per run, and
+        // ignoring a second call keeps a re-used source instance from losing
+        // the labels it is already counting under.
+        let _ = self.roundtrips.set(recorder);
+    }
+
     fn config_schema(&self) -> serde_json::Value {
         serde_json::to_value(faucet_core::schema_for!(RestStreamConfig))
             .expect("schema serialization")
@@ -2479,6 +2515,7 @@ impl faucet_core::Source for RestStream {
                 }
                 let resp = self
                     .job_request_response(
+                        "fetch",
                         &job.fetch.method,
                         &fetch_url,
                         &job.fetch.headers,
@@ -2637,6 +2674,7 @@ impl RestStream {
         for (k, v) in self.metadata_headers(url).await?.iter() {
             headers.insert(k.clone(), v.clone());
         }
+        self.roundtrip("discover");
         let resp = self
             .client
             .get(url)

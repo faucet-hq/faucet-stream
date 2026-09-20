@@ -691,3 +691,86 @@ async fn a_non_streamable_decode_chain_still_decodes() {
     assert_eq!(records[0]["name"], "alice");
     assert_eq!(records[1]["name"], "bob");
 }
+
+/// #638 — an async-job run counts every call it makes to the API, broken down
+/// by the connector's own `op` vocabulary.
+///
+/// This is the number that maps onto a provider's daily API-request budget, and
+/// nothing else in the metric set covers it: `faucet_source_pages_total` sees
+/// the data pages but neither the submit nor the poll loop, which for a bulk
+/// job is most of the traffic.
+#[tokio::test]
+async fn an_async_job_run_counts_its_submit_poll_and_fetch_calls() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snap = recorder.snapshotter();
+    // This test binary has one process-global recorder; installing it here is
+    // the only install in this file.
+    metrics::set_global_recorder(recorder).expect("no other recorder in this test binary");
+
+    let server = MockServer::start().await;
+    // A job that completes on the first poll and whose result spans two
+    // locator pages: one submit, one poll, two fetches.
+    mount_bulk_two_pages(&server).await;
+
+    let stream = RestStream::new(bulk_csv_config(&server)).unwrap();
+    stream.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "rowA",
+            "rest",
+        ),
+    ));
+
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    let mut total = 0usize;
+    while let Some(page) = pages.next().await {
+        total += page.unwrap().records.len();
+    }
+    assert!(total > 0, "the fixture must actually return rows");
+
+    let counts: HashMap<String, u64> = snap
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, _, _, _)| k.key().name() == "faucet_source_roundtrips_total")
+        .filter_map(|(k, _, _, v)| {
+            let key = k.key();
+            // The labels the pipeline resolves must ride along, or this metric
+            // can't be joined to the others in a dashboard.
+            assert_eq!(
+                key.labels()
+                    .find(|l| l.key() == "connector")
+                    .map(|l| l.value()),
+                Some("rest")
+            );
+            assert_eq!(
+                key.labels().find(|l| l.key() == "row").map(|l| l.value()),
+                Some("rowA")
+            );
+            let op = key.labels().find(|l| l.key() == "op")?.value().to_string();
+            match v {
+                DebugValue::Counter(c) => Some((op, c)),
+                _ => None,
+            }
+        })
+        .collect();
+
+    assert_eq!(counts.get("submit"), Some(&1), "one job submit: {counts:?}");
+    assert_eq!(
+        counts.get("poll"),
+        Some(&1),
+        "the poll loop is counted on its own — a job that polls for an hour is \
+         the cost this metric exists to expose, and no other metric sees it: \
+         {counts:?}"
+    );
+    assert_eq!(
+        counts.get("fetch"),
+        Some(&2),
+        "each locator continuation is its own call against the API budget: \
+         {counts:?}"
+    );
+}

@@ -18,6 +18,7 @@ pub mod otel;
 #[cfg(feature = "quality")]
 mod quality;
 pub mod resilience;
+mod roundtrip;
 mod state;
 mod strip;
 mod timer;
@@ -39,6 +40,7 @@ pub use masking::instrumented_apply_masking;
 pub use options::RunStreamOptions;
 #[cfg(feature = "quality")]
 pub use quality::instrumented_apply_quality;
+pub use roundtrip::{RoundtripRecorder, RoundtripSide, describe_roundtrip_metrics};
 pub use state::InstrumentedStateStore;
 pub use strip::strip_type_name;
 pub use timer::DurationGuard;

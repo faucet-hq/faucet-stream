@@ -5801,6 +5801,8 @@ dependencies = [
  "futures-core",
  "httpdate",
  "jsonpath-rust",
+ "metrics",
+ "metrics-util",
  "quick-xml 0.37.5",
  "reqwest 0.13.3",
  "schemars 1.2.1",

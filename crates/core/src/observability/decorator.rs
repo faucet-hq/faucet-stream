@@ -91,6 +91,16 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         guarded_connector_name(self.inner.connector_name())
     }
 
+    /// Forward the round-trip recorder to the wrapped connector (#638) — the
+    /// decorator sits between the pipeline and the connector, so without this
+    /// the hook would never reach the code that performs the I/O.
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
+
     fn state_key(&self) -> Option<String> {
         self.inner.state_key()
     }
@@ -320,6 +330,16 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         // the "unknown" fallback — keeping this passthrough consistent with the
         // `connector` metric label rather than leaking an empty string.
         guarded_connector_name(self.inner.connector_name())
+    }
+
+    /// Forward the round-trip recorder to the wrapped connector (#638) — the
+    /// decorator sits between the pipeline and the connector, so without this
+    /// the hook would never reach the code that performs the I/O.
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
     }
 
     // Identity + provenance passthroughs. Instrumentation must be invisible to
