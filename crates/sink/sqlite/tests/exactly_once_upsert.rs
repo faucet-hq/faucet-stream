@@ -71,6 +71,7 @@ async fn idempotent_upsert_updates_in_place_and_advances_token() {
         column_mapping: SqliteColumnMapping::AutoMap,
         batch_size: 1000,
         max_connections: 1,
+        create_table: true,
         write: WriteSpec {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],

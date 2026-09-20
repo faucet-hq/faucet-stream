@@ -12,6 +12,9 @@ use crate::config::ClickHouseSinkConfig;
 
 /// ClickHouse sink (HTTP interface, `INSERT … FORMAT JSONEachRow`).
 pub struct ClickHouseSink {
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    pub(crate) table_ready: std::sync::atomic::AtomicBool,
     pub(crate) config: ClickHouseSinkConfig,
     pub(crate) client: reqwest::Client,
     /// Resolved once in [`ClickHouseSink::new`] so the hot path never re-parses.
@@ -34,6 +37,39 @@ fn quote_table(table: &str) -> String {
         .map(faucet_core::util::quote_ident)
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Map a [`faucet_core::SqlBaseType`] to the ClickHouse column type used when
+/// auto-creating a table (#580).
+///
+/// Every column is `Nullable(…)`: ClickHouse rejects a null into a
+/// non-nullable column, so a type inferred from page 1 that happened to have
+/// no nulls would fail page 2 the first time a field is absent. `String` is
+/// the landing type for nested values, matching the `JSONEachRow` body the
+/// writer sends.
+fn clickhouse_type(t: faucet_core::SqlBaseType) -> &'static str {
+    use faucet_core::SqlBaseType::*;
+    match t {
+        Integer => "Nullable(Int64)",
+        Double => "Nullable(Float64)",
+        Boolean => "Nullable(Bool)",
+        Text | Json => "Nullable(String)",
+    }
+}
+
+/// `CREATE TABLE IF NOT EXISTS … ENGINE = MergeTree ORDER BY tuple()` (#580).
+///
+/// `ORDER BY tuple()` is the neutral sort key — faucet has no basis to pick
+/// one, and guessing wrong bakes a bad primary index into the table. An
+/// operator who cares about the sort key defines the table and sets
+/// `create_table: false`.
+fn build_create_table_sql(table: &str, columns: &[faucet_core::PlannedColumn]) -> String {
+    let cols =
+        faucet_core::render_columns(columns, faucet_core::util::quote_ident, clickhouse_type);
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({cols}) ENGINE = MergeTree ORDER BY tuple()",
+        quote_table(table)
+    )
 }
 
 /// Build the `INSERT … FORMAT JSONEachRow` statement (carried in the `query`
@@ -64,12 +100,49 @@ fn insert_params(
 }
 
 impl ClickHouseSink {
+    /// Make sure the target table exists before the first write (#580).
+    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !self.config.create_table {
+            // Nothing to probe against cheaply that `EXISTS TABLE` doesn't
+            // already answer; a missing table then surfaces from the INSERT
+            // itself. What this branch guarantees is that faucet does not
+            // create one behind the operator's back.
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        // A page with nothing inferable leaves the table uncreated so the next
+        // page can try, rather than emitting a zero-column CREATE.
+        let Some(columns) = faucet_core::plan_columns(records) else {
+            return Ok(());
+        };
+        let sql = build_create_table_sql(&self.config.table, &columns);
+        self.execute_statement(&sql).await?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Run one DDL/DML statement through the HTTP interface.
+    async fn execute_statement(&self, sql: &str) -> Result<(), FaucetError> {
+        let mut params: Vec<(String, String)> = vec![("query".into(), sql.to_string())];
+        params.push(("database".into(), self.config.connection.database.clone()));
+        let req = self.client.post(&self.base_url).query(&params);
+        let req = apply_auth(req, &self.config.connection);
+        let resp = req.send().await?;
+        check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+        Ok(())
+    }
+
     /// Validate the config and build the reusable HTTP client.
     pub fn new(config: ClickHouseSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let base_url = config.connection.base_url()?;
         let client = build_client(&config.connection)?;
         Ok(Self {
+            table_ready: std::sync::atomic::AtomicBool::new(false),
             config,
             client,
             base_url,
@@ -157,6 +230,7 @@ impl Sink for ClickHouseSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records).await?;
 
         // Staged bulk load (#528): stage the whole page and let the server pull
         // it — no row body, no `batch_size` re-chunking.
@@ -420,5 +494,42 @@ mod tests {
             report.probes[0].status,
             faucet_core::check::ProbeStatus::Fail { .. }
         ));
+    }
+
+    #[test]
+    fn create_table_sql_makes_every_column_nullable() {
+        // ClickHouse rejects a null into a non-nullable column, so a type
+        // inferred from a page that happened to have no nulls would fail the
+        // first page that omits a field (#580).
+        let cols = faucet_core::plan_columns(&[serde_json::json!({
+            "id": 1, "name": "a", "amount": 1.5, "ok": true, "meta": {"k": 1}
+        })])
+        .expect("a plan");
+        let sql = build_create_table_sql("analytics.events", &cols);
+        assert!(sql.contains(r#""id" Nullable(Int64)"#), "{sql}");
+        assert!(sql.contains(r#""name" Nullable(String)"#), "{sql}");
+        assert!(sql.contains(r#""amount" Nullable(Float64)"#), "{sql}");
+        assert!(sql.contains(r#""ok" Nullable(Bool)"#), "{sql}");
+        assert!(sql.contains(r#""meta" Nullable(String)"#), "{sql}");
+        assert!(sql.contains("IF NOT EXISTS"), "{sql}");
+        // Each dotted segment is quoted separately, like every other
+        // statement this sink builds.
+        assert!(sql.contains(r#""analytics"."events""#), "{sql}");
+    }
+
+    #[test]
+    fn create_table_sql_uses_a_neutral_sort_key() {
+        // faucet has no basis to pick a sort key, and guessing wrong bakes a
+        // bad primary index into the table an operator then has to migrate.
+        let cols = faucet_core::plan_columns(&[serde_json::json!({ "id": 1 })]).expect("plan");
+        let sql = build_create_table_sql("t", &cols);
+        assert!(sql.contains("ENGINE = MergeTree ORDER BY tuple()"), "{sql}");
+    }
+
+    #[test]
+    fn create_table_defaults_on() {
+        let cfg = ClickHouseSinkConfig::new("http://localhost:8123", "t");
+        assert!(cfg.create_table);
+        assert!(!cfg.with_create_table(false).create_table);
     }
 }

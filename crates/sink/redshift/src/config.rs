@@ -95,6 +95,18 @@ pub struct RedshiftSinkConfig {
     pub connection: RedshiftConnection,
     /// Target table name.
     pub table_name: String,
+    /// Create the target table (and its schema, when `schema:` is set) if it
+    /// does not exist, inferring the columns from the first written page
+    /// (#580). Enabled by default: a first-ever sync cannot assume the
+    /// destination already exists.
+    ///
+    /// Every inferred column is created nullable, and without a DISTKEY or
+    /// SORTKEY — faucet has no basis to choose either, and the wrong choice is
+    /// baked into the table. Define the table yourself and set
+    /// `create_table: false` when distribution or sort matters, which it does
+    /// for any table you intend to query at scale.
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
     /// Optional schema (namespace) qualifying [`table_name`](Self::table_name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
@@ -151,6 +163,10 @@ pub struct RedshiftSinkConfig {
     /// Maximum number of connections in the pool. Defaults to 5.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+}
+
+fn default_create_table() -> bool {
+    true
 }
 
 impl RedshiftSinkConfig {
@@ -211,6 +227,7 @@ mod tests {
         RedshiftSinkConfig {
             connection: RedshiftConnection::new("host", "db", "user", "pw"),
             table_name: "events".into(),
+            create_table: true,
             schema: None,
             write_strategy: RedshiftWriteStrategy::Copy,
             copy: None,

@@ -16,6 +16,9 @@ use tokio::sync::OnceCell;
 /// A sink that writes JSON records to a Snowflake table using the
 /// SQL REST API.
 pub struct SnowflakeSink {
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
     config: SnowflakeSinkConfig,
     client: Client,
     /// Optional explicit endpoint override. When `None`, the URL is derived
@@ -72,6 +75,35 @@ fn check_statement_code(sf_resp: &SnowflakeResponse) -> Result<(), FaucetError> 
 }
 
 impl SnowflakeSink {
+    /// Make sure the target table exists before the first write (#580).
+    ///
+    /// Snowflake DDL auto-commits, so the `CREATE TABLE IF NOT EXISTS` is its
+    /// own request — the same rule the watermark table already follows.
+    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) || !self.config.create_table {
+            // With `create_table: false` there is nothing to do here: the
+            // INSERT itself reports a missing table, and what this branch
+            // guarantees is that faucet does not create one unasked.
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        // A page with nothing inferable leaves the table uncreated so the next
+        // page can try, rather than emitting a zero-column CREATE.
+        let Some(columns) = faucet_core::plan_columns(records) else {
+            return Ok(());
+        };
+        let sql = build_create_table_sql(
+            &self.config.database,
+            &self.config.schema,
+            &self.config.table,
+            &columns,
+        );
+        self.execute_sql(&sql, None).await?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Create a new Snowflake sink.
     ///
     /// Returns [`FaucetError::Config`] if `batch_size` exceeds
@@ -90,6 +122,7 @@ impl SnowflakeSink {
             ));
         }
         Ok(Self {
+            table_ready: std::sync::atomic::AtomicBool::new(false),
             config,
             client: Client::new(),
             endpoint: None,
@@ -407,6 +440,27 @@ impl SnowflakeSink {
     }
 }
 
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+///
+/// Every column is a nullable `STRING`, matching what `build_insert` actually
+/// writes — it projects each value with `::string`, so a typed column would
+/// reject its own writer's cast. An operator who wants typed columns defines
+/// the table and sets `create_table: false`.
+fn build_create_table_sql(
+    database: &str,
+    schema: &str,
+    table: &str,
+    columns: &[faucet_core::PlannedColumn],
+) -> String {
+    let cols = faucet_core::render_columns(columns, quote_ident, |_| "STRING");
+    format!(
+        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({cols})",
+        quote_ident(database),
+        quote_ident(schema),
+        quote_ident(table)
+    )
+}
+
 #[async_trait]
 impl faucet_core::Sink for SnowflakeSink {
     fn connector_name(&self) -> &'static str {
@@ -476,6 +530,7 @@ impl faucet_core::Sink for SnowflakeSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records).await?;
 
         // `batch_size = 0` is the "no batching" sentinel: forward whatever
         // upstream handed us as a single INSERT, preserving `StreamPage`

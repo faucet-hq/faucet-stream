@@ -27,6 +27,11 @@ fn default_batch_size() -> usize {
 /// table (creating it from the inferred schema when `create_if_not_missing`),
 /// then appends one Delta commit per `flush()`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+// Serde aliases are invisible to schemars, and the registry's unknown-key gate
+// (#654 H9) reads the schema — so a key serde accepts but the schema does not
+// list would be rejected before it ever reached serde. Declared here so the
+// two agree.
+#[schemars(extend("x-faucet-aliases" = ["create_if_not_missing"]))]
 pub struct DeltaSinkConfig {
     /// Table location + object-store credentials.
     #[serde(flatten)]
@@ -35,7 +40,16 @@ pub struct DeltaSinkConfig {
     /// Create the table (and its schema, from the inferred record shape) on the
     /// first write when it does not already exist. When `false`, an absent
     /// table fails the first write with a typed error.
-    #[serde(default = "default_true")]
+    ///
+    /// Spelled `create_table` on the wire since #580, matching every other
+    /// table sink; the historical `create_if_not_missing` stays accepted as an
+    /// alias. Same default (`true`): a first-ever sync cannot assume the
+    /// destination exists.
+    #[serde(
+        default = "default_true",
+        rename = "create_table",
+        alias = "create_if_not_missing"
+    )]
     pub create_if_not_missing: bool,
 
     /// Partition columns, applied only when the table is created. Ignored when

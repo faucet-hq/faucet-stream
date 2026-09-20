@@ -160,14 +160,47 @@ POSTs over a window). S3/GCS/Azure fall back to buffered for the JSON-array form
 Every sink exposes a `batch_size` knob for write-side re-chunking. For the
 file/append sinks (`jsonl`, `csv`, `stdout`) it's a no-op — they write per record.
 
+**Auto-create (`create_table`, #580).** Every **table-based** sink —
+`bigquery`, `postgres`, `mysql`, `sqlite`, `mssql`, `duckdb`, `snowflake`,
+`redshift`, `clickhouse`, `spanner`, `delta`, `iceberg` — takes
+`create_table: bool`, **default `true`**: a first-ever sync cannot assume the
+destination exists, so a missing table is created from the first written
+page's inferred columns. Set `false` to require a pre-existing target and fail
+fast with one uniform error naming both ways out.
+
+Every inferred column is created **nullable**. A column that happened to be
+present in page 1 is not required forever, and a `NOT NULL` inferred from one
+page turns page 2 into a hard failure the first time a record omits the field;
+narrowing later is the [`schema:` drift policy](../cookbook/schema-drift.md)'s
+job, which can see more than one page. Three dialect-specific notes:
+
+- **clickhouse** creates `MergeTree ORDER BY tuple()` and **redshift** creates
+  with no DISTKEY/SORTKEY — faucet has no basis to pick a sort or distribution
+  key, and a wrong one is baked into the table. Define the table yourself and
+  set `create_table: false` when the physical layout matters.
+- **snowflake** creates `STRING` columns, because its insert path projects
+  every value with `::string` and a typed column would reject its own writer's
+  cast.
+- **spanner** needs a primary key on every table, so it auto-creates only when
+  `key:` is set; without one it errors naming that requirement rather than
+  inventing a key column that can never be changed.
+
+`delta` and `iceberg` already created their tables and now spell the knob
+`create_table` like everyone else (their historical `create_if_not_missing` /
+`create_if_missing` stay accepted as aliases). The **schemaless** destinations
+— `mongodb`, `elasticsearch` — deliberately have **no** knob: their servers
+create a collection/index on first write and cannot be told not to, so the
+field would be inert in one direction, which is exactly the silently-ignored
+config this project treats as a defect.
+
 | Connector | Tier¹¹ | Feature | `batch_size` | Compression | Upsert⁸ | Effectively-once⁷ | Write unit |
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|------------|
 | BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
 | PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
 | JSON Lines | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | buffered file append |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
-| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | COPY-from-S3 (staged) or multi-row `INSERT`; append-only |
-| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only |
+| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
+| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
 | MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` |
 | Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |
 | SQLite | T1 ✅ | `sink-sqlite` | ✓ | ✗ | **✓** | **✓** | transaction-wrapped batch |

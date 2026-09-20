@@ -67,6 +67,7 @@ fn insert_config(port: u16, table: &str, batch_size: usize) -> RedshiftSinkConfi
     RedshiftSinkConfig {
         connection: redshift_conn(port),
         table_name: table.into(),
+        create_table: true,
         schema: None,
         write_strategy: RedshiftWriteStrategy::Insert,
         copy: None,

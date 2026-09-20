@@ -87,6 +87,29 @@ fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String {
     }
 }
 
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+///
+/// `IF NOT EXISTS` rather than a probe-then-create: two matrix rows writing the
+/// same table would otherwise race between the probe and the DDL, and the
+/// loser's `CREATE` would fail a run that had nothing wrong with it.
+fn build_create_table_sql(
+    table_ref: &str,
+    columns: &[faucet_core::PlannedColumn],
+    json_column: Option<&str>,
+) -> String {
+    let cols = match json_column {
+        // JSONB mode stores the whole record in one column, so the page's own
+        // shape is irrelevant — the table is the same whatever arrives.
+        Some(col) => format!(
+            "{} bigserial PRIMARY KEY, {} jsonb NOT NULL",
+            quote_ident("id"),
+            quote_ident(col)
+        ),
+        None => faucet_core::render_columns(columns, |n| quote_ident(n), pg_keyword),
+    };
+    format!("CREATE TABLE IF NOT EXISTS {table_ref} ({cols})")
+}
+
 /// Map a [`faucet_core::SqlBaseType`] to the PostgreSQL type keyword used when
 /// adding/widening a column during schema evolution (issue #194). Integers
 /// always widen to `bigint` and floats to `double precision` so a later, wider
@@ -153,9 +176,73 @@ fn pg_udt_to_json_schema(udt: &str, nullable: bool) -> serde_json::Value {
 pub struct PostgresSink {
     config: PostgresSinkConfig,
     pool: PgPool,
+    /// Whether the target has been confirmed present (created or probed) for
+    /// this sink instance (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
 }
 
 impl PostgresSink {
+    /// Make sure the target table exists before the first write (#580).
+    ///
+    /// Runs once per sink instance. With `create_table: true` (the default) a
+    /// missing table — and its schema, when `schema:` is set — is created from
+    /// the first page's inferred columns; with `false` a missing table is a
+    /// typed failure naming both ways out, rather than a confusing
+    /// "relation does not exist" from the first INSERT.
+    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
+
+        if !self.config.create_table {
+            let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+                .bind(&table_ref)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("postgres table probe failed: {e}")))?;
+            if exists.is_none() {
+                return Err(faucet_core::missing_target_error(
+                    "postgres sink",
+                    &table_ref,
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let json_column = match &self.config.column_mapping {
+            PostgresColumnMapping::AutoMap => None,
+            PostgresColumnMapping::Jsonb { column } => Some(column.as_str()),
+        };
+        // AutoMap needs a page to infer from; a page with nothing inferable
+        // leaves the table uncreated so the next page can try, rather than
+        // emitting a zero-column CREATE.
+        let columns = match (json_column, faucet_core::plan_columns(records)) {
+            (Some(_), _) => Vec::new(),
+            (None, Some(c)) => c,
+            (None, None) => return Ok(()),
+        };
+
+        if let Some(schema) = self.config.schema.as_deref() {
+            sqlx::query(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                quote_ident(schema)
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres CREATE SCHEMA failed: {e}")))?;
+        }
+        let sql = build_create_table_sql(&table_ref, &columns, json_column);
+        sqlx::query(&sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres CREATE TABLE failed: {e}")))?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Create a new PostgreSQL sink. Establishes a connection pool.
     pub async fn new(config: PostgresSinkConfig) -> Result<Self, FaucetError> {
         config.write.validate()?;
@@ -192,7 +279,11 @@ impl PostgresSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL connection failed: {e}")))?;
 
-        Ok(Self { config, pool })
+        Ok(Self {
+            config,
+            pool,
+            table_ready: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Staging table name used while an overwrite run is in flight (same schema
@@ -1063,6 +1154,7 @@ impl faucet_core::Sink for PostgresSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records).await?;
 
         if matches!(
             self.config.write.write_mode,
@@ -1251,8 +1343,9 @@ impl faucet_core::Sink for PostgresSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_add_column_sql, build_alter_type_sql, build_drop_not_null_sql, on_conflict_clause,
-        pg_bind_text, pg_udt_to_json_schema, qualified_table_ref,
+        PostgresSinkConfig, build_add_column_sql, build_alter_type_sql, build_create_table_sql,
+        build_drop_not_null_sql, on_conflict_clause, pg_bind_text, pg_udt_to_json_schema,
+        qualified_table_ref,
     };
     use serde_json::json;
 
@@ -1442,5 +1535,59 @@ mod tests {
             pg_bind_text(Some(&json!({"a": 1})), "int4").as_deref(),
             Some("{\"a\":1}")
         );
+    }
+
+    #[test]
+    fn create_table_sql_renders_inferred_columns() {
+        let cols = faucet_core::plan_columns(&[
+            serde_json::json!({ "id": 1, "name": "a", "amount": 1.5, "meta": {"k": 1} }),
+        ])
+        .expect("a plan");
+        let sql = build_create_table_sql(r#""public"."orders""#, &cols, None);
+        assert!(
+            sql.starts_with(r#"CREATE TABLE IF NOT EXISTS "public"."orders" ("#),
+            "{sql}"
+        );
+        assert!(sql.contains(r#""id" bigint"#), "{sql}");
+        assert!(sql.contains(r#""name" text"#), "{sql}");
+        assert!(sql.contains(r#""amount" double precision"#), "{sql}");
+        assert!(sql.contains(r#""meta" jsonb"#), "{sql}");
+        // IF NOT EXISTS, not a probe-then-create: two matrix rows writing one
+        // table would otherwise race and fail the loser for no reason.
+        assert!(sql.contains("IF NOT EXISTS"), "{sql}");
+    }
+
+    #[test]
+    fn create_table_sql_in_jsonb_mode_ignores_the_page_shape() {
+        // The whole record lands in one column, so the table is the same
+        // whatever arrives — inferring per-page columns here would create a
+        // table the writer never uses.
+        let cols = faucet_core::plan_columns(&[serde_json::json!({ "a": 1 })]).expect("plan");
+        let sql = build_create_table_sql(r#""t""#, &cols, Some("data"));
+        assert!(sql.contains(r#""data" jsonb NOT NULL"#), "{sql}");
+        assert!(sql.contains(r#""id" bigserial PRIMARY KEY"#), "{sql}");
+        assert!(
+            !sql.contains(r#""a""#),
+            "the page's own columns must not appear: {sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_quotes_a_hostile_column_name() {
+        let cols =
+            faucet_core::plan_columns(&[serde_json::json!({ "we\"ird": 1 })]).expect("a plan");
+        let sql = build_create_table_sql(r#""t""#, &cols, None);
+        assert!(
+            sql.contains(r#""we""ird" bigint"#),
+            "a column name must never reach the DDL unquoted: {sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_defaults_on() {
+        // A first-ever sync cannot assume the destination exists (#580).
+        let cfg = PostgresSinkConfig::new("postgres://u@h/db", "t");
+        assert!(cfg.create_table);
+        assert!(!cfg.with_create_table(false).create_table);
     }
 }

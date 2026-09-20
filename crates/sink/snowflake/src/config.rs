@@ -24,6 +24,17 @@ pub struct SnowflakeSinkConfig {
     pub schema: String,
     /// Target table name.
     pub table: String,
+    /// Create the target table if it does not exist, inferring the column
+    /// **names** from the first written page (#580). Enabled by default: a
+    /// first-ever sync cannot assume the destination already exists.
+    ///
+    /// Columns are created as nullable `STRING`, not as inferred types,
+    /// because the insert path projects every value with `::string` — a
+    /// `NUMBER` column would reject its own writer's cast. Define the table
+    /// yourself and set `create_table: false` when you want typed columns
+    /// (then use `schema:` drift to keep them aligned).
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
     /// A shared provider must yield a `Bearer` or `Token` credential, which
@@ -133,6 +144,10 @@ fn default_poll_timeout() -> Duration {
     Duration::from_secs(300)
 }
 
+fn default_create_table() -> bool {
+    true
+}
+
 impl SnowflakeSinkConfig {
     /// Create a new config with required fields and sensible defaults.
     pub fn new(
@@ -149,6 +164,7 @@ impl SnowflakeSinkConfig {
             database: database.into(),
             schema: schema.into(),
             table: table.into(),
+            create_table: default_create_table(),
             auth: AuthSpec::Inline(auth),
             batch_size: DEFAULT_BATCH_SIZE,
             poll_timeout: default_poll_timeout(),
@@ -157,6 +173,12 @@ impl SnowflakeSinkConfig {
     }
 
     /// Enable Arrow columnar bulk-load via an external Parquet stage (#381).
+
+    /// Opt out of auto-creating a missing target table (#580).
+    pub fn with_create_table(mut self, create: bool) -> Self {
+        self.create_table = create;
+        self
+    }
     pub fn with_bulk_load(mut self, stage: SnowflakeStageConfig) -> Self {
         self.bulk_load = Some(stage);
         self

@@ -118,6 +118,17 @@
         }
       ]
     },
+    "reconcile": {
+      "description": "Optional completeness reconciliation (#502): after a successful root run,\ncompare rows written against an authoritative count probe and **fail the\nrun** on a shortfall beyond tolerance — a silent-truncation guard,\nespecially for `write_mode: overwrite`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReconcileSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "shard": {
       "description": "Optional source-shard distribution for clustered (Mode B) execution.\nOnly consumed by `faucet serve --cluster`: a run whose source\n[is shardable](faucet_core::Source::is_shardable) is split into\n`shard.count` shards processed concurrently across cluster workers.\nIgnored by `faucet run` and by a non-cluster `serve`, so it is fully\nbackward compatible.",
       "anyOf": [
@@ -201,17 +212,6 @@
       "items": {
         "$ref": "#/$defs/NotificationSpec"
       }
-    },
-    "reconcile": {
-      "description": "Optional completeness reconciliation (#502): after a successful root run,\ncompare rows written against an authoritative count probe and **fail the\nrun** on a shortfall beyond tolerance — a silent-truncation guard,\nespecially for `write_mode: overwrite`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ReconcileSpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
     },
     "metadata_columns": {
       "description": "Optional `_faucet_*` run/lineage metadata columns (#510) stamped onto\nevery row by a connector-agnostic sink decorator (works for any sink).\nOff unless present.",
@@ -1978,6 +1978,15 @@
           ],
           "default": null
         },
+        "weight": {
+          "description": "Relative cost hint used by `execution.schedule: lpt` (#644) — higher is\ndispatched earlier. Ignored under the default `declared` order.\n\nThe useful proxy is **bytes moved**, not rows: a 970k-row × 3-column\ntable is lighter than a 122k-row × 100-column one, so ranking on row\ncount alone mis-orders wide-but-short objects. `faucet discover` fills\nthis in from each dataset's estimated rows and column widths; set it by\nhand when you know better.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
         "depends_on": {
           "description": "Row ids this row waits for. The row starts only after every listed\nrow (all of its invocations) finishes successfully; a failed or\nskipped dependency skips this row. Pure completion-ordering — unlike\n`parent:`, no records are consumed and no per-record fan-out occurs.",
           "type": "array",
@@ -2085,8 +2094,8 @@
             }
           ]
         },
-        "discover": {
-          "description": "**Discovery dimension** (#501). When set, this row enumerates a value-set\nat runtime: it builds `discover.source`, drains it, projects `select`\n(JSONPath) from each record, and dedups (first-seen order). The row has\nno sink and writes nothing — its value-set is exposed to `for_each` rows\nas `${<id>.<as>}`. Runs once per pipeline run, cached across dependents.",
+        "fan_out": {
+          "description": "**Fan-out axis** (#501), spelled `fan_out:` on the wire. When set, this\nrow enumerates a value-set at runtime: it builds `fan_out.source`,\ndrains it, projects `select` (JSONPath) from each record, and dedups\n(first-seen order). The row has no sink and writes nothing — its\nvalue-set is exposed to `for_each` rows as `${<id>.<as>}`. Runs once\nper pipeline run, cached across dependents.\n\nThe historical spelling `discover:` is accepted as an alias (#654 M21).\nIt collided with the other, unrelated `discover` in the vocabulary —\n`Source::discover`, which enumerates a connection's **datasets** — and\nthe canonical verb for \"turn a listed set into one matrix row per\nmember\" is `fan_out` (see the Vocabulary table in\n`.claude/rules/architecture.md`).",
           "anyOf": [
             {
               "$ref": "#/$defs/DiscoverSpec"
@@ -2102,26 +2111,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "weight": {
-          "description": "Relative cost hint used by `execution.schedule: lpt` (#644) — higher is\ndispatched earlier. Ignored under the default `declared` order.\n\nThe useful proxy is **bytes moved**, not rows: a 970k-row × 3-column\ntable is lighter than a 122k-row × 100-column one, so ranking on row\ncount alone mis-orders wide-but-short objects. `faucet discover` fills\nthis in from each dataset's estimated rows and column widths; set it by\nhand when you know better.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double",
-          "default": null
-        },
-        "fan_out": {
-          "description": "**Fan-out axis** (#501), spelled `fan_out:` on the wire. When set, this\nrow enumerates a value-set at runtime: it builds `fan_out.source`,\ndrains it, projects `select` (JSONPath) from each record, and dedups\n(first-seen order). The row has no sink and writes nothing — its\nvalue-set is exposed to `for_each` rows as `${<id>.<as>}`. Runs once\nper pipeline run, cached across dependents.\n\nThe historical spelling `discover:` is accepted as an alias (#654 M21).\nIt collided with the other, unrelated `discover` in the vocabulary —\n`Source::discover`, which enumerates a connection's **datasets** — and\nthe canonical verb for \"turn a listed set into one matrix row per\nmember\" is `fan_out` (see the Vocabulary table in\n`.claude/rules/architecture.md`).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DiscoverSpec"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "additionalProperties": false
@@ -2351,6 +2340,35 @@
         }
       ]
     },
+    "DiscoverSpec": {
+      "description": "A discovery dimension's source + projection (#501). See [`MatrixRow::discover`].",
+      "type": "object",
+      "properties": {
+        "source": {
+          "description": "Source to enumerate. Either a `{ ref: <name> }` pointing at a\n`pipeline.sources` template (recommended — reuses a complete connector\nconfig), or a standalone `{ type, config }`. It is **not** merged over\nthe `default` template — a discovery step is independent of the\npipeline's data source (which typically carries `${dim}` tokens meant\nfor the fan-out rows, not the enumeration).",
+          "$ref": "#/$defs/PartialConnector"
+        },
+        "select": {
+          "description": "JSONPath projecting the dimension value from each discovered record\n(e.g. `$.id`). `$` selects the whole record. Null / missing values are\nskipped with a warning.",
+          "type": "string"
+        },
+        "as": {
+          "description": "Alias the projected value is exposed under: a `for_each` row references\nit as `${<row_id>.<as>}`. Must match `^[a-z0-9][a-z0-9_-]*$`.",
+          "type": "string"
+        },
+        "collect": {
+          "description": "**Collected (list-valued) dimension** (#531). When `true`, the whole\ndeduped value-set is published as a single list per upstream tuple rather\nthan as an independent cartesian axis — so a consuming row injects the\nentire list into one request (`${<id>.<as>}` renders it comma-joined,\ne.g. HubSpot's `?properties=a,b,c`). Required when a `discover:` row also\ndeclares `for_each:` (chained / two-level discovery), and only meaningful\non a discovery row.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "select",
+        "as"
+      ]
+    },
     "ExecutionSpec": {
       "description": "Execution-time controls.",
       "type": "object",
@@ -2489,6 +2507,21 @@
           "default": 50
         }
       }
+    },
+    "DispatchOrder": {
+      "description": "How the executor orders ready sibling rows competing for permits (#644).\n\nOnly the *enqueue order* changes; the permit budget, the `JoinSet`, and the\n`on_error` cancellation are untouched.",
+      "oneOf": [
+        {
+          "description": "Matrix-declaration order (BFS). The default, and fully deterministic.",
+          "type": "string",
+          "const": "declared"
+        },
+        {
+          "description": "Longest-processing-time-first: heaviest rows claim permits first.\n\nWith heterogeneous row durations, makespan otherwise depends on the\norder the user happened to list rows in — a large object listed late\nbecomes an idle tail (measured: two big Salesforce objects finishing\n~9 min after the other 19, with 6 of 8 slots idle). LPT is provably\nwithin 4/3 of optimal for `P || Cmax`, and largest-*last* — which plain\ndeclaration order can accidentally produce — is the worst case.\n\nRows are ranked by [`MatrixRow::weight`]; ties and missing weights fall\nback to declaration order, so dispatch is never nondeterministic.",
+          "type": "string",
+          "const": "lpt"
+        }
+      ]
     },
     "SelectionSpec": {
       "description": "Matrix-row selection policy (#377). Currently a single knob:\n`include_parents`. Extensible for future selection-model settings.",
@@ -2973,6 +3006,52 @@
           "type": "string",
           "const": "iqr"
         }
+      ]
+    },
+    "ReconcileSpec": {
+      "description": "Top-level `reconcile:` block.",
+      "type": "object",
+      "properties": {
+        "count": {
+          "description": "The authoritative-count probe: a source that returns the expected row\ncount (as a single record / value).",
+          "$ref": "#/$defs/CountProbe"
+        },
+        "tolerance_pct": {
+          "description": "Allowed shortfall, as a percentage of the authoritative count. `0.0`\n(default) requires `written >= authoritative`. `1.0` tolerates up to a 1%\nshortfall before failing.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "count"
+      ]
+    },
+    "CountProbe": {
+      "description": "A source that yields the authoritative count.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "Connector type (e.g. `postgres`, `rest`).",
+          "type": "string"
+        },
+        "config": {
+          "description": "Connector-specific config (e.g. a `SELECT count(*) AS n …` query).",
+          "default": null
+        },
+        "count_field": {
+          "description": "Field in the probe's first record holding the count. When omitted, the\nfirst numeric field of the first record is used (so a bare\n`SELECT count(*)` works whatever the column is named).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
       ]
     },
     "ShardingSpec": {
@@ -3742,6 +3821,82 @@
         "url"
       ]
     },
+    "MetadataColumnsSpec": {
+      "description": "The `metadata_columns:` config block.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch (default `true` when the block is present).",
+          "type": "boolean",
+          "default": true
+        },
+        "prefix": {
+          "description": "Column-name prefix (default `_faucet`).",
+          "type": "string",
+          "default": "_faucet"
+        },
+        "columns": {
+          "description": "Columns to stamp. Empty = the default set\n(`extracted_at`, `loaded_at`, `run_id`, `source`).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MetadataColumn"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "MetadataColumn": {
+      "description": "A metadata column to stamp onto every row.",
+      "oneOf": [
+        {
+          "description": "When the record entered the pipeline (ingest time). In the sink-decorator\nmodel this is captured just before the write, so it's ≈ `loaded_at`.",
+          "type": "string",
+          "const": "extracted_at"
+        },
+        {
+          "description": "Sink write time.",
+          "type": "string",
+          "const": "loaded_at"
+        },
+        {
+          "description": "The pipeline run id.",
+          "type": "string",
+          "const": "run_id"
+        },
+        {
+          "description": "The source connector kind / stream id.",
+          "type": "string",
+          "const": "source"
+        },
+        {
+          "description": "A monotonic per-run row ordinal.",
+          "type": "string",
+          "const": "sequence"
+        }
+      ]
+    },
+    "LocalOutputsSpec": {
+      "description": "The top-level `local_outputs:` block: how long the local files this\npipeline's sinks write are kept, and whether faucet records them at all.\n\n```yaml\nlocal_outputs:\n  retention_days: 3   # this pipeline's outputs are collectable after 3 days\n```\n\nThe block is optional. Without it a pipeline still records its local outputs\n(so they can be listed and cleaned) and inherits the runtime's default\nwindow — `--local-output-retention-days` /\n`FAUCET_LOCAL_SINK_OUTPUT_RETENTION_DAYS`, itself 7 days by default.\n\nRecording needs somewhere to record *to*: under `faucet serve` that is the\n`--history` backend; for `faucet run` / `schedule` / `replicate` it is the\n`catalog:` block's store. Without either, tracking is inert and a one-line\nwarning says so rather than failing the run — a pipeline must never break\nbecause a housekeeping ledger was unavailable.",
+      "type": "object",
+      "properties": {
+        "track": {
+          "description": "Record the local files this pipeline's sinks write, so they can be listed\nin the console and reclaimed by the GC. Default `true`.\n\nSetting `false` opts the pipeline out of the ledger entirely: its outputs\nare never listed and — because the GC only ever deletes recorded paths —\nnever automatically deleted either.",
+          "type": "boolean",
+          "default": true
+        },
+        "retention_days": {
+          "description": "Retention window for this pipeline's outputs, in days, overriding the\nruntime default. `0` keeps them forever.\n\nMeasured from the last time faucet wrote the file, so an output a local\nrun keeps refreshing does not expire underneath it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "source_rest__AuthSpec": {
       "description": "A connector's `auth:` field: **either** an inline auth definition `A`\n(the `{ type, config }` shape), **or** a `{ ref: <name> }` reference to a\nshared provider defined in the top-level `auth:` catalog.\n\n`ref` is mutually exclusive with inline fields — supplying both is a\ndeserialization error.",
       "anyOf": [
@@ -3954,6 +4109,21 @@
               }
             }
           }
+        }
+      ]
+    },
+    "source_rest__TokenBodyEncoding": {
+      "description": "Body encoding for the token-endpoint request.",
+      "oneOf": [
+        {
+          "description": "JSON body (`application/json`) — the default (back-compat).",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "Form-urlencoded body (`application/x-www-form-urlencoded`) — required by\nRFC-6749 OAuth token endpoints (Salesforce, Google, most OAuth servers),\nwhich reject a JSON body with `unsupported_grant_type`.",
+          "type": "string",
+          "const": "form"
         }
       ]
     },
@@ -4175,6 +4345,36 @@
         }
       ]
     },
+    "source_rest__RecordCursorTarget": {
+      "description": "Where a [`PaginationStyle::RecordFieldCursor`] keyset value is injected on the\nnext request.",
+      "oneOf": [
+        {
+          "description": "Inject the cursor as a query parameter (default).",
+          "type": "string",
+          "const": "query"
+        },
+        {
+          "description": "Inject the cursor into the JSON request body.",
+          "type": "string",
+          "const": "body"
+        }
+      ]
+    },
+    "source_rest__RecordCursorAgg": {
+      "description": "How a [`PaginationStyle::RecordFieldCursor`] aggregates the cursor field over\na page.",
+      "oneOf": [
+        {
+          "description": "The maximum value seen so far (ascending keyset, the default).",
+          "type": "string",
+          "const": "max"
+        },
+        {
+          "description": "The minimum value seen so far (descending keyset).",
+          "type": "string",
+          "const": "min"
+        }
+      ]
+    },
     "source_rest__ReplicationMethod": {
       "description": "Determines how records are replicated from the source.",
       "oneOf": [
@@ -4199,6 +4399,902 @@
           }
         }
       ]
+    },
+    "source_rest__TlsClientConfig": {
+      "description": "Client-certificate (mutual TLS) configuration for the HTTP sources.\n\nSupply **either** a PEM certificate + key pair (`client_cert` + `client_key`)\n**or** a PKCS#12 identity file (`client_identity_pkcs12` [+ `pkcs12_password`]).\nPEM values may be inline or pulled in with `${file:…}` / `${secret:…}` /\n`${vault:…}`; the PKCS#12 value is a path to a `.p12`/`.pfx` file (its binary\ncontent can't be embedded in a text config).",
+      "type": "object",
+      "properties": {
+        "client_cert": {
+          "description": "PEM-encoded client certificate chain. Pair with `client_key`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key": {
+          "description": "PEM-encoded PKCS#8 private key. Pair with `client_cert`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_identity_pkcs12": {
+          "description": "Path to a PKCS#12 (`.p12`/`.pfx`) identity file — an alternative to the\nPEM pair.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pkcs12_password": {
+          "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_version": {
+          "description": "Minimum negotiated TLS version: `\"1.2\"` or `\"1.3\"`. Defaults to the\nTLS backend's own minimum when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "source_rest__ResponseFormat": {
+      "description": "How to parse the response body into records.",
+      "oneOf": [
+        {
+          "description": "JSON — extract records via `records_path` (JSONPath). The default.",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "CSV — parse a tabular file body (each row → a JSON object). For\nauthenticated file endpoints (e.g. an export URL). Always available.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "Excel (`.xlsx`/`.xls`) — parse a workbook body. Requires the crate's\n`excel` feature.",
+          "type": "string",
+          "const": "excel"
+        }
+      ]
+    },
+    "source_rest__ReplicationBind": {
+      "description": "Declarative binding of the stored bookmark into the **outgoing request** —\n\"server-side incremental push-down\" (#513).\n\nToday faucet tracks bookmarks and filters incrementally *client-side* (after\ndownload). A bind lets a source instead push the bookmark into the request\n(query param / header / body field / path) so the server returns only the\nnew rows. The existing client-side [`filter_incremental`] stays active as a\nsafety net for servers that don't honour the filter exactly.",
+      "type": "object",
+      "properties": {
+        "into": {
+          "description": "Where to place the rendered value.",
+          "$ref": "#/$defs/source_rest__BindTarget",
+          "default": "query"
+        },
+        "name": {
+          "description": "The parameter / header / body-field / path-placeholder name.",
+          "type": "string"
+        },
+        "template": {
+          "description": "Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by\nthe formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.\n`\"gte|${bookmark}\"` (Greenhouse) or `\"[${bookmark} TO *]\"` (Lucene).",
+          "type": "string",
+          "default": "${bookmark}"
+        },
+        "format": {
+          "description": "How to format the bookmark before substitution.",
+          "$ref": "#/$defs/source_rest__BindFormat",
+          "default": "raw"
+        },
+        "advance_from": {
+          "description": "Optional JSONPath into the response body to advance the bookmark from,\ninstead of `max(record[replication_key])`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__BindTarget": {
+      "description": "Where a rendered bookmark is injected into the outgoing request.",
+      "oneOf": [
+        {
+          "description": "A query-string parameter (default) — e.g. `?updated_after=…`.",
+          "type": "string",
+          "const": "query"
+        },
+        {
+          "description": "A request header — e.g. `If-Modified-Since: …`.",
+          "type": "string",
+          "const": "header"
+        },
+        {
+          "description": "A top-level field of the JSON request body (POST-search APIs).",
+          "type": "string",
+          "const": "body"
+        },
+        {
+          "description": "A `{name}` placeholder in the request path.",
+          "type": "string",
+          "const": "path"
+        }
+      ]
+    },
+    "source_rest__BindFormat": {
+      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork.",
+      "oneOf": [
+        {
+          "description": "Emit the scalar verbatim (string as-is, number as its decimal form).\nThe default; no timestamp parsing.",
+          "type": "string",
+          "const": "raw"
+        },
+        {
+          "description": "RFC 3339 / ISO-8601 UTC timestamp, e.g. `2024-06-01T00:00:00Z`.",
+          "type": "string",
+          "const": "iso8601"
+        },
+        {
+          "description": "Unix epoch **seconds** (integer).",
+          "type": "string",
+          "const": "epoch_s"
+        },
+        {
+          "description": "Unix epoch **milliseconds** (integer).",
+          "type": "string",
+          "const": "epoch_ms"
+        },
+        {
+          "description": "Calendar date `YYYY-MM-DD` (UTC).",
+          "type": "string",
+          "const": "date"
+        }
+      ]
+    },
+    "source_rest__ODataConfig": {
+      "description": "OData protocol options for the REST source (#512).\n\nA minimal block — `{ entity: Orders }` — is enough; it derives paging,\nthe `$.value` envelope, and (for `faucet discover`) `$metadata` parsing.\nThe query-option fields render into the standard `$select`/`$filter`/\n`$expand`/`$orderby` params.",
+      "type": "object",
+      "properties": {
+        "version": {
+          "description": "Protocol version (default `v4`).",
+          "$ref": "#/$defs/source_rest__ODataVersion",
+          "default": "v4"
+        },
+        "entity": {
+          "description": "Entity set to read (appended to `base_url` as the path, e.g. `Orders`).\nOptional when the path already names the entity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "select": {
+          "description": "`$select` — columns to return.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expand": {
+          "description": "`$expand` — related entities to inline (one level).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "filter": {
+          "description": "`$filter` — server-side filter expression (verbatim).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "orderby": {
+          "description": "`$orderby` — server-side ordering (verbatim).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "page_size": {
+          "description": "Server page size, sent as `Prefer: odata.maxpagesize=<n>`.",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "fan_out": {
+          "description": "**Experimental** (PRINCIPLES.md §3): the fan-out key group may change\nshape in a minor release; changes are called out in the changelog.\n\nFan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the\n[`objects`](Self::objects) list into one matrix row per entity set (each\nwith its `odata.entity` selected and its sink `table_id` rendered from\n[`emit`](Self::emit)), so one generic template with\n`objects: \"${param.objects}\"` syncs any entity set passed at trigger — no\npre-generated matrix, no field discovery needed (OData returns every column\nby default). Default `false` (the block then only affects a single-entity\nrun / `faucet discover`). Same key and semantics as `discovery.fan_out`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "objects": {
+          "description": "Entity sets to select — a YAML list **or** a comma-separated string (so a\nsingle string run-param can drive it: `objects: \"${param.objects}\"`).\nEmpty means fall back to `$metadata` discovery of every declared entity\nset (`faucet discover`). Same key and semantics as `discovery.objects`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "emit": {
+          "description": "What each discovered/fanned-out entity emits (sink `table_id` template,\nsink routing, extra per-entity config). Same shape as `discovery.emit`.\nUnset ⇒ defaults (`table_id: \"${name_snake}\"`, the default sink).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__EmitSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "partition": {
+          "description": "Key-range partitioned extraction: split large entities into contiguous\nprimary-key ranges fetched concurrently, instead of one sequential\n`@odata.nextLink` page walk. See [`PartitionSpec`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__PartitionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__ODataVersion": {
+      "description": "OData protocol version, which selects the paging-link key.",
+      "oneOf": [
+        {
+          "description": "OData v2 — JSON-light next link `odata.nextLink`.",
+          "type": "string",
+          "const": "v2"
+        },
+        {
+          "description": "OData v4 (default) — next link `@odata.nextLink`.",
+          "type": "string",
+          "const": "v4"
+        }
+      ]
+    },
+    "source_rest__EmitSpec": {
+      "description": "**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.\n\nWhat each discovered dataset **emits** — shared by every discovery mechanism\n(`discovery.emit` and `odata.emit`), so the vocabulary is identical wherever\ndatasets fan out. All string leaves are templates over the dataset:\n`${name}` (verbatim), `${name_snake}`, `${name_lower}`, and (where a\n`describe` step ran) `${field_names}`.",
+      "type": "object",
+      "properties": {
+        "config": {
+          "description": "A JSON object deep-merged into the dataset's source config (e.g. an\n`async_job` query, or extra per-entity overrides). Every string leaf is\ntemplated. Optional for mechanisms whose selection patch is implicit\n(OData sets `odata.entity` itself)."
+        },
+        "table_id": {
+          "description": "Sink `table_id` template (e.g. `\"raw_${name_snake}\"`). Rendered per\ndataset into the descriptor's `sink_patch`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sink_ref": {
+          "description": "Sink template (an entry under `pipeline.sinks`) each fanned-out dataset\nroutes to. Unset ⇒ the default (singular `pipeline.sink`) template, with\nthe rendered `table_id` merged in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__PartitionSpec": {
+      "description": "**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.\n\nKey-range partitioned extraction of a paged dataset (`odata.partition`):\ntile the dataset's integer primary-key space into contiguous ranges and\nfetch them concurrently. Range planning is\n[`faucet_core::shard::plan_pk_shards`] — the same primitive the SQL sources\nshard with, including its unbounded first/last ranges (rows inserted below\nMIN / above MAX during the run are still read).",
+      "type": "object",
+      "properties": {
+        "objects": {
+          "description": "With `fan_out`: which datasets to partition (a YAML list or a\ncomma-separated string). Each listed dataset whose `$metadata` declares a\n**single integer** key partitions on it; others fall back to sequential\npaging. Empty on a single-entity run (where [`key`](Self::key) applies\ndirectly).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "key": {
+          "description": "Integer key column to range-split on. On the fan-out path this is derived\nfrom `$metadata` per dataset; set it explicitly for a single-entity run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workers": {
+          "description": "Concurrent range readers (default [`DEFAULT_PARTITION_WORKERS`], clamped\nto [`MAX_PARTITION_WORKERS`]).",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "count": {
+          "description": "Number of ranges to tile into (default `workers ×`\n[`RANGES_PER_WORKER`], clamped to [`MAX_PARTITION_COUNT`]).",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__DecodeStep": {
+      "description": "One step of the decode chain.",
+      "anyOf": [
+        {
+          "description": "Parameterless byte step (`base64` / `gunzip`).",
+          "$ref": "#/$defs/source_rest__SimpleStep"
+        },
+        {
+          "description": "Pull a (string) field out of a JSON body first.",
+          "type": "object",
+          "properties": {
+            "extract": {
+              "description": "JSONPath to a string field whose value becomes the buffer.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Select a member from a zip archive.",
+          "type": "object",
+          "properties": {
+            "unzip": {
+              "description": "Member selector.",
+              "$ref": "#/$defs/source_rest__UnzipSpec"
+            }
+          }
+        },
+        {
+          "description": "Terminal parse into records.",
+          "type": "object",
+          "properties": {
+            "parse": {
+              "description": "Parse options.",
+              "$ref": "#/$defs/source_rest__ParseSpec"
+            }
+          }
+        }
+      ]
+    },
+    "source_rest__SimpleStep": {
+      "description": "A byte-chain step with no parameters (`- base64`, `- gunzip`).",
+      "oneOf": [
+        {
+          "description": "Base64-decode the (UTF-8 text) buffer into bytes.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "Gzip-decompress the buffer.",
+          "type": "string",
+          "const": "gunzip"
+        }
+      ]
+    },
+    "source_rest__UnzipSpec": {
+      "description": "Select a member of a zip archive.",
+      "type": "object",
+      "properties": {
+        "member": {
+          "description": "Glob (`*.csv`, `prefix*`, `*mid*`, or an exact name) selecting the member.\nWhen omitted, the first file entry is used.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__ParseSpec": {
+      "description": "Parse the decoded bytes into records.",
+      "type": "object",
+      "properties": {
+        "format": {
+          "description": "Output format.",
+          "$ref": "#/$defs/source_rest__ParseFormat"
+        },
+        "records_path": {
+          "description": "JSONPath selecting the record array (json/xml). When omitted, an array\nbody becomes the records and an object becomes a single record.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "delimiter": {
+          "description": "CSV delimiter byte (default `,`).",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "has_headers": {
+          "description": "Whether the first CSV row is a header (default `true`).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        },
+        "sheet": {
+          "description": "Excel worksheet name / index-as-string (default: first).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based Excel header row (default `0`).",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__ParseFormat": {
+      "description": "Final-parse format for a decode chain.",
+      "oneOf": [
+        {
+          "description": "JSON (default).",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "Delimited text.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "Excel workbook (requires the crate's `excel` feature).",
+          "type": "string",
+          "const": "xlsx"
+        },
+        {
+          "description": "XML → JSON.",
+          "type": "string",
+          "const": "xml"
+        }
+      ]
+    },
+    "source_rest__AsyncJobConfig": {
+      "description": "The `async_job:` config block.",
+      "type": "object",
+      "properties": {
+        "submit": {
+          "description": "Job-creation request.",
+          "$ref": "#/$defs/source_rest__JobRequest"
+        },
+        "job_id": {
+          "description": "JSONPath to the job id in the submit response.",
+          "type": "string"
+        },
+        "poll": {
+          "description": "Status polling.",
+          "$ref": "#/$defs/source_rest__PollSpec"
+        },
+        "status": {
+          "description": "Terminal-state classification.",
+          "$ref": "#/$defs/source_rest__JobStatus"
+        },
+        "fetch": {
+          "description": "Result-download request.",
+          "$ref": "#/$defs/source_rest__JobRequest"
+        },
+        "lookback": {
+          "description": "Incremental replication only: re-read margin subtracted from the\npersisted bookmark, same grammar as `window.lookback` (`45s` / `30m` /\n`6h` / `30d`; default `5m`). The bookmark is the client's run-start\nclock, so without a margin a client clock running *ahead* of the server\nwould permanently skip records stamped in the gap; the margin turns\nthat loss into a bounded re-read (deduped by an upsert sink).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "query_path": {
+          "description": "Where the bulk **statement** sits inside the [`submit`](Self::submit)\nbody, as an RFC 6901 JSON Pointer (#654 M23). Defaults to `/query` — the\ntop-level `query` key that used to be hardcoded, so an API putting its\nstatement at `sql`, `statement`, or a nested path silently lost\nincremental push-down and collapsed every object onto one dataset\nidentity. Three behaviours read it: the incremental predicate\ninjection, `validate()`'s incremental gate, and the catalog/lineage\ndataset name.",
+          "type": "string",
+          "default": "/query"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__JobRequest": {
+      "description": "One HTTP request in a job lifecycle (submit / fetch).",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "HTTP method (default `GET`; set `POST` for `submit`).",
+          "type": "string",
+          "default": "GET"
+        },
+        "url": {
+          "description": "URL — absolute, or a `base_url`-relative path. `${job_id}` is substituted.\n\nRequired for `submit`. For `fetch`, set **exactly one** of `url` (a fixed\ntemplate) or [`url_from`](Self::url_from) (a JSONPath into the poll body).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url_from": {
+          "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a Stripe report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers": {
+          "description": "Extra headers.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "query": {
+          "description": "Extra query params.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "json": {
+          "description": "JSON request body."
+        },
+        "locator_header": {
+          "description": "`fetch` only (#557): result-set continuation. Response header carrying a\npagination locator (e.g. Salesforce Bulk `Sforce-Locator`). While present\n(and not empty / `\"null\"`), the fetch is repeated with the locator sent as\n[`locator_param`](Self::locator_param), appending records across pages.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locator_body": {
+          "description": "`fetch` only (#557): JSONPath into the fetch response **body** for the\ncontinuation locator, when it rides the body rather than a header.\nAlternative to [`locator_header`](Self::locator_header).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locator_param": {
+          "description": "`fetch` only (#557): query-param name the locator is sent as on each\ncontinuation request. Required when a locator source is configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "records_path": {
+          "description": "`fetch` only (#557): JSONPath for extracting records from each fetch page,\noverriding the source-level `records_path`. Applies to a JSON result body.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locator_terminal_values": {
+          "description": "`fetch` only (#654 M24): locator values that mean **no more pages**,\ncompared case-insensitively after trimming. Defaults to `[\"null\"]` — one\nvendor's sentinel, which used to be hardcoded in the pagination loop, so\nan API signalling completion with `none` / `-1` / `EOF` needed a code\nchange. An empty/whitespace locator is always terminal regardless of\nthis list; set it to `[]` to make *only* emptiness terminal.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__PollSpec": {
+      "description": "The poll request + cadence.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "HTTP method (default `GET`).",
+          "type": "string",
+          "default": "GET"
+        },
+        "url": {
+          "description": "Status URL — absolute or `base_url`-relative; `${job_id}` substituted.",
+          "type": "string"
+        },
+        "headers": {
+          "description": "Extra headers.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "query": {
+          "description": "Extra query params.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "interval_secs": {
+          "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 5
+        },
+        "timeout_secs": {
+          "description": "Give up after this many seconds (default `1800`).",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 1800
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__JobStatus": {
+      "description": "How to read the job's terminal state from a poll response.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "JSONPath to the status value in the poll response.",
+          "type": "string"
+        },
+        "success": {
+          "description": "Status values meaning \"done — go fetch\".",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "failure": {
+          "description": "Status values meaning \"failed — abort\".",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__WindowSpec": {
+      "description": "Declarative in-run datetime window slicing (#527).",
+      "type": "object",
+      "properties": {
+        "step": {
+          "description": "Window size — `45s` / `30m` / `6h` / `30d`, or a bare integer (= seconds).\nAbsolute UTC durations (`d` = 24h); calendar/DST-correct windows are a\n[`faucet backfill`] concern, not the incremental cursor.",
+          "type": "string"
+        },
+        "lower": {
+          "description": "Lower-bound bind, rendered with the window **start**.",
+          "$ref": "#/$defs/source_rest__WindowBind"
+        },
+        "upper": {
+          "description": "Upper-bound bind, rendered with the window **end**.",
+          "$ref": "#/$defs/source_rest__WindowBind"
+        },
+        "granularity": {
+          "description": "Subtract this from each window's *rendered* upper bound so `[start, end]`\nis non-overlapping for inclusive-inclusive APIs (Airbyte\n`cursor_granularity`). Same grammar as `step`. The **persisted bookmark is\nalways the true half-open boundary**, so resume never gaps or overlaps —\nonly the value sent to the server is adjusted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lookback": {
+          "description": "Re-scan this much *before* the bookmark on the first window, to catch\nlate-arriving updates without a full replay. Same grammar as `step`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_windows": {
+          "description": "Safety cap on the number of windows enumerated in one run. On overflow the\nsweep is truncated (logged, never silently), and the next run resumes from\nthe last window's end.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 10000
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__WindowBind": {
+      "description": "Injects a rendered window boundary into the outgoing request — the window\nanalogue of [`ReplicationBind`](crate::ReplicationBind). Reuses the same\n[`BindTarget`] placement and [`BindFormat`] formatting.",
+      "type": "object",
+      "properties": {
+        "into": {
+          "description": "Where to place the rendered boundary (query param / header / body field /\npath placeholder).",
+          "$ref": "#/$defs/source_rest__BindTarget",
+          "default": "query"
+        },
+        "name": {
+          "description": "The parameter / header / body-field / path-placeholder name.",
+          "type": "string"
+        },
+        "template": {
+          "description": "Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the\nformatted boundary. Defaults to the bare `${window}`; set e.g.\n`\"gte|${window}\"` or `\"[${window} TO *]\"`.",
+          "type": "string",
+          "default": "${window}"
+        },
+        "format": {
+          "description": "How to format the boundary before substitution.",
+          "$ref": "#/$defs/source_rest__BindFormat",
+          "default": "raw"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__RecordsMultiSpec": {
+      "description": "One entry in a [`RestStreamConfig::records_multi`] fan-out (#548): a JSONPath\nselecting an array of records, plus the op marker each is stamped with.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "JSONPath selecting an array of records (e.g. `\"$.added[*]\"`).",
+          "type": "string",
+          "default": ""
+        },
+        "op": {
+          "description": "Op marker stamped onto each record from `path` under\n[`RestStreamConfig::op_field`] (e.g. `upsert` / `delete`, or `u` / `d`).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__DiscoverySpec": {
+      "description": "A generic discovery recipe on a REST source.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
+      "type": "object",
+      "properties": {
+        "list": {
+          "description": "Step 1 — enumerate datasets from a listing endpoint. Optional: omit it and\nsupply [`objects`](Self::objects) directly (e.g. from a run param).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__DiscoveryList"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "objects": {
+          "description": "Datasets supplied directly — a YAML list **or** a comma-separated string\n(`\"A,B,C\"`), so a single string run-param can drive it\n(`objects: \"${param.objects}\"`). Used instead of `list` when non-empty.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "describe": {
+          "description": "Step 2 — per-dataset field discovery (builds a typed schema + a field list\nto template into `emit`). Optional: omit when the dataset needs no field\nenumeration (e.g. an API that returns every column by default).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__DiscoveryDescribe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "emit": {
+          "description": "Step 3 — what each discovered dataset emits (the source `config_patch`\nthat selects it, an optional sink `table_id` template, and sink routing).\nShared shape with `odata.emit` ([`EmitSpec`](crate::config::EmitSpec));\n`emit.config` is required here — it is what selects the dataset.",
+          "$ref": "#/$defs/source_rest__EmitSpec"
+        },
+        "fan_out": {
+          "description": "Fan out **at run time**: `faucet run` / `serve` turn the discovered\ndatasets into one matrix row each, before `expand`. Default `false`\n(the block then only powers `faucet discover`). Same key and semantics\nas `odata.fan_out`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__DiscoveryList": {
+      "description": "Step 1 — the listing request + how to read dataset names out of its response.",
+      "type": "object",
+      "properties": {
+        "get": {
+          "description": "Request path (relative to the source `base_url`); `GET`.",
+          "type": "string"
+        },
+        "items": {
+          "description": "JSONPath selecting the array of listing items (e.g. `$.objects[*]`).",
+          "type": "string"
+        },
+        "name": {
+          "description": "JSONPath, relative to each item, yielding its name (e.g. `$.name`).",
+          "type": "string"
+        },
+        "keep_if": {
+          "description": "Optional keep-if predicate over each item (e.g. `queryable == true`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__DiscoveryPredicate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exclude_name_suffixes": {
+          "description": "Drop any dataset whose name ends with one of these suffixes (e.g.\n`[ChangeEvent, Feed, Share, History]`). Vendor-neutral name filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__DiscoveryPredicate": {
+      "description": "A keep-if predicate: keep a listing item when the value at `path` equals\n`equals`.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "JSONPath relative to the item.",
+          "type": "string"
+        },
+        "equals": {
+          "description": "Keep the item iff the extracted value equals this."
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__DiscoveryDescribe": {
+      "description": "Step 2 — the per-dataset describe request + how to read fields + types.",
+      "type": "object",
+      "properties": {
+        "get": {
+          "description": "Request path template (relative to `base_url`), with `${name}` for the\ndataset (e.g. `/catalog/objects/${name}/fields`); `GET`.",
+          "type": "string"
+        },
+        "fields": {
+          "description": "JSONPath selecting the array of field objects (e.g. `$.fields[*]`).",
+          "type": "string"
+        },
+        "field_name": {
+          "description": "JSONPath, relative to each field, yielding its name.",
+          "type": "string"
+        },
+        "field_type": {
+          "description": "JSONPath, relative to each field, yielding its raw type string. Absent ⇒\nno typed schema is built (fields are still listed for templating).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "field_nullable": {
+          "description": "JSONPath, relative to each field, yielding a truthy \"is nullable\" flag.\nAbsent ⇒ every column is nullable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type_map": {
+          "description": "Raw-type → JSON-Schema-type map (`integer` / `number` / `boolean` /\n`string` / `object` / `array`). Key `\"*\"` is the fallback; absent ⇒\n`string`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "skip_types": {
+          "description": "Drop fields whose raw type is one of these (e.g. compound / blob types\nnot selectable in a query).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
     },
     "source_graphql__AuthSpec": {
       "description": "A connector's `auth:` field: **either** an inline auth definition `A`\n(the `{ type, config }` shape), **or** a `{ ref: <name> }` reference to a\nshared provider defined in the top-level `auth:` catalog.\n\n`ref` is mutually exclusive with inline fields — supplying both is a\ndeserialization error.",
@@ -4278,6 +5374,19 @@
       },
       "additionalProperties": true
     },
+    "source_graphql__GraphqlPaginationSpec": {
+      "description": "Pagination style for the GraphQL source.\n\nDeserialized **untagged** so the legacy cursor block (which carries no\n`type:` discriminator) keeps working unchanged, while the offset block is\nselected by its required `type: Offset` field. The two field sets are\ndisjoint (cursor requires `cursor_path` / `has_next_page_path`; offset\nrequires `type` / `offset_variable` / `page_size`), so serde routes each\nconfig to exactly one variant. The cursor variant is tried first.",
+      "anyOf": [
+        {
+          "description": "Relay-style cursor pagination (the original, `type`-less shape).",
+          "$ref": "#/$defs/source_graphql__GraphqlPagination"
+        },
+        {
+          "description": "Offset-into-variable pagination — selected by `type: Offset`.",
+          "$ref": "#/$defs/source_graphql__GraphqlOffsetPagination"
+        }
+      ]
+    },
     "source_graphql__GraphqlPagination": {
       "description": "Cursor-based pagination configuration for GraphQL.\n\nMost GraphQL APIs use the Relay cursor specification with\n`pageInfo { hasNextPage, endCursor }`.",
       "type": "object",
@@ -4297,6 +5406,97 @@
         "page_size_variable": {
           "description": "Name of the page size variable (default: `\"first\"`).\n\nThe per-page record count itself comes from\n[`GraphqlStreamConfig::batch_size`] — the variable named here is the\nGraphQL variable that the `batch_size` value is injected into on each\nrequest. The plain `batch_size = 0` sentinel omits the variable so the\nupstream uses its own default page size.",
           "type": "string"
+        }
+      }
+    },
+    "source_graphql__GraphqlOffsetPagination": {
+      "description": "Offset-into-query-variable pagination (ShopifyQL and similar).\n\nIncrements an integer offset injected into a GraphQL variable and\nterminates on a **short page** (fewer than `page_size` records) — unlike\ncursor pagination, which follows a `pageInfo` boolean. Suited to APIs whose\nquery language embeds `LIMIT … OFFSET …` (e.g. ShopifyQL): bake the limit\ninto the query string and parameterize only the offset with `${…}`.\n\nThe offset starts at `0`, is sent as a JSON number in the `variables` map on\nevery request, and advances by `page_size` after each page.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "Discriminator — must be `Offset`.",
+          "$ref": "#/$defs/source_graphql__OffsetPaginationKind"
+        },
+        "offset_variable": {
+          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, incremented by `page_size`\nafter each page). Reference it from the query string or as a variable\n(e.g. `${q_offset}` for ShopifyQL).",
+          "type": "string"
+        },
+        "page_size": {
+          "description": "Records requested per page. Used both to advance the offset\n(`offset += page_size`) and, with `stop_when_short`, to detect the final\npage. Must be greater than `0`. This value is **not** injected into the\nrequest — bake the limit into your query (`LIMIT 250 OFFSET ${q_offset}`).",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "stop_when_short": {
+          "description": "Terminate when a page yields fewer than `page_size` records (default\n`true`). When `false`, pagination continues until a fully empty page (or\n`max_pages`) is reached.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        },
+        "substitute_in_query": {
+          "description": "Substitute `${offset_variable}` occurrences in the **query string** with\nthe current offset before each request, instead of sending it as a\nGraphQL variable. Required for query languages that embed the offset in a\nstring-literal argument — e.g. ShopifyQL's\n`shopifyqlQuery(query: \"… LIMIT 250 OFFSET ${q_offset}\")`, where a GraphQL\nvariable cannot interpolate into a string literal (#569). Default\n`false` (variable injection, the #550 behavior).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_graphql__OffsetPaginationKind": {
+      "description": "Discriminator for [`GraphqlOffsetPagination`]; serializes as `\"Offset\"`.\n\nA dedicated single-variant enum (rather than a bare `String`) so the\n`type: Offset` marker is validated at config-load time and gives the\nuntagged [`GraphqlPaginationSpec`] a reliable way to route an offset block.",
+      "oneOf": [
+        {
+          "description": "The offset pagination style.",
+          "type": "string",
+          "const": "Offset"
+        }
+      ]
+    },
+    "source_graphql__TlsClientConfig": {
+      "description": "Client-certificate (mutual TLS) configuration for the HTTP sources.\n\nSupply **either** a PEM certificate + key pair (`client_cert` + `client_key`)\n**or** a PKCS#12 identity file (`client_identity_pkcs12` [+ `pkcs12_password`]).\nPEM values may be inline or pulled in with `${file:…}` / `${secret:…}` /\n`${vault:…}`; the PKCS#12 value is a path to a `.p12`/`.pfx` file (its binary\ncontent can't be embedded in a text config).",
+      "type": "object",
+      "properties": {
+        "client_cert": {
+          "description": "PEM-encoded client certificate chain. Pair with `client_key`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key": {
+          "description": "PEM-encoded PKCS#8 private key. Pair with `client_cert`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_identity_pkcs12": {
+          "description": "Path to a PKCS#12 (`.p12`/`.pfx`) identity file — an alternative to the\nPEM pair.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pkcs12_password": {
+          "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_version": {
+          "description": "Minimum negotiated TLS version: `\"1.2\"` or `\"1.3\"`. Defaults to the\nTLS backend's own minimum when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -4547,6 +5747,194 @@
         }
       ]
     },
+    "source_xml__DecodeStep": {
+      "description": "One step of the decode chain.",
+      "anyOf": [
+        {
+          "description": "Parameterless byte step (`base64` / `gunzip`).",
+          "$ref": "#/$defs/source_xml__SimpleStep"
+        },
+        {
+          "description": "Pull a (string) field out of a JSON body first.",
+          "type": "object",
+          "properties": {
+            "extract": {
+              "description": "JSONPath to a string field whose value becomes the buffer.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Select a member from a zip archive.",
+          "type": "object",
+          "properties": {
+            "unzip": {
+              "description": "Member selector.",
+              "$ref": "#/$defs/source_xml__UnzipSpec"
+            }
+          }
+        },
+        {
+          "description": "Terminal parse into records.",
+          "type": "object",
+          "properties": {
+            "parse": {
+              "description": "Parse options.",
+              "$ref": "#/$defs/source_xml__ParseSpec"
+            }
+          }
+        }
+      ]
+    },
+    "source_xml__SimpleStep": {
+      "description": "A byte-chain step with no parameters (`- base64`, `- gunzip`).",
+      "oneOf": [
+        {
+          "description": "Base64-decode the (UTF-8 text) buffer into bytes.",
+          "type": "string",
+          "const": "base64"
+        },
+        {
+          "description": "Gzip-decompress the buffer.",
+          "type": "string",
+          "const": "gunzip"
+        }
+      ]
+    },
+    "source_xml__UnzipSpec": {
+      "description": "Select a member of a zip archive.",
+      "type": "object",
+      "properties": {
+        "member": {
+          "description": "Glob (`*.csv`, `prefix*`, `*mid*`, or an exact name) selecting the member.\nWhen omitted, the first file entry is used.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_xml__ParseSpec": {
+      "description": "Parse the decoded bytes into records.",
+      "type": "object",
+      "properties": {
+        "format": {
+          "description": "Output format.",
+          "$ref": "#/$defs/source_xml__ParseFormat"
+        },
+        "records_path": {
+          "description": "JSONPath selecting the record array (json/xml). When omitted, an array\nbody becomes the records and an object becomes a single record.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "delimiter": {
+          "description": "CSV delimiter byte (default `,`).",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "has_headers": {
+          "description": "Whether the first CSV row is a header (default `true`).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        },
+        "sheet": {
+          "description": "Excel worksheet name / index-as-string (default: first).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based Excel header row (default `0`).",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_xml__ParseFormat": {
+      "description": "Final-parse format for a decode chain.",
+      "oneOf": [
+        {
+          "description": "JSON (default).",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "Delimited text.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "Excel workbook (requires the crate's `excel` feature).",
+          "type": "string",
+          "const": "xlsx"
+        },
+        {
+          "description": "XML → JSON.",
+          "type": "string",
+          "const": "xml"
+        }
+      ]
+    },
+    "source_xml__TlsClientConfig": {
+      "description": "Client-certificate (mutual TLS) configuration for the HTTP sources.\n\nSupply **either** a PEM certificate + key pair (`client_cert` + `client_key`)\n**or** a PKCS#12 identity file (`client_identity_pkcs12` [+ `pkcs12_password`]).\nPEM values may be inline or pulled in with `${file:…}` / `${secret:…}` /\n`${vault:…}`; the PKCS#12 value is a path to a `.p12`/`.pfx` file (its binary\ncontent can't be embedded in a text config).",
+      "type": "object",
+      "properties": {
+        "client_cert": {
+          "description": "PEM-encoded client certificate chain. Pair with `client_key`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key": {
+          "description": "PEM-encoded PKCS#8 private key. Pair with `client_cert`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_identity_pkcs12": {
+          "description": "Path to a PKCS#12 (`.p12`/`.pfx`) identity file — an alternative to the\nPEM pair.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pkcs12_password": {
+          "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_version": {
+          "description": "Minimum negotiated TLS version: `\"1.2\"` or `\"1.3\"`. Defaults to the\nTLS backend's own minimum when unset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "source_grpc__AuthSpec": {
       "description": "A connector's `auth:` field: **either** an inline auth definition `A`\n(the `{ type, config }` shape), **or** a `{ ref: <name> }` reference to a\nshared provider defined in the top-level `auth:` catalog.\n\n`ref` is mutually exclusive with inline fields — supplying both is a\ndeserialization error.",
       "anyOf": [
@@ -4625,7 +6013,10 @@
           "type": "string"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "max_reconnect_attempts"
+      ]
     },
     "source_grpc__AuthReference": {
       "description": "A `{ ref: <name> }` pointer to a named provider in the top-level `auth:`\ncatalog. The only permitted key is `ref`.",
@@ -6863,48 +8254,6 @@
         }
       ]
     },
-    "source_parquet__ParquetS3Config": {
-      "description": "S3 location parameters.\n\nExactly one of `key` or `prefix` must be set.",
-      "type": "object",
-      "properties": {
-        "bucket": {
-          "description": "S3 bucket name.",
-          "type": "string"
-        },
-        "key": {
-          "description": "A single object key (mutually exclusive with `prefix`).",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "prefix": {
-          "description": "An object key prefix to list and read (mutually exclusive with `key`).",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "region": {
-          "description": "AWS region. `None` uses the default-region resolution chain.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "endpoint_url": {
-          "description": "Custom endpoint URL for S3-compatible services (MinIO, LocalStack, …).",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      }
-    },
     "source_delta__DeltaCredentials": {
       "description": "Object-store credentials for reading/writing a Delta table.\n\nUses the project-wide adjacently-tagged `{ type, config }` shape\n(snake_case discriminators): e.g. `credentials: { type: aws, config: { … } }`.\nThe default is [`DeltaCredentials::Default`], which resolves credentials from\nthe ambient environment / instance metadata via the object-store default\nprovider chain — nothing is injected into `storage_options`.",
       "oneOf": [
@@ -7498,6 +8847,33 @@
         }
       }
     },
+    "sink_bigquery__OverwriteScope": {
+      "description": "Scope for a **scoped/windowed overwrite** (#518): with `write_mode:\noverwrite`, replace only the destination rows matching this scope instead of\ntruncating the whole table. The sink-side sibling of scoped cleanup (#478).\n\nv1 supports a half-open date/number **window** on a single column.",
+      "oneOf": [
+        {
+          "description": "Replace rows where `column` is in the half-open range `[from, to)`.",
+          "type": "object",
+          "properties": {
+            "window": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "description": "The destination column to window on.",
+                  "type": "string"
+                },
+                "from": {
+                  "description": "Inclusive lower bound."
+                },
+                "to": {
+                  "description": "Exclusive upper bound."
+                }
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
     "sink_bigquery__BigQueryLoadConfig": {
       "description": "GCS-staged Parquet load-job configuration for the Arrow columnar path.",
       "type": "object",
@@ -7770,44 +9146,6 @@
         }
       ]
     },
-    "sink_iceberg__CatalogInner": {
-      "description": "Configuration fields shared by every catalog variant.\n\nIndividual variants carry the same fields so `CatalogConfig` stays a\nwell-typed tagged enum without a separate inner struct (which would make\nthe JSON Schema less readable).",
-      "type": "object",
-      "properties": {
-        "uri": {
-          "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "warehouse": {
-          "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "credential": {
-          "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "properties": {
-          "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        }
-      }
-    },
     "sink_iceberg__PartitionField": {
       "description": "A single partition field: source column + transform.\n\nSupported transforms: `identity`, `year`, `month`, `day`, `hour`, `void`,\nand parameterized forms `bucket[N]` and `truncate[N]` (e.g. `bucket[16]`,\n`truncate[8]`). Used only when `create_if_missing: true` and the table\ndoes not yet exist.",
       "type": "object",
@@ -7939,6 +9277,33 @@
           "description": "`COPY … FROM STDIN (FORMAT text)` bulk load — typically **5–10×\nfaster** than multi-row `INSERT` for bulk append (issue #308).\n\n**Append-only**: `COPY` has no `ON CONFLICT`, so combining\n`write_method: copy` with `write_mode: upsert|delete` is rejected at\nconfig load. The exactly-once path (`write_batch_idempotent`) always\nuses the `INSERT`/transaction path regardless of this setting — the\nwatermark token must commit atomically with the page's data.\n\nError semantics are all-or-nothing per batch, the same as a failed\nmulti-row `INSERT`: one bad row fails the whole `COPY` and the DLQ\nrouter's `on_batch_error` policy applies.",
           "type": "string",
           "const": "copy"
+        }
+      ]
+    },
+    "sink_postgres__OverwriteScope": {
+      "description": "Scope for a **scoped/windowed overwrite** (#518): with `write_mode:\noverwrite`, replace only the destination rows matching this scope instead of\ntruncating the whole table. The sink-side sibling of scoped cleanup (#478).\n\nv1 supports a half-open date/number **window** on a single column.",
+      "oneOf": [
+        {
+          "description": "Replace rows where `column` is in the half-open range `[from, to)`.",
+          "type": "object",
+          "properties": {
+            "window": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "description": "The destination column to window on.",
+                  "type": "string"
+                },
+                "from": {
+                  "description": "Inclusive lower bound."
+                },
+                "to": {
+                  "description": "Exclusive upper bound."
+                }
+              }
+            }
+          },
+          "additionalProperties": true
         }
       ]
     },
@@ -8302,6 +9667,120 @@
         }
       }
     },
+    "sink_mssql__MssqlStagingConfig": {
+      "description": "Staged-load configuration for the MSSQL sink (#528). `COPY INTO` reads Azure\nBlob / ADLS Gen2 only, so `location` must be `az://…` and `format: csv`.",
+      "type": "object",
+      "properties": {
+        "location": {
+          "description": "Object-store location to stage files under, e.g.\n`s3://my-bucket/faucet-stage/`. Scheme selects the backend\n(`s3://` / `gs://` / `az://`).",
+          "type": "string"
+        },
+        "format": {
+          "description": "File format written to the stage. Default `parquet`.",
+          "$ref": "#/$defs/sink_mssql__StagingFormat",
+          "default": "parquet"
+        },
+        "compression": {
+          "description": "Outer compression for `csv`/`jsonl` (ignored for `parquet`). Default `none`.",
+          "$ref": "#/$defs/sink_mssql__StagingCompression",
+          "default": "none"
+        },
+        "cleanup": {
+          "description": "When staged objects are deleted. Default `always`.",
+          "$ref": "#/$defs/sink_mssql__StagingCleanup",
+          "default": "always"
+        },
+        "copy_options": {
+          "description": "Extra options appended verbatim to the warehouse's native load command\n(e.g. Redshift `\"TIMEFORMAT 'auto' STATUPDATE ON\"`). Passed through\nunquoted — the operator owns its correctness.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storage_account": {
+          "description": "Azure storage account (the `az://` URI does not carry it) used to build\nthe `COPY INTO` HTTPS URL.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "description": "Explicit blob endpoint base (`host[/account]`, path-style) — for Azurite\n/ sovereign clouds. Overrides `storage_account`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sas_token": {
+          "description": "Shared Access Signature token SQL Server uses to **read** the staged\nobjects. Omit to rely on the server's managed identity / configured access.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_mssql__StagingFormat": {
+      "description": "Physical file format written to the stage.",
+      "oneOf": [
+        {
+          "description": "One JSON object per line. The default — every warehouse can load it and\nit maps by column name (no positional column list needed).",
+          "type": "string",
+          "const": "jsonl"
+        },
+        {
+          "description": "Comma-separated values with a header row.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "Apache Parquet. Columnar + compressed; the fastest to load where the\nwarehouse supports it. Written by the sink (needs Arrow), not by this\nmodule's byte serializers.",
+          "type": "string",
+          "const": "parquet"
+        }
+      ]
+    },
+    "sink_mssql__StagingCompression": {
+      "description": "Outer compression for text staging formats.",
+      "oneOf": [
+        {
+          "description": "No compression (the default).",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "gzip (`.gz`).",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "zstd (`.zst`).",
+          "type": "string",
+          "const": "zstd"
+        }
+      ]
+    },
+    "sink_mssql__StagingCleanup": {
+      "description": "When staged objects are deleted after a load.",
+      "oneOf": [
+        {
+          "description": "Delete staged objects whether the load succeeded or failed (the default —\nkeeps the stage tidy).",
+          "type": "string",
+          "const": "always"
+        },
+        {
+          "description": "Delete only after a successful load; leave them on failure for inspection.",
+          "type": "string",
+          "const": "on_success"
+        },
+        {
+          "description": "Never delete — the caller/operator manages the stage lifecycle.",
+          "type": "string",
+          "const": "never"
+        }
+      ]
+    },
     "sink_sqlite__SqliteColumnMapping": {
       "description": "How to map JSON records to table columns.",
       "oneOf": [
@@ -8500,6 +9979,43 @@
           }
         }
       ]
+    },
+    "sink_sqs__PartialRetrySpec": {
+      "description": "Per-record retry budget for a sink whose bulk API reports **partial**\nfailures (#654 M20).\n\nAWS batch APIs (`PutRecords`, `SendMessageBatch`) return a 200 whose body\nmarks individual entries as failed; the sink retries just those entries with\njittered exponential backoff. The three knobs that describe it used to sit\nflat and byte-identical in two connector configs, beside unrelated sizing\nkeys — one block, one definition, per Principle 4.",
+      "type": "object",
+      "properties": {
+        "max_attempts": {
+          "description": "Attempts per record before it is reported failed (DLQ-routable).\nDefault 5; `1` means \"no retry\".",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 5
+        },
+        "initial_backoff_ms": {
+          "description": "First backoff, in milliseconds. Doubles per attempt, jittered by the\nshared [`apply_jitter`]. Default 100.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 100
+        },
+        "max_backoff_ms": {
+          "description": "Backoff ceiling in milliseconds, applied before jitter. Default 30000.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30000
+        }
+      },
+      "additionalProperties": true
     },
     "sink_nats__NatsAuth": {
       "description": "NATS client authentication configuration.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape.\n\nThe [`std::fmt::Debug`] implementation is hand-written so secret material\n(`token`, `password`, `nkey` seed) is never printed — only the variant name\nand non-secret fields appear.",
@@ -9279,6 +10795,43 @@
         }
       ]
     },
+    "sink_kafka__KafkaExactlyOnceSpec": {
+      "description": "Exactly-once delivery knobs for the Kafka sink (#654 M20).\n\nThese four apply **only** under `delivery: exactly_once` — the transactional\nproducer and its compacted commit-token side-topic. They used to sit flat\nbeside `brokers` / `linger_ms`, where nothing said they were inert in the\ndefault at-least-once mode; grouping them is what makes that legible.",
+      "type": "object",
+      "properties": {
+        "transactional_id_prefix": {
+          "description": "Namespace prefix for the producer's auto-derived `transactional.id`.\nThe id is `\"{prefix}.{sanitized_scope}\"`; defaults to `\"faucet\"`. Set it\nto isolate transactional ids across clusters or environments that share\na pipeline scope namespace.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_token_topic": {
+          "description": "Compacted side-topic holding one commit-token record per pipeline\nscope. Auto-created with `cleanup.policy=compact` if absent.",
+          "type": "string",
+          "default": "__faucet_commit_token"
+        },
+        "commit_token_topic_partitions": {
+          "description": "Partition count used when auto-creating the commit-token topic.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "int32",
+          "default": 1
+        },
+        "commit_token_topic_replication": {
+          "description": "Replication factor used when auto-creating the commit-token topic.\n`-1` means \"use the broker default\".",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "int32",
+          "default": -1
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_kinesis__KinesisCredentials": {
       "description": "How to authenticate with AWS Kinesis.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by\nevery faucet connector.",
       "oneOf": [
@@ -9519,6 +11072,43 @@
           "const": "bytes"
         }
       ]
+    },
+    "sink_kinesis__PartialRetrySpec": {
+      "description": "Per-record retry budget for a sink whose bulk API reports **partial**\nfailures (#654 M20).\n\nAWS batch APIs (`PutRecords`, `SendMessageBatch`) return a 200 whose body\nmarks individual entries as failed; the sink retries just those entries with\njittered exponential backoff. The three knobs that describe it used to sit\nflat and byte-identical in two connector configs, beside unrelated sizing\nkeys — one block, one definition, per Principle 4.",
+      "type": "object",
+      "properties": {
+        "max_attempts": {
+          "description": "Attempts per record before it is reported failed (DLQ-routable).\nDefault 5; `1` means \"no retry\".",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 5
+        },
+        "initial_backoff_ms": {
+          "description": "First backoff, in milliseconds. Doubles per attempt, jittered by the\nshared [`apply_jitter`]. Default 100.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 100
+        },
+        "max_backoff_ms": {
+          "description": "Backoff ceiling in milliseconds, applied before jitter. Default 30000.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30000
+        }
+      },
+      "additionalProperties": true
     },
     "sink_spanner__SpannerCredentials": {
       "description": "Credentials used to authenticate against Cloud Spanner.\n\nSerialized in the project-wide adjacently-tagged shape:\n\n```yaml\nauth:\n  type: service_account_key_path\n  config:\n    path: /secrets/sa.json\n```",
@@ -9844,45 +11434,6 @@
           "additionalProperties": true
         }
       ]
-    },
-    "sink_parquet__ParquetS3Destination": {
-      "description": "S3 destination configuration.",
-      "type": "object",
-      "properties": {
-        "bucket": {
-          "description": "S3 bucket name.",
-          "type": "string"
-        },
-        "prefix": {
-          "description": "Key prefix for written objects. Empty string writes to the bucket root.",
-          "type": "string",
-          "default": ""
-        },
-        "region": {
-          "description": "AWS region. `None` uses the SDK default.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "endpoint_url": {
-          "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO, LocalStack).",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "allow_http": {
-          "description": "Allow non-HTTPS endpoints. Required when `endpoint_url` is an `http://`\nURL (e.g. for LocalStack).",
-          "type": [
-            "boolean",
-            "string"
-          ],
-          "default": false
-        }
-      }
     },
     "sink_parquet__SchemaSource": {
       "description": "How the sink obtains its Arrow schema.",
@@ -10297,6 +11848,51 @@
         }
       ]
     },
+    "sink_redshift__RedshiftCopySpec": {
+      "description": "`COPY`-path settings for the Redshift sink (#654 M20).\n\nSix keys that only mean anything under `write_strategy: copy` used to sit\nflat beside `table_name` and `batch_size`, with nothing saying they were\ninert for `insert`. Grouping them is what makes that legible — the same\nshape the BigQuery sink already uses for `bulk_load:`.",
+      "type": "object",
+      "properties": {
+        "format": {
+          "description": "Staged-file format. Defaults to [`RedshiftCopyFormat::Jsonl`].",
+          "$ref": "#/$defs/sink_redshift__RedshiftCopyFormat",
+          "default": "jsonl"
+        },
+        "staging_bucket": {
+          "description": "S3 bucket used to stage `COPY` files. **Required** for `copy`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "staging_prefix": {
+          "description": "Key prefix for staged objects (e.g. `redshift-staging/`). Empty by\ndefault.",
+          "type": "string",
+          "default": ""
+        },
+        "iam_role": {
+          "description": "IAM role ARN Redshift assumes to read the staged file\n(`COPY … IAM_ROLE '<arn>'`). **Required** for `copy`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "description": "AWS region of the staging bucket, used for both the S3 client and the\n`COPY … REGION '<region>'` clause. `None` uses the SDK default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint_url": {
+          "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO) — a testing\naid; production loads use real S3.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_redshift__RedshiftCopyFormat": {
       "description": "Format of the staged file that `COPY` reads.",
       "oneOf": [
@@ -10435,6 +12031,127 @@
               "const": "jsonpath"
             }
           }
+        }
+      ]
+    },
+    "sink_clickhouse__ClickHouseStagingConfig": {
+      "description": "Staged-load configuration for the ClickHouse sink (#528).",
+      "type": "object",
+      "properties": {
+        "location": {
+          "description": "Object-store location to stage files under, e.g.\n`s3://my-bucket/faucet-stage/`. Scheme selects the backend\n(`s3://` / `gs://` / `az://`).",
+          "type": "string"
+        },
+        "format": {
+          "description": "File format written to the stage. Default `parquet`.",
+          "$ref": "#/$defs/sink_clickhouse__StagingFormat",
+          "default": "parquet"
+        },
+        "compression": {
+          "description": "Outer compression for `csv`/`jsonl` (ignored for `parquet`). Default `none`.",
+          "$ref": "#/$defs/sink_clickhouse__StagingCompression",
+          "default": "none"
+        },
+        "cleanup": {
+          "description": "When staged objects are deleted. Default `always`.",
+          "$ref": "#/$defs/sink_clickhouse__StagingCleanup",
+          "default": "always"
+        },
+        "copy_options": {
+          "description": "Extra options appended verbatim to the warehouse's native load command\n(e.g. Redshift `\"TIMEFORMAT 'auto' STATUPDATE ON\"`). Passed through\nunquoted — the operator owns its correctness.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "description": "AWS region for the derived `s3()` URL (virtual-hosted). Ignored for `gs://`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "description": "Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /\nnon-AWS stores. Overrides `region`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "access_key": {
+          "description": "Access key the ClickHouse server uses to **read** the staged objects\n(the `s3()`/`gcs()` credentials). Omit to rely on the server's own IAM /\nconfigured access.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret_key": {
+          "description": "Secret paired with [`access_key`](Self::access_key).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_clickhouse__StagingFormat": {
+      "description": "Physical file format written to the stage.",
+      "oneOf": [
+        {
+          "description": "One JSON object per line. The default — every warehouse can load it and\nit maps by column name (no positional column list needed).",
+          "type": "string",
+          "const": "jsonl"
+        },
+        {
+          "description": "Comma-separated values with a header row.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "Apache Parquet. Columnar + compressed; the fastest to load where the\nwarehouse supports it. Written by the sink (needs Arrow), not by this\nmodule's byte serializers.",
+          "type": "string",
+          "const": "parquet"
+        }
+      ]
+    },
+    "sink_clickhouse__StagingCompression": {
+      "description": "Outer compression for text staging formats.",
+      "oneOf": [
+        {
+          "description": "No compression (the default).",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "gzip (`.gz`).",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "zstd (`.zst`).",
+          "type": "string",
+          "const": "zstd"
+        }
+      ]
+    },
+    "sink_clickhouse__StagingCleanup": {
+      "description": "When staged objects are deleted after a load.",
+      "oneOf": [
+        {
+          "description": "Delete staged objects whether the load succeeded or failed (the default —\nkeeps the stage tidy).",
+          "type": "string",
+          "const": "always"
+        },
+        {
+          "description": "Delete only after a successful load; leave them on failure for inspection.",
+          "type": "string",
+          "const": "on_success"
+        },
+        {
+          "description": "Never delete — the caller/operator manages the stage lifecycle.",
+          "type": "string",
+          "const": "never"
         }
       ]
     },
@@ -13542,7 +15259,10 @@
             "config": {
               "anyOf": [
                 {
-                  "additionalProperties": true,
+                  "x-faucet-aliases": [
+                    "max_reconnect_attempts",
+                    "reconnect_initial_backoff"
+                  ],
                   "title": "WebsocketSourceConfig",
                   "description": "Configuration for the WebSocket source.",
                   "type": "object",
@@ -13662,7 +15382,8 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  }
+                  },
+                  "additionalProperties": true
                 },
                 true
               ]
@@ -15148,7 +16869,9 @@
             "config": {
               "anyOf": [
                 {
-                  "additionalProperties": true,
+                  "x-faucet-aliases": [
+                    "create_if_missing"
+                  ],
                   "title": "IcebergSinkConfig",
                   "description": "Configuration for the Apache Iceberg sink.\n\nRecords are buffered into Arrow batches, written as Parquet data files via\nthe iceberg-rust writer pipeline, and committed as a single snapshot per\n`flush()` call using `Transaction::fast_append`.\n\n## Append-only (v1)\n\nOnly `write_mode: append` is supported at runtime. The `write_mode` field\naccepts the shared [`faucet_core::WriteMode`] enum, so `upsert` and\n`delete` deserialise without error but are rejected by\n[`IcebergSink::new`](crate::sink::IcebergSink::new) with a `FaucetError::Config`. Configuring\n`write_mode: overwrite` still produces a deserialization error (it is not\na recognised variant). Equality-delete upsert is tracked in #179.\n\n## Catalog feature gates\n\nThe REST catalog is included in the default build (`catalog-rest`). Glue,\nSQL, and HMS each require their own Cargo feature (`catalog-glue`,\n`catalog-sql`, `catalog-hms`). Configuring a disabled catalog type returns\n`FaucetError::Config` at startup.",
                   "type": "object",
@@ -15168,8 +16891,8 @@
                       "description": "Name of the Iceberg table (without namespace), e.g. `\"page_views\"`.",
                       "type": "string"
                     },
-                    "create_if_missing": {
-                      "description": "Create the table if it does not exist, inferring the schema from the\nfirst batch. When `false`, `load_table` is called at startup and an\nabsent table causes a `FaucetError::Sink` immediately.",
+                    "create_table": {
+                      "description": "Create the table if it does not exist, inferring the schema from the\nfirst batch. When `false`, `load_table` is called at startup and an\nabsent table causes a `FaucetError::Sink` immediately.\n\nSpelled `create_table` on the wire since #580, matching every other\ntable sink; the historical `create_if_missing` stays accepted as an\nalias. Same default (`true`).",
                       "type": [
                         "boolean",
                         "string"
@@ -15232,7 +16955,8 @@
                       ],
                       "default": false
                     }
-                  }
+                  },
+                  "additionalProperties": true
                 },
                 true
               ]
@@ -15298,6 +17022,14 @@
                       "format": "uint32",
                       "minimum": 0,
                       "default": 5
+                    },
+                    "create_table": {
+                      "description": "Create the target table (and its schema, when `schema:` is set) if it\ndoes not exist, inferring the columns from the first written page\n(#580). Enabled by default: a first-ever sync cannot assume the\ndestination already exists.\n\nEvery inferred column is created **nullable** — a column that happened\nto be present in page 1 is not required forever, and a `NOT NULL`\ninferred from one page turns page 2 into a hard failure the first time\na record omits the field. Narrowing is the `schema:` drift policy's job.\n\nSet `false` to require the table to pre-exist and fail fast when it is\nmissing (the schema is managed externally, and a missing table means a\ntypo rather than a first run).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
                     },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
@@ -15460,6 +17192,14 @@
                       "description": "Target table name.",
                       "type": "string"
                     },
+                    "create_table": {
+                      "description": "Create the target table if it does not exist, inferring the column\n**names** from the first written page (#580). Enabled by default: a\nfirst-ever sync cannot assume the destination already exists.\n\nColumns are created as nullable `STRING`, not as inferred types,\nbecause the insert path projects every value with `::string` — a\n`NUMBER` column would reject its own writer's cast. Define the table\nyourself and set `create_table: false` when you want typed columns\n(then use `schema:` drift to keep them aligned).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
                     "auth": {
                       "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.\nA shared provider must yield a `Bearer` or `Token` credential, which\nmaps onto [`SnowflakeAuth::OAuth`]; key-pair JWT is always inline.",
                       "$ref": "#/$defs/sink_snowflake__AuthSpec"
@@ -15553,6 +17293,14 @@
                       "format": "uint32",
                       "minimum": 0,
                       "default": 5
+                    },
+                    "create_table": {
+                      "description": "Create the target table if it does not exist, inferring the columns\nfrom the first written page (#580). Enabled by default: a first-ever\nsync cannot assume the destination already exists.\n\nEvery inferred column is created **nullable** — a column that happened\nto be present in page 1 is not required forever, and a `NOT NULL`\ninferred from one page turns page 2 into a hard failure the first time\na record omits the field. Narrowing is the `schema:` drift policy's job.\n\nSet `false` to require the table to pre-exist and fail fast when it is\nmissing (the schema is managed externally, and a missing table means a\ntypo rather than a first run).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
                     },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
@@ -15683,12 +17431,12 @@
                       "default": 300
                     },
                     "create_table": {
-                      "description": "In `json_column` mode only, create the table if absent as\n`(id BIGINT IDENTITY PRIMARY KEY, <column> NVARCHAR(MAX))`. Rejected with\n`auto_columns` (schema inference is unsafe for MSSQL types). Defaults to false.",
+                      "description": "Create the target table if it does not exist (#580). Enabled by\ndefault: a first-ever sync cannot assume the destination already\nexists.\n\nIn `json_column` mode the shape is fixed —\n`(id BIGINT IDENTITY PRIMARY KEY, <column> NVARCHAR(MAX))`. In\n`auto_columns` mode the columns are inferred from the first written\npage, all nullable: a column present in page 1 is not required forever,\nand a `NOT NULL` inferred from one page fails page 2 the first time a\nrecord omits the field.\n\nSet `false` to require the table to pre-exist and fail fast when it is\nmissing.",
                       "type": [
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": true
                     },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
@@ -15782,6 +17530,14 @@
                       "minimum": 0,
                       "default": 1
                     },
+                    "create_table": {
+                      "description": "Create the target table if it does not exist, inferring the columns\nfrom the first written page (#580). Enabled by default: a first-ever\nsync cannot assume the destination already exists.\n\nEvery inferred column is created **nullable** — a column that happened\nto be present in page 1 is not required forever, and a `NOT NULL`\ninferred from one page turns page 2 into a hard failure the first time\na record omits the field. Narrowing is the `schema:` drift policy's job.\n\nSet `false` to require the table to pre-exist and fail fast when it is\nmissing (the schema is managed externally, and a missing table means a\ntypo rather than a first run).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
                     "write_mode": {
                       "description": "Append (default), upsert, or delete.",
                       "$ref": "#/$defs/sink_sqlite__WriteMode",
@@ -15861,6 +17617,14 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "create_table": {
+                      "description": "Create the target table if it does not exist, inferring the columns\nfrom the first written page (#580). Enabled by default: a first-ever\nsync cannot assume the destination already exists. Every inferred\ncolumn is created nullable. Set `false` to require the table to\npre-exist and fail fast when it is missing.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
                     }
                   }
                 },
@@ -16991,6 +18755,14 @@
                       "description": "Target table name.",
                       "type": "string"
                     },
+                    "create_table": {
+                      "description": "Create the target table if it does not exist, inferring the columns\nfrom the first written page (#580). Enabled by default: a first-ever\nsync cannot assume the destination already exists.\n\n**Spanner needs a primary key on every table**, and faucet has no basis\nto invent one — so auto-create applies only when `key:` is set (which\n`write_mode: upsert`/`delete` already require, and which Spanner\nrequires to equal the PK). Without a `key`, a missing table is an error\nnaming that requirement rather than a table with a made-up key column.\n\nInferred columns are `STRING(MAX)` apart from the key columns, because\nthe writer serialises values through the shared JSON→mutation encoder;\ndefine the table yourself and set `create_table: false` for typed\ncolumns.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
                     "batch_size": {
                       "description": "Maximum rows per Spanner commit. Defaults to [`DEFAULT_BATCH_SIZE`].\n\nEach chunk is applied as one atomic commit. Spanner additionally caps\na commit at ~80,000 mutated *cells* (rows × columns, plus secondary\nindex amplification), so the sink also splits chunks to stay under a\nconservative 60,000-cell budget regardless of `batch_size`.\n\n`batch_size = 0` is the \"no batching\" sentinel: the entire upstream\npage is written in as few commits as the cell budget allows.",
                       "type": [
@@ -17283,6 +19055,12 @@
             "config": {
               "anyOf": [
                 {
+                  "x-faucet-aliases": [
+                    "create_if_not_missing"
+                  ],
+                  "title": "DeltaSinkConfig",
+                  "description": "Configuration for the Delta Lake sink connector (append-only in v1).\n\nThe `table_uri` / `credentials` / `storage_options` keys are flattened in\nfrom the shared [`DeltaConnection`]. On first write the sink opens the\ntable (creating it from the inferred schema when `create_if_not_missing`),\nthen appends one Delta commit per `flush()`.",
+                  "type": "object",
                   "properties": {
                     "table_uri": {
                       "description": "Delta table location URI: `file:///abs/path`, `s3://bucket/key`,\n`abfss://…`, `gs://bucket/key`. A bare local path is accepted and\ntreated as `file://`.",
@@ -17303,8 +19081,8 @@
                       },
                       "default": {}
                     },
-                    "create_if_not_missing": {
-                      "description": "Create the table (and its schema, from the inferred record shape) on the\nfirst write when it does not already exist. When `false`, an absent\ntable fails the first write with a typed error.",
+                    "create_table": {
+                      "description": "Create the table (and its schema, from the inferred record shape) on the\nfirst write when it does not already exist. When `false`, an absent\ntable fails the first write with a typed error.\n\nSpelled `create_table` on the wire since #580, matching every other\ntable sink; the historical `create_if_not_missing` stays accepted as an\nalias. Same default (`true`): a first-ever sync cannot assume the\ndestination exists.",
                       "type": [
                         "boolean",
                         "string"
@@ -17349,10 +19127,7 @@
                       "format": "uint",
                       "minimum": 0
                     }
-                  },
-                  "title": "DeltaSinkConfig",
-                  "description": "Configuration for the Delta Lake sink connector (append-only in v1).\n\nThe `table_uri` / `credentials` / `storage_options` keys are flattened in\nfrom the shared [`DeltaConnection`]. On first write the sink opens the\ntable (creating it from the inferred schema when `create_if_not_missing`),\nthen appends one Delta commit per `flush()`.",
-                  "type": "object"
+                  }
                 },
                 true
               ]
@@ -17505,6 +19280,14 @@
                     "table_name": {
                       "description": "Target table name.",
                       "type": "string"
+                    },
+                    "create_table": {
+                      "description": "Create the target table (and its schema, when `schema:` is set) if it\ndoes not exist, inferring the columns from the first written page\n(#580). Enabled by default: a first-ever sync cannot assume the\ndestination already exists.\n\nEvery inferred column is created nullable, and without a DISTKEY or\nSORTKEY — faucet has no basis to choose either, and the wrong choice is\nbaked into the table. Define the table yourself and set\n`create_table: false` when distribution or sort matters, which it does\nfor any table you intend to query at scale.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
                     },
                     "schema": {
                       "description": "Optional schema (namespace) qualifying [`table_name`](Self::table_name).",
@@ -17774,6 +19557,14 @@
                       "minimum": 0,
                       "default": 1000
                     },
+                    "create_table": {
+                      "description": "Create the target table if it does not exist, inferring the columns\nfrom the first written page (#580). Enabled by default: a first-ever\nsync cannot assume the destination already exists. The table is created\nwith the `MergeTree` engine and `ORDER BY tuple()` — the neutral choice\nwhen faucet has no key to sort by; define the table yourself and set\n`create_table: false` when the sort key matters, which it does for any\ntable you intend to query at scale.\n\nEvery inferred column is `Nullable(…)`: a column present in page 1 is\nnot required forever, and ClickHouse rejects a null into a non-nullable\ncolumn, so inferring non-nullability would fail page 2.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
                     "async_insert": {
                       "description": "Enable ClickHouse [asynchronous inserts](https://clickhouse.com/docs/en/optimize/asynchronous-inserts)\n(`async_insert=1`): the server buffers rows and flushes them in the\nbackground, which greatly improves throughput for many small inserts.\nDefaults to `false`.",
                       "type": [
@@ -17927,1850 +19718,6 @@
           "additionalProperties": false
         }
       ]
-    },
-    "source_rest__TlsClientConfig": {
-      "description": "Client-certificate (mutual TLS) configuration for the HTTP sources.\n\nSupply **either** a PEM certificate + key pair (`client_cert` + `client_key`)\n**or** a PKCS#12 identity file (`client_identity_pkcs12` [+ `pkcs12_password`]).\nPEM values may be inline or pulled in with `${file:…}` / `${secret:…}` /\n`${vault:…}`; the PKCS#12 value is a path to a `.p12`/`.pfx` file (its binary\ncontent can't be embedded in a text config).",
-      "type": "object",
-      "properties": {
-        "client_cert": {
-          "description": "PEM-encoded client certificate chain. Pair with `client_key`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_key": {
-          "description": "PEM-encoded PKCS#8 private key. Pair with `client_cert`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_identity_pkcs12": {
-          "description": "Path to a PKCS#12 (`.p12`/`.pfx`) identity file — an alternative to the\nPEM pair.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pkcs12_password": {
-          "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "min_version": {
-          "description": "Minimum negotiated TLS version: `\"1.2\"` or `\"1.3\"`. Defaults to the\nTLS backend's own minimum when unset.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    "source_xml__TlsClientConfig": {
-      "description": "Client-certificate (mutual TLS) configuration for the HTTP sources.\n\nSupply **either** a PEM certificate + key pair (`client_cert` + `client_key`)\n**or** a PKCS#12 identity file (`client_identity_pkcs12` [+ `pkcs12_password`]).\nPEM values may be inline or pulled in with `${file:…}` / `${secret:…}` /\n`${vault:…}`; the PKCS#12 value is a path to a `.p12`/`.pfx` file (its binary\ncontent can't be embedded in a text config).",
-      "type": "object",
-      "properties": {
-        "client_cert": {
-          "description": "PEM-encoded client certificate chain. Pair with `client_key`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_key": {
-          "description": "PEM-encoded PKCS#8 private key. Pair with `client_cert`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_identity_pkcs12": {
-          "description": "Path to a PKCS#12 (`.p12`/`.pfx`) identity file — an alternative to the\nPEM pair.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pkcs12_password": {
-          "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "min_version": {
-          "description": "Minimum negotiated TLS version: `\"1.2\"` or `\"1.3\"`. Defaults to the\nTLS backend's own minimum when unset.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    "source_graphql__TlsClientConfig": {
-      "description": "Client-certificate (mutual TLS) configuration for the HTTP sources.\n\nSupply **either** a PEM certificate + key pair (`client_cert` + `client_key`)\n**or** a PKCS#12 identity file (`client_identity_pkcs12` [+ `pkcs12_password`]).\nPEM values may be inline or pulled in with `${file:…}` / `${secret:…}` /\n`${vault:…}`; the PKCS#12 value is a path to a `.p12`/`.pfx` file (its binary\ncontent can't be embedded in a text config).",
-      "type": "object",
-      "properties": {
-        "client_cert": {
-          "description": "PEM-encoded client certificate chain. Pair with `client_key`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_key": {
-          "description": "PEM-encoded PKCS#8 private key. Pair with `client_cert`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_identity_pkcs12": {
-          "description": "Path to a PKCS#12 (`.p12`/`.pfx`) identity file — an alternative to the\nPEM pair.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "pkcs12_password": {
-          "description": "Password for the PKCS#12 file (omit or empty if the file is unencrypted).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "min_version": {
-          "description": "Minimum negotiated TLS version: `\"1.2\"` or `\"1.3\"`. Defaults to the\nTLS backend's own minimum when unset.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    "ReconcileSpec": {
-      "description": "Top-level `reconcile:` block.",
-      "type": "object",
-      "properties": {
-        "count": {
-          "description": "The authoritative-count probe: a source that returns the expected row\ncount (as a single record / value).",
-          "$ref": "#/$defs/CountProbe"
-        },
-        "tolerance_pct": {
-          "description": "Allowed shortfall, as a percentage of the authoritative count. `0.0`\n(default) requires `written >= authoritative`. `1.0` tolerates up to a 1%\nshortfall before failing.",
-          "type": "number",
-          "format": "double",
-          "default": 0.0
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "count"
-      ]
-    },
-    "CountProbe": {
-      "description": "A source that yields the authoritative count.",
-      "type": "object",
-      "properties": {
-        "type": {
-          "description": "Connector type (e.g. `postgres`, `rest`).",
-          "type": "string"
-        },
-        "config": {
-          "description": "Connector-specific config (e.g. a `SELECT count(*) AS n …` query).",
-          "default": null
-        },
-        "count_field": {
-          "description": "Field in the probe's first record holding the count. When omitted, the\nfirst numeric field of the first record is used (so a bare\n`SELECT count(*)` works whatever the column is named).",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "type"
-      ]
-    },
-    "source_rest__ResponseFormat": {
-      "description": "How to parse the response body into records.",
-      "oneOf": [
-        {
-          "description": "JSON — extract records via `records_path` (JSONPath). The default.",
-          "type": "string",
-          "const": "json"
-        },
-        {
-          "description": "CSV — parse a tabular file body (each row → a JSON object). For\nauthenticated file endpoints (e.g. an export URL). Always available.",
-          "type": "string",
-          "const": "csv"
-        },
-        {
-          "description": "Excel (`.xlsx`/`.xls`) — parse a workbook body. Requires the crate's\n`excel` feature.",
-          "type": "string",
-          "const": "excel"
-        }
-      ]
-    },
-    "DiscoverSpec": {
-      "description": "A discovery dimension's source + projection (#501). See [`MatrixRow::discover`].",
-      "type": "object",
-      "properties": {
-        "source": {
-          "description": "Source to enumerate. Either a `{ ref: <name> }` pointing at a\n`pipeline.sources` template (recommended — reuses a complete connector\nconfig), or a standalone `{ type, config }`. It is **not** merged over\nthe `default` template — a discovery step is independent of the\npipeline's data source (which typically carries `${dim}` tokens meant\nfor the fan-out rows, not the enumeration).",
-          "$ref": "#/$defs/PartialConnector"
-        },
-        "select": {
-          "description": "JSONPath projecting the dimension value from each discovered record\n(e.g. `$.id`). `$` selects the whole record. Null / missing values are\nskipped with a warning.",
-          "type": "string"
-        },
-        "as": {
-          "description": "Alias the projected value is exposed under: a `for_each` row references\nit as `${<row_id>.<as>}`. Must match `^[a-z0-9][a-z0-9_-]*$`.",
-          "type": "string"
-        },
-        "collect": {
-          "description": "**Collected (list-valued) dimension** (#531). When `true`, the whole\ndeduped value-set is published as a single list per upstream tuple rather\nthan as an independent cartesian axis — so a consuming row injects the\nentire list into one request (`${<id>.<as>}` renders it comma-joined,\ne.g. HubSpot's `?properties=a,b,c`). Required when a `discover:` row also\ndeclares `for_each:` (chained / two-level discovery), and only meaningful\non a discovery row.",
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "source",
-        "select",
-        "as"
-      ]
-    },
-    "source_rest__BindFormat": {
-      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork.",
-      "oneOf": [
-        {
-          "description": "Emit the scalar verbatim (string as-is, number as its decimal form).\nThe default; no timestamp parsing.",
-          "type": "string",
-          "const": "raw"
-        },
-        {
-          "description": "RFC 3339 / ISO-8601 UTC timestamp, e.g. `2024-06-01T00:00:00Z`.",
-          "type": "string",
-          "const": "iso8601"
-        },
-        {
-          "description": "Unix epoch **seconds** (integer).",
-          "type": "string",
-          "const": "epoch_s"
-        },
-        {
-          "description": "Unix epoch **milliseconds** (integer).",
-          "type": "string",
-          "const": "epoch_ms"
-        },
-        {
-          "description": "Calendar date `YYYY-MM-DD` (UTC).",
-          "type": "string",
-          "const": "date"
-        }
-      ]
-    },
-    "source_rest__BindTarget": {
-      "description": "Where a rendered bookmark is injected into the outgoing request.",
-      "oneOf": [
-        {
-          "description": "A query-string parameter (default) — e.g. `?updated_after=…`.",
-          "type": "string",
-          "const": "query"
-        },
-        {
-          "description": "A request header — e.g. `If-Modified-Since: …`.",
-          "type": "string",
-          "const": "header"
-        },
-        {
-          "description": "A top-level field of the JSON request body (POST-search APIs).",
-          "type": "string",
-          "const": "body"
-        },
-        {
-          "description": "A `{name}` placeholder in the request path.",
-          "type": "string",
-          "const": "path"
-        }
-      ]
-    },
-    "source_rest__ODataConfig": {
-      "description": "OData protocol options for the REST source (#512).\n\nA minimal block — `{ entity: Orders }` — is enough; it derives paging,\nthe `$.value` envelope, and (for `faucet discover`) `$metadata` parsing.\nThe query-option fields render into the standard `$select`/`$filter`/\n`$expand`/`$orderby` params.",
-      "type": "object",
-      "properties": {
-        "version": {
-          "description": "Protocol version (default `v4`).",
-          "$ref": "#/$defs/source_rest__ODataVersion",
-          "default": "v4"
-        },
-        "entity": {
-          "description": "Entity set to read (appended to `base_url` as the path, e.g. `Orders`).\nOptional when the path already names the entity.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "select": {
-          "description": "`$select` — columns to return.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "expand": {
-          "description": "`$expand` — related entities to inline (one level).",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "filter": {
-          "description": "`$filter` — server-side filter expression (verbatim).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "orderby": {
-          "description": "`$orderby` — server-side ordering (verbatim).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "page_size": {
-          "description": "Server page size, sent as `Prefer: odata.maxpagesize=<n>`.",
-          "type": [
-            "integer",
-            "null",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "fan_out": {
-          "description": "**Experimental** (PRINCIPLES.md §3): the fan-out key group may change\nshape in a minor release; changes are called out in the changelog.\n\nFan out **at run time**: when `true`, `faucet run` / `faucet serve` turn the\n[`objects`](Self::objects) list into one matrix row per entity set (each\nwith its `odata.entity` selected and its sink `table_id` rendered from\n[`emit`](Self::emit)), so one generic template with\n`objects: \"${param.objects}\"` syncs any entity set passed at trigger — no\npre-generated matrix, no field discovery needed (OData returns every column\nby default). Default `false` (the block then only affects a single-entity\nrun / `faucet discover`). Same key and semantics as `discovery.fan_out`.",
-          "type": [
-            "boolean",
-            "string"
-          ],
-          "default": false
-        },
-        "objects": {
-          "description": "Entity sets to select — a YAML list **or** a comma-separated string (so a\nsingle string run-param can drive it: `objects: \"${param.objects}\"`).\nEmpty means fall back to `$metadata` discovery of every declared entity\nset (`faucet discover`). Same key and semantics as `discovery.objects`.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "emit": {
-          "description": "What each discovered/fanned-out entity emits (sink `table_id` template,\nsink routing, extra per-entity config). Same shape as `discovery.emit`.\nUnset ⇒ defaults (`table_id: \"${name_snake}\"`, the default sink).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/source_rest__EmitSpec"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "partition": {
-          "description": "Key-range partitioned extraction: split large entities into contiguous\nprimary-key ranges fetched concurrently, instead of one sequential\n`@odata.nextLink` page walk. See [`PartitionSpec`].",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/source_rest__PartitionSpec"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__ODataVersion": {
-      "description": "OData protocol version, which selects the paging-link key.",
-      "oneOf": [
-        {
-          "description": "OData v2 — JSON-light next link `odata.nextLink`.",
-          "type": "string",
-          "const": "v2"
-        },
-        {
-          "description": "OData v4 (default) — next link `@odata.nextLink`.",
-          "type": "string",
-          "const": "v4"
-        }
-      ]
-    },
-    "source_rest__ReplicationBind": {
-      "description": "Declarative binding of the stored bookmark into the **outgoing request** —\n\"server-side incremental push-down\" (#513).\n\nToday faucet tracks bookmarks and filters incrementally *client-side* (after\ndownload). A bind lets a source instead push the bookmark into the request\n(query param / header / body field / path) so the server returns only the\nnew rows. The existing client-side [`filter_incremental`] stays active as a\nsafety net for servers that don't honour the filter exactly.",
-      "type": "object",
-      "properties": {
-        "into": {
-          "description": "Where to place the rendered value.",
-          "$ref": "#/$defs/source_rest__BindTarget",
-          "default": "query"
-        },
-        "name": {
-          "description": "The parameter / header / body-field / path-placeholder name.",
-          "type": "string"
-        },
-        "template": {
-          "description": "Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by\nthe formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.\n`\"gte|${bookmark}\"` (Greenhouse) or `\"[${bookmark} TO *]\"` (Lucene).",
-          "type": "string",
-          "default": "${bookmark}"
-        },
-        "format": {
-          "description": "How to format the bookmark before substitution.",
-          "$ref": "#/$defs/source_rest__BindFormat",
-          "default": "raw"
-        },
-        "advance_from": {
-          "description": "Optional JSONPath into the response body to advance the bookmark from,\ninstead of `max(record[replication_key])`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "MetadataColumn": {
-      "description": "A metadata column to stamp onto every row.",
-      "oneOf": [
-        {
-          "description": "When the record entered the pipeline (ingest time). In the sink-decorator\nmodel this is captured just before the write, so it's ≈ `loaded_at`.",
-          "type": "string",
-          "const": "extracted_at"
-        },
-        {
-          "description": "Sink write time.",
-          "type": "string",
-          "const": "loaded_at"
-        },
-        {
-          "description": "The pipeline run id.",
-          "type": "string",
-          "const": "run_id"
-        },
-        {
-          "description": "The source connector kind / stream id.",
-          "type": "string",
-          "const": "source"
-        },
-        {
-          "description": "A monotonic per-run row ordinal.",
-          "type": "string",
-          "const": "sequence"
-        }
-      ]
-    },
-    "MetadataColumnsSpec": {
-      "description": "The `metadata_columns:` config block.",
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "description": "Master switch (default `true` when the block is present).",
-          "type": "boolean",
-          "default": true
-        },
-        "prefix": {
-          "description": "Column-name prefix (default `_faucet`).",
-          "type": "string",
-          "default": "_faucet"
-        },
-        "columns": {
-          "description": "Columns to stamp. Empty = the default set\n(`extracted_at`, `loaded_at`, `run_id`, `source`).",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/MetadataColumn"
-          },
-          "default": []
-        }
-      },
-      "additionalProperties": false
-    },
-    "sink_bigquery__OverwriteScope": {
-      "description": "Scope for a **scoped/windowed overwrite** (#518): with `write_mode:\noverwrite`, replace only the destination rows matching this scope instead of\ntruncating the whole table. The sink-side sibling of scoped cleanup (#478).\n\nv1 supports a half-open date/number **window** on a single column.",
-      "oneOf": [
-        {
-          "description": "Replace rows where `column` is in the half-open range `[from, to)`.",
-          "type": "object",
-          "properties": {
-            "window": {
-              "type": "object",
-              "properties": {
-                "column": {
-                  "description": "The destination column to window on.",
-                  "type": "string"
-                },
-                "from": {
-                  "description": "Inclusive lower bound."
-                },
-                "to": {
-                  "description": "Exclusive upper bound."
-                }
-              }
-            }
-          },
-          "additionalProperties": true
-        }
-      ]
-    },
-    "sink_postgres__OverwriteScope": {
-      "description": "Scope for a **scoped/windowed overwrite** (#518): with `write_mode:\noverwrite`, replace only the destination rows matching this scope instead of\ntruncating the whole table. The sink-side sibling of scoped cleanup (#478).\n\nv1 supports a half-open date/number **window** on a single column.",
-      "oneOf": [
-        {
-          "description": "Replace rows where `column` is in the half-open range `[from, to)`.",
-          "type": "object",
-          "properties": {
-            "window": {
-              "type": "object",
-              "properties": {
-                "column": {
-                  "description": "The destination column to window on.",
-                  "type": "string"
-                },
-                "from": {
-                  "description": "Inclusive lower bound."
-                },
-                "to": {
-                  "description": "Exclusive upper bound."
-                }
-              }
-            }
-          },
-          "additionalProperties": true
-        }
-      ]
-    },
-    "source_rest__AsyncJobConfig": {
-      "description": "The `async_job:` config block.",
-      "type": "object",
-      "properties": {
-        "submit": {
-          "description": "Job-creation request.",
-          "$ref": "#/$defs/source_rest__JobRequest"
-        },
-        "job_id": {
-          "description": "JSONPath to the job id in the submit response.",
-          "type": "string"
-        },
-        "poll": {
-          "description": "Status polling.",
-          "$ref": "#/$defs/source_rest__PollSpec"
-        },
-        "status": {
-          "description": "Terminal-state classification.",
-          "$ref": "#/$defs/source_rest__JobStatus"
-        },
-        "fetch": {
-          "description": "Result-download request.",
-          "$ref": "#/$defs/source_rest__JobRequest"
-        },
-        "lookback": {
-          "description": "Incremental replication only: re-read margin subtracted from the\npersisted bookmark, same grammar as `window.lookback` (`45s` / `30m` /\n`6h` / `30d`; default `5m`). The bookmark is the client's run-start\nclock, so without a margin a client clock running *ahead* of the server\nwould permanently skip records stamped in the gap; the margin turns\nthat loss into a bounded re-read (deduped by an upsert sink).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "query_path": {
-          "description": "Where the bulk **statement** sits inside the [`submit`](Self::submit)\nbody, as an RFC 6901 JSON Pointer (#654 M23). Defaults to `/query` — the\ntop-level `query` key that used to be hardcoded, so an API putting its\nstatement at `sql`, `statement`, or a nested path silently lost\nincremental push-down and collapsed every object onto one dataset\nidentity. Three behaviours read it: the incremental predicate\ninjection, `validate()`'s incremental gate, and the catalog/lineage\ndataset name.",
-          "type": "string",
-          "default": "/query"
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__DecodeStep": {
-      "description": "One step of the decode chain.",
-      "anyOf": [
-        {
-          "description": "Parameterless byte step (`base64` / `gunzip`).",
-          "$ref": "#/$defs/source_rest__SimpleStep"
-        },
-        {
-          "description": "Pull a (string) field out of a JSON body first.",
-          "type": "object",
-          "properties": {
-            "extract": {
-              "description": "JSONPath to a string field whose value becomes the buffer.",
-              "type": "string"
-            }
-          }
-        },
-        {
-          "description": "Select a member from a zip archive.",
-          "type": "object",
-          "properties": {
-            "unzip": {
-              "description": "Member selector.",
-              "$ref": "#/$defs/source_rest__UnzipSpec"
-            }
-          }
-        },
-        {
-          "description": "Terminal parse into records.",
-          "type": "object",
-          "properties": {
-            "parse": {
-              "description": "Parse options.",
-              "$ref": "#/$defs/source_rest__ParseSpec"
-            }
-          }
-        }
-      ]
-    },
-    "source_rest__JobRequest": {
-      "description": "One HTTP request in a job lifecycle (submit / fetch).",
-      "type": "object",
-      "properties": {
-        "method": {
-          "description": "HTTP method (default `GET`; set `POST` for `submit`).",
-          "type": "string",
-          "default": "GET"
-        },
-        "url": {
-          "description": "URL — absolute, or a `base_url`-relative path. `${job_id}` is substituted.\n\nRequired for `submit`. For `fetch`, set **exactly one** of `url` (a fixed\ntemplate) or [`url_from`](Self::url_from) (a JSONPath into the poll body).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "url_from": {
-          "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a Stripe report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "headers": {
-          "description": "Extra headers.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "query": {
-          "description": "Extra query params.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "json": {
-          "description": "JSON request body."
-        },
-        "locator_header": {
-          "description": "`fetch` only (#557): result-set continuation. Response header carrying a\npagination locator (e.g. Salesforce Bulk `Sforce-Locator`). While present\n(and not empty / `\"null\"`), the fetch is repeated with the locator sent as\n[`locator_param`](Self::locator_param), appending records across pages.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "locator_body": {
-          "description": "`fetch` only (#557): JSONPath into the fetch response **body** for the\ncontinuation locator, when it rides the body rather than a header.\nAlternative to [`locator_header`](Self::locator_header).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "locator_param": {
-          "description": "`fetch` only (#557): query-param name the locator is sent as on each\ncontinuation request. Required when a locator source is configured.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "records_path": {
-          "description": "`fetch` only (#557): JSONPath for extracting records from each fetch page,\noverriding the source-level `records_path`. Applies to a JSON result body.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "locator_terminal_values": {
-          "description": "`fetch` only (#654 M24): locator values that mean **no more pages**,\ncompared case-insensitively after trimming. Defaults to `[\"null\"]` — one\nvendor's sentinel, which used to be hardcoded in the pagination loop, so\nan API signalling completion with `none` / `-1` / `EOF` needed a code\nchange. An empty/whitespace locator is always terminal regardless of\nthis list; set it to `[]` to make *only* emptiness terminal.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__JobStatus": {
-      "description": "How to read the job's terminal state from a poll response.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "description": "JSONPath to the status value in the poll response.",
-          "type": "string"
-        },
-        "success": {
-          "description": "Status values meaning \"done — go fetch\".",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "failure": {
-          "description": "Status values meaning \"failed — abort\".",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__ParseFormat": {
-      "description": "Final-parse format for a decode chain.",
-      "oneOf": [
-        {
-          "description": "JSON (default).",
-          "type": "string",
-          "const": "json"
-        },
-        {
-          "description": "Delimited text.",
-          "type": "string",
-          "const": "csv"
-        },
-        {
-          "description": "Excel workbook (requires the crate's `excel` feature).",
-          "type": "string",
-          "const": "xlsx"
-        },
-        {
-          "description": "XML → JSON.",
-          "type": "string",
-          "const": "xml"
-        }
-      ]
-    },
-    "source_rest__ParseSpec": {
-      "description": "Parse the decoded bytes into records.",
-      "type": "object",
-      "properties": {
-        "format": {
-          "description": "Output format.",
-          "$ref": "#/$defs/source_rest__ParseFormat"
-        },
-        "records_path": {
-          "description": "JSONPath selecting the record array (json/xml). When omitted, an array\nbody becomes the records and an object becomes a single record.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "delimiter": {
-          "description": "CSV delimiter byte (default `,`).",
-          "type": [
-            "integer",
-            "null",
-            "string"
-          ],
-          "format": "uint8",
-          "minimum": 0,
-          "maximum": 255
-        },
-        "has_headers": {
-          "description": "Whether the first CSV row is a header (default `true`).",
-          "type": [
-            "boolean",
-            "string"
-          ],
-          "default": true
-        },
-        "sheet": {
-          "description": "Excel worksheet name / index-as-string (default: first).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "header_row": {
-          "description": "0-based Excel header row (default `0`).",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 0
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__PollSpec": {
-      "description": "The poll request + cadence.",
-      "type": "object",
-      "properties": {
-        "method": {
-          "description": "HTTP method (default `GET`).",
-          "type": "string",
-          "default": "GET"
-        },
-        "url": {
-          "description": "Status URL — absolute or `base_url`-relative; `${job_id}` substituted.",
-          "type": "string"
-        },
-        "headers": {
-          "description": "Extra headers.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "query": {
-          "description": "Extra query params.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "interval_secs": {
-          "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": 5
-        },
-        "timeout_secs": {
-          "description": "Give up after this many seconds (default `1800`).",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": 1800
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__SimpleStep": {
-      "description": "A byte-chain step with no parameters (`- base64`, `- gunzip`).",
-      "oneOf": [
-        {
-          "description": "Base64-decode the (UTF-8 text) buffer into bytes.",
-          "type": "string",
-          "const": "base64"
-        },
-        {
-          "description": "Gzip-decompress the buffer.",
-          "type": "string",
-          "const": "gunzip"
-        }
-      ]
-    },
-    "source_rest__UnzipSpec": {
-      "description": "Select a member of a zip archive.",
-      "type": "object",
-      "properties": {
-        "member": {
-          "description": "Glob (`*.csv`, `prefix*`, `*mid*`, or an exact name) selecting the member.\nWhen omitted, the first file entry is used.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__WindowSpec": {
-      "description": "Declarative in-run datetime window slicing (#527).",
-      "type": "object",
-      "properties": {
-        "step": {
-          "description": "Window size — `45s` / `30m` / `6h` / `30d`, or a bare integer (= seconds).\nAbsolute UTC durations (`d` = 24h); calendar/DST-correct windows are a\n[`faucet backfill`] concern, not the incremental cursor.",
-          "type": "string"
-        },
-        "lower": {
-          "description": "Lower-bound bind, rendered with the window **start**.",
-          "$ref": "#/$defs/source_rest__WindowBind"
-        },
-        "upper": {
-          "description": "Upper-bound bind, rendered with the window **end**.",
-          "$ref": "#/$defs/source_rest__WindowBind"
-        },
-        "granularity": {
-          "description": "Subtract this from each window's *rendered* upper bound so `[start, end]`\nis non-overlapping for inclusive-inclusive APIs (Airbyte\n`cursor_granularity`). Same grammar as `step`. The **persisted bookmark is\nalways the true half-open boundary**, so resume never gaps or overlaps —\nonly the value sent to the server is adjusted.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "lookback": {
-          "description": "Re-scan this much *before* the bookmark on the first window, to catch\nlate-arriving updates without a full replay. Same grammar as `step`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "max_windows": {
-          "description": "Safety cap on the number of windows enumerated in one run. On overflow the\nsweep is truncated (logged, never silently), and the next run resumes from\nthe last window's end.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 10000
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__WindowBind": {
-      "description": "Injects a rendered window boundary into the outgoing request — the window\nanalogue of [`ReplicationBind`](crate::ReplicationBind). Reuses the same\n[`BindTarget`] placement and [`BindFormat`] formatting.",
-      "type": "object",
-      "properties": {
-        "into": {
-          "description": "Where to place the rendered boundary (query param / header / body field /\npath placeholder).",
-          "$ref": "#/$defs/source_rest__BindTarget",
-          "default": "query"
-        },
-        "name": {
-          "description": "The parameter / header / body-field / path-placeholder name.",
-          "type": "string"
-        },
-        "template": {
-          "description": "Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the\nformatted boundary. Defaults to the bare `${window}`; set e.g.\n`\"gte|${window}\"` or `\"[${window} TO *]\"`.",
-          "type": "string",
-          "default": "${window}"
-        },
-        "format": {
-          "description": "How to format the boundary before substitution.",
-          "$ref": "#/$defs/source_rest__BindFormat",
-          "default": "raw"
-        }
-      },
-      "additionalProperties": true
-    },
-    "sink_clickhouse__ClickHouseStagingConfig": {
-      "description": "Staged-load configuration for the ClickHouse sink (#528).",
-      "type": "object",
-      "properties": {
-        "location": {
-          "description": "Object-store location to stage files under, e.g.\n`s3://my-bucket/faucet-stage/`. Scheme selects the backend\n(`s3://` / `gs://` / `az://`).",
-          "type": "string"
-        },
-        "format": {
-          "description": "File format written to the stage. Default `parquet`.",
-          "$ref": "#/$defs/sink_clickhouse__StagingFormat",
-          "default": "parquet"
-        },
-        "compression": {
-          "description": "Outer compression for `csv`/`jsonl` (ignored for `parquet`). Default `none`.",
-          "$ref": "#/$defs/sink_clickhouse__StagingCompression",
-          "default": "none"
-        },
-        "cleanup": {
-          "description": "When staged objects are deleted. Default `always`.",
-          "$ref": "#/$defs/sink_clickhouse__StagingCleanup",
-          "default": "always"
-        },
-        "copy_options": {
-          "description": "Extra options appended verbatim to the warehouse's native load command\n(e.g. Redshift `\"TIMEFORMAT 'auto' STATUPDATE ON\"`). Passed through\nunquoted — the operator owns its correctness.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "region": {
-          "description": "AWS region for the derived `s3()` URL (virtual-hosted). Ignored for `gs://`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "endpoint": {
-          "description": "Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /\nnon-AWS stores. Overrides `region`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "access_key": {
-          "description": "Access key the ClickHouse server uses to **read** the staged objects\n(the `s3()`/`gcs()` credentials). Omit to rely on the server's own IAM /\nconfigured access.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "secret_key": {
-          "description": "Secret paired with [`access_key`](Self::access_key).",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "sink_clickhouse__StagingCleanup": {
-      "description": "When staged objects are deleted after a load.",
-      "oneOf": [
-        {
-          "description": "Delete staged objects whether the load succeeded or failed (the default —\nkeeps the stage tidy).",
-          "type": "string",
-          "const": "always"
-        },
-        {
-          "description": "Delete only after a successful load; leave them on failure for inspection.",
-          "type": "string",
-          "const": "on_success"
-        },
-        {
-          "description": "Never delete — the caller/operator manages the stage lifecycle.",
-          "type": "string",
-          "const": "never"
-        }
-      ]
-    },
-    "sink_clickhouse__StagingCompression": {
-      "description": "Outer compression for text staging formats.",
-      "oneOf": [
-        {
-          "description": "No compression (the default).",
-          "type": "string",
-          "const": "none"
-        },
-        {
-          "description": "gzip (`.gz`).",
-          "type": "string",
-          "const": "gzip"
-        },
-        {
-          "description": "zstd (`.zst`).",
-          "type": "string",
-          "const": "zstd"
-        }
-      ]
-    },
-    "sink_clickhouse__StagingFormat": {
-      "description": "Physical file format written to the stage.",
-      "oneOf": [
-        {
-          "description": "One JSON object per line. The default — every warehouse can load it and\nit maps by column name (no positional column list needed).",
-          "type": "string",
-          "const": "jsonl"
-        },
-        {
-          "description": "Comma-separated values with a header row.",
-          "type": "string",
-          "const": "csv"
-        },
-        {
-          "description": "Apache Parquet. Columnar + compressed; the fastest to load where the\nwarehouse supports it. Written by the sink (needs Arrow), not by this\nmodule's byte serializers.",
-          "type": "string",
-          "const": "parquet"
-        }
-      ]
-    },
-    "sink_mssql__MssqlStagingConfig": {
-      "description": "Staged-load configuration for the MSSQL sink (#528). `COPY INTO` reads Azure\nBlob / ADLS Gen2 only, so `location` must be `az://…` and `format: csv`.",
-      "type": "object",
-      "properties": {
-        "location": {
-          "description": "Object-store location to stage files under, e.g.\n`s3://my-bucket/faucet-stage/`. Scheme selects the backend\n(`s3://` / `gs://` / `az://`).",
-          "type": "string"
-        },
-        "format": {
-          "description": "File format written to the stage. Default `parquet`.",
-          "$ref": "#/$defs/sink_mssql__StagingFormat",
-          "default": "parquet"
-        },
-        "compression": {
-          "description": "Outer compression for `csv`/`jsonl` (ignored for `parquet`). Default `none`.",
-          "$ref": "#/$defs/sink_mssql__StagingCompression",
-          "default": "none"
-        },
-        "cleanup": {
-          "description": "When staged objects are deleted. Default `always`.",
-          "$ref": "#/$defs/sink_mssql__StagingCleanup",
-          "default": "always"
-        },
-        "copy_options": {
-          "description": "Extra options appended verbatim to the warehouse's native load command\n(e.g. Redshift `\"TIMEFORMAT 'auto' STATUPDATE ON\"`). Passed through\nunquoted — the operator owns its correctness.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "storage_account": {
-          "description": "Azure storage account (the `az://` URI does not carry it) used to build\nthe `COPY INTO` HTTPS URL.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "endpoint": {
-          "description": "Explicit blob endpoint base (`host[/account]`, path-style) — for Azurite\n/ sovereign clouds. Overrides `storage_account`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "sas_token": {
-          "description": "Shared Access Signature token SQL Server uses to **read** the staged\nobjects. Omit to rely on the server's managed identity / configured access.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "sink_mssql__StagingCleanup": {
-      "description": "When staged objects are deleted after a load.",
-      "oneOf": [
-        {
-          "description": "Delete staged objects whether the load succeeded or failed (the default —\nkeeps the stage tidy).",
-          "type": "string",
-          "const": "always"
-        },
-        {
-          "description": "Delete only after a successful load; leave them on failure for inspection.",
-          "type": "string",
-          "const": "on_success"
-        },
-        {
-          "description": "Never delete — the caller/operator manages the stage lifecycle.",
-          "type": "string",
-          "const": "never"
-        }
-      ]
-    },
-    "sink_mssql__StagingCompression": {
-      "description": "Outer compression for text staging formats.",
-      "oneOf": [
-        {
-          "description": "No compression (the default).",
-          "type": "string",
-          "const": "none"
-        },
-        {
-          "description": "gzip (`.gz`).",
-          "type": "string",
-          "const": "gzip"
-        },
-        {
-          "description": "zstd (`.zst`).",
-          "type": "string",
-          "const": "zstd"
-        }
-      ]
-    },
-    "sink_mssql__StagingFormat": {
-      "description": "Physical file format written to the stage.",
-      "oneOf": [
-        {
-          "description": "One JSON object per line. The default — every warehouse can load it and\nit maps by column name (no positional column list needed).",
-          "type": "string",
-          "const": "jsonl"
-        },
-        {
-          "description": "Comma-separated values with a header row.",
-          "type": "string",
-          "const": "csv"
-        },
-        {
-          "description": "Apache Parquet. Columnar + compressed; the fastest to load where the\nwarehouse supports it. Written by the sink (needs Arrow), not by this\nmodule's byte serializers.",
-          "type": "string",
-          "const": "parquet"
-        }
-      ]
-    },
-    "source_xml__DecodeStep": {
-      "description": "One step of the decode chain.",
-      "anyOf": [
-        {
-          "description": "Parameterless byte step (`base64` / `gunzip`).",
-          "$ref": "#/$defs/source_xml__SimpleStep"
-        },
-        {
-          "description": "Pull a (string) field out of a JSON body first.",
-          "type": "object",
-          "properties": {
-            "extract": {
-              "description": "JSONPath to a string field whose value becomes the buffer.",
-              "type": "string"
-            }
-          }
-        },
-        {
-          "description": "Select a member from a zip archive.",
-          "type": "object",
-          "properties": {
-            "unzip": {
-              "description": "Member selector.",
-              "$ref": "#/$defs/source_xml__UnzipSpec"
-            }
-          }
-        },
-        {
-          "description": "Terminal parse into records.",
-          "type": "object",
-          "properties": {
-            "parse": {
-              "description": "Parse options.",
-              "$ref": "#/$defs/source_xml__ParseSpec"
-            }
-          }
-        }
-      ]
-    },
-    "source_xml__ParseFormat": {
-      "description": "Final-parse format for a decode chain.",
-      "oneOf": [
-        {
-          "description": "JSON (default).",
-          "type": "string",
-          "const": "json"
-        },
-        {
-          "description": "Delimited text.",
-          "type": "string",
-          "const": "csv"
-        },
-        {
-          "description": "Excel workbook (requires the crate's `excel` feature).",
-          "type": "string",
-          "const": "xlsx"
-        },
-        {
-          "description": "XML → JSON.",
-          "type": "string",
-          "const": "xml"
-        }
-      ]
-    },
-    "source_xml__ParseSpec": {
-      "description": "Parse the decoded bytes into records.",
-      "type": "object",
-      "properties": {
-        "format": {
-          "description": "Output format.",
-          "$ref": "#/$defs/source_xml__ParseFormat"
-        },
-        "records_path": {
-          "description": "JSONPath selecting the record array (json/xml). When omitted, an array\nbody becomes the records and an object becomes a single record.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "delimiter": {
-          "description": "CSV delimiter byte (default `,`).",
-          "type": [
-            "integer",
-            "null",
-            "string"
-          ],
-          "format": "uint8",
-          "minimum": 0,
-          "maximum": 255
-        },
-        "has_headers": {
-          "description": "Whether the first CSV row is a header (default `true`).",
-          "type": [
-            "boolean",
-            "string"
-          ],
-          "default": true
-        },
-        "sheet": {
-          "description": "Excel worksheet name / index-as-string (default: first).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "header_row": {
-          "description": "0-based Excel header row (default `0`).",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 0
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_xml__SimpleStep": {
-      "description": "A byte-chain step with no parameters (`- base64`, `- gunzip`).",
-      "oneOf": [
-        {
-          "description": "Base64-decode the (UTF-8 text) buffer into bytes.",
-          "type": "string",
-          "const": "base64"
-        },
-        {
-          "description": "Gzip-decompress the buffer.",
-          "type": "string",
-          "const": "gunzip"
-        }
-      ]
-    },
-    "source_xml__UnzipSpec": {
-      "description": "Select a member of a zip archive.",
-      "type": "object",
-      "properties": {
-        "member": {
-          "description": "Glob (`*.csv`, `prefix*`, `*mid*`, or an exact name) selecting the member.\nWhen omitted, the first file entry is used.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__RecordCursorTarget": {
-      "description": "Where a [`PaginationStyle::RecordFieldCursor`] keyset value is injected on the\nnext request.",
-      "oneOf": [
-        {
-          "description": "Inject the cursor as a query parameter (default).",
-          "type": "string",
-          "const": "query"
-        },
-        {
-          "description": "Inject the cursor into the JSON request body.",
-          "type": "string",
-          "const": "body"
-        }
-      ]
-    },
-    "source_rest__RecordCursorAgg": {
-      "description": "How a [`PaginationStyle::RecordFieldCursor`] aggregates the cursor field over\na page.",
-      "oneOf": [
-        {
-          "description": "The maximum value seen so far (ascending keyset, the default).",
-          "type": "string",
-          "const": "max"
-        },
-        {
-          "description": "The minimum value seen so far (descending keyset).",
-          "type": "string",
-          "const": "min"
-        }
-      ]
-    },
-    "source_rest__RecordsMultiSpec": {
-      "description": "One entry in a [`RestStreamConfig::records_multi`] fan-out (#548): a JSONPath\nselecting an array of records, plus the op marker each is stamped with.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "description": "JSONPath selecting an array of records (e.g. `\"$.added[*]\"`).",
-          "type": "string",
-          "default": ""
-        },
-        "op": {
-          "description": "Op marker stamped onto each record from `path` under\n[`RestStreamConfig::op_field`] (e.g. `upsert` / `delete`, or `u` / `d`).",
-          "type": "string"
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_graphql__GraphqlPaginationSpec": {
-      "description": "Pagination style for the GraphQL source.\n\nDeserialized **untagged** so the legacy cursor block (which carries no\n`type:` discriminator) keeps working unchanged, while the offset block is\nselected by its required `type: Offset` field. The two field sets are\ndisjoint (cursor requires `cursor_path` / `has_next_page_path`; offset\nrequires `type` / `offset_variable` / `page_size`), so serde routes each\nconfig to exactly one variant. The cursor variant is tried first.",
-      "anyOf": [
-        {
-          "description": "Relay-style cursor pagination (the original, `type`-less shape).",
-          "$ref": "#/$defs/source_graphql__GraphqlPagination"
-        },
-        {
-          "description": "Offset-into-variable pagination — selected by `type: Offset`.",
-          "$ref": "#/$defs/source_graphql__GraphqlOffsetPagination"
-        }
-      ]
-    },
-    "source_graphql__GraphqlOffsetPagination": {
-      "description": "Offset-into-query-variable pagination (ShopifyQL and similar).\n\nIncrements an integer offset injected into a GraphQL variable and\nterminates on a **short page** (fewer than `page_size` records) — unlike\ncursor pagination, which follows a `pageInfo` boolean. Suited to APIs whose\nquery language embeds `LIMIT … OFFSET …` (e.g. ShopifyQL): bake the limit\ninto the query string and parameterize only the offset with `${…}`.\n\nThe offset starts at `0`, is sent as a JSON number in the `variables` map on\nevery request, and advances by `page_size` after each page.",
-      "type": "object",
-      "properties": {
-        "type": {
-          "description": "Discriminator — must be `Offset`.",
-          "$ref": "#/$defs/source_graphql__OffsetPaginationKind"
-        },
-        "offset_variable": {
-          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, incremented by `page_size`\nafter each page). Reference it from the query string or as a variable\n(e.g. `${q_offset}` for ShopifyQL).",
-          "type": "string"
-        },
-        "page_size": {
-          "description": "Records requested per page. Used both to advance the offset\n(`offset += page_size`) and, with `stop_when_short`, to detect the final\npage. Must be greater than `0`. This value is **not** injected into the\nrequest — bake the limit into your query (`LIMIT 250 OFFSET ${q_offset}`).",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "stop_when_short": {
-          "description": "Terminate when a page yields fewer than `page_size` records (default\n`true`). When `false`, pagination continues until a fully empty page (or\n`max_pages`) is reached.",
-          "type": [
-            "boolean",
-            "string"
-          ],
-          "default": true
-        },
-        "substitute_in_query": {
-          "description": "Substitute `${offset_variable}` occurrences in the **query string** with\nthe current offset before each request, instead of sending it as a\nGraphQL variable. Required for query languages that embed the offset in a\nstring-literal argument — e.g. ShopifyQL's\n`shopifyqlQuery(query: \"… LIMIT 250 OFFSET ${q_offset}\")`, where a GraphQL\nvariable cannot interpolate into a string literal (#569). Default\n`false` (variable injection, the #550 behavior).",
-          "type": [
-            "boolean",
-            "string"
-          ],
-          "default": false
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_graphql__OffsetPaginationKind": {
-      "description": "Discriminator for [`GraphqlOffsetPagination`]; serializes as `\"Offset\"`.\n\nA dedicated single-variant enum (rather than a bare `String`) so the\n`type: Offset` marker is validated at config-load time and gives the\nuntagged [`GraphqlPaginationSpec`] a reliable way to route an offset block.",
-      "oneOf": [
-        {
-          "description": "The offset pagination style.",
-          "type": "string",
-          "const": "Offset"
-        }
-      ]
-    },
-    "LocalOutputsSpec": {
-      "description": "The top-level `local_outputs:` block: how long the local files this\npipeline's sinks write are kept, and whether faucet records them at all.\n\n```yaml\nlocal_outputs:\n  retention_days: 3   # this pipeline's outputs are collectable after 3 days\n```\n\nThe block is optional. Without it a pipeline still records its local outputs\n(so they can be listed and cleaned) and inherits the runtime's default\nwindow — `--local-output-retention-days` /\n`FAUCET_LOCAL_SINK_OUTPUT_RETENTION_DAYS`, itself 7 days by default.\n\nRecording needs somewhere to record *to*: under `faucet serve` that is the\n`--history` backend; for `faucet run` / `schedule` / `replicate` it is the\n`catalog:` block's store. Without either, tracking is inert and a one-line\nwarning says so rather than failing the run — a pipeline must never break\nbecause a housekeeping ledger was unavailable.",
-      "type": "object",
-      "properties": {
-        "track": {
-          "description": "Record the local files this pipeline's sinks write, so they can be listed\nin the console and reclaimed by the GC. Default `true`.\n\nSetting `false` opts the pipeline out of the ledger entirely: its outputs\nare never listed and — because the GC only ever deletes recorded paths —\nnever automatically deleted either.",
-          "type": "boolean",
-          "default": true
-        },
-        "retention_days": {
-          "description": "Retention window for this pipeline's outputs, in days, overriding the\nruntime default. `0` keeps them forever.\n\nMeasured from the last time faucet wrote the file, so an output a local\nrun keeps refreshing does not expire underneath it.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0
-        }
-      },
-      "additionalProperties": false
-    },
-    "source_rest__TokenBodyEncoding": {
-      "description": "Body encoding for the token-endpoint request.",
-      "oneOf": [
-        {
-          "description": "JSON body (`application/json`) — the default (back-compat).",
-          "type": "string",
-          "const": "json"
-        },
-        {
-          "description": "Form-urlencoded body (`application/x-www-form-urlencoded`) — required by\nRFC-6749 OAuth token endpoints (Salesforce, Google, most OAuth servers),\nwhich reject a JSON body with `unsupported_grant_type`.",
-          "type": "string",
-          "const": "form"
-        }
-      ]
-    },
-    "source_rest__EmitSpec": {
-      "description": "**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.\n\nWhat each discovered dataset **emits** — shared by every discovery mechanism\n(`discovery.emit` and `odata.emit`), so the vocabulary is identical wherever\ndatasets fan out. All string leaves are templates over the dataset:\n`${name}` (verbatim), `${name_snake}`, `${name_lower}`, and (where a\n`describe` step ran) `${field_names}`.",
-      "type": "object",
-      "properties": {
-        "config": {
-          "description": "A JSON object deep-merged into the dataset's source config (e.g. an\n`async_job` query, or extra per-entity overrides). Every string leaf is\ntemplated. Optional for mechanisms whose selection patch is implicit\n(OData sets `odata.entity` itself)."
-        },
-        "table_id": {
-          "description": "Sink `table_id` template (e.g. `\"raw_${name_snake}\"`). Rendered per\ndataset into the descriptor's `sink_patch`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "sink_ref": {
-          "description": "Sink template (an entry under `pipeline.sinks`) each fanned-out dataset\nroutes to. Unset ⇒ the default (singular `pipeline.sink`) template, with\nthe rendered `table_id` merged in.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__PartitionSpec": {
-      "description": "**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.\n\nKey-range partitioned extraction of a paged dataset (`odata.partition`):\ntile the dataset's integer primary-key space into contiguous ranges and\nfetch them concurrently. Range planning is\n[`faucet_core::shard::plan_pk_shards`] — the same primitive the SQL sources\nshard with, including its unbounded first/last ranges (rows inserted below\nMIN / above MAX during the run are still read).",
-      "type": "object",
-      "properties": {
-        "objects": {
-          "description": "With `fan_out`: which datasets to partition (a YAML list or a\ncomma-separated string). Each listed dataset whose `$metadata` declares a\n**single integer** key partitions on it; others fall back to sequential\npaging. Empty on a single-entity run (where [`key`](Self::key) applies\ndirectly).",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "key": {
-          "description": "Integer key column to range-split on. On the fan-out path this is derived\nfrom `$metadata` per dataset; set it explicitly for a single-entity run.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "workers": {
-          "description": "Concurrent range readers (default [`DEFAULT_PARTITION_WORKERS`], clamped\nto [`MAX_PARTITION_WORKERS`]).",
-          "type": [
-            "integer",
-            "null",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "count": {
-          "description": "Number of ranges to tile into (default `workers ×`\n[`RANGES_PER_WORKER`], clamped to [`MAX_PARTITION_COUNT`]).",
-          "type": [
-            "integer",
-            "null",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__DiscoverySpec": {
-      "description": "A generic discovery recipe on a REST source.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
-      "type": "object",
-      "properties": {
-        "list": {
-          "description": "Step 1 — enumerate datasets from a listing endpoint. Optional: omit it and\nsupply [`objects`](Self::objects) directly (e.g. from a run param).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/source_rest__DiscoveryList"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "objects": {
-          "description": "Datasets supplied directly — a YAML list **or** a comma-separated string\n(`\"A,B,C\"`), so a single string run-param can drive it\n(`objects: \"${param.objects}\"`). Used instead of `list` when non-empty.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "describe": {
-          "description": "Step 2 — per-dataset field discovery (builds a typed schema + a field list\nto template into `emit`). Optional: omit when the dataset needs no field\nenumeration (e.g. an API that returns every column by default).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/source_rest__DiscoveryDescribe"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "emit": {
-          "description": "Step 3 — what each discovered dataset emits (the source `config_patch`\nthat selects it, an optional sink `table_id` template, and sink routing).\nShared shape with `odata.emit` ([`EmitSpec`](crate::config::EmitSpec));\n`emit.config` is required here — it is what selects the dataset.",
-          "$ref": "#/$defs/source_rest__EmitSpec"
-        },
-        "fan_out": {
-          "description": "Fan out **at run time**: `faucet run` / `serve` turn the discovered\ndatasets into one matrix row each, before `expand`. Default `false`\n(the block then only powers `faucet discover`). Same key and semantics\nas `odata.fan_out`.",
-          "type": [
-            "boolean",
-            "string"
-          ],
-          "default": false
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__DiscoveryList": {
-      "description": "Step 1 — the listing request + how to read dataset names out of its response.",
-      "type": "object",
-      "properties": {
-        "get": {
-          "description": "Request path (relative to the source `base_url`); `GET`.",
-          "type": "string"
-        },
-        "items": {
-          "description": "JSONPath selecting the array of listing items (e.g. `$.objects[*]`).",
-          "type": "string"
-        },
-        "name": {
-          "description": "JSONPath, relative to each item, yielding its name (e.g. `$.name`).",
-          "type": "string"
-        },
-        "keep_if": {
-          "description": "Optional keep-if predicate over each item (e.g. `queryable == true`).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/source_rest__DiscoveryPredicate"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "exclude_name_suffixes": {
-          "description": "Drop any dataset whose name ends with one of these suffixes (e.g.\n`[ChangeEvent, Feed, Share, History]`). Vendor-neutral name filtering.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__DiscoveryPredicate": {
-      "description": "A keep-if predicate: keep a listing item when the value at `path` equals\n`equals`.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "description": "JSONPath relative to the item.",
-          "type": "string"
-        },
-        "equals": {
-          "description": "Keep the item iff the extracted value equals this."
-        }
-      },
-      "additionalProperties": true
-    },
-    "source_rest__DiscoveryDescribe": {
-      "description": "Step 2 — the per-dataset describe request + how to read fields + types.",
-      "type": "object",
-      "properties": {
-        "get": {
-          "description": "Request path template (relative to `base_url`), with `${name}` for the\ndataset (e.g. `/catalog/objects/${name}/fields`); `GET`.",
-          "type": "string"
-        },
-        "fields": {
-          "description": "JSONPath selecting the array of field objects (e.g. `$.fields[*]`).",
-          "type": "string"
-        },
-        "field_name": {
-          "description": "JSONPath, relative to each field, yielding its name.",
-          "type": "string"
-        },
-        "field_type": {
-          "description": "JSONPath, relative to each field, yielding its raw type string. Absent ⇒\nno typed schema is built (fields are still listed for templating).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "field_nullable": {
-          "description": "JSONPath, relative to each field, yielding a truthy \"is nullable\" flag.\nAbsent ⇒ every column is nullable.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "type_map": {
-          "description": "Raw-type → JSON-Schema-type map (`integer` / `number` / `boolean` /\n`string` / `object` / `array`). Key `\"*\"` is the fallback; absent ⇒\n`string`.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "skip_types": {
-          "description": "Drop fields whose raw type is one of these (e.g. compound / blob types\nnot selectable in a query).",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": true
-    },
-    "DispatchOrder": {
-      "description": "How the executor orders ready sibling rows competing for permits (#644).\n\nOnly the *enqueue order* changes; the permit budget, the `JoinSet`, and the\n`on_error` cancellation are untouched.",
-      "oneOf": [
-        {
-          "description": "Matrix-declaration order (BFS). The default, and fully deterministic.",
-          "type": "string",
-          "const": "declared"
-        },
-        {
-          "description": "Longest-processing-time-first: heaviest rows claim permits first.\n\nWith heterogeneous row durations, makespan otherwise depends on the\norder the user happened to list rows in — a large object listed late\nbecomes an idle tail (measured: two big Salesforce objects finishing\n~9 min after the other 19, with 6 of 8 slots idle). LPT is provably\nwithin 4/3 of optimal for `P || Cmax`, and largest-*last* — which plain\ndeclaration order can accidentally produce — is the worst case.\n\nRows are ranked by [`MatrixRow::weight`]; ties and missing weights fall\nback to declaration order, so dispatch is never nondeterministic.",
-          "type": "string",
-          "const": "lpt"
-        }
-      ]
-    },
-    "sink_sqs__PartialRetrySpec": {
-      "description": "Per-record retry budget for a sink whose bulk API reports **partial**\nfailures (#654 M20).\n\nAWS batch APIs (`PutRecords`, `SendMessageBatch`) return a 200 whose body\nmarks individual entries as failed; the sink retries just those entries with\njittered exponential backoff. The three knobs that describe it used to sit\nflat and byte-identical in two connector configs, beside unrelated sizing\nkeys — one block, one definition, per Principle 4.",
-      "type": "object",
-      "properties": {
-        "max_attempts": {
-          "description": "Attempts per record before it is reported failed (DLQ-routable).\nDefault 5; `1` means \"no retry\".",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 5
-        },
-        "initial_backoff_ms": {
-          "description": "First backoff, in milliseconds. Doubles per attempt, jittered by the\nshared [`apply_jitter`]. Default 100.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": 100
-        },
-        "max_backoff_ms": {
-          "description": "Backoff ceiling in milliseconds, applied before jitter. Default 30000.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": 30000
-        }
-      },
-      "additionalProperties": true
-    },
-    "sink_kafka__KafkaExactlyOnceSpec": {
-      "description": "Exactly-once delivery knobs for the Kafka sink (#654 M20).\n\nThese four apply **only** under `delivery: exactly_once` — the transactional\nproducer and its compacted commit-token side-topic. They used to sit flat\nbeside `brokers` / `linger_ms`, where nothing said they were inert in the\ndefault at-least-once mode; grouping them is what makes that legible.",
-      "type": "object",
-      "properties": {
-        "transactional_id_prefix": {
-          "description": "Namespace prefix for the producer's auto-derived `transactional.id`.\nThe id is `\"{prefix}.{sanitized_scope}\"`; defaults to `\"faucet\"`. Set it\nto isolate transactional ids across clusters or environments that share\na pipeline scope namespace.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "commit_token_topic": {
-          "description": "Compacted side-topic holding one commit-token record per pipeline\nscope. Auto-created with `cleanup.policy=compact` if absent.",
-          "type": "string",
-          "default": "__faucet_commit_token"
-        },
-        "commit_token_topic_partitions": {
-          "description": "Partition count used when auto-creating the commit-token topic.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "int32",
-          "default": 1
-        },
-        "commit_token_topic_replication": {
-          "description": "Replication factor used when auto-creating the commit-token topic.\n`-1` means \"use the broker default\".",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "int32",
-          "default": -1
-        }
-      },
-      "additionalProperties": true
-    },
-    "sink_kinesis__PartialRetrySpec": {
-      "description": "Per-record retry budget for a sink whose bulk API reports **partial**\nfailures (#654 M20).\n\nAWS batch APIs (`PutRecords`, `SendMessageBatch`) return a 200 whose body\nmarks individual entries as failed; the sink retries just those entries with\njittered exponential backoff. The three knobs that describe it used to sit\nflat and byte-identical in two connector configs, beside unrelated sizing\nkeys — one block, one definition, per Principle 4.",
-      "type": "object",
-      "properties": {
-        "max_attempts": {
-          "description": "Attempts per record before it is reported failed (DLQ-routable).\nDefault 5; `1` means \"no retry\".",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint",
-          "minimum": 0,
-          "default": 5
-        },
-        "initial_backoff_ms": {
-          "description": "First backoff, in milliseconds. Doubles per attempt, jittered by the\nshared [`apply_jitter`]. Default 100.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": 100
-        },
-        "max_backoff_ms": {
-          "description": "Backoff ceiling in milliseconds, applied before jitter. Default 30000.",
-          "type": [
-            "integer",
-            "string"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": 30000
-        }
-      },
-      "additionalProperties": true
-    },
-    "sink_redshift__RedshiftCopySpec": {
-      "description": "`COPY`-path settings for the Redshift sink (#654 M20).\n\nSix keys that only mean anything under `write_strategy: copy` used to sit\nflat beside `table_name` and `batch_size`, with nothing saying they were\ninert for `insert`. Grouping them is what makes that legible — the same\nshape the BigQuery sink already uses for `bulk_load:`.",
-      "type": "object",
-      "properties": {
-        "format": {
-          "description": "Staged-file format. Defaults to [`RedshiftCopyFormat::Jsonl`].",
-          "$ref": "#/$defs/sink_redshift__RedshiftCopyFormat",
-          "default": "jsonl"
-        },
-        "staging_bucket": {
-          "description": "S3 bucket used to stage `COPY` files. **Required** for `copy`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "staging_prefix": {
-          "description": "Key prefix for staged objects (e.g. `redshift-staging/`). Empty by\ndefault.",
-          "type": "string",
-          "default": ""
-        },
-        "iam_role": {
-          "description": "IAM role ARN Redshift assumes to read the staged file\n(`COPY … IAM_ROLE '<arn>'`). **Required** for `copy`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "region": {
-          "description": "AWS region of the staging bucket, used for both the S3 client and the\n`COPY … REGION '<region>'` clause. `None` uses the SDK default.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "endpoint_url": {
-          "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO) — a testing\naid; production loads use real S3.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": true
     }
   }
 }

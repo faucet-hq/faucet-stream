@@ -10,6 +10,7 @@ use std::time::Duration;
 
 /// Configuration for the WebSocket source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-aliases" = ["max_reconnect_attempts", "reconnect_initial_backoff"]))]
 #[serde(deny_unknown_fields)]
 pub struct WebsocketSourceConfig {
     /// WebSocket endpoint, `ws://` or `wss://`. Supports `{placeholder}`

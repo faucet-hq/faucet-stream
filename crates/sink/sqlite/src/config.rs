@@ -59,6 +59,20 @@ pub struct SqliteSinkConfig {
     /// read concurrently with the single writer).
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// Create the target table if it does not exist, inferring the columns
+    /// from the first written page (#580). Enabled by default: a first-ever
+    /// sync cannot assume the destination already exists.
+    ///
+    /// Every inferred column is created **nullable** — a column that happened
+    /// to be present in page 1 is not required forever, and a `NOT NULL`
+    /// inferred from one page turns page 2 into a hard failure the first time
+    /// a record omits the field. Narrowing is the `schema:` drift policy's job.
+    ///
+    /// Set `false` to require the table to pre-exist and fail fast when it is
+    /// missing (the schema is managed externally, and a missing table means a
+    /// typo rather than a first run).
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
     /// Write mode, key columns, and optional delete marker. `write_mode`
     /// defaults to `append`. Upsert/delete require `column_mapping: auto_map`
     /// and a UNIQUE/PRIMARY KEY constraint on `key`.
@@ -68,6 +82,10 @@ pub struct SqliteSinkConfig {
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+fn default_create_table() -> bool {
+    true
 }
 
 fn default_max_connections() -> u32 {
@@ -83,11 +101,18 @@ impl SqliteSinkConfig {
             column_mapping: SqliteColumnMapping::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             max_connections: default_max_connections(),
+            create_table: default_create_table(),
             write: faucet_core::WriteSpec::default(),
         }
     }
 
     /// Set the column mapping strategy.
+    /// Opt out of auto-creating a missing target table (#580).
+    pub fn with_create_table(mut self, create: bool) -> Self {
+        self.create_table = create;
+        self
+    }
+
     pub fn column_mapping(mut self, mapping: SqliteColumnMapping) -> Self {
         self.column_mapping = mapping;
         self

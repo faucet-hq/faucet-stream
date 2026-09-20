@@ -232,6 +232,11 @@ impl Default for ParquetOpts {
 /// `FaucetError::Config` at startup.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+// Serde aliases are invisible to schemars, and the registry's unknown-key gate
+// (#654 H9) reads the schema — so a key serde accepts but the schema does not
+// list would be rejected before it ever reached serde. Declared here so the
+// two agree.
+#[schemars(extend("x-faucet-aliases" = ["create_if_missing"]))]
 pub struct IcebergSinkConfig {
     /// Iceberg catalog connection settings.
     pub catalog: CatalogConfig,
@@ -246,7 +251,15 @@ pub struct IcebergSinkConfig {
     /// Create the table if it does not exist, inferring the schema from the
     /// first batch. When `false`, `load_table` is called at startup and an
     /// absent table causes a `FaucetError::Sink` immediately.
-    #[serde(default = "default_create_if_missing")]
+    ///
+    /// Spelled `create_table` on the wire since #580, matching every other
+    /// table sink; the historical `create_if_missing` stays accepted as an
+    /// alias. Same default (`true`).
+    #[serde(
+        default = "default_create_if_missing",
+        rename = "create_table",
+        alias = "create_if_missing"
+    )]
     pub create_if_missing: bool,
 
     /// Partition fields applied when creating the table. Ignored on writes to

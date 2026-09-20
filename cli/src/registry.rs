@@ -1139,6 +1139,13 @@ fn collect_schema_keys(
     if let Some(props) = obj.get("properties").and_then(Value::as_object) {
         out.extend(props.keys().cloned());
     }
+    // Serde `alias`es are invisible to schemars, so a config declaring one
+    // lists it under `x-faucet-aliases` (via `#[schemars(extend(...))]`).
+    // Without this the gate would reject a key serde would have accepted —
+    // which is exactly how a documented back-compat alias stops working.
+    if let Some(aliases) = obj.get("x-faucet-aliases").and_then(Value::as_array) {
+        out.extend(aliases.iter().filter_map(Value::as_str).map(str::to_string));
+    }
     if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
         let Some(target) = resolve_local_ref(root, r) else {
             return false;
@@ -2946,6 +2953,27 @@ mod tests {
         // A key in no branch is still caught.
         let bad = json!({ "host": "h", "usernme": "u" });
         assert!(reject_unknown_config_keys("source", "sftp", "row", &bad, &schema).is_err());
+    }
+
+    #[test]
+    fn a_declared_serde_alias_is_accepted() {
+        // schemars does not emit serde `alias`es, so a config that declares
+        // one lists it under `x-faucet-aliases`. Without this the gate would
+        // reject a key serde accepts — which is how a documented back-compat
+        // alias silently stops working (#580 hit exactly this on delta and
+        // iceberg's `create_table` rename).
+        let schema = json!({
+            "type": "object",
+            "properties": { "create_table": {} },
+            "x-faucet-aliases": ["create_if_missing"]
+        });
+        let cfg = json!({ "create_if_missing": true });
+        assert!(reject_unknown_config_keys("sink", "iceberg", "row", &cfg, &schema).is_ok());
+        // An undeclared key is still rejected.
+        assert!(
+            reject_unknown_config_keys("sink", "iceberg", "row", &json!({"nope": 1}), &schema)
+                .is_err()
+        );
     }
 
     #[test]

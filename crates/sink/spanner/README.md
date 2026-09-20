@@ -116,6 +116,19 @@ DDL runs as a Spanner long-running operation, bounded by `ddl_timeout_secs`.
 
 Point the sink at the [Cloud Spanner emulator](https://cloud.google.com/spanner/docs/emulator) (`gcr.io/cloud-spanner-emulator/emulator`, gRPC port 9010) with `emulator_host: localhost:9010`. Credentials are ignored against the emulator. The crate's integration tests bootstrap instance + database programmatically through the admin API.
 
+
+## Auto-create (`create_table`)
+
+`create_table` (**default `true`**, #580) creates the target table from the
+first written page's inferred columns when it does not exist — a first-ever
+sync cannot assume the destination is already there. Every inferred column is
+created **nullable**: a column present in page 1 is not required forever, and a
+`NOT NULL` inferred from one page fails page 2 the first time a record omits
+the field (narrowing later is the `schema:` drift policy's job). Spanner requires a primary key, so auto-create needs `key:`; without one a missing table errors naming that requirement rather than inventing a key column.
+
+Set `create_table: false` to require a pre-existing target; a missing one then
+fails fast with the same error every table sink raises, naming both ways out.
+
 ## License
 
 MIT OR Apache-2.0

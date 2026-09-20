@@ -12,6 +12,7 @@ use std::time::Duration;
 /// Use a `Vec<MetadataEntry>` rather than a map because gRPC allows duplicate
 /// keys and order is occasionally observable.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-aliases" = ["max_reconnect_attempts"]))]
 #[serde(deny_unknown_fields)]
 pub struct MetadataEntry {
     pub key: String,

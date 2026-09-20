@@ -22,6 +22,9 @@ fn scope_key(scope: &str) -> String {
 pub struct MysqlSink {
     config: MysqlSinkConfig,
     pool: MySqlPool,
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
 }
 
 /// Quote a MySQL identifier using backticks.
@@ -199,6 +202,32 @@ fn bind_value<'q>(
     }
 }
 
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+///
+/// `IF NOT EXISTS` rather than probe-then-create: two matrix rows writing the
+/// same table would otherwise race between the probe and the DDL, failing the
+/// loser for no reason.
+fn build_create_table_sql(
+    table: &str,
+    columns: &[faucet_core::PlannedColumn],
+    json_column: Option<&str>,
+) -> String {
+    let cols = match json_column {
+        // JSON mode stores the whole record in one column, so the page's own
+        // shape is irrelevant — the table is the same whatever arrives.
+        Some(col) => format!(
+            "{} BIGINT AUTO_INCREMENT PRIMARY KEY, {} JSON NOT NULL",
+            quote_ident_mysql("id"),
+            quote_ident_mysql(col)
+        ),
+        None => faucet_core::render_columns(columns, |n| quote_ident_mysql(n), mysql_keyword),
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({cols})",
+        quote_ident_mysql(table)
+    )
+}
+
 /// Map a [`SqlBaseType`] to the MySQL type keyword used when adding/widening a
 /// column during schema evolution (issue #194). Integers always widen to
 /// `BIGINT` and floats to `DOUBLE` so a later, wider value never overflows a
@@ -316,6 +345,57 @@ fn on_duplicate_clause(key: &[String], all_cols: &[String]) -> String {
 }
 
 impl MysqlSink {
+    /// Make sure the target table exists before the first write (#580).
+    ///
+    /// Runs once per sink instance. With `create_table: true` (the default) a
+    /// missing table is created from the first page's inferred columns; with
+    /// `false` a missing table is a typed failure naming both ways out, rather
+    /// than a confusing "table doesn't exist" from the first INSERT.
+    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !self.config.create_table {
+            let exists: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_name = ?",
+            )
+            .bind(&self.config.table_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL table probe failed: {e}")))?;
+            if exists.is_none() {
+                return Err(faucet_core::missing_target_error(
+                    "mysql sink",
+                    &self.config.table_name,
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let json_column = match &self.config.column_mapping {
+            MysqlColumnMapping::AutoMap => None,
+            MysqlColumnMapping::Json { column } => Some(column.as_str()),
+        };
+        // AutoMap needs a page to infer from; a page with nothing inferable
+        // leaves the table uncreated so the next page can try, rather than
+        // emitting a zero-column CREATE.
+        let columns = match (json_column, faucet_core::plan_columns(records)) {
+            (Some(_), _) => Vec::new(),
+            (None, Some(c)) => c,
+            (None, None) => return Ok(()),
+        };
+        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column);
+        sqlx::query(&sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MySQL CREATE TABLE failed: {e}")))?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Create a new MySQL sink. Establishes a connection pool.
     pub async fn new(config: MysqlSinkConfig) -> Result<Self, FaucetError> {
         config.write.validate()?;
@@ -337,7 +417,11 @@ impl MysqlSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL connection failed: {e}")))?;
 
-        let sink = Self { config, pool };
+        let sink = Self {
+            config,
+            pool,
+            table_ready: std::sync::atomic::AtomicBool::new(false),
+        };
 
         // For upsert/delete, MySQL's anonymous `ON DUPLICATE KEY UPDATE` /
         // `DELETE … WHERE (key) IN (…)` only resolves correctly when the
@@ -1237,6 +1321,7 @@ impl faucet_core::Sink for MysqlSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records).await?;
 
         // Upsert/delete modes: plan the writes and apply atomically. Append and
         // overwrite are insert-shaped (overwrite lands in the staging table via
