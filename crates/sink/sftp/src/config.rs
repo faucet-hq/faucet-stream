@@ -23,6 +23,20 @@ pub struct SftpSinkConfig {
     /// object. Defaults to [`DEFAULT_BATCH_SIZE`].
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum records per file before rolling to a new one (#618). `None`
+    /// removes the record cap; the sink accumulates across `write_batch`
+    /// calls, so a small upstream page no longer means a small file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_records_per_file: Option<usize>,
+    /// Maximum **bytes** per file before rolling to a new one (#618).
+    ///
+    /// Rows are a poor proxy for file size, so a rows-only cap either writes
+    /// tiny files for narrow data or unbounded ones for wide data. This is
+    /// also what bounds peak memory: the open file's body is buffered until it
+    /// rolls. `None` (the default) removes the byte cap; a single record
+    /// larger than the cap still gets its own file rather than being split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<usize>,
 }
 
 fn default_file_extension() -> String {
@@ -41,6 +55,8 @@ impl SftpSinkConfig {
             path: path.into(),
             file_extension: default_file_extension(),
             batch_size: DEFAULT_BATCH_SIZE,
+            max_records_per_file: None,
+            max_bytes_per_file: None,
         }
     }
 
@@ -51,6 +67,18 @@ impl SftpSinkConfig {
     }
 
     /// Set the per-object record count.
+    pub fn max_records_per_file(mut self, n: usize) -> Self {
+        self.max_records_per_file = Some(n);
+        self
+    }
+
+    /// Set the per-file byte cap (#618).
+    pub fn max_bytes_per_file(mut self, n: usize) -> Self {
+        self.max_bytes_per_file = Some(n);
+        self
+    }
+
+    /// Set the per-call record chunk size.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self

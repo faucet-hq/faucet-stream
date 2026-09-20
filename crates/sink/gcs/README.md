@@ -303,6 +303,28 @@ Enable the connector itself in the CLI/umbrella via the `sink-gcs` feature.
 - [`faucet-common-gcs`](https://crates.io/crates/faucet-common-gcs) — shared `GcsCredentials` enum and client builders.
 - [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3) — the structurally equivalent AWS S3 sink.
 
+
+## Object rollover (`max_records_per_file` / `max_bytes_per_file`)
+
+Records **accumulate across `write_batch` calls** and roll to a new object when
+either cap is reached (#618). Before this, every upstream page became its own
+object, so a small `batch_size` produced a swarm of tiny objects — the
+small-files problem that dominates read time on a data lake, where per-object
+overhead outweighs the bytes.
+
+- `max_records_per_file` — record cap. When unset, `batch_size` still sizes
+  objects, so an existing config keeps the object size it asked for; what
+  changed is that a page *smaller* than the cap now joins the open object.
+- `max_bytes_per_file` — byte cap, counted on the **uncompressed** body. Rows
+  are a poor proxy for size (10k wide rows and 10k `{"id":1}` rows differ by
+  orders of magnitude), and this is the axis that bounds buffered memory. A
+  single record larger than the cap still gets its own object rather than
+  being split or dropped.
+
+With neither cap set the whole run lands in one object, closed at `flush` —
+which the pipeline calls at every bookmark-carrying page and at the end, so
+the remainder is always written before a bookmark advances.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

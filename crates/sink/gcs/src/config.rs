@@ -44,6 +44,17 @@ pub struct GcsSinkConfig {
     /// Hard cap on records per uploaded object. `None` means a single
     /// object per `write_batch` call (still subject to `batch_size`).
     pub max_records_per_file: Option<usize>,
+    /// Maximum **bytes** per object before rolling to a new one (#618).
+    ///
+    /// Rows are a poor proxy for object size, so a rows-only cap either writes
+    /// tiny objects for narrow data or unbounded ones for wide data. This is
+    /// also what bounds peak memory: the open object's body is buffered until
+    /// it rolls. Counted on the uncompressed body, before any `compression`
+    /// codec, so the threshold means the same thing whatever the codec.
+    /// `None` (the default) removes the byte cap. A single record larger than
+    /// the cap still gets its own object rather than being split or dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<usize>,
     /// Maximum number of concurrent uploads (default 10).
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -85,6 +96,7 @@ impl GcsSinkConfig {
             auth: GcsCredentials::default(),
             file_extension: default_file_extension(),
             max_records_per_file: None,
+            max_bytes_per_file: None,
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
             storage_host: None,
@@ -111,6 +123,12 @@ impl GcsSinkConfig {
         self.file_extension = ext.into();
         self
     }
+    pub fn max_bytes_per_file(mut self, n: usize) -> Self {
+        self.max_bytes_per_file = Some(n);
+        self
+    }
+
+    /// Set the per-object record cap.
     pub fn max_records_per_file(mut self, n: usize) -> Self {
         self.max_records_per_file = Some(n);
         self

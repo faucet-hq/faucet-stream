@@ -384,13 +384,9 @@ where
     Fut: std::future::Future<Output = usize>,
 {
     let before = count().await;
-    sink.write_batch(&rows(&[1, 2, 3]))
-        .await
-        .unwrap_or_else(|e| panic!("[{label}] write_batch(page 1) errored: {e}"));
+    write_and_flush(sink, &rows(&[1, 2, 3]), "page 1").await;
     // Overlapping page: ids 2 and 3 are re-delivered.
-    sink.write_batch(&rows(&[2, 3, 4]))
-        .await
-        .unwrap_or_else(|e| panic!("[{label}] write_batch(overlapping page) errored: {e}"));
+    write_and_flush(sink, &rows(&[2, 3, 4]), "overlapping page").await;
     let after = count().await;
     assert_eq!(
         after - before,
@@ -411,6 +407,23 @@ where
 /// - the honest-false branch: a non-idempotent sink's `write_batch_idempotent`
 ///   delegates to `write_batch` and records no token.
 ///
+/// Write a page and make it visible.
+///
+/// A buffering sink (object-store JSONL since #618, Parquet always) only makes
+/// rows readable at `flush` — the trait's contract — so a harness that counts
+/// straight after `write_batch` measures nothing on those sinks. `flush` is a
+/// no-op for the immediate writers, so this is correct for every sink rather
+/// than a special case for some.
+async fn write_and_flush<S: Sink + ?Sized>(sink: &S, page: &[Value], what: &str) {
+    let label = sink.connector_name();
+    sink.write_batch(page)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] write_batch({what}) errored: {e}"));
+    sink.flush()
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] flush after {what} errored: {e}"));
+}
+
 /// `distinct_count` reports the destination's current distinct-row count.
 pub async fn assert_capabilities_truthful<S, F, Fut>(sink: &S, distinct_count: F)
 where
@@ -433,9 +446,7 @@ where
     } else {
         // Honest-false: the default idempotent path must delegate, not pretend.
         let before = distinct_count().await;
-        sink.write_batch(&rows(&[100]))
-            .await
-            .unwrap_or_else(|e| panic!("[{label}] write_batch (append probe) errored: {e}"));
+        write_and_flush(sink, &rows(&[100]), "append probe").await;
         assert_eq!(
             distinct_count().await - before,
             1,
@@ -553,12 +564,13 @@ where
     if has_upsert {
         let before = distinct_count().await;
         // Two distinct keys, then re-write one of them.
-        sink.write_batch(&rows(&[1, 2]))
-            .await
-            .unwrap_or_else(|e| panic!("[{label}] write_batch(upsert seed) errored: {e}"));
-        sink.write_batch(&[serde_json::json!({ "id": 1, "v": "updated" })])
-            .await
-            .unwrap_or_else(|e| panic!("[{label}] write_batch(upsert overwrite) errored: {e}"));
+        write_and_flush(sink, &rows(&[1, 2]), "upsert seed").await;
+        write_and_flush(
+            sink,
+            &[serde_json::json!({ "id": 1, "v": "updated" })],
+            "upsert overwrite",
+        )
+        .await;
         let after = distinct_count().await;
         assert_eq!(
             after - before,
@@ -572,9 +584,12 @@ where
     // ── Delete: a delete-marked record removes its keyed row. ──
     if has_delete {
         let before = distinct_count().await;
-        sink.write_batch(&[serde_json::json!({ "id": 777, "v": "doomed" })])
-            .await
-            .unwrap_or_else(|e| panic!("[{label}] write_batch(delete seed) errored: {e}"));
+        write_and_flush(
+            sink,
+            &[serde_json::json!({ "id": 777, "v": "doomed" })],
+            "delete seed",
+        )
+        .await;
         let seeded = distinct_count().await;
         assert_eq!(
             seeded - before,
@@ -587,9 +602,7 @@ where
             doubles::DELETE_MARKER_FIELD.to_string(),
             Value::String(doubles::DELETE_MARKER_VALUE.to_string()),
         );
-        sink.write_batch(&[Value::Object(del)])
-            .await
-            .unwrap_or_else(|e| panic!("[{label}] write_batch(delete) errored: {e}"));
+        write_and_flush(sink, &[Value::Object(del)], "delete").await;
         let after = distinct_count().await;
         assert_eq!(
             after, before,

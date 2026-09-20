@@ -38,6 +38,7 @@ pub mod local_outputs;
 pub mod masking;
 pub mod metadata;
 pub mod native;
+pub mod object_rollover;
 pub mod observability;
 pub mod pipeline;
 #[cfg(feature = "quality")]
@@ -113,6 +114,7 @@ pub use native::{
     CsvDialect, NativeBatch, NativeFormat, NativeLoadCapability, NativeLoadContext, NativePayload,
     NativePlan, NativePlanInputs, plan_native_transfer,
 };
+pub use object_rollover::{CompletedObject, ObjectAccumulator};
 #[cfg(feature = "contract")]
 pub use observability::instrumented_apply_contract;
 #[cfg(feature = "masking")]

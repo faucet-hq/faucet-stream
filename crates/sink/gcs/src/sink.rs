@@ -15,13 +15,27 @@ use serde_json::Value;
 pub struct GcsSink {
     config: GcsSinkConfig,
     storage: Storage,
+    /// Rows accumulated across `write_batch` calls for the open object (#618).
+    ///
+    /// Without this the sink wrote one object per upstream page, so a small
+    /// `batch_size` produced a swarm of tiny objects — the small-files problem
+    /// that dominates read time on a data lake.
+    open: tokio::sync::Mutex<faucet_core::ObjectAccumulator>,
 }
 
 impl GcsSink {
     pub async fn new(config: GcsSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let storage = build_storage(&config.auth, config.storage_host.as_deref()).await?;
-        Ok(Self { config, storage })
+        let open = tokio::sync::Mutex::new(faucet_core::ObjectAccumulator::new(
+            Some(resolve_effective_chunk_size(&config)),
+            config.max_bytes_per_file,
+        ));
+        Ok(Self {
+            config,
+            storage,
+            open,
+        })
     }
 
     /// Bucket as a GCS resource path: `projects/_/buckets/{bucket}`.
@@ -97,6 +111,25 @@ impl faucet_core::Sink for GcsSink {
         format!("gs://{}/{}", self.config.bucket, self.config.prefix)
     }
 
+    /// Close the open object (#618).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so the accumulated remainder is uploaded before the bookmark
+    /// advances — an object left unfinished after a "successful" run is data
+    /// loss with a green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let finished = {
+            let mut open = self.open.lock().await;
+            open.finish()
+        };
+        if let Some(obj) = finished {
+            let key = self.generate_key();
+            self.upload_file(&key, obj.body).await?;
+            tracing::info!(key = %key, records = obj.rows, "GCS object closed");
+        }
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
@@ -124,14 +157,18 @@ impl faucet_core::Sink for GcsSink {
             return Ok(written);
         }
 
-        let uploads: Vec<(String, Vec<u8>)> = records
-            .chunks(chunk)
-            .map(|slice| {
-                let body = Self::serialize_jsonl(slice)?;
-                Ok::<(String, Vec<u8>), FaucetError>((self.generate_key(), body))
-            })
-            .collect::<Result<_, _>>()?;
-
+        // JSONL path: accumulate across calls and roll on the record/byte cap
+        // (#618). A page smaller than the cap now joins the open object
+        // instead of becoming an object of its own.
+        let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let mut open = self.open.lock().await;
+            for record in records {
+                if let faucet_core::object_rollover::Emit::Object(obj) = open.push_record(record)? {
+                    uploads.push((self.generate_key(), obj.body));
+                }
+            }
+        }
         stream::iter(uploads)
             .map(|(key, body)| async move { self.upload_file(&key, body).await })
             .buffer_unordered(concurrency)

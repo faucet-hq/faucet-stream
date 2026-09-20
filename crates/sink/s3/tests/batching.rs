@@ -148,6 +148,9 @@ async fn write_batch_rechunks_into_batch_size_objects() {
 
     let written = sink.write_batch(&records(1_500)).await.expect("write");
     assert_eq!(written, 1_500, "all records reported written");
+    // Since #618 the remainder of the open object is closed at `flush`, which
+    // the pipeline calls at every bookmark-carrying page and at the end.
+    sink.flush().await.expect("flush");
 
     let admin = assertion_client(&endpoint).await;
     let keys = list_keys(&admin, prefix).await;
@@ -179,7 +182,7 @@ async fn write_batch_rechunks_into_batch_size_objects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_batch_sentinel_writes_one_object_per_call() {
+async fn write_batch_sentinel_writes_one_object_for_the_whole_run() {
     let (_container, endpoint) = start_minio().await;
     create_bucket(&endpoint).await;
 
@@ -191,18 +194,19 @@ async fn write_batch_sentinel_writes_one_object_per_call() {
 
     let written = sink.write_batch(&records(1_500)).await.expect("write");
     assert_eq!(written, 1_500);
+    sink.flush().await.expect("flush");
 
     let admin = assertion_client(&endpoint).await;
     let keys = list_keys(&admin, prefix).await;
     assert_eq!(
         keys.len(),
         1,
-        "batch_size = 0 must collapse the call into a single object, got {:?}",
+        "batch_size = 0 must collapse the whole run into a single object, got {:?}",
         keys
     );
 
     let recs = fetch_jsonl(&admin, &keys[0]).await;
-    assert_eq!(recs.len(), 1_500, "single object holds the full call");
+    assert_eq!(recs.len(), 1_500, "single object holds the full run");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -218,6 +222,7 @@ async fn write_batch_partial_final_object() {
 
     let written = sink.write_batch(&records(1_000)).await.expect("write");
     assert_eq!(written, 1_000);
+    sink.flush().await.expect("flush");
 
     let admin = assertion_client(&endpoint).await;
     let keys = list_keys(&admin, prefix).await;
@@ -237,4 +242,118 @@ async fn write_batch_partial_final_object() {
         vec![200, 400, 400],
         "the final object holds the 200-record remainder"
     );
+}
+
+/// #618 — the headline fix: several small pages must coalesce into one object,
+/// not become one object each.
+///
+/// Before this, every `write_batch` call minted its own key, so a source with
+/// a small `batch_size` produced a swarm of tiny objects — the small-files
+/// problem that dominates read time on S3/Athena/Spark, where per-object
+/// overhead outweighs the bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn small_pages_coalesce_into_one_object() {
+    let (_container, endpoint) = start_minio().await;
+    create_bucket(&endpoint).await;
+
+    let prefix = "coalesce/";
+    let config = S3SinkConfig::new(TEST_BUCKET)
+        .prefix(prefix)
+        .with_batch_size(0)
+        .max_records_per_file(1_000);
+    let sink = build_sink(&endpoint, config).await;
+
+    // Ten pages of 100 — exactly the shape that used to produce ten objects.
+    for _ in 0..10 {
+        sink.write_batch(&records(100)).await.expect("write");
+    }
+    sink.flush().await.expect("flush");
+
+    let admin = assertion_client(&endpoint).await;
+    let keys = list_keys(&admin, prefix).await;
+    assert_eq!(
+        keys.len(),
+        1,
+        "ten 100-record pages under a 1000-record cap must be ONE object, got {:?}",
+        keys
+    );
+    assert_eq!(
+        fetch_jsonl(&admin, &keys[0]).await.len(),
+        1_000,
+        "and it must hold every record"
+    );
+}
+
+/// The byte cap rolls independently of rows — the axis that actually bounds
+/// object size for wide data (#618).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_byte_cap_rolls_objects() {
+    let (_container, endpoint) = start_minio().await;
+    create_bucket(&endpoint).await;
+
+    let prefix = "bytes/";
+    // No record cap at all: only the byte cap may roll.
+    let config = S3SinkConfig::new(TEST_BUCKET)
+        .prefix(prefix)
+        .with_batch_size(0)
+        .max_bytes_per_file(1_000);
+    let sink = build_sink(&endpoint, config).await;
+
+    sink.write_batch(&records(2_000)).await.expect("write");
+    sink.flush().await.expect("flush");
+
+    let admin = assertion_client(&endpoint).await;
+    let keys = list_keys(&admin, prefix).await;
+    assert!(
+        keys.len() > 1,
+        "a 1000-byte cap over 2000 records must roll, got {:?}",
+        keys
+    );
+
+    let mut total = 0usize;
+    for key in &keys {
+        total += fetch_jsonl(&admin, key).await.len();
+    }
+    assert_eq!(total, 2_000, "no record lost across byte rollovers");
+}
+
+/// An object larger than the 5 MiB multipart floor must stream through
+/// multipart and still read back intact (#618).
+///
+/// This is the memory bound the issue is really about: without multipart the
+/// whole object sits in RAM before a single-shot PUT, so output size is capped
+/// by the process's memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_object_streams_through_multipart_and_round_trips() {
+    let (_container, endpoint) = start_minio().await;
+    create_bucket(&endpoint).await;
+
+    let prefix = "multipart/";
+    let config = S3SinkConfig::new(TEST_BUCKET)
+        .prefix(prefix)
+        .with_batch_size(0);
+    let sink = build_sink(&endpoint, config).await;
+
+    // ~200 bytes per record × 60k ≈ 12 MiB → at least two 5 MiB parts plus a
+    // tail, so the completion path is exercised rather than the single-shot
+    // fallback.
+    let wide: Vec<Value> = (0..60_000)
+        .map(|i| json!({ "id": i, "pad": "x".repeat(180) }))
+        .collect();
+    for page in wide.chunks(5_000) {
+        sink.write_batch(page).await.expect("write");
+    }
+    sink.flush().await.expect("flush");
+
+    let admin = assertion_client(&endpoint).await;
+    let keys = list_keys(&admin, prefix).await;
+    assert_eq!(keys.len(), 1, "one object for the run, got {:?}", keys);
+    let recs = fetch_jsonl(&admin, &keys[0]).await;
+    assert_eq!(
+        recs.len(),
+        60_000,
+        "every record must survive the multipart assembly"
+    );
+    assert_eq!(recs[0]["id"], 0);
+    assert_eq!(recs[59_999]["id"], 59_999);
 }

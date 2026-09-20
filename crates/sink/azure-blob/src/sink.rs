@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use faucet_common_azure::build_store;
 use faucet_core::FaucetError;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::Value;
@@ -16,7 +16,28 @@ use crate::config::AzureBlobSinkConfig;
 pub struct AzureBlobSink {
     config: AzureBlobSinkConfig,
     store: Arc<dyn ObjectStore>,
+    /// Rows accumulated across `write_batch` calls for the open object (#618).
+    open: tokio::sync::Mutex<OpenObject>,
 }
+
+/// The in-flight object: the accumulator plus, once a part has been uploaded,
+/// the `object_store` multipart upload it belongs to.
+///
+/// Started **lazily**, on the first full part — an object that fits in one
+/// part stays a plain `put`, which is cheaper and leaves nothing abandoned if
+/// the run dies before the object is finished.
+struct OpenObject {
+    acc: faucet_core::ObjectAccumulator,
+    upload: Option<(String, Box<dyn object_store::MultipartUpload>)>,
+}
+
+/// Part size for the streaming multipart upload (#618).
+///
+/// Azure block blobs cap a single `put` at 5000 MiB but the practical reason
+/// to stream is memory: without parts the whole object is held before upload,
+/// so output size is bounded by RAM. 8 MiB is the `object_store` default
+/// block size and a good trade between request count and buffer size.
+const PART_BYTES: usize = 8 * 1024 * 1024;
 
 impl AzureBlobSink {
     /// Construct the sink, building the object store eagerly so it is reused
@@ -24,19 +45,19 @@ impl AzureBlobSink {
     pub async fn new(config: AzureBlobSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         let store = build_store(&config.connection)?;
-        Ok(Self { config, store })
-    }
-
-    /// Serialize a slice of records as a JSON Lines byte buffer.
-    fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
-        let mut buf: Vec<u8> = Vec::new();
-        for record in records {
-            let line = serde_json::to_vec(record)
-                .map_err(|e| FaucetError::Sink(format!("JSON serialization failed: {e}")))?;
-            buf.extend_from_slice(&line);
-            buf.push(b'\n');
-        }
-        Ok(buf)
+        let open = tokio::sync::Mutex::new(OpenObject {
+            acc: faucet_core::ObjectAccumulator::new(
+                Some(resolve_effective_chunk_size(&config)),
+                config.max_bytes_per_file,
+            )
+            .with_part_size(PART_BYTES),
+            upload: None,
+        });
+        Ok(Self {
+            config,
+            store,
+            open,
+        })
     }
 
     /// Generate a time-sortable UUIDv7 object name.
@@ -44,15 +65,78 @@ impl AzureBlobSink {
         generate_object_key(&self.config.prefix, &self.config.file_extension)
     }
 
-    /// Upload a single JSONL object.
-    async fn upload_file(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
+    /// Upload one multipart part, starting the upload if this is the first.
+    ///
+    /// This is the memory bound: the accumulator hands over a full part and
+    /// drops its buffer, so peak stays at O(part size) instead of O(object
+    /// size). Before #618 the sink held the whole object and issued a single
+    /// `put`, so output size was capped by the process's memory.
+    async fn upload_part(&self, open: &mut OpenObject, body: Vec<u8>) -> Result<(), FaucetError> {
+        if open.upload.is_none() {
+            let key = self.generate_key();
+            let path = ObjectPath::from(key.clone());
+            let upload = self.store.put_multipart(&path).await.map_err(|e| {
+                FaucetError::Sink(format!("azure start multipart for '{key}': {e}"))
+            })?;
+            open.upload = Some((key, upload));
+        }
+        let (key, upload) = open.upload.as_mut().expect("just set");
+        let body = self.encode_body(body)?;
+        upload
+            .put_part(bytes::Bytes::from(body).into())
+            .await
+            .map_err(|e| FaucetError::Sink(format!("azure put part for '{key}': {e}")))?;
+        Ok(())
+    }
+
+    /// Finish an object: complete its multipart upload (after sending the
+    /// trailing tail as the last part) or, when no part was ever uploaded,
+    /// write it in one `put`.
+    async fn finish_object(
+        &self,
+        open: &mut OpenObject,
+        obj: faucet_core::CompletedObject,
+    ) -> Result<(), FaucetError> {
+        if open.upload.is_none() {
+            let key = self.generate_key();
+            self.upload_file(&key, obj.body).await?;
+            tracing::info!(key = %key, records = obj.rows, "Azure object written");
+            return Ok(());
+        }
+        // The tail can be empty when the object rolled exactly on a part
+        // boundary; a zero-byte part is pointless and some stores reject it.
+        if !obj.body.is_empty() {
+            self.upload_part(open, obj.body).await?;
+        }
+        let (key, mut upload) = open.upload.take().expect("checked above");
+        upload
+            .complete()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("azure complete multipart for '{key}': {e}")))?;
+        tracing::info!(key = %key, records = obj.rows, "Azure multipart object written");
+        Ok(())
+    }
+
+    /// Apply the configured codec to a body (or a multipart part).
+    ///
+    /// Applied per part on the multipart path: gzip and zstd both concatenate,
+    /// so a multi-member object decodes transparently — the same property the
+    /// file sinks already rely on. Compressing the whole object instead would
+    /// mean buffering it, which is the bound multipart exists to remove.
+    fn encode_body(&self, body: Vec<u8>) -> Result<Vec<u8>, FaucetError> {
         #[cfg(feature = "compression")]
-        let body = {
+        {
             let codec = self.config.compression.resolve(&self.config.file_extension);
             faucet_core::compression::warn_mismatch(&self.config.file_extension, codec);
-            faucet_core::compression::compress_buf(&body, codec)?
-        };
+            return faucet_core::compression::compress_buf(&body, codec);
+        }
+        #[cfg(not(feature = "compression"))]
+        Ok(body)
+    }
 
+    /// Upload a single JSONL object.
+    async fn upload_file(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
+        let body = self.encode_body(body)?;
         let path = ObjectPath::from(key);
         let payload = bytes::Bytes::from(body);
         self.store.put(&path, payload.into()).await.map_err(|e| {
@@ -60,12 +144,6 @@ impl AzureBlobSink {
         })?;
         tracing::debug!(key = %key, "Uploaded Azure object");
         Ok(())
-    }
-
-    /// Effective per-object chunk size (smaller of `batch_size` and
-    /// `max_records_per_file`).
-    fn effective_chunk_size(&self) -> usize {
-        resolve_effective_chunk_size(&self.config)
     }
 }
 
@@ -75,28 +153,48 @@ impl faucet_core::Sink for AzureBlobSink {
         format!("az://{}/{}", self.config.container(), self.config.prefix)
     }
 
+    /// Close the open object (#618).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so the remainder lands before the bookmark advances — an
+    /// object left unfinished after a "successful" run is data loss with a
+    /// green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let mut open = self.open.lock().await;
+        if let Some(obj) = open.acc.finish() {
+            self.finish_object(&mut open, obj).await?;
+        }
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let chunk = self.effective_chunk_size();
-        let concurrency = self.config.concurrency.max(1);
-
-        let uploads: Vec<(String, Vec<u8>)> = records
-            .chunks(chunk)
-            .map(|slice| {
-                let body = Self::serialize_jsonl(slice)?;
-                Ok::<(String, Vec<u8>), FaucetError>((self.generate_key(), body))
-            })
-            .collect::<Result<_, _>>()?;
-
+        // Accumulate across calls and roll on the record/byte cap (#618): a
+        // page smaller than the cap joins the open object rather than
+        // becoming an object of its own.
+        //
+        // Parts are collected and uploaded with the closing body rather than
+        // streamed into a `put_multipart` handle: holding an open handle
+        // across `write_batch` calls would mean carrying a `!Send`-shaped
+        // writer in the sink's mutex, and the memory win is already had — the
+        // accumulator hands the buffer over at `PART_BYTES` and drops it.
+        let mut files = 0usize;
+        let mut open = self.open.lock().await;
+        for record in records {
+            match open.acc.push_record(record)? {
+                faucet_core::object_rollover::Emit::Nothing => {}
+                faucet_core::object_rollover::Emit::Part(body) => {
+                    self.upload_part(&mut open, body).await?;
+                }
+                faucet_core::object_rollover::Emit::Object(obj) => {
+                    self.finish_object(&mut open, obj).await?;
+                    files += 1;
+                }
+            }
+        }
         let written = records.len();
-        let files = uploads.len();
-        stream::iter(uploads)
-            .map(|(key, body)| async move { self.upload_file(&key, body).await })
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<()>>()
-            .await?;
 
         tracing::info!(records = written, files, "Azure batch write complete");
         Ok(written)
@@ -196,19 +294,31 @@ mod tests {
         assert_eq!(sink.dataset_uri(), "az://cont/out/");
     }
 
+    /// The NDJSON encoding moved into `faucet_core::ObjectAccumulator` with
+    /// the cross-page accumulation (#618) — pinned here too, because this sink
+    /// is what an operator reads back and a drift in either direction would
+    /// change the bytes in the blob.
     #[test]
-    fn serialize_jsonl_two_records() {
-        let body = AzureBlobSink::serialize_jsonl(&[json!({"a": 1}), json!({"b": 2})]).unwrap();
+    fn records_encode_as_ndjson() {
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        acc.push_record(&json!({"a": 1})).unwrap();
+        let faucet_core::object_rollover::Emit::Object(obj) =
+            acc.push_record(&json!({"b": 2})).unwrap()
+        else {
+            panic!("rolled at 2 records");
+        };
         assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
+            std::str::from_utf8(&obj.body).unwrap(),
             "{\"a\":1}\n{\"b\":2}\n"
         );
     }
 
     #[test]
-    fn serialize_jsonl_empty_is_empty() {
-        let body = AzureBlobSink::serialize_jsonl(&[]).unwrap();
-        assert!(body.is_empty());
+    fn an_empty_accumulator_writes_no_object() {
+        // An empty page must not mint an empty blob — a listing full of
+        // zero-byte objects is the small-files problem in its purest form.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        assert!(acc.finish().is_none());
     }
 
     #[test]

@@ -14,6 +14,49 @@ use serde_json::Value;
 pub struct S3Sink {
     config: S3SinkConfig,
     client: Client,
+    /// Rows accumulated across `write_batch` calls for the open object (#618).
+    ///
+    /// Without this the sink wrote one object per upstream page, so a small
+    /// `batch_size` produced a swarm of tiny objects — the small-files problem
+    /// that dominates read time on S3/Athena/Spark. `Mutex` rather than an
+    /// atomic because the buffer and its counters must move together.
+    open: tokio::sync::Mutex<OpenObject>,
+}
+
+/// Minimum S3 multipart part size. Every part except the last must be at least
+/// 5 MiB, so this is the floor the SDK accepts, not a tuning choice.
+const MIN_PART_BYTES: usize = 5 * 1024 * 1024;
+
+/// The in-flight object: the accumulator plus, once a part has been uploaded,
+/// the multipart upload it belongs to.
+///
+/// A multipart upload is started **lazily**, on the first full part — an object
+/// that fits in one part stays a plain `put_object`, which is cheaper and
+/// leaves nothing abandoned if the run dies before the object is finished.
+struct OpenObject {
+    acc: faucet_core::ObjectAccumulator,
+    /// Key and upload id of the multipart upload, once one has been started.
+    upload: Option<(String, String)>,
+    parts: Vec<aws_sdk_s3::types::CompletedPart>,
+}
+
+impl OpenObject {
+    fn new(config: &S3SinkConfig) -> Self {
+        Self {
+            // `batch_size` keeps sizing objects when no explicit
+            // `max_records_per_file` is given, so an existing config still
+            // gets objects of the size it asked for — the change is that a
+            // page *smaller* than the cap now joins the open object instead
+            // of becoming a file of its own (#618).
+            acc: faucet_core::ObjectAccumulator::new(
+                config.effective_chunk_cap(),
+                config.max_bytes_per_file,
+            )
+            .with_part_size(MIN_PART_BYTES),
+            upload: None,
+            parts: Vec::new(),
+        }
+    }
 }
 
 impl S3Sink {
@@ -23,7 +66,12 @@ impl S3Sink {
     pub async fn new(config: S3SinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let client = Self::build_client(&config).await?;
-        Ok(Self { config, client })
+        let open = tokio::sync::Mutex::new(OpenObject::new(&config));
+        Ok(Self {
+            config,
+            client,
+            open,
+        })
     }
 
     /// Build an S3 client from the configuration.
@@ -61,28 +109,120 @@ impl S3Sink {
         format!("{}{}{}", self.config.prefix, id, self.config.file_extension)
     }
 
-    /// The effective per-object record cap, combining `batch_size` (write-side
-    /// re-chunking) and `max_records_per_file`. `None` means "one object for
-    /// the whole call". Shared by the JSONL and Parquet write paths.
-    fn effective_chunk_cap(&self) -> Option<usize> {
-        match (self.config.batch_size, self.config.max_records_per_file) {
-            (0, None) => None,
-            (0, Some(0)) => None,
-            (0, Some(max)) => Some(max),
-            (bs, None) => Some(bs),
-            (bs, Some(0)) => Some(bs),
-            (bs, Some(max)) => Some(bs.min(max)),
+    /// Apply the configured codec to a body (or a multipart part).
+    ///
+    /// Applied per part on the multipart path: gzip and zstd both concatenate,
+    /// so a multi-member object decodes transparently — the same property the
+    /// file sinks already rely on when they reopen a compressed file to append.
+    /// Compressing the whole object instead would mean buffering it, which is
+    /// the memory bound multipart exists to remove.
+    fn encode_body(&self, body: Vec<u8>) -> Result<Vec<u8>, FaucetError> {
+        #[cfg(feature = "compression")]
+        {
+            let codec = self.config.compression.resolve(&self.config.file_extension);
+            faucet_core::compression::warn_mismatch(&self.config.file_extension, codec);
+            return faucet_core::compression::compress_buf(&body, codec);
         }
+        #[cfg(not(feature = "compression"))]
+        Ok(body)
+    }
+
+    /// Upload one multipart part, starting the upload if this is the first.
+    ///
+    /// Started lazily so an object that fits in a single part stays a plain
+    /// `put_object` — cheaper, and it leaves nothing behind if the run dies
+    /// before the object is finished.
+    async fn upload_part(&self, open: &mut OpenObject, body: Vec<u8>) -> Result<(), FaucetError> {
+        if open.upload.is_none() {
+            let key = self.generate_key();
+            let out = self
+                .client
+                .create_multipart_upload()
+                .bucket(&self.config.bucket)
+                .key(&key)
+                .content_type("application/x-ndjson")
+                .send()
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("S3 create multipart upload for '{key}': {e}"))
+                })?;
+            let id = out.upload_id().ok_or_else(|| {
+                FaucetError::Sink(format!(
+                    "S3 create multipart upload for '{key}': no upload id"
+                ))
+            })?;
+            open.upload = Some((key, id.to_string()));
+        }
+        let (key, upload_id) = open.upload.as_ref().expect("just set");
+        // Part numbers are 1-based and must be contiguous in the completion
+        // request, which is why they come from the parts already recorded
+        // rather than from a counter that could drift.
+        let part_number = open.parts.len() as i32 + 1;
+        let body = self.encode_body(body)?;
+        let out = self
+            .client
+            .upload_part()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(body.into())
+            .send()
+            .await
+            .map_err(|e| {
+                FaucetError::Sink(format!("S3 upload part {part_number} for '{key}': {e}"))
+            })?;
+        open.parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .set_e_tag(out.e_tag().map(str::to_string))
+                .part_number(part_number)
+                .build(),
+        );
+        Ok(())
+    }
+
+    /// Finish an object: complete its multipart upload (after sending the
+    /// trailing tail as the last part) or, when no part was ever uploaded,
+    /// write it in one `put_object`.
+    async fn finish_object(
+        &self,
+        open: &mut OpenObject,
+        obj: faucet_core::CompletedObject,
+    ) -> Result<(), FaucetError> {
+        if open.upload.is_none() {
+            let key = self.generate_key();
+            self.upload_file(&key, obj.body).await?;
+            tracing::info!(key = %key, records = obj.rows, "S3 object written");
+            return Ok(());
+        }
+        // A trailing tail may be empty when the object rolled exactly on a
+        // part boundary; S3 rejects a zero-byte part, so skip it.
+        if !obj.body.is_empty() {
+            self.upload_part(open, obj.body).await?;
+        }
+        let (key, upload_id) = open.upload.take().expect("checked above");
+        let parts = std::mem::take(&mut open.parts);
+        let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+            .set_parts(Some(parts))
+            .build();
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.config.bucket)
+            .key(&key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .map_err(|e| {
+                FaucetError::Sink(format!("S3 complete multipart upload for '{key}': {e}"))
+            })?;
+        tracing::info!(key = %key, records = obj.rows, "S3 multipart object written");
+        Ok(())
     }
 
     /// Upload a single JSONL file to S3.
     async fn upload_file(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
-        #[cfg(feature = "compression")]
-        let body = {
-            let codec = self.config.compression.resolve(&self.config.file_extension);
-            faucet_core::compression::warn_mismatch(&self.config.file_extension, codec);
-            faucet_core::compression::compress_buf(&body, codec)?
-        };
+        let body = self.encode_body(body)?;
 
         self.client
             .put_object()
@@ -132,6 +272,20 @@ impl S3Sink {
 
 #[async_trait]
 impl faucet_core::Sink for S3Sink {
+    /// Close the open object (#618).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so the accumulated remainder is uploaded before the bookmark
+    /// advances — an object left unfinished after a "successful" run is data
+    /// loss with a green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let mut open = self.open.lock().await;
+        if let Some(obj) = open.acc.finish() {
+            self.finish_object(&mut open, obj).await?;
+        }
+        Ok(())
+    }
+
     fn connector_name(&self) -> &'static str {
         "s3"
     }
@@ -176,7 +330,7 @@ impl faucet_core::Sink for S3Sink {
             return Ok(0);
         }
 
-        let chunks: Vec<&[Value]> = match self.effective_chunk_cap() {
+        let chunks: Vec<&[Value]> = match self.config.effective_chunk_cap() {
             Some(cap) => records.chunks(cap).collect(),
             None => vec![records],
         };
@@ -201,29 +355,28 @@ impl faucet_core::Sink for S3Sink {
             return Ok(records.len());
         }
 
-        let total_files = chunks.len();
-        let concurrency = self.config.concurrency.max(1);
-
-        // Pre-serialize each chunk and generate keys before uploading.
-        let prepared: Vec<(String, Vec<u8>)> = chunks
-            .iter()
-            .map(|chunk| {
-                let body = Self::serialize_jsonl(chunk)?;
-                let key = self.generate_key();
-                Ok((key, body))
-            })
-            .collect::<Result<Vec<_>, FaucetError>>()?;
-
-        stream::iter(prepared)
-            .map(|(key, body)| async move { self.upload_file(&key, body).await })
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<()>>()
-            .await?;
-
-        tracing::info!(
+        // JSONL path: accumulate across calls and roll on the record/byte cap
+        // (#618). `batch_size` still bounds how much is held before a rollover
+        // check, but it no longer *forces* an object boundary — a page smaller
+        // than the cap now joins the open object instead of becoming a file.
+        let mut open = self.open.lock().await;
+        for chunk in &chunks {
+            for record in *chunk {
+                match open.acc.push_record(record)? {
+                    faucet_core::object_rollover::Emit::Nothing => {}
+                    faucet_core::object_rollover::Emit::Part(body) => {
+                        self.upload_part(&mut open, body).await?;
+                    }
+                    faucet_core::object_rollover::Emit::Object(obj) => {
+                        self.finish_object(&mut open, obj).await?;
+                    }
+                }
+            }
+        }
+        tracing::debug!(
             records = records.len(),
-            files = total_files,
-            "S3 batch write complete"
+            open_rows = open.acc.rows(),
+            "S3 batch accumulated (objects roll on the record/byte cap)"
         );
         Ok(records.len())
     }
@@ -256,7 +409,7 @@ impl faucet_core::Sink for S3Sink {
         }
 
         let n = batch.num_rows();
-        let cap = self.effective_chunk_cap().unwrap_or(n).max(1);
+        let cap = self.config.effective_chunk_cap().unwrap_or(n).max(1);
         let mut prepared: Vec<(String, Vec<u8>)> = Vec::new();
         let mut offset = 0usize;
         while offset < n {
@@ -312,7 +465,12 @@ mod tests {
             .behavior_version(aws_config::BehaviorVersion::latest())
             .build();
         let client = Client::new(&sdk_config);
-        S3Sink { config, client }
+        let open = tokio::sync::Mutex::new(OpenObject::new(&config));
+        S3Sink {
+            config,
+            client,
+            open,
+        }
     }
 
     #[test]

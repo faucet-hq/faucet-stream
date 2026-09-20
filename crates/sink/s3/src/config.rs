@@ -40,11 +40,27 @@ pub struct S3SinkConfig {
     pub endpoint_url: Option<String>,
     /// File extension for written objects (default: `.jsonl`).
     pub file_extension: String,
-    /// Maximum records per file. `None` removes the per-file record cap — but
-    /// the sink still writes **one object per `write_batch` call** (i.e. one per
-    /// upstream page), and `batch_size` may chunk a call further; it does not
-    /// coalesce a streaming run into a single object.
+    /// Maximum records per object. Since #618 the sink **accumulates across
+    /// `write_batch` calls** and rolls to a new object when this (or
+    /// [`max_bytes_per_file`](Self::max_bytes_per_file)) is reached, so a
+    /// small upstream page no longer means a small object. `None` removes the
+    /// record cap; with neither cap set the whole run lands in one object,
+    /// closed at `flush`.
     pub max_records_per_file: Option<usize>,
+    /// Maximum **bytes** per object before rolling to a new one (#618).
+    ///
+    /// Rows are a poor proxy for object size — 10k wide rows and 10k
+    /// `{"id":1}` rows differ by orders of magnitude — so a rows-only cap
+    /// either writes tiny objects for narrow data or unbounded ones for wide
+    /// data. This is also what bounds peak memory: the open object's body is
+    /// buffered until it rolls. Counted on the **uncompressed** body, before
+    /// any `compression` codec, so the threshold means the same thing whatever
+    /// the codec. `None` (the default) removes the byte cap.
+    ///
+    /// A single record larger than the cap still gets its own object rather
+    /// than being split (which would corrupt it) or dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<usize>,
     /// Maximum number of concurrent file uploads (default: 10).
     pub concurrency: usize,
     /// Records per S3 object written by a single
@@ -91,6 +107,7 @@ impl S3SinkConfig {
             endpoint_url: None,
             file_extension: ".jsonl".to_string(),
             max_records_per_file: None,
+            max_bytes_per_file: None,
             concurrency: 10,
             batch_size: DEFAULT_BATCH_SIZE,
             #[cfg(feature = "compression")]
@@ -130,6 +147,30 @@ impl S3SinkConfig {
     }
 
     /// Set the maximum number of records per file.
+    /// The effective per-object record cap, combining `batch_size` (write-side
+    /// re-chunking) and `max_records_per_file`. `None` means "no record cap".
+    ///
+    /// Lives on the config rather than the sink because the cross-page
+    /// accumulator (#618) needs it at construction time, and the Parquet path
+    /// needs the same number — two definitions would be one drift away from
+    /// objects of different sizes depending on the format.
+    pub fn effective_chunk_cap(&self) -> Option<usize> {
+        match (self.batch_size, self.max_records_per_file) {
+            (0, None) => None,
+            (0, Some(0)) => None,
+            (0, Some(max)) => Some(max),
+            (bs, None) => Some(bs),
+            (bs, Some(0)) => Some(bs),
+            (bs, Some(max)) => Some(bs.min(max)),
+        }
+    }
+
+    pub fn max_bytes_per_file(mut self, max: usize) -> Self {
+        self.max_bytes_per_file = Some(max);
+        self
+    }
+
+    /// Set the per-object record cap.
     pub fn max_records_per_file(mut self, max: usize) -> Self {
         self.max_records_per_file = Some(max);
         self

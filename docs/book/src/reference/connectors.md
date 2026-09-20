@@ -160,6 +160,16 @@ POSTs over a window). S3/GCS/Azure fall back to buffered for the JSON-array form
 Every sink exposes a `batch_size` knob for write-side re-chunking. For the
 file/append sinks (`jsonl`, `csv`, `stdout`) it's a no-op — they write per record.
 
+**Object rollover (`max_records_per_file` / `max_bytes_per_file`, #618).** The
+object-store sinks — `s3`, `gcs`, `azure-blob`, `sftp` — **accumulate across
+`write_batch` calls** and roll to a new object when either cap is reached.
+Before this each upstream page became its own object, so a small `batch_size`
+produced a swarm of tiny objects: the small-files problem that dominates read
+time on S3/Athena/Spark. With no cap set the whole run lands in one object,
+closed at `flush`. The byte cap is what bounds buffered memory (rows are a poor
+proxy for size), and `s3`/`azure-blob` additionally stream large objects
+through **multipart** so peak memory is O(part size), not O(object size).
+
 **Auto-create (`create_table`, #580).** Every **table-based** sink —
 `bigquery`, `postgres`, `mysql`, `sqlite`, `mssql`, `duckdb`, `snowflake`,
 `redshift`, `clickhouse`, `spanner`, `delta`, `iceberg` — takes

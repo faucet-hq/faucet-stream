@@ -18053,6 +18053,26 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "max_records_per_file": {
+                      "description": "Maximum records per file before rolling to a new one (#618). `None`\nremoves the record cap; the sink accumulates across `write_batch`\ncalls, so a small upstream page no longer means a small file.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "max_bytes_per_file": {
+                      "description": "Maximum **bytes** per file before rolling to a new one (#618).\n\nRows are a poor proxy for file size, so a rows-only cap either writes\ntiny files for narrow data or unbounded ones for wide data. This is\nalso what bounds peak memory: the open file's body is buffered until it\nrolls. `None` (the default) removes the byte cap; a single record\nlarger than the cap still gets its own file rather than being split.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
                     }
                   }
                 },
@@ -18112,7 +18132,17 @@
                       "type": "string"
                     },
                     "max_records_per_file": {
-                      "description": "Maximum records per file. `None` removes the per-file record cap — but\nthe sink still writes **one object per `write_batch` call** (i.e. one per\nupstream page), and `batch_size` may chunk a call further; it does not\ncoalesce a streaming run into a single object.",
+                      "description": "Maximum records per object. Since #618 the sink **accumulates across\n`write_batch` calls** and rolls to a new object when this (or\n[`max_bytes_per_file`](Self::max_bytes_per_file)) is reached, so a\nsmall upstream page no longer means a small object. `None` removes the\nrecord cap; with neither cap set the whole run lands in one object,\nclosed at `flush`.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "max_bytes_per_file": {
+                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size — 10k wide rows and 10k\n`{\"id\":1}` rows differ by orders of magnitude — so a rows-only cap\neither writes tiny objects for narrow data or unbounded ones for wide\ndata. This is also what bounds peak memory: the open object's body is\nbuffered until it rolls. Counted on the **uncompressed** body, before\nany `compression` codec, so the threshold means the same thing whatever\nthe codec. `None` (the default) removes the byte cap.\n\nA single record larger than the cap still gets its own object rather\nthan being split (which would corrupt it) or dropped.",
                       "type": [
                         "integer",
                         "null",
@@ -19294,6 +19324,16 @@
                       "format": "uint",
                       "minimum": 0
                     },
+                    "max_bytes_per_file": {
+                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. This is\nalso what bounds peak memory: the open object's body is buffered until\nit rolls. Counted on the uncompressed body, before any `compression`\ncodec, so the threshold means the same thing whatever the codec.\n`None` (the default) removes the byte cap. A single record larger than\nthe cap still gets its own object rather than being split or dropped.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
                     "concurrency": {
                       "description": "Maximum number of concurrent uploads (default 10).",
                       "type": [
@@ -19776,6 +19816,16 @@
                     },
                     "max_records_per_file": {
                       "description": "Hard cap on records per uploaded object. `None` means a single object\nper `write_batch` call (still subject to `batch_size`).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "max_bytes_per_file": {
+                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. Counted\non the uncompressed body, before any `compression` codec. `None` (the\ndefault) removes the byte cap; a single record larger than the cap\nstill gets its own object rather than being split or dropped.",
                       "type": [
                         "integer",
                         "null",

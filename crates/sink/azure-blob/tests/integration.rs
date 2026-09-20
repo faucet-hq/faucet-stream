@@ -175,6 +175,9 @@ async fn sink_rolls_over_multiple_files() {
     let records: Vec<Value> = (1..=5).map(|i| json!({ "id": i })).collect();
     let written = sink.write_batch(&records).await.expect("write_batch");
     assert_eq!(written, 5);
+    // Since #618 the remainder of the open object is closed at `flush`, which
+    // the pipeline calls at every bookmark-carrying page and at the end.
+    sink.flush().await.expect("flush");
 
     let store = verify_store(port);
     let keys = list_keys(&store, "roll").await;
@@ -260,6 +263,7 @@ async fn sink_writes_gzip_when_compression_enabled() {
         .await
         .expect("write_batch");
     assert_eq!(written, 2);
+    sink.flush().await.expect("flush");
 
     let store = verify_store(port);
     let keys = list_keys(&store, "gz").await;
