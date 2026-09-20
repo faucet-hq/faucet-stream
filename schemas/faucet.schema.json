@@ -16708,6 +16708,16 @@
                       ],
                       "format": "int32",
                       "default": 1
+                    },
+                    "stream_concurrency": {
+                      "description": "How many Storage Read streams to consume concurrently (#621).\n\n`max_streams` asks BigQuery to shard the table; this says how many of\nthose shards to read at once. Consuming them one at a time made the\nrequest pointless — the read stayed as slow as a single stream.\nDefaults to `4`; `0` and `1` both mean sequential.\n\nBatches from different streams **interleave**. The Storage Read API\ngives no ordering guarantee across streams — that is what sharding\nmeans — so this costs nothing a caller could have relied on. Each\nin-flight stream carries its own decode buffer, so this is also the\nmemory knob.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 4
                     }
                   }
                 },
@@ -16810,6 +16820,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "partition_concurrency": {
+                      "description": "How many result **partitions** to fetch concurrently (#621).\n\nSnowflake splits a large result into server-chosen partitions, each\nits own `GET …/partition={n}`. Fetching them one at a time makes the\nread latency-bound on the round trip rather than throughput-bound on\nthe data, and the partition count is the server's choice — not\nsomething `batch_size` can influence.\n\nDefaults to `4`. `0` and `1` both mean sequential. Partitions are\nfetched **in order** with a bounded look-ahead, so the emitted row\norder is unchanged and a failure is still attributed to the partition\nthat caused it. The look-ahead holds up to this many partitions'\ndecoded rows, so raise it for throughput and lower it for memory.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 4
                     }
                   }
                 },

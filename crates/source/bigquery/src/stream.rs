@@ -79,15 +79,69 @@ impl BigQuerySource {
         }
         #[cfg(feature = "arrow")]
         {
-            if config.read_table.as_deref().unwrap_or("").is_empty() {
+            // Either a table to read outright, or SQL whose destination
+            // table can be read (#621). Only *neither* is a misconfiguration.
+            if config.read_table.as_deref().unwrap_or("").is_empty()
+                && config.query.trim().is_empty()
+            {
                 return Err(FaucetError::Config(
-                    "BigQuery `read_api` requires `read_table` (dataset.table or \
-                     project.dataset.table)"
+                    "BigQuery `read_api` requires either `read_table` (dataset.table or \
+                     project.dataset.table) or a `query` whose result table can be read"
                         .into(),
                 ));
             }
             Ok(())
         }
+    }
+
+    /// Run the configured SQL and return its **destination table** in Storage
+    /// Read API form (#621).
+    ///
+    /// BigQuery materialises every query result into a table — an anonymous
+    /// cache table when the caller names none — so a large SQL result can take
+    /// the same fast gRPC Arrow path as a direct table read instead of
+    /// paginating `getQueryResults` REST JSON.
+    ///
+    /// The query is run to completion first: the destination table only exists
+    /// (and only has rows) once the job is DONE.
+    #[cfg(feature = "arrow")]
+    pub(crate) async fn query_destination_table(&self) -> Result<String, FaucetError> {
+        let req = self.build_query_request(self.config.query.clone(), &[]);
+        let initial = self
+            .client
+            .job()
+            .query(&self.config.project_id, req)
+            .await
+            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        let job_ref = initial.job_reference.as_ref().ok_or_else(|| {
+            FaucetError::Source("BigQuery jobs.query returned no jobReference".into())
+        })?;
+        let job_id = job_ref.job_id.as_deref().ok_or_else(|| {
+            FaucetError::Source("BigQuery jobs.query returned a jobReference with no jobId".into())
+        })?;
+        let job = self
+            .client
+            .job()
+            .get_job(&self.config.project_id, job_id, job_ref.location.as_deref())
+            .await
+            .map_err(|e| FaucetError::Source(format!("BigQuery jobs.get failed: {e}")))?;
+        let dest = job
+            .configuration
+            .as_ref()
+            .and_then(|c| c.query.as_ref())
+            .and_then(|q| q.destination_table.as_ref())
+            .ok_or_else(|| {
+                FaucetError::Source(
+                    "BigQuery query job reported no destination table, so its result cannot be \
+                     read through the Storage Read API — set `read_table`, or turn `read_api` \
+                     off for this query"
+                        .into(),
+                )
+            })?;
+        Ok(format!(
+            "projects/{}/datasets/{}/tables/{}",
+            dest.project_id, dest.dataset_id, dest.table_id
+        ))
     }
 
     /// Accessor for the Arrow Storage Read path (`storage_read.rs`).
@@ -745,8 +799,18 @@ mod tests {
         c.read_api = true;
         #[cfg(feature = "arrow")]
         {
-            // read_api on but no table → error.
-            assert!(BigQuerySource::validate_read_api(&c).is_err());
+            // A `query` is enough since #621: its destination table is what
+            // gets read, so arbitrary SQL reaches the fast Arrow path too.
+            assert!(BigQuerySource::validate_read_api(&c).is_ok());
+
+            // Neither a table nor SQL is the real misconfiguration.
+            let mut empty = c.clone();
+            empty.query = String::new();
+            assert!(BigQuerySource::validate_read_api(&empty).is_err());
+
+            // A named table works with or without SQL.
+            empty.read_table = Some("ds.events".into());
+            assert!(BigQuerySource::validate_read_api(&empty).is_ok());
             c.read_table = Some("ds.events".into());
             assert!(BigQuerySource::validate_read_api(&c).is_ok());
         }

@@ -814,10 +814,25 @@ impl faucet_core::Source for SnowflakeSource {
                 let auth = authorization_header(&effective, &self.config.account)?;
                 let token_type = snowflake_token_type(&effective);
 
-                for i in 1..partition_count {
-                    let raw = self.fetch_partition(&handle, i, &auth, token_type).await?;
-                    for r in raw {
-                        buffer.push(row_to_json(&r, &columns));
+                // Ordered look-ahead (#621): partitions are fetched up to
+                // `partition_concurrency` at a time but consumed **in order**,
+                // so the emitted row order is unchanged and a failure is still
+                // attributed to the partition that caused it. Unordered would
+                // be marginally faster and would silently reorder a result set
+                // the user wrote an ORDER BY for.
+                let concurrency = self.config.partition_concurrency.max(1);
+                use futures::StreamExt as _;
+                let mut fetches = futures::stream::iter(1..partition_count)
+                    .map(|i| {
+                        let handle = handle.clone();
+                        let auth = auth.clone();
+                        async move { self.fetch_partition(&handle, i, &auth, token_type).await }
+                    })
+                    .buffered(concurrency);
+                while let Some(raw) = fetches.next().await {
+                    let raw = raw?;
+                    for r in &raw {
+                        buffer.push(row_to_json(r, &columns));
                         if buffer.len() >= chunk {
                             let page = std::mem::replace(
                                 &mut buffer,

@@ -89,6 +89,25 @@ pub struct SnowflakeSourceConfig {
     /// one large request to many small ones.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// How many result **partitions** to fetch concurrently (#621).
+    ///
+    /// Snowflake splits a large result into server-chosen partitions, each
+    /// its own `GET …/partition={n}`. Fetching them one at a time makes the
+    /// read latency-bound on the round trip rather than throughput-bound on
+    /// the data, and the partition count is the server's choice — not
+    /// something `batch_size` can influence.
+    ///
+    /// Defaults to `4`. `0` and `1` both mean sequential. Partitions are
+    /// fetched **in order** with a bounded look-ahead, so the emitted row
+    /// order is unchanged and a failure is still attributed to the partition
+    /// that caused it. The look-ahead holds up to this many partitions'
+    /// decoded rows, so raise it for throughput and lower it for memory.
+    #[serde(default = "default_partition_concurrency")]
+    pub partition_concurrency: usize,
+}
+
+fn default_partition_concurrency() -> usize {
+    4
 }
 
 impl std::fmt::Debug for SnowflakeSourceConfig {
@@ -131,6 +150,7 @@ impl SnowflakeSourceConfig {
             statement_timeout: default_statement_timeout(),
             poll_timeout: default_poll_timeout(),
             batch_size: DEFAULT_BATCH_SIZE,
+            partition_concurrency: default_partition_concurrency(),
         }
     }
 
@@ -163,6 +183,12 @@ impl SnowflakeSourceConfig {
     ///
     /// Pass `0` to opt out of batching — the entire result set is emitted in
     /// a single page.
+    pub fn with_partition_concurrency(mut self, n: usize) -> Self {
+        self.partition_concurrency = n;
+        self
+    }
+
+    /// Set the per-page record count.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self

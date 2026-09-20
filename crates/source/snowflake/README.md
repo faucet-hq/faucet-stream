@@ -297,6 +297,22 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [`faucet-common-snowflake`](https://crates.io/crates/faucet-common-snowflake) — the shared `SnowflakeAuth` enum and header helpers
 - [`faucet-sink-snowflake`](https://crates.io/crates/faucet-sink-snowflake) — write rows back to Snowflake
 
+
+## Partition read throughput (`partition_concurrency`)
+
+Snowflake splits a large result into server-chosen partitions, each its own
+`GET …/partition={n}`. Those used to be fetched one at a time, making the read
+latency-bound on the round trip rather than throughput-bound on the data — and
+the partition count is the *server's* choice, not something `batch_size` can
+influence.
+
+`partition_concurrency` (default `4`; `0`/`1` mean sequential) fetches them
+with a bounded look-ahead. Partitions are consumed **in order**, so the emitted
+row order is unchanged — a result set with an `ORDER BY` is not silently
+reordered by a throughput knob — and a failure is still attributed to the
+partition that caused it. The look-ahead holds up to this many partitions'
+decoded rows, so raise it for throughput and lower it for memory.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

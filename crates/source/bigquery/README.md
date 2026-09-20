@@ -230,6 +230,23 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | Bind parameter compared as text unexpectedly | Each `params` entry is typed from its JSON value. Pass `0.75` (number) not `"0.75"` (string) to bind a `FLOAT64`. |
 | Legacy table reference fails to parse | Set `use_legacy_sql: true` for `[project:dataset.table]` syntax. |
 
+
+## Storage Read throughput (`max_streams` / `stream_concurrency`)
+
+`max_streams` asks BigQuery to shard the table into that many read streams;
+`stream_concurrency` (default `4`) says how many of those shards to read at
+once (#621). Consuming them one at a time made `max_streams` pointless — the
+read stayed as slow as a single stream. Batches from different streams
+**interleave**, which costs nothing: the Storage Read API gives no ordering
+guarantee across streams, since that is what sharding means. Each in-flight
+stream carries its own decode buffer, so this is also the memory knob.
+
+`read_api` no longer needs `read_table`: with only a `query`, the source runs
+it and reads the job's **destination table** through the same gRPC Arrow path
+(#621). Before this, arbitrary SQL fell back to paginating `getQueryResults`
+REST JSON — exactly where a large result most needs the fast path. Only a
+config with *neither* a table nor SQL is rejected.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
