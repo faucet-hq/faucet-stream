@@ -21,11 +21,27 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
-/// Counts concurrent in-flight requests and records the high-water mark.
+/// How long the mock holds each response before delivering it.
+const RESPONSE_DELAY_MS: u64 = 200;
+/// How long a request counts as "in flight" for the overlap measurement.
 ///
-/// `wiremock`'s `Respond` is synchronous, so the "hold" is expressed as a
-/// response delay: the counter is incremented here and the matching decrement
-/// happens after the delay elapses, on a task spawned per request.
+/// Deliberately **shorter** than [`RESPONSE_DELAY_MS`]. `wiremock`'s `Respond`
+/// is synchronous and cannot hook response *delivery*, so the close of the
+/// in-flight window has to be a timer of its own. Making the two equal — as
+/// this harness first did — sets both to fire at the same instant with no
+/// ordering between them: on a sequential run the client can receive its
+/// response and issue the next request before the previous decrement task is
+/// polled, so `in_flight` reads 2 and the sequential assertions fail. That is
+/// a defect in the *measurement*, not in the code under test, and it surfaced
+/// under coverage instrumentation, which widens every scheduling window.
+///
+/// With the window closing well before the response is delivered, the count
+/// can only ever **under**-report overlap — which is the safe direction: a
+/// sequential run reads exactly 1, and genuinely concurrent requests (issued
+/// back-to-back, far inside this window) still all overlap.
+const IN_FLIGHT_WINDOW_MS: u64 = 40;
+
+/// Counts concurrent in-flight requests and records the high-water mark.
 struct CountingResponder {
     in_flight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
@@ -37,11 +53,11 @@ impl Respond for CountingResponder {
         self.peak.fetch_max(now, Ordering::SeqCst);
         let in_flight = Arc::clone(&self.in_flight);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(IN_FLIGHT_WINDOW_MS)).await;
             in_flight.fetch_sub(1, Ordering::SeqCst);
         });
         ResponseTemplate::new(200)
-            .set_delay(std::time::Duration::from_millis(150))
+            .set_delay(std::time::Duration::from_millis(RESPONSE_DELAY_MS))
             .set_body_json(json!([{ "id": 1 }]))
     }
 }
