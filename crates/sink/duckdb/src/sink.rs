@@ -538,6 +538,70 @@ mod tests {
         );
     }
 
+    /// The other arm of `create_table: false`: the table *does* exist, so the
+    /// probe must accept it and write. Only the failure arm was covered, and a
+    /// probe that rejected a healthy table would break every opted-out config.
+    #[tokio::test]
+    async fn an_existing_table_is_accepted_when_create_is_off() {
+        let sink = DuckdbSink::new(
+            DuckdbSinkConfig::new(":memory:", "present")
+                .column_mapping(DuckdbColumnMapping::AutoMap)
+                .with_create_table(false),
+        )
+        .await
+        .unwrap();
+        sink.conn
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE present (a BIGINT)")
+            .expect("ddl");
+
+        assert_eq!(sink.write_batch(&[json!({"a": 1})]).await.unwrap(), 1);
+        assert_eq!(count(&sink, "present"), 1);
+        // The probe runs once and latches, so a second page does not re-probe.
+        assert_eq!(sink.write_batch(&[json!({"a": 2})]).await.unwrap(), 1);
+        assert_eq!(count(&sink, "present"), 2);
+    }
+
+    /// A page with nothing inferable must leave the table uncreated so the
+    /// next page can try — emitting a zero-column CREATE would poison the
+    /// destination for every later page.
+    #[tokio::test]
+    async fn a_page_with_nothing_inferable_creates_no_table() {
+        let sink = DuckdbSink::new(
+            DuckdbSinkConfig::new(":memory:", "later").column_mapping(DuckdbColumnMapping::AutoMap),
+        )
+        .await
+        .unwrap();
+
+        // Records with no inferable columns: nothing to build a schema from,
+        // so the page fails rather than creating a zero-column table.
+        let err = sink
+            .write_batch(&[json!({})])
+            .await
+            .expect_err("an empty shape cannot be written");
+        assert!(
+            err.to_string().contains("no columns or does not exist"),
+            "got: {err}"
+        );
+        let exists: i64 = sink
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'later'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "no table may be created from an empty shape");
+
+        // The point of leaving it uncreated: a later page with real columns
+        // still creates it, so one shapeless page does not poison the run.
+        assert_eq!(sink.write_batch(&[json!({"a": 1})]).await.unwrap(), 1);
+        assert_eq!(count(&sink, "later"), 1);
+    }
+
     #[tokio::test]
     async fn a_missing_table_is_created_from_the_first_page_by_default() {
         // #580: a first-ever sync cannot assume the destination exists.

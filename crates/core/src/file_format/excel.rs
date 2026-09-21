@@ -125,12 +125,12 @@ pub fn encode(records: &[Value], sheet: Option<&str>) -> Result<Vec<u8>, FaucetE
                 Some(Value::Bool(b)) => {
                     ws.write_boolean(row, col, *b).map_err(err)?;
                 }
-                Some(Value::Number(n)) => match n.as_f64() {
+                Some(Value::Number(n)) => match exact_f64(n) {
                     Some(f) => {
                         ws.write_number(row, col, f).map_err(err)?;
                     }
-                    // An integer too large for f64 would lose precision as a
-                    // number; write the exact digits as text instead.
+                    // Not exactly representable as a double; write the exact
+                    // digits as text instead.
                     None => {
                         ws.write_string(row, col, n.to_string().as_str())
                             .map_err(err)?;
@@ -146,6 +146,28 @@ pub fn encode(records: &[Value], sheet: Option<&str>) -> Result<Vec<u8>, FaucetE
     book.push_worksheet(ws);
     book.save_to_buffer()
         .map_err(|e| FaucetError::Sink(format!("xlsx: finishing the workbook: {e}")))
+}
+
+/// The double form of `n`, but only when that conversion is **exact**.
+///
+/// xlsx stores every number as an IEEE double, so an integer past 2^53 has no
+/// exact cell representation: writing 9007199254740993 as a number stores
+/// 9007199254740992 and the run reports success. That is silent corruption of
+/// exactly the values — bigint ids, ledger amounts in minor units — most
+/// likely to be beyond the range. Returning `None` routes them to text, which
+/// keeps every digit; the caller's read-back then yields a string rather than
+/// a wrong number, which is visible.
+fn exact_f64(n: &serde_json::Number) -> Option<f64> {
+    /// Largest integer with an exact f64 (2^53).
+    const MAX_EXACT: i64 = 9_007_199_254_740_992;
+    if let Some(i) = n.as_i64() {
+        return (-MAX_EXACT..=MAX_EXACT).contains(&i).then_some(i as f64);
+    }
+    if let Some(u) = n.as_u64() {
+        return (u <= MAX_EXACT as u64).then_some(u as f64);
+    }
+    // A float literal is already a double; nothing is lost by writing it.
+    n.as_f64()
 }
 
 /// An integral double becomes an integer; anything else stays a float.
@@ -343,5 +365,47 @@ mod tests {
         assert_eq!(float_to_value(f64::NAN), Value::Null);
         assert_eq!(float_to_value(f64::INFINITY), Value::Null);
         assert_eq!(float_to_value(-0.0), json!(0));
+    }
+
+    /// The guard that decides number-vs-text. Every branch matters: an i64
+    /// past 2^53, a u64 past it, and a plain float that is always exact.
+    #[test]
+    fn only_exactly_representable_numbers_are_written_as_numbers() {
+        use serde_json::Number;
+        let n = |v: &str| -> Number { serde_json::from_str(v).expect("number") };
+        assert_eq!(exact_f64(&n("0")), Some(0.0));
+        assert_eq!(exact_f64(&n("-1")), Some(-1.0));
+        assert_eq!(exact_f64(&n("9007199254740992")), Some(9007199254740992.0));
+        assert_eq!(
+            exact_f64(&n("-9007199254740992")),
+            Some(-9007199254740992.0)
+        );
+        // One past 2^53 in each direction has no exact double.
+        assert_eq!(exact_f64(&n("9007199254740993")), None);
+        assert_eq!(exact_f64(&n("-9007199254740993")), None);
+        assert_eq!(exact_f64(&n("9223372036854775807")), None);
+        // A u64 beyond i64::MAX takes the unsigned branch.
+        assert_eq!(exact_f64(&n("18446744073709551615")), None);
+        // A float literal is already a double, so nothing is lost.
+        assert_eq!(exact_f64(&n("1.5")), Some(1.5));
+        assert_eq!(exact_f64(&n("1e300")), Some(1e300));
+    }
+
+    /// The regression itself, end to end: a bigint must survive as digits.
+    /// Writing it as a number stores 9007199254740992 and reports success —
+    /// silent corruption of exactly the ids most likely to be that large.
+    #[test]
+    fn an_integer_past_2_53_keeps_its_digits_instead_of_rounding() {
+        let recs = vec![json!({ "id": 9007199254740993i64, "small": 42 })];
+        let bytes = encode(&recs, None).expect("encode");
+        let back = decode(&bytes, None, 0).expect("decode");
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0]["id"],
+            Value::String("9007199254740993".into()),
+            "the exact digits must survive, as text"
+        );
+        // A value inside the exact range is still a typed number.
+        assert_eq!(back[0]["small"], json!(42));
     }
 }

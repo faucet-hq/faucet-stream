@@ -24,6 +24,10 @@ tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# The shared file-format layer (#604) is the one "connector" every file source
+# and sink shares, so its typed fidelity is asserted here against the same
+# corpus each connector pair uses.
+faucet-core = { workspace = true, features = ["file-formats"] }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -42,3 +46,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+# `scripted::Boundary` and `scripted::Event` exist to grow: the documented
+# process for a new engine guarantee (#651, `.claude/rules/maintenance.md`) is
+# "add a new Boundary/Event if the failure point is new". Both are
+# `#[non_exhaustive]`, so a consumer already matches them with a `_` arm and a
+# new variant cannot break one. Without these two allowances every new
+# reliability boundary would force a major bump of the harness crate.
+enum_variant_added = "allow"
+enum_marked_non_exhaustive = "allow"

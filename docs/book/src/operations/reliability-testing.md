@@ -176,6 +176,44 @@ The read is made slow deterministically with `pg_sleep` per row rather than by
 tuning a delay: the first version of this test raced, the table streamed in
 before the cut, and it "failed" on a perfectly healthy run.
 
+### Dead-letter boundary (`reliability_dlq_boundary`)
+
+The DLQ is the one error path where **the run keeps going and still reports
+success**, which is what makes a mistake here so expensive: a row is dropped,
+or a bookmark advances past a row that was never made durable anywhere, and
+nothing in the exit code says so.
+
+Asserts, against one interleaved log shared by the main sink, the DLQ sink and
+the state store: a rejected row is durable in the DLQ **before** the bookmark
+covering its page is persisted (reverse the two and a crash in that window
+loses the row from both destinations); the surviving rows of a partial page
+are still written and the stream still advances; `on_batch_error: propagate`
+aborts and never bookmarks the failed page; a DLQ sink that itself fails
+fails the run instead of swallowing the row; the per-page failure budget
+aborts rather than silently capping; and whether row outcomes are consulted at
+all is decided by the *presence of a DLQ*, not by the sink.
+
+`Boundary::RowsInWrite { batch, rows }` is the row-level injector this needed
+— `Boundary::Write` is whole-batch, and deliberately stays an **outer** error
+even on the `write_batch_partial` path, because that is exactly what
+`on_batch_error` keys off.
+
+### File-format fidelity (`format_fidelity`)
+
+`faucet_core::file_format` is the one "connector" every file source and sink
+shares — what the s3/gcs/azure-blob/sftp sinks write is what those sources
+read back — so the pair-level fidelity question is asked of each format once,
+here, rather than eight times.
+
+Each format's lossiness is asserted as an explicit `Tolerance` rather than
+assumed, so a change that makes a format *quietly* lossier turns a green
+tolerance into a red mismatch. The JSON formats must be exact; CSV and XML are
+text-only; xlsx keeps scalar types within the double it stores them in. The
+named edges — XML trimming surrounding whitespace, XML having no
+representation for an empty array, xlsx returning an integer past 2^53 as
+text rather than rounding it — are pinned individually, and tabulated in the
+[file-formats cookbook](../cookbook/file-formats.md).
+
 ## Adding to the program
 
 ### A new guarantee

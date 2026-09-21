@@ -117,6 +117,24 @@ sink:
   union of every record's keys in the group, so a late field is written for
   every row rather than silently lost.
 
+### The edges, precisely
+
+These are asserted by `crates/conformance/tests/format_fidelity.rs` against
+the shared fidelity corpus, so they stay true as the layer changes:
+
+| Value | `json_*` | `csv` | `xml` | `xlsx` |
+|---|---|---|---|---|
+| Integer past 2^53 | exact | exact digits, as text | exact digits, as text | **exact digits, as text** — no double represents it, so writing it as a number would silently round it |
+| `null` | `null` | empty field (reads back `""`) | empty element | empty cell |
+| `""` | `""` | `""` | `""` | reads back `null` — a spreadsheet cannot tell an empty cell from an empty string |
+| `-0.0` | `-0.0` | `"-0.0"` | `"-0.0"` | `0` — no signed zero in a cell |
+| Leading/trailing spaces | kept | kept | **trimmed** — XML text nodes are whitespace-normalised on read |
+| `[]` (empty array) | `[]` | `"[]"` | **field absent** — a list is repeated elements, so an empty one is no element at all |
+
+The two in bold worth planning around: **XML trims padding**, so quote-and-pad
+alignment does not survive a round trip; and **xlsx returns a big integer as a
+string**, which is visible and correctable, unlike a rounded number.
+
 ## Streaming and memory
 
 Only `json_lines` can be built a record at a time. Every other format has a

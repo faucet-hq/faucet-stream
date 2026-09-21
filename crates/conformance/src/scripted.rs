@@ -25,7 +25,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use faucet_core::{FaucetError, Sink, StateStore, Value, async_trait, json};
+use faucet_core::{FaucetError, RowOutcome, Sink, StateStore, Value, async_trait, json};
 
 /// One thing that happened, in the order it happened.
 ///
@@ -33,6 +33,7 @@ use faucet_core::{FaucetError, Sink, StateStore, Value, async_trait, json};
 /// the payload: an assertion about ordering needs to know that write #3 landed
 /// before the bookmark that followed it, not what was in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// `write_batch` (or one of its idempotent / partial variants) succeeded
     /// with this many records.
@@ -60,6 +61,13 @@ pub enum Event {
     StatePutFailed { key: String },
     /// `cleanup_scope` ran with this many tracked keys.
     Cleanup(usize),
+    /// A write that landed in the **DLQ** sink, carrying the envelope count.
+    ///
+    /// A distinct variant (rather than a second `EventLog`) is what makes the
+    /// DLQ's *ordering* assertable: quarantined rows must reach the DLQ before
+    /// the bookmark covering their page is persisted, and only one totally
+    /// ordered log can show that.
+    DlqWrite(usize),
 }
 
 /// The shared, ordered event log. Clone it to keep a handle after the doubles
@@ -184,6 +192,7 @@ pub fn assert_bookmarks_backed_by_writes(
 /// Every variant names a real transition the engine makes, and each one is a
 /// place a naive implementation gets the ordering wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Boundary {
     /// Never fail — the control arm every failure test needs for comparison.
     #[default]
@@ -204,6 +213,65 @@ pub enum Boundary {
     /// Fail `commit_overwrite` — the atomic swap itself. The prior destination
     /// must survive.
     CommitOverwrite,
+    /// Fail specific **rows** of the (0-indexed) `batch`, via
+    /// `write_batch_partial`, while the rest of the batch succeeds.
+    ///
+    /// The row-level error path is the only one that produces a DLQ envelope
+    /// without failing the page, so it cannot be modelled by [`Self::Write`]
+    /// (whole-batch) — and it is the path the delivery guarantees are most
+    /// easily wrong about, because the run stays green.
+    RowsInWrite {
+        /// Which batch (0-indexed) carries the failing rows.
+        batch: usize,
+        /// Which rows *within that batch* must fail.
+        rows: RowMask,
+    },
+}
+
+/// A set of row indices, as a bitmask over the first 64 rows of a batch.
+///
+/// A `Vec<usize>` would be the obvious shape, but [`Boundary`] is a public
+/// `Copy` enum and dropping that impl is a major semver break
+/// (`copy_impl_removed`). 64 rows is far more than any ordering test needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RowMask(u64);
+
+impl RowMask {
+    /// The mask holding exactly `rows`. Indices past 63 are ignored.
+    pub fn of(rows: &[usize]) -> Self {
+        Self(
+            rows.iter()
+                .filter(|r| **r < 64)
+                .fold(0, |m, r| m | (1 << r)),
+        )
+    }
+
+    /// Just one row.
+    pub fn just(row: usize) -> Self {
+        Self::of(&[row])
+    }
+
+    /// Whether `row` is in the mask.
+    pub fn contains(self, row: usize) -> bool {
+        row < 64 && self.0 & (1 << row) != 0
+    }
+
+    /// How many of the first `len` rows are in the mask.
+    pub fn count_within(self, len: usize) -> usize {
+        (0..len.min(64)).filter(|i| self.contains(*i)).count()
+    }
+}
+
+/// How one batch is scripted to fail — resolved once per write call.
+#[derive(Debug, Clone, Copy)]
+enum BatchFailure {
+    /// Not scripted; the batch succeeds.
+    None,
+    /// The whole call fails, as `write_batch` would. This is what the
+    /// `on_batch_error` policy is applied to.
+    Outer,
+    /// These rows fail individually; the rest of the batch lands.
+    Rows(RowMask),
 }
 
 /// Shared script state behind a [`ScriptedSink`] / [`ScriptedStateStore`].
@@ -236,6 +304,8 @@ pub struct ScriptedSink {
     tokens: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Delay injected into each write, for backpressure / latency tests.
     write_delay: Option<Duration>,
+    /// Log writes as [`Event::DlqWrite`] — this instance is the DLQ sink.
+    dlq: bool,
 }
 
 impl ScriptedSink {
@@ -255,7 +325,20 @@ impl ScriptedSink {
             cleanup: false,
             tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
             write_delay: None,
+            dlq: false,
         }
+    }
+
+    /// Mark this instance as the **DLQ** sink, so its writes log as
+    /// [`Event::DlqWrite`].
+    ///
+    /// Share one [`EventLog`] between the main sink, the DLQ sink and the
+    /// state store and the log becomes a single ordered history of the whole
+    /// run — which is the only way to assert that quarantined rows are durable
+    /// before the bookmark that covers them.
+    pub fn as_dlq(mut self) -> Self {
+        self.dlq = true;
+        self
     }
 
     /// Fail at `boundary`.
@@ -371,8 +454,29 @@ impl ScriptedSink {
                 records.len()
             )));
         }
-        self.log.push(Event::Write(records.len()));
+        self.log.push(if self.dlq {
+            Event::DlqWrite(records.len())
+        } else {
+            Event::Write(records.len())
+        });
         Ok(records.len())
+    }
+
+    /// How this batch is scripted to fail, if at all. Increments the batch
+    /// counter exactly once per call, like [`Self::should_fail_write`].
+    ///
+    /// [`Boundary::Write`] stays an **outer** failure even on the partial
+    /// path: that is what the `on_batch_error` policy keys off, so collapsing
+    /// it into "every row failed" would make `propagate` untestable.
+    fn scripted_failure(&self) -> BatchFailure {
+        let mut s = self.script.lock().expect("script lock");
+        let nth = s.writes;
+        s.writes += 1;
+        match s.boundary {
+            Boundary::RowsInWrite { batch, rows } if batch == nth => BatchFailure::Rows(rows),
+            Boundary::Write(n) if n == nth => BatchFailure::Outer,
+            _ => BatchFailure::None,
+        }
     }
 }
 
@@ -380,6 +484,48 @@ impl ScriptedSink {
 impl Sink for ScriptedSink {
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.record_write(records).await
+    }
+
+    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+        if let Some(d) = self.write_delay {
+            tokio::time::sleep(d).await;
+        }
+        let failing = match self.scripted_failure() {
+            BatchFailure::None => {
+                self.log.push(if self.dlq {
+                    Event::DlqWrite(records.len())
+                } else {
+                    Event::Write(records.len())
+                });
+                return Ok(records.iter().map(|_| Ok(())).collect());
+            }
+            BatchFailure::Outer => {
+                self.log.push(Event::WriteFailed(records.len()));
+                return Err(FaucetError::Sink(format!(
+                    "scripted sink: write of {} records failed at the scripted boundary",
+                    records.len()
+                )));
+            }
+            BatchFailure::Rows(mask) => mask,
+        };
+        let failed = failing.count_within(records.len());
+        let ok = records.len() - failed;
+        // The rows that did land are still a real write, and the bookmark
+        // logic depends on seeing it — a double that logged nothing here
+        // would make a partially-successful page look like a total failure.
+        self.log.push(Event::Write(ok));
+        self.log.push(Event::WriteFailed(failed));
+        Ok((0..records.len())
+            .map(|i| {
+                if failing.contains(i) {
+                    Err(FaucetError::Sink(format!(
+                        "scripted sink: row {i} failed at the scripted boundary"
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+            .collect())
     }
 
     async fn flush(&self) -> Result<(), FaucetError> {
@@ -972,5 +1118,80 @@ mod tests {
         log.push(Event::Write(2));
         assert_eq!(log.position(|e| matches!(e, Event::Flush)), Some(1));
         assert_eq!(log.position(|e| matches!(e, Event::Cleanup(_))), None);
+    }
+
+    // ── row-level failures + the DLQ log (#651) ──────────────────────────
+
+    #[test]
+    fn a_row_mask_holds_exactly_the_rows_it_was_given() {
+        let m = RowMask::of(&[0, 3, 63]);
+        assert!(m.contains(0) && m.contains(3) && m.contains(63));
+        assert!(!m.contains(1) && !m.contains(62));
+        // Out of range is ignored rather than wrapping onto a real row, which
+        // would silently fail the wrong one.
+        assert!(!RowMask::of(&[64]).contains(64));
+        assert!(!RowMask::of(&[64]).contains(0));
+        assert_eq!(RowMask::of(&[0, 3, 63]).count_within(4), 2);
+        assert_eq!(RowMask::of(&[0, 3, 63]).count_within(64), 3);
+        assert_eq!(RowMask::just(2).count_within(3), 1);
+        assert_eq!(RowMask::default().count_within(10), 0);
+    }
+
+    #[tokio::test]
+    async fn rows_in_write_fails_exactly_those_rows_and_lands_the_rest() {
+        let log = EventLog::new();
+        let sink = ScriptedSink::new(log.clone()).failing_at(Boundary::RowsInWrite {
+            batch: 0,
+            rows: RowMask::of(&[1, 2]),
+        });
+        let page: Vec<Value> = (0..4).map(|i| json!({ "i": i })).collect();
+        let outcomes = sink.write_batch_partial(&page).await.expect("partial");
+        let failed: Vec<usize> = outcomes
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.is_err())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(failed, vec![1, 2]);
+        assert!(log.contains(&Event::Write(2)), "{:?}", log.events());
+        assert!(log.contains(&Event::WriteFailed(2)), "{:?}", log.events());
+
+        // Only the scripted batch is affected; the next one is clean.
+        let outcomes = sink.write_batch_partial(&page).await.expect("partial");
+        assert!(outcomes.iter().all(|o| o.is_ok()));
+    }
+
+    /// The whole-batch boundary must stay an **outer** error on the partial
+    /// path too — the `on_batch_error` policy keys off exactly that, so
+    /// collapsing it into "every row failed" would make `propagate`
+    /// untestable and silently reroute an aborting failure into the DLQ.
+    #[tokio::test]
+    async fn the_write_boundary_stays_an_outer_error_on_the_partial_path() {
+        let log = EventLog::new();
+        let sink = ScriptedSink::new(log.clone()).failing_at(Boundary::Write(0));
+        let page = vec![json!({ "i": 0 }), json!({ "i": 1 })];
+        assert!(sink.write_batch_partial(&page).await.is_err());
+        assert!(log.contains(&Event::WriteFailed(2)), "{:?}", log.events());
+    }
+
+    #[tokio::test]
+    async fn a_dlq_sink_logs_its_writes_distinctly_from_the_main_sink() {
+        // One shared log is what makes the DLQ's ordering assertable, so the
+        // two sinks must be distinguishable within it.
+        let log = EventLog::new();
+        let main = ScriptedSink::new(log.clone());
+        let dlq = ScriptedSink::new(log.clone()).as_dlq();
+        main.write_batch(&[json!({})]).await.expect("main write");
+        dlq.write_batch(&[json!({}), json!({})])
+            .await
+            .expect("dlq write");
+        assert_eq!(
+            log.events(),
+            vec![Event::Write(1), Event::DlqWrite(2)],
+            "the log must order and distinguish both sinks"
+        );
+        // The partial path labels them the same way.
+        dlq.write_batch_partial(&[json!({})]).await.expect("dlq");
+        assert!(log.contains(&Event::DlqWrite(1)));
     }
 }
