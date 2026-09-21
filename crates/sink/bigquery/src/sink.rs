@@ -1413,11 +1413,8 @@ impl BigQuerySink {
     /// Best-effort `CREATE SCHEMA IF NOT EXISTS` so `create_table` can target a
     /// dataset that does not exist yet. Idempotent; runs in `config.location`.
     async fn ensure_dataset(&self) -> Result<(), FaucetError> {
-        let sql = format!(
-            "CREATE SCHEMA IF NOT EXISTS `{}`.`{}`",
-            self.config.project_id.replace('`', ""),
-            self.config.dataset_id.replace('`', "")
-        );
+        let sql =
+            idempotent::build_ensure_dataset_ddl(&self.config.project_id, &self.config.dataset_id);
         self.run_ddl(sql).await
     }
 
@@ -2258,8 +2255,10 @@ impl faucet_core::Sink for BigQuerySink {
         let temp = self.overwrite_temp_ref();
         let sql = match &self.config.scope {
             Some(scope) => {
-                // Backtick-quote the scoped column (strip any backticks).
-                let col = format!("`{}`", scope.column().replace('`', ""));
+                // The scope column is **user-supplied**, so escape rather than
+                // strip (#654 M15): stripping rewrote ``a`b`` to `ab` and the
+                // cleanup then deleted against a different, real column.
+                let col = idempotent::quote_ident(scope.column());
                 idempotent::build_scoped_overwrite_commit_sql(
                     &self.table_ref(),
                     &temp,
