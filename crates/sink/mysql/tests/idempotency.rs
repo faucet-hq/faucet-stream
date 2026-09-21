@@ -194,8 +194,12 @@ async fn idempotent_write_auto_map_mode_commits_data_and_token() {
 async fn auto_map_into_missing_table_errors_with_no_columns() {
     let (_container, url) = start_mysql().await;
 
-    let config =
-        MysqlSinkConfig::new(&url, "does_not_exist").column_mapping(MysqlColumnMapping::AutoMap);
+    // `create_table` defaults on since #580, so the sink would create the
+    // table rather than fail. Pinned off here because the missing-table error
+    // path is exactly what this test covers.
+    let config = MysqlSinkConfig::new(&url, "does_not_exist")
+        .column_mapping(MysqlColumnMapping::AutoMap)
+        .with_create_table(false);
     let sink = MysqlSink::new(config).await.expect("sink new");
 
     let err = sink
@@ -204,8 +208,9 @@ async fn auto_map_into_missing_table_errors_with_no_columns() {
         .expect_err("missing table must error");
     let msg = err.to_string();
     assert!(
-        msg.contains("has no columns or does not exist"),
-        "must surface the missing-table error; got: {msg}"
+        msg.contains("does not exist") && msg.contains("create_table"),
+        "the refusal must name the missing target and the knob that would \
+         create it (#580); got: {msg}"
     );
 }
 

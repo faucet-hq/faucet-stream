@@ -43,6 +43,62 @@ principals:
 faucet serve --auth-config auth.yaml
 ```
 
+### The read / write / admin token trio
+
+For the common split — dashboards read, operators write, one admin — there is
+no file to author. Pass any subset of three flags (or their env vars) and the
+server synthesizes the equivalent RBAC config:
+
+```bash
+faucet serve \
+  --read-token  "$READ_TOKEN" \   # FAUCET_SERVE_READ_TOKEN  → viewer
+  --write-token "$WRITE_TOKEN" \  # FAUCET_SERVE_WRITE_TOKEN → operator
+  --admin-token "$ADMIN_TOKEN"     # FAUCET_SERVE_ADMIN_TOKEN → admin
+```
+
+Prefer the env vars: a flag value is visible in `ps`. The trio is mutually
+exclusive with `--auth-token` / `--auth-config` / `--no-auth`, an empty token
+is rejected at startup, and reusing one token for two roles is refused (the
+role would otherwise depend on scan order).
+
+### Role × route matrix
+
+The contract, enforced by a table-driven test over **every** registered route
+(`cli/tests/serve_rbac.rs`): a read token cannot reach anything that changes
+state, and a route nobody classified stays admin-only and fails the test until
+someone does.
+
+| Route | viewer | operator | admin |
+|---|:--:|:--:|:--:|
+| `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs` | ✓ | ✓ | ✓ |
+| `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
+| `POST /v1/backfill` | — | ✓ | ✓ |
+| `GET /v1/schemas`, `/v1/schemas/{kind}/{name}` | ✓ | ✓ | ✓ |
+| `POST /v1/doctor` | — | ✓ | ✓ |
+| `POST /v1/dlq/inspect` | ✓ | ✓ | ✓ |
+| `POST /v1/dlq/replay`, `/v1/dlq/discard` | — | ✓ | ✓ |
+| `POST`/`PUT /v1/triggers/{name}` | — | ✓ | ✓ |
+| `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
+| `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
+| `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
+| `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
+| `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | ✓ | ✓ |
+| `POST /v1/templates/{id}/{runs,tags,launch,rollback,deprecate}` | — | ✓ | ✓ |
+| `POST /mcp` | ✓ | ✓ | ✓ |
+| `GET /v1/audit` | — | — | ✓ |
+| `POST /v1/reload` | — | — | ✓ |
+| *any unclassified `/v1` route* | — | — | ✓ |
+
+Two entries are POSTs a **read** token can reach, because they change nothing:
+
+- `POST /mcp` — the MCP transport's baseline is a read scope; its one mutating
+  tool (`run_pipeline`) re-checks `RunWrite` inside the handler.
+- `POST /v1/dlq/inspect` — summarises a DLQ location. The location is
+  caller-supplied, so a read token can ask the server to read a path on its
+  filesystem. That is the same trust boundary as run logs (which carry record
+  data), and the reason the control plane is not meant to face the public
+  internet.
+
 A request whose role lacks the route's required permission gets `403 forbidden`
 (and a `denied` audit record). `--auth-config` is mutually exclusive with
 `--auth-token` / `--no-auth`. Every token is registered for log redaction at
@@ -121,6 +177,19 @@ Request body:
   submit returns `422` with the doctor report in `error.details`.
 - **`idempotency_key`** — replay protection (see cookbook).
 - **`clock`** — overrides the `${now.*}` clock for backfills (default: submit time).
+- **`concurrency`** — overrides this run's **connector** concurrency: how many
+  concurrent connections/fetches the source and sink may use, whatever the
+  config says. This is the multi-tenant knob — one template driving a customer
+  with beefy read replicas and one with a small instance, without per-customer
+  config copies or the template author pre-declaring a `${param.*}`. It maps
+  onto whichever knob the connector declares (`max_connections` /
+  `partition_concurrency` / `shard_concurrency` / `concurrency`), so a
+  connector with none ignores it. It does **not** change matrix parallelism
+  (`execution.max_concurrent`) or the server's `--max-concurrent` slots, and it
+  caps only the *client* side — it cannot raise what the upstream will accept.
+  Per-shard for a sharded run. `0` is rejected. It is part of the idempotency
+  fingerprint, so replaying a key with a different value is a 409, not a
+  replay.
 - **`callback`** — a per-run completion callback; see below.
 
 Response (`202`):
@@ -432,7 +501,7 @@ second request. Use `?version=newest` to read a `draft` template.
 
 The trigger body's `params` / `env` / `version` are template-specific; every other
 field (`name`, `labels`, `timeout_secs`, `doctor_first`, `idempotency_key`,
-`clock`) behaves exactly as in `POST /v1/runs`, because the run is submitted
+`clock`, `concurrency`) behaves exactly as in `POST /v1/runs`, because the run is submitted
 through the same path. The run is labelled `template` and `template_version`.
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing

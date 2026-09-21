@@ -30,6 +30,7 @@ pub async fn run(args: TemplateArgs) -> CliResult<()> {
         TemplateCommand::Promote(a) => promote(a).await,
         TemplateCommand::Delete(a) => delete(a).await,
         TemplateCommand::Run(a) => run_template(a).await,
+        TemplateCommand::Test(a) => test_suite(a).await,
     }
 }
 
@@ -508,6 +509,90 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     crate::commands::run::execute(cfg, run_args, None).await
 }
 
+/// `faucet template test` — run a suite across a template's parameter space
+/// (#648).
+///
+/// Offline by default and by design: the validation tier materializes every
+/// combination and checks it expands and compiles, which catches the whole
+/// "param X breaks the config" class with no data, no network, and no credits.
+async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
+    use crate::templates::suite::{SuiteFile, Target, report::SuiteReport};
+
+    let cwd = std::env::current_dir()?;
+    let env_path =
+        crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
+    crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
+
+    let file = SuiteFile::from_path(&args.suite)?;
+    let select = args.select.as_deref().or(file.select.as_deref());
+
+    // A `template:` that names an existing file is tested straight from disk —
+    // no registry needed, which is the point at which most of these failures
+    // are cheapest to fix.
+    let as_path = std::path::Path::new(&file.template);
+    let (outcome, version) = if as_path.is_file() {
+        let body = std::fs::read_to_string(as_path).map_err(|e| {
+            CliError::Config(format!("template test: reading {}: {e}", as_path.display()))
+        })?;
+        (
+            crate::templates::suite::run(&file, Target::Document { body }, args.filter.as_deref())
+                .await?,
+            None,
+        )
+    } else {
+        let store_url = args.store.as_deref().ok_or_else(|| {
+            CliError::Config(format!(
+                "template test: `{}` is neither a readable config path nor usable without a \
+                 registry — pass --store (or FAUCET_TEMPLATE_STORE) to test a registered template",
+                file.template
+            ))
+        })?;
+        let store = crate::templates::resolve_store_url(store_url).await?;
+        let version =
+            crate::templates::suite::resolve_target_version(&store, &file.template, select).await?;
+        (
+            crate::templates::suite::run(
+                &file,
+                Target::Registered {
+                    store: &store,
+                    id: &file.template,
+                    version,
+                },
+                args.filter.as_deref(),
+            )
+            .await?,
+            Some(version),
+        )
+    };
+
+    if outcome.cases.is_empty() {
+        return Err(CliError::Config(match &args.filter {
+            Some(f) => format!("no cases match --filter '{f}'"),
+            None => "the suite produced no cases".into(),
+        }));
+    }
+
+    let report = SuiteReport::new(&file.template, version, &outcome);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|e| CliError::Internal(format!("template test report: {e}")))?
+        );
+    } else {
+        print!("{}", report.render_human());
+    }
+
+    // Exit code is the failed-case count, mirroring `faucet test`, so CI can
+    // gate on it without parsing output.
+    if report.failed > 0 {
+        return Err(CliError::TestsFailed {
+            failed: report.failed,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +886,7 @@ pipeline:
                 secret: false,
                 description: None,
                 computed: None,
+                values: Vec::new(),
             },
         );
         params.insert(
@@ -811,6 +897,7 @@ pipeline:
                 default: Some(serde_json::json!(5)),
                 secret: false,
                 computed: None,
+                values: Vec::new(),
                 description: None,
             },
         );
@@ -868,5 +955,246 @@ pipeline:
         })
         .await
         .expect("empty list is not an error");
+    }
+
+    // ── `faucet template test` (#648) ─────────────────────────────────────
+
+    fn test_args(suite: &std::path::Path) -> crate::cli::TemplateTestArgs {
+        crate::cli::TemplateTestArgs {
+            suite: suite.to_path_buf(),
+            store: None,
+            select: None,
+            filter: None,
+            json: false,
+            env_file: None,
+            no_env_file: true,
+        }
+    }
+
+    /// Writes a template and a suite that points at it by **path**, which is
+    /// the form that needs no registry.
+    fn suite_fixture(suite_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tpl = dir.path().join("tpl.yaml");
+        std::fs::write(
+            &tpl,
+            r#"version: 1
+name: adapter-fixture
+params:
+  tenant: { type: string, required: true }
+  region: { type: string, default: us, values: [us, eu] }
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: "https://${param.region}.example.com"
+      path: "/t/${param.tenant}"
+  sink:
+    type: jsonl
+    config: { path: "./out/${param.tenant}.jsonl" }
+"#,
+        )
+        .expect("write template");
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            suite_body.replace("TEMPLATE_PATH", tpl.to_str().expect("utf-8")),
+        )
+        .expect("write suite");
+        (dir, suite)
+    }
+
+    #[tokio::test]
+    async fn a_passing_suite_exits_ok_without_a_store() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme, region: eu }
+"#,
+        );
+        test_suite(test_args(&suite)).await.expect("suite passes");
+    }
+
+    /// The exit code is the failed-case count, so CI can gate on it without
+    /// parsing output.
+    #[tokio::test]
+    async fn a_failing_suite_reports_the_failed_count() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: bad-region
+      params: { tenant: acme, region: mars }
+    - name: also-bad
+      params: { tenant: acme, region: pluto }
+"#,
+        );
+        match test_suite(test_args(&suite)).await {
+            Err(CliError::TestsFailed { failed }) => assert_eq!(failed, 2),
+            other => panic!("expected TestsFailed{{2}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_output_is_selectable() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme }
+"#,
+        );
+        let mut args = test_args(&suite);
+        args.json = true;
+        test_suite(args).await.expect("json run passes");
+    }
+
+    #[tokio::test]
+    async fn a_filter_matching_nothing_is_an_error_not_a_silent_pass() {
+        // A suite that runs zero cases and reports green is the failure mode
+        // the whole feature exists to prevent.
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme }
+"#,
+        );
+        let mut args = test_args(&suite);
+        args.filter = Some("nothing-matches-this".into());
+        let err = test_suite(args).await.expect_err("no cases must error");
+        assert!(err.to_string().contains("no cases match"), "{err}");
+    }
+
+    /// A `template:` that is neither a readable path nor accompanied by a
+    /// store cannot be resolved, and the message has to say which of the two
+    /// is missing.
+    #[tokio::test]
+    async fn a_registry_target_without_a_store_names_the_missing_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            "version: 1
+template: not-a-path-and-not-registered
+suite:
+  cases:
+    - name: a
+      params: {}
+",
+        )
+        .expect("write");
+        let err = test_suite(test_args(&suite)).await.expect_err("no store");
+        assert!(err.to_string().contains("--store"), "{err}");
+    }
+
+    /// The registry branch: a `template:` that is not a path goes through the
+    /// store, and an id that was never registered is reported as such rather
+    /// than silently producing zero cases.
+    #[tokio::test]
+    async fn a_registry_target_reports_an_unregistered_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            "version: 1\ntemplate: never-registered\nsuite:\n  cases:\n    - name: a\n      params: {}\n",
+        )
+        .expect("write");
+        let mut args = test_args(&suite);
+        args.store = Some("memory".into());
+        let err = test_suite(args).await.expect_err("unknown template");
+        assert!(err.to_string().contains("never-registered"), "{err}");
+    }
+
+    /// The registry *success* path, end to end through the dispatcher.
+    ///
+    /// `memory` cannot serve this: `resolve_store_url("memory")` builds a
+    /// fresh store per call, so a template registered in the test would be
+    /// invisible to `test_suite`'s own connection. A sqlite file is the
+    /// smallest store that actually persists between the two.
+    #[tokio::test]
+    async fn a_registered_template_is_resolved_and_its_suite_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("tpl.db");
+        let store_url = format!("sqlite:{}", db.display());
+
+        let store = crate::templates::resolve_store_url(&store_url)
+            .await
+            .expect("sqlite store");
+        crate::templates::register(
+            &store,
+            crate::templates::RegisterRequest {
+                id: Some("adapter-registered".into()),
+                body: r#"version: 1
+name: adapter-registered
+params:
+  tenant: { type: string, required: true }
+pipeline:
+  source:
+    type: rest
+    config: { base_url: "https://example.com", path: "/t/${param.tenant}" }
+  sink:
+    type: jsonl
+    config: { path: "./out/${param.tenant}.jsonl" }
+"#
+                .into(),
+                format: ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .expect("register");
+
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            "version: 1\ntemplate: adapter-registered\nsuite:\n  cases:\n    - name: ok\n      params: { tenant: acme }\n",
+        )
+        .expect("write suite");
+
+        let mut args = test_args(&suite);
+        args.store = Some(store_url);
+        // Resolves `stable` through the registry and runs the case.
+        test_suite(args).await.expect("registered suite passes");
+    }
+
+    /// The dispatcher arm itself — `faucet template test` reaches
+    /// `test_suite` rather than some other subcommand.
+    #[tokio::test]
+    async fn the_test_subcommand_dispatches_to_the_runner() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme }
+"#,
+        );
+        run(crate::cli::TemplateArgs {
+            command: TemplateCommand::Test(test_args(&suite)),
+        })
+        .await
+        .expect("dispatched and passed");
+    }
+
+    #[tokio::test]
+    async fn a_missing_suite_file_is_a_clear_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = test_suite(test_args(&dir.path().join("nope.yaml")))
+            .await
+            .expect_err("missing suite");
+        assert!(err.to_string().contains("template test suite"), "{err}");
     }
 }

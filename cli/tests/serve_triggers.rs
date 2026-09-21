@@ -394,6 +394,9 @@ async fn spawn_serve_with_triggers(
         listen: format!("127.0.0.1:{port}"),
         auth_token: token.map(|t| t.to_string()),
         auth_config: None,
+        read_token: None,
+        write_token: None,
+        admin_token: None,
         no_auth: token.is_none(),
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
@@ -431,7 +434,10 @@ async fn spawn_serve_with_triggers(
     });
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for _ in 0..200 {
+    // 30s: this polls a server starting up next to the whole
+    // workspace test suite, so the budget has to survive a loaded
+    // runner. Costs nothing when it is already up.
+    for _ in 0..1200 {
         if client
             .get(format!("{base}/healthz"))
             .send()

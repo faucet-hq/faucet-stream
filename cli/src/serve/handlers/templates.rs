@@ -473,6 +473,21 @@ pub struct TriggerBody {
     pub doctor_first: bool,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Override this run's **connector** concurrency (#610): how many
+    /// concurrent connections/fetches the source and sink may use, whatever
+    /// the config says.
+    ///
+    /// The multi-tenant knob — the same template driving a customer with beefy
+    /// read replicas and one with a small instance, without per-customer
+    /// copies of the config or the template author having to pre-declare a
+    /// `${param.*}` for it. Mapped onto whichever knob the connector declares
+    /// (`max_connections` / `partition_concurrency` / `shard_concurrency` /
+    /// `concurrency`); a connector with none ignores it. Does **not** change
+    /// matrix parallelism or the server's own `--max-concurrent` slots, and it
+    /// caps only the *client* side — it cannot exceed what the upstream will
+    /// actually accept. Must be > 0. Per-shard for a sharded run.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
     #[serde(default)]
     pub clock: Option<String>,
     /// Optional completion callback for this run (#481). The primary use case
@@ -591,6 +606,7 @@ pub async fn trigger_template(
         doctor_first: body.doctor_first,
         idempotency_key: body.idempotency_key,
         clock: body.clock,
+        concurrency: body.concurrency,
         callback: body.callback,
     };
     let run = runner::submit(state.clone(), req, actor.clone()).await?;

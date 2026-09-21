@@ -28,7 +28,7 @@ sink:
 | `max_record_size_bytes` | `1048576` | Per-record cap (data + partition key; Kinesis hard limit 1 MiB). Oversized records fail per-record, never sent. |
 | `max_request_bytes` | `5242880` | Per-request cap (Kinesis hard limit 5 MiB); batches re-chunk to it. |
 | `concurrency` | `4` | Bounded in-flight `PutRecords` requests. |
-| `retry_max_attempts` / `retry_initial_backoff_ms` / `retry_max_backoff_ms` | `5` / `100` / `30000` | Per-entry partial-failure retry budget + exponential backoff. |
+| `retry` | `{}` | Per-entry partial-failure retry, grouped: `max_attempts` (`5`), `initial_backoff_ms` (`100`), `max_backoff_ms` (`30000`). The flat `retry_max_attempts` / `retry_initial_backoff_ms` / `retry_max_backoff_ms` keys are still accepted (**deprecated** since #654) and are superseded wholesale when `retry:` is present. |
 
 ## Partition-key strategies
 
@@ -46,7 +46,7 @@ partition key land on the same shard, preserving their relative order.
 ## Failure semantics
 
 - **Per-entry `PutRecords` rejections** (throughput, internal errors) are
-  retried with backoff up to `retry_max_attempts`; on exhaustion those records
+  retried with backoff up to `retry.max_attempts`; on exhaustion those records
   come back as `Err` rows from `write_batch_partial` — the pipeline's `dlq:`
   router quarantines them.
 - **Whole-request failures** (network partition, auth) retry the same way; on

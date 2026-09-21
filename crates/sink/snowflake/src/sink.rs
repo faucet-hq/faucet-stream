@@ -16,6 +16,12 @@ use tokio::sync::OnceCell;
 /// A sink that writes JSON records to a Snowflake table using the
 /// SQL REST API.
 pub struct SnowflakeSink {
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
+    /// Records accumulated across `write_batch` calls (#617). Without this,
+    /// each small page was its own warehouse query.
+    pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
     config: SnowflakeSinkConfig,
     client: Client,
     /// Optional explicit endpoint override. When `None`, the URL is derived
@@ -72,6 +78,55 @@ fn check_statement_code(sf_resp: &SnowflakeResponse) -> Result<(), FaucetError> 
 }
 
 impl SnowflakeSink {
+    /// Commit one accumulated group as a single warehouse operation (#617).
+    ///
+    /// `batch_size` still bounds the size of an individual REST request, so a
+    /// very large group is split into requests near Snowflake's documented
+    /// sweet spot — but the *group* is what accumulation controls, and a small
+    /// source page no longer forces its own query.
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
+        let chunk = if self.config.batch_size == 0 {
+            rows.len().max(1)
+        } else {
+            self.config.batch_size
+        };
+        for slice in rows.chunks(chunk) {
+            let (sql, payload) = self.build_insert(slice)?;
+            let bindings = json!({ "1": { "type": "TEXT", "value": payload } });
+            self.execute_sql(&sql, Some(bindings)).await?;
+        }
+        Ok(())
+    }
+
+    /// Make sure the target table exists before the first write (#580).
+    ///
+    /// Snowflake DDL auto-commits, so the `CREATE TABLE IF NOT EXISTS` is its
+    /// own request — the same rule the watermark table already follows.
+    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) || !self.config.create_table {
+            // With `create_table: false` there is nothing to do here: the
+            // INSERT itself reports a missing table, and what this branch
+            // guarantees is that faucet does not create one unasked.
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        // A page with nothing inferable leaves the table uncreated so the next
+        // page can try, rather than emitting a zero-column CREATE.
+        let Some(columns) = faucet_core::plan_columns(records) else {
+            return Ok(());
+        };
+        let sql = build_create_table_sql(
+            &self.config.database,
+            &self.config.schema,
+            &self.config.table,
+            &columns,
+        );
+        self.execute_sql(&sql, None).await?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Create a new Snowflake sink.
     ///
     /// Returns [`FaucetError::Config`] if `batch_size` exceeds
@@ -90,6 +145,11 @@ impl SnowflakeSink {
             ));
         }
         Ok(Self {
+            table_ready: std::sync::atomic::AtomicBool::new(false),
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+                config.commit_rows,
+                config.commit_bytes,
+            )),
             config,
             client: Client::new(),
             endpoint: None,
@@ -407,6 +467,27 @@ impl SnowflakeSink {
     }
 }
 
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+///
+/// Every column is a nullable `STRING`, matching what `build_insert` actually
+/// writes — it projects each value with `::string`, so a typed column would
+/// reject its own writer's cast. An operator who wants typed columns defines
+/// the table and sets `create_table: false`.
+fn build_create_table_sql(
+    database: &str,
+    schema: &str,
+    table: &str,
+    columns: &[faucet_core::PlannedColumn],
+) -> String {
+    let cols = faucet_core::render_columns(columns, quote_ident, |_| "STRING");
+    format!(
+        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({cols})",
+        quote_ident(database),
+        quote_ident(schema),
+        quote_ident(table)
+    )
+}
+
 #[async_trait]
 impl faucet_core::Sink for SnowflakeSink {
     fn connector_name(&self) -> &'static str {
@@ -472,29 +553,40 @@ impl faucet_core::Sink for SnowflakeSink {
         Ok(CheckReport::single(probe))
     }
 
+    /// Commit whatever the cross-page accumulator holds (#617).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so a buffered group is always committed before the bookmark
+    /// advances — records left in the accumulator after a "successful" run
+    /// would be data loss with a green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let group = {
+            let mut open = self.pending.lock().await;
+            open.finish()
+        };
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
+        }
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records).await?;
 
-        // `batch_size = 0` is the "no batching" sentinel: forward whatever
-        // upstream handed us as a single INSERT, preserving `StreamPage`
-        // framing. Otherwise re-chunk into `batch_size` slices so each
-        // outbound REST request stays near Snowflake's documented sweet
-        // spot (~1000 rows).
-        let effective_chunk = if self.config.batch_size == 0 {
-            records.len()
-        } else {
-            self.config.batch_size
+        // Accumulate across calls and commit once per threshold (#617). A
+        // warehouse query per small page is dominated by per-query overhead,
+        // and `batch_size` could only ever split a page, never merge two.
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.push_page(records)
         };
-
-        let mut total = 0;
-        for chunk in records.chunks(effective_chunk) {
-            let (sql, payload) = self.build_insert(chunk)?;
-            let bindings = json!({ "1": { "type": "TEXT", "value": payload } });
-            self.execute_sql(&sql, Some(bindings)).await?;
-            total += chunk.len();
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
         }
+        let total = records.len();
 
         tracing::info!(
             table = %format!(

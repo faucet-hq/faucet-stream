@@ -22,6 +22,7 @@ pub mod columnar;
 pub mod config;
 #[cfg(feature = "contract")]
 pub mod contract;
+pub mod create_table;
 #[cfg(feature = "transform-cross-join")]
 pub mod cross_join;
 pub mod discover;
@@ -30,6 +31,7 @@ pub mod drift;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 pub mod error;
+pub mod file_format;
 pub mod idempotency;
 pub mod join;
 pub mod local_outputs;
@@ -37,6 +39,7 @@ pub mod local_outputs;
 pub mod masking;
 pub mod metadata;
 pub mod native;
+pub mod object_rollover;
 pub mod observability;
 pub mod pipeline;
 #[cfg(feature = "quality")]
@@ -81,6 +84,7 @@ pub use columnar::{
     ColumnarPage, infer_arrow_schema, record_batch_to_values, values_to_record_batch,
     values_to_record_batch_inferred,
 };
+pub use create_table::{PlannedColumn, missing_target_error, plan_columns, render_columns};
 #[cfg(feature = "transform-cross-join")]
 pub use cross_join::{CompiledCrossJoin, CrossJoinSpec, OnEmpty as CrossJoinOnEmpty};
 pub use discover::{DatasetDescriptor, columns_to_schema, nullable_type, sql_type_to_json_schema};
@@ -95,6 +99,7 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
 pub use error::FaucetError;
+pub use file_format::{CsvOptions, ExcelOptions, FileFormat, FormatOptions, XmlOptions};
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,
     SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,
@@ -111,6 +116,7 @@ pub use native::{
     CsvDialect, NativeBatch, NativeFormat, NativeLoadCapability, NativeLoadContext, NativePayload,
     NativePlan, NativePlanInputs, plan_native_transfer,
 };
+pub use object_rollover::{CompletedObject, ObjectAccumulator, PageAccumulator};
 #[cfg(feature = "contract")]
 pub use observability::instrumented_apply_contract;
 #[cfg(feature = "masking")]

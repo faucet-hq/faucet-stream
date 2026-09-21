@@ -69,7 +69,7 @@ This uploads each batch of records as one or more `events/{uuidv7}.jsonl` object
 | `bucket` | string | — *(required)* | GCS bucket name (without the `gs://` scheme). |
 | `prefix` | string | — *(required)* | Object-name prefix; concatenated with the UUIDv7 key and `file_extension` to form each object name. Use a trailing `/` for a folder-like layout (e.g. `events/2026/`). |
 | `auth` | `GcsCredentials` | `application_default` | Authentication — see [Authentication](#authentication). |
-| `format` | `json_lines` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode). |
+| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Suffix appended to every object name. Also drives compression auto-detection (`.jsonl.gz` → gzip). |
 
 ### Batching & throughput
@@ -302,6 +302,63 @@ Enable the connector itself in the CLI/umbrella via the `sink-gcs` feature.
 - [`faucet-source-gcs`](https://crates.io/crates/faucet-source-gcs) — the matching GCS source.
 - [`faucet-common-gcs`](https://crates.io/crates/faucet-common-gcs) — shared `GcsCredentials` enum and client builders.
 - [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3) — the structurally equivalent AWS S3 sink.
+
+
+## Object rollover (`max_records_per_file` / `max_bytes_per_file`)
+
+Records **accumulate across `write_batch` calls** and roll to a new object when
+either cap is reached (#618). Before this, every upstream page became its own
+object, so a small `batch_size` produced a swarm of tiny objects — the
+small-files problem that dominates read time on a data lake, where per-object
+overhead outweighs the bytes.
+
+- `max_records_per_file` — record cap. When unset, `batch_size` still sizes
+  objects, so an existing config keeps the object size it asked for; what
+  changed is that a page *smaller* than the cap now joins the open object.
+- `max_bytes_per_file` — byte cap, counted on the **uncompressed** body. Rows
+  are a poor proxy for size (10k wide rows and 10k `{"id":1}` rows differ by
+  orders of magnitude), and this is the axis that bounds buffered memory. A
+  single record larger than the cap still gets its own object rather than
+  being split or dropped.
+
+With neither cap set the whole run lands in one object, closed at `flush` —
+which the pipeline calls at every bookmark-carrying page and at the end, so
+the remainder is always written before a bookmark advances.
+
+## File formats (#604)
+
+Beyond JSON Lines this sink writes **JSON array**, **CSV**, **XML** and
+**Excel** through `faucet_core::file_format`, so what it writes is exactly what
+the file *sources* can read back.
+
+```yaml
+sink:
+  type: gcs
+  config:
+    bucket: reports
+    format: csv
+    file_extension: .csv.gz
+    compression: gzip
+    csv: { delimiter: ";" }
+```
+
+| Option block | Applies to | Fields |
+|---|---|---|
+| `csv` | `csv` | `delimiter` (one byte; `"\t"` for tabs), `has_headers` (default `true`) |
+| `xml` | `xml` | `record_element`, `root_element` |
+| `excel` | `xlsx` | `sheet` (worksheet name) |
+
+Enable with `--features file-formats` (or one of `file-format-csv` /
+`file-format-xml` / `file-format-excel`). Format composes with `compression`.
+
+**Only `json_lines` can be built a record at a time.** Every other format has a
+header, a document element, a container index or a pair of brackets, so its
+records are buffered and encoded together at the rollover — bounded by the same
+`max_records_per_file` / `max_bytes_per_file` caps, so object sizing means the
+same thing whatever the format. Columns are the union of every record's keys in
+the group, so a record that gains a field mid-page widens the file rather than
+losing it. See the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
 ## License
 

@@ -87,10 +87,20 @@ pub struct MssqlSinkConfig {
     /// Per-statement timeout in seconds (`0` disables). Defaults to 300.
     #[serde(default = "default_statement_timeout_secs")]
     pub statement_timeout_secs: u64,
-    /// In `json_column` mode only, create the table if absent as
-    /// `(id BIGINT IDENTITY PRIMARY KEY, <column> NVARCHAR(MAX))`. Rejected with
-    /// `auto_columns` (schema inference is unsafe for MSSQL types). Defaults to false.
-    #[serde(default)]
+    /// Create the target table if it does not exist (#580). Enabled by
+    /// default: a first-ever sync cannot assume the destination already
+    /// exists.
+    ///
+    /// In `json_column` mode the shape is fixed —
+    /// `(id BIGINT IDENTITY PRIMARY KEY, <column> NVARCHAR(MAX))`. In
+    /// `auto_columns` mode the columns are inferred from the first written
+    /// page, all nullable: a column present in page 1 is not required forever,
+    /// and a `NOT NULL` inferred from one page fails page 2 the first time a
+    /// record omits the field.
+    ///
+    /// Set `false` to require the table to pre-exist and fail fast when it is
+    /// missing.
+    #[serde(default = "default_true")]
     pub create_table: bool,
     /// Write mode (`append` / `upsert` / `delete`) + `key` / `delete_marker`.
     /// `upsert` and `delete` require `column_mapping: auto_columns` (the key
@@ -174,7 +184,7 @@ impl MssqlSinkConfig {
             transaction_per_batch: true,
             isolate_row_failures: true,
             statement_timeout_secs: default_statement_timeout_secs(),
-            create_table: false,
+            create_table: true,
             write: faucet_core::WriteSpec::default(),
             staging: None,
         }
@@ -186,15 +196,6 @@ impl MssqlSinkConfig {
         validate_batch_size(self.batch_size)?;
         if self.table.trim().is_empty() {
             return Err(FaucetError::Config("MSSQL sink requires a `table`".into()));
-        }
-        if self.create_table
-            && matches!(self.column_mapping, MssqlColumnMapping::AutoColumns { .. })
-        {
-            return Err(FaucetError::Config(
-                "MSSQL sink `create_table` is only supported with `json_column` mode \
-                 (schema inference for auto_columns is unsafe — create the table first)"
-                    .into(),
-            ));
         }
         Ok(())
     }
@@ -276,11 +277,16 @@ mod tests {
         assert!(cfg.transaction_per_batch);
         assert!(cfg.isolate_row_failures);
         assert_eq!(cfg.statement_timeout_secs, 300);
-        assert!(!cfg.create_table);
+        // #580 aligned the default to `true` across every table sink: a
+        // first-ever sync cannot assume the destination exists.
+        assert!(cfg.create_table);
     }
 
     #[test]
-    fn validate_rejects_auto_columns_with_create_table() {
+    fn auto_columns_with_create_table_is_now_valid() {
+        // It used to be rejected because schema inference was not available
+        // here; #580 gave every table sink the shared inference, so the
+        // combination is the normal first-sync case rather than an error.
         let cfg = MssqlSinkConfig {
             column_mapping: MssqlColumnMapping::AutoColumns {
                 on_unknown_field: OnUnknownField::Warn,
@@ -288,7 +294,8 @@ mod tests {
             create_table: true,
             ..MssqlSinkConfig::new("mssql://sa:pw@h/db", "dbo.events")
         };
-        assert!(cfg.validate().is_err());
+        cfg.validate()
+            .expect("auto_columns + create_table is valid");
     }
 
     #[test]

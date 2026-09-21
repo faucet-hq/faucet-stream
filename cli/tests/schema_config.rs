@@ -137,6 +137,30 @@ fn committed_schema_covers_current_build() {
     let committed: Value = serde_json::from_str(include_str!("../../schemas/faucet.schema.json"))
         .expect("committed schema parses");
     if let Err(path) = is_subset(&current, &committed, String::new()) {
+        // A bare JSON pointer costs a debugging round-trip when the divergence
+        // is inside an order-insensitive `oneOf` (the index is the *current*
+        // build's, which need not match the committed order). Print the node
+        // itself so the offending connector is named.
+        let node = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .try_fold(&current, |v: &Value, seg| match v {
+                Value::Object(m) => m.get(seg),
+                Value::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get(i)),
+                _ => None,
+            })
+            .map(|v| {
+                v.get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        let mut s = v.to_string();
+                        s.truncate(400);
+                        s
+                    })
+            })
+            .unwrap_or_else(|| "<node not found>".to_string());
+        eprintln!("divergent node at {path}: {node}");
         panic!(
             "schemas/faucet.schema.json is stale at `{path}` — regenerate with \
              `cargo run --all-features -- schema config > schemas/faucet.schema.json`"
@@ -158,10 +182,18 @@ fn is_subset(sub: &Value, sup: &Value, path: String) -> Result<(), String> {
             Ok(())
         }
         (Value::Array(a), Value::Array(b)) => {
-            // Order-insensitive membership: every element of `sub` must
-            // deep-equal some element of `sup` (handles connector `oneOf`).
+            // Order-insensitive containment: every element of `sub` must be a
+            // *subset* of some element of `sup` (handles connector `oneOf`).
+            //
+            // Subset, not deep equality — that was the bug this comment used
+            // to describe wrongly. The test's whole premise is that a smaller
+            // feature set than the one the file was generated under still
+            // passes, but an equality check fails the moment the committed
+            // node carries one extra feature-gated field (e.g. BigQuery's
+            // arrow-only `bulk_load`), which is exactly the situation the
+            // subset check exists for.
             for (i, va) in a.iter().enumerate() {
-                if !b.iter().any(|vb| vb == va) {
+                if !b.iter().any(|vb| is_subset(va, vb, String::new()).is_ok()) {
                     return Err(format!("{path}/{i}"));
                 }
             }
@@ -170,4 +202,26 @@ fn is_subset(sub: &Value, sup: &Value, path: String) -> Result<(), String> {
         _ if sub == sup => Ok(()),
         _ => Err(path),
     }
+}
+
+/// Regenerate `schemas/faucet.schema.json` from **this test binary's** view of
+/// the composed schema.
+///
+/// Ignored by default, so it never runs in CI. It exists because the binary's
+/// `faucet schema config` output and the test binary's `config_schema()` can
+/// differ: a test build unifies features across dev-dependencies, so a
+/// hand-run `cargo run -- schema config` can emit a field the checked build
+/// does not, and the committed file then fails the very test it is meant to
+/// satisfy. Run with:
+///
+/// ```text
+/// cargo test -p faucet-cli --all-features --test schema_config -- --ignored regenerate
+/// ```
+#[test]
+#[ignore]
+fn regenerate_committed_schema() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../schemas/faucet.schema.json");
+    let mut text = serde_json::to_string_pretty(&config_schema()).expect("serialize");
+    text.push('\n');
+    std::fs::write(path, text).expect("write the committed schema");
 }

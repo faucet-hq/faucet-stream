@@ -28,7 +28,7 @@ name: csv_to_jsonl_wasm
 pipeline:
   source:
     type: csv
-    config: { path: cli/examples/data/orders.csv, has_header: true }
+    config: { path: cli/examples/data/orders.csv, has_headers: true }
   transforms:
     - type: wasm
       config:

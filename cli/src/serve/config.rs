@@ -143,7 +143,23 @@ impl ServeConfig {
     pub fn from_args(args: ServeArgs) -> CliResult<Self> {
         // RBAC (`--auth-config`) takes precedence and is mutually exclusive with
         // `--auth-token` / `--no-auth` (enforced by clap `conflicts_with`).
-        let auth = if let Some(path) = args.auth_config {
+        // The three-token shorthand (#608): `--read-token` / `--write-token` /
+        // `--admin-token` synthesize the same `RbacConfig` an `--auth-config`
+        // file would, so the common "dashboards read, ops write, I admin"
+        // split needs no file. Mutually exclusive with every other auth flag
+        // (clap enforces it); any subset of the three may be set.
+        let token_trio = RbacConfig::from_token_trio(
+            args.read_token.as_deref(),
+            args.write_token.as_deref(),
+            args.admin_token.as_deref(),
+        )?;
+
+        let auth = if let Some(rbac) = token_trio {
+            for token in rbac.tokens() {
+                crate::secrets::registry::register(token);
+            }
+            AuthMode::Rbac(Arc::new(rbac))
+        } else if let Some(path) = args.auth_config {
             let rbac = RbacConfig::from_file(&path)?;
             // Register every principal token so the RedactingWriter scrubs it
             // from any tracing/log/error output for the process lifetime.
@@ -170,7 +186,8 @@ impl ServeConfig {
                 (None, false) => {
                     return Err(CliError::Serve(
                         "refusing to start without authentication: pass --auth-token \
-                         (or FAUCET_SERVE_AUTH_TOKEN), --auth-config <file> for RBAC, \
+                         (or FAUCET_SERVE_AUTH_TOKEN), the --read-token / --write-token / \
+                         --admin-token trio, --auth-config <file> for RBAC, \
                          or --no-auth to explicitly disable it"
                             .into(),
                     ));
@@ -319,6 +336,9 @@ mod tests {
             listen: "127.0.0.1:8080".into(),
             auth_token: None,
             auth_config: None,
+            read_token: None,
+            write_token: None,
+            admin_token: None,
             no_auth: false,
             max_concurrent_runs: None,
             max_queued_runs: None,

@@ -178,6 +178,7 @@ mod tests {
             config_format: None,
             timeout_secs: None,
             clock: None,
+            concurrency: None,
             attempt: 0,
             replay_of: None,
             callback: None,

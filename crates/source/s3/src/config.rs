@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Format of files stored in S3.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum S3FileFormat {
     /// Each line in the file is a separate JSON record.
@@ -24,6 +24,49 @@ pub enum S3FileFormat {
     /// (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     Parquet,
+    /// Delimited text, decoded through
+    /// [`faucet_core::file_format`] so the records match what every other
+    /// connector produces for the same file. Dialect from
+    /// [`csv`](S3SourceConfig::csv). Requires `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, decoded to the compact element→object mapping. The repeated
+    /// element is named by [`xml`](S3SourceConfig::xml). Requires
+    /// `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet and header row from
+    /// [`excel`](S3SourceConfig::excel). **Buffered whole** — a workbook is a
+    /// zip container whose directory sits at the end, so peak memory is the
+    /// object, not the page. Requires `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl S3FileFormat {
+    /// The shared format this variant maps onto, or `None` for the two the
+    /// connector decodes itself (`RawText`'s `{key, content}` envelope is the
+    /// connector's own shape, and Parquet is columnar).
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    pub(crate) fn shared(&self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            Self::RawText => None,
+            #[cfg(feature = "arrow")]
+            Self::Parquet => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
 }
 
 fn default_concurrency() -> usize {
@@ -100,6 +143,15 @@ pub struct S3SourceConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `file_format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet selection, used when `file_format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `file_format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 /// Serde default for the integrity flags that default on.
@@ -127,6 +179,24 @@ impl S3SourceConfig {
             verify_checksum: false,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
+        }
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::decode`] wants.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
         }
     }
 
@@ -358,5 +428,73 @@ mod tests {
         assert!(cfg.max_objects.is_none());
         assert_eq!(cfg.concurrency, 10);
         assert!(matches!(cfg.file_format, S3FileFormat::JsonLines));
+    }
+
+    /// #604 — the shared formats deserialize with their option blocks, and
+    /// each maps onto the one `faucet_core::FileFormat` every other file
+    /// connector uses for the same bytes.
+    #[test]
+    #[cfg(feature = "file-format-csv")]
+    fn csv_carries_its_dialect_and_maps_onto_the_shared_format() {
+        let cfg: S3SourceConfig = serde_json::from_value(serde_json::json!({
+            "bucket": "b",
+            "file_format": "csv",
+            "csv": { "delimiter": ";", "has_headers": false }
+        }))
+        .expect("csv config");
+        assert_eq!(cfg.file_format, S3FileFormat::Csv);
+        assert_eq!(cfg.csv.delimiter, ";");
+        assert!(!cfg.csv.has_headers);
+        assert_eq!(cfg.file_format.shared(), Some(faucet_core::FileFormat::Csv));
+        assert_eq!(cfg.format_options().csv.delimiter, ";");
+    }
+
+    #[test]
+    #[cfg(feature = "file-format-xml")]
+    fn xml_carries_its_record_element() {
+        let cfg: S3SourceConfig = serde_json::from_value(serde_json::json!({
+            "bucket": "b",
+            "file_format": "xml",
+            "xml": { "record_element": "row" }
+        }))
+        .expect("xml config");
+        assert_eq!(cfg.file_format.shared(), Some(faucet_core::FileFormat::Xml));
+        assert_eq!(cfg.format_options().xml.record_element, "row");
+    }
+
+    #[test]
+    #[cfg(feature = "file-format-excel")]
+    fn xlsx_carries_its_sheet_selection() {
+        let cfg: S3SourceConfig = serde_json::from_value(serde_json::json!({
+            "bucket": "b",
+            "file_format": "xlsx",
+            "excel": { "sheet": "Data", "header_row": 2 }
+        }))
+        .expect("xlsx config");
+        assert_eq!(
+            cfg.file_format.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+        assert_eq!(cfg.format_options().excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(cfg.format_options().excel.header_row, 2);
+    }
+
+    /// The two the connector decodes itself keep their own shapes: `raw_text`
+    /// yields `{key, content}` (not core's `{text}`) and parquet is columnar.
+    #[test]
+    fn the_connector_owned_formats_are_not_routed_through_the_shared_decoder() {
+        assert_eq!(S3FileFormat::RawText.shared(), None);
+        #[cfg(feature = "arrow")]
+        assert_eq!(S3FileFormat::Parquet.shared(), None);
+        // The two JSON shapes, by contrast, are the shared decoder's — so a
+        // file this source reads is one the file sinks can write.
+        assert_eq!(
+            S3FileFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            S3FileFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
     }
 }

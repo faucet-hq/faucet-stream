@@ -312,6 +312,7 @@ notifications:
         pipeline_name: "cb_pipeline".into(),
         run_id: Some("submitted-run-42".into()),
         execution: None,
+        concurrency: None,
         dry_run: false,
         limit: None,
         state_path_override: None,

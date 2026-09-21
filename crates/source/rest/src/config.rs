@@ -219,7 +219,16 @@ pub struct RestStreamConfig {
     #[serde(default)]
     pub partitions: Vec<HashMap<String, Value>>,
     /// Maximum number of partitions to fetch concurrently.
-    /// `None` means sequential processing (backward compatible default).
+    /// `None` (and `0`/`1`) means sequential processing — the default.
+    ///
+    /// Honoured on **both** read paths since #624: the buffering `fetch_all`
+    /// and the `stream_pages` path the pipeline actually drives, where it used
+    /// to be silently ignored. Above 1, partition pages **interleave**: the
+    /// streams are polled together, so a page from partition 3 can arrive
+    /// before partition 1 has finished. Partitions are disjoint and the
+    /// persisted bookmark is a max across all of them, so this changes
+    /// throughput rather than the resume position — but a downstream that
+    /// assumed partition-at-a-time page order no longer gets it.
     #[serde(default)]
     pub partition_concurrency: Option<usize>,
 
@@ -275,6 +284,15 @@ pub struct RestStreamConfig {
     /// time (explicit values still win). See [`ODataConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub odata: Option<ODataConfig>,
+    /// Drop per-record keys starting with any of these prefixes (#654 M24).
+    ///
+    /// Protocol control fields — OData's `@odata.etag` / `@odata.editLink`,
+    /// JSON:API's `links`, HAL's `_links` — are metadata, not data, and are
+    /// often invalid column names downstream. An `odata:` block implies
+    /// `@odata.` (the prefix that used to be hardcoded), so existing configs
+    /// need no change; list prefixes here for any other protocol envelope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_key_prefixes: Vec<String>,
 
     // ── Response-decode pipeline (#515) ─────────────────────────────────────────
     /// Decode the response body before record extraction: a chain of
@@ -628,6 +646,7 @@ impl Default for RestStreamConfig {
             path: String::new(),
             method: Method::GET,
             auth: AuthSpec::Inline(Auth::None),
+            drop_key_prefixes: Vec::new(),
             headers: HashMap::new(),
             query_params: HashMap::new(),
             query_params_multi: HashMap::new(),
@@ -741,10 +760,15 @@ impl RestStreamConfig {
         }
         if let Some(job) = &self.async_job {
             job.validate()?;
-            if !matches!(self.pagination, PaginationStyle::None) {
+            // Size-based routing (#629) is the one shape that legitimately
+            // carries both: the job for large objects, and the ordinary
+            // paginated read — which needs its own pagination style — for
+            // small ones.
+            if !matches!(self.pagination, PaginationStyle::None) && job.sync_routing().is_none() {
                 return Err(faucet_core::FaucetError::Config(
                     "rest: an `async_job:` lifecycle fetches a single result — set \
-                     `pagination: none`"
+                     `pagination: none` (or add `sync_below_rows` + `count:` to route \
+                     small objects to the paginated path, #629)"
                         .into(),
                 ));
             }

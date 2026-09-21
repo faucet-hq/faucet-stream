@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for the CSV file source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CsvSourceConfig {
     /// Path to the CSV file.
     pub path: String,

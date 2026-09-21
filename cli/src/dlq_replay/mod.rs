@@ -211,6 +211,7 @@ pub async fn replay(
             pipeline_name: inputs.pipeline_name,
             run_id: None,
             execution: inputs.execution,
+            concurrency: None,
             dry_run: inputs.dry_run,
             limit: None,
             state_path_override: None,

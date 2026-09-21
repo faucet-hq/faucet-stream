@@ -70,6 +70,11 @@ pub struct RestStream {
     /// (see [`metadata_xml`](Self::metadata_xml)). Instance-owned by design —
     /// no process-global cache state.
     metadata_xml_cache: tokio::sync::OnceCell<Arc<String>>,
+    /// Upstream round-trip counter (#638), installed once by the pipeline via
+    /// [`Source::set_roundtrip_recorder`]. `OnceLock` rather than a field on
+    /// the config because the labels are only known at run time, and because
+    /// the hook takes `&self`.
+    roundtrips: std::sync::OnceLock<Arc<faucet_core::observability::RoundtripRecorder>>,
 }
 
 /// Default value of [`RestStreamConfig::max_retries`]. When the user leaves this
@@ -203,19 +208,21 @@ fn jsonpath_first_value(v: &Value, path: &str) -> Option<Value> {
     v.query(path).ok()?.first().map(|x| (*x).clone())
 }
 
-/// A locator value counts as "no more pages" when it is empty or the literal
-/// string `null` (Salesforce Bulk sends `Sforce-Locator: null` when done).
-fn is_terminal_locator(value: &str) -> bool {
+/// A locator value counts as "no more pages" when it is empty, or when it
+/// matches one of the configured `locator_terminal_values` (default `["null"]`
+/// — Salesforce Bulk sends `Sforce-Locator: null` when done). Comparison is
+/// case-insensitive after trimming.
+fn is_terminal_locator(value: &str, terminal: &[String]) -> bool {
     let v = value.trim();
-    v.is_empty() || v.eq_ignore_ascii_case("null")
+    v.is_empty() || terminal.iter().any(|t| v.eq_ignore_ascii_case(t.trim()))
 }
 
 /// Derive the queried object name for an async-job source's `dataset_uri` (#640).
 /// Looks for a `query` string in the submit body (Salesforce Bulk SOQL, etc.) and
 /// returns its `FROM <object>`. `None` when there's no query or it can't be parsed
 /// (the caller then falls back to a hash of the submit body).
-fn async_job_object(submit_json: Option<&Value>) -> Option<String> {
-    let query = submit_json?.get("query")?.as_str()?;
+fn async_job_object(submit_json: Option<&Value>, query_path: &str) -> Option<String> {
+    let query = submit_json?.pointer(query_path)?.as_str()?;
     sql_from_object(query)
 }
 
@@ -392,16 +399,17 @@ fn next_locator(
     body: Option<&Value>,
     job: &crate::async_job::AsyncJobConfig,
 ) -> Option<String> {
+    let terminal = &job.fetch.locator_terminal_values;
     if let Some(name) = &job.fetch.locator_header
         && let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok())
-        && !is_terminal_locator(raw)
+        && !is_terminal_locator(raw, terminal)
     {
         return Some(raw.trim().to_string());
     }
     if let Some(path) = &job.fetch.locator_body
         && let Some(body) = body
         && let Some(raw) = jsonpath_first_string(body, path)
-        && !is_terminal_locator(&raw)
+        && !is_terminal_locator(&raw, terminal)
     {
         return Some(raw.trim().to_string());
     }
@@ -483,6 +491,7 @@ impl RestStream {
             retry_policy,
             static_headers,
             metadata_xml_cache: tokio::sync::OnceCell::new(),
+            roundtrips: std::sync::OnceLock::new(),
         })
     }
 
@@ -658,7 +667,7 @@ impl RestStream {
     pub fn stream_pages(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + '_>> {
-        let mut inner = self.stream_pages_inner(None, None);
+        let mut inner = self.stream_pages_inner(None, None, faucet_core::DEFAULT_BATCH_SIZE);
         Box::pin(async_stream::try_stream! {
             loop {
                 let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
@@ -677,6 +686,97 @@ impl RestStream {
     /// configured extraction mode: `records_multi` (#548, op-stamped multi-array
     /// fan-out), `record_ancestors` (#549, nested path with lifted ancestor
     /// fields), or the classic single `records_path`.
+    /// The per-record key prefixes to drop. An `odata:` block implies
+    /// `@odata.`; explicit `drop_key_prefixes` are added to it.
+    /// Count one upstream round trip, when the pipeline installed a recorder
+    /// (#638). `op` is drawn from this connector's closed set:
+    /// `submit` / `poll` / `fetch` / `page`.
+    fn roundtrip(&self, op: &'static str) {
+        if let Some(r) = self.roundtrips.get() {
+            r.record(op);
+        }
+    }
+
+    /// Run the row-count probe and read the count out of its response (#629).
+    ///
+    /// A probe that fails is **not** fatal: falling back to the async job is
+    /// the pre-#629 behaviour and always correct, just slower — failing the
+    /// run because an optimisation's probe 404'd would be the worse trade.
+    async fn probe_row_count(
+        &self,
+        probe: &crate::async_job::RowCountProbe,
+    ) -> Result<u64, FaucetError> {
+        let base = &self.config.base_url;
+        let url =
+            crate::async_job::resolve_url(base, probe.request.url.as_deref().unwrap_or_default());
+        let body = match self
+            .job_request_json(
+                "count",
+                &probe.request.method,
+                &url,
+                &probe.request.headers,
+                &probe.request.query,
+                probe.request.json.as_ref(),
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "rest: row-count probe failed; using the async job path"
+                );
+                return Ok(u64::MAX);
+            }
+        };
+        let found = jsonpath_first_value(&body, &probe.count_path);
+        match found {
+            Some(Value::Number(n)) => Ok(n.as_u64().unwrap_or(u64::MAX)),
+            // A count arriving as a string is common enough (and unambiguous)
+            // to accept; anything else means the path is wrong, which is a
+            // config error worth surfacing rather than silently guessing.
+            Some(Value::String(t)) => t.trim().parse::<u64>().map_err(|_| {
+                FaucetError::Config(format!(
+                    "async_job: count_path '{}' matched '{t}', which is not a row count",
+                    probe.count_path
+                ))
+            }),
+            Some(other) => Err(FaucetError::Config(format!(
+                "async_job: count_path '{}' matched {other}, which is not a row count",
+                probe.count_path
+            ))),
+            None => Err(FaucetError::Config(format!(
+                "async_job: count_path '{}' matched nothing in the probe response",
+                probe.count_path
+            ))),
+        }
+    }
+
+    /// Page size for the whole-file tabular formats, or `None` when this is
+    /// not file mode (#624).
+    ///
+    /// `response_format: csv | excel` fetches one body that is the entire
+    /// table — `validate()` guarantees `pagination: none` — so the only place
+    /// a page boundary can come from is here. `0` is the house "no batching"
+    /// sentinel and keeps the single-page behaviour.
+    fn file_mode_page_size(&self, csv_page_size: usize) -> Option<usize> {
+        use crate::config::ResponseFormat;
+        matches!(
+            self.config.response_format,
+            ResponseFormat::Csv | ResponseFormat::Excel
+        )
+        .then_some(csv_page_size)
+        .filter(|n| *n > 0)
+    }
+
+    fn drop_key_prefixes(&self) -> Vec<String> {
+        let mut out = self.config.drop_key_prefixes.clone();
+        if self.config.odata.is_some() && !out.iter().any(|p| p == "@odata.") {
+            out.push("@odata.".to_string());
+        }
+        out
+    }
+
     fn extract_page(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
         let mut records = extract::extract_configured(
             body,
@@ -685,13 +785,17 @@ impl RestStream {
             &self.config.records_multi,
             self.config.op_field.as_deref().unwrap_or("_op"),
         )?;
-        // OData responses stamp per-record protocol control fields (`@odata.etag`,
-        // `@odata.editLink`, …) that are metadata, not data, and are invalid column
-        // names downstream. Drop them so records carry only the entity's own fields.
-        if self.config.odata.is_some() {
+        // Protocol control fields stamped per record (`@odata.etag`, JSON:API's
+        // `links`, HAL's `_links`, …) are metadata, not data, and are often
+        // invalid column names downstream. Drop them so records carry only the
+        // entity's own fields. The prefix list is configurable
+        // (`drop_key_prefixes`); an `odata:` block implies `@odata.` so existing
+        // configs keep working without naming it (#654 M24).
+        let prefixes = self.drop_key_prefixes();
+        if !prefixes.is_empty() {
             for rec in &mut records {
                 if let Value::Object(map) = rec {
-                    map.retain(|k, _| !k.starts_with("@odata."));
+                    map.retain(|k, _| !prefixes.iter().any(|p| k.starts_with(p.as_str())));
                 }
             }
         }
@@ -709,6 +813,10 @@ impl RestStream {
         &self,
         context: Option<&HashMap<String, Value>>,
         range_filter: Option<String>,
+        // Records per emitted page for the bounded-memory CSV path (#626).
+        // `0` is the house "no batching" sentinel. Ignored by the HTTP-paged
+        // paths, which chunk on upstream page boundaries.
+        csv_page_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
         // Clone the context into an owned map so it can live inside the
         // `async_stream` generator without borrowing from the caller.
@@ -718,7 +826,29 @@ impl RestStream {
             // Async-job lifecycle (#514/#623): submit → poll → resolve the fetch
             // URL once, then stream one `StreamPage` per locator-paged result set
             // (#557) instead of buffering the entire extract into a single page.
-            if let Some(job) = self.config.async_job.as_ref() {
+            // Size-based routing (#629): when the object is small enough, skip
+            // the job's async floor entirely and fall through to the ordinary
+            // paginated read below. Decided per run from a probe rather than
+            // from a guess baked into the config, because which objects are
+            // "small" changes.
+            let take_async_job = match self.config.async_job.as_ref() {
+                None => false,
+                Some(job) => match job.sync_routing() {
+                    None => true,
+                    Some((threshold, probe)) => {
+                        let rows = self.probe_row_count(probe).await?;
+                        let small = rows < threshold;
+                        tracing::info!(
+                            rows,
+                            threshold,
+                            path = %if small { "synchronous" } else { "async job" },
+                            "rest: routed by row count"
+                        );
+                        !small
+                    }
+                },
+            };
+            if let Some(job) = self.config.async_job.as_ref().filter(|_| take_async_job) {
                 // Capture the incremental bookmark (#630) BEFORE submitting, so it
                 // reflects the query's start time (conservative — a small re-read
                 // overlap next run, deduped by an upsert sink). `None` for full-table.
@@ -731,20 +861,80 @@ impl RestStream {
                     if let (Some(loc), Some(param)) = (&locator, &job.fetch.locator_param) {
                         query.insert(param.clone(), loc.clone());
                     }
-                    let (bytes, resp_headers) = self
-                        .job_request_bytes(
-                            &job.fetch.method,
-                            &fetch_url,
-                            &job.fetch.headers,
-                            &query,
-                            job.fetch.json.as_ref(),
-                        )
-                        .await?;
-                    let (records, body_value) = self.parse_fetch_page(&bytes, job).await?;
-                    // Stream this locator page immediately — peak memory is
-                    // O(one page), not O(whole extract). Per-page bookmark stays
-                    // `None`; the incremental bookmark is emitted once at the end.
-                    yield faucet_core::StreamPage { records, bookmark: None };
+                    // Bounded-memory CSV (#626). A locator page is one HTTP
+                    // response, and for a Bulk extract that response *is* the
+                    // whole object — 3.96 GB peak for 838k rows once it is
+                    // buffered and turned into one `Vec<Value>`. When the decode
+                    // chain is a bare `parse: csv`, decode straight off the body
+                    // and emit `batch_size` pages, so peak memory is one page.
+                    //
+                    // Requires the locator to come from a **header**: reading it
+                    // from the body would need the parsed document this path
+                    // deliberately never materializes.
+                    let plan = crate::decode::csv_stream_plan(&self.config.decode)
+                        .filter(|_| job.fetch.locator_body.is_none());
+                    // Each branch returns the response headers (for the locator
+                    // advance) and, for the buffered path only, the parsed body.
+                    let (body_value, resp_headers) = if let Some(plan) = plan {
+                        let resp = self
+                            .job_request_response(
+                                "fetch",
+                                &job.fetch.method,
+                                &fetch_url,
+                                &job.fetch.headers,
+                                &query,
+                                job.fetch.json.as_ref(),
+                            )
+                            .await?;
+                        // Read the locator before the body is consumed.
+                        let resp_headers_streamed = resp.headers().clone();
+                        use futures::TryStreamExt as _;
+                        let body = resp.bytes_stream().map_err(std::io::Error::other);
+                        let reader = tokio_util::io::StreamReader::new(body);
+                        let mut pages = Box::pin(crate::format::csv_reader_to_value_pages(
+                            reader,
+                            plan.delimiter,
+                            plan.has_headers,
+                            csv_page_size,
+                        ));
+                        use futures::StreamExt as _;
+                        let mut emitted = false;
+                        while let Some(page) = pages.next().await {
+                            let records = page?;
+                            emitted = true;
+                            yield faucet_core::StreamPage { records, bookmark: None };
+                        }
+                        // A header-only (or empty) result still produces one
+                        // page, matching the buffered path: every locator fetch
+                        // yields at least one `StreamPage`, so a downstream that
+                        // counts pages per fetch sees the same thing either way.
+                        if !emitted {
+                            yield faucet_core::StreamPage {
+                                records: Vec::new(),
+                                bookmark: None,
+                            };
+                        }
+                        (None, resp_headers_streamed)
+                    } else {
+                        let (bytes, resp_headers_buffered) = self
+                            .job_request_bytes(
+                                "fetch",
+                                &job.fetch.method,
+                                &fetch_url,
+                                &job.fetch.headers,
+                                &query,
+                                job.fetch.json.as_ref(),
+                            )
+                            .await?;
+                        let (records, body_value) =
+                            self.parse_fetch_page(&bytes, job).await?;
+                        // Stream this locator page immediately — peak memory is
+                        // O(one page), not O(whole extract). Per-page bookmark
+                        // stays `None`; the incremental bookmark is emitted once
+                        // at the end.
+                        yield faucet_core::StreamPage { records, bookmark: None };
+                        (body_value, resp_headers_buffered)
+                    };
 
                     // Advance to the next locator; stop when it is absent, empty,
                     // `"null"`, or repeats (loop guard) — matching the previous
@@ -1034,7 +1224,31 @@ impl RestStream {
                             running_max.clone()
                         };
                         bookmark_emitted = bookmark.is_some();
-                        yield faucet_core::StreamPage { records, bookmark };
+                        // File mode (`response_format: csv | excel`) downloads
+                        // the whole tabular body in one response, so without
+                        // this the entire sheet lands in a single page and the
+                        // pipeline holds every record at once (#624). The
+                        // bytes are still whole — there is no ranged parse of
+                        // a CSV over HTTP — but the *parsed* page is bounded.
+                        let chunk = self.file_mode_page_size(csv_page_size);
+                        if let Some(size) = chunk.filter(|s| records.len() > *s) {
+                            let total = records.len();
+                            let mut emitted = 0usize;
+                            for part in records.chunks(size) {
+                                emitted += part.len();
+                                let last = emitted == total;
+                                yield faucet_core::StreamPage {
+                                    records: part.to_vec(),
+                                    // Only the final chunk carries the
+                                    // bookmark: a mid-file checkpoint would
+                                    // claim progress the sink has not been
+                                    // handed yet.
+                                    bookmark: if last { bookmark.clone() } else { None },
+                                };
+                            }
+                        } else {
+                            yield faucet_core::StreamPage { records, bookmark };
+                        }
                         break;
                     }
 
@@ -1082,7 +1296,7 @@ impl RestStream {
     ) -> Result<Vec<Value>, FaucetError> {
         let mut all_records = Vec::new();
         let mut pages_fetched = 0usize;
-        let mut pages = self.stream_pages_inner(context, None);
+        let mut pages = self.stream_pages_inner(context, None, faucet_core::DEFAULT_BATCH_SIZE);
 
         // Poll the stream without requiring StreamExt (avoids extra dependency).
         loop {
@@ -1242,6 +1456,7 @@ impl RestStream {
     /// json). Returns the raw response bytes; errors on non-2xx.
     async fn job_request_bytes(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1258,7 +1473,7 @@ impl RestStream {
             self.retry_policy.base,
             || async {
                 let resp = self
-                    .job_request_response_once(method, url, headers, query, json)
+                    .job_request_response_once(op, method, url, headers, query, json)
                     .await?;
                 let resp_headers = resp.headers().clone();
                 let bytes = resp.bytes().await.map_err(FaucetError::Http)?;
@@ -1277,6 +1492,7 @@ impl RestStream {
     /// (never fetched, expires server-side) and at-least-once-consistent.
     async fn job_request_response(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1286,7 +1502,7 @@ impl RestStream {
         retry::execute_with_retry(
             self.retry_policy.max_attempts.saturating_sub(1),
             self.retry_policy.base,
-            || self.job_request_response_once(method, url, headers, query, json),
+            || self.job_request_response_once(op, method, url, headers, query, json),
         )
         .await
     }
@@ -1296,6 +1512,7 @@ impl RestStream {
     /// [`job_request_response`](Self::job_request_response).
     async fn job_request_response_once(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1325,6 +1542,9 @@ impl RestStream {
         if let Some(j) = json {
             req = req.json(j);
         }
+        // Counted here, at the one unretried attempt, so a retried call counts
+        // again — a retry is a real round trip against the API's quota (#638).
+        self.roundtrip(op);
         // Transport errors stay typed (`FaucetError::Http`) so the shared retry
         // runner's `is_retriable` classification sees connect/timeout failures —
         // stringifying them into `Source(...)` would silently make every
@@ -1343,6 +1563,7 @@ impl RestStream {
 
     async fn job_request_json(
         &self,
+        op: &'static str,
         method: &str,
         url: &str,
         headers: &HashMap<String, String>,
@@ -1350,7 +1571,7 @@ impl RestStream {
         json: Option<&Value>,
     ) -> Result<Value, FaucetError> {
         let (bytes, _headers) = self
-            .job_request_bytes(method, url, headers, query, json)
+            .job_request_bytes(op, method, url, headers, query, json)
             .await?;
         serde_json::from_slice(&bytes)
             .map_err(|e| FaucetError::Source(format!("async_job: {url} returned non-JSON: {e}")))
@@ -1382,10 +1603,11 @@ impl RestStream {
                 .or_else(|| self.config.start_replication_value.clone())
         }?;
         let submit = job.submit.json.as_ref()?;
-        let query = submit.get("query")?.as_str()?;
+        let query = job.submit_query()?;
         let predicate = format!("{key} > {}", sql_literal(&start));
         let mut cloned = submit.clone();
-        cloned["query"] = Value::String(inject_sql_predicate(query, &predicate));
+        *cloned.pointer_mut(&job.query_path)? =
+            Value::String(inject_sql_predicate(query, &predicate));
         Some(cloned)
     }
 
@@ -1435,6 +1657,7 @@ impl RestStream {
         let submit_json = injected.as_ref().or(job.submit.json.as_ref());
         let submit_body = self
             .job_request_json(
+                "submit",
                 &job.submit.method,
                 &submit_url,
                 &job.submit.headers,
@@ -1468,6 +1691,7 @@ impl RestStream {
         let last_poll_body: Value = loop {
             let body = self
                 .job_request_json(
+                    "poll",
                     &job.poll.method,
                     &poll_url,
                     &job.poll.headers,
@@ -1990,6 +2214,9 @@ impl RestStream {
             req = req.json(body);
         }
 
+        // One data-page request against the API (#638). Counted per attempt,
+        // so a 429-then-retry counts twice — it consumed two calls of quota.
+        self.roundtrip("page");
         let resp = req.send().await?;
         let status = resp.status();
 
@@ -2211,6 +2438,13 @@ impl faucet_core::Source for RestStream {
         "rest"
     }
 
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        // First install wins; the pipeline installs exactly once per run, and
+        // ignoring a second call keeps a re-used source instance from losing
+        // the labels it is already counting under.
+        let _ = self.roundtrips.set(recorder);
+    }
+
     fn config_schema(&self) -> serde_json::Value {
         serde_json::to_value(faucet_core::schema_for!(RestStreamConfig))
             .expect("schema serialization")
@@ -2230,7 +2464,7 @@ impl faucet_core::Source for RestStream {
         // dataset either way).
         if let Some(job) = &self.config.async_job {
             let sep = if base.ends_with('/') { "" } else { "/" };
-            if let Some(obj) = async_job_object(job.submit.json.as_ref()) {
+            if let Some(obj) = async_job_object(job.submit.json.as_ref(), &job.query_path) {
                 return format!("{base}{sep}objects/{obj}");
             }
             if let Some(j) = &job.submit.json {
@@ -2273,11 +2507,12 @@ impl faucet_core::Source for RestStream {
     fn stream_pages<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
-        _batch_size: usize,
+        batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
-        // RestStream chunks by upstream-API page boundaries, not by an
-        // in-memory `batch_size` knob. The arg is accepted for trait
-        // conformance and reserved for a future `page_size` mapping.
+        // RestStream chunks by upstream-API page boundaries for the HTTP-paged
+        // modes. The hint *is* honoured by the bounded-memory CSV path (#626),
+        // where there is no upstream page to chunk on and the whole result set
+        // would otherwise land in one page.
         //
         // Key-range partitioning (#479): when an integer PK is configured, tile the
         // key space and stream the tiles concurrently (the fix for a huge OData
@@ -2289,7 +2524,7 @@ impl faucet_core::Source for RestStream {
             .and_then(|o| o.partition.as_ref())
             .and_then(|p| p.key.clone())
         {
-            return self.stream_key_range_partitions(context, key);
+            return self.stream_key_range_partitions(context, key, batch_size);
         }
         // Partition fan-out (#535): when `partitions` are configured the stream
         // must run once per partition — mirroring `fetch_all` / `fetch_with_context`
@@ -2297,7 +2532,7 @@ impl faucet_core::Source for RestStream {
         // (the pipeline drives this method). Any parent `context` is merged into
         // each partition context, exactly as `fetch_with_context` does.
         if self.config.partitions.is_empty() {
-            return self.stream_pages_inner(Some(context), None);
+            return self.stream_pages_inner(Some(context), None, batch_size);
         }
         let contexts: Vec<HashMap<String, Value>> = self
             .config
@@ -2309,27 +2544,63 @@ impl faucet_core::Source for RestStream {
                 merged
             })
             .collect();
+        // `partition_concurrency` used to be honoured only by the buffering
+        // `fetch_all`, so the documented knob did nothing on the path the
+        // pipeline actually drives (#624 — the same no-op class as the
+        // object-store `concurrency` in #619). `1`, `0` and `None` all mean
+        // "one at a time", which is the pre-#624 behaviour.
+        let concurrency = self.config.partition_concurrency.unwrap_or(1).max(1);
         Box::pin(async_stream::try_stream! {
             // Per-partition streams each emit their own final bookmark; we
             // suppress those and emit a single consolidated (max) bookmark after
             // the last partition, so the persisted state is the global high-water
             // mark rather than whichever partition happened to finish last.
             let mut max_bookmark: Option<Value> = None;
-            for ctx in &contexts {
-                let mut inner = self.stream_pages_inner(Some(ctx), None);
-                loop {
-                    let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
-                    match page {
-                        Some(Ok(p)) => {
-                            if let Some(bm) = p.bookmark {
-                                max_bookmark = value_max(max_bookmark.take(), bm);
-                                yield faucet_core::StreamPage { records: p.records, bookmark: None };
-                            } else {
-                                yield p;
+            if concurrency <= 1 {
+                for ctx in &contexts {
+                    let mut inner = self.stream_pages_inner(Some(ctx), None, batch_size);
+                    loop {
+                        let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
+                        match page {
+                            Some(Ok(p)) => {
+                                if let Some(bm) = p.bookmark {
+                                    max_bookmark = value_max(max_bookmark.take(), bm);
+                                    yield faucet_core::StreamPage { records: p.records, bookmark: None };
+                                } else {
+                                    yield p;
+                                }
                             }
+                            Some(Err(e)) => Err(e)?,
+                            None => break,
                         }
-                        Some(Err(e)) => Err(e)?,
-                        None => break,
+                    }
+                }
+            } else {
+                // Interleaved, not ordered: `flatten_unordered` polls up to
+                // `concurrency` partition streams at once, so pages arrive as
+                // each partition produces them. Partitions are disjoint by
+                // construction and the consolidated bookmark is a max over all
+                // of them, so interleaving changes throughput, not the
+                // persisted position — but a downstream that assumed
+                // partition-at-a-time page order no longer gets it.
+                use futures::StreamExt as _;
+                // Built eagerly into a `Vec` rather than mapped lazily: a
+                // closure returning a borrow-capturing stream is not
+                // higher-ranked enough for the combinator, and forcing it
+                // here costs one allocation per partition.
+                let mut inners = Vec::with_capacity(contexts.len());
+                for ctx in &contexts {
+                    inners.push(self.stream_pages_inner(Some(ctx), None, batch_size));
+                }
+                let mut merged =
+                    futures::stream::iter(inners).flatten_unordered(Some(concurrency));
+                while let Some(page) = merged.next().await {
+                    let p = page?;
+                    if let Some(bm) = p.bookmark {
+                        max_bookmark = value_max(max_bookmark.take(), bm);
+                        yield faucet_core::StreamPage { records: p.records, bookmark: None };
+                    } else {
+                        yield p;
                     }
                 }
             }
@@ -2398,6 +2669,7 @@ impl faucet_core::Source for RestStream {
                 }
                 let resp = self
                     .job_request_response(
+                        "fetch",
                         &job.fetch.method,
                         &fetch_url,
                         &job.fetch.headers,
@@ -2556,6 +2828,7 @@ impl RestStream {
         for (k, v) in self.metadata_headers(url).await?.iter() {
             headers.insert(k.clone(), v.clone());
         }
+        self.roundtrip("discover");
         let resp = self
             .client
             .get(url)
@@ -2677,6 +2950,7 @@ impl RestStream {
         &'a self,
         context: &'a HashMap<String, Value>,
         key: String,
+        batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>> {
         use futures::StreamExt as _;
         let odata = self.config.odata.as_ref().expect("odata configured");
@@ -2701,7 +2975,7 @@ impl RestStream {
                 .filter_map(faucet_core::shard::PkShardBounds::from_spec)
                 .map(|bounds| {
                     let filter = crate::odata::key_range_filter(&bounds);
-                    self.stream_pages_inner(Some(&parent), filter)
+                    self.stream_pages_inner(Some(&parent), filter, batch_size)
                 })
                 .collect();
             let mut merged = futures::stream::iter(streams).flatten_unordered(workers);
@@ -3112,18 +3386,66 @@ mod tests {
     #[test]
     fn async_job_object_reads_query_field() {
         assert_eq!(
-            async_job_object(Some(&serde_json::json!({
-                "operation": "queryAll",
-                "query": "SELECT Id FROM Lead"
-            }))),
+            async_job_object(
+                Some(&serde_json::json!({
+                    "operation": "queryAll",
+                    "query": "SELECT Id FROM Lead"
+                })),
+                "/query"
+            ),
             Some("Lead".to_string())
         );
         // Missing query / missing body → None.
         assert_eq!(
-            async_job_object(Some(&serde_json::json!({"operation": "queryAll"}))),
+            async_job_object(
+                Some(&serde_json::json!({"operation": "queryAll"})),
+                "/query"
+            ),
             None
         );
-        assert_eq!(async_job_object(None), None);
+        assert_eq!(async_job_object(None, "/query"), None);
+    }
+
+    #[test]
+    fn async_job_object_follows_a_non_default_query_path() {
+        // The statement need not sit at top-level `query`: a nested or
+        // differently-named key used to silently collapse every object onto
+        // one dataset identity (#654 M23).
+        assert_eq!(
+            async_job_object(
+                Some(&serde_json::json!({"request": {"sql": "SELECT Id FROM Account"}})),
+                "/request/sql"
+            ),
+            Some("Account".to_string())
+        );
+        // The default pointer finds nothing in that body.
+        assert_eq!(
+            async_job_object(
+                Some(&serde_json::json!({"request": {"sql": "SELECT Id FROM Account"}})),
+                "/query"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_locator_honours_the_configured_sentinels() {
+        let default = vec!["null".to_string()];
+        // Empty is always terminal, whatever the list says.
+        assert!(is_terminal_locator("", &default));
+        assert!(is_terminal_locator("   ", &[]));
+        // The default sentinel, case-insensitively and after trimming.
+        assert!(is_terminal_locator(" NULL ", &default));
+        assert!(!is_terminal_locator("abc123", &default));
+        // A vendor signalling with its own sentinel is now expressible; the
+        // default one stops being special once replaced.
+        let custom = vec!["EOF".to_string(), "-1".to_string()];
+        assert!(is_terminal_locator("eof", &custom));
+        assert!(is_terminal_locator("-1", &custom));
+        assert!(
+            !is_terminal_locator("null", &custom),
+            "replacing the list must replace it, not extend it"
+        );
     }
 
     #[test]
@@ -3424,6 +3746,38 @@ mod patch_edge_tests {
         ]});
         let recs = s.extract_page(&body).unwrap();
         assert_eq!(recs, vec![json!({ "Id": 1, "Name": "a" })]);
+    }
+
+    #[test]
+    fn extract_page_drops_configured_prefixes_for_any_protocol() {
+        // The need is generic; only the prefix was OData's. A JSON:API / HAL
+        // envelope can now be stripped without a code change (#654 M24).
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.drop_key_prefixes = vec!["_".to_string(), "links".to_string()];
+        cfg.records_path = Some("$.data[*]".into());
+        let s = RestStream::new(cfg).unwrap();
+        let body = json!({ "data": [
+            { "_links": {"self": "/x"}, "links": {"next": "/y"}, "id": 1, "name": "a" },
+        ]});
+        assert_eq!(
+            s.extract_page(&body).unwrap(),
+            vec![json!({ "id": 1, "name": "a" })]
+        );
+    }
+
+    #[test]
+    fn an_odata_block_still_implies_the_odata_prefix_alongside_explicit_ones() {
+        // Existing `odata:` configs must keep stripping `@odata.` without
+        // naming it, even once the list is used for something else.
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.odata = Some(serde_json::from_value(json!({ "entity": "Orders" })).unwrap());
+        cfg.drop_key_prefixes = vec!["x-".to_string()];
+        cfg.records_path = Some("$.value[*]".into());
+        let s = RestStream::new(cfg).unwrap();
+        let body = json!({ "value": [
+            { "@odata.etag": "W/\"1\"", "x-trace": "t", "Id": 1 },
+        ]});
+        assert_eq!(s.extract_page(&body).unwrap(), vec![json!({ "Id": 1 })]);
     }
 
     #[test]

@@ -40,6 +40,16 @@ enum Fetched {
     /// whole-object checksum can only be verified by reading the whole object.
     #[cfg(feature = "arrow")]
     Parquet(bytes::Bytes),
+    /// A whole object already decoded into records by
+    /// [`faucet_core::file_format`] (#604) — CSV, XML and Excel. Decoding at
+    /// fetch time keeps the per-format work in one place; the page loop then
+    /// chunks these exactly as it chunks a JSON array's.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    Records(Vec<Value>),
 }
 
 /// A GCS source that lists and reads objects from a bucket.
@@ -135,7 +145,37 @@ impl GcsSource {
                 Some(stream) => Fetched::ParquetStream(Box::new(stream)),
                 None => Fetched::Parquet(self.read_object_bytes(key).await?),
             },
+            #[cfg(feature = "file-format-csv")]
+            GcsFileFormat::Csv => self.fetch_decoded(key).await?,
+            #[cfg(feature = "file-format-xml")]
+            GcsFileFormat::Xml => self.fetch_decoded(key).await?,
+            #[cfg(feature = "file-format-excel")]
+            GcsFileFormat::Xlsx => self.fetch_decoded(key).await?,
         })
+    }
+
+    /// Read one object whole and decode it through the shared format layer.
+    ///
+    /// Whole-object for all three: a workbook's directory sits at the end of a
+    /// zip container, an XML document is a tree, and a CSV's records are
+    /// chunked by the same page loop either way — so one buffered path keeps
+    /// the decode in one place rather than three.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    async fn fetch_decoded(&self, key: &str) -> Result<Fetched, FaucetError> {
+        let bytes = self.read_object_all(key).await?;
+        let format =
+            self.config.file_format.shared().ok_or_else(|| {
+                FaucetError::Source(format!("GCS '{key}': format has no decoder"))
+            })?;
+        let records =
+            faucet_core::file_format::decode(&bytes, format, &self.config.format_options())
+                .await
+                .map_err(|e| FaucetError::Source(format!("GCS '{key}': {e}")))?;
+        Ok(Fetched::Records(records))
     }
 
     /// Whether this object can be read row group at a time, and a reader for it
@@ -343,6 +383,18 @@ impl GcsSource {
     /// cannot go through [`read_object_text`](Self::read_object_text)).
     #[cfg(feature = "arrow")]
     async fn read_object_bytes(&self, key: &str) -> Result<bytes::Bytes, FaucetError> {
+        Ok(bytes::Bytes::from(self.read_object_all(key).await?))
+    }
+
+    /// The same whole-body read, without the `bytes` dependency the Parquet
+    /// path brings — the shared formats (#604) need the bytes but not Arrow.
+    #[cfg(any(
+        feature = "arrow",
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
         use tokio::io::AsyncReadExt as _;
         let mut reader = self.open_object_reader(key).await?;
         let mut buf = Vec::new();
@@ -350,7 +402,7 @@ impl GcsSource {
             .read_to_end(&mut buf)
             .await
             .map_err(|e| FaucetError::Source(format!("GCS read error for key '{key}': {e}")))?;
-        Ok(bytes::Bytes::from(buf))
+        Ok(buf)
     }
 
     /// Decode a single Parquet object into its Arrow schema and batches. The
@@ -364,6 +416,19 @@ impl GcsSource {
     ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
         Self::decode_parquet(self.read_object_bytes(key).await?, key).await
     }
+}
+
+/// The shared-format decoders run at fetch time, not through the text parser.
+#[cfg(any(
+    feature = "file-format-csv",
+    feature = "file-format-xml",
+    feature = "file-format-excel"
+))]
+fn shared_format_via_text(key: &str, format: &str) -> FaucetError {
+    FaucetError::Source(format!(
+        "GCS {format} object '{key}' reached the text parser (internal error: {format} is \
+         decoded at fetch time)"
+    ))
 }
 
 /// Parse file content into records for a given format. Free function (vs. a
@@ -411,9 +476,16 @@ pub(crate) fn parse_file_content(
             "key": key,
             "content": text,
         })]),
-        // Parquet is binary and is decoded via `read_object_parquet`, never
-        // through this text parser — reaching here is an internal invariant
-        // violation.
+        // The shared-format objects (#604) are decoded at fetch time by
+        // `fetch_decoded`, and Parquet via `read_object_parquet`; neither
+        // reaches this synchronous text parser, so an arm here is an internal
+        // invariant violation rather than a user error.
+        #[cfg(feature = "file-format-csv")]
+        GcsFileFormat::Csv => Err(shared_format_via_text(key, "csv")),
+        #[cfg(feature = "file-format-xml")]
+        GcsFileFormat::Xml => Err(shared_format_via_text(key, "xml")),
+        #[cfg(feature = "file-format-excel")]
+        GcsFileFormat::Xlsx => Err(shared_format_via_text(key, "xlsx")),
         #[cfg(feature = "arrow")]
         GcsFileFormat::Parquet => Err(FaucetError::Source(format!(
             "GCS parquet object '{key}' cannot be parsed as text (internal error: \
@@ -704,6 +776,36 @@ impl faucet_core::Source for GcsSource {
                             yield StreamPage { records: array, bookmark: None };
                         } else {
                             for record in array {
+                                buffer.push(record);
+                                if buffer.len() >= chunk {
+                                    let page = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(initial_capacity),
+                                    );
+                                    total += page.len();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(any(
+                        feature = "file-format-csv",
+                        feature = "file-format-xml",
+                        feature = "file-format-excel"
+                    ))]
+                    Fetched::Records(records) => {
+                        // CSV / XML / Excel (#604): already decoded at fetch
+                        // time, so chunk exactly as a JSON array is chunked.
+                        if batch_size == 0 {
+                            if !buffer.is_empty() {
+                                let page = std::mem::take(&mut buffer);
+                                total += page.len();
+                                yield StreamPage { records: page, bookmark: None };
+                            }
+                            total += records.len();
+                            yield StreamPage { records, bookmark: None };
+                        } else {
+                            for record in records {
                                 buffer.push(record);
                                 if buffer.len() >= chunk {
                                     let page = std::mem::replace(

@@ -22,6 +22,17 @@ pub struct SftpSink {
     /// Reused SFTP session, opened on first write. Behind a `Mutex` so writes
     /// share one SSH connection instead of reconnecting per page.
     session: Mutex<Option<SftpSession>>,
+    /// Rows accumulated across `write_batch` calls for the open file (#618).
+    ///
+    /// Without this the sink wrote one file per upstream page, so a small
+    /// `batch_size` produced a directory of tiny files.
+    open: Mutex<faucet_core::ObjectAccumulator>,
+    /// Records held for a **whole-file** format (#604). CSV has a header, XML
+    /// a document element, a workbook a container index and a JSON array its
+    /// brackets — none can be appended a record at a time, so their records
+    /// are buffered and encoded together at the rollover. Always empty for
+    /// JSON Lines, which streams through `open`.
+    pending: Mutex<faucet_core::object_rollover::PageAccumulator>,
 }
 
 impl SftpSink {
@@ -29,22 +40,26 @@ impl SftpSink {
     /// The batch size is validated up front so a bad config fails fast.
     pub fn new(config: SftpSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        let open = Mutex::new(faucet_core::ObjectAccumulator::new(
+            config.max_records_per_file.or(match config.batch_size {
+                0 => None,
+                n => Some(n),
+            }),
+            config.max_bytes_per_file,
+        ));
+        let pending = Mutex::new(faucet_core::object_rollover::PageAccumulator::new(
+            config.max_records_per_file.or(match config.batch_size {
+                0 => None,
+                n => Some(n),
+            }),
+            config.max_bytes_per_file,
+        ));
         Ok(Self {
             config,
             session: Mutex::new(None),
+            open,
+            pending,
         })
-    }
-
-    /// Serialize a slice of records as JSON Lines bytes.
-    fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
-        let mut buf: Vec<u8> = Vec::new();
-        for record in records {
-            let line = serde_json::to_vec(record)
-                .map_err(|e| FaucetError::Sink(format!("JSON serialization failed: {e}")))?;
-            buf.extend_from_slice(&line);
-            buf.push(b'\n');
-        }
-        Ok(buf)
     }
 
     /// Join the configured directory prefix with a file name using POSIX `/`.
@@ -63,6 +78,30 @@ impl SftpSink {
     fn final_key(&self) -> String {
         let id = uuid::Uuid::new_v4();
         self.join_path(&format!("{id}{}", self.config.file_extension))
+    }
+
+    /// Encode one buffered group in the configured whole-file format and
+    /// write it as a single file (#604).
+    async fn write_encoded_file(&self, group: Vec<Value>) -> Result<(), FaucetError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let format = self.config.format.shared();
+        let rows = group.len();
+        let body = faucet_core::file_format::encode(&group, format, &self.config.format_options())?;
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            let sftp = connect(&self.config.connection).await?;
+            if let Err(e) = sftp.create_dir(self.config.path.as_str()).await {
+                tracing::debug!(path = %self.config.path, error = %e, "SFTP create_dir (best-effort)");
+            }
+            *guard = Some(sftp);
+        }
+        let sftp = guard.as_ref().expect("session initialized above");
+        let key = self.final_key();
+        Self::upload_atomic(sftp, &key, &body).await?;
+        tracing::info!(path = %key, records = rows, format = format.as_str(), "SFTP file written");
+        Ok(())
     }
 
     /// Upload `body` to `final_key` atomically: write a temporary object and
@@ -109,9 +148,61 @@ impl SftpSink {
 
 #[async_trait]
 impl faucet_core::Sink for SftpSink {
+    /// Close the open file (#618).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so the remainder is uploaded before the bookmark advances — a
+    /// file left unwritten after a "successful" run is data loss with a green
+    /// exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let finished = {
+            let mut open = self.open.lock().await;
+            open.finish()
+        };
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.finish()
+        };
+        if let Some(group) = group {
+            self.write_encoded_file(group).await?;
+        }
+        let Some(obj) = finished else {
+            return Ok(());
+        };
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            let sftp = connect(&self.config.connection).await?;
+            if let Err(e) = sftp.create_dir(self.config.path.as_str()).await {
+                tracing::debug!(path = %self.config.path, error = %e, "SFTP create_dir (best-effort)");
+            }
+            *guard = Some(sftp);
+        }
+        let sftp = guard.as_ref().expect("session initialized above");
+        let key = self.final_key();
+        Self::upload_atomic(sftp, &key, &obj.body).await?;
+        tracing::info!(path = %key, records = obj.rows, "SFTP file closed");
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
+        }
+
+        // Whole-file formats (#604): a CSV header, an XML document element, a
+        // workbook index and a JSON array's brackets all need every record
+        // before any byte is final, so records are buffered and encoded
+        // together. The same row/byte caps decide the rollover, so file sizing
+        // means the same thing whatever the format.
+        if !self.config.format.appends_per_record() {
+            let group = {
+                let mut pending = self.pending.lock().await;
+                pending.push_page(records)
+            };
+            if let Some(group) = group {
+                self.write_encoded_file(group).await?;
+            }
+            return Ok(records.len());
         }
 
         let mut guard = self.session.lock().await;
@@ -127,20 +218,24 @@ impl faucet_core::Sink for SftpSink {
         }
         let sftp = guard.as_ref().expect("session initialized above");
 
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
-        };
-
-        let files = chunks.len();
-        for chunk in chunks {
-            let body = Self::serialize_jsonl(chunk)?;
-            let key = self.final_key();
-            Self::upload_atomic(sftp, &key, &body).await?;
+        // Accumulate across calls and roll on the record/byte cap (#618). A
+        // page smaller than the cap joins the open file rather than becoming a
+        // file of its own. `batch_size` still sizes files when no explicit
+        // `max_records_per_file` is given, so an existing config keeps the
+        // file size it asked for.
+        let mut files = 0usize;
+        {
+            let mut open = self.open.lock().await;
+            for record in records {
+                if let faucet_core::object_rollover::Emit::Object(obj) = open.push_record(record)? {
+                    let key = self.final_key();
+                    Self::upload_atomic(sftp, &key, &obj.body).await?;
+                    files += 1;
+                }
+            }
         }
 
-        tracing::info!(records = records.len(), files, "SFTP batch write complete");
+        tracing::debug!(records = records.len(), files, "SFTP batch accumulated");
         Ok(records.len())
     }
 
@@ -180,14 +275,21 @@ mod tests {
         assert!(matches!(SftpSink::new(bad), Err(FaucetError::Config(_))));
     }
 
+    /// The NDJSON encoding moved into `faucet_core::ObjectAccumulator` with
+    /// the cross-page accumulation (#618) — pinned here too, because this is
+    /// what lands on the remote filesystem.
     #[test]
-    fn serialize_jsonl_is_newline_delimited() {
-        let records = vec![
-            serde_json::json!({"id": 1, "name": "Alice"}),
-            serde_json::json!({"id": 2, "name": "Bob"}),
-        ];
-        let bytes = SftpSink::serialize_jsonl(&records).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
+    fn records_write_as_newline_delimited_json() {
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        acc.push_record(&serde_json::json!({"id": 1, "name": "Alice"}))
+            .unwrap();
+        let faucet_core::object_rollover::Emit::Object(obj) = acc
+            .push_record(&serde_json::json!({"id": 2, "name": "Bob"}))
+            .unwrap()
+        else {
+            panic!("rolled at 2 records");
+        };
+        let text = String::from_utf8(obj.body).unwrap();
         let lines: Vec<&str> = text.trim().split('\n').collect();
         assert_eq!(lines.len(), 2);
         let first: Value = serde_json::from_str(lines[0]).unwrap();
@@ -195,8 +297,10 @@ mod tests {
     }
 
     #[test]
-    fn serialize_jsonl_empty() {
-        assert!(SftpSink::serialize_jsonl(&[]).unwrap().is_empty());
+    fn an_empty_accumulator_writes_no_file() {
+        // An empty page must not create an empty file on the remote host.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        assert!(acc.finish().is_none());
     }
 
     #[test]
@@ -241,5 +345,19 @@ mod tests {
             sink.supported_write_modes()
                 .contains(&faucet_core::write_mode::WriteMode::Append)
         );
+    }
+
+    /// `batch_size: 0` is the documented "no batching" sentinel: it must
+    /// become *no* record cap, not a cap of zero — which would roll a new
+    /// file on every record.
+    #[test]
+    fn batch_size_zero_leaves_both_accumulators_uncapped() {
+        let sink = SftpSink::new(cfg().with_batch_size(0)).expect("zero is a valid batch size");
+        assert_eq!(sink.config.batch_size, 0);
+        assert_eq!(sink.config.max_records_per_file, None);
+
+        // An explicit record cap still wins over the batch size.
+        let capped = SftpSink::new(cfg().with_batch_size(0).max_records_per_file(7)).expect("new");
+        assert_eq!(capped.config.max_records_per_file, Some(7));
     }
 }

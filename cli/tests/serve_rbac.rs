@@ -30,6 +30,9 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         listen: format!("127.0.0.1:{port}"),
         auth_token: None,
         auth_config: Some(auth_config),
+        read_token: None,
+        write_token: None,
+        admin_token: None,
         no_auth: false,
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
@@ -74,7 +77,10 @@ async fn spawn_rbac_server(port: u16) -> tempfile::TempDir {
         let _ = faucet_cli::serve::run_server(config, Default::default()).await;
     });
     let client = reqwest::Client::new();
-    for _ in 0..100 {
+    // 30s: this polls a server starting up next to the whole
+    // workspace test suite, so the budget has to survive a loaded
+    // runner. Costs nothing when it is already up.
+    for _ in 0..1200 {
         if client
             .get(format!("http://127.0.0.1:{port}/healthz"))
             .send()
@@ -260,4 +266,232 @@ async fn audit_log_records_actions_and_is_admin_only() {
             .all(|e| e["principal"] == "bob"),
         "principal filter must only return that principal's entries"
     );
+}
+
+// ── #608: the verified read/write/admin permission matrix ────────────────────
+//
+// The contract an operator is handed three tokens on: a read token can never
+// change anything. Enforced as a table walk over **every** registered `/v1`
+// route rather than a hand-picked sample, so a new mutating route that nobody
+// classified fails here instead of quietly becoming viewer-reachable.
+
+/// Every (method, route-template) the router registers under the current
+/// feature set — the same inventory `serve_openapi.rs` checks the spec against.
+/// Duplicated deliberately: if the two ever disagree, one of them is wrong and
+/// this test is the one that decides whether a route is safe.
+fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
+    use axum::http::Method;
+    #[allow(unused_mut)]
+    let mut v: Vec<(Method, &'static str)> = vec![
+        (Method::POST, "/v1/runs"),
+        (Method::GET, "/v1/runs"),
+        (Method::GET, "/v1/runs/{id}"),
+        (Method::DELETE, "/v1/runs/{id}"),
+        (Method::POST, "/v1/runs/{id}/cancel"),
+        (Method::GET, "/v1/runs/{id}/logs"),
+        (Method::GET, "/v1/schemas"),
+        (Method::GET, "/v1/schemas/{kind}/{name}"),
+        (Method::POST, "/v1/doctor"),
+        (Method::POST, "/v1/backfill"),
+        (Method::POST, "/v1/dlq/inspect"),
+        (Method::POST, "/v1/dlq/replay"),
+        (Method::POST, "/v1/dlq/discard"),
+        (Method::GET, "/v1/audit"),
+        (Method::POST, "/v1/reload"),
+        (Method::POST, "/mcp"),
+    ];
+    #[cfg(feature = "triggers")]
+    v.extend([
+        (Method::POST, "/v1/triggers/{name}"),
+        (Method::PUT, "/v1/triggers/{name}"),
+    ]);
+    #[cfg(feature = "catalog")]
+    v.extend([
+        (Method::GET, "/v1/catalog/datasets"),
+        (Method::GET, "/v1/catalog/datasets/{id}"),
+        (Method::GET, "/v1/catalog/lineage"),
+        (Method::GET, "/v1/local-outputs"),
+        (Method::DELETE, "/v1/local-outputs/{id}"),
+        (Method::POST, "/v1/local-outputs/cleanup"),
+        (Method::GET, "/v1/local-outputs/{id}/preview"),
+    ]);
+    #[cfg(feature = "templates")]
+    v.extend([
+        (Method::POST, "/v1/templates"),
+        (Method::GET, "/v1/templates"),
+        (Method::GET, "/v1/templates/{id}"),
+        (Method::DELETE, "/v1/templates/{id}"),
+        (Method::POST, "/v1/templates/{id}/runs"),
+        (Method::POST, "/v1/templates/{id}/tags"),
+        (Method::POST, "/v1/templates/{id}/launch"),
+        (Method::POST, "/v1/templates/{id}/rollback"),
+        (Method::POST, "/v1/templates/{id}/deprecate"),
+    ]);
+    v
+}
+
+/// A route is *mutating* if it can change server- or destination-side state.
+/// `GET` never is. `/mcp` is a POST that is **not** mutating at this layer —
+/// its baseline is a read scope and its one mutating tool re-checks `RunWrite`
+/// inside the handler.
+fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    // POSTs that carry a body but change nothing. Enumerated, not inferred:
+    // adding a route here is the one way to make it viewer-reachable, so the
+    // decision is visible in a diff.
+    //
+    // - `/mcp` — its baseline is a read scope; the one mutating tool
+    //   (`run_pipeline`) re-checks `RunWrite` inside the handler.
+    // - `/v1/dlq/inspect` — reads a DLQ location and summarises it. Note for
+    //   operators: the location is caller-supplied, so a read token can ask
+    //   the server to read a path on its filesystem. That is the same trust
+    //   boundary as run logs (which carry record data) and is why the DLQ
+    //   endpoints are not exposed to the public internet.
+    const READ_ONLY_POSTS: &[&str] = &["/mcp", "/v1/dlq/inspect"];
+    if READ_ONLY_POSTS.contains(&path) {
+        return false;
+    }
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    )
+}
+
+#[test]
+fn a_read_token_is_denied_on_every_mutating_route() {
+    use faucet_cli::serve::rbac::{Role, required_permission};
+
+    let mut reachable: Vec<String> = Vec::new();
+    for (method, path) in all_v1_routes() {
+        if !is_mutating(&method, path) {
+            continue;
+        }
+        let perm = required_permission(&method, path);
+        // An unmapped route is admin-only (fail-closed), which is also a deny
+        // for a viewer — but it must be *deliberate*, so it is flagged below.
+        let allowed = perm.is_some_and(|p| Role::Viewer.grants(p));
+        if allowed {
+            reachable.push(format!("{method} {path}"));
+        }
+    }
+    assert!(
+        reachable.is_empty(),
+        "a read token must never reach a mutating route — these are reachable: {reachable:?}"
+    );
+}
+
+#[test]
+fn a_read_token_can_reach_every_read_route() {
+    use faucet_cli::serve::rbac::{Role, required_permission};
+
+    let mut denied: Vec<String> = Vec::new();
+    for (method, path) in all_v1_routes() {
+        if method != axum::http::Method::GET || path == "/v1/audit" {
+            continue; // the audit log is admin-only by design
+        }
+        let ok = required_permission(&method, path).is_some_and(|p| Role::Viewer.grants(p));
+        if !ok {
+            denied.push(format!("{method} {path}"));
+        }
+    }
+    assert!(
+        denied.is_empty(),
+        "a read token must be able to read — these GETs are denied to a viewer, so either \
+         the route is misclassified or it belongs on the admin-only list: {denied:?}"
+    );
+}
+
+#[test]
+fn every_route_is_explicitly_classified() {
+    use faucet_cli::serve::rbac::required_permission;
+
+    let unmapped: Vec<String> = all_v1_routes()
+        .into_iter()
+        .filter(|(m, p)| required_permission(m, p).is_none())
+        .map(|(m, p)| format!("{m} {p}"))
+        .collect();
+    assert!(
+        unmapped.is_empty(),
+        "these routes fall through to the admin-only default. That is fail-closed, so \
+         nothing is exposed — but an unclassified route is an accident waiting to be \
+         reclassified wrongly. Add them to `required_permission`: {unmapped:?}"
+    );
+}
+
+#[test]
+fn an_operator_token_is_denied_the_audit_log_and_reload() {
+    use faucet_cli::serve::rbac::{Permission, Role};
+    assert!(!Role::Operator.grants(Permission::AuditRead));
+    assert!(!Role::Operator.grants(Permission::Reload));
+    assert!(Role::Admin.grants(Permission::AuditRead));
+    assert!(Role::Admin.grants(Permission::Reload));
+}
+
+#[test]
+fn an_admin_token_reaches_every_route() {
+    use faucet_cli::serve::rbac::{Role, required_permission};
+    for (method, path) in all_v1_routes() {
+        // An unmapped route is admin-only, so admin reaches it either way.
+        if let Some(p) = required_permission(&method, path) {
+            assert!(Role::Admin.grants(p), "admin denied {method} {path}");
+        }
+    }
+}
+
+#[test]
+fn the_token_trio_maps_each_token_to_its_role() {
+    use faucet_cli::serve::rbac::{RbacConfig, Role};
+
+    let cfg = RbacConfig::from_token_trio(Some("r"), Some("w"), Some("a"))
+        .expect("valid trio")
+        .expect("three tokens means an RBAC config");
+    assert_eq!(
+        cfg.authenticate("r").expect("read token").role,
+        Role::Viewer
+    );
+    assert_eq!(
+        cfg.authenticate("w").expect("write token").role,
+        Role::Operator
+    );
+    assert_eq!(
+        cfg.authenticate("a").expect("admin token").role,
+        Role::Admin
+    );
+    assert!(cfg.authenticate("nope").is_none());
+}
+
+#[test]
+fn a_partial_token_trio_is_allowed() {
+    use faucet_cli::serve::rbac::{RbacConfig, Role};
+    // A deployment that only hands out read + admin should not have to invent
+    // an operator token it will never use.
+    let cfg = RbacConfig::from_token_trio(Some("r"), None, Some("a"))
+        .expect("valid")
+        .expect("some");
+    assert_eq!(cfg.authenticate("r").expect("read").role, Role::Viewer);
+    assert_eq!(cfg.authenticate("a").expect("admin").role, Role::Admin);
+}
+
+#[test]
+fn no_trio_tokens_means_no_rbac_config() {
+    use faucet_cli::serve::rbac::RbacConfig;
+    assert!(
+        RbacConfig::from_token_trio(None, None, None)
+            .expect("no error")
+            .is_none(),
+        "with none of the three set the caller must fall through to the other auth modes"
+    );
+}
+
+#[test]
+fn the_trio_rejects_an_empty_or_reused_token() {
+    use faucet_cli::serve::rbac::RbacConfig;
+    let err = RbacConfig::from_token_trio(Some("  "), None, None).expect_err("empty token");
+    assert!(err.to_string().contains("read-token"), "{err}");
+
+    // The same token for two roles would make the role assignment depend on
+    // scan order — refused rather than silently resolved.
+    let err =
+        RbacConfig::from_token_trio(Some("same"), None, Some("same")).expect_err("reused token");
+    assert!(err.to_string().contains("reuses a token"), "{err}");
 }

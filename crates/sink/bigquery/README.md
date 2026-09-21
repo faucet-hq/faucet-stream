@@ -11,7 +11,7 @@ Reach for it when you want to land events, CDC streams, or query results into a 
 
 ## Feature highlights
 
-- **Streaming inserts** — high-throughput `tabledata.insertAll`; each batch is re-chunked to BigQuery's ~10 MB / ~500-row sweet spot.
+- **Bucket-free bulk load (default)** — appends and overwrites stream into a single resumable BigQuery load job (gzip-compressed newline-delimited JSON, no GCS bucket), so a run costs one job rather than one per page. Set `media_load: false` for the per-page `jobs.query` path, or `insert_id_field` for streaming `tabledata.insertAll`.
 - **Three credential modes** — Application Default Credentials, a service-account key file, or inline service-account JSON. The shared `BigQueryCredentials` enum is re-exported from [`faucet-common-bigquery`](https://crates.io/crates/faucet-common-bigquery) so it matches the BigQuery **source** byte-for-byte.
 - **Write modes** — `append` (default), `upsert`, and `delete` via an in-place `MERGE` over the target table; no staging table required.
 - **Effectively-once delivery** — pair with a CDC source for a multi-statement `MERGE`/`INSERT` transaction that commits records and a `_faucet_commit_token` watermark atomically.
@@ -85,8 +85,9 @@ When `create_table` is on and the table is missing (or exists without a schema),
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `batch_size` | int | `1000` | Maximum rows per `insertAll` request. **`0` = no batching**: the whole upstream page is sent in one call (use when the source already chunks to BigQuery's preferred size). See [Streaming & batching](#streaming--batching). |
-| `insert_id_field` | string | *(unset)* | Record field whose value is sent as the per-row streaming `insertId` for best-effort de-duplication on retry. See [Retry de-duplication](#retry-de-duplication). |
+| `media_load` | bool | `true` | Append and overwrite via one resumable **load job** instead of per-page requests. See [Streaming & batching](#streaming--batching). |
+| `batch_size` | int | `1000` | Rows per request on the per-page paths. **`0` = no batching**: the whole upstream page is sent in one call. Inert on the load path, which streams pages into one job. See [Streaming & batching](#streaming--batching). |
+| `insert_id_field` | string | *(unset)* | Record field whose value is sent as the per-row streaming `insertId` for best-effort de-duplication on retry. Setting it keeps appends on `insertAll`, since a load job cannot honour `insertId`. See [Retry de-duplication](#retry-de-duplication). |
 
 ### Write mode
 
@@ -94,7 +95,7 @@ These fields are flattened, so they appear at the sink `config` top level.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `write_mode` | enum | `append` | `append` (streaming `insertAll`), `upsert`, or `delete` (in-place `MERGE` / keyed `DELETE`). |
+| `write_mode` | enum | `append` | `append` (bulk load by default; `insertAll` when `media_load: false` or `insert_id_field` is set), `upsert`, or `delete` (in-place `MERGE` / keyed `DELETE`), or `overwrite` (full refresh). |
 | `key` | array | `[]` | Key column(s). **Required and non-empty** for `upsert`/`delete`; must be real columns of the target table. |
 | `delete_marker` | object | *(none)* | `upsert` only — `{ field: <name>, values: [<str>, …] }`; rows whose `field` matches one of `values` become deletes instead of upserts. |
 
@@ -204,7 +205,21 @@ See the full runnable config at [`cli/examples/postgres_cdc_to_bigquery_upsert.y
 
 ## Streaming & batching
 
-The BigQuery sink re-chunks each incoming `StreamPage` to keep individual `tabledata.insertAll` calls under BigQuery's limits. `write_batch` accepts whatever slice the pipeline hands it:
+### The default: one load job per run (`media_load: true`)
+
+Appends (and overwrites) stream each page into a **single resumable load job** — `multipart/related` uploads of gzip-compressed newline-delimited JSON, finalized on `flush`. No GCS bucket is involved (unlike the `arrow` `bulk_load` path), and no page is buffered past its chunk, so peak memory is O(chunk) regardless of table size.
+
+This is the default because the alternative is job-latency bound rather than volume bound: a ~59k-row overwrite at `batch_size: 1000` issued ~60 sequential query jobs and took 6m44s, and BigQuery's per-table load-job budget (1,500/day) is spent one job per *run* here instead of one per *page*.
+
+`batch_size` does not chunk the load — pages feed one stream. Three things opt out of it:
+
+- `media_load: false` — the per-page `jobs.query` `INSERT … SELECT` path.
+- `insert_id_field` — a load job cannot honour `insertId`, so asking for streaming de-duplication keeps appends on `insertAll` (logged at startup, never silent).
+- `write_mode: upsert` / `delete` and `delivery: exactly_once` — these commit a `MERGE` or a watermark in one transaction, which a load job cannot express, so they ignore `media_load` entirely.
+
+### Chunking on the per-page paths
+
+When one of the opt-outs above applies, the sink re-chunks each incoming `StreamPage` to keep individual requests under BigQuery's limits. `write_batch` accepts whatever slice the pipeline hands it:
 
 - **`batch_size > 0`** (default `1000`) — the sink slices the incoming slice into `batch_size`-row chunks and issues one `insertAll` HTTP call per chunk. **Recommended value is `500`**: the documented sweet spot for BigQuery streaming inserts — small enough to stay well under the ~10 MB request limit even for wide rows, large enough to amortise per-call overhead. Bump it higher when rows are narrow; drop it when rows are wide enough to push individual chunks past 10 MB.
 - **`batch_size = 0`** — the "no batching" sentinel. The entire upstream `StreamPage` is forwarded in a single `insertAll` call. Use this when the source already emits page sizes tuned for BigQuery (e.g. a Postgres source configured with `batch_size: 500`). Larger pages risk HTTP-413 from BigQuery's ~10 MB body limit.
@@ -213,7 +228,9 @@ The BigQuery sink re-chunks each incoming `StreamPage` to keep individual `table
 
 ### Retry de-duplication
 
-BigQuery streaming inserts are **at-least-once** — a transport retry can insert the same row twice. Setting `insert_id_field` to a stable per-row key (e.g. a primary key or event id) makes the sink send that value as the row's `insertId`, which BigQuery uses for best-effort de-duplication over a short window. When `insert_id_field` is unset, or a given row lacks the field, that row is inserted without an `insertId` (no dedup for it).
+BigQuery streaming inserts are **at-least-once** — a transport retry can insert the same row twice. Setting `insert_id_field` to a stable per-row key (e.g. a primary key or event id) makes the sink send that value as the row's `insertId`, which BigQuery uses for best-effort de-duplication over a short window. When a given row lacks the field, that row is inserted without an `insertId` (no dedup for it).
+
+Because only `insertAll` implements `insertId`, setting this field also **selects** the streaming path for appends — the default load job would accept the rows and silently drop the de-duplication. For a stronger guarantee than best-effort, use [effectively-once delivery](#effectively-once-delivery) or `write_mode: upsert` instead.
 
 ## Write modes (`upsert` / `delete`)
 
@@ -378,7 +395,7 @@ println!("Transferred {} records", result.records_written);
 ## How it works
 
 1. `new()` resolves `BigQueryCredentials` and builds an authenticated client **once**, validating credentials eagerly so failures surface immediately.
-2. `write_batch()` slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and sends each chunk as a separate `insertAll` request.
+2. `write_batch()` appends by feeding the page into the run's resumable load job (the default), finalized on `flush()`. With `media_load: false` it slices the input into `batch_size`-row chunks (or forwards the whole slice when `batch_size = 0`) and issues a `jobs.query` `INSERT … SELECT` per chunk; with `insert_id_field` set it issues an `insertAll` per chunk instead.
 3. Per-row errors in the BigQuery response are detected and reported. If any rows fail, the batch returns an error with details about the first failure; `write_batch_partial` exposes them per-row for DLQ routing.
 4. `write_mode: upsert`/`delete` and the effectively-once path build pure-SQL `MERGE` / `INSERT` statements and execute them via `jobs.query`, verifying success against the job's `errorResult`.
 5. The client is reused across all calls — no re-authentication per request.
@@ -451,12 +468,19 @@ sink:
 
 Full-refresh: each run atomically **replaces** the whole table — and it is
 **bucket-free** (no GCS staging bucket required, unlike the `bulk_load`
-`WRITE_TRUNCATE` path). The page is loaded into a `LIKE` temp table via the
-query API (not streaming `insertAll`), then swapped with a
+`WRITE_TRUNCATE` path). No `key` is needed; the target table must already exist.
+
+By default (`media_load: true`) a solo overwrite streams every page into **one
+`WRITE_TRUNCATE` load job**: no staging table and no swap, because such a load
+is atomic on its own — the target keeps its prior rows until the load succeeds.
+A *grouped* fan-out (several matrix rows writing one physical table) and a
+scoped overwrite still stage, since neither can be expressed as one truncate.
+
+With `media_load: false` the page is loaded into a `LIKE` temp table via the
+query API, then swapped with a
 `BEGIN TRANSACTION; TRUNCATE; INSERT … SELECT; COMMIT` that preserves the
 target's partitioning and clustering — only after the run succeeds, so a mid-run
-failure leaves the previous rows intact. No `key` is needed; the target table
-must already exist.
+failure leaves the previous rows intact.
 
 **Scoped / windowed overwrite (#518):** add a `scope: { window: { column, from, to } }`
 to replace only the rows in a half-open `[from, to)` window — the swap becomes

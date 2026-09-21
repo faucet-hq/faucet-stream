@@ -5,6 +5,54 @@ use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// On-the-wire format of files written by the SFTP sink (#604).
+///
+/// Only [`JsonLines`](Self::JsonLines) can be built a record at a time; every
+/// other format has a header, a wrapper, or a container index, so its records
+/// are buffered and encoded together at the rollover.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SftpSinkFormat {
+    /// Newline-delimited JSON — one JSON record per line (the default).
+    #[default]
+    JsonLines,
+    /// A single JSON array per file.
+    JsonArray,
+    /// Delimited text. Columns are the union of every record's keys; dialect
+    /// from `csv`. Requires `file-format-csv`.
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, one element per record. Framing from `xml`. Requires
+    /// `file-format-xml`.
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet name from `excel`. Requires
+    /// `file-format-excel`.
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl SftpSinkFormat {
+    /// The shared format this variant maps onto.
+    pub(crate) fn shared(self) -> faucet_core::FileFormat {
+        match self {
+            Self::JsonLines => faucet_core::FileFormat::JsonLines,
+            Self::JsonArray => faucet_core::FileFormat::JsonArray,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => faucet_core::FileFormat::Csv,
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => faucet_core::FileFormat::Xml,
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => faucet_core::FileFormat::Xlsx,
+        }
+    }
+
+    /// Whether a file of this format can be built one record at a time.
+    pub(crate) fn appends_per_record(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
+}
+
 /// Configuration for the SFTP sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SftpSinkConfig {
@@ -14,6 +62,9 @@ pub struct SftpSinkConfig {
     pub connection: SftpConnectionConfig,
     /// Remote directory prefix under which JSON Lines objects are written.
     pub path: String,
+    /// File format (default `json_lines`) (#604).
+    #[serde(default)]
+    pub format: SftpSinkFormat,
     /// File extension for written objects (default: `.jsonl`).
     #[serde(default = "default_file_extension")]
     pub file_extension: String,
@@ -23,6 +74,29 @@ pub struct SftpSinkConfig {
     /// object. Defaults to [`DEFAULT_BATCH_SIZE`].
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum records per file before rolling to a new one (#618). `None`
+    /// removes the record cap; the sink accumulates across `write_batch`
+    /// calls, so a small upstream page no longer means a small file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_records_per_file: Option<usize>,
+    /// Maximum **bytes** per file before rolling to a new one (#618).
+    ///
+    /// Rows are a poor proxy for file size, so a rows-only cap either writes
+    /// tiny files for narrow data or unbounded ones for wide data. This is
+    /// also what bounds peak memory: the open file's body is buffered until it
+    /// rolls. `None` (the default) removes the byte cap; a single record
+    /// larger than the cap still gets its own file rather than being split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<usize>,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet name, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_file_extension() -> String {
@@ -39,8 +113,48 @@ impl SftpSinkConfig {
         Self {
             connection,
             path: path.into(),
+            format: SftpSinkFormat::default(),
             file_extension: default_file_extension(),
             batch_size: DEFAULT_BATCH_SIZE,
+            max_records_per_file: None,
+            max_bytes_per_file: None,
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
+        }
+    }
+
+    /// Set the file format (#604).
+    pub fn format(mut self, format: SftpSinkFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Set the CSV dialect used when `format: csv` (#604).
+    pub fn csv(mut self, csv: faucet_core::CsvOptions) -> Self {
+        self.csv = csv;
+        self
+    }
+
+    /// Set the worksheet name used when `format: xlsx` (#604).
+    pub fn excel(mut self, excel: faucet_core::ExcelOptions) -> Self {
+        self.excel = excel;
+        self
+    }
+
+    /// Set the record framing used when `format: xml` (#604).
+    pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
+        self.xml = xml;
+        self
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::encode`] wants.
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
         }
     }
 
@@ -51,6 +165,18 @@ impl SftpSinkConfig {
     }
 
     /// Set the per-object record count.
+    pub fn max_records_per_file(mut self, n: usize) -> Self {
+        self.max_records_per_file = Some(n);
+        self
+    }
+
+    /// Set the per-file byte cap (#618).
+    pub fn max_bytes_per_file(mut self, n: usize) -> Self {
+        self.max_bytes_per_file = Some(n);
+        self
+    }
+
+    /// Set the per-call record chunk size.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
@@ -95,5 +221,91 @@ mod tests {
     fn batch_size_zero_is_valid_sentinel() {
         let cfg = SftpSinkConfig::new(conn(), "/o").with_batch_size(0);
         assert!(faucet_core::validate_batch_size(cfg.batch_size).is_ok());
+    }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Only JSON Lines can be appended a record at a time. That predicate
+    /// routes a write between the streaming byte accumulator and the buffered
+    /// record one, so a wrong answer silently changes how objects are built.
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(SftpSinkFormat::JsonLines.appends_per_record());
+        assert!(!SftpSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(SftpSinkFormat::default(), SftpSinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!SftpSinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!SftpSinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!SftpSinkFormat::Xlsx.appends_per_record());
+    }
+
+    /// Every variant maps onto exactly one shared format, so what this sink
+    /// writes is what the file sources read back.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            SftpSinkFormat::JsonLines.shared(),
+            faucet_core::FileFormat::JsonLines
+        );
+        assert_eq!(
+            SftpSinkFormat::JsonArray.shared(),
+            faucet_core::FileFormat::JsonArray
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(SftpSinkFormat::Csv.shared(), faucet_core::FileFormat::Csv);
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(SftpSinkFormat::Xml.shared(), faucet_core::FileFormat::Xml);
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(SftpSinkFormat::Xlsx.shared(), faucet_core::FileFormat::Xlsx);
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = SftpSinkConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/p")
+            .format(SftpSinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, SftpSinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
+    }
+
+    /// Both rollover caps are opt-in and independent (#618): setting one must
+    /// not disturb the other, or an operator asking for a byte cap silently
+    /// gets a record cap too.
+    #[test]
+    fn the_rollover_caps_are_independent_and_default_to_unset() {
+        let base = SftpSinkConfig::new(conn(), "/out");
+        assert_eq!(base.max_records_per_file, None);
+        assert_eq!(base.max_bytes_per_file, None);
+
+        let records_only = SftpSinkConfig::new(conn(), "/out").max_records_per_file(10);
+        assert_eq!(records_only.max_records_per_file, Some(10));
+        assert_eq!(records_only.max_bytes_per_file, None);
+
+        let both = SftpSinkConfig::new(conn(), "/out")
+            .max_records_per_file(10)
+            .max_bytes_per_file(4096)
+            .file_extension(".csv");
+        assert_eq!(both.max_records_per_file, Some(10));
+        assert_eq!(both.max_bytes_per_file, Some(4096));
+        assert_eq!(both.file_extension, ".csv");
     }
 }

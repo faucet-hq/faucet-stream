@@ -400,6 +400,19 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [State & effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) — resumable and effectively-once runs.
 - [`faucet-source-mysql`](https://crates.io/crates/faucet-source-mysql) · [`faucet-source-mysql-cdc`](https://crates.io/crates/faucet-source-mysql-cdc) — the MySQL query and CDC sources.
 
+
+## Auto-create (`create_table`)
+
+`create_table` (**default `true`**, #580) creates the target table from the
+first written page's inferred columns when it does not exist — a first-ever
+sync cannot assume the destination is already there. Every inferred column is
+created **nullable**: a column present in page 1 is not required forever, and a
+`NOT NULL` inferred from one page fails page 2 the first time a record omits
+the field (narrowing later is the `schema:` drift policy's job).
+
+Set `create_table: false` to require a pre-existing target; a missing one then
+fails fast with the same error every table sink raises, naming both ways out.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

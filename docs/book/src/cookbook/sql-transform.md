@@ -257,7 +257,7 @@ pipeline:
     type: csv
     config:
       path: cli/examples/data/orders.csv
-      has_header: true
+      has_headers: true
       batch_size: 0          # whole file as one page → global GROUP BY
 
   transforms:

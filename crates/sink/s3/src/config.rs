@@ -19,10 +19,54 @@ pub enum S3SinkFormat {
     /// (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     Parquet,
+    /// A single JSON array per object.
+    JsonArray,
+    /// Delimited text. Columns are the union of every record's keys; dialect
+    /// from [`csv`](S3SinkConfig::csv). Requires `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, one element per record. Framing from
+    /// [`xml`](S3SinkConfig::xml). Requires `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet name from [`excel`](S3SinkConfig::excel).
+    /// Requires `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl S3SinkFormat {
+    /// The shared format this variant maps onto, or `None` for Parquet, which
+    /// is columnar and has its own Arrow writer.
+    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            #[cfg(feature = "arrow")]
+            Self::Parquet => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
+
+    /// Whether an object of this format can be built one record at a time.
+    ///
+    /// Only JSON Lines can: every other format has a header, a wrapper, or a
+    /// container index, so its records must be buffered and encoded together.
+    /// This is what decides between the byte accumulator (streaming, multipart)
+    /// and the record accumulator (buffered, single `put_object`).
+    pub(crate) fn appends_per_record(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
 }
 
 /// Configuration for the S3 sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct S3SinkConfig {
     /// S3 bucket name.
     pub bucket: String,
@@ -39,11 +83,27 @@ pub struct S3SinkConfig {
     pub endpoint_url: Option<String>,
     /// File extension for written objects (default: `.jsonl`).
     pub file_extension: String,
-    /// Maximum records per file. `None` removes the per-file record cap — but
-    /// the sink still writes **one object per `write_batch` call** (i.e. one per
-    /// upstream page), and `batch_size` may chunk a call further; it does not
-    /// coalesce a streaming run into a single object.
+    /// Maximum records per object. Since #618 the sink **accumulates across
+    /// `write_batch` calls** and rolls to a new object when this (or
+    /// [`max_bytes_per_file`](Self::max_bytes_per_file)) is reached, so a
+    /// small upstream page no longer means a small object. `None` removes the
+    /// record cap; with neither cap set the whole run lands in one object,
+    /// closed at `flush`.
     pub max_records_per_file: Option<usize>,
+    /// Maximum **bytes** per object before rolling to a new one (#618).
+    ///
+    /// Rows are a poor proxy for object size — 10k wide rows and 10k
+    /// `{"id":1}` rows differ by orders of magnitude — so a rows-only cap
+    /// either writes tiny objects for narrow data or unbounded ones for wide
+    /// data. This is also what bounds peak memory: the open object's body is
+    /// buffered until it rolls. Counted on the **uncompressed** body, before
+    /// any `compression` codec, so the threshold means the same thing whatever
+    /// the codec. `None` (the default) removes the byte cap.
+    ///
+    /// A single record larger than the cap still gets its own object rather
+    /// than being split (which would corrupt it) or dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<usize>,
     /// Maximum number of concurrent file uploads (default: 10).
     pub concurrency: usize,
     /// Records per S3 object written by a single
@@ -73,6 +133,15 @@ pub struct S3SinkConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet name, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_batch_size() -> usize {
@@ -80,6 +149,16 @@ fn default_batch_size() -> usize {
 }
 
 impl S3SinkConfig {
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::encode`] wants.
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
+        }
+    }
+
     /// Create a new config with the required bucket name and sensible defaults.
     pub fn new(bucket: impl Into<String>) -> Self {
         Self {
@@ -90,10 +169,14 @@ impl S3SinkConfig {
             endpoint_url: None,
             file_extension: ".jsonl".to_string(),
             max_records_per_file: None,
+            max_bytes_per_file: None,
             concurrency: 10,
             batch_size: DEFAULT_BATCH_SIZE,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::Auto,
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
         }
     }
 
@@ -107,6 +190,24 @@ impl S3SinkConfig {
     /// `parquet`).
     pub fn format(mut self, format: S3SinkFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Set the CSV dialect used when `format: csv` (#604).
+    pub fn csv(mut self, csv: faucet_core::CsvOptions) -> Self {
+        self.csv = csv;
+        self
+    }
+
+    /// Set the worksheet name used when `format: xlsx` (#604).
+    pub fn excel(mut self, excel: faucet_core::ExcelOptions) -> Self {
+        self.excel = excel;
+        self
+    }
+
+    /// Set the record framing used when `format: xml` (#604).
+    pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
+        self.xml = xml;
         self
     }
 
@@ -128,7 +229,30 @@ impl S3SinkConfig {
         self
     }
 
-    /// Set the maximum number of records per file.
+    /// The effective per-object record cap, combining `batch_size` (write-side
+    /// re-chunking) and `max_records_per_file`. `None` means "no record cap".
+    ///
+    /// Lives on the config rather than the sink because the cross-page
+    /// accumulator (#618) needs it at construction time, and the Parquet path
+    /// needs the same number — two definitions would be one drift away from
+    /// objects of different sizes depending on the format.
+    pub fn effective_chunk_cap(&self) -> Option<usize> {
+        match (self.batch_size, self.max_records_per_file) {
+            (0, None) => None,
+            (0, Some(0)) => None,
+            (0, Some(max)) => Some(max),
+            (bs, None) => Some(bs),
+            (bs, Some(0)) => Some(bs),
+            (bs, Some(max)) => Some(bs.min(max)),
+        }
+    }
+
+    pub fn max_bytes_per_file(mut self, max: usize) -> Self {
+        self.max_bytes_per_file = Some(max);
+        self
+    }
+
+    /// Set the per-object record cap.
     pub fn max_records_per_file(mut self, max: usize) -> Self {
         self.max_records_per_file = Some(max);
         self
@@ -305,5 +429,106 @@ mod tests {
     fn compression_default_is_auto() {
         let cfg = S3SinkConfig::new("bucket");
         assert_eq!(cfg.compression, faucet_core::CompressionConfig::Auto);
+    }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Only JSON Lines can be appended a record at a time. That predicate
+    /// routes a write between the streaming byte accumulator and the buffered
+    /// record one, so a wrong answer silently changes how objects are built.
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(S3SinkFormat::JsonLines.appends_per_record());
+        assert!(!S3SinkFormat::JsonArray.appends_per_record());
+        assert_eq!(S3SinkFormat::default(), S3SinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!S3SinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!S3SinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!S3SinkFormat::Xlsx.appends_per_record());
+    }
+
+    /// Every variant maps onto exactly one shared format, so what this sink
+    /// writes is what the file sources read back.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            S3SinkFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            S3SinkFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(
+            S3SinkFormat::Csv.shared(),
+            Some(faucet_core::FileFormat::Csv)
+        );
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(
+            S3SinkFormat::Xml.shared(),
+            Some(faucet_core::FileFormat::Xml)
+        );
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            S3SinkFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+        // Parquet is the one variant that is NOT the shared encoder's: it has
+        // its own Arrow writer, and routing it through `encode` would produce
+        // a JSON body under a `.parquet` key.
+        #[cfg(feature = "arrow")]
+        assert_eq!(S3SinkFormat::Parquet.shared(), None);
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = S3SinkConfig::new("b")
+            .format(S3SinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, S3SinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
+    }
+
+    /// `effective_chunk_cap` resolves `batch_size` against
+    /// `max_records_per_file`; `0` means "no limit on this axis" on both, so
+    /// the four combinations are genuinely different answers and a wrong one
+    /// silently changes object size.
+    #[test]
+    fn the_effective_chunk_cap_covers_the_whole_lattice() {
+        let base = S3SinkConfig::new("b");
+        let with = |bs: usize, max: Option<usize>| {
+            let mut c = base.clone();
+            c.batch_size = bs;
+            c.max_records_per_file = max;
+            c.effective_chunk_cap()
+        };
+        assert_eq!(with(0, None), None, "neither axis caps: one object");
+        assert_eq!(with(0, Some(0)), None, "an explicit zero cap is no cap");
+        assert_eq!(with(0, Some(500)), Some(500), "the record cap alone");
+        assert_eq!(with(100, None), Some(100), "batch_size alone");
+        assert_eq!(with(100, Some(0)), Some(100), "a zero record cap defers");
+        // Both are caps, so the tighter one binds — in either direction.
+        assert_eq!(with(100, Some(500)), Some(100));
+        assert_eq!(with(500, Some(100)), Some(100));
     }
 }

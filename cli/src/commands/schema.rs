@@ -30,6 +30,8 @@ pub fn schema_targets() -> Vec<&'static str> {
     #[cfg(feature = "masking")]
     targets.push("masking");
     targets.push("test");
+    #[cfg(feature = "templates")]
+    targets.push("template-test");
     targets.push("secrets");
     #[cfg(feature = "schedule")]
     targets.push("schedule");
@@ -138,6 +140,11 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
             let s = faucet_core::schema_for!(crate::pipeline_test::spec::TestSpecFile);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
         }
+        #[cfg(feature = "templates")]
+        SchemaTarget::TemplateTest => serde_json::to_value(faucet_core::schema_for!(
+            crate::templates::suite::spec::SuiteFile
+        ))
+        .expect("schema serialization"),
         #[cfg(feature = "notify")]
         SchemaTarget::Notifications => {
             // The `notifications:` block is a list; emit the per-rule schema.
@@ -304,5 +311,21 @@ mod tests {
         let out = serde_json::to_string(&schema).expect("resilience schema serializes");
         assert!(out.contains("max_attempts"), "{out}");
         assert!(out.contains("circuit_breaker"), "{out}");
+    }
+
+    /// `faucet schema template-test` is the only way to discover the suite
+    /// file's grammar, so the target must actually resolve to a schema rather
+    /// than falling through the dispatch match.
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn schema_template_test_target_renders() {
+        let r = super::run(SchemaArgs {
+            target: Some(SchemaTarget::TemplateTest),
+            list: false,
+        })
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+        // The target must also be discoverable from `--list`.
+        assert!(super::schema_targets().contains(&"template-test"));
     }
 }

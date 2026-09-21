@@ -545,7 +545,7 @@ impl SpannerSink {
 
     /// Cached metadata, fetched on first use. Errors when the table is absent
     /// — every caller here is a write path that requires it.
-    async fn require_meta(&self) -> Result<Arc<TableMeta>, FaucetError> {
+    async fn require_meta(&self, records: &[Value]) -> Result<Arc<TableMeta>, FaucetError> {
         if let Some(meta) = self.meta.read().await.as_ref() {
             return Ok(Arc::clone(meta));
         }
@@ -554,13 +554,19 @@ impl SpannerSink {
         if let Some(meta) = slot.as_ref() {
             return Ok(Arc::clone(meta));
         }
-        let fetched = self.fetch_meta().await?.ok_or_else(|| {
-            FaucetError::Sink(format!(
-                "spanner table `{}` does not exist in {}",
-                self.config.table_name,
-                self.config.connection.database_path()
-            ))
-        })?;
+        let fetched = match self.fetch_meta().await? {
+            Some(m) => m,
+            None => {
+                self.create_target(records).await?;
+                self.fetch_meta().await?.ok_or_else(|| {
+                    FaucetError::Sink(format!(
+                        "spanner table `{}` does not exist in {} even after CREATE TABLE",
+                        self.config.table_name,
+                        self.config.connection.database_path()
+                    ))
+                })?
+            }
+        };
         let arc = Arc::new(fetched);
         *slot = Some(Arc::clone(&arc));
         Ok(arc)
@@ -615,6 +621,68 @@ impl SpannerSink {
         Ok((planned, count))
     }
 
+    /// Create the target table from the first page (#580).
+    ///
+    /// Spanner requires a primary key on every table and faucet has no basis
+    /// to invent one, so this needs `key:` — which `write_mode: upsert`/
+    /// `delete` already require and which Spanner requires to equal the PK.
+    /// Without it, a made-up key column would be worse than a clear error:
+    /// it becomes the table's physical layout and cannot be changed later.
+    async fn create_target(&self, records: &[Value]) -> Result<(), FaucetError> {
+        if !self.config.create_table {
+            return Err(faucet_core::missing_target_error(
+                "spanner sink",
+                &self.config.table_name,
+            ));
+        }
+        let key = &self.config.write.key;
+        if key.is_empty() {
+            return Err(FaucetError::Sink(format!(
+                "spanner sink: table `{}` does not exist and cannot be auto-created without \
+                 `key:` — Spanner requires a primary key on every table, and inventing one \
+                 would bake a wrong physical layout in permanently. Set `key:` to the \
+                 intended primary-key column(s), or create the table yourself and set \
+                 `create_table: false`.",
+                self.config.table_name
+            )));
+        }
+        let Some(columns) = faucet_core::plan_columns(records) else {
+            return Err(FaucetError::Sink(format!(
+                "spanner sink: table `{}` does not exist and the first page carried no \
+                 inferable columns to create it from",
+                self.config.table_name
+            )));
+        };
+        for k in key {
+            if !columns.iter().any(|c| &c.name == k) {
+                return Err(FaucetError::Sink(format!(
+                    "spanner sink: key column `{k}` is not present in the first page, so the \
+                     auto-created table would have a primary key no record can fill"
+                )));
+            }
+        }
+        // Key columns must be NOT NULL — Spanner rejects a null in a primary
+        // key, so a nullable key column would fail every write.
+        let cols: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                let null = if key.iter().any(|k| k == &c.name) {
+                    " NOT NULL"
+                } else {
+                    ""
+                };
+                format!("{} STRING(MAX){null}", quote_ident_spanner(&c.name))
+            })
+            .collect();
+        let pk: Vec<String> = key.iter().map(|k| quote_ident_spanner(k)).collect();
+        let ddl = format!(
+            "CREATE TABLE {} ({}) PRIMARY KEY ({})",
+            quote_ident_spanner(&self.config.table_name),
+            cols.join(", "),
+            pk.join(", ")
+        );
+        self.run_ddl(vec![ddl]).await
+    }
     /// Run DDL statements through the admin API, bounded by
     /// `ddl_timeout_secs`.
     async fn run_ddl(&self, statements: Vec<String>) -> Result<(), FaucetError> {
@@ -675,7 +743,7 @@ impl SpannerSink {
                 "spanner cleanup requires a non-empty `key`".to_string(),
             ));
         }
-        let meta = self.require_meta().await?;
+        let meta = self.require_meta(&[]).await?;
         // The delete is by primary key, so the same PK-equality rule the
         // upsert/delete write path enforces applies here.
         validate_key_matches_pk(key, &meta.pk, table)?;
@@ -900,7 +968,7 @@ impl faucet_core::Sink for SpannerSink {
         let meta = if evolution.widenings.is_empty() && evolution.relax_nullability.is_empty() {
             None
         } else {
-            Some(self.require_meta().await?)
+            Some(self.require_meta(&[]).await?)
         };
         for c in &evolution.widenings {
             let from_base = c.from.as_ref().and_then(faucet_core::json_schema_base_type);
@@ -1036,7 +1104,7 @@ impl faucet_core::Sink for SpannerSink {
         if records.is_empty() {
             return Ok(0);
         }
-        let meta = self.require_meta().await?;
+        let meta = self.require_meta(records).await?;
         let (planned, count) = self.plan_page(records, &meta)?;
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
@@ -1067,7 +1135,7 @@ impl faucet_core::Sink for SpannerSink {
             return Ok(records.iter().map(|_| Ok(())).collect());
         }
 
-        let meta = self.require_meta().await?;
+        let meta = self.require_meta(records).await?;
         validate_key_matches_pk(&self.config.write.key, &meta.pk, &self.config.table_name)?;
         let plan = faucet_core::plan_writes(records, &self.config.write);
 
@@ -1164,7 +1232,7 @@ impl faucet_core::Sink for SpannerSink {
         token: &str,
     ) -> Result<usize, FaucetError> {
         self.ensure_token_table().await?;
-        let meta = self.require_meta().await?;
+        let meta = self.require_meta(records).await?;
         // Plan before the transaction so planning failures abort cleanly.
         let (planned, count) = self.plan_page(records, &meta)?;
 

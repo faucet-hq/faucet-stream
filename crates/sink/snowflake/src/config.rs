@@ -12,6 +12,7 @@ pub use faucet_common_snowflake::SnowflakeAuth;
 
 /// Configuration for the Snowflake sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SnowflakeSinkConfig {
     /// Snowflake account identifier (e.g. `"xy12345.us-east-1"`).
     pub account: String,
@@ -23,6 +24,40 @@ pub struct SnowflakeSinkConfig {
     pub schema: String,
     /// Target table name.
     pub table: String,
+    /// Create the target table if it does not exist, inferring the column
+    /// **names** from the first written page (#580). Enabled by default: a
+    /// first-ever sync cannot assume the destination already exists.
+    ///
+    /// Columns are created as nullable `STRING`, not as inferred types,
+    /// because the insert path projects every value with `::string` — a
+    /// `NUMBER` column would reject its own writer's cast. Define the table
+    /// yourself and set `create_table: false` when you want typed columns
+    /// (then use `schema:` drift to keep them aligned).
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
+    /// Commit-group size for the cross-page accumulator (#617).
+    ///
+    /// Warehouse loads are dominated by per-operation overhead, and
+    /// `batch_size` can only ever *split* a page — it can never merge
+    /// undersized ones, so a small source page meant one expensive warehouse
+    /// operation per small page. Records now accumulate across `write_batch`
+    /// calls and commit once per threshold, plus once at `flush`.
+    ///
+    /// `None` (the default) accumulates the **whole run** into one commit.
+    /// Set it to bound how much is buffered, or to commit progressively on a
+    /// long run. `0` means the same as `None`.
+    ///
+    /// Only the append path accumulates: `delivery: exactly_once` and the DLQ
+    /// path commit per page, because a watermark must land with its own page
+    /// and a DLQ must report which rows of *this* page failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_rows: Option<usize>,
+    /// Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)
+    /// (#617). Rows are a poor proxy for how much work a warehouse commit is;
+    /// this bounds the buffered size. `None` (the default) removes the byte
+    /// threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_bytes: Option<usize>,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
     /// A shared provider must yield a `Bearer` or `Token` credential, which
@@ -74,6 +109,7 @@ pub struct SnowflakeSinkConfig {
 /// cloud location as `url`; the sink uploads Parquet files to `url` (via
 /// `object_store`) and then references them as `@stage/<file>` in `COPY INTO`.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SnowflakeStageConfig {
     /// Named **external** stage in Snowflake — `MY_DB.MY_SCHEMA.MY_STAGE` or a
     /// schema-relative `MY_STAGE`. Must already exist and reference `url`.
@@ -131,6 +167,10 @@ fn default_poll_timeout() -> Duration {
     Duration::from_secs(300)
 }
 
+fn default_create_table() -> bool {
+    true
+}
+
 impl SnowflakeSinkConfig {
     /// Create a new config with required fields and sensible defaults.
     pub fn new(
@@ -147,11 +187,20 @@ impl SnowflakeSinkConfig {
             database: database.into(),
             schema: schema.into(),
             table: table.into(),
+            create_table: default_create_table(),
+            commit_rows: None,
+            commit_bytes: None,
             auth: AuthSpec::Inline(auth),
             batch_size: DEFAULT_BATCH_SIZE,
             poll_timeout: default_poll_timeout(),
             bulk_load: None,
         }
+    }
+
+    /// Opt out of auto-creating a missing target table (#580).
+    pub fn with_create_table(mut self, create: bool) -> Self {
+        self.create_table = create;
+        self
     }
 
     /// Enable Arrow columnar bulk-load via an external Parquet stage (#381).

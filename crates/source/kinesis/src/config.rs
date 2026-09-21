@@ -49,6 +49,7 @@ pub enum ValueFormat {
 
 /// Configuration for [`KinesisSource`](crate::KinesisSource).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KinesisSourceConfig {
     /// Kinesis Data Stream name.
     pub stream_name: String,

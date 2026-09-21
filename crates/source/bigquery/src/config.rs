@@ -31,6 +31,7 @@ fn default_batch_size() -> usize {
 
 /// Configuration for the BigQuery query source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BigQuerySourceConfig {
     /// GCP project ID against which the query is billed and run.
     pub project_id: String,
@@ -127,6 +128,24 @@ pub struct BigQuerySourceConfig {
     /// sequentially.
     #[serde(default = "default_max_streams")]
     pub max_streams: i32,
+    /// How many Storage Read streams to consume concurrently (#621).
+    ///
+    /// `max_streams` asks BigQuery to shard the table; this says how many of
+    /// those shards to read at once. Consuming them one at a time made the
+    /// request pointless — the read stayed as slow as a single stream.
+    /// Defaults to `4`; `0` and `1` both mean sequential.
+    ///
+    /// Batches from different streams **interleave**. The Storage Read API
+    /// gives no ordering guarantee across streams — that is what sharding
+    /// means — so this costs nothing a caller could have relied on. Each
+    /// in-flight stream carries its own decode buffer, so this is also the
+    /// memory knob.
+    #[serde(default = "default_stream_concurrency")]
+    pub stream_concurrency: usize,
+}
+
+fn default_stream_concurrency() -> usize {
+    4
 }
 
 fn default_max_streams() -> i32 {
@@ -151,6 +170,7 @@ impl std::fmt::Debug for BigQuerySourceConfig {
             .field("row_restriction", &self.row_restriction)
             .field("selected_fields", &self.selected_fields)
             .field("max_streams", &self.max_streams)
+            .field("stream_concurrency", &self.stream_concurrency)
             .finish()
     }
 }
@@ -178,6 +198,7 @@ impl BigQuerySourceConfig {
             row_restriction: None,
             selected_fields: Vec::new(),
             max_streams: default_max_streams(),
+            stream_concurrency: default_stream_concurrency(),
         }
     }
 

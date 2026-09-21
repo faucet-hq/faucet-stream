@@ -16,6 +16,10 @@
 #
 #   faucet validate cli/examples/rest_to_jsonl_templated.yaml
 #
+# Sweep its whole parameter space in CI — no registry, no network:
+#
+#   faucet template test cli/examples/tests/template_suite.yaml
+#
 # Or register it **once** and trigger by id thereafter — the register-once /
 # trigger-by-id model. The registry rides the run-history backends, so point
 # `faucet serve --history` at the same URL to trigger the very same template
@@ -69,6 +73,17 @@ params:
     default: 500
     description: Records per page
 
+  # A closed `values:` set turns the param into an *enumerable axis*: anything
+  # outside the set is rejected at bind time (naming the allowed values), and a
+  # `faucet template test` suite's `auto.enum_coverage` derives one case per
+  # value — so "does this template still work for every region it advertises?"
+  # is answered by the suite rather than by hand.
+  region:
+    type: string
+    default: us
+    values: [us, eu, apac]
+    description: API region to read from
+
   # `secret: true` registers the value for redaction the moment it is bound, so
   # it never reaches a log line, an error message, an API response, or the audit
   # log. It is never persisted with the template either — only the token
@@ -83,7 +98,7 @@ pipeline:
   source:
     type: rest
     config:
-      base_url: "https://api.example.com"
+      base_url: "https://${param.region}.api.example.com"
       path: "/tenants/${param.tenant_id}/events"
       query_params:
         since: "${param.since}"

@@ -14,6 +14,22 @@ pub struct SpannerSinkConfig {
     pub connection: SpannerConnection,
     /// Target table name.
     pub table_name: String,
+    /// Create the target table if it does not exist, inferring the columns
+    /// from the first written page (#580). Enabled by default: a first-ever
+    /// sync cannot assume the destination already exists.
+    ///
+    /// **Spanner needs a primary key on every table**, and faucet has no basis
+    /// to invent one — so auto-create applies only when `key:` is set (which
+    /// `write_mode: upsert`/`delete` already require, and which Spanner
+    /// requires to equal the PK). Without a `key`, a missing table is an error
+    /// naming that requirement rather than a table with a made-up key column.
+    ///
+    /// Inferred columns are `STRING(MAX)` apart from the key columns, because
+    /// the writer serialises values through the shared JSON→mutation encoder;
+    /// define the table yourself and set `create_table: false` for typed
+    /// columns.
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
     /// Maximum rows per Spanner commit. Defaults to [`DEFAULT_BATCH_SIZE`].
     ///
     /// Each chunk is applied as one atomic commit. Spanner additionally caps
@@ -44,6 +60,10 @@ fn default_ddl_timeout_secs() -> u64 {
     300
 }
 
+fn default_create_table() -> bool {
+    true
+}
+
 impl SpannerSinkConfig {
     /// Create a new config with required fields and sensible defaults.
     pub fn new(
@@ -62,10 +82,17 @@ impl SpannerSinkConfig {
                 emulator_host: None,
             },
             table_name: table_name.into(),
+            create_table: default_create_table(),
             batch_size: DEFAULT_BATCH_SIZE,
             ddl_timeout_secs: default_ddl_timeout_secs(),
             write: faucet_core::WriteSpec::default(),
         }
+    }
+
+    /// Opt out of auto-creating a missing target table (#580).
+    pub fn with_create_table(mut self, create: bool) -> Self {
+        self.create_table = create;
+        self
     }
 
     /// Set the per-commit row count. Pass `0` to opt out of row-count
@@ -193,5 +220,18 @@ mod tests {
         };
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("TOPSECRET"));
+    }
+
+    /// `create_table` defaults on since #580; this is the opt-out that
+    /// selects the refusal path the integration tests assert against.
+    #[test]
+    fn create_table_can_be_turned_off() {
+        let cfg = SpannerSinkConfig::new("p", "i", "d", "t");
+        assert!(cfg.create_table, "auto-create is the default (#580)");
+        assert!(
+            !SpannerSinkConfig::new("p", "i", "d", "t")
+                .with_create_table(false)
+                .create_table
+        );
     }
 }

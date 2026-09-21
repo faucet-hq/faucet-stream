@@ -34,6 +34,7 @@ pub fn request_fingerprint(
     config_fingerprint: &str,
     clock: Option<&str>,
     timeout_secs: Option<u64>,
+    concurrency: Option<usize>,
     labels: &std::collections::BTreeMap<String, String>,
 ) -> String {
     let mut hasher = Sha256::new();
@@ -44,6 +45,16 @@ pub fn request_fingerprint(
     hasher.update(
         timeout_secs
             .map(|t| t.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update([0u8]);
+    // A key replayed with a different concurrency override is a different run
+    // (it would hit the upstream with a different pool size), so it must be a
+    // 409 rather than a silent replay of the original (#610).
+    hasher.update(
+        concurrency
+            .map(|c| c.to_string())
             .unwrap_or_default()
             .as_bytes(),
     );
@@ -126,24 +137,43 @@ mod tests {
         use std::collections::BTreeMap;
         let cfg_fp = fingerprint(&json!({ "a": 1 }), Some("p"));
         let empty = BTreeMap::new();
-        let base = request_fingerprint(&cfg_fp, None, None, &empty);
+        let base = request_fingerprint(&cfg_fp, None, None, None, &empty);
 
         // Same inputs → same fingerprint.
-        assert_eq!(base, request_fingerprint(&cfg_fp, None, None, &empty));
+        assert_eq!(base, request_fingerprint(&cfg_fp, None, None, None, &empty));
         // A different clock (backfill window) must change it (#146 M7).
         assert_ne!(
             base,
-            request_fingerprint(&cfg_fp, Some("2026-01-01T00:00:00Z"), None, &empty)
+            request_fingerprint(&cfg_fp, Some("2026-01-01T00:00:00Z"), None, None, &empty)
         );
         // timeout_secs is run-affecting.
-        assert_ne!(base, request_fingerprint(&cfg_fp, None, Some(30), &empty));
+        assert_ne!(
+            base,
+            request_fingerprint(&cfg_fp, None, Some(30), None, &empty)
+        );
         // labels are part of the request identity.
         let mut labels = BTreeMap::new();
         labels.insert("env".to_string(), "prod".to_string());
-        assert_ne!(base, request_fingerprint(&cfg_fp, None, None, &labels));
+        assert_ne!(
+            base,
+            request_fingerprint(&cfg_fp, None, None, None, &labels)
+        );
+        // A different concurrency override is a different run — it hits the
+        // upstream with a different pool size (#610).
+        assert_ne!(
+            base,
+            request_fingerprint(&cfg_fp, None, None, Some(8), &empty)
+        );
+        assert_ne!(
+            request_fingerprint(&cfg_fp, None, None, Some(8), &empty),
+            request_fingerprint(&cfg_fp, None, None, Some(4), &empty)
+        );
         // A different config fingerprint still changes the result.
         let other_cfg = fingerprint(&json!({ "a": 2 }), Some("p"));
-        assert_ne!(base, request_fingerprint(&other_cfg, None, None, &empty));
+        assert_ne!(
+            base,
+            request_fingerprint(&other_cfg, None, None, None, &empty)
+        );
     }
 
     #[test]
@@ -155,8 +185,8 @@ mod tests {
         let mut b = BTreeMap::new();
         b.insert("k".to_string(), "v2".to_string());
         assert_ne!(
-            request_fingerprint(&cfg_fp, None, None, &a),
-            request_fingerprint(&cfg_fp, None, None, &b)
+            request_fingerprint(&cfg_fp, None, None, None, &a),
+            request_fingerprint(&cfg_fp, None, None, None, &b)
         );
     }
 }

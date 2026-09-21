@@ -19,6 +19,41 @@ pub(crate) fn qualified_table_ref(schema: Option<&str>, table: &str) -> String {
     }
 }
 
+/// Map a [`faucet_core::SqlBaseType`] to the Redshift column type used when
+/// auto-creating a table (#580).
+///
+/// Redshift has no JSON column type, so nested values land in `VARCHAR(MAX)`
+/// — the same text the writer already serialises them to. Integers widen to
+/// `BIGINT` and floats to `DOUBLE PRECISION` so a later, wider value never
+/// overflows a narrower column.
+pub(crate) fn redshift_type(t: faucet_core::SqlBaseType) -> &'static str {
+    use faucet_core::SqlBaseType::*;
+    match t {
+        Integer => "BIGINT",
+        Double => "DOUBLE PRECISION",
+        Boolean => "BOOLEAN",
+        // `VARCHAR(65535)` rather than Redshift's `VARCHAR(MAX)` alias: they
+        // mean the same thing on Redshift, and the explicit width is also
+        // valid standard SQL — which is what lets the integration suite
+        // exercise this DDL against a Postgres stand-in rather than skipping
+        // it (there is no Redshift container).
+        Text | Json => "VARCHAR(65535)",
+    }
+}
+
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+///
+/// No DISTKEY or SORTKEY: faucet has no basis to choose either, and the wrong
+/// choice is baked into the table and has to be migrated out. An operator who
+/// cares defines the table and sets `create_table: false`.
+pub(crate) fn build_create_table_sql(
+    table_ref: &str,
+    columns: &[faucet_core::PlannedColumn],
+) -> String {
+    let cols = faucet_core::render_columns(columns, quote_ident, redshift_type);
+    format!("CREATE TABLE IF NOT EXISTS {table_ref} ({cols})")
+}
+
 /// Render a value as a single-quoted SQL string literal, doubling interior
 /// single quotes so it is injection-safe.
 pub(crate) fn sql_string_literal(s: &str) -> String {
@@ -340,5 +375,32 @@ mod tests {
     #[test]
     fn serialize_csv_rejects_non_object() {
         assert!(serialize_csv(&[json!(5)], &["a".to_string()]).is_err());
+    }
+
+    #[test]
+    fn create_table_sql_maps_each_inferred_type() {
+        let cols = faucet_core::plan_columns(&[serde_json::json!({
+            "id": 1, "name": "a", "amount": 1.5, "ok": true, "meta": {"k": 1}
+        })])
+        .expect("a plan");
+        let sql = build_create_table_sql(r#""public"."events""#, &cols);
+        assert!(sql.contains(r#""id" BIGINT"#), "{sql}");
+        assert!(sql.contains(r#""name" VARCHAR(65535)"#), "{sql}");
+        assert!(sql.contains(r#""amount" DOUBLE PRECISION"#), "{sql}");
+        assert!(sql.contains(r#""ok" BOOLEAN"#), "{sql}");
+        // Redshift has no JSON type; nested values land as the text the
+        // writer already serialises them to.
+        assert!(sql.contains(r#""meta" VARCHAR(65535)"#), "{sql}");
+        assert!(sql.contains("IF NOT EXISTS"), "{sql}");
+    }
+
+    #[test]
+    fn create_table_sql_picks_no_distkey_or_sortkey() {
+        // Guessing either bakes a bad physical layout into the table that an
+        // operator then has to migrate out of (#580).
+        let cols = faucet_core::plan_columns(&[serde_json::json!({ "id": 1 })]).expect("plan");
+        let sql = build_create_table_sql(r#""t""#, &cols);
+        assert!(!sql.to_uppercase().contains("DISTKEY"), "{sql}");
+        assert!(!sql.to_uppercase().contains("SORTKEY"), "{sql}");
     }
 }

@@ -151,11 +151,8 @@ impl KafkaSink {
     async fn txn_producer(&self, scope: &str) -> Result<Arc<FutureProducer>, FaucetError> {
         self.txn
             .get_or_try_init(|| async {
-                let prefix = self
-                    .config
-                    .transactional_id_prefix
-                    .as_deref()
-                    .unwrap_or("faucet");
+                let eo = self.config.exactly_once_spec();
+                let prefix = eo.transactional_id_prefix.as_deref().unwrap_or("faucet");
                 let txn_id = crate::idempotent::derive_transactional_id(prefix, scope);
 
                 let mut cfg = crate::idempotent::producer_client_config(&self.config)?;
@@ -432,7 +429,7 @@ impl Sink for KafkaSink {
         // user record, so `headers_path` must not reach it.
         if let Err(e) = crate::idempotent::enqueue_in_txn(
             &producer,
-            &self.config.commit_token_topic,
+            &self.config.exactly_once_spec().commit_token_topic,
             token.as_bytes().to_vec(),
             RecordRouting {
                 key: Some(scope.as_bytes().to_vec()),

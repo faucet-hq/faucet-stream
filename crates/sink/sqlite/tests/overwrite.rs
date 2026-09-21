@@ -81,6 +81,7 @@ fn overwrite_config(url: &str, mapping: SqliteColumnMapping) -> SqliteSinkConfig
         column_mapping: mapping,
         batch_size: 1000,
         max_connections: 1,
+        create_table: true,
         write: WriteSpec {
             write_mode: WriteMode::Overwrite,
             key: vec![],

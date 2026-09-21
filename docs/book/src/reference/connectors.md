@@ -37,10 +37,10 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | DuckDB | T2 | `source-duckdb` | ✓ | ✗ | ✗ | ✗ | ✗ | SQL query (file or `:memory:`), rows as JSON; blocking-task + channel streaming |
 | AWS SQS | T2 | `source-sqs` | ✓ | ✗ | ✗ | ✗ | ✗ | long-poll ReceiveMessage, delete-after-emit (at-least-once), idle/max-messages termination |
 | NATS | T2 | `source-nats` | ✓ | ✗ | ✗ | ✗ | ✗ | subject subscription or JetStream durable consumer; idle/max-messages termination |
-| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text |
-| AWS S3 | T1 ✅ | `source-s3` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text |
-| Google Cloud Storage | T2 | `source-gcs` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text |
-| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text |
+| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `source-s3` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Google Cloud Storage | T2 | `source-gcs` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
 | MongoDB | T1 ✅ | `source-mongodb` | ✓ | ✗ | ✗ | ✗ | ✓ | `find()` with filter/projection/sort |
 | MongoDB CDC | T1 ✅ | `source-mongodb-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | Change Streams, resumeToken bookmarks; `max_staged_records` buffer cap |
 | Redis | T1 ✅ | `source-redis` | ✓ | ✗ | ✗ | ✗ | ✗ | streams, lists, key patterns |
@@ -160,24 +160,78 @@ POSTs over a window). S3/GCS/Azure fall back to buffered for the JSON-array form
 Every sink exposes a `batch_size` knob for write-side re-chunking. For the
 file/append sinks (`jsonl`, `csv`, `stdout`) it's a no-op — they write per record.
 
+**Object rollover (`max_records_per_file` / `max_bytes_per_file`, #618).** The
+object-store sinks — `s3`, `gcs`, `azure-blob`, `sftp` — **accumulate across
+`write_batch` calls** and roll to a new object when either cap is reached.
+Before this each upstream page became its own object, so a small `batch_size`
+produced a swarm of tiny objects: the small-files problem that dominates read
+time on S3/Athena/Spark. With no cap set the whole run lands in one object,
+closed at `flush`. The byte cap is what bounds buffered memory (rows are a poor
+proxy for size), and `s3`/`azure-blob` additionally stream large objects
+through **multipart** so peak memory is O(part size), not O(object size).
+
+**Commit accumulation (`commit_rows` / `commit_bytes`, #617).** The warehouse
+sinks — `snowflake`, `clickhouse`, `redshift` — accumulate records across
+`write_batch` calls and commit once per threshold, plus once at `flush`. The
+commit unit used to be the page unit and `batch_size` could only *split* a
+page, never merge two, so a small source page meant one expensive warehouse
+operation per page — and on ClickHouse, one MergeTree part per page, which
+fails outright once they accumulate. Only the **append** path accumulates:
+`delivery: exactly_once` and the DLQ path commit per page, because a watermark
+must land with its own page and a DLQ must name which rows of *this* page
+failed.
+
+**Auto-create (`create_table`, #580).** Every **table-based** sink —
+`bigquery`, `postgres`, `mysql`, `sqlite`, `mssql`, `duckdb`, `snowflake`,
+`redshift`, `clickhouse`, `spanner`, `delta`, `iceberg` — takes
+`create_table: bool`, **default `true`**: a first-ever sync cannot assume the
+destination exists, so a missing table is created from the first written
+page's inferred columns. Set `false` to require a pre-existing target and fail
+fast with one uniform error naming both ways out.
+
+Every inferred column is created **nullable**. A column that happened to be
+present in page 1 is not required forever, and a `NOT NULL` inferred from one
+page turns page 2 into a hard failure the first time a record omits the field;
+narrowing later is the [`schema:` drift policy](../cookbook/schema-drift.md)'s
+job, which can see more than one page. Three dialect-specific notes:
+
+- **clickhouse** creates `MergeTree ORDER BY tuple()` and **redshift** creates
+  with no DISTKEY/SORTKEY — faucet has no basis to pick a sort or distribution
+  key, and a wrong one is baked into the table. Define the table yourself and
+  set `create_table: false` when the physical layout matters.
+- **snowflake** creates `STRING` columns, because its insert path projects
+  every value with `::string` and a typed column would reject its own writer's
+  cast.
+- **spanner** needs a primary key on every table, so it auto-creates only when
+  `key:` is set; without one it errors naming that requirement rather than
+  inventing a key column that can never be changed.
+
+`delta` and `iceberg` already created their tables and now spell the knob
+`create_table` like everyone else (their historical `create_if_not_missing` /
+`create_if_missing` stay accepted as aliases). The **schemaless** destinations
+— `mongodb`, `elasticsearch` — deliberately have **no** knob: their servers
+create a collection/index on first write and cannot be told not to, so the
+field would be inert in one direction, which is exactly the silently-ignored
+config this project treats as a defect.
+
 | Connector | Tier¹¹ | Feature | `batch_size` | Compression | Upsert⁸ | Effectively-once⁷ | Write unit |
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|------------|
-| BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | `tabledata.insertAll` streaming; in-place `MERGE` for upsert + effectively-once |
+| BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
 | PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
 | JSON Lines | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | buffered file append |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
-| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | COPY-from-S3 (staged) or multi-row `INSERT`; append-only |
-| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only |
+| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
+| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
 | MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` |
 | Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |
 | SQLite | T1 ✅ | `sink-sqlite` | ✓ | ✗ | **✓** | **✓** | transaction-wrapped batch |
 | DuckDB | T2 | `sink-duckdb` | ✓ | ✗ | ✗ | ✗ | transaction-wrapped multi-row `INSERT` (JSON column or auto-mapped); append-only |
 | AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
 | NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | publish to a subject (optional subject-per-record), flush per batch |
-| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | JSONL files over SSH; atomic temp-then-rename upload |
-| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | JSONL objects, parallel uploads |
-| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | JSONL objects |
-| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | JSONL blobs (object_store), batch/byte rollover |
+| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | JSONL objects, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
 | MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | `insert_many`; multi-document transaction for effectively-once (replica set required) |
 | Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
 | CSV | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |
@@ -196,7 +250,7 @@ file/append sinks (`jsonl`, `csv`, `stdout`) it's a no-op — they write per rec
 level, so the file-level `compression` feature doesn't apply to either.
 ⁷ **Effectively-once** = commits data and a watermark token atomically; required for
 `delivery: exactly_once`. The BigQuery sink does this via a multi-statement
-`MERGE` transaction (distinct from its default streaming `insertAll` path); the
+`MERGE` transaction (distinct from its default bulk-load append path); the
 Kafka sink uses a transactional producer that writes each page's records plus a
 commit-token record into a compacted side-topic in one Kafka transaction; the
 Snowflake sink runs one multi-statement `BEGIN;INSERT;MERGE;COMMIT` request; the

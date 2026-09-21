@@ -91,6 +91,23 @@ pub struct ParamSpec {
     /// `accounts_domain: { computed: "${map:region|ca=zohocloud|*=zoho}" }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computed: Option<String>,
+
+    /// Closed set of acceptable values (#648).
+    ///
+    /// Without this a typo'd param value — `sink: jsonlines` — binds happily
+    /// and fails somewhere downstream, or worse produces a config that is
+    /// merely *wrong*. With it, the bind refuses and names the alternatives.
+    ///
+    /// It is also what makes a template's parameter space enumerable: the
+    /// `auto.enum_coverage` case generator in `faucet template test` derives
+    /// one case per listed value, so "does this template still work for every
+    /// sink it advertises?" is a red/green check rather than a manual sweep.
+    ///
+    /// Values are held to the declared `type` and compared after the same
+    /// coercion a supplied value gets, so `values: [1, 2]` on an `int` param
+    /// accepts the string `"1"` from a query string. Empty means unconstrained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<Value>,
 }
 
 impl ParamSpec {
@@ -104,6 +121,7 @@ impl ParamSpec {
             secret: false,
             description: None,
             computed: None,
+            values: Vec::new(),
         }
     }
 }
@@ -189,8 +207,47 @@ pub fn validate(spec: &ParamsSpec) -> CliResult<()> {
                 )));
             }
         }
+        if !p.values.is_empty() {
+            if p.computed.is_some() {
+                return Err(CliError::Config(format!(
+                    "param '{name}' is `computed` and cannot also declare `values` — its value \
+                     comes from the expression, not from a caller"
+                )));
+            }
+            // Every listed value must be a legal literal for the declared
+            // type, and the default (when there is one) must be in the set —
+            // otherwise the all-defaults case would fail its own constraint.
+            for v in &p.values {
+                if !default_matches(p.kind, v) {
+                    return Err(CliError::Config(format!(
+                        "param '{name}': value {v} in `values` is not a valid {} value",
+                        p.kind.as_str()
+                    )));
+                }
+            }
+            if let Some(d) = &p.default
+                && !p.values.iter().any(|v| values_match(p.kind, v, d))
+            {
+                return Err(CliError::Config(format!(
+                    "param '{name}': default {d} is not one of the declared `values`"
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether two literals name the same value for `kind`, after the coercion a
+/// caller-supplied value would get.
+///
+/// Compared post-coercion so `values: [1, 2]` on an `int` param accepts the
+/// string `"1"` a query string or `--param` delivers — otherwise the
+/// constraint would reject exactly the inputs it exists to guard.
+pub(crate) fn values_match(kind: ParamType, a: &Value, b: &Value) -> bool {
+    match (coerce("_", kind, a), coerce("_", kind, b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Coerce a caller-supplied value to the declared type.
@@ -259,6 +316,7 @@ mod tests {
             secret: false,
             description: None,
             computed: None,
+            values: Vec::new(),
         }
     }
 
@@ -431,5 +489,86 @@ mod tests {
         let s = ParamSpec::string_default("v");
         assert!(!s.required);
         assert_eq!(s.default, Some(json!("v")));
+    }
+
+    // ── closed value sets (#648) ──────────────────────────────────────────
+
+    fn spec_of(name: &str, value: Value) -> ParamsSpec {
+        let p: ParamSpec = serde_json::from_value(value).expect("param spec");
+        let mut m = ParamsSpec::new();
+        m.insert(name.into(), p);
+        m
+    }
+
+    #[test]
+    fn a_closed_value_set_accepts_a_matching_default() {
+        let spec = spec_of(
+            "region",
+            json!({"type": "string", "default": "us", "values": ["us", "eu"]}),
+        );
+        validate(&spec).expect("a default inside the set is fine");
+    }
+
+    #[test]
+    fn a_default_outside_the_closed_set_is_rejected() {
+        // Otherwise the all-defaults case would fail its own constraint — the
+        // one combination every caller hits.
+        let spec = spec_of(
+            "region",
+            json!({"type": "string", "default": "mars", "values": ["us", "eu"]}),
+        );
+        let err = validate(&spec).expect_err("default outside the set");
+        assert!(
+            err.to_string().contains("not one of the declared `values`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_listed_value_of_the_wrong_type_is_rejected() {
+        let spec = spec_of("n", json!({"type": "int", "values": [1, "not-an-int"]}));
+        let err = validate(&spec).expect_err("bad literal");
+        assert!(
+            err.to_string().contains("is not a valid int value"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn values_and_computed_are_mutually_exclusive() {
+        // A computed param's value comes from the expression, so a caller-facing
+        // constraint on it would never be checked against anything.
+        let spec = spec_of(
+            "derived",
+            json!({"type": "string", "computed": "${param.other}", "values": ["a"]}),
+        );
+        let err = validate(&spec).expect_err("computed + values");
+        assert!(
+            err.to_string().contains("cannot also declare `values`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn membership_is_decided_after_coercion() {
+        // `values: [1, 2]` on an `int` param must accept the string "1" that a
+        // query string or `--param` delivers, or the constraint would reject
+        // exactly the inputs it exists to guard.
+        assert!(values_match(ParamType::Int, &json!(1), &json!("1")));
+        assert!(values_match(ParamType::Float, &json!(1.5), &json!("1.5")));
+        assert!(values_match(ParamType::Bool, &json!(true), &json!("true")));
+        assert!(!values_match(ParamType::Int, &json!(1), &json!(2)));
+        // Uncoercible on both sides falls back to structural equality.
+        assert!(values_match(ParamType::Int, &json!("x"), &json!("x")));
+    }
+
+    #[test]
+    fn an_int_default_that_is_not_an_int_is_rejected() {
+        let spec = spec_of("n", json!({"type": "int", "default": "abc"}));
+        let err = validate(&spec).expect_err("bad default");
+        assert!(
+            err.to_string().contains("is not a valid int value"),
+            "{err}"
+        );
     }
 }

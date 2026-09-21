@@ -56,6 +56,20 @@ pub struct MysqlSinkConfig {
     /// the server's own connection limit. There is no "unlimited" setting.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// Create the target table if it does not exist, inferring the columns
+    /// from the first written page (#580). Enabled by default: a first-ever
+    /// sync cannot assume the destination already exists.
+    ///
+    /// Every inferred column is created **nullable** — a column that happened
+    /// to be present in page 1 is not required forever, and a `NOT NULL`
+    /// inferred from one page turns page 2 into a hard failure the first time
+    /// a record omits the field. Narrowing is the `schema:` drift policy's job.
+    ///
+    /// Set `false` to require the table to pre-exist and fail fast when it is
+    /// missing (the schema is managed externally, and a missing table means a
+    /// typo rather than a first run).
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
     /// Write mode: `append` (default), `upsert`, or `delete`.
     ///
     /// `upsert` and `delete` require `column_mapping: auto_map` (key columns
@@ -69,6 +83,10 @@ pub struct MysqlSinkConfig {
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+fn default_create_table() -> bool {
+    true
 }
 
 fn default_max_connections() -> u32 {
@@ -96,11 +114,18 @@ impl MysqlSinkConfig {
             column_mapping: MysqlColumnMapping::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             max_connections: 5,
+            create_table: default_create_table(),
             write: WriteSpec::default(),
         }
     }
 
     /// Set the column mapping strategy.
+    /// Opt out of auto-creating a missing target table (#580).
+    pub fn with_create_table(mut self, create: bool) -> Self {
+        self.create_table = create;
+        self
+    }
+
     pub fn column_mapping(mut self, mapping: MysqlColumnMapping) -> Self {
         self.column_mapping = mapping;
         self

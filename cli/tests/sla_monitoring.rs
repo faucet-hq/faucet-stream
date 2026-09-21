@@ -207,6 +207,7 @@ async fn dry_run_skips_sla_evaluation() {
             pipeline_name: "slatest".into(),
             run_id: None,
             execution: None,
+            concurrency: None,
             dry_run: true,
             limit: None,
             state_path_override: None,

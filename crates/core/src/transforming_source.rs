@@ -584,6 +584,10 @@ mod tests {
     }
 
     /// A source that emits a single page with the given records and bookmark.
+    ///
+    /// Only the bookmark-forwarding tests construct it, and those are gated on
+    /// a transform feature, so a build without one compiles it unused.
+    #[allow(dead_code)]
     struct OnePageSource {
         records: Vec<Value>,
         bookmark: Option<Value>,

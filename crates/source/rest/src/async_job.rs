@@ -82,6 +82,18 @@ pub struct JobRequest {
     /// overriding the source-level `records_path`. Applies to a JSON result body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub records_path: Option<String>,
+    /// `fetch` only (#654 M24): locator values that mean **no more pages**,
+    /// compared case-insensitively after trimming. Defaults to `["null"]` — one
+    /// vendor's sentinel, which used to be hardcoded in the pagination loop, so
+    /// an API signalling completion with `none` / `-1` / `EOF` needed a code
+    /// change. An empty/whitespace locator is always terminal regardless of
+    /// this list; set it to `[]` to make *only* emptiness terminal.
+    #[serde(default = "default_locator_terminal_values")]
+    pub locator_terminal_values: Vec<String>,
+}
+
+fn default_locator_terminal_values() -> Vec<String> {
+    vec!["null".to_string()]
 }
 
 /// The poll request + cadence.
@@ -170,6 +182,68 @@ pub struct AsyncJobConfig {
     /// that loss into a bounded re-read (deduped by an upsert sink).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookback: Option<String>,
+    /// Where the bulk **statement** sits inside the [`submit`](Self::submit)
+    /// body, as an RFC 6901 JSON Pointer (#654 M23). Defaults to `/query` — the
+    /// top-level `query` key that used to be hardcoded, so an API putting its
+    /// statement at `sql`, `statement`, or a nested path silently lost
+    /// incremental push-down and collapsed every object onto one dataset
+    /// identity. Three behaviours read it: the incremental predicate
+    /// injection, `validate()`'s incremental gate, and the catalog/lineage
+    /// dataset name.
+    #[serde(default = "default_query_path")]
+    pub query_path: String,
+    /// Skip the job entirely and read through the source's **ordinary
+    /// paginated path** when a cheap probe says the object is small (#629).
+    ///
+    /// An async bulk API has a fixed async floor — job queue plus processing,
+    /// measured at ~14s of a 22s 701-row Salesforce `User` run — that is paid
+    /// whatever the row count. A synchronous query API answers the same
+    /// request immediately. Bulk is still right for the large objects it was
+    /// designed for, so the choice is per-run and made from data rather than
+    /// from a guess baked into the config.
+    ///
+    /// Requires [`count`](Self::count). The source's own `path` / `params` /
+    /// `pagination` describe the synchronous read, so a config that opts in
+    /// carries both shapes and faucet picks between them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_below_rows: Option<u64>,
+    /// Row-count probe for [`sync_below_rows`](Self::sync_below_rows) — a
+    /// request plus a JSONPath to the count in its response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<RowCountProbe>,
+}
+
+/// A cheap row-count request, used to decide between the async-job and the
+/// synchronous read paths (#629).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RowCountProbe {
+    /// The probe request (e.g. `SELECT COUNT() FROM Account` through a
+    /// synchronous query endpoint).
+    #[serde(flatten)]
+    pub request: JobRequest,
+    /// JSONPath to the count in the probe response. The match must be a
+    /// number, or a string parsing as one.
+    pub count_path: String,
+}
+
+impl AsyncJobConfig {
+    /// Whether this config can route small objects to the synchronous path.
+    ///
+    /// Both halves are required: a threshold with no probe could never fire,
+    /// and a probe with no threshold has nothing to compare against. Rather
+    /// than silently ignoring a half-configured pair — the inert-config class
+    /// this project treats as a defect — `validate()` rejects it.
+    pub fn sync_routing(&self) -> Option<(u64, &RowCountProbe)> {
+        match (self.sync_below_rows, self.count.as_ref()) {
+            (Some(n), Some(p)) => Some((n, p)),
+            _ => None,
+        }
+    }
+}
+
+fn default_query_path() -> String {
+    "/query".to_string()
 }
 
 /// Default bookmark re-read margin (seconds) when `lookback` is unset: wide
@@ -185,11 +259,18 @@ impl AsyncJobConfig {
     /// `replication_method: incremental` in that shape — otherwise a bookmark
     /// would advance while the export silently stays full-table.
     pub fn supports_incremental_query(&self) -> bool {
+        self.submit_query().is_some()
+    }
+
+    /// The bulk statement in the submit body, resolved through
+    /// [`query_path`](Self::query_path). `None` when there is no submit body,
+    /// the pointer matches nothing, or the match is not a string.
+    pub fn submit_query(&self) -> Option<&str> {
         self.submit
             .json
-            .as_ref()
-            .and_then(|j| j.get("query"))
-            .is_some_and(serde_json::Value::is_string)
+            .as_ref()?
+            .pointer(&self.query_path)?
+            .as_str()
     }
 
     /// The parsed `lookback` margin (default 5 minutes — see the field docs).
@@ -216,6 +297,35 @@ impl AsyncJobConfig {
             return Err(faucet_core::FaucetError::Config(
                 "async_job: `submit.url` must not be empty".into(),
             ));
+        }
+        // A half-configured pair is rejected rather than ignored: a threshold
+        // with no probe can never fire and a probe with no threshold is never
+        // read, so either alone is a config that reads as doing something and
+        // does nothing (#629).
+        match (self.sync_below_rows, self.count.as_ref()) {
+            (Some(_), None) => {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `sync_below_rows` needs a `count:` probe to compare against".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `count:` is only read by `sync_below_rows`, which is unset".into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(p) = self.count.as_ref() {
+            if p.request.url.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `count.url` must not be empty".into(),
+                ));
+            }
+            if p.count_path.trim().is_empty() {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `count.count_path` must not be empty".into(),
+                ));
+            }
         }
         // `fetch` needs exactly one of `url` (templated) or `url_from` (JSONPath
         // into the poll body, #543).

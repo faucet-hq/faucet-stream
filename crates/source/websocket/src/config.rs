@@ -10,6 +10,8 @@ use std::time::Duration;
 
 /// Configuration for the WebSocket source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-aliases" = ["max_reconnect_attempts", "reconnect_initial_backoff"]))]
+#[serde(deny_unknown_fields)]
 pub struct WebsocketSourceConfig {
     /// WebSocket endpoint, `ws://` or `wss://`. Supports `{placeholder}`
     /// parent-matrix context substitution.
@@ -73,8 +75,11 @@ pub struct WebsocketSourceConfig {
     /// Retries grow **exponentially with jitter** from this base and are
     /// capped, so a dead endpoint is not dialled at a fixed rate forever.
     /// Set it to the delay you want before the *first* retry.
+    /// Also accepted as `reconnect_initial_backoff` — the gRPC source's
+    /// spelling for the same knob (#654 M20).
     #[serde(
         default = "default_backoff",
+        alias = "reconnect_initial_backoff",
         with = "faucet_core::config::duration_secs"
     )]
     #[schemars(with = "u64")]
@@ -82,7 +87,18 @@ pub struct WebsocketSourceConfig {
 
     /// Cap on *consecutive* failed reconnects (resets on any received
     /// message). `None` = unlimited (then `idle_timeout` is the natural cap).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Spelled `reconnect_max_attempts` on the wire, matching the gRPC
+    /// source's `reconnect_*` prefix; the historical `max_reconnect_attempts`
+    /// stays accepted as an alias (#654 M20). The prefix used to be reversed
+    /// between the two connectors, so a user who learned one spelling had the
+    /// other silently ignored and reconnected without a bound.
+    #[serde(
+        default,
+        rename = "reconnect_max_attempts",
+        alias = "max_reconnect_attempts",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_reconnect_attempts: Option<usize>,
 
     /// Bound the max WebSocket message/frame size (bytes) to prevent runaway
@@ -370,5 +386,30 @@ mod helper_tests {
             v,
             json!({"data": {"a": 1}, "received_at": 123, "url": "wss://x"})
         );
+    }
+
+    #[test]
+    fn both_reconnect_attempt_spellings_deserialize() {
+        // The prefix used to be reversed between this source and the gRPC one,
+        // so whichever spelling a user learned first was silently dropped on
+        // the other connector and reconnects ran unbounded (#654 M20).
+        let canonical: WebsocketSourceConfig = serde_json::from_value(serde_json::json!({
+            "url": "wss://example.com/s", "reconnect_max_attempts": 4
+        }))
+        .unwrap();
+        assert_eq!(canonical.max_reconnect_attempts, Some(4));
+
+        let historical: WebsocketSourceConfig = serde_json::from_value(serde_json::json!({
+            "url": "wss://example.com/s", "max_reconnect_attempts": 4
+        }))
+        .unwrap();
+        assert_eq!(historical.max_reconnect_attempts, Some(4));
+
+        // The gRPC source's backoff spelling is accepted here too.
+        let aliased: WebsocketSourceConfig = serde_json::from_value(serde_json::json!({
+            "url": "wss://example.com/s", "reconnect_initial_backoff": 9
+        }))
+        .unwrap();
+        assert_eq!(aliased.reconnect_backoff, Duration::from_secs(9));
     }
 }

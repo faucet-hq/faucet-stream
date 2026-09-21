@@ -78,6 +78,7 @@ pub enum ValueFormat {
 
 /// Configuration for [`KinesisSink`](crate::KinesisSink).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KinesisSinkConfig {
     /// Kinesis Data Stream name.
     pub stream_name: String,
@@ -122,12 +123,22 @@ pub struct KinesisSinkConfig {
     /// Bounded concurrent in-flight `PutRecords` requests. Default 4.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    /// Per-record retry for partial failures, grouped (#654 M20). When
+    /// present it supersedes the three deprecated flat `retry_*` keys below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<faucet_core::retry::PartialRetrySpec>,
+    /// **Deprecated** — use `retry.max_attempts`.
+    ///
     /// Per-record retry budget for partial failures. Default 5.
     #[serde(default = "default_retry_max_attempts")]
     pub retry_max_attempts: usize,
+    /// **Deprecated** — use `retry.initial_backoff_ms`.
+    ///
     /// Initial retry backoff (milliseconds). Default 100.
     #[serde(default = "default_retry_initial_backoff_ms")]
     pub retry_initial_backoff_ms: u64,
+    /// **Deprecated** — use `retry.max_backoff_ms`.
+    ///
     /// Backoff ceiling (milliseconds). Default 30000.
     #[serde(default = "default_retry_max_backoff_ms")]
     pub retry_max_backoff_ms: u64,
@@ -156,6 +167,22 @@ fn default_retry_max_backoff_ms() -> u64 {
 }
 
 impl KinesisSinkConfig {
+    /// The effective per-record retry budget: the `retry:` block when present,
+    /// otherwise the three deprecated flat `retry_*` keys (#654 M20).
+    ///
+    /// The block wins wholesale — a flat key has a default, so "was it set?"
+    /// is not observable, and a per-field merge would silently mix two
+    /// spellings of one setting.
+    pub fn retry_spec(&self) -> faucet_core::retry::PartialRetrySpec {
+        self.retry
+            .clone()
+            .unwrap_or(faucet_core::retry::PartialRetrySpec {
+                max_attempts: self.retry_max_attempts,
+                initial_backoff_ms: self.retry_initial_backoff_ms,
+                max_backoff_ms: self.retry_max_backoff_ms,
+            })
+    }
+
     /// Minimal config with defaults for everything but the stream name.
     pub fn new(stream_name: impl Into<String>) -> Self {
         Self {
@@ -170,6 +197,7 @@ impl KinesisSinkConfig {
             max_record_size_bytes: default_max_record_bytes(),
             max_request_bytes: default_max_request_bytes(),
             concurrency: default_concurrency(),
+            retry: None,
             retry_max_attempts: default_retry_max_attempts(),
             retry_initial_backoff_ms: default_retry_initial_backoff_ms(),
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
@@ -313,5 +341,31 @@ retry_max_attempts: 3
                 path: "routing.hash".into()
             }
         );
+    }
+
+    #[test]
+    fn retry_block_supersedes_the_deprecated_flat_keys() {
+        // Flat-only (the pre-#654 shape) still works.
+        let flat: KinesisSinkConfig = serde_json::from_value(serde_json::json!({
+            "stream_name": "s",
+            "retry_max_attempts": 9,
+            "retry_initial_backoff_ms": 7
+        }))
+        .unwrap();
+        let r = flat.retry_spec();
+        assert_eq!(r.max_attempts, 9);
+        assert_eq!(r.initial_backoff_ms, 7);
+
+        // The block wins wholesale, so an unset block field falls back to the
+        // block's own default rather than silently inheriting the flat key.
+        let blocked: KinesisSinkConfig = serde_json::from_value(serde_json::json!({
+            "stream_name": "s",
+            "retry_max_attempts": 9,
+            "retry": { "initial_backoff_ms": 25 }
+        }))
+        .unwrap();
+        let r = blocked.retry_spec();
+        assert_eq!(r.initial_backoff_ms, 25);
+        assert_eq!(r.max_attempts, 5, "block default, not the flat 9");
     }
 }

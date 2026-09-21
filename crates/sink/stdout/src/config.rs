@@ -37,6 +37,7 @@ pub enum StdoutFormat {
 
 /// Configuration for the stdout/stderr sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StdoutSinkConfig {
     /// Which standard stream to write to.
     #[serde(default)]

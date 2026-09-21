@@ -37,6 +37,7 @@
   - [Parallel range partitioning](./cookbook/partitioning.md)
   - [Dead-letter queues](./cookbook/dlq.md)
   - [Resilience (retry / circuit breaker / poison-pill)](./cookbook/resilience.md)
+  - [File formats](./cookbook/file-formats.md)
   - [Compression](./cookbook/compression.md)
 - [Data quality & governance]()
   - [Data-quality checks](./cookbook/quality.md)

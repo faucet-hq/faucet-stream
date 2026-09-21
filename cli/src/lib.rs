@@ -330,6 +330,7 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
             pipeline_name,
             run_id: None,
             execution: cfg.execution.clone(),
+            concurrency: None,
             dry_run: false,
             limit: None,
             state_path_override: None,

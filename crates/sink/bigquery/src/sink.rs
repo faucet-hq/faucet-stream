@@ -417,6 +417,18 @@ fn is_direct_overwrite(config: &BigQuerySinkConfig) -> bool {
     config.media_load && !config.overwrite_staging && config.scope.is_none()
 }
 
+/// Whether an **append** page is written by a bulk load job rather than the
+/// per-row `tabledata.insertAll` path.
+///
+/// `insert_id_field` is the carve-out: it is an explicit request for
+/// BigQuery's streaming best-effort dedup, which only `insertAll` implements.
+/// A load job would accept the rows and silently drop the dedup, so an
+/// explicit `insert_id_field` keeps the streaming path even though
+/// `media_load` now defaults on (#612).
+fn appends_via_media_load(config: &BigQuerySinkConfig) -> bool {
+    config.media_load && config.insert_id_field.is_none()
+}
+
 /// Gzip-compress bytes for the BigQuery load media part. BigQuery auto-detects
 /// gzip for `NEWLINE_DELIMITED_JSON` loads, so no source-format flag is needed —
 /// the wire payload just shrinks (often 5–10× for JSON).
@@ -579,6 +591,13 @@ impl BigQuerySink {
     pub async fn new(config: BigQuerySinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         config.write.validate()?;
+        if config.media_load && config.insert_id_field.is_some() {
+            tracing::warn!(
+                insert_id_field = config.insert_id_field.as_deref(),
+                "insert_id_field is set, so appends use streaming inserts rather than \
+                 the default bulk load path (a load job cannot honour insertId dedup)"
+            );
+        }
         let client = build_client(&config.auth).await?;
         Ok(Self {
             config,
@@ -1864,7 +1883,7 @@ impl faucet_core::Sink for BigQuerySink {
         // instead of the streaming `insertAll` chunk loop — no streaming buffer,
         // no per-row insertAll quota, gzip-compressed, and peak memory O(chunk +
         // page) regardless of table size.
-        if self.config.media_load {
+        if appends_via_media_load(&self.config) {
             self.feed_session(&self.config.table_id, "WRITE_APPEND", records)
                 .await?;
             return Ok(records.len());
@@ -1944,15 +1963,15 @@ impl faucet_core::Sink for BigQuerySink {
 
         self.ensure_table_ready(records).await?;
 
-        // Append via a bucket-free streaming resumable load when `media_load` is
-        // on. A load job is all-or-nothing, so either every row commits (all
-        // `Ok`, finalized in `flush`) or the whole page/load fails (outer `Err` —
-        // no partial per-row outcomes).
-        if self.config.media_load {
-            self.feed_session(&self.config.table_id, "WRITE_APPEND", records)
-                .await?;
-            return Ok(records.iter().map(|_| Ok(())).collect());
-        }
+        // NOTE: no `media_load` branch here, deliberately. This method is only
+        // called when a **DLQ is configured**, and a BigQuery load job is
+        // all-or-nothing: it cannot say *which* rows were rejected. Taking it
+        // here would silently convert "three bad rows quarantined, the rest
+        // written" into "the whole page failed" (or, worse, "all rows reported
+        // OK") — the operator asked for row isolation by configuring a DLQ, so
+        // the per-row `insertAll` path is what they get, whatever `media_load`
+        // says. Runs without a DLQ go through `write_batch`, which does take
+        // the load path (#612).
 
         let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
             vec![records]
@@ -2517,9 +2536,9 @@ impl faucet_core::Sink for BigQuerySink {
 #[cfg(test)]
 mod tests {
     use super::{
-        BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, build_load_job_json,
-        build_load_job_json_fmt, build_load_job_json_full, build_multipart_related,
-        deletes_to_payload, dml_affected_rows, gzip, is_direct_overwrite,
+        BigQueryCredentials, BigQuerySinkConfig, Job, all_string_schema, appends_via_media_load,
+        build_load_job_json, build_load_job_json_fmt, build_load_job_json_full,
+        build_multipart_related, deletes_to_payload, dml_affected_rows, gzip, is_direct_overwrite,
         json_schema_to_load_schema, media_boundary, multipart_boundary, native_batch_columns,
         records_to_ndjson, scope_to_payload,
     };
@@ -2827,9 +2846,49 @@ mod tests {
         });
         assert!(!is_direct_overwrite(&c));
 
-        // Non-media overwrite (jobs.query path) ⇒ always stage.
-        let c = base();
+        // Non-media overwrite (jobs.query path) ⇒ always stage. `media_load`
+        // now defaults to true (#612), so opting out is what selects that path.
+        let mut c = base();
+        c.media_load = false;
         assert!(!is_direct_overwrite(&c));
+
+        // And the default config takes the direct load — the whole point of
+        // the flip: a solo overwrite is one atomic `WRITE_TRUNCATE` load.
+        assert!(
+            is_direct_overwrite(&base()),
+            "a default solo overwrite must take the direct load path"
+        );
+    }
+
+    #[test]
+    fn appends_via_media_load_yields_to_an_explicit_insert_id_field() {
+        let base =
+            || BigQuerySinkConfig::new("p", "d", "t", BigQueryCredentials::ApplicationDefault);
+
+        // The #612 default: appends take the bulk load path.
+        assert!(
+            appends_via_media_load(&base()),
+            "a default append must take the load path"
+        );
+
+        // Opting out selects the per-page insertAll path.
+        let mut c = base();
+        c.media_load = false;
+        assert!(!appends_via_media_load(&c));
+
+        // `insert_id_field` asks for insertAll's best-effort dedup, which a
+        // load job cannot honour — so it wins over the default. Losing it
+        // silently is the regression this guards.
+        let c = base().with_insert_id_field("event_id");
+        assert!(
+            !appends_via_media_load(&c),
+            "an explicit insert_id_field must keep appends on the streaming path"
+        );
+
+        // Both opted out ⇒ still streaming, for the same reason.
+        let mut c = base().with_insert_id_field("event_id");
+        c.media_load = false;
+        assert!(!appends_via_media_load(&c));
     }
 
     #[test]

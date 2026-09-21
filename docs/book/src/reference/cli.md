@@ -68,6 +68,7 @@ Flags:
 | Flag | Purpose |
 |------|---------|
 | `--clock <value>` | Override the clock used by `${now.*}` tokens. Accepts an RFC 3339 timestamp (`2026-03-01T00:00:00Z`) or a bare date (`2026-03-01`, treated as midnight UTC). Default: process start time in UTC. Use this for backfills — run the same config with a different date without changing the file. |
+| `--concurrency <n>` | Override this run's **connector** concurrency — how many concurrent connections/fetches the source and sink may use — whatever the config says. Maps onto whichever knob the connector declares (`max_connections` / `partition_concurrency` / `shard_concurrency` / `concurrency`); a connector with none ignores it. Does **not** change matrix parallelism (`execution.max_concurrent`), and it caps only the *client* side — it cannot raise what the upstream will accept. Must be > 0. |
 | `--profile <name>` | Select a named overlay from the config's `profiles:` block (see [Config composition](config.md#config-composition)). Overrides `FAUCET_PROFILE`. |
 | `--env-file <path>` / `--no-env-file` | Same `.env` handling as `validate` / `preview`. |
 | `--from-env` | Build the pipeline entirely from `FAUCET_*` environment variables; mutually exclusive with a positional config path. |
@@ -668,6 +669,8 @@ faucet template deprecate tenant-sync --reason "superseded"      # retire (`--un
 faucet template run       tenant-sync --store sqlite:./faucet-templates.db \
   --version prod --param tenant_id=acme --param-env API_HOST=eu.example.com
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
+faucet template test      suite.yaml                            # suite names a config path — no registry
+faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
 ```
 
 Register a config declaring [`params:`](config.md#params) **once**, then trigger
@@ -688,6 +691,9 @@ runs by id — the register-once / trigger-by-id model. See the
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
 | `--dry-run` | *(run)* Materialize and validate without writing to any sink. |
 | `--limit <n>` | *(run)* Stop after writing this many records. |
+| `--suite <path>` | *(test)* Positional: the suite file (YAML or JSON). `faucet schema template-test` prints its schema. |
+| `--select <n\|channel>` | *(test)* Override the suite's own `select:`. Ignored when the suite's `template:` is a path. |
+| `--filter <pattern>` | *(test)* Run only cases whose name matches; `*` wildcards, otherwise an exact match. |
 | `--json` | Machine-readable output for every subcommand. |
 
 Every `register` appends a new **numeric version** (auto-incrementing from 1) and
@@ -717,6 +723,19 @@ a file (`… --clean > template.yaml`); `${param.…}` placeholders are preserve
 observability, lineage, notifications, the catalog, and SLA evaluation all behave
 the same. The stored body is verbatim — `${env:…}` / `${vault:…}` resolve at
 trigger time, never at registration.
+
+`faucet template test` sweeps a template's **parameter space** offline: each case
+materializes the template exactly as a real trigger would, then expands it and
+compiles each row's transform chain (or validates the graph, in topology mode).
+No network, no data, no sink. Cases come from three places — hand-written
+`cases:`, a generated `combine:` product (with `exclude:` and an all-pairs
+`pairwise:` reduction), and `auto:` cases derived from the template's own
+`params:` — and a `behavioral:` block runs fixture records through the real
+pipeline with `faucet test`'s matchers. When the suite's `template:` names a
+readable config path, no registry is involved at all, so a template can be tested
+before it is ever registered. The exit code is the failed-case count, mirroring
+`faucet test`. See
+[Testing the parameter space](../cookbook/templates.md#testing-the-parameter-space).
 
 ## `notify`
 
@@ -855,7 +874,7 @@ list / SSE-logs endpoints plus `/healthz`, `/readyz`, and `/metrics`. Requires t
 feature (included in `full`).
 
 Unlike the other commands, `serve` takes **no config file** — configs arrive per request. Auth is
-mandatory: pass `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN`, or `--no-auth` to explicitly disable it
+mandatory: pass `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN`, the `--read-token`/`--write-token`/`--admin-token` trio, or `--no-auth` to explicitly disable it
 (absent both, startup fails).
 
 Selected flags (`faucet serve --help` for the full list):
@@ -865,6 +884,7 @@ Selected flags (`faucet serve --help` for the full list):
 | `--listen <addr>` | Bind address (default `127.0.0.1:8080`; env `FAUCET_SERVE_LISTEN`). |
 | `--auth-token <t>` / `--no-auth` | Bearer token (prefer the env var) or explicit no-auth opt-in. |
 | `--auth-config <path>` | RBAC principals file (`{ name, token, role }`; roles `viewer`/`operator`/`admin`) — enables role enforcement + the `GET /v1/audit` log. Mutually exclusive with `--auth-token`/`--no-auth`. |
+| `--read-token <t>` / `--write-token <t>` / `--admin-token <t>` | The three-token shorthand for the same RBAC (`viewer` / `operator` / `admin`) with no file to author — prefer the env vars `FAUCET_SERVE_{READ,WRITE,ADMIN}_TOKEN`. Any subset may be set; mutually exclusive with `--auth-token` / `--auth-config` / `--no-auth`. See the [role × route matrix](http-api.md#role--route-matrix). |
 | `--max-concurrent-runs <n>` / `--max-queued-runs <n>` | Concurrency + queue caps (429 past the queue). |
 | `--history <url>` | `postgres://…` / `sqlite:…` for durable run history (feature-gated; default in-memory). |
 | `--default-config <path>` | Workspace defaults merged under every submitted run. |

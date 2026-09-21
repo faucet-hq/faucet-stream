@@ -58,6 +58,7 @@ pub enum HttpBatchMode {
 
 /// Configuration for the HTTP sink connector.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HttpSinkConfig {
     /// Target endpoint URL.
     pub url: String,

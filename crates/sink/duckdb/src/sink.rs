@@ -29,6 +29,36 @@ fn quote_table(table: &str) -> String {
         .join(".")
 }
 
+/// Map a [`faucet_core::SqlBaseType`] to the DuckDB type keyword used when
+/// auto-creating a table (#580). Integers land as `BIGINT` and floats as
+/// `DOUBLE` so a later, wider value never overflows a narrower column;
+/// nested values land as `JSON` text, matching how the writer serialises them.
+fn duckdb_keyword(t: faucet_core::SqlBaseType) -> &'static str {
+    use faucet_core::SqlBaseType::*;
+    match t {
+        Integer => "BIGINT",
+        Double => "DOUBLE",
+        Boolean => "BOOLEAN",
+        Text => "TEXT",
+        Json => "TEXT",
+    }
+}
+
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+fn build_create_table_sql(
+    table: &str,
+    columns: &[faucet_core::PlannedColumn],
+    json_column: Option<&str>,
+) -> String {
+    let cols = match json_column {
+        // JSON mode stores the whole record in one column, so the page's own
+        // shape is irrelevant — the table is the same whatever arrives.
+        Some(col) => format!("{} TEXT NOT NULL", quote_ident(col)),
+        None => faucet_core::render_columns(columns, quote_ident, duckdb_keyword),
+    };
+    format!("CREATE TABLE IF NOT EXISTS {} ({cols})", quote_table(table))
+}
+
 /// The bare table name of a possibly schema-qualified target, plus its schema —
 /// `information_schema.columns` stores the two separately.
 fn split_table(table: &str) -> (Option<&str>, &str) {
@@ -42,6 +72,9 @@ fn split_table(table: &str) -> (Option<&str>, &str) {
 pub struct DuckdbSink {
     config: DuckdbSinkConfig,
     conn: Arc<Mutex<Connection>>,
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
 }
 
 fn open(path: &str) -> Result<Connection, FaucetError> {
@@ -266,6 +299,59 @@ fn write_all_blocking(
 }
 
 impl DuckdbSink {
+    /// Make sure the target table exists before the first write (#580).
+    ///
+    /// Synchronous: the DuckDB connection is already behind a `Mutex` and the
+    /// DDL is one statement, so hopping to `spawn_blocking` for it would cost
+    /// more than it saves.
+    fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let json_column = match &self.config.column_mapping {
+            DuckdbColumnMapping::AutoMap => None,
+            DuckdbColumnMapping::Json { column } => Some(column.as_str()),
+        };
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|e| FaucetError::Sink(format!("duckdb connection mutex poisoned: {e}")))?;
+
+        if !self.config.create_table {
+            let found: i64 = guard
+                .query_row(
+                    "SELECT count(*) FROM duckdb_tables() WHERE table_name = ?",
+                    [&self.config.table_name],
+                    |r| r.get(0),
+                )
+                .map_err(|e| FaucetError::Sink(format!("duckdb table probe failed: {e}")))?;
+            if found == 0 {
+                return Err(faucet_core::missing_target_error(
+                    "duckdb sink",
+                    &self.config.table_name,
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        // AutoMap needs a page to infer from; a page with nothing inferable
+        // leaves the table uncreated so the next page can try.
+        let columns = match (json_column, faucet_core::plan_columns(records)) {
+            (Some(_), _) => Vec::new(),
+            (None, Some(c)) => c,
+            (None, None) => return Ok(()),
+        };
+        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column);
+        guard
+            .execute_batch(&sql)
+            .map_err(|e| FaucetError::Sink(format!("duckdb CREATE TABLE failed: {e}")))?;
+        drop(guard);
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Create a new DuckDB sink, opening (and reusing) one read-write connection.
     pub async fn new(config: DuckdbSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
@@ -276,6 +362,7 @@ impl DuckdbSink {
         Ok(Self {
             config,
             conn: Arc::new(Mutex::new(conn)),
+            table_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -341,6 +428,7 @@ impl faucet_core::Sink for DuckdbSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records)?;
         let conn = self.conn.clone();
         let config = self.config.clone();
         let owned = records.to_vec();
@@ -432,13 +520,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_table_errors_not_panics() {
+    async fn a_missing_table_errors_not_panics_when_create_is_off() {
         let sink = DuckdbSink::new(
-            DuckdbSinkConfig::new(":memory:", "nope").column_mapping(DuckdbColumnMapping::AutoMap),
+            DuckdbSinkConfig::new(":memory:", "nope")
+                .column_mapping(DuckdbColumnMapping::AutoMap)
+                .with_create_table(false),
         )
         .await
         .unwrap();
-        assert!(sink.write_batch(&[json!({"a": 1})]).await.is_err());
+        let err = sink
+            .write_batch(&[json!({"a": 1})])
+            .await
+            .expect_err("a missing table with create_table: false must fail");
+        assert!(
+            err.to_string().contains("create_table: true"),
+            "the error must name the way out: {err}"
+        );
+    }
+
+    /// The other arm of `create_table: false`: the table *does* exist, so the
+    /// probe must accept it and write. Only the failure arm was covered, and a
+    /// probe that rejected a healthy table would break every opted-out config.
+    #[tokio::test]
+    async fn an_existing_table_is_accepted_when_create_is_off() {
+        let sink = DuckdbSink::new(
+            DuckdbSinkConfig::new(":memory:", "present")
+                .column_mapping(DuckdbColumnMapping::AutoMap)
+                .with_create_table(false),
+        )
+        .await
+        .unwrap();
+        sink.conn
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE present (a BIGINT)")
+            .expect("ddl");
+
+        assert_eq!(sink.write_batch(&[json!({"a": 1})]).await.unwrap(), 1);
+        assert_eq!(count(&sink, "present"), 1);
+        // The probe runs once and latches, so a second page does not re-probe.
+        assert_eq!(sink.write_batch(&[json!({"a": 2})]).await.unwrap(), 1);
+        assert_eq!(count(&sink, "present"), 2);
+    }
+
+    /// A page with nothing inferable must leave the table uncreated so the
+    /// next page can try — emitting a zero-column CREATE would poison the
+    /// destination for every later page.
+    #[tokio::test]
+    async fn a_page_with_nothing_inferable_creates_no_table() {
+        let sink = DuckdbSink::new(
+            DuckdbSinkConfig::new(":memory:", "later").column_mapping(DuckdbColumnMapping::AutoMap),
+        )
+        .await
+        .unwrap();
+
+        // Records with no inferable columns: nothing to build a schema from,
+        // so the page fails rather than creating a zero-column table.
+        let err = sink
+            .write_batch(&[json!({})])
+            .await
+            .expect_err("an empty shape cannot be written");
+        assert!(
+            err.to_string().contains("no columns or does not exist"),
+            "got: {err}"
+        );
+        let exists: i64 = sink
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'later'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "no table may be created from an empty shape");
+
+        // The point of leaving it uncreated: a later page with real columns
+        // still creates it, so one shapeless page does not poison the run.
+        assert_eq!(sink.write_batch(&[json!({"a": 1})]).await.unwrap(), 1);
+        assert_eq!(count(&sink, "later"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missing_table_is_created_from_the_first_page_by_default() {
+        // #580: a first-ever sync cannot assume the destination exists.
+        let sink = DuckdbSink::new(
+            DuckdbSinkConfig::new(":memory:", "fresh").column_mapping(DuckdbColumnMapping::AutoMap),
+        )
+        .await
+        .unwrap();
+        let n = sink
+            .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})])
+            .await
+            .expect("the table is created, then written");
+        assert_eq!(n, 2);
+        assert_eq!(count(&sink, "fresh"), 2);
+
+        // The created columns take the inferred types, and a second page with
+        // a null in a column that was non-null in page 1 still writes — every
+        // inferred column is nullable on purpose.
+        sink.write_batch(&[json!({"id": 3, "name": Value::Null})])
+            .await
+            .expect("a later null must not violate an inferred NOT NULL");
+        assert_eq!(count(&sink, "fresh"), 3);
     }
 }
 
@@ -467,5 +652,20 @@ mod schema_qualified_tests {
             split_table("db.analytics.events"),
             (Some("db.analytics"), "events")
         );
+    }
+
+    /// Every inferred base type must have a DuckDB keyword. A wrong keyword
+    /// here silently creates a column of the wrong type on first write, and
+    /// the data is only found to be mistyped much later.
+    #[test]
+    fn every_base_type_maps_to_a_duckdb_keyword() {
+        use faucet_core::SqlBaseType;
+        assert_eq!(duckdb_keyword(SqlBaseType::Integer), "BIGINT");
+        assert_eq!(duckdb_keyword(SqlBaseType::Double), "DOUBLE");
+        assert_eq!(duckdb_keyword(SqlBaseType::Boolean), "BOOLEAN");
+        assert_eq!(duckdb_keyword(SqlBaseType::Text), "TEXT");
+        // Nested values are serialised as JSON text by the writer, so the
+        // column must be TEXT and not a DuckDB JSON type.
+        assert_eq!(duckdb_keyword(SqlBaseType::Json), "TEXT");
     }
 }

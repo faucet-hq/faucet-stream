@@ -11,7 +11,6 @@
 //! a deliberately separate family from the REST `gcp-bigquery-client` used for
 //! the query path; it is only compiled with the `arrow` feature.
 
-use crate::config::BigQuerySourceConfig;
 use crate::stream::BigQuerySource;
 use arrow::array::RecordBatch;
 use faucet_core::columnar::ColumnarPage;
@@ -114,8 +113,9 @@ async fn build_environment(auth: &BigQueryCredentials) -> Result<Environment, Fa
 
 /// Open a read session for the configured table and stream its Arrow batches.
 fn read_batches(
-    cfg: &BigQuerySourceConfig,
+    src: &BigQuerySource,
 ) -> impl Stream<Item = Result<RecordBatch, FaucetError>> + Send + '_ {
+    let cfg = src.config();
     async_stream::try_stream! {
         let env = build_environment(&cfg.auth).await?;
         let cm = ConnectionManager::new(
@@ -129,7 +129,14 @@ fn read_batches(
         .map_err(|e| FaucetError::Source(format!("BigQuery Storage Read connect: {e}")))?;
         let mut client = BigQueryReadClient::new(cm.conn()).max_decoding_message_size(MAX_DECODE_BYTES);
 
-        let table = resolve_table(&cfg.project_id, cfg.read_table.as_deref())?;
+        // Either a table named outright, or — new in #621 — the destination
+        // table of the configured SQL. Without the second, arbitrary SQL fell
+        // back to `getQueryResults` REST JSON and never saw the fast gRPC
+        // Arrow path, which is precisely where a large result needs it.
+        let table = match cfg.read_table.as_deref() {
+            Some(t) if !t.is_empty() => resolve_table(&cfg.project_id, Some(t))?,
+            _ => src.query_destination_table().await?,
+        };
         let read_options = TableReadOptions {
             selected_fields: cfg.selected_fields.clone(),
             row_restriction: cfg.row_restriction.clone().unwrap_or_default(),
@@ -153,36 +160,59 @@ fn read_batches(
             .map_err(|e| FaucetError::Source(format!("BigQuery CreateReadSession failed: {e}")))?
             .into_inner();
 
-        let mut schema_bytes: Option<Vec<u8>> = None;
+        // Read the session's streams **concurrently** (#621). `max_streams`
+        // asked BigQuery to shard the table, but the shards were then consumed
+        // one after another, so the request bought nothing: the read stayed as
+        // slow as a single stream.
+        //
+        // Unordered is correct here, not a shortcut: the Storage Read API
+        // explicitly gives no ordering guarantee across streams — that is what
+        // sharding means — so interleaving them changes nothing a caller could
+        // have relied on. `stream_concurrency` bounds how many are in flight,
+        // since each carries its own decode buffer.
+        let concurrency = cfg.stream_concurrency.max(1);
+        let mut readers = Vec::with_capacity(created.streams.len());
         for stream in &created.streams {
-            let rr = ReadRowsRequest { read_stream: stream.name.clone(), offset: 0 };
-            let mut responses = client
-                .read_rows(rr)
-                .await
-                .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows failed: {e}")))?
-                .into_inner();
-            while let Some(msg) = responses
-                .message()
-                .await
-                .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows stream error: {e}")))?
-            {
-                if let Some(Schema::ArrowSchema(s)) = msg.schema {
-                    schema_bytes = Some(s.serialized_schema);
-                }
-                if let Some(Rows::ArrowRecordBatch(rb)) = msg.rows {
-                    let sch = schema_bytes.as_deref().ok_or_else(|| {
-                        FaucetError::Source(
-                            "BigQuery Storage Read: record batch arrived before the Arrow schema"
-                                .into(),
-                        )
-                    })?;
-                    for batch in decode_arrow(sch, &rb.serialized_record_batch)? {
-                        if batch.num_rows() > 0 {
-                            yield batch;
+            let mut client = client.clone();
+            let name = stream.name.clone();
+            readers.push(Box::pin(async_stream::try_stream! {
+                let rr = ReadRowsRequest { read_stream: name, offset: 0 };
+                let mut responses = client
+                    .read_rows(rr)
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows failed: {e}")))?
+                    .into_inner();
+                // Per stream, not shared: each stream's messages carry their
+                // own schema, and a batch decoded against a neighbour's schema
+                // would be silently wrong rather than an error.
+                let mut schema_bytes: Option<Vec<u8>> = None;
+                while let Some(msg) = responses
+                    .message()
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("BigQuery ReadRows stream error: {e}")))?
+                {
+                    if let Some(Schema::ArrowSchema(s)) = msg.schema {
+                        schema_bytes = Some(s.serialized_schema);
+                    }
+                    if let Some(Rows::ArrowRecordBatch(rb)) = msg.rows {
+                        let sch = schema_bytes.as_deref().ok_or_else(|| {
+                            FaucetError::Source(
+                                "BigQuery Storage Read: record batch arrived before the Arrow schema"
+                                    .into(),
+                            )
+                        })?;
+                        for batch in decode_arrow(sch, &rb.serialized_record_batch)? {
+                            if batch.num_rows() > 0 {
+                                yield batch;
+                            }
                         }
                     }
                 }
-            }
+            }) as Pin<Box<dyn Stream<Item = Result<RecordBatch, FaucetError>> + Send>>);
+        }
+        let mut merged = futures::stream::iter(readers).flatten_unordered(Some(concurrency));
+        while let Some(batch) = merged.next().await {
+            yield batch?;
         }
     }
 }
@@ -193,7 +223,7 @@ pub fn stream_batches_arrow(
 ) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + '_>> {
     let cfg = src.config();
     Box::pin(async_stream::try_stream! {
-        let inner = read_batches(cfg);
+        let inner = read_batches(src);
         futures::pin_mut!(inner);
         while let Some(batch) = inner.next().await {
             yield ColumnarPage::new(batch?, None);
@@ -212,7 +242,7 @@ pub fn stream_pages_arrow(
     Box::pin(async_stream::try_stream! {
         let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
         let mut buffer: Vec<Value> = Vec::new();
-        let inner = read_batches(cfg);
+        let inner = read_batches(src);
         futures::pin_mut!(inner);
         while let Some(batch) = inner.next().await {
             let batch = batch?;

@@ -23,7 +23,7 @@ name: log-format-test
 pipeline:
   source:
     type: csv
-    config: {{ path: "{}", has_header: true }}
+    config: {{ path: "{}", has_headers: true }}
   sink:
     type: jsonl
     config: {{ path: "{}" }}

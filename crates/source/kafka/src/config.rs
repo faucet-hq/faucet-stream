@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KafkaSourceConfig {
     /// Comma-separated bootstrap server list, e.g. `"broker1:9092,broker2:9092"`.
     pub brokers: String,

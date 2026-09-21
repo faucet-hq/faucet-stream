@@ -29,6 +29,42 @@ pub struct ClickHouseSinkConfig {
     /// [`DEFAULT_BATCH_SIZE`].
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Create the target table if it does not exist, inferring the columns
+    /// from the first written page (#580). Enabled by default: a first-ever
+    /// sync cannot assume the destination already exists. The table is created
+    /// with the `MergeTree` engine and `ORDER BY tuple()` — the neutral choice
+    /// when faucet has no key to sort by; define the table yourself and set
+    /// `create_table: false` when the sort key matters, which it does for any
+    /// table you intend to query at scale.
+    ///
+    /// Every inferred column is `Nullable(…)`: a column present in page 1 is
+    /// not required forever, and ClickHouse rejects a null into a non-nullable
+    /// column, so inferring non-nullability would fail page 2.
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
+    /// Commit-group size for the cross-page accumulator (#617).
+    ///
+    /// Warehouse loads are dominated by per-operation overhead, and
+    /// `batch_size` can only ever *split* a page — it can never merge
+    /// undersized ones, so a small source page meant one expensive warehouse
+    /// operation per small page. Records now accumulate across `write_batch`
+    /// calls and commit once per threshold, plus once at `flush`.
+    ///
+    /// `None` (the default) accumulates the **whole run** into one commit.
+    /// Set it to bound how much is buffered, or to commit progressively on a
+    /// long run. `0` means the same as `None`.
+    ///
+    /// Only the append path accumulates: `delivery: exactly_once` and the DLQ
+    /// path commit per page, because a watermark must land with its own page
+    /// and a DLQ must report which rows of *this* page failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_rows: Option<usize>,
+    /// Estimated-bytes counterpart of [`commit_rows`](Self::commit_rows)
+    /// (#617). Rows are a poor proxy for how much work a warehouse commit is;
+    /// this bounds the buffered size. `None` (the default) removes the byte
+    /// threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_bytes: Option<usize>,
     /// Enable ClickHouse [asynchronous inserts](https://clickhouse.com/docs/en/optimize/asynchronous-inserts)
     /// (`async_insert=1`): the server buffers rows and flushes them in the
     /// background, which greatly improves throughput for many small inserts.
@@ -103,6 +139,10 @@ impl std::fmt::Debug for ClickHouseSinkConfig {
     }
 }
 
+fn default_create_table() -> bool {
+    true
+}
+
 impl ClickHouseSinkConfig {
     /// Build a config from a base URL and table, with defaults elsewhere.
     pub fn new(url: impl Into<String>, table: impl Into<String>) -> Self {
@@ -110,10 +150,19 @@ impl ClickHouseSinkConfig {
             connection: ClickHouseConnection::from_url(url),
             table: table.into(),
             batch_size: default_batch_size(),
+            create_table: default_create_table(),
+            commit_rows: None,
+            commit_bytes: None,
             async_insert: false,
             wait_for_async_insert: default_wait_for_async_insert(),
             staging: None,
         }
+    }
+
+    /// Opt out of auto-creating a missing target table (#580).
+    pub fn with_create_table(mut self, create: bool) -> Self {
+        self.create_table = create;
+        self
     }
 
     /// Set the per-request record count.

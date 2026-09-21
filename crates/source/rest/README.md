@@ -117,6 +117,7 @@ the secrets/redaction boundary like any other config string.
 |-------|------|---------|-------------|
 | `pagination` | `PaginationStyle` | `None` | Pagination strategy. See [Pagination](#pagination). |
 | `records_path` | string / null | `null` | JSONPath expression to extract the record array from each response body (e.g. `$.data[*]`). When unset, the whole body is treated as the record set. |
+| `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | `100` | Hard cap on pages fetched, across **all** pagination styles. `null` removes the cap (rely on the style's own termination). |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
@@ -467,15 +468,53 @@ async_job:
     records_path: "$.records[*]"
 ```
 
-Records are appended across pages; the loop stops when the locator header/body is missing, empty, or `"null"`.
+Records are appended across pages; the loop stops when the locator header/body is missing, empty, or matches one of `locator_terminal_values` (default `["null"]` — the Salesforce Bulk sentinel). An API that signals completion differently sets its own list, without a code change:
+
+```yaml
+    locator_terminal_values: ["EOF", "-1"]   # replaces the default, does not extend it
+```
+
+#### Routing small objects off the async job (`sync_below_rows`)
+
+A bulk API pays a fixed async floor — job queue plus processing — whatever the
+row count; measured at ~14s of a 22s, 701-row run. A synchronous query answers
+the same request immediately. Bulk stays right for the large objects it exists
+for, so make the choice per run from a cheap count probe rather than from a
+guess baked into the config:
+
+```yaml
+pagination: { style: none }          # or whatever the *synchronous* read needs
+records_path: "$.records[*]"
+path: /services/data/v60.0/query
+params: { q: "SELECT Id, Name FROM Account" }
+
+async_job:
+  # …submit / poll / status / fetch, used for large objects…
+  sync_below_rows: 50000
+  count:
+    url: /services/data/v60.0/query
+    query: { q: "SELECT COUNT() FROM Account" }
+    count_path: "$.totalSize"
+```
+
+Below the threshold the job is **never submitted** — the point is not paying
+its latency, which a submitted-then-discarded job would still cost — and the
+source's own `path` / `params` / `pagination` describe the read instead. Both
+keys are required together: a threshold with no probe can never fire and a
+probe with no threshold is never read, so either alone is rejected at config
+load. A probe that *fails* is not fatal — it logs and uses the job, which is
+always correct, just slower.
 
 #### Incremental replication with `async_job`
 
 Set `replication_method: { type: Incremental }` + `replication_key` and the
 source pushes the bookmark down into the job itself: the resumed bookmark is
-injected as `WHERE <replication_key> > <bookmark>` into the **top-level string
-`query` of `submit.json`** (wrapping any existing `WHERE`, before trailing
-clauses; subqueries and quoted literals are left alone). That `query` field is
+injected as `WHERE <replication_key> > <bookmark>` into the **statement inside
+`submit.json`** (wrapping any existing `WHERE`, before trailing clauses;
+subqueries and quoted literals are left alone). `query_path` says where that
+statement lives — an RFC 6901 JSON Pointer, default `/query`, so an API whose
+body reads `{"request": {"sql": "…"}}` sets `query_path: /request/sql` instead
+of losing push-down silently. A statement at the configured path is
 **required** for this mode — without one the predicate could never apply, so
 the config is rejected at validate time rather than silently exporting
 full-table on every run. `replication_bind` is mutually exclusive with
@@ -496,7 +535,12 @@ async_job:
   submit: { method: POST, url: /jobs, json: { operation: query, query: "SELECT Id FROM Lead" } }
   # …job_id / poll / status / fetch…
   lookback: 15m        # optional; default 5m
+  query_path: /query   # optional; where the statement sits in submit.json
 ```
+
+The same pointer names the dataset for catalog and lineage, so pointing it at
+the real statement is what keeps one object per dataset rather than every
+object collapsing onto one.
 
 #### Native byte passthrough (#633)
 
@@ -522,7 +566,7 @@ exactly-once delivery falls back to the ordinary record path.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `partitions` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per partition and concatenates results. Empty = run once with no substitution. |
-| `partition_concurrency` | int / null | `null` | Max partitions fetched concurrently. `null` = sequential. |
+| `partition_concurrency` | int / null | `null` | Max partitions fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the partitions' pages **interleave** — partitions are disjoint and the bookmark is a max across them, so only page order changes. |
 
 ## Authentication
 
@@ -813,7 +857,7 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 ## How it works
 
 1. `new()` resolves the auth method and builds the `reqwest` client **once**, reusing it for every request and partition.
-2. For each partition, `{key}` placeholders in `path` are substituted from the context map; with `partition_concurrency` set, partitions run concurrently.
+2. For each partition, `{key}` placeholders in `path` are substituted from the context map; with `partition_concurrency > 1`, partitions run concurrently and their pages interleave.
 3. Each page request is wrapped in the retry layer: transient failures back off exponentially with jitter (capped at 60 s); `429` honours `Retry-After`.
 4. Records are extracted from the response body via `records_path` (JSONPath); the pagination style decides the next request and when to stop.
 5. In `Incremental` mode, records at or before the bookmark are filtered out and the max replication-key value becomes the new bookmark, carried on the final page.

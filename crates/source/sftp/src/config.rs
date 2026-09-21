@@ -18,6 +18,46 @@ pub enum SftpFormat {
     JsonArray,
     /// Each file becomes a single record with `"path"` and `"content"` fields.
     RawText,
+    /// Delimited text, decoded through [`faucet_core::file_format`] so the
+    /// records match what every other connector produces for the same file.
+    /// Dialect from [`csv`](SftpSourceConfig::csv). Requires
+    /// `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, decoded to the compact element→object mapping. The repeated
+    /// element is named by [`xml`](SftpSourceConfig::xml). Requires
+    /// `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet and header row from
+    /// [`excel`](SftpSourceConfig::excel). **Buffered whole** — a workbook is
+    /// a zip container whose directory sits at the end. Requires
+    /// `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl SftpFormat {
+    /// The shared format this variant maps onto, or `None` for `RawText`,
+    /// whose `{path, content}` envelope is the connector's own shape.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::Jsonl => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            Self::RawText => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
 }
 
 /// Configuration for the SFTP source connector.
@@ -56,6 +96,15 @@ pub struct SftpSourceConfig {
     /// `0` is treated as `1`.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet selection, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_batch_size() -> usize {
@@ -77,6 +126,22 @@ impl SftpSourceConfig {
             format: SftpFormat::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             concurrency: default_concurrency(),
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
+        }
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::decode`] wants.
+    ///
+    /// Not feature-gated: `fetch` takes it on every path, so it is built even
+    /// when no format feature is on (where it is simply unused).
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
         }
     }
 
@@ -260,5 +325,67 @@ mod tests {
             "a single `?` matches exactly one char"
         );
         assert!(!glob_match("?", ""), "a single `?` needs a char");
+    }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Each variant maps onto the one shared format every other file
+    /// connector uses for the same bytes. The connector-owned shapes map to
+    /// `None` so they are never routed through the shared decoder — raw text
+    /// keeps this connector's own envelope.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn formats_map_onto_the_shared_vocabulary_or_opt_out() {
+        assert_eq!(
+            SftpFormat::Jsonl.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            SftpFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        assert_eq!(SftpFormat::RawText.shared(), None);
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(SftpFormat::Csv.shared(), Some(faucet_core::FileFormat::Csv));
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(SftpFormat::Xml.shared(), Some(faucet_core::FileFormat::Xml));
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            SftpFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+    }
+
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn the_format_option_blocks_reach_the_decoder() {
+        let mut cfg =
+            SftpSourceConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/p");
+        cfg.csv = faucet_core::CsvOptions {
+            delimiter: "\\t".into(),
+            has_headers: false,
+        };
+        cfg.excel = faucet_core::ExcelOptions {
+            sheet: Some("Q3".into()),
+            header_row: 1,
+        };
+        cfg.xml = faucet_core::XmlOptions {
+            record_element: "order".into(),
+            root_element: "orders".into(),
+        };
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter_byte().expect("tab"), b'\t');
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Q3"));
+        assert_eq!(opts.excel.header_row, 1);
+        assert_eq!(opts.xml.record_element, "order");
     }
 }

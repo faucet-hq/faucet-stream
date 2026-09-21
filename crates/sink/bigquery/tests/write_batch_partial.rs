@@ -106,7 +106,12 @@ async fn build_sink(
         TABLE_ID,
         BigQueryCredentials::ApplicationDefault, // unused: from_parts bypasses auth
     )
-    .with_batch_size(batch_size);
+    .with_batch_size(batch_size)
+    // This file asserts the `insertAll` envelope and its per-row error
+    // handling. `write_batch_partial` takes that path regardless (a DLQ needs
+    // row isolation), but the plain `write_batch` cases here would otherwise
+    // take the load path that became the default in #612.
+    .with_media_load(false);
 
     (BigQuerySink::from_parts(config, client), sa_file)
 }

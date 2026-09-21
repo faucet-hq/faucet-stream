@@ -188,8 +188,12 @@ async fn auto_map_into_missing_table_errors_with_no_columns() {
     // surfacing the typed "no columns or does not exist" error.
     let (_container, url) = start_postgres().await;
 
+    // `create_table` defaults on since #580, so the sink would create the
+    // table rather than fail. Pinned off here because the missing-table error
+    // path is exactly what this test covers.
     let config = PostgresSinkConfig::new(&url, "does_not_exist")
         .column_mapping(PostgresColumnMapping::AutoMap)
+        .with_create_table(false)
         .with_batch_size(0);
     let sink = PostgresSink::new(config).await.expect("sink new");
 
@@ -199,8 +203,9 @@ async fn auto_map_into_missing_table_errors_with_no_columns() {
         .expect_err("missing table must error");
     let msg = err.to_string();
     assert!(
-        msg.contains("no columns or does not exist"),
-        "must surface the missing-table error; got: {msg}"
+        msg.contains("does not exist") && msg.contains("create_table"),
+        "the refusal must name the missing target and the knob that would \
+         create it (#580); got: {msg}"
     );
 }
 

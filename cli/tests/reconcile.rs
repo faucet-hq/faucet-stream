@@ -31,6 +31,7 @@ fn opts_with_reconcile(reconcile: Option<ReconcileSpec>) -> ExecuteOptions {
         pipeline_name: "recon_test".into(),
         run_id: None,
         execution: None,
+        concurrency: None,
         dry_run: false,
         limit: None,
         state_path_override: None,

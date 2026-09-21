@@ -143,6 +143,7 @@ impl KinesisSink {
         &self,
         mut pending: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
+        let retry_cfg = self.config.retry_spec();
         let mut outcomes: BTreeMap<usize, Result<(), FaucetError>> = BTreeMap::new();
         let mut attempt = 0usize;
         loop {
@@ -179,7 +180,7 @@ impl KinesisSink {
                                 outcomes.insert(entry.index, Ok(()));
                             }
                             Some(code) => {
-                                if attempt + 1 < self.config.retry_max_attempts {
+                                if attempt + 1 < retry_cfg.max_attempts {
                                     retry.push(entry.clone());
                                 } else {
                                     outcomes.insert(
@@ -187,7 +188,7 @@ impl KinesisSink {
                                         Err(FaucetError::Sink(format!(
                                             "kinesis: record rejected after {} attempts: \
                                              {code}: {}",
-                                            self.config.retry_max_attempts,
+                                            retry_cfg.max_attempts,
                                             result.error_message().unwrap_or("(no message)")
                                         ))),
                                     );
@@ -200,8 +201,8 @@ impl KinesisSink {
                     }
                     attempt += 1;
                     let delay = backoff_delay(
-                        self.config.retry_initial_backoff_ms,
-                        self.config.retry_max_backoff_ms,
+                        retry_cfg.initial_backoff_ms,
+                        retry_cfg.max_backoff_ms,
                         attempt,
                     );
                     tracing::debug!(
@@ -217,15 +218,15 @@ impl KinesisSink {
                 Err(err) => {
                     attempt += 1;
                     let service = err.into_service_error();
-                    if attempt >= self.config.retry_max_attempts {
+                    if attempt >= retry_cfg.max_attempts {
                         return Err(FaucetError::Sink(format!(
                             "kinesis: PutRecords to '{}' failed after {} attempts: {service}",
-                            self.config.stream_name, self.config.retry_max_attempts
+                            self.config.stream_name, retry_cfg.max_attempts
                         )));
                     }
                     let delay = backoff_delay(
-                        self.config.retry_initial_backoff_ms,
-                        self.config.retry_max_backoff_ms,
+                        retry_cfg.initial_backoff_ms,
+                        retry_cfg.max_backoff_ms,
                         attempt,
                     );
                     tracing::warn!(

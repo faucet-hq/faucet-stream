@@ -17,6 +17,9 @@ fn args_on(port: u16, token: Option<&str>) -> ServeArgs {
         listen: format!("127.0.0.1:{port}"),
         auth_token: token.map(|t| t.to_string()),
         auth_config: None,
+        read_token: None,
+        write_token: None,
+        admin_token: None,
         no_auth: token.is_none(),
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
@@ -56,7 +59,10 @@ async fn spawn_server(port: u16, token: Option<&str>) {
         let _ = faucet_cli::serve::run_server(config, Default::default()).await;
     });
     let client = reqwest::Client::new();
-    for _ in 0..100 {
+    // 30s: this polls a server starting up next to the whole
+    // workspace test suite, so the budget has to survive a loaded
+    // runner. Costs nothing when it is already up.
+    for _ in 0..1200 {
         if client
             .get(format!("http://127.0.0.1:{port}/healthz"))
             .send()

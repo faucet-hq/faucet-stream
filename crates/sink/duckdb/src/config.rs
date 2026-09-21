@@ -25,6 +25,7 @@ impl Default for DuckdbColumnMapping {
 
 /// Configuration for the DuckDB sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DuckdbSinkConfig {
     /// Path to the DuckDB database file, or `:memory:`. A `duckdb://` /
     /// `duckdb:` scheme prefix is accepted and stripped. The target table must
@@ -40,10 +41,21 @@ pub struct DuckdbSinkConfig {
     /// upstream slice as a single multi-row INSERT (no re-chunking).
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Create the target table if it does not exist, inferring the columns
+    /// from the first written page (#580). Enabled by default: a first-ever
+    /// sync cannot assume the destination already exists. Every inferred
+    /// column is created nullable. Set `false` to require the table to
+    /// pre-exist and fail fast when it is missing.
+    #[serde(default = "default_create_table")]
+    pub create_table: bool,
 }
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE
+}
+
+fn default_create_table() -> bool {
+    true
 }
 
 impl DuckdbSinkConfig {
@@ -54,7 +66,14 @@ impl DuckdbSinkConfig {
             table_name: table_name.into(),
             column_mapping: DuckdbColumnMapping::default(),
             batch_size: DEFAULT_BATCH_SIZE,
+            create_table: default_create_table(),
         }
+    }
+
+    /// Opt out of auto-creating a missing target table (#580).
+    pub fn with_create_table(mut self, create: bool) -> Self {
+        self.create_table = create;
+        self
     }
 
     /// Set the column mapping strategy.

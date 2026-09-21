@@ -42,7 +42,7 @@ cargo install faucet-cli --no-default-features \
 | `faucet backfill <config> --from A --to B [--window W] [--resume]` | Replay a bounded historical window as resumable, bookmark-isolated window units (`${backfill.*}` tokens scope the source; durable progress marker; `--dry-run` to preview; bookmark mode via `--from-bookmark`). `faucet schema backfill` prints the defaults-block schema. Exits with the failed-unit count. |
 | `faucet schedule <config> [--once]` | Run a pipeline on a cron schedule (long-running foreground process). Requires a `schedule:` block. |
 | `faucet catalog datasets\|show\|lineage [--config C] [--json]` | Browse the Data Movement Catalog accumulated by a config's `catalog:` store: dataset list, per-dataset schema timeline / volume / edges, and the lineage graph. Requires the `catalog` build feature. `faucet schema catalog` prints the block's JSON Schema. |
-| `faucet template register\|list\|show\|launch\|rollback\|deprecate\|promote\|delete\|run --store URL` | Register a config declaring `params:` **once**, then trigger runs by id + `--param name=value`. Versions auto-increment and a register **moves nobody** — `launch` is the one step that changes what an unpinned run gets (`rollback` re-launches the previous one), so a template is `draft` until launched, then `launched`, and `deprecated` once retired. Three channels are derived (`stable` = the launched version and the default selector, `previous`, `newest`); six are assignable with `--tag` (`dev`/`test`/`staging`/`pre-prod`/`canary`/`prod`). `--version <n\|channel>` selects one. Point `faucet serve --history` at the same store and the same templates are triggerable over HTTP/MCP/the web console. Requires the `templates` build feature. `faucet schema params` prints one param entry's JSON Schema. |
+| `faucet template register\|list\|show\|launch\|rollback\|deprecate\|promote\|delete\|run\|test --store URL` | Register a config declaring `params:` **once**, then trigger runs by id + `--param name=value`. Versions auto-increment and a register **moves nobody** — `launch` is the one step that changes what an unpinned run gets (`rollback` re-launches the previous one), so a template is `draft` until launched, then `launched`, and `deprecated` once retired. Three channels are derived (`stable` = the launched version and the default selector, `previous`, `newest`); six are assignable with `--tag` (`dev`/`test`/`staging`/`pre-prod`/`canary`/`prod`). `--version <n\|channel>` selects one. Point `faucet serve --history` at the same store and the same templates are triggerable over HTTP/MCP/the web console. Requires the `templates` build feature. `faucet template test <suite>` sweeps a template's parameter space offline (no registry needed when the suite's `template:` is a config path). `faucet schema params` / `faucet schema template-test` print the JSON Schemas. |
 | `faucet completions <bash\|zsh\|fish\|powershell\|elvish>` | Print a shell tab-completion script. For registry- and config-aware **dynamic** completion, enable the `COMPLETE` hook instead (see [`faucet completions`](#faucet-completions)). |
 | `faucet migrate [config] [--check\|--stdout]` | Upgrade an old-grammar config to the current shape in place (idempotent): wraps top-level `source:`/`sink:` into `pipeline:`, folds legacy `auth`/`credentials` into `{ type, config }`. `--check` exits non-zero if a migration is needed (CI); `--stdout` previews without writing. |
 | `faucet doctor --offline [config]` | Static, credential-free config lints (no network): dangling / unreferenced `auth:` providers, unused `vars:`, no-op sink `batch_size: 0`. Exits non-zero on any lint error. |
@@ -1149,6 +1149,7 @@ params:
   since:     { default: "1970-01-01" }        # type defaults to string
   page_size: { type: int, default: 500 }
   api_token: { required: true, secret: true } # redacted everywhere, never persisted
+  region:    { default: us, values: [us, eu, apac] }  # closed set: anything else is rejected
 pipeline:
   source:
     type: rest
@@ -1169,12 +1170,29 @@ to the declared type, so CLI and HTTP behave identically. A missing `required`
 param, a type mismatch, an undeclared `--param`, or an undeclared `${param.x}`
 reference is an error naming the param.
 
+`values:` declares a closed set: a value outside it is rejected at bind time
+naming the alternatives, instead of binding happily and failing downstream. It
+also makes the axis enumerable, which is what `faucet template test`'s
+`auto.enum_coverage` sweeps.
+
 `--param-env NAME[=VALUE]` overrides an environment variable for one run's
 `${env:VAR}` resolution without mutating the process environment. Always
 available (no build feature); `faucet schema params` prints one entry's JSON
 Schema. To register a parameterized config once and trigger it by id, see
 `faucet template` and
 [Parameters & pipeline templates](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html).
+
+`faucet template test <suite>` sweeps a template's whole parameter space
+offline — each case materializes the template as a real trigger would, then
+expands it and compiles its transform chain. Cases come from hand-written
+`cases:`, a generated `combine:` product (`exclude:`, all-pairs `pairwise:`), and
+`auto:` cases derived from the template's own `params:`; an optional
+`behavioral:` block runs fixture records through the real pipeline with `faucet
+test`'s matchers. When the suite's `template:` is a config **path** no registry
+is involved, so a template can be tested before it is ever registered. Exit code
+is the failed-case count. Example:
+[`examples/tests/template_suite.yaml`](examples/tests/template_suite.yaml);
+`faucet schema template-test` prints the suite schema.
 
 ### Transforms
 

@@ -20,10 +20,52 @@ pub enum GcsSinkFormat {
     /// (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     Parquet,
+    /// A single JSON array per object.
+    JsonArray,
+    /// Delimited text. Columns are the union of every record's keys; dialect
+    /// from [`csv`](GcsSinkConfig::csv). Requires `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, one element per record. Framing from
+    /// [`xml`](GcsSinkConfig::xml). Requires `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet name from [`excel`](GcsSinkConfig::excel).
+    /// Requires `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl GcsSinkFormat {
+    /// The shared format this variant maps onto, or `None` for Parquet, which
+    /// is columnar and has its own Arrow writer.
+    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            #[cfg(feature = "arrow")]
+            Self::Parquet => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
+
+    /// Whether an object of this format can be built one record at a time.
+    ///
+    /// Only JSON Lines can: every other format has a header, a wrapper, or a
+    /// container index, so its records must be buffered and encoded together.
+    pub(crate) fn appends_per_record(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
 }
 
 /// Configuration for the GCS sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GcsSinkConfig {
     /// GCS bucket name.
     pub bucket: String,
@@ -43,6 +85,17 @@ pub struct GcsSinkConfig {
     /// Hard cap on records per uploaded object. `None` means a single
     /// object per `write_batch` call (still subject to `batch_size`).
     pub max_records_per_file: Option<usize>,
+    /// Maximum **bytes** per object before rolling to a new one (#618).
+    ///
+    /// Rows are a poor proxy for object size, so a rows-only cap either writes
+    /// tiny objects for narrow data or unbounded ones for wide data. This is
+    /// also what bounds peak memory: the open object's body is buffered until
+    /// it rolls. Counted on the uncompressed body, before any `compression`
+    /// codec, so the threshold means the same thing whatever the codec.
+    /// `None` (the default) removes the byte cap. A single record larger than
+    /// the cap still gets its own object rather than being split or dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<usize>,
     /// Maximum number of concurrent uploads (default 10).
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -63,6 +116,15 @@ pub struct GcsSinkConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet name, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_file_extension() -> String {
@@ -84,12 +146,44 @@ impl GcsSinkConfig {
             auth: GcsCredentials::default(),
             file_extension: default_file_extension(),
             max_records_per_file: None,
+            max_bytes_per_file: None,
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
             storage_host: None,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::Auto,
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
         }
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::encode`] wants.
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
+        }
+    }
+
+    /// Set the CSV dialect used when `format: csv` (#604).
+    pub fn csv(mut self, csv: faucet_core::CsvOptions) -> Self {
+        self.csv = csv;
+        self
+    }
+
+    /// Set the worksheet name used when `format: xlsx` (#604).
+    pub fn excel(mut self, excel: faucet_core::ExcelOptions) -> Self {
+        self.excel = excel;
+        self
+    }
+
+    /// Set the record framing used when `format: xml` (#604).
+    pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
+        self.xml = xml;
+        self
     }
 
     pub fn prefix(mut self, p: impl Into<String>) -> Self {
@@ -110,6 +204,12 @@ impl GcsSinkConfig {
         self.file_extension = ext.into();
         self
     }
+    pub fn max_bytes_per_file(mut self, n: usize) -> Self {
+        self.max_bytes_per_file = Some(n);
+        self
+    }
+
+    /// Set the per-object record cap.
     pub fn max_records_per_file(mut self, n: usize) -> Self {
         self.max_records_per_file = Some(n);
         self
@@ -248,5 +348,101 @@ mod tests {
         assert_eq!(GcsSinkConfig::new("b").format, GcsSinkFormat::JsonLines);
         let cfg = GcsSinkConfig::new("b").format(GcsSinkFormat::Parquet);
         assert_eq!(cfg.format, GcsSinkFormat::Parquet);
+    }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// GCS is excluded from coverage on its I/O files (no gRPC-compatible
+    /// emulator, #220), which makes its *pure* logic the only part that can
+    /// be verified at all — so it is verified here rather than left to the
+    /// exclusion to hide.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            GcsSinkFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            GcsSinkFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(
+            GcsSinkFormat::Csv.shared(),
+            Some(faucet_core::FileFormat::Csv)
+        );
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(
+            GcsSinkFormat::Xml.shared(),
+            Some(faucet_core::FileFormat::Xml)
+        );
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            GcsSinkFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+        // Parquet is columnar and owns its own Arrow writer, so it opts out
+        // of the record encoder entirely.
+        #[cfg(feature = "arrow")]
+        assert_eq!(GcsSinkFormat::Parquet.shared(), None);
+    }
+
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(GcsSinkFormat::JsonLines.appends_per_record());
+        assert!(!GcsSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(GcsSinkFormat::default(), GcsSinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!GcsSinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!GcsSinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!GcsSinkFormat::Xlsx.appends_per_record());
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = GcsSinkConfig::new("b")
+            .format(GcsSinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, GcsSinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
+    }
+
+    /// Both rollover caps are opt-in and independent (#618): setting one must
+    /// not disturb the other, or an operator asking for a byte cap silently
+    /// gets a record cap too.
+    #[test]
+    fn the_rollover_caps_are_independent_and_default_to_unset() {
+        let base = GcsSinkConfig::new("b");
+        assert_eq!(base.max_bytes_per_file, None);
+        assert_eq!(base.max_records_per_file, None);
+
+        let bytes_only = GcsSinkConfig::new("b").max_bytes_per_file(4096);
+        assert_eq!(bytes_only.max_bytes_per_file, Some(4096));
+        assert_eq!(bytes_only.max_records_per_file, None);
+
+        let both = GcsSinkConfig::new("b")
+            .max_bytes_per_file(4096)
+            .max_records_per_file(10);
+        assert_eq!(both.max_bytes_per_file, Some(4096));
+        assert_eq!(both.max_records_per_file, Some(10));
     }
 }

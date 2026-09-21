@@ -17,6 +17,7 @@ fn opts() -> ExecuteOptions {
         pipeline_name: "disc_test".into(),
         run_id: None,
         execution: None,
+        concurrency: None,
         dry_run: false,
         limit: None,
         state_path_override: None,

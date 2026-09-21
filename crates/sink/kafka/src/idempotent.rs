@@ -72,10 +72,11 @@ pub(crate) async fn ensure_commit_topic(
     let admin: AdminClient<DefaultClientContext> = base
         .create()
         .map_err(|e| FaucetError::Sink(format!("kafka admin client init: {e}")))?;
+    let eo = config.exactly_once_spec();
     let topic = NewTopic::new(
-        &config.commit_token_topic,
-        config.commit_token_topic_partitions,
-        TopicReplication::Fixed(config.commit_token_topic_replication),
+        &eo.commit_token_topic,
+        eo.commit_token_topic_partitions,
+        TopicReplication::Fixed(eo.commit_token_topic_replication),
     )
     .set("cleanup.policy", "compact");
     let results = admin
@@ -119,7 +120,7 @@ pub(crate) async fn read_last_token(
     // what `poll` delivers. librdkafka defaults to this, but it is load-bearing
     // for exactly-once correctness, so pin it explicitly.
     cfg.set("isolation.level", "read_committed");
-    let topic = config.commit_token_topic.clone();
+    let topic = config.exactly_once_spec().commit_token_topic;
     let scope = scope.to_string();
     let timeout = config.message_timeout;
 
@@ -407,6 +408,7 @@ mod tests {
             max_in_flight: 100,
             queue_full_backoff: Duration::from_millis(100),
             queue_full_max_retries: 3,
+            exactly_once: None,
             transactional_id_prefix: None,
             commit_token_topic: "__faucet_commit_token".into(),
             commit_token_topic_partitions: 1,

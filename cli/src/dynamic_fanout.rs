@@ -60,23 +60,27 @@ pub async fn resolve_dynamic_fanout(cfg: &mut PipelineConfig, auth: &AuthCatalog
     Ok(())
 }
 
-/// The block driving fan-out — a `discovery:` recipe or an `odata:` block —
-/// whichever carries `fan_out: true`. Returned so the caller can read `emit.sink_ref`
-/// from the same block that opted in.
+/// The block driving fan-out: **any** top-level connector-config block carrying
+/// `fan_out: true`. Returned so the caller can read `emit.sink_ref` from the
+/// same block that opted in.
+///
+/// The opt-in is the key, not the block's name (#654 M22). This used to scan a
+/// closed `["discovery", "odata"]` list, so a third discovery-capable source
+/// needed an edit in generic CLI machinery to be usable at all — a vendor-shaped
+/// dependency with no vendor named. Blocks are visited in sorted order so the
+/// choice is deterministic when a config opts in twice.
 fn fanout_block(spec: &ConnectorSpec) -> Option<&Value> {
-    for key in ["discovery", "odata"] {
-        if let Some(block) = spec.config.get(key)
-            && block.get("fan_out").and_then(Value::as_bool) == Some(true)
-        {
-            return Some(block);
-        }
-    }
-    None
+    let obj = spec.config.as_object()?;
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort_unstable();
+    keys.into_iter()
+        .map(|k| &obj[k])
+        .find(|block| block.get("fan_out").and_then(Value::as_bool) == Some(true))
 }
 
 /// Find a source template (named `sources.*`, or the singular `source`
-/// registered as `default`) whose config opts into fan-out via
-/// `discovery.fan_out` or `odata.fan_out`.
+/// registered as `default`) whose config opts into fan-out — any block with
+/// `fan_out: true`.
 fn find_fanout_source(cfg: &PipelineConfig) -> Option<(String, ConnectorSpec)> {
     // Prefer a named template; fall back to the singular default source.
     for (name, spec) in &cfg.pipeline.sources {

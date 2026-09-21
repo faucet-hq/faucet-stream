@@ -129,3 +129,81 @@ async fn server_error_surfaces() {
         "{err}"
     );
 }
+
+/// #624 — a whole-file CSV download must reach the pipeline as **bounded**
+/// pages, not one page holding the entire sheet.
+///
+/// The bytes are inherently whole (there is no ranged parse of a CSV over
+/// HTTP), but the parsed `Vec<Value>` — which is where the 15–20× JSON
+/// overhead lives — does not have to be.
+#[tokio::test]
+async fn a_large_csv_file_arrives_as_bounded_pages() {
+    use futures::StreamExt as _;
+
+    let mut body = String::from("id,name\n");
+    for i in 0..250 {
+        body.push_str(&format!("{i},row-{i}\n"));
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/big.csv"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let mut c = cfg(&server, "/big.csv");
+    c.response_format = ResponseFormat::Csv;
+    let stream = RestStream::new(c).unwrap();
+
+    let ctx = std::collections::HashMap::new();
+    let mut pages = <RestStream as faucet_core::Source>::stream_pages(&stream, &ctx, 100);
+    let mut sizes = Vec::new();
+    let mut records = Vec::new();
+    while let Some(page) = pages.next().await {
+        let page = page.unwrap();
+        if page.records.is_empty() {
+            continue; // a trailing bookmark-only checkpoint
+        }
+        sizes.push(page.records.len());
+        records.extend(page.records);
+    }
+
+    assert_eq!(
+        sizes,
+        vec![100, 100, 50],
+        "250 rows at batch_size 100 must arrive as bounded pages, not one page \
+         of 250 — sizes were {sizes:?}"
+    );
+    assert_eq!(records.len(), 250, "no row lost at a chunk boundary");
+    assert_eq!(records[0]["name"], "row-0");
+    assert_eq!(records[249]["name"], "row-249");
+}
+
+/// The `0` sentinel keeps the whole-file-in-one-page behaviour, so a config
+/// that deliberately wants one page still gets it.
+#[tokio::test]
+async fn a_zero_batch_size_keeps_the_file_in_one_page() {
+    use futures::StreamExt as _;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/small.csv"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CSV))
+        .mount(&server)
+        .await;
+
+    let mut c = cfg(&server, "/small.csv");
+    c.response_format = ResponseFormat::Csv;
+    let stream = RestStream::new(c).unwrap();
+
+    let ctx = std::collections::HashMap::new();
+    let mut pages = <RestStream as faucet_core::Source>::stream_pages(&stream, &ctx, 0);
+    let mut sizes = Vec::new();
+    while let Some(page) = pages.next().await {
+        let page = page.unwrap();
+        if !page.records.is_empty() {
+            sizes.push(page.records.len());
+        }
+    }
+    assert_eq!(sizes, vec![2]);
+}

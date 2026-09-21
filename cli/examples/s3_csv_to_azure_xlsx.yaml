@@ -1,0 +1,58 @@
+# Uniform file formats across every file connector (#604).
+#
+# The same format vocabulary — csv / json_lines / json_array / xml / xlsx /
+# parquet / raw_text — on S3, GCS, Azure Blob and SFTP, source *and* sink, with
+# the same option blocks. Read a CSV export out of one store and hand a
+# spreadsheet to the team that asked for one, without a script in between.
+#
+#   faucet validate cli/examples/s3_csv_to_azure_xlsx.yaml
+#
+# Needs a build with the format features (included in `--features full`):
+#
+#   cargo install faucet-cli --features "source-s3,sink-azure-blob,file-formats"
+#
+# Only `json_lines` is built a record at a time; every other format has a
+# header, a document element or a container index, so its records are buffered
+# and encoded together at the rollover — bounded here by `max_records_per_file`.
+version: 1
+name: exports-to-workbook
+
+pipeline:
+  source:
+    type: s3
+    config:
+      bucket: acme-exports
+      prefix: orders/daily/
+      region: us-east-1
+      file_format: csv
+      # Resolved per object key, so one run can read a mix of `.csv` and
+      # `.csv.gz`. Format and codec are independent.
+      compression: auto
+      csv:
+        delimiter: ","
+        # `false` would name the fields column_0, column_1, …
+        has_headers: true
+      batch_size: 5000
+
+  # CSV is a text format: every value arrives as a string. Cast the ones the
+  # spreadsheet should hold as numbers, so they land as numbers in the cells.
+  transforms:
+    - type: cast
+      config:
+        fields:
+          quantity: int
+          amount: float
+        on_error: "null"
+
+  sink:
+    type: azure-blob
+    config:
+      container: reports
+      prefix: orders/
+      format: xlsx
+      file_extension: .xlsx
+      excel:
+        sheet: Orders
+      # A workbook is a zip container decoded whole, so this is the real memory
+      # bound — not just an object-size preference.
+      max_records_per_file: 50000

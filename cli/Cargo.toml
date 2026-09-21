@@ -28,7 +28,7 @@ default = ["observability", "source", "sink", "state", "transforms", "compressio
 
 # Everything the default build ships, plus the long-running runtime modes:
 # `schedule` (cron scheduler) and `serve` (HTTP control plane).
-full = ["default", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "source-rest-excel", "source-xml-excel"]
+full = ["default", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "source-rest-excel", "source-xml-excel", "file-formats"]
 
 # Data Movement Catalog (#279): the `catalog:` config block + post-run
 # recording (datasets, schema timelines, volume/freshness stats, lineage
@@ -240,6 +240,41 @@ compression = [
     "faucet-source-azure-blob?/compression",
     "faucet-sink-azure-blob?/compression",
 ]
+
+# Uniform file formats (#604): read and write CSV / XML / Excel objects on
+# every file connector that is enabled. Optional-dep forwarding, so it never
+# pulls a connector the user didn't request. `file-formats` is the aggregate.
+file-format-csv = [
+    "faucet-source-s3?/file-format-csv",
+    "faucet-source-gcs?/file-format-csv",
+    "faucet-source-azure-blob?/file-format-csv",
+    "faucet-source-sftp?/file-format-csv",
+    "faucet-sink-s3?/file-format-csv",
+    "faucet-sink-gcs?/file-format-csv",
+    "faucet-sink-azure-blob?/file-format-csv",
+    "faucet-sink-sftp?/file-format-csv",
+]
+file-format-xml = [
+    "faucet-source-s3?/file-format-xml",
+    "faucet-source-gcs?/file-format-xml",
+    "faucet-source-azure-blob?/file-format-xml",
+    "faucet-source-sftp?/file-format-xml",
+    "faucet-sink-s3?/file-format-xml",
+    "faucet-sink-gcs?/file-format-xml",
+    "faucet-sink-azure-blob?/file-format-xml",
+    "faucet-sink-sftp?/file-format-xml",
+]
+file-format-excel = [
+    "faucet-source-s3?/file-format-excel",
+    "faucet-source-gcs?/file-format-excel",
+    "faucet-source-azure-blob?/file-format-excel",
+    "faucet-source-sftp?/file-format-excel",
+    "faucet-sink-s3?/file-format-excel",
+    "faucet-sink-gcs?/file-format-excel",
+    "faucet-sink-azure-blob?/file-format-excel",
+    "faucet-sink-sftp?/file-format-excel",
+]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
 
 # Mutual-TLS client-certificate auth (#495) on whichever HTTP sources are
 # enabled. Optional-dep forwarding, so it never pulls a source the user didn't

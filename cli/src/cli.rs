@@ -491,6 +491,36 @@ pub enum TemplateCommand {
     Delete(TemplateDeleteArgs),
     /// Materialize a template with the given params and run it locally.
     Run(TemplateRunArgs),
+    /// Run a parameter-combination test suite against a template (#648).
+    Test(TemplateTestArgs),
+}
+
+/// `faucet template test` — run a suite across a template's parameter space.
+#[cfg(feature = "templates")]
+#[derive(Debug, Parser)]
+pub struct TemplateTestArgs {
+    /// Suite file (YAML or JSON). See `faucet schema template-test`.
+    pub suite: PathBuf,
+    /// Registry store URL. Omit when the suite's `template:` is a path to a
+    /// config file — that form needs no registry, which is what lets a
+    /// template be tested before it is ever registered.
+    #[arg(long, env = "FAUCET_TEMPLATE_STORE")]
+    pub store: Option<String>,
+    /// Override the suite's `select:` version selector.
+    #[arg(long)]
+    pub select: Option<String>,
+    /// Run only cases whose name matches this pattern (`*` wildcards).
+    #[arg(long)]
+    pub filter: Option<String>,
+    /// Emit machine-readable JSON instead of the human checklist.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file to load for `${env:VAR}` interpolation.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
 }
 
 /// Where the template registry lives — shared by every `faucet template`
@@ -997,6 +1027,36 @@ pub struct ServeArgs {
     /// `--auth-token` / `--no-auth`.
     #[arg(long, conflicts_with_all = ["auth_token", "no_auth"])]
     pub auth_config: Option<std::path::PathBuf>,
+    /// Bearer token granting the **read-only** `viewer` role (#608). The
+    /// ergonomic form of an `--auth-config` with one `viewer` principal: hand
+    /// this to dashboards and people who must never be able to change
+    /// anything. Any subset of the three token flags may be set; together they
+    /// synthesize an in-memory RBAC config. Prefer the env var over the flag
+    /// (a flag value is visible in `ps`).
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_READ_TOKEN",
+        conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
+    )]
+    pub read_token: Option<String>,
+    /// Bearer token granting the `operator` role (#608): everything a viewer
+    /// can do, plus submitting/cancelling runs, firing triggers, and
+    /// registering or launching templates — but **not** the audit log.
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_WRITE_TOKEN",
+        conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
+    )]
+    pub write_token: Option<String>,
+    /// Bearer token granting the `admin` role (#608): everything, including the
+    /// audit log and any route not explicitly classified (which stays
+    /// admin-only by design).
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_ADMIN_TOKEN",
+        conflicts_with_all = ["auth_token", "no_auth", "auth_config"]
+    )]
+    pub admin_token: Option<String>,
     /// Max pipeline runs executing at once. Default: min(16, cpu count).
     #[arg(long)]
     pub max_concurrent_runs: Option<usize>,
@@ -1211,6 +1271,14 @@ pub struct RunArgs {
     /// Override the state-store directory (file backend only).
     #[arg(long)]
     pub state_path: Option<PathBuf>,
+    /// Override this run's **connector** concurrency — how many concurrent
+    /// connections/fetches the source and sink may use — whatever the config
+    /// says. Maps onto whichever knob the connector declares
+    /// (`max_connections` / `partition_concurrency` / `shard_concurrency` /
+    /// `concurrency`); a connector with none ignores it. Does not change
+    /// matrix parallelism (`execution.max_concurrent`). Must be > 0.
+    #[arg(long, value_name = "N")]
+    pub concurrency: Option<usize>,
     /// Override the `${now.*}` interpolation clock (RFC3339 like
     /// `2026-01-31T00:00:00Z`, or a date `2026-01-31`). Default: process start (UTC).
     /// Use for backfills.
@@ -1531,6 +1599,9 @@ pub enum SchemaTarget {
     Masking,
     /// JSON Schema for the `faucet test` spec file.
     Test,
+    /// JSON Schema for a `faucet template test` suite file (#648).
+    #[cfg(feature = "templates")]
+    TemplateTest,
     /// Grammar reference for secrets-manager interpolation directives.
     Secrets,
     /// JSON Schema for the `schedule:` block.

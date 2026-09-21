@@ -67,8 +67,12 @@ fn insert_config(port: u16, table: &str, batch_size: usize) -> RedshiftSinkConfi
     RedshiftSinkConfig {
         connection: redshift_conn(port),
         table_name: table.into(),
+        create_table: true,
+        commit_rows: None,
+        commit_bytes: None,
         schema: None,
         write_strategy: RedshiftWriteStrategy::Insert,
+        copy: None,
         copy_format: RedshiftCopyFormat::Jsonl,
         staging_bucket: None,
         staging_prefix: String::new(),
@@ -151,6 +155,7 @@ async fn insert_writes_typed_rows() {
     ];
     let written = sink.write_batch(&records).await.expect("insert runs");
     assert_eq!(written, 2);
+    sink.flush().await.expect("flush");
     assert_eq!(row_count(&pool, "events").await, 2);
 
     let row = sqlx::query("SELECT id, name, amount, active, note FROM events WHERE id = 1")
@@ -191,6 +196,7 @@ async fn write_batch_re_chunks_by_batch_size() {
 
     let written = sink.write_batch(&records).await.expect("write");
     assert_eq!(written, 5);
+    sink.flush().await.expect("flush");
     assert_eq!(row_count(&pool, "events").await, 5);
     assert_eq!(
         insert_call_count(&pool).await,
@@ -222,6 +228,7 @@ async fn batch_size_zero_writes_single_statement() {
     let records: Vec<Value> = (1..=4).map(|i| json!({"id": i, "name": "r"})).collect();
 
     assert_eq!(sink.write_batch(&records).await.expect("write"), 4);
+    sink.flush().await.expect("flush");
     assert_eq!(row_count(&pool, "events").await, 4);
     assert_eq!(
         insert_call_count(&pool).await,
@@ -251,20 +258,24 @@ async fn insert_with_no_matching_columns_is_a_noop() {
         .write_batch(&[json!({"unknown": 1})])
         .await
         .expect("write");
-    assert_eq!(written, 0);
+    // The sink reports what it accepted; the row is dropped at commit time
+    // because no key matches a real column.
+    assert_eq!(written, 1);
+    sink.flush().await.expect("flush");
     assert_eq!(row_count(&pool, "events").await, 0);
     pool.close().await;
 }
 
-/// Column discovery against a missing table surfaces a typed sink error.
+/// With `create_table: false`, a missing table surfaces a typed sink error
+/// naming the way out rather than a bare "relation does not exist" (#580).
 #[tokio::test(flavor = "multi_thread")]
 async fn insert_into_missing_table_errors() {
     let _guard = serial().lock().await;
     let (_container, port) = start_postgres().await;
 
-    let sink = RedshiftSink::new(insert_config(port, "does_not_exist", 1000))
-        .await
-        .expect("sink builds");
+    let mut cfg = insert_config(port, "does_not_exist", 1000);
+    cfg.create_table = false;
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
     let err = sink
         .write_batch(&[json!({"id": 1})])
         .await

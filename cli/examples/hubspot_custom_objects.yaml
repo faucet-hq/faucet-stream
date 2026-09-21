@@ -41,14 +41,14 @@ pipeline:
 matrix:
   # 1. Enumerate object types.
   - id: types
-    discover:
+    fan_out:
       source: { ref: hs_schemas }
       select: "$.name"
       as: name
   # 2. Chained discovery: one list of property names PER type (collected).
   - id: props
     for_each: [types]
-    discover:
+    fan_out:
       source:
         ref: hs_properties
         config: { path: "/crm/v3/properties/${types.name}" }

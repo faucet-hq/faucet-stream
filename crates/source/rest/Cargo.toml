@@ -80,6 +80,8 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 async-trait.workspace = true
 faucet-conformance.workspace = true
+metrics-util.workspace = true
+metrics.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

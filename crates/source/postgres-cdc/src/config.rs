@@ -29,6 +29,7 @@ fn default_slot_acquire_retries() -> u32 {
 
 /// Configuration for [`PostgresCdcSource`](crate::PostgresCdcSource).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PostgresCdcSourceConfig {
     /// Connection URL pointing at the database whose WAL we want to read.
     /// The crate internally upgrades the connection to `replication=database`
@@ -61,6 +62,17 @@ pub struct PostgresCdcSourceConfig {
     /// [`PostgresCdcSource::drop_slot`](crate::PostgresCdcSource::drop_slot).
     #[serde(default)]
     pub slot_type: SlotType,
+
+    /// Number of times to retry acquiring the replication slot when the server
+    /// reports it is still **active** (held by a not-yet-released prior
+    /// connection). On a rapid restart — a scheduler or `serve` re-running the
+    /// pipeline before the previous backend has dropped the slot — both the
+    /// pre-stream `pg_replication_slot_advance` and `START_REPLICATION` fail
+    /// with *"replication slot … is active for PID …"*. Each retry waits an
+    /// exponentially increasing backoff (250 ms, doubling, capped at 4 s).
+    /// `0` disables retries (fail fast). Defaults to 10.
+    #[serde(default = "default_slot_acquire_retries")]
+    pub slot_acquire_retries: u32,
 
     /// TLS settings for the replication connection. Default `disable`
     /// (plaintext) for back-compatibility, but credentials and all WAL data
@@ -157,17 +169,6 @@ pub struct PostgresCdcSourceConfig {
     /// initial-snapshot style runs.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-
-    /// Number of times to retry acquiring the replication slot when the server
-    /// reports it is still **active** (held by a not-yet-released prior
-    /// connection). On a rapid restart — a scheduler or `serve` re-running the
-    /// pipeline before the previous backend has dropped the slot — both the
-    /// pre-stream `pg_replication_slot_advance` and `START_REPLICATION` fail
-    /// with *"replication slot … is active for PID …"*. Each retry waits an
-    /// exponentially increasing backoff (250 ms, doubling, capped at 4 s).
-    /// `0` disables retries (fail fast). Defaults to 10.
-    #[serde(default = "default_slot_acquire_retries")]
-    pub slot_acquire_retries: u32,
 }
 
 /// Lifetime of a newly-created replication slot.

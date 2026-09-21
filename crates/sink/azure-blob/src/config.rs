@@ -5,6 +5,54 @@ use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// On-the-wire format of objects written by the Azure Blob sink (#604).
+///
+/// Only [`JsonLines`](Self::JsonLines) can be built a record at a time; every
+/// other format has a header, a wrapper, or a container index, so its records
+/// are buffered and encoded together at the rollover.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureSinkFormat {
+    /// Newline-delimited JSON — one JSON record per line (the default).
+    #[default]
+    JsonLines,
+    /// A single JSON array per object.
+    JsonArray,
+    /// Delimited text. Columns are the union of every record's keys; dialect
+    /// from `csv`. Requires `file-format-csv`.
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, one element per record. Framing from `xml`. Requires
+    /// `file-format-xml`.
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet name from `excel`. Requires
+    /// `file-format-excel`.
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl AzureSinkFormat {
+    /// The shared format this variant maps onto.
+    pub(crate) fn shared(self) -> faucet_core::FileFormat {
+        match self {
+            Self::JsonLines => faucet_core::FileFormat::JsonLines,
+            Self::JsonArray => faucet_core::FileFormat::JsonArray,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => faucet_core::FileFormat::Csv,
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => faucet_core::FileFormat::Xml,
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => faucet_core::FileFormat::Xlsx,
+        }
+    }
+
+    /// Whether an object of this format can be built one record at a time.
+    pub(crate) fn appends_per_record(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
+}
+
 /// Configuration for the Azure Blob sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AzureBlobSinkConfig {
@@ -14,12 +62,24 @@ pub struct AzureBlobSinkConfig {
     /// Object-name prefix for written objects.
     #[serde(default)]
     pub prefix: String,
+    /// Object format (default `json_lines`) (#604).
+    #[serde(default)]
+    pub format: AzureSinkFormat,
     /// File extension for written objects (default `.jsonl`).
     #[serde(default = "default_file_extension")]
     pub file_extension: String,
     /// Hard cap on records per uploaded object. `None` means a single object
     /// per `write_batch` call (still subject to `batch_size`).
     pub max_records_per_file: Option<usize>,
+    /// Maximum **bytes** per object before rolling to a new one (#618).
+    ///
+    /// Rows are a poor proxy for object size, so a rows-only cap either writes
+    /// tiny objects for narrow data or unbounded ones for wide data. Counted
+    /// on the uncompressed body, before any `compression` codec. `None` (the
+    /// default) removes the byte cap; a single record larger than the cap
+    /// still gets its own object rather than being split or dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<usize>,
     /// Maximum number of concurrent uploads (default 10).
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
@@ -38,6 +98,15 @@ pub struct AzureBlobSinkConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet name, used when `format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 fn default_file_extension() -> String {
@@ -56,12 +125,51 @@ impl AzureBlobSinkConfig {
         Self {
             connection: AzureConnection::new(container),
             prefix: String::new(),
+            format: AzureSinkFormat::default(),
             file_extension: default_file_extension(),
             max_records_per_file: None,
+            max_bytes_per_file: None,
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::Auto,
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
+        }
+    }
+
+    /// Set the object format (#604).
+    pub fn format(mut self, format: AzureSinkFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Set the CSV dialect used when `format: csv` (#604).
+    pub fn csv(mut self, csv: faucet_core::CsvOptions) -> Self {
+        self.csv = csv;
+        self
+    }
+
+    /// Set the worksheet name used when `format: xlsx` (#604).
+    pub fn excel(mut self, excel: faucet_core::ExcelOptions) -> Self {
+        self.excel = excel;
+        self
+    }
+
+    /// Set the record framing used when `format: xml` (#604).
+    pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
+        self.xml = xml;
+        self
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::encode`] wants.
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
         }
     }
 
@@ -108,6 +216,12 @@ impl AzureBlobSinkConfig {
     }
 
     /// Cap records per uploaded object.
+    pub fn max_bytes_per_file(mut self, n: usize) -> Self {
+        self.max_bytes_per_file = Some(n);
+        self
+    }
+
+    /// Set the per-object record cap.
     pub fn max_records_per_file(mut self, n: usize) -> Self {
         self.max_records_per_file = Some(n);
         self
@@ -212,5 +326,72 @@ mod tests {
     fn compression_default_is_auto() {
         let cfg = AzureBlobSinkConfig::new("cont");
         assert_eq!(cfg.compression, faucet_core::CompressionConfig::Auto);
+    }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Only JSON Lines can be appended a record at a time. That predicate
+    /// routes a write between the streaming byte accumulator and the buffered
+    /// record one, so a wrong answer silently changes how objects are built.
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(AzureSinkFormat::JsonLines.appends_per_record());
+        assert!(!AzureSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(AzureSinkFormat::default(), AzureSinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!AzureSinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!AzureSinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!AzureSinkFormat::Xlsx.appends_per_record());
+    }
+
+    /// Every variant maps onto exactly one shared format, so what this sink
+    /// writes is what the file sources read back.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            AzureSinkFormat::JsonLines.shared(),
+            faucet_core::FileFormat::JsonLines
+        );
+        assert_eq!(
+            AzureSinkFormat::JsonArray.shared(),
+            faucet_core::FileFormat::JsonArray
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(AzureSinkFormat::Csv.shared(), faucet_core::FileFormat::Csv);
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(AzureSinkFormat::Xml.shared(), faucet_core::FileFormat::Xml);
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            AzureSinkFormat::Xlsx.shared(),
+            faucet_core::FileFormat::Xlsx
+        );
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = AzureBlobSinkConfig::new("c")
+            .format(AzureSinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, AzureSinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
     }
 }

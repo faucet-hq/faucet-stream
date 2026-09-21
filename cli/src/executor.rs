@@ -74,6 +74,20 @@ pub struct ExecuteOptions {
     /// Override for `execution.max_concurrent`. `None` → use the value in
     /// `ExecutionSpec` or the default (`num_cpus::get().min(4)`, floored at 1).
     pub execution: Option<ExecutionSpec>,
+    /// Run-level **connector** concurrency override (#610): how many
+    /// concurrent connections/fetches this run's source and sink may use,
+    /// whatever the config says.
+    ///
+    /// Exists for the multi-tenant case — one template driving a customer with
+    /// beefy read replicas and one with a small instance — where the pool size
+    /// would otherwise be baked into the config, or have to be pre-declared as
+    /// a `${param.*}` by the template author. Applied by rewriting whichever
+    /// knob the connector declares in its own schema
+    /// (`registry::override_source_concurrency`), so a connector with no such
+    /// knob ignores it. Does **not** change `execution.max_concurrent` (matrix
+    /// parallelism) or the server's `--max-concurrent` slots. For a sharded
+    /// run it is per-shard, because each shard is its own invocation.
+    pub concurrency: Option<usize>,
     /// `--dry-run` — every sink is replaced with a no-op counter.
     pub dry_run: bool,
     /// `--limit N` — wraps every sink to drop records past the cap.
@@ -1708,6 +1722,22 @@ async fn run_one_invocation(
     //    (an envelope-unwrapping DLQ reader) via `source_override`; every
     //    config-driven node builds from the connector registry. The override
     //    is taken once — replay runs a single invocation.
+    // Run-level concurrency override (#610), applied after every
+    // interpolation pass so it always wins over what the config says, and
+    // before the build so the connector sees only the final value.
+    if let Some(n) = opts.concurrency {
+        if let Some(knob) =
+            crate::registry::override_source_concurrency(&node.source.kind, &mut source_cfg, n)
+        {
+            tracing::debug!(row = %node.id, kind = %node.source.kind, knob, n, "concurrency override applied to source");
+        }
+        if let Some(knob) =
+            crate::registry::override_sink_concurrency(&node.sink.kind, &mut sink_cfg, n)
+        {
+            tracing::debug!(row = %node.id, kind = %node.sink.kind, knob, n, "concurrency override applied to sink");
+        }
+    }
+
     let source = match node.source_override.as_ref().and_then(|o| o.take()) {
         Some(prebuilt) => prebuilt,
         None => {
@@ -3159,6 +3189,7 @@ mod tests {
                 pipeline_name: "t".into(),
                 run_id: None,
                 execution: None,
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -3199,6 +3230,7 @@ mod tests {
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
+            concurrency: None,
             dry_run: false,
             limit: None,
             state_path_override: None,
@@ -3635,6 +3667,7 @@ matrix:
                 pipeline_name: "matrix".into(),
                 run_id: None,
                 execution: None,
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -3699,6 +3732,7 @@ matrix:
                 pipeline_name: "dagtest".into(),
                 run_id: None,
                 execution: None,
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -3928,6 +3962,7 @@ execution:
                 pipeline_name: "stoptest".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -4017,6 +4052,7 @@ pipeline:
                 pipeline_name: "bad name".into(), // space is illegal in a state key
                 run_id: None,
                 execution: None,
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -4080,6 +4116,7 @@ matrix:
                 pipeline_name: "ok".into(),
                 run_id: None,
                 execution: None,
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -4152,6 +4189,7 @@ execution:
                 pipeline_name: "stop_parallel".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -4225,6 +4263,7 @@ matrix:
                 pipeline_name: "continuetest".into(),
                 run_id: None,
                 execution: None,
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
@@ -4495,6 +4534,7 @@ matrix:
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
+            concurrency: None,
             dry_run: false,
             limit: None,
             state_path_override: None,
@@ -5185,6 +5225,7 @@ matrix:
                 pipeline_name: "projtest".into(),
                 run_id: None,
                 execution: None,
+                concurrency: None,
                 dry_run: false,
                 limit: None,
                 state_path_override: None,

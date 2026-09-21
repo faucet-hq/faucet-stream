@@ -65,6 +65,7 @@ fn upsert_config(url: &str) -> SqliteSinkConfig {
         column_mapping: SqliteColumnMapping::AutoMap,
         batch_size: 1000,
         max_connections: 1,
+        create_table: true,
         write: WriteSpec {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
@@ -118,6 +119,7 @@ async fn delete_marker_removes_row() {
         column_mapping: SqliteColumnMapping::AutoMap,
         batch_size: 1000,
         max_connections: 1,
+        create_table: true,
         write: WriteSpec {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],

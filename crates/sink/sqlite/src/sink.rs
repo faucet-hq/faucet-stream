@@ -167,6 +167,31 @@ fn bind_value<'q>(
     }
 }
 
+/// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
+///
+/// `IF NOT EXISTS` rather than probe-then-create: two matrix rows writing the
+/// same table would otherwise race between the probe and the DDL.
+fn build_create_table_sql(
+    table: &str,
+    columns: &[faucet_core::PlannedColumn],
+    json_column: Option<&str>,
+) -> String {
+    let cols = match json_column {
+        // JSON mode stores the whole record in one column, so the page's own
+        // shape is irrelevant — the table is the same whatever arrives.
+        Some(col) => format!(
+            "{} INTEGER PRIMARY KEY AUTOINCREMENT, {} TEXT NOT NULL",
+            quote_ident_sqlite("id"),
+            quote_ident_sqlite(col)
+        ),
+        None => faucet_core::render_columns(columns, quote_ident_sqlite, sqlite_keyword),
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({cols})",
+        quote_ident_sqlite(table)
+    )
+}
+
 /// Map a [`SqlBaseType`] to the SQLite column-type keyword used when adding a
 /// column during schema evolution (issue #194). SQLite uses dynamic typing
 /// (type affinity), so these are advisory affinities rather than strict types:
@@ -256,9 +281,54 @@ fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String {
 pub struct SqliteSink {
     config: SqliteSinkConfig,
     pool: SqlitePool,
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
 }
 
 impl SqliteSink {
+    /// Make sure the target table exists before the first write (#580).
+    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !self.config.create_table {
+            let exists: Option<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(&self.config.table_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("SQLite table probe failed: {e}")))?;
+            if exists.is_none() {
+                return Err(faucet_core::missing_target_error(
+                    "sqlite sink",
+                    &self.config.table_name,
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        let json_column = match &self.config.column_mapping {
+            SqliteColumnMapping::AutoMap => None,
+            SqliteColumnMapping::Json { column } => Some(column.as_str()),
+        };
+        let columns = match (json_column, faucet_core::plan_columns(records)) {
+            (Some(_), _) => Vec::new(),
+            (None, Some(c)) => c,
+            (None, None) => return Ok(()),
+        };
+        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column);
+        sqlx::query(&sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("SQLite CREATE TABLE failed: {e}")))?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Create a new SQLite sink. Establishes a connection pool.
     ///
     /// The pool opens each connection with `journal_mode = WAL` and a 5-second
@@ -294,7 +364,11 @@ impl SqliteSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite connection failed: {e}")))?;
 
-        Ok(Self { config, pool })
+        Ok(Self {
+            config,
+            pool,
+            table_ready: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// The staging table name used while an overwrite run is in flight.
@@ -1014,6 +1088,7 @@ impl faucet_core::Sink for SqliteSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records).await?;
 
         // Upsert/delete modes: plan the writes and apply atomically. Append and
         // overwrite are insert-shaped and fall through (overwrite lands in the

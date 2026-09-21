@@ -250,6 +250,7 @@ pub fn install_observability(cfg: &ObservabilityConfig) -> Result<InstallReport,
     crate::observability::resilience::describe();
     crate::observability::cleanup::describe();
     crate::observability::drift::describe();
+    crate::observability::describe_roundtrip_metrics();
     register_build_info();
 
     Ok(report)
@@ -391,6 +392,7 @@ pub fn install_observability(_cfg: &ObservabilityConfig) -> Result<InstallReport
     crate::observability::resilience::describe();
     crate::observability::cleanup::describe();
     crate::observability::drift::describe();
+    crate::observability::describe_roundtrip_metrics();
     crate::observability::otel::describe();
     register_build_info();
     Ok(InstallReport::default())

@@ -54,6 +54,7 @@ fn sink_config(brokers: &str, topic: KafkaSinkTopic) -> KafkaSinkConfig {
         queue_full_backoff: Duration::from_millis(100),
         queue_full_max_retries: 3,
         transactional_id_prefix: None,
+        exactly_once: None,
         commit_token_topic: "__faucet_commit_token".into(),
         commit_token_topic_partitions: 1,
         commit_token_topic_replication: -1,

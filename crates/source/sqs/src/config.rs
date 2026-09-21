@@ -11,6 +11,7 @@ pub const MAX_RECEIVE_BATCH: i32 = 10;
 
 /// Configuration for [`SqsSource`](crate::SqsSource).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SqsSourceConfig {
     /// SQS queue URL (e.g. `https://sqs.us-east-1.amazonaws.com/1234/my-q`).
     pub queue_url: String,

@@ -113,6 +113,14 @@ encryption = ["dep:aes-gcm", "dep:sha2"]
 # byte-identical to the `Value`-only pipeline; the `arrow` deps are pulled only
 # when a connector opts a chain into the columnar fast path.
 arrow = ["dep:arrow", "dep:arrow-json"]
+# Uniform file formats for every file/object-store connector (#604). Each
+# format pulls only its own parser/writer, so a build that reads CSV does not
+# link calamine and a build that never touches a spreadsheet does not link an
+# xlsx writer. `file-formats` is the aggregate.
+file-format-csv = ["dep:csv", "dep:csv-async"]
+file-format-xml = ["dep:quick-xml"]
+file-format-excel = ["dep:calamine", "dep:rust_xlsxwriter"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
 
 [dependencies]
 serde.workspace = true
@@ -163,6 +171,11 @@ aes-gcm = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 # Opt-in columnar record path (feature `arrow`). Heavy, so strictly optional.
 arrow = { workspace = true, optional = true }
+csv = { workspace = true, optional = true }
+csv-async = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+calamine = { workspace = true, optional = true }
+rust_xlsxwriter = { workspace = true, optional = true }
 arrow-json = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -26,6 +26,16 @@ enum Fetched {
     Lines(SftpFile),
     RawText(String),
     JsonArray(String),
+    /// A whole file already decoded into records by
+    /// [`faucet_core::file_format`] (#604) — CSV, XML and Excel. Decoding at
+    /// fetch time keeps the per-format work in one place; the page loop then
+    /// chunks these exactly as it chunks a JSON array's.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    Records(Vec<Value>),
 }
 
 /// An SFTP source that lists and reads remote files.
@@ -106,6 +116,15 @@ impl SftpSource {
         sftp: &SftpSession,
         path: &str,
         format: SftpFormat,
+        #[cfg_attr(
+            not(any(
+                feature = "file-format-csv",
+                feature = "file-format-xml",
+                feature = "file-format-excel"
+            )),
+            allow(unused_variables)
+        )]
+        opts: &faucet_core::FormatOptions,
     ) -> Result<Fetched, FaucetError> {
         Ok(match format {
             SftpFormat::Jsonl => Fetched::Lines(
@@ -115,7 +134,43 @@ impl SftpSource {
             ),
             SftpFormat::RawText => Fetched::RawText(Self::read_file_text(sftp, path).await?),
             SftpFormat::JsonArray => Fetched::JsonArray(Self::read_file_text(sftp, path).await?),
+            #[cfg(feature = "file-format-csv")]
+            SftpFormat::Csv => Self::fetch_decoded(sftp, path, format, opts).await?,
+            #[cfg(feature = "file-format-xml")]
+            SftpFormat::Xml => Self::fetch_decoded(sftp, path, format, opts).await?,
+            #[cfg(feature = "file-format-excel")]
+            SftpFormat::Xlsx => Self::fetch_decoded(sftp, path, format, opts).await?,
         })
+    }
+
+    /// Read one remote file whole and decode it through the shared format
+    /// layer.
+    ///
+    /// Whole-file for all three: a workbook's directory sits at the end of a
+    /// zip container, an XML document is a tree, and a CSV's records are
+    /// chunked by the same page loop either way.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    async fn fetch_decoded(
+        sftp: &SftpSession,
+        path: &str,
+        format: SftpFormat,
+        opts: &faucet_core::FormatOptions,
+    ) -> Result<Fetched, FaucetError> {
+        let bytes = sftp
+            .read(path)
+            .await
+            .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))?;
+        let shared = format
+            .shared()
+            .ok_or_else(|| FaucetError::Source(format!("SFTP '{path}': format has no decoder")))?;
+        let records = faucet_core::file_format::decode(&bytes, shared, opts)
+            .await
+            .map_err(|e| FaucetError::Source(format!("SFTP '{path}': {e}")))?;
+        Ok(Fetched::Records(records))
     }
 }
 
@@ -171,12 +226,14 @@ impl faucet_core::Source for SftpSource {
             // returning a borrow-capturing async block is not higher-ranked
             // enough for `buffered`.
             let format = self.config.format;
+            let opts = self.config.format_options();
+            let opts = &opts;
             let concurrency = self.config.concurrency.max(1);
             let mut fetched = futures::stream::iter(files.iter().cloned())
                 .map(|file| {
                     let sftp = &sftp;
                     async move {
-                        let payload = Self::fetch(sftp, &file, format).await;
+                        let payload = Self::fetch(sftp, &file, format, opts).await;
                         (file, payload)
                     }
                 })
@@ -254,6 +311,36 @@ impl faucet_core::Source for SftpSource {
                             yield StreamPage { records: array, bookmark: None };
                         } else {
                             for record in array {
+                                buffer.push(record);
+                                if buffer.len() >= chunk {
+                                    let page = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(initial_capacity),
+                                    );
+                                    total += page.len();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(any(
+                        feature = "file-format-csv",
+                        feature = "file-format-xml",
+                        feature = "file-format-excel"
+                    ))]
+                    Fetched::Records(records) => {
+                        // CSV / XML / Excel (#604): already decoded at fetch
+                        // time, so chunk exactly as a JSON array is chunked.
+                        if batch_size == 0 {
+                            if !buffer.is_empty() {
+                                let page = std::mem::take(&mut buffer);
+                                total += page.len();
+                                yield StreamPage { records: page, bookmark: None };
+                            }
+                            total += records.len();
+                            yield StreamPage { records, bookmark: None };
+                        } else {
+                            for record in records {
                                 buffer.push(record);
                                 if buffer.len() >= chunk {
                                     let page = std::mem::replace(

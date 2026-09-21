@@ -239,6 +239,7 @@ params:
   since:     { default: "1970-01-01" }
   page_size: { type: int, default: 500 }
   api_token: { required: true, secret: true }
+  region:    { default: us, values: [us, eu, apac] }
 ```
 
 | Field | Default | Meaning |
@@ -249,6 +250,15 @@ params:
 | `secret` | `false` | Registered for redaction the instant it is bound — never reaches a log, error, API response, audit record, or the template registry. |
 | `description` | — | Surfaced by `faucet template list`/`show`, `GET /v1/templates`, and the MCP `get_template` tool. |
 | `computed` | — | A **derived** value (see below). Mutually exclusive with `required`, `default`, and `secret`; excluded from the trigger surface. |
+| `values` | — | Closed set of acceptable values. Anything else is rejected at bind time, naming the allowed set. Mutually exclusive with `computed`; a `default` must be one of them. |
+
+**Closed value sets.** `values:` turns a param into an enumerable axis. Without
+it a typo'd value — `region: ue` — binds happily and surfaces as a 404 mid-run;
+with it the bind fails up front naming the three allowed values. It also makes
+the axis machine-enumerable, which is what a
+[template test suite's](../cookbook/templates.md#testing-the-parameter-space)
+`auto.enum_coverage` sweeps. Each listed value must match the declared `type`,
+and a `default` must be one of them.
 
 **Computed params & `${map:…}`.** A param can be *derived* from other params
 instead of supplied, via `computed:` — resolved after the ordinary params bind
@@ -333,9 +343,14 @@ Semantics:
 - Ordering works identically under `faucet run`, `schedule`, and `serve` —
   they all execute the same expanded plan.
 
-### `discover:` / `for_each:` — discovery-driven fan-out (#501)
+### `fan_out:` / `for_each:` — discovery-driven fan-out (#501)
 
-A `discover:` row enumerates a **value-set at run time** from a live endpoint,
+> Spelled `discover:` before #654; the old key is still accepted. It was
+> renamed because `discover` already meant enumerating a connection's
+> **datasets** (`faucet discover`), and this block enumerates a fan-out
+> *axis* — one row per value, not one row per dataset.
+
+A `fan_out:` row enumerates a **value-set at run time** from a live endpoint,
 and a `for_each:` row fans a stream out over the **cartesian product** of those
 value-sets — "sync this report once per `{subsidiary} × {custom-field}`
 returned by a discovery call". This is the first-class version of the
@@ -352,12 +367,12 @@ pipeline:
 
 matrix:
   - id: subs                  # discovery dimension
-    discover:
+    fan_out:
       source: { ref: api, config: { path: "/subsidiaries", records_path: "$.subsidiaries[*]" } }
       select: "$.id"          # JSONPath projecting the value from each record
       as: subsidiary_id       # exposed as ${subs.subsidiary_id}
   - id: flds
-    discover:
+    fan_out:
       source: { ref: api, config: { path: "/fields", records_path: "$.fields[*]" } }
       select: "$.id"
       as: field_id
@@ -373,7 +388,7 @@ matrix:
 
 Semantics:
 
-- A **`discover:` row** runs its source once, projects `select` (a dot-path,
+- A **`fan_out:` row** runs its source once, projects `select` (a dot-path,
   optionally `$`-prefixed; `$` = whole record) from each record, and **dedups**
   (first-seen order; null / missing values skipped). It has **no sink** and
   writes nothing. It runs once per pipeline run, cached across all dependents.
@@ -388,7 +403,7 @@ Semantics:
   cascade, and cycle detection reuse the ordering machinery. Per-tuple state
   keys (`{name}::{row}::alias=value&…`) let every cell resume independently.
 - Guards (all at load time via `faucet validate`): `for_each` must name
-  `discover:` rows; a `discover:` row can't carry a sink or `parent:`;
+  `fan_out:` rows; a `fan_out:` row can't carry a sink or `parent:`;
   `for_each` can't combine with `parent:` (v1). The product is
   bounded by `MAX_MATRIX_PRODUCT` (10 000) — a larger cross-product fails
   rather than spawning an unbounded fleet.
@@ -403,7 +418,7 @@ object types, then discover each type's fields, then read each type asking for
 all its fields" (HubSpot custom objects, Salesforce `describe`, Airtable, …).
 Two additions cover it:
 
-- **Chained discovery** — a `discover:` row may itself carry `for_each: [dims]`,
+- **Chained discovery** — a `fan_out:` row may itself carry `for_each: [dims]`,
   so it runs *once per upstream tuple* with `${<dim>.<alias>}` resolved in its
   own source config. It must set **`collect: true`**.
 - **Collected (list-valued) dimensions** — `collect: true` publishes the whole
@@ -415,10 +430,10 @@ Two additions cover it:
 ```yaml
 matrix:
   - id: types                      # 1. object types
-    discover: { source: { ref: hs_schemas }, select: "$.name", as: name }
+    fan_out: { source: { ref: hs_schemas }, select: "$.name", as: name }
   - id: props                      # 2. per type, collect its property names
     for_each: [types]
-    discover:
+    fan_out:
       source: { ref: hs_properties, config: { path: "/crm/v3/properties/${types.name}" } }
       select: "$.name"
       as: name
@@ -432,7 +447,7 @@ matrix:
         query_params: { properties: "${props.name}" }
 ```
 
-Guards: a chained `discover:` row (`for_each:` present) must set `collect: true`;
+Guards: a chained `fan_out:` row (`for_each:` present) must set `collect: true`;
 `collect: true` requires `for_each:`; chained-discovery cycles are rejected at
 load time. See `cli/examples/hubspot_custom_objects.yaml`.
 

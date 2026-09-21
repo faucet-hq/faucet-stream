@@ -151,6 +151,32 @@ pub struct Pipeline<'a, So: Source + ?Sized, Si: Sink + ?Sized> {
     suppress_overwrite_lifecycle: bool,
 }
 
+/// Build and install the source/sink round-trip recorders for one run (#638).
+///
+/// Split out of `Pipeline::run` so the label derivation is unit-testable
+/// without driving a whole pipeline, and so the native/columnar run paths can
+/// call the same thing.
+pub(crate) fn install_roundtrip_recorders(
+    source: &dyn Source,
+    sink: &dyn Sink,
+    pipeline: &str,
+    row: &str,
+) {
+    use crate::observability::{RoundtripRecorder, RoundtripSide};
+    source.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
+        RoundtripSide::Source,
+        pipeline.to_string(),
+        row.to_string(),
+        source.connector_name(),
+    )));
+    sink.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
+        RoundtripSide::Sink,
+        pipeline.to_string(),
+        row.to_string(),
+        sink.connector_name(),
+    )));
+}
+
 impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
     /// Create a new pipeline from a source and a sink.
     pub fn new(source: &'a So, sink: &'a Si) -> Self {
@@ -342,6 +368,13 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         // Wrap source, sink, state-store.
         let wrapped_source = InstrumentedSource::new(self.source, obs_labels.clone());
         let wrapped_sink = InstrumentedSink::new(self.sink, obs_labels.clone());
+
+        // Hand each connector a pre-labelled round-trip recorder (#638). Done
+        // here because the pipeline is the only place that knows the
+        // pipeline/row/connector trio every other metric carries; the
+        // decorators forward it down to the connector that does the I/O. A
+        // connector that never records emits nothing.
+        install_roundtrip_recorders(&wrapped_source, &wrapped_sink, &name, &row);
         let wrapped_state_store: Option<Arc<dyn StateStore>> = self.state_store.as_ref().map(|s| {
             Arc::new(InstrumentedStateStore::new(
                 Arc::clone(s),

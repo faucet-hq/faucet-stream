@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the webhook receiver source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookSourceConfig {
     /// Address to bind the HTTP server to (default: `"127.0.0.1:8080"`).
     ///

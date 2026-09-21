@@ -18,8 +18,8 @@ use sqlx::{PgPool, Row};
 
 use crate::config::{RedshiftCopyFormat, RedshiftSinkConfig, RedshiftWriteStrategy};
 use crate::copy::{
-    columns_present, copy_statement, insert_statement, qualified_table_ref, s3_uri, serialize_csv,
-    serialize_jsonl,
+    build_create_table_sql, columns_present, copy_statement, insert_statement, qualified_table_ref,
+    s3_uri, serialize_csv, serialize_jsonl,
 };
 
 /// Redshift caps bind parameters per statement; keep multi-row `INSERT`s under
@@ -28,6 +28,15 @@ const MAX_REDSHIFT_PARAMS: usize = 32_767;
 
 /// A sink that loads JSON records into an Amazon Redshift table.
 pub struct RedshiftSink {
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
+    /// Records accumulated across `write_batch` calls (#617).
+    ///
+    /// `COPY` wants millions of rows per load; one `COPY` per 1000-row page
+    /// produced many small commits, small unsorted blocks, and VACUUM
+    /// pressure.
+    pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
     config: RedshiftSinkConfig,
     pool: PgPool,
     /// S3 client, built only for the `copy` strategy.
@@ -35,6 +44,84 @@ pub struct RedshiftSink {
 }
 
 impl RedshiftSink {
+    /// Load one accumulated group, still re-chunked to `batch_size` so a
+    /// single staged object / `INSERT` statement stays a reasonable size
+    /// (#617).
+    async fn commit_group(&self, rows: &[Value]) -> Result<(), FaucetError> {
+        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
+            vec![rows]
+        } else {
+            rows.chunks(self.config.batch_size).collect()
+        };
+        let mut total = 0;
+        for chunk in chunks {
+            total += match self.config.write_strategy {
+                RedshiftWriteStrategy::Copy => self.copy_chunk(chunk).await?,
+                RedshiftWriteStrategy::Insert => self.insert_chunk(chunk).await?,
+            };
+        }
+        tracing::info!(
+            table = %self.config.table_name,
+            rows = total,
+            strategy = self.config.write_strategy.as_str(),
+            "Redshift write complete"
+        );
+        Ok(())
+    }
+
+    /// Make sure the target table exists before the first write (#580).
+    ///
+    /// Runs once per sink instance. With `create_table: true` (the default) a
+    /// missing table — and its schema, when `schema:` is set — is created from
+    /// the first page's inferred columns; with `false` a missing table is a
+    /// typed failure naming both ways out.
+    async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !self.config.create_table {
+            let exists: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_name = $1 AND ($2::text IS NULL OR table_schema = $2)",
+            )
+            .bind(&self.config.table_name)
+            .bind(self.config.schema.as_deref())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("redshift table probe failed: {e}")))?;
+            if exists.is_none() {
+                return Err(faucet_core::missing_target_error(
+                    "redshift sink",
+                    &self.table_ref(),
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        // A page with nothing inferable leaves the table uncreated so the next
+        // page can try, rather than emitting a zero-column CREATE.
+        let Some(columns) = faucet_core::plan_columns(records) else {
+            return Ok(());
+        };
+        if let Some(schema) = self.config.schema.as_deref() {
+            sqlx::query(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                faucet_core::util::quote_ident(schema)
+            ))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("redshift CREATE SCHEMA failed: {e}")))?;
+        }
+        let sql = build_create_table_sql(&self.table_ref(), &columns);
+        sqlx::query(&sql)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("redshift CREATE TABLE failed: {e}")))?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Create a new sink. Validates config, builds a lazily-connected pool (no
     /// DB I/O), and — for the `copy` strategy — an S3 client.
     pub async fn new(config: RedshiftSinkConfig) -> Result<Self, FaucetError> {
@@ -46,16 +133,26 @@ impl RedshiftSink {
         } else {
             None
         };
-        Ok(Self { config, pool, s3 })
+        Ok(Self {
+            table_ready: std::sync::atomic::AtomicBool::new(false),
+            pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::new(
+                config.commit_rows,
+                config.commit_bytes,
+            )),
+            config,
+            pool,
+            s3,
+        })
     }
 
     /// Build an S3 client honouring the optional region / endpoint overrides.
     async fn build_s3_client(config: &RedshiftSinkConfig) -> S3Client {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(region) = &config.region {
+        let copy_cfg = config.copy_spec();
+        if let Some(region) = &copy_cfg.region {
             loader = loader.region(aws_config::Region::new(region.clone()));
         }
-        if let Some(endpoint) = &config.endpoint_url {
+        if let Some(endpoint) = &copy_cfg.endpoint_url {
             loader = loader.endpoint_url(endpoint);
         }
         let sdk_config = loader.load().await;
@@ -69,7 +166,7 @@ impl RedshiftSink {
     /// Generate a unique staging object key for one page.
     fn staging_key(&self, ext: &str) -> String {
         let id = uuid::Uuid::new_v4();
-        format!("{}{}.{}", self.config.staging_prefix, id, ext)
+        format!("{}{}.{}", self.config.copy_spec().staging_prefix, id, ext)
     }
 
     /// Discover the destination table's column names in ordinal order via
@@ -108,22 +205,23 @@ impl RedshiftSink {
         let s3 = self.s3.as_ref().ok_or_else(|| {
             FaucetError::Sink("redshift: S3 client not initialized for copy strategy".into())
         })?;
-        let bucket = self.config.staging_bucket.as_deref().ok_or_else(|| {
+        let copy_cfg = self.config.copy_spec();
+        let bucket = copy_cfg.staging_bucket.as_deref().ok_or_else(|| {
             FaucetError::Sink("redshift: staging_bucket is required for copy strategy".into())
         })?;
-        let iam_role = self.config.iam_role.as_deref().ok_or_else(|| {
+        let iam_role = copy_cfg.iam_role.as_deref().ok_or_else(|| {
             FaucetError::Sink("redshift: iam_role is required for copy strategy".into())
         })?;
 
         // Serialize the page and, for CSV, learn the destination column order.
-        let (body, columns): (Vec<u8>, Option<Vec<String>>) = match self.config.copy_format {
+        let (body, columns): (Vec<u8>, Option<Vec<String>>) = match copy_cfg.format {
             RedshiftCopyFormat::Jsonl => (serialize_jsonl(records)?, None),
             RedshiftCopyFormat::Csv => {
                 let cols = self.discover_columns().await?;
                 (serialize_csv(records, &cols)?, Some(cols))
             }
         };
-        let ext = match self.config.copy_format {
+        let ext = match copy_cfg.format {
             RedshiftCopyFormat::Jsonl => "jsonl",
             RedshiftCopyFormat::Csv => "csv",
         };
@@ -146,8 +244,8 @@ impl RedshiftSink {
             columns.as_deref(),
             &s3_uri(bucket, &key),
             iam_role,
-            self.config.region.as_deref(),
-            self.config.copy_format,
+            copy_cfg.region.as_deref(),
+            copy_cfg.format,
         );
         let copy_result = sqlx::query(&sql).execute(&self.pool).await;
 
@@ -294,31 +392,39 @@ impl faucet_core::Sink for RedshiftSink {
         )
     }
 
+    /// Commit whatever the cross-page accumulator holds (#617).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so a buffered group is always loaded before the bookmark
+    /// advances — records left in the accumulator after a "successful" run
+    /// would be data loss with a green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let group = {
+            let mut open = self.pending.lock().await;
+            open.finish()
+        };
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
+        }
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let chunks: Vec<&[Value]> = if self.config.batch_size == 0 {
-            vec![records]
-        } else {
-            records.chunks(self.config.batch_size).collect()
+        self.ensure_table_ready(records).await?;
+        // Accumulate across calls and load once per threshold (#617): `COPY`
+        // wants millions of rows per load, and `batch_size` could only ever
+        // split a page — never merge two small ones.
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.push_page(records)
         };
-
-        let mut total = 0;
-        for chunk in chunks {
-            total += match self.config.write_strategy {
-                RedshiftWriteStrategy::Copy => self.copy_chunk(chunk).await?,
-                RedshiftWriteStrategy::Insert => self.insert_chunk(chunk).await?,
-            };
+        if let Some(rows) = group {
+            self.commit_group(&rows).await?;
         }
-
-        tracing::info!(
-            table = %self.config.table_name,
-            rows = total,
-            strategy = self.config.write_strategy.as_str(),
-            "Redshift write complete"
-        );
-        Ok(total)
+        Ok(records.len())
     }
 
     /// Preflight connectivity probe (`faucet doctor`): acquire a connection and
@@ -364,8 +470,12 @@ mod tests {
         RedshiftSinkConfig {
             connection: RedshiftConnection::new("host", "db", "user", "pw"),
             table_name: "events".into(),
+            create_table: true,
+            commit_rows: None,
+            commit_bytes: None,
             schema: Some("public".into()),
             write_strategy: RedshiftWriteStrategy::Insert,
+            copy: None,
             copy_format: RedshiftCopyFormat::Jsonl,
             staging_bucket: None,
             staging_prefix: String::new(),

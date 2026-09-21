@@ -1,7 +1,7 @@
 //! GCS sink executor.
 
 use crate::config::GcsSinkConfig;
-#[cfg(feature = "arrow")]
+#[cfg(any(feature = "arrow", test))]
 use crate::config::GcsSinkFormat;
 use async_trait::async_trait;
 use faucet_common_gcs::{build_storage, build_storage_control};
@@ -15,30 +15,62 @@ use serde_json::Value;
 pub struct GcsSink {
     config: GcsSinkConfig,
     storage: Storage,
+    /// Rows accumulated across `write_batch` calls for the open object (#618).
+    ///
+    /// Without this the sink wrote one object per upstream page, so a small
+    /// `batch_size` produced a swarm of tiny objects — the small-files problem
+    /// that dominates read time on a data lake.
+    open: tokio::sync::Mutex<faucet_core::ObjectAccumulator>,
+    /// Records held for a **whole-object** format (#604). CSV has a header,
+    /// XML a document element, a workbook a container index and a JSON array
+    /// its brackets — none can be appended a record at a time, so their
+    /// records are buffered and encoded together at the rollover. Always empty
+    /// for JSON Lines, which streams through `open`.
+    pending: tokio::sync::Mutex<faucet_core::object_rollover::PageAccumulator>,
 }
 
 impl GcsSink {
     pub async fn new(config: GcsSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let storage = build_storage(&config.auth, config.storage_host.as_deref()).await?;
-        Ok(Self { config, storage })
+        let open = tokio::sync::Mutex::new(faucet_core::ObjectAccumulator::new(
+            Some(resolve_effective_chunk_size(&config)),
+            config.max_bytes_per_file,
+        ));
+        let pending = tokio::sync::Mutex::new(faucet_core::object_rollover::PageAccumulator::new(
+            Some(resolve_effective_chunk_size(&config)),
+            config.max_bytes_per_file,
+        ));
+        Ok(Self {
+            config,
+            storage,
+            open,
+            pending,
+        })
+    }
+
+    /// Encode one buffered group in the configured whole-object format and
+    /// upload it as a single object (#604).
+    async fn write_encoded_object(&self, group: Vec<Value>) -> Result<(), FaucetError> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let format = self.config.format.shared().ok_or_else(|| {
+            FaucetError::Sink(
+                "GCS sink: parquet is written by the Arrow path, not the record encoder".into(),
+            )
+        })?;
+        let rows = group.len();
+        let body = faucet_core::file_format::encode(&group, format, &self.config.format_options())?;
+        let key = self.generate_key();
+        self.upload_file(&key, body).await?;
+        tracing::info!(key = %key, records = rows, format = format.as_str(), "GCS object written");
+        Ok(())
     }
 
     /// Bucket as a GCS resource path: `projects/_/buckets/{bucket}`.
     fn bucket_path(&self) -> String {
         format!("projects/_/buckets/{}", self.config.bucket)
-    }
-
-    /// Serialize a slice of records as a JSON Lines byte buffer.
-    fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
-        let mut buf: Vec<u8> = Vec::new();
-        for record in records {
-            let line = serde_json::to_vec(record)
-                .map_err(|e| FaucetError::Sink(format!("JSON serialization failed: {e}")))?;
-            buf.extend_from_slice(&line);
-            buf.push(b'\n');
-        }
-        Ok(buf)
     }
 
     /// Generate a time-sortable UUIDv7 object name.
@@ -81,14 +113,6 @@ impl GcsSink {
         tracing::debug!(key = %key, "Uploaded GCS parquet object");
         Ok(())
     }
-
-    /// Compute the effective chunk size combining `batch_size` and
-    /// `max_records_per_file`. `batch_size = 0` removes the batch-size
-    /// limit; `max_records_per_file = None` removes the file-rollover
-    /// limit. When both are unlimited, returns `usize::MAX` (single chunk).
-    fn effective_chunk_size(&self) -> usize {
-        resolve_effective_chunk_size(&self.config)
-    }
 }
 
 #[async_trait]
@@ -97,17 +121,46 @@ impl faucet_core::Sink for GcsSink {
         format!("gs://{}/{}", self.config.bucket, self.config.prefix)
     }
 
+    /// Close the open object (#618).
+    ///
+    /// The pipeline calls `flush` at every bookmark-carrying page and once at
+    /// the end, so the accumulated remainder is uploaded before the bookmark
+    /// advances — an object left unfinished after a "successful" run is data
+    /// loss with a green exit code.
+    async fn flush(&self) -> Result<(), FaucetError> {
+        let finished = {
+            let mut open = self.open.lock().await;
+            open.finish()
+        };
+        if let Some(obj) = finished {
+            let key = self.generate_key();
+            self.upload_file(&key, obj.body).await?;
+            tracing::info!(key = %key, records = obj.rows, "GCS object closed");
+        }
+        let group = {
+            let mut pending = self.pending.lock().await;
+            pending.finish()
+        };
+        if let Some(group) = group {
+            self.write_encoded_object(group).await?;
+        }
+        Ok(())
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        let chunk = self.effective_chunk_size();
         let concurrency = self.config.concurrency.max(1);
         let written = records.len();
 
         // Parquet path: encode each chunk as a self-contained Parquet object.
+        // Parquet objects are self-describing and carry their own footer, so
+        // they are not accumulated across pages — a rolled-over half-file
+        // would not be readable.
         #[cfg(feature = "arrow")]
         if matches!(self.config.format, GcsSinkFormat::Parquet) {
+            let chunk = resolve_effective_chunk_size(&self.config);
             let uploads: Vec<(String, Vec<u8>)> = records
                 .chunks(chunk)
                 .map(|slice| {
@@ -124,14 +177,34 @@ impl faucet_core::Sink for GcsSink {
             return Ok(written);
         }
 
-        let uploads: Vec<(String, Vec<u8>)> = records
-            .chunks(chunk)
-            .map(|slice| {
-                let body = Self::serialize_jsonl(slice)?;
-                Ok::<(String, Vec<u8>), FaucetError>((self.generate_key(), body))
-            })
-            .collect::<Result<_, _>>()?;
+        // Whole-object formats (#604): a CSV header, an XML document element,
+        // a workbook index and a JSON array's brackets all need every record
+        // before any byte is final, so records are buffered and encoded
+        // together. The same row/byte caps decide the rollover, so object
+        // sizing means the same thing whatever the format.
+        if !self.config.format.appends_per_record() {
+            let group = {
+                let mut pending = self.pending.lock().await;
+                pending.push_page(records)
+            };
+            if let Some(group) = group {
+                self.write_encoded_object(group).await?;
+            }
+            return Ok(written);
+        }
 
+        // JSONL path: accumulate across calls and roll on the record/byte cap
+        // (#618). A page smaller than the cap now joins the open object
+        // instead of becoming an object of its own.
+        let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let mut open = self.open.lock().await;
+            for record in records {
+                if let faucet_core::object_rollover::Emit::Object(obj) = open.push_record(record)? {
+                    uploads.push((self.generate_key(), obj.body));
+                }
+            }
+        }
         stream::iter(uploads)
             .map(|(key, body)| async move { self.upload_file(&key, body).await })
             .buffer_unordered(concurrency)
@@ -166,7 +239,7 @@ impl faucet_core::Sink for GcsSink {
         }
 
         let n = batch.num_rows();
-        let cap = self.effective_chunk_size().min(n).max(1);
+        let cap = resolve_effective_chunk_size(&self.config).min(n).max(1);
         let concurrency = self.config.concurrency.max(1);
         let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         let mut offset = 0usize;
@@ -300,6 +373,40 @@ mod tests {
     // credentials (build_storage errors without auth), and no offline
     // constructor exists.
 
+    /// #604 — only JSON Lines can be appended a record at a time; every other
+    /// format has a header, a wrapper or a container index, so its records are
+    /// buffered and encoded together.
+    #[test]
+    fn json_lines_is_the_one_format_that_still_streams() {
+        assert!(GcsSinkFormat::JsonLines.appends_per_record());
+        assert!(!GcsSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(
+            GcsSinkFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+    }
+
+    #[cfg(feature = "file-format-csv")]
+    #[test]
+    fn a_csv_object_carries_a_header_and_the_configured_delimiter() {
+        let cfg = GcsSinkConfig::new("b")
+            .format(GcsSinkFormat::Csv)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: true,
+            });
+        assert!(!cfg.format.appends_per_record());
+        let body = faucet_core::file_format::encode(
+            &[serde_json::json!({"a": 1, "b": 2})],
+            cfg.format
+                .shared()
+                .expect("csv maps onto the shared format"),
+            &cfg.format_options(),
+        )
+        .expect("encode");
+        assert_eq!(String::from_utf8(body).unwrap(), "a;b\n1;2\n");
+    }
+
     #[tokio::test]
     async fn new_rejects_out_of_range_batch_size() {
         // Validation runs before any GCS client setup, so this needs no backend.
@@ -313,8 +420,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn serialize_jsonl_two_records() {
-        let body = GcsSink::serialize_jsonl(&[json!({"a": 1}), json!({"b": 2})]).unwrap();
+    fn records_encode_as_ndjson() {
+        // The encoding moved into `faucet_core::ObjectAccumulator` with the
+        // cross-page accumulation (#618) — pinned here too, because this is
+        // what lands in the bucket.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        acc.push_record(&json!({"a": 1})).unwrap();
+        let faucet_core::object_rollover::Emit::Object(obj) =
+            acc.push_record(&json!({"b": 2})).unwrap()
+        else {
+            panic!("rolled at 2 records");
+        };
+        let body = obj.body;
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
             "{\"a\":1}\n{\"b\":2}\n"
@@ -322,9 +439,11 @@ mod tests {
     }
 
     #[test]
-    fn serialize_jsonl_empty_is_empty() {
-        let body = GcsSink::serialize_jsonl(&[]).unwrap();
-        assert!(body.is_empty());
+    fn an_empty_accumulator_writes_no_object() {
+        // An empty page must not mint a zero-byte object — a listing full of
+        // those is the small-files problem in its purest form.
+        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
+        assert!(acc.finish().is_none());
     }
 
     #[test]

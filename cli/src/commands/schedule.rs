@@ -278,6 +278,7 @@ fn make_opts(
         pipeline_name: pipeline_name.to_string(),
         run_id: None,
         execution: execution.clone(),
+        concurrency: None,
         dry_run: false,
         limit: None,
         state_path_override: None,

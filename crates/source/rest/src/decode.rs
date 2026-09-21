@@ -111,6 +111,45 @@ pub enum DecodeStep {
     },
 }
 
+/// A decode chain that can be run **streaming**, and the CSV dialect to run it
+/// with (#626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CsvStreamPlan {
+    /// CSV delimiter byte.
+    pub delimiter: u8,
+    /// Whether the first row names the fields.
+    pub has_headers: bool,
+}
+
+/// Classify a decode chain as streamable, or not.
+///
+/// Only `[{ parse: { format: csv } }]` streams. Every other step needs the
+/// whole body before it can produce anything, and saying so explicitly is the
+/// point of this function — a chain that *looks* close (say `gunzip` then
+/// `csv`) must fall back rather than silently mis-decode:
+///
+/// - `extract` / `parse: json` parse a complete JSON document;
+/// - `unzip` needs the archive's central directory, which is at the **end**;
+/// - `parse: xlsx` needs the whole workbook (calamine is not incremental);
+/// - `parse: xml` parses a complete document;
+/// - `base64` / `gunzip` are byte steps that would need their own streaming
+///   wrappers before the CSV reader could be fed from them.
+///
+/// A `records_path` on the parse step also disqualifies it: that selects into a
+/// parsed document, which a row-at-a-time reader never materializes.
+pub fn csv_stream_plan(steps: &[DecodeStep]) -> Option<CsvStreamPlan> {
+    let [DecodeStep::Parse { parse }] = steps else {
+        return None;
+    };
+    if parse.format != ParseFormat::Csv || parse.records_path.is_some() {
+        return None;
+    }
+    Some(CsvStreamPlan {
+        delimiter: parse.delimiter.unwrap_or(b','),
+        has_headers: parse.has_headers,
+    })
+}
+
 /// Run the decode chain over the response body, returning records.
 pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>, FaucetError> {
     let mut buf = body.to_vec();
@@ -408,6 +447,92 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #626 — which decode chains may stream.
+    ///
+    /// The classifier is the safety boundary: saying "yes" to a chain that
+    /// needs the whole body would mis-decode silently, so each "no" is pinned.
+    mod stream_plan {
+        use super::*;
+
+        fn parse(format: ParseFormat) -> DecodeStep {
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format,
+                    records_path: None,
+                    delimiter: None,
+                    has_headers: true,
+                    sheet: None,
+                    header_row: 0,
+                },
+            }
+        }
+
+        #[test]
+        fn a_bare_csv_parse_streams_with_its_dialect() {
+            let plan = csv_stream_plan(&[parse(ParseFormat::Csv)]).expect("streamable");
+            assert_eq!(plan.delimiter, b',');
+            assert!(plan.has_headers);
+
+            let mut tabbed = parse(ParseFormat::Csv);
+            if let DecodeStep::Parse { parse } = &mut tabbed {
+                parse.delimiter = Some(b'\t');
+                parse.has_headers = false;
+            }
+            let plan = csv_stream_plan(&[tabbed]).expect("streamable");
+            assert_eq!(plan.delimiter, b'\t');
+            assert!(!plan.has_headers);
+        }
+
+        #[test]
+        fn every_other_terminal_format_is_buffered() {
+            for f in [ParseFormat::Json, ParseFormat::Xml] {
+                assert!(
+                    csv_stream_plan(&[parse(f)]).is_none(),
+                    "{f:?} parses a complete document and cannot stream"
+                );
+            }
+        }
+
+        #[test]
+        fn a_records_path_disqualifies_streaming() {
+            // `records_path` selects into a parsed document, which a
+            // row-at-a-time reader never materializes.
+            let mut step = parse(ParseFormat::Csv);
+            if let DecodeStep::Parse { parse } = &mut step {
+                parse.records_path = Some("$.rows".into());
+            }
+            assert!(csv_stream_plan(&[step]).is_none());
+        }
+
+        #[test]
+        fn a_byte_step_before_the_parse_disqualifies_streaming() {
+            // gunzip/base64 would each need their own streaming wrapper; until
+            // then the chain must fall back rather than decode garbage.
+            for pre in [SimpleStep::Gunzip, SimpleStep::Base64] {
+                assert!(
+                    csv_stream_plan(&[DecodeStep::Simple(pre), parse(ParseFormat::Csv)]).is_none(),
+                    "{pre:?} before the parse must fall back to buffered"
+                );
+            }
+            // ...and an `extract` prefix, which needs a whole JSON document.
+            assert!(
+                csv_stream_plan(&[
+                    DecodeStep::Extract {
+                        extract: "$.data".into()
+                    },
+                    parse(ParseFormat::Csv)
+                ])
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn an_empty_chain_does_not_stream() {
+            // No decode chain at all means `response_format` handles the body.
+            assert!(csv_stream_plan(&[]).is_none());
+        }
+    }
     use super::*;
     use serde_json::json;
 

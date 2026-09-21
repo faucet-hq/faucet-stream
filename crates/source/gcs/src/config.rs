@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Format of files stored in GCS.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GcsFileFormat {
     /// Each line in the file is a separate JSON record.
@@ -25,6 +25,49 @@ pub enum GcsFileFormat {
     /// (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     Parquet,
+    /// Delimited text, decoded through [`faucet_core::file_format`] so the
+    /// records match what every other connector produces for the same file.
+    /// Dialect from [`csv`](GcsSourceConfig::csv). Requires
+    /// `file-format-csv` (#604).
+    #[cfg(feature = "file-format-csv")]
+    Csv,
+    /// XML, decoded to the compact element→object mapping. The repeated
+    /// element is named by [`xml`](GcsSourceConfig::xml). Requires
+    /// `file-format-xml` (#604).
+    #[cfg(feature = "file-format-xml")]
+    Xml,
+    /// An Excel workbook. Sheet and header row from
+    /// [`excel`](GcsSourceConfig::excel). **Buffered whole** — a workbook is a
+    /// zip container whose directory sits at the end. Requires
+    /// `file-format-excel` (#604).
+    #[cfg(feature = "file-format-excel")]
+    Xlsx,
+}
+
+impl GcsFileFormat {
+    /// The shared format this variant maps onto, or `None` for the two the
+    /// connector decodes itself (`RawText`'s `{key, content}` envelope is the
+    /// connector's own shape, and Parquet is columnar).
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    pub(crate) fn shared(&self) -> Option<faucet_core::FileFormat> {
+        match self {
+            Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
+            Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
+            Self::RawText => None,
+            #[cfg(feature = "arrow")]
+            Self::Parquet => None,
+            #[cfg(feature = "file-format-csv")]
+            Self::Csv => Some(faucet_core::FileFormat::Csv),
+            #[cfg(feature = "file-format-xml")]
+            Self::Xml => Some(faucet_core::FileFormat::Xml),
+            #[cfg(feature = "file-format-excel")]
+            Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+        }
+    }
 }
 
 /// Configuration for the GCS source connector.
@@ -83,6 +126,15 @@ pub struct GcsSourceConfig {
     #[cfg(feature = "compression")]
     #[serde(default)]
     pub compression: faucet_core::CompressionConfig,
+    /// CSV dialect, used when `file_format: csv` (#604).
+    #[serde(default)]
+    pub csv: faucet_core::CsvOptions,
+    /// Worksheet selection, used when `file_format: xlsx` (#604).
+    #[serde(default)]
+    pub excel: faucet_core::ExcelOptions,
+    /// Record framing, used when `file_format: xml` (#604).
+    #[serde(default)]
+    pub xml: faucet_core::XmlOptions,
 }
 
 /// Serde default for the integrity flags that default on.
@@ -114,6 +166,24 @@ impl GcsSourceConfig {
             storage_host: None,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
+            csv: faucet_core::CsvOptions::default(),
+            excel: faucet_core::ExcelOptions::default(),
+            xml: faucet_core::XmlOptions::default(),
+        }
+    }
+
+    /// The per-format option blocks in the shape
+    /// [`faucet_core::file_format::decode`] wants.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
+        faucet_core::FormatOptions {
+            csv: self.csv.clone(),
+            excel: self.excel.clone(),
+            xml: self.xml.clone(),
         }
     }
 
@@ -348,5 +418,75 @@ mod tests {
             GcsSourceConfig::new("   ").validate(),
             Err(faucet_core::FaucetError::Config(_))
         ));
+    }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// GCS's I/O files are excluded from coverage (no emulator, #220), so its
+    /// pure logic is the only part that can be verified — and the mapping is
+    /// what decides whether a body reaches the shared decoder at all.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn formats_map_onto_the_shared_vocabulary_or_opt_out() {
+        assert_eq!(
+            GcsFileFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            GcsFileFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        // `raw_text` keeps this connector's own `{key, content}` envelope, so
+        // it must never be routed through the shared decoder.
+        assert_eq!(GcsFileFormat::RawText.shared(), None);
+        #[cfg(feature = "arrow")]
+        assert_eq!(GcsFileFormat::Parquet.shared(), None);
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(
+            GcsFileFormat::Csv.shared(),
+            Some(faucet_core::FileFormat::Csv)
+        );
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(
+            GcsFileFormat::Xml.shared(),
+            Some(faucet_core::FileFormat::Xml)
+        );
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            GcsFileFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+    }
+
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn the_format_option_blocks_reach_the_decoder() {
+        let mut cfg = GcsSourceConfig::new("b");
+        cfg.csv = faucet_core::CsvOptions {
+            delimiter: "\\t".into(),
+            has_headers: false,
+        };
+        cfg.excel = faucet_core::ExcelOptions {
+            sheet: Some("Q3".into()),
+            header_row: 1,
+        };
+        cfg.xml = faucet_core::XmlOptions {
+            record_element: "order".into(),
+            root_element: "orders".into(),
+        };
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter_byte().expect("tab"), b'\t');
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Q3"));
+        assert_eq!(opts.excel.header_row, 1);
+        assert_eq!(opts.xml.record_element, "order");
     }
 }

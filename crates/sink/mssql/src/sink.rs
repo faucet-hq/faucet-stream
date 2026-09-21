@@ -41,6 +41,9 @@ pub struct MssqlSink {
     staging_table_quoted: String,
     /// Cached writable (non-IDENTITY) columns for `auto_columns` mode.
     columns_cache: Mutex<Option<Vec<String>>>,
+    /// Whether the target has been confirmed present for this sink instance
+    /// (#580). One check per run, not per page.
+    table_ready: std::sync::atomic::AtomicBool,
     /// Per-sink run id for staged-object keys (#528).
     #[cfg(feature = "staging")]
     pub(crate) stage_run_id: String,
@@ -82,6 +85,7 @@ impl MssqlSink {
             table_quoted,
             staging_table_quoted,
             columns_cache: Mutex::new(None),
+            table_ready: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "staging")]
             stage_run_id: crate::staged::new_stage_run_id(),
             #[cfg(feature = "staging")]
@@ -98,12 +102,19 @@ impl MssqlSink {
         }
     }
 
+    /// Create the target at construction time when its shape does not depend
+    /// on the data (#580).
+    ///
+    /// `json_column` mode has a fixed shape, so it can be created before the
+    /// first page — which also means `faucet doctor` and a zero-record run
+    /// leave a usable table behind. `auto_columns` mode has to wait for a page
+    /// to infer from; that is [`ensure_table_ready`](Self::ensure_table_ready).
     async fn maybe_create_table(&self) -> Result<(), FaucetError> {
         if !self.config.create_table {
             return Ok(());
         }
         let MssqlColumnMapping::JsonColumn { column } = &self.config.column_mapping else {
-            return Ok(()); // validated: create_table only with json_column
+            return Ok(());
         };
         let col = quote_ident_mssql(column)?;
         let sql = format!(
@@ -113,13 +124,90 @@ impl MssqlSink {
             self.table_quoted,
             col
         );
+        self.run_ddl(&sql, "create_table").await
+    }
+
+    /// Create the target from the first page's inferred columns, in
+    /// `auto_columns` mode (#580).
+    ///
+    /// Runs once per sink instance. With `create_table: false` a missing table
+    /// is a typed failure naming both ways out, rather than a bare
+    /// "Invalid object name" from the first INSERT.
+    pub(crate) async fn ensure_table_ready(&self, records: &[Value]) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        if self.table_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !matches!(
+            self.config.column_mapping,
+            MssqlColumnMapping::AutoColumns { .. }
+        ) {
+            // The fixed json_column shape is already handled in `new`.
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        if !self.config.create_table {
+            let mut conn = self.checkout().await?;
+            let rows = conn
+                .simple_query(
+                    format!(
+                        "SELECT OBJECT_ID(N'{}', N'U')",
+                        self.config.table.replace('\'', "''")
+                    )
+                    .as_str(),
+                )
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?
+                .into_first_result()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?;
+            let found = rows
+                .first()
+                .and_then(|r| r.try_get::<i32, _>(0).ok().flatten())
+                .is_some();
+            if !found {
+                return Err(faucet_core::missing_target_error(
+                    "mssql sink",
+                    &self.config.table,
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        // A page with nothing inferable leaves the table uncreated so the next
+        // page can try, rather than emitting a zero-column CREATE.
+        let Some(columns) = faucet_core::plan_columns(records) else {
+            return Ok(());
+        };
+        let mut rendered: Vec<String> = Vec::with_capacity(columns.len());
+        for c in &columns {
+            rendered.push(format!(
+                "{} {}",
+                quote_ident_mssql(&c.name)?,
+                mssql_keyword(c.base_type)
+            ));
+        }
+        let sql = format!(
+            "IF OBJECT_ID(N'{}', N'U') IS NULL CREATE TABLE {} ({})",
+            self.config.table.replace('\'', "''"),
+            self.table_quoted,
+            rendered.join(", ")
+        );
+        self.run_ddl(&sql, "create_table").await?;
+        self.table_ready.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Run one DDL statement, mapping both the send and the result-drain
+    /// failure to the same typed error.
+    async fn run_ddl(&self, sql: &str, what: &str) -> Result<(), FaucetError> {
         let mut conn = self.checkout().await?;
-        conn.simple_query(sql.as_str())
+        conn.simple_query(sql)
             .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL create_table failed: {e}")))?
+            .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))?
             .into_results()
             .await
-            .map_err(|e| FaucetError::Sink(format!("MSSQL create_table failed: {e}")))?;
+            .map_err(|e| FaucetError::Sink(format!("MSSQL {what} failed: {e}")))?;
         Ok(())
     }
 
@@ -922,6 +1010,7 @@ impl Sink for MssqlSink {
         if records.is_empty() {
             return Ok(0);
         }
+        self.ensure_table_ready(records).await?;
 
         // Staged bulk load (#528): stage the page to Azure and `COPY INTO`.
         #[cfg(feature = "staging")]

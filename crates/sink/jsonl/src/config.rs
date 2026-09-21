@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration for the JSON Lines file sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JsonlSinkConfig {
     /// Path to the output file.
     pub path: PathBuf,

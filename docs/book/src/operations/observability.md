@@ -24,6 +24,16 @@ cardinality and never a Prometheus label.
 - **Sink:** `faucet_sink_records_total`, `faucet_sink_writes_total`,
   `faucet_sink_errors_total`, `faucet_sink_write_duration_seconds`,
   `faucet_sink_flush_duration_seconds`, `faucet_sink_in_flight`.
+- **Upstream round trips** (#638): `faucet_source_roundtrips_total{op}` and
+  `faucet_sink_roundtrips_total{op}` — how many calls a connector actually made
+  to its backend, with companion `*_roundtrip_duration_seconds{op}` histograms.
+  This is the number that maps onto an API quota, S3 GET cost, or database
+  load; `faucet_source_pages_total` only proxies the data fetches for paged
+  HTTP sources and misses job submits, poll loops, and every non-HTTP
+  connector. `op` is a **closed, connector-defined** set — the REST source
+  emits `submit` / `poll` / `fetch` / `page` / `discover`. Retries count: a
+  retried call is a real round trip. A connector that has not been instrumented
+  emits nothing.
 - **Transform:** `faucet_transform_records_in_total`,
   `faucet_transform_records_out_total` (use the `out/in` ratio for
   filter drop rate or explode fan-out), `faucet_transform_errors_total{kind}`,
