@@ -222,4 +222,68 @@ mod tests {
         let cfg = SftpSinkConfig::new(conn(), "/o").with_batch_size(0);
         assert!(faucet_core::validate_batch_size(cfg.batch_size).is_ok());
     }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Only JSON Lines can be appended a record at a time. That predicate
+    /// routes a write between the streaming byte accumulator and the buffered
+    /// record one, so a wrong answer silently changes how objects are built.
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(SftpSinkFormat::JsonLines.appends_per_record());
+        assert!(!SftpSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(SftpSinkFormat::default(), SftpSinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!SftpSinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!SftpSinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!SftpSinkFormat::Xlsx.appends_per_record());
+    }
+
+    /// Every variant maps onto exactly one shared format, so what this sink
+    /// writes is what the file sources read back.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            SftpSinkFormat::JsonLines.shared(),
+            faucet_core::FileFormat::JsonLines
+        );
+        assert_eq!(
+            SftpSinkFormat::JsonArray.shared(),
+            faucet_core::FileFormat::JsonArray
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(SftpSinkFormat::Csv.shared(), faucet_core::FileFormat::Csv);
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(SftpSinkFormat::Xml.shared(), faucet_core::FileFormat::Xml);
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(SftpSinkFormat::Xlsx.shared(), faucet_core::FileFormat::Xlsx);
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = SftpSinkConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/p")
+            .format(SftpSinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, SftpSinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
+    }
 }

@@ -431,4 +431,77 @@ mod tests {
         let cfg = S3SinkConfig::new("bucket");
         assert_eq!(cfg.compression, faucet_core::CompressionConfig::Auto);
     }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Only JSON Lines can be appended a record at a time. That predicate
+    /// routes a write between the streaming byte accumulator and the buffered
+    /// record one, so a wrong answer silently changes how objects are built.
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(S3SinkFormat::JsonLines.appends_per_record());
+        assert!(!S3SinkFormat::JsonArray.appends_per_record());
+        assert_eq!(S3SinkFormat::default(), S3SinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!S3SinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!S3SinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!S3SinkFormat::Xlsx.appends_per_record());
+    }
+
+    /// Every variant maps onto exactly one shared format, so what this sink
+    /// writes is what the file sources read back.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            S3SinkFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            S3SinkFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(
+            S3SinkFormat::Csv.shared(),
+            Some(faucet_core::FileFormat::Csv)
+        );
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(
+            S3SinkFormat::Xml.shared(),
+            Some(faucet_core::FileFormat::Xml)
+        );
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            S3SinkFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = S3SinkConfig::new("b")
+            .format(S3SinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, S3SinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
+    }
 }

@@ -327,4 +327,71 @@ mod tests {
         let cfg = AzureBlobSinkConfig::new("cont");
         assert_eq!(cfg.compression, faucet_core::CompressionConfig::Auto);
     }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Only JSON Lines can be appended a record at a time. That predicate
+    /// routes a write between the streaming byte accumulator and the buffered
+    /// record one, so a wrong answer silently changes how objects are built.
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(AzureSinkFormat::JsonLines.appends_per_record());
+        assert!(!AzureSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(AzureSinkFormat::default(), AzureSinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!AzureSinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!AzureSinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!AzureSinkFormat::Xlsx.appends_per_record());
+    }
+
+    /// Every variant maps onto exactly one shared format, so what this sink
+    /// writes is what the file sources read back.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            AzureSinkFormat::JsonLines.shared(),
+            faucet_core::FileFormat::JsonLines
+        );
+        assert_eq!(
+            AzureSinkFormat::JsonArray.shared(),
+            faucet_core::FileFormat::JsonArray
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(AzureSinkFormat::Csv.shared(), faucet_core::FileFormat::Csv);
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(AzureSinkFormat::Xml.shared(), faucet_core::FileFormat::Xml);
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            AzureSinkFormat::Xlsx.shared(),
+            faucet_core::FileFormat::Xlsx
+        );
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = AzureBlobSinkConfig::new("c")
+            .format(AzureSinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, AzureSinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
+    }
 }

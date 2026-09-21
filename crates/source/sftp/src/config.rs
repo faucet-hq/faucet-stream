@@ -326,4 +326,66 @@ mod tests {
         );
         assert!(!glob_match("?", ""), "a single `?` needs a char");
     }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// Each variant maps onto the one shared format every other file
+    /// connector uses for the same bytes. The connector-owned shapes map to
+    /// `None` so they are never routed through the shared decoder — raw text
+    /// keeps this connector's own envelope.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn formats_map_onto_the_shared_vocabulary_or_opt_out() {
+        assert_eq!(
+            SftpFormat::Jsonl.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            SftpFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        assert_eq!(SftpFormat::RawText.shared(), None);
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(SftpFormat::Csv.shared(), Some(faucet_core::FileFormat::Csv));
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(SftpFormat::Xml.shared(), Some(faucet_core::FileFormat::Xml));
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            SftpFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+    }
+
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn the_format_option_blocks_reach_the_decoder() {
+        let mut cfg =
+            SftpSourceConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/p");
+        cfg.csv = faucet_core::CsvOptions {
+            delimiter: "\\t".into(),
+            has_headers: false,
+        };
+        cfg.excel = faucet_core::ExcelOptions {
+            sheet: Some("Q3".into()),
+            header_row: 1,
+        };
+        cfg.xml = faucet_core::XmlOptions {
+            record_element: "order".into(),
+            root_element: "orders".into(),
+        };
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter_byte().expect("tab"), b'\t');
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Q3"));
+        assert_eq!(opts.excel.header_row, 1);
+        assert_eq!(opts.xml.record_element, "order");
+    }
 }

@@ -334,8 +334,7 @@ mod tests {
     #[test]
     fn a_self_closing_element_and_cdata_decode() {
         // `Event::Empty` and `Event::CData` are separate arms from Start/Text.
-        let v = to_json(br#"<r><e/><c><![CDATA[raw <>&]]></c><!-- ignored --></r>"#)
-            .expect("json");
+        let v = to_json(br#"<r><e/><c><![CDATA[raw <>&]]></c><!-- ignored --></r>"#).expect("json");
         assert_eq!(v["r"]["e"], json!(""));
         assert_eq!(v["r"]["c"], json!("raw <>&"));
     }
