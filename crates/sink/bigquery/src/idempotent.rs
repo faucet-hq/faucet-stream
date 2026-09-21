@@ -428,6 +428,21 @@ pub fn base_to_bq(t: faucet_core::SqlBaseType) -> &'static str {
     }
 }
 
+/// `CREATE SCHEMA IF NOT EXISTS `<project>`.`<dataset>`` — best-effort dataset
+/// creation so `create_table` can target a dataset that does not exist yet.
+///
+/// Both identifiers are **escaped, never stripped** (#654 M15). Stripping a
+/// backtick rewrites the id into a *different but perfectly valid* one, so the
+/// DDL silently creates (or targets) the wrong dataset; escaping yields either
+/// the intended identifier or a loud BigQuery parse error.
+pub fn build_ensure_dataset_ddl(project: &str, dataset: &str) -> String {
+    format!(
+        "CREATE SCHEMA IF NOT EXISTS {}.{}",
+        quote_ident(project),
+        quote_ident(dataset)
+    )
+}
+
 /// `ALTER TABLE <ref> ADD COLUMN IF NOT EXISTS `<col>` <bq_type>` — idempotent
 /// column addition. `table_ref` is already backtick-quoted (`` `p.d.t` ``).
 pub fn build_add_column_ddl(table_ref: &str, col: &str, bq_type: &str) -> String {
@@ -941,5 +956,27 @@ mod tests {
         // Backslashes escape first, so the escape itself cannot be forged.
         assert_eq!(quote_ident("a\\b"), "`a\\\\b`");
         assert_eq!(quote_ident("a\\`b"), "`a\\\\\\`b`");
+    }
+
+    /// The dataset DDL was the last site still *stripping* backticks (#654
+    /// M15). Stripping is the dangerous half: `` my`ds `` became `myds`, a
+    /// different but perfectly valid dataset, so the CREATE silently landed
+    /// somewhere else. Escaping yields the intended name or a parse error.
+    #[test]
+    fn ensure_dataset_ddl_escapes_both_identifiers() {
+        assert_eq!(
+            build_ensure_dataset_ddl("proj", "ds"),
+            "CREATE SCHEMA IF NOT EXISTS `proj`.`ds`"
+        );
+        assert_eq!(
+            build_ensure_dataset_ddl("pr`oj", "d`s"),
+            "CREATE SCHEMA IF NOT EXISTS `pr\\`oj`.`d\\`s`"
+        );
+        // The separating dot stays outside the quotes, so a dotted *value*
+        // cannot smuggle in an extra qualifier.
+        assert_eq!(
+            build_ensure_dataset_ddl("a.b", "c"),
+            "CREATE SCHEMA IF NOT EXISTS `a.b`.`c`"
+        );
     }
 }
