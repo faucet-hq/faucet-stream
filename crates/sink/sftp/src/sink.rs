@@ -346,4 +346,18 @@ mod tests {
                 .contains(&faucet_core::write_mode::WriteMode::Append)
         );
     }
+
+    /// `batch_size: 0` is the documented "no batching" sentinel: it must
+    /// become *no* record cap, not a cap of zero — which would roll a new
+    /// file on every record.
+    #[test]
+    fn batch_size_zero_leaves_both_accumulators_uncapped() {
+        let sink = SftpSink::new(cfg().with_batch_size(0)).expect("zero is a valid batch size");
+        assert_eq!(sink.config.batch_size, 0);
+        assert_eq!(sink.config.max_records_per_file, None);
+
+        // An explicit record cap still wins over the batch size.
+        let capped = SftpSink::new(cfg().with_batch_size(0).max_records_per_file(7)).expect("new");
+        assert_eq!(capped.config.max_records_per_file, Some(7));
+    }
 }

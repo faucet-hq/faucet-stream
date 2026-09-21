@@ -286,4 +286,26 @@ mod tests {
         assert_eq!(opts.xml.record_element, "row");
         assert_eq!(opts.xml.root_element, "rows");
     }
+
+    /// Both rollover caps are opt-in and independent (#618): setting one must
+    /// not disturb the other, or an operator asking for a byte cap silently
+    /// gets a record cap too.
+    #[test]
+    fn the_rollover_caps_are_independent_and_default_to_unset() {
+        let base = SftpSinkConfig::new(conn(), "/out");
+        assert_eq!(base.max_records_per_file, None);
+        assert_eq!(base.max_bytes_per_file, None);
+
+        let records_only = SftpSinkConfig::new(conn(), "/out").max_records_per_file(10);
+        assert_eq!(records_only.max_records_per_file, Some(10));
+        assert_eq!(records_only.max_bytes_per_file, None);
+
+        let both = SftpSinkConfig::new(conn(), "/out")
+            .max_records_per_file(10)
+            .max_bytes_per_file(4096)
+            .file_extension(".csv");
+        assert_eq!(both.max_records_per_file, Some(10));
+        assert_eq!(both.max_bytes_per_file, Some(4096));
+        assert_eq!(both.file_extension, ".csv");
+    }
 }

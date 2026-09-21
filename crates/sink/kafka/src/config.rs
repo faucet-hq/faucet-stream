@@ -733,4 +733,32 @@ mod tests {
             .expect_err("an empty topic in the block must fail");
         assert!(err.to_string().contains("commit_token_topic"), "{err}");
     }
+
+    /// The exactly-once block is defaulted in two places — serde and
+    /// `Default` — and they must agree, or a config that omits the block
+    /// behaves differently from one that spells out the defaults.
+    #[test]
+    fn the_exactly_once_defaults_match_the_serde_defaults() {
+        let d = KafkaExactlyOnceSpec::default();
+        assert_eq!(d.transactional_id_prefix, None);
+        assert_eq!(d.commit_token_topic, "__faucet_commit_token");
+        assert_eq!(d.commit_token_topic_partitions, 1);
+        // -1 means "use the broker default".
+        assert_eq!(d.commit_token_topic_replication, -1);
+
+        let from_serde: KafkaExactlyOnceSpec = serde_json::from_str("{}").expect("empty block");
+        assert_eq!(
+            from_serde.transactional_id_prefix,
+            d.transactional_id_prefix
+        );
+        assert_eq!(from_serde.commit_token_topic, d.commit_token_topic);
+        assert_eq!(
+            from_serde.commit_token_topic_partitions,
+            d.commit_token_topic_partitions
+        );
+        assert_eq!(
+            from_serde.commit_token_topic_replication,
+            d.commit_token_topic_replication
+        );
+    }
 }

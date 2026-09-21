@@ -486,5 +486,15 @@ mod tests {
         assert_eq!(S3FileFormat::RawText.shared(), None);
         #[cfg(feature = "arrow")]
         assert_eq!(S3FileFormat::Parquet.shared(), None);
+        // The two JSON shapes, by contrast, are the shared decoder's — so a
+        // file this source reads is one the file sinks can write.
+        assert_eq!(
+            S3FileFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            S3FileFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
     }
 }

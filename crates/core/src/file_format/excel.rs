@@ -288,4 +288,60 @@ mod tests {
         // Without the name-first rule this would be read as index 2024.
         assert!(decode(&bytes, Some("2024"), 0).is_ok());
     }
+
+    /// Every `calamine::Data` variant maps to a JSON value. xlsx has no type
+    /// system of its own beyond these, so an unmapped variant would silently
+    /// become the wrong JSON type on read-back.
+    #[test]
+    fn every_cell_variant_decodes_to_its_json_shape() {
+        use calamine::{CellErrorType, Data, ExcelDateTime, ExcelDateTimeType};
+        assert_eq!(cell_to_value(&Data::Empty), Value::Null);
+        assert_eq!(cell_to_value(&Data::String("s".into())), json!("s"));
+        assert_eq!(cell_to_value(&Data::Bool(true)), json!(true));
+        assert_eq!(cell_to_value(&Data::Int(-7)), json!(-7));
+        assert_eq!(cell_to_value(&Data::Float(2.5)), json!(2.5));
+        // An integral double comes back as an integer, not `3.0`.
+        assert_eq!(cell_to_value(&Data::Float(3.0)), json!(3));
+        assert_eq!(
+            cell_to_value(&Data::DateTimeIso("2026-01-02T03:04:05".into())),
+            json!("2026-01-02T03:04:05")
+        );
+        assert_eq!(
+            cell_to_value(&Data::DurationIso("PT1H".into())),
+            json!("PT1H")
+        );
+        // An error cell becomes text rather than being dropped, so a bad cell
+        // is visible downstream instead of vanishing.
+        assert_eq!(
+            cell_to_value(&Data::Error(CellErrorType::Div0)),
+            json!("Div0")
+        );
+        // A datetime cell becomes a non-empty string.
+        let dt = Data::DateTime(ExcelDateTime::new(
+            45000.5,
+            ExcelDateTimeType::DateTime,
+            false,
+        ));
+        assert!(matches!(cell_to_value(&dt), Value::String(s) if !s.is_empty()));
+    }
+
+    /// Header cells are read as text. An empty header must be the empty
+    /// string, not the word "Empty" — that string becomes a record key.
+    #[test]
+    fn header_cells_stringify_without_leaking_the_debug_form() {
+        use calamine::Data;
+        assert_eq!(cell_to_string(&Data::String("name".into())), "name");
+        assert_eq!(cell_to_string(&Data::Empty), "");
+        assert_eq!(cell_to_string(&Data::Int(3)), "3");
+        assert_eq!(cell_to_string(&Data::Bool(true)), "true");
+    }
+
+    /// `float_to_value` is what keeps a write→read round trip faithful; a
+    /// non-finite double has no JSON number form and must not panic.
+    #[test]
+    fn a_non_finite_double_becomes_null_rather_than_panicking() {
+        assert_eq!(float_to_value(f64::NAN), Value::Null);
+        assert_eq!(float_to_value(f64::INFINITY), Value::Null);
+        assert_eq!(float_to_value(-0.0), json!(0));
+    }
 }

@@ -476,6 +476,11 @@ mod tests {
             S3SinkFormat::Xlsx.shared(),
             Some(faucet_core::FileFormat::Xlsx)
         );
+        // Parquet is the one variant that is NOT the shared encoder's: it has
+        // its own Arrow writer, and routing it through `encode` would produce
+        // a JSON body under a `.parquet` key.
+        #[cfg(feature = "arrow")]
+        assert_eq!(S3SinkFormat::Parquet.shared(), None);
     }
 
     #[test]

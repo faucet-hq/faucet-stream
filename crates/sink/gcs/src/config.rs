@@ -425,4 +425,24 @@ mod tests {
         assert_eq!(opts.xml.record_element, "row");
         assert_eq!(opts.xml.root_element, "rows");
     }
+
+    /// Both rollover caps are opt-in and independent (#618): setting one must
+    /// not disturb the other, or an operator asking for a byte cap silently
+    /// gets a record cap too.
+    #[test]
+    fn the_rollover_caps_are_independent_and_default_to_unset() {
+        let base = GcsSinkConfig::new("b");
+        assert_eq!(base.max_bytes_per_file, None);
+        assert_eq!(base.max_records_per_file, None);
+
+        let bytes_only = GcsSinkConfig::new("b").max_bytes_per_file(4096);
+        assert_eq!(bytes_only.max_bytes_per_file, Some(4096));
+        assert_eq!(bytes_only.max_records_per_file, None);
+
+        let both = GcsSinkConfig::new("b")
+            .max_bytes_per_file(4096)
+            .max_records_per_file(10);
+        assert_eq!(both.max_bytes_per_file, Some(4096));
+        assert_eq!(both.max_records_per_file, Some(10));
+    }
 }

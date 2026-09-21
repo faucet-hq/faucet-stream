@@ -589,4 +589,19 @@ mod schema_qualified_tests {
             (Some("db.analytics"), "events")
         );
     }
+
+    /// Every inferred base type must have a DuckDB keyword. A wrong keyword
+    /// here silently creates a column of the wrong type on first write, and
+    /// the data is only found to be mistyped much later.
+    #[test]
+    fn every_base_type_maps_to_a_duckdb_keyword() {
+        use faucet_core::SqlBaseType;
+        assert_eq!(duckdb_keyword(SqlBaseType::Integer), "BIGINT");
+        assert_eq!(duckdb_keyword(SqlBaseType::Double), "DOUBLE");
+        assert_eq!(duckdb_keyword(SqlBaseType::Boolean), "BOOLEAN");
+        assert_eq!(duckdb_keyword(SqlBaseType::Text), "TEXT");
+        // Nested values are serialised as JSON text by the writer, so the
+        // column must be TEXT and not a DuckDB JSON type.
+        assert_eq!(duckdb_keyword(SqlBaseType::Json), "TEXT");
+    }
 }
