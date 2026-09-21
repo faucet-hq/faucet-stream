@@ -42,8 +42,13 @@ mtls = ["reqwest/native-tls"]
 # Excel (.xlsx/.xls) response parsing for `response_format: excel` (#497), via
 # calamine. CSV parsing is always available; only Excel needs this feature.
 excel = ["dep:calamine"]
+# Arrow-columnar streaming (#635): `stream_batches` emits Arrow RecordBatches
+# for the CSV `async_job` path, so a Bulk extract can reach a columnar sink
+# (BigQuery Parquet load) without ever materializing `serde_json::Value`.
+arrow = ["faucet-core/arrow", "dep:arrow"]
 
 [dependencies]
+arrow = { workspace = true, optional = true }
 faucet-core.workspace = true
 # `stream` for `Response::bytes_stream()` — the native byte-passthrough path (#633)
 # streams the async-job CSV response body straight into the CSV→NDJSON converter
