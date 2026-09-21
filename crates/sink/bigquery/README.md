@@ -437,14 +437,26 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 
 ## Arrow columnar load job (opt-in, `arrow` feature)
 
-With a binary built `--features arrow`, add a `bulk_load` block to switch the
-sink onto the Arrow columnar fast path: incoming Arrow `RecordBatch`es are
-written to Parquet on a GCS staging bucket, then loaded with a BigQuery
-`PARQUET` load job (`jobs.insert`, polled to `DONE`) instead of per-row
-`tabledata.insertAll`. This runs end-to-end without per-row JSON when the source
-is also columnar (e.g. `parquet → bigquery`). Load jobs are append/truncate
-only, so the columnar path is used **only** when `write_mode` is `append`
-(upsert/delete stay on the streaming/MERGE path).
+With a binary built `--features arrow`, incoming Arrow `RecordBatch`es are
+encoded to Parquet and loaded with a BigQuery `PARQUET` load job
+(`jobs.insert`, polled to `DONE`) instead of per-row `tabledata.insertAll`.
+This runs end-to-end without per-row JSON when the source is also columnar
+(e.g. `parquet → bigquery`, or `rest` with a CSV `async_job`).
+
+**No GCS bucket is required (#635).** Without a `bulk_load` block the Parquet
+is uploaded *with* the job as a `multipart/related` media upload — the same
+bucket-free shape the NDJSON path uses. A `bulk_load` block switches to
+staging the Parquet on GCS first, which is worth it only for batches large
+enough that a single request is unwise.
+
+Load jobs are append/truncate only, so the columnar path serves `append` and
+`overwrite`; upsert/delete stay on the streaming/MERGE path. Under
+`overwrite` the **first** batch loads with `WRITE_TRUNCATE` and the rest
+append, so one atomic load replaces the table and a mid-run failure leaves
+the prior data intact. (That first-batch-truncates shape needs a per-batch
+disposition, which the staged path's fixed `write_disposition` cannot
+express, so a staged overwrite is refused rather than silently leaving only
+the last batch.)
 
 ```yaml
 sink:
@@ -461,8 +473,9 @@ sink:
       write_disposition: WRITE_APPEND          # default (or WRITE_TRUNCATE / WRITE_EMPTY)
 ```
 
-`bulk_load` is only present in `arrow` builds. The Storage **Write** API
-(gRPC `AppendRows`) is a separate future enhancement.
+`bulk_load` is only present in `arrow` builds, and is now optional rather
+than the trigger for the columnar path. The Storage **Write** API (gRPC
+`AppendRows`) is a separate future enhancement.
 
 ## Overwrite (`write_mode: overwrite`)
 

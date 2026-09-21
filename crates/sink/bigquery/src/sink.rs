@@ -376,7 +376,7 @@ fn multipart_boundary(ndjson: &str) -> String {
 /// Byte-oriented boundary derivation, shared by the `Value` and native load
 /// paths: a hash of the (already gzipped, effectively random) media bytes, so it
 /// is deterministic yet never a substring of the payload.
-fn media_boundary(media: &[u8]) -> String {
+pub(crate) fn media_boundary(media: &[u8]) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     media.hash(&mut h);
@@ -387,7 +387,7 @@ fn media_boundary(media: &[u8]) -> String {
 /// (text), part 2 is the media (gzipped NDJSON — arbitrary bytes). Uses CRLF
 /// line endings as the multipart spec requires. The media part is binary, so
 /// the body is assembled byte-wise rather than via `format!`.
-fn build_multipart_related(boundary: &str, job_json: &str, media: &[u8]) -> Vec<u8> {
+pub(crate) fn build_multipart_related(boundary: &str, job_json: &str, media: &[u8]) -> Vec<u8> {
     let head = format!(
         "--{boundary}\r\n\
          Content-Type: application/json; charset=UTF-8\r\n\r\n\
@@ -2508,27 +2508,70 @@ impl faucet_core::Sink for BigQuerySink {
         Ok(())
     }
 
-    /// Columnar load-job is available only when a `bulk_load` staging config is
-    /// set **and** the write mode is `append` (#380). Load jobs are
-    /// append/truncate only; upsert/delete stay on the `Value` MERGE path, so
-    /// the pipeline never negotiates the columnar loop for them.
+    /// Columnar Parquet loads are available for `append` and `overwrite`
+    /// (#380, #635). A `bulk_load` bucket is no longer required: without one
+    /// the batch is uploaded with the job itself (bucket-free media load), so
+    /// the only thing a bucket buys now is staging for very large batches.
+    ///
+    /// Load jobs are append/truncate only, so upsert/delete stay on the
+    /// `Value` MERGE path and the pipeline never negotiates the columnar loop
+    /// for them.
     #[cfg(feature = "arrow")]
     fn supports_columnar(&self) -> bool {
-        self.config.bulk_load.is_some()
-            && self.config.write.write_mode == faucet_core::WriteMode::Append
+        matches!(
+            self.config.write.write_mode,
+            faucet_core::WriteMode::Append | faucet_core::WriteMode::Overwrite
+        )
     }
 
-    /// Write one Arrow `RecordBatch` by encoding it to Parquet, staging it on
-    /// GCS, and running a BigQuery `PARQUET` load job to completion. Append-only.
-    /// The body lives in `load.rs` (pure cloud I/O — a GCS-SDK staging upload +
-    /// live load job — that can't run in CI, so `codecov.yml` excludes that file
-    /// exactly as it does the GCS connectors).
+    /// Write one Arrow `RecordBatch` as a BigQuery `PARQUET` load job.
+    ///
+    /// Two routes, chosen by whether a staging bucket is configured:
+    /// `bulk_load` stages the Parquet on GCS and loads from `gs://`; without
+    /// it the bytes are POSTed with the job (#635). The bodies live in
+    /// `load.rs` (pure cloud I/O that cannot run in CI, so `codecov.yml`
+    /// excludes that file exactly as it does the GCS connectors).
+    ///
+    /// Under `write_mode: overwrite` the **first** batch truncates and the
+    /// rest append, the same single-load-refresh shape the media NDJSON path
+    /// uses: a `WRITE_TRUNCATE` load is atomic on its own, so a mid-run
+    /// failure leaves the prior table intact.
     #[cfg(feature = "arrow")]
     async fn write_batch_columnar(
         &self,
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
-        crate::load::write_columnar(&self.client, &self.config, &self.gcs_store, batch).await
+        let overwrite = self.config.write.write_mode == faucet_core::WriteMode::Overwrite;
+        // `swap` so only the first batch of an overwrite run truncates; every
+        // later batch must append or the run keeps replacing its own output.
+        let disposition = if overwrite && !self.overwrite_setup.swap(true, Ordering::AcqRel) {
+            "WRITE_TRUNCATE"
+        } else {
+            "WRITE_APPEND"
+        };
+        if self.config.bulk_load.is_some() {
+            if overwrite {
+                return Err(FaucetError::Sink(
+                    "BigQuery: `write_mode: overwrite` on the columnar path is bucket-free \
+                     only — remove `bulk_load` (the staged path's write disposition is \
+                     fixed per config, so it cannot truncate-then-append within a run)"
+                        .into(),
+                ));
+            }
+            return crate::load::write_columnar(&self.client, &self.config, &self.gcs_store, batch)
+                .await;
+        }
+        let token = self.access_token().await?;
+        crate::load::write_columnar_media(
+            &self.client,
+            &self.config,
+            self.upload_base(),
+            &token,
+            &self.config.table_id,
+            disposition,
+            batch,
+        )
+        .await
     }
 }
 

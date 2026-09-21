@@ -305,6 +305,9 @@ arrow = [
     "faucet-source-gcs?/arrow",
     "faucet-sink-gcs?/arrow",
     "faucet-source-databricks?/arrow",
+    # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can
+    # reach the BigQuery Parquet load without materializing `Value`.
+    "faucet-source-rest?/arrow",
     "faucet-source-bigquery?/arrow",
     "faucet-sink-bigquery?/arrow",
     "faucet-sink-snowflake?/arrow",

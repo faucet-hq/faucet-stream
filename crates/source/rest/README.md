@@ -552,6 +552,23 @@ built, so peak memory stays flat regardless of row count. Negotiated
 automatically; any transform, quality/contract/masking pass, DLQ, or
 exactly-once delivery falls back to the ordinary record path.
 
+#### Arrow-columnar streaming (#635, `arrow` feature)
+
+The columnar twin of the byte path: the same CSV `async_job` shape, emitted as
+Arrow `RecordBatch`es so a columnar sink (BigQuery's Parquet load) receives
+typed columns rather than bytes it must re-parse. Negotiated automatically
+when both ends are Arrow-native and no `Value`-shaped stage intervenes.
+
+Every column is **`Utf8`** — types are never inferred. Inferring per page
+means two pages of one export can disagree about a column's type, which is
+exactly why the NDJSON path is pinned to all-STRING. Column names come from
+the header row, or `column_<i>` without one, so a batch's schema is
+field-for-field what the `Value` path's keys are.
+
+Advertised only when the job's result is CSV, there is no custom `decode:`
+chain, and the locator comes from a **header** — a body locator would need
+the parsed document this path deliberately never materializes.
+
 ### Singer / Meltano metadata
 
 | Field | Type | Default | Description |
