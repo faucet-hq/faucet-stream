@@ -75,7 +75,10 @@ async fn spawn_server(port: u16, dir: &std::path::Path) {
         let _ = faucet_cli::serve::run_server(config, Default::default()).await;
     });
     let client = reqwest::Client::new();
-    for _ in 0..100 {
+    // 30s: this polls a server starting up next to the whole
+    // workspace test suite, so the budget has to survive a loaded
+    // runner. Costs nothing when it is already up.
+    for _ in 0..1200 {
         if client
             .get(format!("http://127.0.0.1:{port}/healthz"))
             .send()

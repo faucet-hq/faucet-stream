@@ -138,7 +138,6 @@ async fn server_error_surfaces() {
 /// overhead lives — does not have to be.
 #[tokio::test]
 async fn a_large_csv_file_arrives_as_bounded_pages() {
-    
     use futures::StreamExt as _;
 
     let mut body = String::from("id,name\n");
@@ -184,7 +183,6 @@ async fn a_large_csv_file_arrives_as_bounded_pages() {
 /// that deliberately wants one page still gets it.
 #[tokio::test]
 async fn a_zero_batch_size_keeps_the_file_in_one_page() {
-    
     use futures::StreamExt as _;
 
     let server = MockServer::start().await;

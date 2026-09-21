@@ -434,7 +434,10 @@ async fn spawn_serve_with_triggers(
     });
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for _ in 0..200 {
+    // 30s: this polls a server starting up next to the whole
+    // workspace test suite, so the budget has to survive a loaded
+    // runner. Costs nothing when it is already up.
+    for _ in 0..1200 {
         if client
             .get(format!("{base}/healthz"))
             .send()

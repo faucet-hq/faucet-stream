@@ -633,6 +633,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.0"
+      # This job builds rustdoc for every publishable crate, which reaches
+      # rdkafka's `sasl2-sys` and its bundled C build. Every other build job
+      # already installs these; this one did not, and a warm `rust-cache`
+      # hid it — until a lockfile change rotated the cache key and the
+      # build script ran for real.
+      - name: Install librdkafka prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@v2
       - name: Check every published crate's public API for breaking changes
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
