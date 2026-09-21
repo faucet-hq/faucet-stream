@@ -229,7 +229,6 @@ impl S3SinkConfig {
         self
     }
 
-    /// Set the maximum number of records per file.
     /// The effective per-object record cap, combining `batch_size` (write-side
     /// re-chunking) and `max_records_per_file`. `None` means "no record cap".
     ///
@@ -503,5 +502,28 @@ mod tests {
         assert_eq!(opts.excel.header_row, 2);
         assert_eq!(opts.xml.record_element, "row");
         assert_eq!(opts.xml.root_element, "rows");
+    }
+
+    /// `effective_chunk_cap` resolves `batch_size` against
+    /// `max_records_per_file`; `0` means "no limit on this axis" on both, so
+    /// the four combinations are genuinely different answers and a wrong one
+    /// silently changes object size.
+    #[test]
+    fn the_effective_chunk_cap_covers_the_whole_lattice() {
+        let base = S3SinkConfig::new("b");
+        let with = |bs: usize, max: Option<usize>| {
+            let mut c = base.clone();
+            c.batch_size = bs;
+            c.max_records_per_file = max;
+            c.effective_chunk_cap()
+        };
+        assert_eq!(with(0, None), None, "neither axis caps: one object");
+        assert_eq!(with(0, Some(0)), None, "an explicit zero cap is no cap");
+        assert_eq!(with(0, Some(500)), Some(500), "the record cap alone");
+        assert_eq!(with(100, None), Some(100), "batch_size alone");
+        assert_eq!(with(100, Some(0)), Some(100), "a zero record cap defers");
+        // Both are caps, so the tighter one binds — in either direction.
+        assert_eq!(with(100, Some(500)), Some(100));
+        assert_eq!(with(500, Some(100)), Some(100));
     }
 }

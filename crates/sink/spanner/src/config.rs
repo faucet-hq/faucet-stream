@@ -221,4 +221,17 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("TOPSECRET"));
     }
+
+    /// `create_table` defaults on since #580; this is the opt-out that
+    /// selects the refusal path the integration tests assert against.
+    #[test]
+    fn create_table_can_be_turned_off() {
+        let cfg = SpannerSinkConfig::new("p", "i", "d", "t");
+        assert!(cfg.create_table, "auto-create is the default (#580)");
+        assert!(
+            !SpannerSinkConfig::new("p", "i", "d", "t")
+                .with_create_table(false)
+                .create_table
+        );
+    }
 }

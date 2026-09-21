@@ -419,4 +419,74 @@ mod tests {
             Err(faucet_core::FaucetError::Config(_))
         ));
     }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// GCS's I/O files are excluded from coverage (no emulator, #220), so its
+    /// pure logic is the only part that can be verified — and the mapping is
+    /// what decides whether a body reaches the shared decoder at all.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn formats_map_onto_the_shared_vocabulary_or_opt_out() {
+        assert_eq!(
+            GcsFileFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            GcsFileFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        // `raw_text` keeps this connector's own `{key, content}` envelope, so
+        // it must never be routed through the shared decoder.
+        assert_eq!(GcsFileFormat::RawText.shared(), None);
+        #[cfg(feature = "arrow")]
+        assert_eq!(GcsFileFormat::Parquet.shared(), None);
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(
+            GcsFileFormat::Csv.shared(),
+            Some(faucet_core::FileFormat::Csv)
+        );
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(
+            GcsFileFormat::Xml.shared(),
+            Some(faucet_core::FileFormat::Xml)
+        );
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            GcsFileFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+    }
+
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel"
+    ))]
+    #[test]
+    fn the_format_option_blocks_reach_the_decoder() {
+        let mut cfg = GcsSourceConfig::new("b");
+        cfg.csv = faucet_core::CsvOptions {
+            delimiter: "\\t".into(),
+            has_headers: false,
+        };
+        cfg.excel = faucet_core::ExcelOptions {
+            sheet: Some("Q3".into()),
+            header_row: 1,
+        };
+        cfg.xml = faucet_core::XmlOptions {
+            record_element: "order".into(),
+            root_element: "orders".into(),
+        };
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter_byte().expect("tab"), b'\t');
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Q3"));
+        assert_eq!(opts.excel.header_row, 1);
+        assert_eq!(opts.xml.record_element, "order");
+    }
 }

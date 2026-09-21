@@ -349,4 +349,80 @@ mod tests {
         let cfg = GcsSinkConfig::new("b").format(GcsSinkFormat::Parquet);
         assert_eq!(cfg.format, GcsSinkFormat::Parquet);
     }
+
+    // ── file formats (#604) ───────────────────────────────────────────────
+
+    /// GCS is excluded from coverage on its I/O files (no gRPC-compatible
+    /// emulator, #220), which makes its *pure* logic the only part that can
+    /// be verified at all — so it is verified here rather than left to the
+    /// exclusion to hide.
+    #[test]
+    fn every_format_maps_onto_the_shared_vocabulary() {
+        assert_eq!(
+            GcsSinkFormat::JsonLines.shared(),
+            Some(faucet_core::FileFormat::JsonLines)
+        );
+        assert_eq!(
+            GcsSinkFormat::JsonArray.shared(),
+            Some(faucet_core::FileFormat::JsonArray)
+        );
+        #[cfg(feature = "file-format-csv")]
+        assert_eq!(
+            GcsSinkFormat::Csv.shared(),
+            Some(faucet_core::FileFormat::Csv)
+        );
+        #[cfg(feature = "file-format-xml")]
+        assert_eq!(
+            GcsSinkFormat::Xml.shared(),
+            Some(faucet_core::FileFormat::Xml)
+        );
+        #[cfg(feature = "file-format-excel")]
+        assert_eq!(
+            GcsSinkFormat::Xlsx.shared(),
+            Some(faucet_core::FileFormat::Xlsx)
+        );
+        // Parquet is columnar and owns its own Arrow writer, so it opts out
+        // of the record encoder entirely.
+        #[cfg(feature = "arrow")]
+        assert_eq!(GcsSinkFormat::Parquet.shared(), None);
+    }
+
+    #[test]
+    fn only_json_lines_appends_per_record() {
+        assert!(GcsSinkFormat::JsonLines.appends_per_record());
+        assert!(!GcsSinkFormat::JsonArray.appends_per_record());
+        assert_eq!(GcsSinkFormat::default(), GcsSinkFormat::JsonLines);
+        #[cfg(feature = "file-format-csv")]
+        assert!(!GcsSinkFormat::Csv.appends_per_record());
+        #[cfg(feature = "file-format-xml")]
+        assert!(!GcsSinkFormat::Xml.appends_per_record());
+        #[cfg(feature = "file-format-excel")]
+        assert!(!GcsSinkFormat::Xlsx.appends_per_record());
+    }
+
+    #[test]
+    fn the_format_option_blocks_survive_the_builders() {
+        let cfg = GcsSinkConfig::new("b")
+            .format(GcsSinkFormat::JsonArray)
+            .csv(faucet_core::CsvOptions {
+                delimiter: ";".into(),
+                has_headers: false,
+            })
+            .excel(faucet_core::ExcelOptions {
+                sheet: Some("Data".into()),
+                header_row: 2,
+            })
+            .xml(faucet_core::XmlOptions {
+                record_element: "row".into(),
+                root_element: "rows".into(),
+            });
+        assert_eq!(cfg.format, GcsSinkFormat::JsonArray);
+        let opts = cfg.format_options();
+        assert_eq!(opts.csv.delimiter, ";");
+        assert!(!opts.csv.has_headers);
+        assert_eq!(opts.excel.sheet.as_deref(), Some("Data"));
+        assert_eq!(opts.excel.header_row, 2);
+        assert_eq!(opts.xml.record_element, "row");
+        assert_eq!(opts.xml.root_element, "rows");
+    }
 }

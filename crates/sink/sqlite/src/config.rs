@@ -251,4 +251,17 @@ mod tests {
         let config: SqliteSinkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
     }
+
+    /// `create_table` defaults on since #580; this is the opt-out that
+    /// selects the refusal path the integration tests assert against.
+    #[test]
+    fn create_table_can_be_turned_off() {
+        let cfg = SqliteSinkConfig::new("sqlite::memory:", "t");
+        assert!(cfg.create_table, "auto-create is the default (#580)");
+        assert!(
+            !SqliteSinkConfig::new("sqlite::memory:", "t")
+                .with_create_table(false)
+                .create_table
+        );
+    }
 }
