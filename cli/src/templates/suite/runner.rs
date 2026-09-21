@@ -333,4 +333,409 @@ mod tests {
         // when the author meant one named `auto`.
         assert!(!name_matches("auto:defaults", Some("auto")));
     }
+
+    // ── the runner against a document target ──────────────────────────────
+    //
+    // `Target::Document` needs no registry, so the whole materialize → expand
+    // → compile path is exercised here with nothing but a config string.
+
+    /// A template with one required param, one defaulted, and one closed set.
+    fn template() -> String {
+        r#"version: 1
+name: suite-fixture
+params:
+  tenant:
+    type: string
+    required: true
+  region:
+    type: string
+    default: us
+    values: [us, eu]
+  page_size:
+    type: int
+    default: 100
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: "https://${param.region}.example.com"
+      path: "/t/${param.tenant}"
+  sink:
+    type: jsonl
+    config:
+      path: "./out/${param.tenant}.jsonl"
+"#
+        .to_string()
+    }
+
+    fn doc() -> Target<'static> {
+        Target::Document { body: template() }
+    }
+
+    fn suite_from(yaml: &str) -> SuiteFile {
+        SuiteFile::parse(yaml).expect("suite parses")
+    }
+
+    #[tokio::test]
+    async fn an_explicit_case_that_materializes_cleanly_passes() {
+        let file = suite_from(
+            r#"
+version: 1
+template: ignored-for-document-targets
+suite:
+  cases:
+    - name: eu
+      params: { tenant: acme, region: eu }
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        assert_eq!(out.passed(), 1, "{:?}", out.cases);
+        assert_eq!(out.failed(), 0);
+        assert_eq!(out.cases[0].origin, "explicit");
+        assert!(out.cases[0].failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_value_outside_the_closed_set_fails_the_case() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  cases:
+    - name: bad-region
+      params: { tenant: acme, region: antarctica }
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        assert_eq!(out.failed(), 1);
+        let msg = out.cases[0].failure.as_deref().unwrap_or_default();
+        assert!(msg.contains("region"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_negative_case_passes_when_the_error_matches_and_fails_when_it_does_not() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  cases:
+    - name: names-the-param
+      params: { tenant: acme, region: antarctica }
+      expect: { error: region }
+    - name: names-the-wrong-thing
+      params: { tenant: acme, region: antarctica }
+      expect: { error: "some unrelated phrase" }
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        assert!(out.cases[0].passed, "{:?}", out.cases[0]);
+        assert!(!out.cases[1].passed, "a wrong `error:` must not pass");
+        let msg = out.cases[1].failure.as_deref().unwrap_or_default();
+        assert!(msg.contains("did not mention"), "{msg}");
+    }
+
+    /// The direction that matters most: a negative case going green means the
+    /// guard it pins is gone.
+    #[tokio::test]
+    async fn a_case_expected_to_fail_that_succeeds_is_reported() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  cases:
+    - name: should-have-failed
+      params: { tenant: acme }
+      expect: { valid: false }
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        assert_eq!(out.failed(), 1);
+        let msg = out.cases[0].failure.as_deref().unwrap_or_default();
+        assert!(msg.contains("expected this combination to fail"), "{msg}");
+    }
+
+    /// A missing required param is a materialize failure, not a panic.
+    #[tokio::test]
+    async fn omitting_a_required_param_fails_the_case_naming_it() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  cases:
+    - name: no-tenant
+      params: { region: eu }
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        assert_eq!(out.failed(), 1);
+        assert!(
+            out.cases[0]
+                .failure
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tenant"),
+            "{:?}",
+            out.cases[0].failure
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_cases_are_derived_from_the_templates_own_params() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  auto:
+    enum_coverage: true
+    required_omitted: true
+    defaults_baseline: true
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        let names: Vec<&str> = out.cases.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"auto:defaults"), "{names:?}");
+        assert!(names.contains(&"auto:region=us"), "{names:?}");
+        assert!(names.contains(&"auto:region=eu"), "{names:?}");
+        assert!(names.contains(&"auto:missing-tenant"), "{names:?}");
+        assert_eq!(out.failed(), 0, "{:?}", out.cases);
+        assert!(out.cases.iter().all(|c| c.origin == "auto"));
+    }
+
+    #[tokio::test]
+    async fn combine_sweeps_the_axes_and_fills_the_required_params() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  combine:
+    params:
+      region: [us, eu]
+      page_size: [1, 50]
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        assert_eq!(out.cases.len(), 4, "2 x 2");
+        assert_eq!(out.failed(), 0, "{:?}", out.cases);
+        assert!(out.cases.iter().all(|c| c.origin == "combine"));
+    }
+
+    #[tokio::test]
+    async fn the_filter_selects_a_subset_by_glob() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  cases:
+    - name: keep-me
+      params: { tenant: a }
+    - name: drop-me
+      params: { tenant: b }
+"#,
+        );
+        let out = run(&file, doc(), Some("keep-*")).await.expect("runs");
+        assert_eq!(out.cases.len(), 1);
+        assert_eq!(out.cases[0].name, "keep-me");
+    }
+
+    /// The behavioural tier runs fixture records through the real pipeline and
+    /// reports a mismatch as a case failure rather than an error.
+    #[tokio::test]
+    async fn a_behavioural_case_runs_fixtures_and_reports_a_mismatch() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  behavioral:
+    - name: counts-the-rows
+      params: { tenant: acme }
+      input: [{ "id": "1" }, { "id": "2" }]
+      expect: { records_written: 2 }
+    - name: wrong-count
+      params: { tenant: acme }
+      input: [{ "id": "1" }]
+      expect: { records_written: 99 }
+"#,
+        );
+        let out = run(&file, doc(), None).await.expect("runs");
+        assert_eq!(out.cases.len(), 2);
+        assert!(out.cases[0].passed, "{:?}", out.cases[0].failure);
+        assert_eq!(out.cases[0].origin, "behavioral");
+        assert!(!out.cases[1].passed, "a wrong expectation must fail");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_behavioural_expectation_fails_the_case_not_the_run() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  behavioral:
+    - name: bad-expect
+      params: { tenant: acme }
+      input: []
+      expect: { not_a_real_key: 1 }
+"#,
+        );
+        let out = run(&file, doc(), None)
+            .await
+            .expect("the run itself survives");
+        assert_eq!(out.failed(), 1);
+        assert!(out.cases[0].failure.is_some());
+    }
+
+    /// A template that is not parseable is a run-level error, not a silent
+    /// zero-case pass.
+    #[tokio::test]
+    async fn an_unparseable_template_is_an_error() {
+        let file = suite_from(
+            r#"
+version: 1
+template: t
+suite:
+  cases:
+    - name: a
+      params: {}
+"#,
+        );
+        let target = Target::Document {
+            body: "this: is: not: valid: yaml:
+"
+            .into(),
+        };
+        assert!(run(&file, target, None).await.is_err());
+    }
+
+    // ── the registry target ───────────────────────────────────────────────
+
+    /// Register the same fixture into an in-process store so the
+    /// `Target::Registered` path — version resolution and the registry read —
+    /// is exercised without a database.
+    async fn registered() -> crate::templates::TemplateStore {
+        let store = crate::templates::resolve_store_url("memory")
+            .await
+            .expect("memory store");
+        crate::templates::register(
+            &store,
+            crate::templates::RegisterRequest {
+                id: Some("suite-fixture".into()),
+                body: template(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .expect("register");
+        store
+    }
+
+    #[tokio::test]
+    async fn a_registered_template_resolves_and_runs() {
+        let store = registered().await;
+        let version = resolve_target_version(&store, "suite-fixture", None)
+            .await
+            .expect("stable resolves after a launch");
+        assert_eq!(version, 1);
+
+        let file = suite_from(
+            r#"
+version: 1
+template: suite-fixture
+suite:
+  cases:
+    - name: eu
+      params: { tenant: acme, region: eu }
+"#,
+        );
+        let out = run(
+            &file,
+            Target::Registered {
+                store: &store,
+                id: "suite-fixture",
+                version,
+            },
+            None,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out.passed(), 1, "{:?}", out.cases);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_selector_is_honoured() {
+        let store = registered().await;
+        assert_eq!(
+            resolve_target_version(&store, "suite-fixture", Some("1"))
+                .await
+                .expect("pinned"),
+            1
+        );
+        assert_eq!(
+            resolve_target_version(&store, "suite-fixture", Some("newest"))
+                .await
+                .expect("channel"),
+            1
+        );
+        assert!(
+            resolve_target_version(&store, "suite-fixture", Some("latest"))
+                .await
+                .is_err(),
+            "`latest` is deliberately not a channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_registered_template_is_an_error() {
+        let store = registered().await;
+        let file = suite_from(
+            "version: 1\ntemplate: nope\nsuite:\n  cases:\n    - name: a\n      params: {}\n",
+        );
+        let err = run(
+            &file,
+            Target::Registered {
+                store: &store,
+                id: "nope",
+                version: 1,
+            },
+            None,
+        )
+        .await
+        .expect_err("unknown id");
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn outcome_counts_split_passed_and_failed() {
+        let outcome = SuiteOutcome {
+            cases: vec![
+                CaseOutcome {
+                    name: "a".into(),
+                    origin: "explicit",
+                    params: BTreeMap::new(),
+                    passed: true,
+                    failure: None,
+                },
+                CaseOutcome {
+                    name: "b".into(),
+                    origin: "auto",
+                    params: BTreeMap::new(),
+                    passed: false,
+                    failure: Some("nope".into()),
+                },
+            ],
+        };
+        assert_eq!(outcome.passed(), 1);
+        assert_eq!(outcome.failed(), 1);
+    }
 }

@@ -956,4 +956,170 @@ pipeline:
         .await
         .expect("empty list is not an error");
     }
+
+    // ── `faucet template test` (#648) ─────────────────────────────────────
+
+    fn test_args(suite: &std::path::Path) -> crate::cli::TemplateTestArgs {
+        crate::cli::TemplateTestArgs {
+            suite: suite.to_path_buf(),
+            store: None,
+            select: None,
+            filter: None,
+            json: false,
+            env_file: None,
+            no_env_file: true,
+        }
+    }
+
+    /// Writes a template and a suite that points at it by **path**, which is
+    /// the form that needs no registry.
+    fn suite_fixture(suite_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tpl = dir.path().join("tpl.yaml");
+        std::fs::write(
+            &tpl,
+            r#"version: 1
+name: adapter-fixture
+params:
+  tenant: { type: string, required: true }
+  region: { type: string, default: us, values: [us, eu] }
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: "https://${param.region}.example.com"
+      path: "/t/${param.tenant}"
+  sink:
+    type: jsonl
+    config: { path: "./out/${param.tenant}.jsonl" }
+"#,
+        )
+        .expect("write template");
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            suite_body.replace("TEMPLATE_PATH", tpl.to_str().expect("utf-8")),
+        )
+        .expect("write suite");
+        (dir, suite)
+    }
+
+    #[tokio::test]
+    async fn a_passing_suite_exits_ok_without_a_store() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme, region: eu }
+"#,
+        );
+        test_suite(test_args(&suite)).await.expect("suite passes");
+    }
+
+    /// The exit code is the failed-case count, so CI can gate on it without
+    /// parsing output.
+    #[tokio::test]
+    async fn a_failing_suite_reports_the_failed_count() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: bad-region
+      params: { tenant: acme, region: mars }
+    - name: also-bad
+      params: { tenant: acme, region: pluto }
+"#,
+        );
+        match test_suite(test_args(&suite)).await {
+            Err(CliError::TestsFailed { failed }) => assert_eq!(failed, 2),
+            other => panic!("expected TestsFailed{{2}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_output_is_selectable() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme }
+"#,
+        );
+        let mut args = test_args(&suite);
+        args.json = true;
+        test_suite(args).await.expect("json run passes");
+    }
+
+    #[tokio::test]
+    async fn a_filter_matching_nothing_is_an_error_not_a_silent_pass() {
+        // A suite that runs zero cases and reports green is the failure mode
+        // the whole feature exists to prevent.
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme }
+"#,
+        );
+        let mut args = test_args(&suite);
+        args.filter = Some("nothing-matches-this".into());
+        let err = test_suite(args).await.expect_err("no cases must error");
+        assert!(err.to_string().contains("no cases match"), "{err}");
+    }
+
+    /// A `template:` that is neither a readable path nor accompanied by a
+    /// store cannot be resolved, and the message has to say which of the two
+    /// is missing.
+    #[tokio::test]
+    async fn a_registry_target_without_a_store_names_the_missing_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            "version: 1
+template: not-a-path-and-not-registered
+suite:
+  cases:
+    - name: a
+      params: {}
+",
+        )
+        .expect("write");
+        let err = test_suite(test_args(&suite)).await.expect_err("no store");
+        assert!(err.to_string().contains("--store"), "{err}");
+    }
+
+    /// The registry branch: a `template:` that is not a path goes through the
+    /// store, and an id that was never registered is reported as such rather
+    /// than silently producing zero cases.
+    #[tokio::test]
+    async fn a_registry_target_reports_an_unregistered_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            "version: 1\ntemplate: never-registered\nsuite:\n  cases:\n    - name: a\n      params: {}\n",
+        )
+        .expect("write");
+        let mut args = test_args(&suite);
+        args.store = Some("memory".into());
+        let err = test_suite(args).await.expect_err("unknown template");
+        assert!(err.to_string().contains("never-registered"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_suite_file_is_a_clear_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = test_suite(test_args(&dir.path().join("nope.yaml")))
+            .await
+            .expect_err("missing suite");
+        assert!(err.to_string().contains("template test suite"), "{err}");
+    }
 }
