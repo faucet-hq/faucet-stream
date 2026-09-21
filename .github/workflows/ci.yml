@@ -755,7 +755,12 @@ jobs:
         # result is deterministic.
         if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         run: |
-          git fetch --no-tags --depth=0 origin "${{ github.base_ref }}" || true
+          # `--depth=0` is not a valid depth; this printed a red "fatal:"
+          # on every coverage run and made real failures look like tooling
+          # breakage. `checkout@v4` above already uses fetch-depth: 0, so the
+          # merge base is present — deepen only if the clone were shallow.
+          git rev-parse --is-shallow-repository | grep -qx false \
+            || git fetch --no-tags --unshallow origin "${{ github.base_ref }}" || true
           python3 scripts/patch-coverage.py \
             --lcov lcov.info \
             --base "origin/${{ github.base_ref }}" \

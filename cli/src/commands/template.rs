@@ -1114,6 +1114,81 @@ suite:
         assert!(err.to_string().contains("never-registered"), "{err}");
     }
 
+    /// The registry *success* path, end to end through the dispatcher.
+    ///
+    /// `memory` cannot serve this: `resolve_store_url("memory")` builds a
+    /// fresh store per call, so a template registered in the test would be
+    /// invisible to `test_suite`'s own connection. A sqlite file is the
+    /// smallest store that actually persists between the two.
+    #[tokio::test]
+    async fn a_registered_template_is_resolved_and_its_suite_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("tpl.db");
+        let store_url = format!("sqlite:{}", db.display());
+
+        let store = crate::templates::resolve_store_url(&store_url)
+            .await
+            .expect("sqlite store");
+        crate::templates::register(
+            &store,
+            crate::templates::RegisterRequest {
+                id: Some("adapter-registered".into()),
+                body: r#"version: 1
+name: adapter-registered
+params:
+  tenant: { type: string, required: true }
+pipeline:
+  source:
+    type: rest
+    config: { base_url: "https://example.com", path: "/t/${param.tenant}" }
+  sink:
+    type: jsonl
+    config: { path: "./out/${param.tenant}.jsonl" }
+"#
+                .into(),
+                format: ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .expect("register");
+
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            "version: 1\ntemplate: adapter-registered\nsuite:\n  cases:\n    - name: ok\n      params: { tenant: acme }\n",
+        )
+        .expect("write suite");
+
+        let mut args = test_args(&suite);
+        args.store = Some(store_url);
+        // Resolves `stable` through the registry and runs the case.
+        test_suite(args).await.expect("registered suite passes");
+    }
+
+    /// The dispatcher arm itself — `faucet template test` reaches
+    /// `test_suite` rather than some other subcommand.
+    #[tokio::test]
+    async fn the_test_subcommand_dispatches_to_the_runner() {
+        let (_d, suite) = suite_fixture(
+            r#"version: 1
+template: TEMPLATE_PATH
+suite:
+  cases:
+    - name: ok
+      params: { tenant: acme }
+"#,
+        );
+        run(crate::cli::TemplateArgs {
+            command: TemplateCommand::Test(test_args(&suite)),
+        })
+        .await
+        .expect("dispatched and passed");
+    }
+
     #[tokio::test]
     async fn a_missing_suite_file_is_a_clear_error() {
         let dir = tempfile::tempdir().expect("tempdir");

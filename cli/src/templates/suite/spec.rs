@@ -335,4 +335,33 @@ suite:
             "an `error:` expectation means the case must fail"
         );
     }
+
+    /// A suite pointed at nothing cannot resolve a template, and reporting
+    /// green for zero cases is the failure this whole feature exists to
+    /// prevent — so it is refused at parse time.
+    #[test]
+    fn an_empty_template_reference_is_rejected() {
+        let err =
+            SuiteFile::parse("version: 1\ntemplate: \"   \"\nsuite:\n  cases:\n    - name: a\n")
+                .expect_err("blank template");
+        assert!(err.to_string().contains("`template` must name"), "{err}");
+    }
+
+    /// An unnamed case makes `--filter` ambiguous and the report unreadable.
+    #[test]
+    fn a_case_without_a_name_is_rejected() {
+        let err =
+            SuiteFile::parse("version: 1\ntemplate: t\nsuite:\n  cases:\n    - name: \"  \"\n")
+                .expect_err("blank case name");
+        assert!(err.to_string().contains("non-empty `name`"), "{err}");
+    }
+
+    /// `combine:` present but with no axes generates nothing, which would
+    /// again read as a green suite that tested nothing.
+    #[test]
+    fn an_empty_combine_params_map_is_rejected() {
+        let err = SuiteFile::parse("version: 1\ntemplate: t\nsuite:\n  combine:\n    params: {}\n")
+            .expect_err("no axes");
+        assert!(err.to_string().contains("nothing to generate"), "{err}");
+    }
 }
