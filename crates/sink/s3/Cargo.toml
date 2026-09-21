@@ -42,6 +42,7 @@ file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+futures.workspace = true
 serde_json.workspace = true
 faucet-conformance.workspace = true
 schemars.workspace = true
@@ -52,7 +53,12 @@ testcontainers-modules = { version = "0.15", features = ["minio"] }
 bytes = { workspace = true }
 # The MinIO Parquet round-trip integration test writes via this sink and reads
 # back via the S3 source, and builds a RecordBatch via the core columnar shim.
-faucet-source-s3 = { workspace = true, features = ["arrow"] }
+faucet-source-s3 = { workspace = true, features = [
+    "arrow",
+    "compression",
+    "file-format-csv",
+    "file-format-xml",
+] }
 faucet-core = { workspace = true, features = ["arrow"] }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
