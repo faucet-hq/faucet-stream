@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Format of objects stored in the container.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AzureFileFormat {
     /// Each line in the object is a separate JSON record.
@@ -43,7 +43,7 @@ impl AzureFileFormat {
         feature = "file-format-xml",
         feature = "file-format-excel"
     ))]
-    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+    pub(crate) fn shared(&self) -> Option<faucet_core::FileFormat> {
         match self {
             Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
             Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),

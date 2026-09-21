@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Format of files stored in GCS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GcsFileFormat {
     /// Each line in the file is a separate JSON record.
@@ -53,7 +53,7 @@ impl GcsFileFormat {
         feature = "file-format-xml",
         feature = "file-format-excel"
     ))]
-    pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
+    pub(crate) fn shared(&self) -> Option<faucet_core::FileFormat> {
         match self {
             Self::JsonLines => Some(faucet_core::FileFormat::JsonLines),
             Self::JsonArray => Some(faucet_core::FileFormat::JsonArray),
