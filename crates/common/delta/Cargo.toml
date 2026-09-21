@@ -32,23 +32,6 @@ url.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-# Upstream semver violation, pinned here until it is fixed (2026-09-21).
-#
-# `deltalake 0.32.4` (the latest) pulls `buoyant_kernel 0.22.2`, which declares
-# `buoyant_kernel_derive ^1` — but `buoyant_kernel_derive 1.2.0` removed the
-# `parse_column_name!` macro that the 0.22 line calls, so a *minor* release
-# breaks the build. Our `Cargo.lock` happens to hold 1.1.0, which is why
-# ordinary builds are green; anything that re-resolves (cargo-semver-checks
-# builds the current crate from the manifests, not the lockfile) picks 1.2.0
-# and fails to compile.
-#
-# A dev-dependency is the smallest lever that constrains workspace resolution:
-# it pins the version everywhere in this workspace while staying invisible to
-# downstream consumers, who never resolve our dev-deps. Nothing here `use`s it.
-#
-# Remove once upstream yanks 1.2.0, or `deltalake` moves to the
-# `buoyant_kernel` 0.28 line that pairs with it.
-buoyant_kernel_derive = "=1.1.0"
 
 [package.metadata.docs.rs]
 all-features = true

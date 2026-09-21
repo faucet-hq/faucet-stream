@@ -4345,7 +4345,6 @@ version = "1.0.6"
 dependencies = [
  "arrow",
  "arrow-json",
- "buoyant_kernel_derive",
  "chrono",
  "deltalake",
  "faucet-core",

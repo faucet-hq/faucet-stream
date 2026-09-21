@@ -647,6 +647,25 @@ jobs:
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
+          # Temporarily unguarded (2026-09-21): these five cannot be *built* at
+          # all under a fresh dependency resolution, so there is no API to
+          # compare. `deltalake 0.32.4` (the latest) pulls `buoyant_kernel
+          # 0.22.2`, which declares `buoyant_kernel_derive ^1`; upstream then
+          # published `buoyant_kernel_derive 1.2.0`, a *minor* release that
+          # removed the `parse_column_name!` macro the 0.22 line calls.
+          #
+          # Our committed `Cargo.lock` holds 1.1.0, so every other job is green.
+          # cargo-semver-checks builds each crate from a generated manifest
+          # rather than the workspace lockfile, re-resolves, and takes 1.2.0.
+          # A `=1.1.0` pin does not reach it (tried as a dev-dependency in
+          # d7abb758 and reverted — dev-deps are not in that manifest), and the
+          # only pin that would means adding an unused runtime dependency to
+          # five published crates, which every downstream user would then see.
+          #
+          # Excluding them is internal, reversible, and honest about what is
+          # unguarded. Restore the moment upstream yanks 1.2.0 or `deltalake`
+          # moves to the `buoyant_kernel` 0.28 line that pairs with it.
+          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta
           # No `package:` — check the whole workspace. Gating only `faucet-core`
           # left 89 crates unguarded, so a genuine removal or signature change in
           # a connector could publish in a minor and break dependents silently

@@ -82,6 +82,23 @@ def changed_lines(base: str) -> dict[str, set[int]]:
     return out
 
 
+def compress(nums: list[int]) -> str:
+    """[1,2,3,7] -> "1-3,7" — a long line list is unreadable one per row."""
+    out: list[str] = []
+    start = prev = None
+    for n in sorted(nums):
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = n
+    if start is not None:
+        out.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lcov", default="lcov.info")
@@ -123,7 +140,7 @@ def main() -> int:
             total += 1
             if table[ln] > 0:
                 hit += 1
-            elif len(misses) < 40:
+            else:
                 misses.append(f"{rel}:{ln}")
 
     if total == 0:
@@ -135,9 +152,19 @@ def main() -> int:
 
     if pct + 1e-9 < args.min and not args.report_only:
         print(f"\npatch-coverage: FAILED — below the {args.min:.2f}% floor.")
-        print("Uncovered changed lines (first 40):")
+        # Per-file counts first, then the lines. A truncated flat list is
+        # useless on a large diff: it shows forty consecutive lines of whatever
+        # sorts first and hides where the deficit actually is.
+        per_file: dict[str, list[int]] = defaultdict(list)
         for m in misses:
-            print(f"  {m}")
+            f, _, ln = m.rpartition(":")
+            per_file[f].append(int(ln))
+        print(f"\n{len(misses)} uncovered changed lines, worst files first:")
+        for f, lns in sorted(per_file.items(), key=lambda kv: -len(kv[1])):
+            print(f"  {len(lns):5}  {f}")
+        print("\nUncovered changed lines:")
+        for f, lns in sorted(per_file.items()):
+            print(f"  {f}: {compress(lns)}")
         print(
             "\nThe project standard is >=95% patch coverage. If a line is genuinely "
             "untestable (a signal handler, a main() dispatch arm, an infinite "
