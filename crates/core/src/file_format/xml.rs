@@ -332,6 +332,46 @@ mod tests {
     }
 
     #[test]
+    fn a_self_closing_element_and_cdata_decode() {
+        // `Event::Empty` and `Event::CData` are separate arms from Start/Text.
+        let v = to_json(br#"<r><e/><c><![CDATA[raw <>&]]></c><!-- ignored --></r>"#)
+            .expect("json");
+        assert_eq!(v["r"]["e"], json!(""));
+        assert_eq!(v["r"]["c"], json!("raw <>&"));
+    }
+
+    #[test]
+    fn three_repeated_elements_accumulate_into_one_array() {
+        // The second occurrence promotes the value to an array; the third
+        // takes the push branch.
+        let recs = decode(br#"<rs><r>a</r><r>b</r><r>c</r></rs>"#, "r").expect("decode");
+        assert_eq!(recs, vec![json!("a"), json!("b"), json!("c")]);
+    }
+
+    #[test]
+    fn a_root_wrapping_a_single_child_still_yields_one_record() {
+        // `root_children` has a distinct arm for a lone non-array child.
+        let recs = decode(br#"<rows><row><id>1</id></row></rows>"#, "nope").expect("decode");
+        assert_eq!(recs, vec![json!({"id": "1"})]);
+    }
+
+    #[test]
+    fn emptiness_is_judged_on_the_root_shape() {
+        assert!(is_empty_document(&json!({})));
+        assert!(is_empty_document(&json!({"r": ""})));
+        assert!(is_empty_document(&json!({"r": "   "})));
+        assert!(is_empty_document(&json!({"r": {}})));
+        assert!(!is_empty_document(&json!({"r": "text"})));
+        assert!(!is_empty_document(&json!({"r": {"a": 1}})));
+        assert!(!is_empty_document(&json!({"r": [1]})));
+    }
+
+    #[test]
+    fn the_writer_error_helper_is_prefixed() {
+        assert_eq!(err("boom").to_string(), "Sink error: xml: boom");
+    }
+
+    #[test]
     fn an_empty_document_reads_back_as_zero_records_not_an_error() {
         let bytes = encode(&[], "records", "record").expect("encode");
         assert_eq!(

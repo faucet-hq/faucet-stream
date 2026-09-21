@@ -419,6 +419,52 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Every variant's extension and wire name, so adding a format without
+    /// giving it both is a test failure rather than a `.txt` file called
+    /// "raw_text".
+    #[test]
+    fn every_variant_has_an_extension_and_a_wire_name() {
+        let all = [
+            (FileFormat::JsonLines, ".jsonl", "json_lines"),
+            (FileFormat::JsonArray, ".json", "json_array"),
+            (FileFormat::Csv, ".csv", "csv"),
+            (FileFormat::Xml, ".xml", "xml"),
+            (FileFormat::Xlsx, ".xlsx", "xlsx"),
+            (FileFormat::Parquet, ".parquet", "parquet"),
+            (FileFormat::RawText, ".txt", "raw_text"),
+        ];
+        for (f, ext, name) in all {
+            assert_eq!(f.extension(), ext, "{f:?}");
+            assert_eq!(f.as_str(), name, "{f:?}");
+        }
+    }
+
+    /// `raw_text` is source-only in the connectors, but the shared helper
+    /// still round-trips it — the sink side is what `encode_raw_text` exists
+    /// for, and routing it through the top-level dispatch is how a connector
+    /// reaches it.
+    #[tokio::test]
+    async fn raw_text_round_trips_through_the_top_level_dispatch() {
+        let opts = FormatOptions::default();
+        let recs = decode(b"hello", FileFormat::RawText, &opts)
+            .await
+            .expect("decode");
+        assert_eq!(recs, vec![json!({"text": "hello"})]);
+        let bytes = encode(&recs, FileFormat::RawText, &opts).expect("encode");
+        assert_eq!(bytes, b"hello\n");
+    }
+
+    /// The refusal a build without the feature emits — it must name the
+    /// format and the feature, because mis-parsing an Excel blob as CSV is
+    /// the outcome this exists to prevent.
+    #[test]
+    fn a_missing_feature_is_named_not_guessed() {
+        let err = missing_feature(FileFormat::Xlsx, "file-format-excel");
+        let msg = err.to_string();
+        assert!(msg.contains("xlsx"), "{msg}");
+        assert!(msg.contains("file-format-excel"), "{msg}");
+    }
+
     #[test]
     fn extensions_and_names_are_stable() {
         assert_eq!(FileFormat::default(), FileFormat::JsonLines);

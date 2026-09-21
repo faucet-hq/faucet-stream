@@ -244,6 +244,29 @@ mod tests {
     }
 
     #[test]
+    fn a_sheet_index_out_of_range_names_the_count() {
+        let bytes = encode(&[json!({"a": 1})], None).expect("encode");
+        let err = decode(&bytes, Some("7"), 0).expect_err("index 7");
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn a_non_string_header_cell_is_stringified_rather_than_dropped() {
+        // A worksheet whose header row holds numbers still names its columns;
+        // dropping them would silently shift every value.
+        let bytes = encode(&[json!({"2024": "q1", "flag": true})], None).expect("encode");
+        let back = decode(&bytes, None, 0).expect("decode");
+        assert_eq!(back, vec![json!({"2024": "q1", "flag": true})]);
+    }
+
+    #[test]
+    fn a_blank_cell_reads_back_as_null() {
+        let bytes = encode(&[json!({"a": 1, "b": null})], None).expect("encode");
+        let back = decode(&bytes, None, 0).expect("decode");
+        assert_eq!(back, vec![json!({"a": 1, "b": null})]);
+    }
+
+    #[test]
     fn not_a_workbook_is_an_error_not_a_panic() {
         let err = decode(b"id,name\n1,ada\n", None, 0).expect_err("csv is not xlsx");
         assert!(err.to_string().contains("opening workbook"), "{err}");
