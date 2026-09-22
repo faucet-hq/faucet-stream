@@ -1089,9 +1089,6 @@ where
             "contract: on_breach 'quarantine' requires a DLQ sink".into(),
         ));
     }
-    // One-shot warn guard for contract `on_breach: warn` breaches.
-    #[cfg(feature = "contract")]
-    let mut warned_contract_breach = false;
 
     // Masking policy (issue #206). Applied *first* per page — before
     // quality/contract/drift and every sink — so PII never leaks to a sink,
@@ -1111,11 +1108,10 @@ where
                 .into(),
         ));
     }
-    // Destination schema cache: fetched lazily once, refreshed after evolve.
-    // The inner `None` means "fetched, sink is schemaless"; the outer `None`
-    // tracks "not yet fetched".
-    let mut dest_schema_cache: Option<Option<Value>> = None;
-    let mut warned_drift_inert = false;
+    // Governance state carried across pages: the lazily-fetched destination
+    // schema (inner `None` = "fetched, sink is schemaless"; outer `None` = "not
+    // yet fetched") and the one-shot warning latches.
+    let mut gov_state = GovernanceState::default();
 
     if let Some(key) = state_key.as_ref() {
         validate_state_key(key)?;
@@ -1338,241 +1334,31 @@ where
                         continue;
                     }
 
-                    // ── Masking pass (FIRST — before quality/contract/drift and
-                    // every sink write) ─────────────────────────────────────
-                    // Runs ahead of everything so PII never reaches a sink, the
-                    // DLQ (quarantine envelopes are built downstream from these
-                    // already-masked records), or the sink-side lineage sample.
-                    #[cfg(feature = "masking")]
-                    let page = if let Some(m) = masking.as_ref() {
-                        let labels =
-                            crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                        let outcome = crate::observability::instrumented_apply_masking(
-                            page.records,
-                            m,
-                            &labels,
-                        );
-                        StreamPage {
-                            records: outcome.records,
-                            bookmark: page.bookmark,
-                        }
-                    } else {
-                        page
-                    };
-
-                    // True page positions of the records currently flowing, kept
-                    // in lockstep as quality/contract remove rows, so a later
-                    // schema-drift quarantine annotates the envelope with the
-                    // record's real page index — not a survivor-relative one
-                    // (audit #321 L6). Quality's own quarantine already uses the
-                    // true `page_index`; this carries the same truth to drift.
-                    let page_len = page.records.len();
-
-                    // ── Quality pass (after transforms, before sink) ─────────
-                    #[cfg(feature = "quality")]
-                    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-                        if let Some(q) = quality.as_ref() {
-                            let labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            let outcome = crate::observability::instrumented_apply_quality(
-                                page.records,
-                                q,
-                                &labels,
-                            )?;
-                            let quarantined_idx: std::collections::HashSet<usize> =
-                                outcome.quarantined.iter().map(|qr| qr.page_index).collect();
-                            let envelopes: Vec<Value> = outcome
-                                .quarantined
-                                .iter()
-                                .map(|qr| {
-                                    let err = FaucetError::QualityFailure {
-                                        check: qr.check.to_string(),
-                                        message: qr.message.clone(),
-                                    };
-                                    // `record_index` is the position within the PAGE
-                                    // (the frozen envelope contract), not the index in
-                                    // the quarantine list (#146 R).
-                                    build_envelope(
-                                        &qr.record,
-                                        &err,
-                                        DlqReason::Quality,
-                                        sink_name,
-                                        &pipeline_name,
-                                        &row,
-                                        qr.page_index,
-                                    )
-                                })
-                                .collect();
-                            let survivor_idx: Vec<usize> =
-                                (0..page_len).filter(|i| !quarantined_idx.contains(i)).collect();
-                            (outcome.survivors, envelopes, survivor_idx)
-                        } else {
-                            (page.records, Vec::new(), (0..page_len).collect())
-                        };
-                    #[cfg(not(feature = "quality"))]
-                    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-                        (page.records, Vec::new(), (0..page_len).collect());
-
-                    // ── Contract pass (after quality, before schema drift) ───
-                    // `fail` mirrors a quality `abort`: the breach error
-                    // propagates immediately and nothing from this page is
-                    // written — a contract must never commit breaching data
-                    // (unlike drift `fail`, which defers because its records
-                    // are individually fine).
-                    #[cfg(feature = "contract")]
-                    let (records, contract_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-                        if let Some(c) = contract.as_ref() {
-                            let labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            let outcome = crate::observability::instrumented_apply_contract(
-                                records, c, &labels,
-                            )?;
-                            if !outcome.warned.is_empty() && !warned_contract_breach {
-                                tracing::warn!(
-                                    version = %c.version,
-                                    breaches = outcome.warned.len(),
-                                    first = %outcome.warned[0].describe(),
-                                    "contract: breaching records written unchanged \
-                                     (on_breach=warn); this warning fires once per run"
-                                );
-                                warned_contract_breach = true;
-                            }
-                            let envelopes: Vec<Value> = outcome
-                                .quarantined
-                                .iter()
-                                .map(|vr| {
-                                    let err = FaucetError::ContractViolation {
-                                        version: c.version.clone(),
-                                        message: vr.violation.describe(),
-                                    };
-                                    // `record_index` must be the position within the
-                                    // original PAGE (the frozen envelope contract).
-                                    // `vr.violation.page_index` is the position within
-                                    // *this pass's input* — the quality survivors —
-                                    // which is aligned with `page_indices`, so translate
-                                    // through it. Without this, an earlier quality
-                                    // quarantine on the same page shifts every contract
-                                    // envelope's index by the count of quality-removed
-                                    // rows (#466 M1).
-                                    let page_index = page_indices
-                                        .get(vr.violation.page_index)
-                                        .copied()
-                                        .unwrap_or(vr.violation.page_index);
-                                    build_envelope(
-                                        &vr.record,
-                                        &err,
-                                        DlqReason::Contract,
-                                        sink_name,
-                                        &pipeline_name,
-                                        &row,
-                                        page_index,
-                                    )
-                                })
-                                .collect();
-                            // Contract's `page_index` is the position within ITS
-                            // input (the quality survivors) — aligned with the
-                            // incoming `page_indices`. Drop those positions so the
-                            // vector still maps each remaining record to its true
-                            // original page index (#321 L6).
-                            let contract_quarantined: std::collections::HashSet<usize> = outcome
-                                .quarantined
-                                .iter()
-                                .map(|vr| vr.violation.page_index)
-                                .collect();
-                            let survivor_idx: Vec<usize> = page_indices
-                                .iter()
-                                .enumerate()
-                                .filter(|(pos, _)| !contract_quarantined.contains(pos))
-                                .map(|(_, orig)| *orig)
-                                .collect();
-                            (outcome.survivors, envelopes, survivor_idx)
-                        } else {
-                            (records, Vec::new(), page_indices)
-                        };
-
-                    // ── Schema-drift pass (after quality, before sink) ───────
-                    let mut drift_envelopes: Vec<Value> = Vec::new();
-                    let (records, drift_abort): (Vec<Value>, Option<FaucetError>) =
-                        if let Some(policy) = schema_drift.as_ref().filter(|_| !records.is_empty()) {
-                            // Lazily fetch + cache the destination schema.
-                            if dest_schema_cache.is_none() {
-                                dest_schema_cache = Some(sink.current_schema().await?);
-                            }
-                            let dest = dest_schema_cache.as_ref().and_then(|o| o.as_ref());
-                            match dest {
-                                None => {
-                                    if !warned_drift_inert {
-                                        tracing::info!(
-                                            connector = sink_name,
-                                            "schema-drift: sink reports no destination schema; \
-                                             drift handling is inert this run"
-                                        );
-                                        warned_drift_inert = true;
-                                    }
-                                    (records, None)
-                                }
-                                Some(dest) => {
-                                    let inferred = crate::schema::infer_schema(&records);
-                                    let diff = crate::drift::diff_schema(
-                                        dest,
-                                        &inferred,
-                                        policy.allow_widening,
-                                    );
-                                    if diff.is_empty() {
-                                        (records, None)
-                                    } else {
-                                        // The cache may be replaced inside the evolve
-                                        // arm; `dest` borrows it, so re-clone before the
-                                        // call to drop the borrow.
-                                        let dest_owned = dest.clone();
-                                        apply_drift_policy(
-                                            policy,
-                                            &diff,
-                                            &dest_owned,
-                                            records,
-                                            &page_indices,
-                                            sink,
-                                            sink_name,
-                                            &pipeline_name,
-                                            &row,
-                                            &mut dest_schema_cache,
-                                            &mut drift_envelopes,
-                                        )
-                                        .await?
-                                    }
-                                }
-                            }
-                        } else {
-                            (records, None)
-                        };
-                    // Merge contract + drift quarantine envelopes into the
-                    // quality envelopes so the existing DLQ path writes them
-                    // together.
-                    let quality_envelopes = {
-                        let mut q = quality_envelopes;
+                    // Governance passes — masking → quality → contract →
+                    // schema drift — shared verbatim with the columnar loop
+                    // (#636) so the two paths cannot drift apart.
+                    let specs = GovernanceSpecs {
+                        #[cfg(feature = "masking")]
+                        masking: masking.as_ref(),
+                        #[cfg(feature = "quality")]
+                        quality: quality.as_ref(),
                         #[cfg(feature = "contract")]
-                        q.extend(contract_envelopes);
-                        q.append(&mut drift_envelopes);
-                        q
+                        contract: contract.as_ref(),
+                        schema_drift: schema_drift.as_ref(),
+                        pipeline: &pipeline_name,
+                        row: &row,
+                        run_id: &run_id,
+                        sink_name,
+                        has_dlq: dlq.is_some(),
                     };
-                    // A drift `fail` / incompatible-`fail` abort is *deferred* the
-                    // same way the DLQ-budget and circuit-breaker aborts are: when a
-                    // DLQ is configured this page may carry quality- or drift-
-                    // quarantine envelopes that must still reach the DLQ before the
-                    // run stops (dropping them on an early `return` would silently
-                    // lose those rows — #146 M4). So with a DLQ we thread the error
-                    // into the post-commit raise site below; with no DLQ there are
-                    // no envelopes to strand (a no-DLQ quarantine config is rejected
-                    // at run start), so we abort immediately and write nothing.
-                    let mut drift_abort = drift_abort;
-                    if dlq.is_none()
-                        && let Some(e) = drift_abort.take()
-                    {
-                        return Err(e);
-                    }
+                    let gov =
+                        apply_governance(page.records, &specs, &mut gov_state, sink).await?;
+                    let quality_envelopes = gov.envelopes;
+                    let mut drift_abort = gov.deferred_abort;
+                    let _ = &mut drift_abort;
 
                     let page = StreamPage {
-                        records,
+                        records: gov.records,
                         bookmark: page.bookmark,
                     };
 
@@ -2254,6 +2040,266 @@ fn maybe_warn_noop_sink(sink_name: &str, warned: &mut bool) {
 /// no envelopes can exist — it is raised immediately and the page is not written.
 /// Appends drift quarantine envelopes to `drift_envelopes`.
 #[allow(clippy::too_many_arguments)]
+/// Compiled governance specs for one run, borrowed per page.
+///
+/// Bundled into a struct rather than passed as loose arguments because the set
+/// is feature-gated: a `#[cfg]` on a function parameter is not expressible, and
+/// threading five `Option`s through two call sites invites them being passed in
+/// the wrong order.
+pub(crate) struct GovernanceSpecs<'a> {
+    #[cfg(feature = "masking")]
+    pub masking: Option<&'a Arc<crate::masking::CompiledMasking>>,
+    #[cfg(feature = "quality")]
+    pub quality: Option<&'a Arc<crate::quality::CompiledQuality>>,
+    #[cfg(feature = "contract")]
+    pub contract: Option<&'a Arc<crate::contract::CompiledContract>>,
+    pub schema_drift: Option<&'a crate::drift::SchemaDriftPolicy>,
+    pub pipeline: &'a str,
+    pub row: &'a str,
+    pub run_id: &'a str,
+    pub sink_name: &'a str,
+    /// Whether a DLQ is configured. A drift/incompatible `fail` is **deferred**
+    /// when it is, so this page's already-built quarantine envelopes still
+    /// reach the DLQ before the run stops (#146 M4).
+    pub has_dlq: bool,
+}
+
+/// State the governance passes carry **across** pages of one run: the lazily
+/// fetched destination schema and the one-shot warning latches.
+#[derive(Default)]
+pub(crate) struct GovernanceState {
+    pub dest_schema_cache: Option<Option<Value>>,
+    pub warned_drift_inert: bool,
+    #[cfg(feature = "contract")]
+    pub warned_contract_breach: bool,
+}
+
+/// What one page's governance passes produced.
+pub(crate) struct GovernanceOutcome {
+    /// Records that survived every pass and should be written.
+    pub records: Vec<Value>,
+    /// DLQ envelopes from quality + contract + drift quarantine, merged in that
+    /// order so the caller writes them as one batch.
+    pub envelopes: Vec<Value>,
+    /// A drift `fail` / incompatible-`fail` abort to raise **after** the
+    /// envelopes are durable. `None` when there is nothing to defer; with no
+    /// DLQ configured the error is returned directly instead.
+    pub deferred_abort: Option<FaucetError>,
+}
+
+/// Run the per-page governance passes in their load-bearing order —
+/// **masking → quality → contract → schema drift** — and return the survivors
+/// plus any DLQ envelopes.
+///
+/// Extracted from `run_stream` so the columnar loop runs the *same* code rather
+/// than a second copy (#636). The ordering and the page-index bookkeeping are
+/// the subtle parts and must not be duplicated: masking runs first so PII never
+/// reaches a sink, the DLQ, or a lineage sample; quality and contract each
+/// remove rows, and `page_indices` is carried in lockstep so a later drift
+/// quarantine annotates an envelope with the record's **true** page position
+/// rather than a survivor-relative one (#321 L6, #466 M1).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
+    records: Vec<Value>,
+    specs: &GovernanceSpecs<'_>,
+    state: &mut GovernanceState,
+    sink: &Si,
+) -> Result<GovernanceOutcome, FaucetError> {
+    use crate::dlq::{DlqReason, build_envelope};
+
+    let pipeline_name = specs.pipeline;
+    let row = specs.row;
+    let sink_name = specs.sink_name;
+
+    // ── Masking pass (FIRST — before quality/contract/drift and every sink
+    // write) ────────────────────────────────────────────────────────────────
+    // Runs ahead of everything so PII never reaches a sink, the DLQ (quarantine
+    // envelopes are built downstream from these already-masked records), or the
+    // sink-side lineage sample.
+    #[cfg(feature = "masking")]
+    let records = if let Some(m) = specs.masking {
+        let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
+        crate::observability::instrumented_apply_masking(records, m, &labels).records
+    } else {
+        records
+    };
+
+    // True page positions of the records currently flowing, kept in lockstep as
+    // quality/contract remove rows.
+    let page_len = records.len();
+
+    // ── Quality pass ────────────────────────────────────────────────────────
+    #[cfg(feature = "quality")]
+    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
+        if let Some(q) = specs.quality {
+            let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
+            let outcome = crate::observability::instrumented_apply_quality(records, q, &labels)?;
+            let quarantined_idx: std::collections::HashSet<usize> =
+                outcome.quarantined.iter().map(|qr| qr.page_index).collect();
+            let envelopes: Vec<Value> = outcome
+                .quarantined
+                .iter()
+                .map(|qr| {
+                    let err = FaucetError::QualityFailure {
+                        check: qr.check.to_string(),
+                        message: qr.message.clone(),
+                    };
+                    // `record_index` is the position within the PAGE (the frozen
+                    // envelope contract), not the index in the quarantine list.
+                    build_envelope(
+                        &qr.record,
+                        &err,
+                        DlqReason::Quality,
+                        sink_name,
+                        pipeline_name,
+                        row,
+                        qr.page_index,
+                    )
+                })
+                .collect();
+            let survivor_idx: Vec<usize> = (0..page_len)
+                .filter(|i| !quarantined_idx.contains(i))
+                .collect();
+            (outcome.survivors, envelopes, survivor_idx)
+        } else {
+            (records, Vec::new(), (0..page_len).collect())
+        };
+    #[cfg(not(feature = "quality"))]
+    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
+        (records, Vec::new(), (0..page_len).collect());
+
+    // ── Contract pass ───────────────────────────────────────────────────────
+    // `fail` mirrors a quality `abort`: the breach error propagates immediately
+    // and nothing from this page is written.
+    #[cfg(feature = "contract")]
+    let (records, contract_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
+        if let Some(c) = specs.contract {
+            let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
+            let outcome = crate::observability::instrumented_apply_contract(records, c, &labels)?;
+            if !outcome.warned.is_empty() && !state.warned_contract_breach {
+                tracing::warn!(
+                    version = %c.version,
+                    breaches = outcome.warned.len(),
+                    first = %outcome.warned[0].describe(),
+                    "contract: breaching records written unchanged (on_breach=warn); \
+                     this warning fires once per run"
+                );
+                state.warned_contract_breach = true;
+            }
+            let envelopes: Vec<Value> = outcome
+                .quarantined
+                .iter()
+                .map(|vr| {
+                    let err = FaucetError::ContractViolation {
+                        version: c.version.clone(),
+                        message: vr.violation.describe(),
+                    };
+                    // `vr.violation.page_index` is the position within *this
+                    // pass's input* — the quality survivors — which is aligned
+                    // with `page_indices`, so translate through it (#466 M1).
+                    let page_index = page_indices
+                        .get(vr.violation.page_index)
+                        .copied()
+                        .unwrap_or(vr.violation.page_index);
+                    build_envelope(
+                        &vr.record,
+                        &err,
+                        DlqReason::Contract,
+                        sink_name,
+                        pipeline_name,
+                        row,
+                        page_index,
+                    )
+                })
+                .collect();
+            let contract_quarantined: std::collections::HashSet<usize> = outcome
+                .quarantined
+                .iter()
+                .map(|vr| vr.violation.page_index)
+                .collect();
+            let survivor_idx: Vec<usize> = page_indices
+                .iter()
+                .enumerate()
+                .filter(|(pos, _)| !contract_quarantined.contains(pos))
+                .map(|(_, orig)| *orig)
+                .collect();
+            (outcome.survivors, envelopes, survivor_idx)
+        } else {
+            (records, Vec::new(), page_indices)
+        };
+
+    // ── Schema-drift pass ───────────────────────────────────────────────────
+    let mut drift_envelopes: Vec<Value> = Vec::new();
+    let (records, drift_abort): (Vec<Value>, Option<FaucetError>) =
+        if let Some(policy) = specs.schema_drift.filter(|_| !records.is_empty()) {
+            if state.dest_schema_cache.is_none() {
+                state.dest_schema_cache = Some(sink.current_schema().await?);
+            }
+            let dest = state.dest_schema_cache.as_ref().and_then(|o| o.as_ref());
+            match dest {
+                None => {
+                    if !state.warned_drift_inert {
+                        tracing::info!(
+                            connector = sink_name,
+                            "schema-drift: sink reports no destination schema; \
+                             drift handling is inert this run"
+                        );
+                        state.warned_drift_inert = true;
+                    }
+                    (records, None)
+                }
+                Some(dest) => {
+                    let inferred = crate::schema::infer_schema(&records);
+                    let diff = crate::drift::diff_schema(dest, &inferred, policy.allow_widening);
+                    if diff.is_empty() {
+                        (records, None)
+                    } else {
+                        // The cache may be replaced inside the evolve arm; `dest`
+                        // borrows it, so re-clone before the call to drop the borrow.
+                        let dest_owned = dest.clone();
+                        apply_drift_policy(
+                            policy,
+                            &diff,
+                            &dest_owned,
+                            records,
+                            &page_indices,
+                            sink,
+                            sink_name,
+                            pipeline_name,
+                            row,
+                            &mut state.dest_schema_cache,
+                            &mut drift_envelopes,
+                        )
+                        .await?
+                    }
+                }
+            }
+        } else {
+            (records, None)
+        };
+
+    // Merge quality + contract + drift envelopes so the caller writes one batch.
+    let mut envelopes = quality_envelopes;
+    #[cfg(feature = "contract")]
+    envelopes.extend(contract_envelopes);
+    envelopes.append(&mut drift_envelopes);
+
+    // With no DLQ there are no envelopes to strand (a no-DLQ quarantine config
+    // is rejected at run start), so a drift abort is raised immediately.
+    let mut drift_abort = drift_abort;
+    if !specs.has_dlq
+        && let Some(e) = drift_abort.take()
+    {
+        return Err(e);
+    }
+
+    Ok(GovernanceOutcome {
+        records,
+        envelopes,
+        deferred_abort: drift_abort,
+    })
+}
+
 async fn apply_drift_policy<Si: Sink + ?Sized>(
     policy: &crate::drift::SchemaDriftPolicy,
     diff: &crate::drift::SchemaDiff,
