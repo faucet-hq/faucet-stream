@@ -15,7 +15,11 @@ use std::time::Duration;
 #[schemars(extend("x-faucet-aliases" = ["max_reconnect_attempts"]))]
 #[serde(deny_unknown_fields)]
 pub struct MetadataEntry {
+    /// Metadata key. gRPC lowercases keys on the wire; a `-bin` suffix marks a
+    /// binary value.
     pub key: String,
+    /// Metadata value, sent verbatim. Use `${env:…}` / `${secret:…}` for
+    /// credentials rather than inlining them.
     pub value: String,
 }
 
