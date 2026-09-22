@@ -580,7 +580,15 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             {
                 let columnar_ok = wrapped_source.supports_columnar()
                     && wrapped_sink.supports_columnar()
-                    && self.dlq.is_none()
+                    // A DLQ is fine now: the columnar loop routes quarantine
+                    // envelopes and enforces the same budgets (#636). Only the
+                    // row-level `DlqAll` policy still needs the `Value` path,
+                    // because `write_batch_columnar` reports no per-row
+                    // outcomes to route.
+                    && self
+                        .dlq
+                        .as_ref()
+                        .is_none_or(|d| d.on_batch_error == crate::dlq::OnBatchError::Propagate)
                     && self.delivery == crate::idempotency::DeliveryMode::AtLeastOnce
                     && self.adaptive.is_none()
                     && self.resilience.is_none()
@@ -594,20 +602,10 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     // wired below; the columnar path would append straight to
                     // the destination and skip the atomic swap.
                     && !wrapped_sink.is_overwrite();
-                // Governance no longer disqualifies the fast path outright
-                // (#636) — it runs *inside* the columnar loop via the same
-                // `apply_governance` the `Value` loop uses. A **quarantining**
-                // policy still falls back, because quarantine needs the DLQ
-                // envelope/budget machinery that only `run_stream` has (and
-                // `dlq.is_none()` above already excludes it).
-                let columnar_ok =
-                    columnar_ok && self.schema_drift.as_ref().is_none_or(|p| !p.requires_dlq());
-                #[cfg(feature = "quality")]
-                let columnar_ok =
-                    columnar_ok && self.quality.as_ref().is_none_or(|q| !q.requires_dlq());
-                #[cfg(feature = "contract")]
-                let columnar_ok =
-                    columnar_ok && self.contract.as_ref().is_none_or(|c| !c.requires_dlq());
+                // Governance no longer disqualifies the fast path (#636) — it
+                // runs *inside* the columnar loop via the same
+                // `apply_governance` the `Value` loop uses, including
+                // quarantine: envelopes go to the DLQ under the same budgets.
                 if columnar_ok {
                     let state = match (wrapped_state_store.clone(), state_key.clone()) {
                         (Some(store), Some(key)) => Some((store, key)),
@@ -640,8 +638,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         row: &row,
                         run_id: &run_id,
                         sink_name,
-                        // No DLQ on this path, so a drift abort raises directly.
-                        has_dlq: false,
+                        has_dlq: self.dlq.is_some(),
                     };
                     return run_stream_columnar(
                         &wrapped_source,
@@ -653,6 +650,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         &run_id,
                         specs,
                         has_governance,
+                        self.dlq.clone(),
                     )
                     .await;
                 }
@@ -860,6 +858,7 @@ async fn run_stream_columnar<S, Si>(
     run_id: &str,
     specs: GovernanceSpecs<'_>,
     has_governance: bool,
+    dlq: Option<crate::dlq::DlqConfig>,
 ) -> Result<PipelineResult, FaucetError>
 where
     S: crate::Source + ?Sized,
@@ -884,6 +883,7 @@ where
     let mut records_written = 0usize;
     let mut last_bookmark: Option<Value> = None;
     let mut gov_state = GovernanceState::default();
+    let mut dlq_stats = crate::dlq::DlqStats::default();
 
     loop {
         // Cooperative cancellation: race the next batch against the token so a
@@ -913,14 +913,55 @@ where
         // The batch is materialized to `Value` only when a policy is actually
         // configured; with none, the batch goes to the sink untouched and the
         // run stays pure-columnar end to end.
+        // A quarantine abort (budget exceeded) is raised only after this page's
+        // envelopes are durable and the bookmark has advanced — the same
+        // deferral the `Value` path uses, so quarantined rows are never dropped
+        // on the way out (#146 M4).
+        let mut deferred: Option<FaucetError> = None;
         let batch = if has_governance && rows > 0 {
             let records = crate::columnar::record_batch_to_values(&page.batch)?;
             let schema = page.batch.schema();
             let gov = apply_governance(records, &specs, &mut gov_state, sink).await?;
-            debug_assert!(
-                gov.envelopes.is_empty() && gov.deferred_abort.is_none(),
-                "columnar governance is gated to non-quarantining policies"
-            );
+            deferred = gov.deferred_abort;
+
+            if !gov.envelopes.is_empty() {
+                let dlq_cfg = dlq.as_ref().ok_or_else(|| {
+                    // Unreachable: a quarantining policy without a DLQ is
+                    // rejected at run start. Fail loudly rather than drop rows.
+                    FaucetError::Config(
+                        "governance quarantined records but no DLQ sink is configured".into(),
+                    )
+                })?;
+                let page_failures = gov.envelopes.len();
+                // Budgets are shared across the run, exactly as on the `Value`
+                // path; the overshoot is written rather than dropped, because
+                // losing the rows is strictly worse than exceeding the budget.
+                if deferred.is_none()
+                    && let Some(limit) = dlq_cfg.max_failures_per_page
+                    && page_failures > limit
+                {
+                    deferred = Some(FaucetError::Sink(format!(
+                        "DLQ per-page budget exceeded: {page_failures} > {limit}"
+                    )));
+                }
+                let new_total = dlq_stats.records_dlq + page_failures;
+                if deferred.is_none()
+                    && let Some(limit) = dlq_cfg.max_failures_total
+                    && new_total > limit
+                {
+                    deferred = Some(FaucetError::Sink(format!(
+                        "DLQ total budget exceeded: {new_total} > {limit}"
+                    )));
+                }
+                dlq_cfg
+                    .sink
+                    .write_batch(&gov.envelopes)
+                    .await
+                    .map_err(|e| FaucetError::Sink(format!("DLQ write failed: {e}")))?;
+                dlq_stats.records_dlq += page_failures;
+                dlq_stats.pages_with_failures += 1;
+            }
+
             // Re-encode against the *incoming* schema so a pass that only
             // removes rows cannot silently re-type a column via inference.
             crate::columnar::values_to_record_batch(&gov.records, schema)?
@@ -945,6 +986,13 @@ where
             }
             last_bookmark = Some(bm);
         }
+
+        // Now the page is fully durable — envelopes written, bookmark advanced
+        // — so a deferred drift/budget abort can stop the run without
+        // stranding anything.
+        if let Some(e) = deferred {
+            return Err(e);
+        }
     }
 
     // Final flush (mirrors the Value path's end-of-stream / on-cancel flush).
@@ -952,7 +1000,7 @@ where
     Ok(PipelineResult {
         records_written,
         bookmark: last_bookmark,
-        dlq: None,
+        dlq: dlq.is_some().then_some(dlq_stats),
     })
 }
 

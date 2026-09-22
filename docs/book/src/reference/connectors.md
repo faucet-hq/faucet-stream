@@ -293,13 +293,14 @@ to the row path.
 **Governance no longer disqualifies it (#636).** `masking:`, `quality:`,
 `contract:` and `schema:` now run *inside* the columnar loop, via the same
 pass the row path uses — so a `parquet → mask + quality → parquet` run stays
-columnar instead of dropping to `Value` the moment a policy is attached. The
-one exception is a **quarantining** policy (`on_failure: quarantine`,
-`on_breach: quarantine`, `on_drift: quarantine`): routing quarantined rows
-needs the DLQ envelope and failure-budget machinery that only the row path
-has, so those configurations still fall back. The governance pass itself
-materializes `Value` for the page it inspects; the source→sink transfer stays
-columnar.
+columnar instead of dropping to `Value` the moment a policy is attached.
+**Quarantine works there too**: quarantined rows are written to the `dlq:`
+sink under the same per-page and total budgets, and a budget abort still
+writes the overshoot before stopping, so no quarantined row is dropped. The
+one configuration that still falls back is `on_batch_error: dlq_all`, which
+routes a *failed write* row-by-row — `write_batch_columnar` reports no
+per-row outcomes to route. The governance pass materializes `Value` for the
+page it inspects; the source→sink transfer stays columnar.
 
 Arrow-native connectors:
 

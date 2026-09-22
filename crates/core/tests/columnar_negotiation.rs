@@ -344,33 +344,41 @@ async fn a_quality_abort_fires_on_the_columnar_path() {
     );
 }
 
-/// A *quarantining* policy still falls back to the `Value` path — quarantine
-/// needs the DLQ envelope/budget machinery only `run_stream` has. With
-/// columnar-only mocks the fallback surfaces as an error, which is exactly the
-/// signal that the gate held.
+/// Quarantine now runs **on** the columnar path: the offending rows go to the
+/// DLQ, the survivors are written, and the run stays green. With columnar-only
+/// mocks a successful run is itself proof the fast path was taken.
 #[cfg(feature = "quality")]
 #[tokio::test]
-async fn a_quarantining_quality_policy_falls_back_off_the_columnar_path() {
+async fn a_quarantining_quality_policy_routes_to_the_dlq_on_the_columnar_path() {
     use faucet_core::dlq::DlqConfig;
     use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
 
-    struct NoopDlq;
+    struct CapturingDlq {
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
     #[async_trait]
-    impl Sink for NoopDlq {
-        async fn write_batch(&self, _r: &[Value]) -> Result<usize, FaucetError> {
-            Ok(0)
+    impl Sink for CapturingDlq {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.seen.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
         }
         fn connector_name(&self) -> &'static str {
-            "noop-dlq"
+            "capturing-dlq"
         }
     }
 
     let source = ColumnarOnlySource {
-        rows: vec![json!({"id": 1, "email": null})],
+        rows: vec![
+            json!({"id": 1, "email": "ada@example.com"}),
+            json!({"id": 2, "email": null}),
+            json!({"id": 3, "email": "hopper@example.com"}),
+        ],
     };
     let rows = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let sink = ColumnarOnlySink::new(Arc::clone(&rows), Arc::clone(&calls));
+    let seen = Arc::clone(&sink.seen);
+    let dlq_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let spec = QualitySpec {
         record: vec![RecordCheck::NotNull {
@@ -384,13 +392,86 @@ async fn a_quarantining_quality_policy_falls_back_off_the_columnar_path() {
 
     let result = Pipeline::new(&source, &sink)
         .with_quality(quality)
-        .with_dlq(DlqConfig::new(Arc::new(NoopDlq)))
+        .with_dlq(DlqConfig::new(Arc::new(CapturingDlq {
+            seen: Arc::clone(&dlq_seen),
+        })))
         .run()
-        .await;
+        .await
+        .expect("quarantine must not fail the run on the columnar path");
+
+    // Two survivors written columnar, one row dead-lettered.
+    assert_eq!(result.records_written, 2);
+    let written = seen.lock().unwrap().clone();
+    assert_eq!(written.len(), 2);
     assert!(
-        result.is_err(),
-        "a quarantining policy must leave the columnar path (the Value-only \
-         methods on these mocks then error), got {result:?}"
+        written.iter().all(|r| r["email"] != json!(null)),
+        "the offending row must not reach the sink: {written:?}"
+    );
+    let envelopes = dlq_seen.lock().unwrap().clone();
+    assert_eq!(envelopes.len(), 1, "exactly one envelope: {envelopes:?}");
+    assert_eq!(
+        result.dlq.map(|d| d.records_dlq),
+        Some(1),
+        "the run result reports the DLQ count"
+    );
+}
+
+/// The per-page DLQ budget is enforced on the columnar path too — and the
+/// overshoot is still **written** before the run aborts, so quarantined rows
+/// are never dropped on the way out.
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn the_dlq_budget_aborts_on_the_columnar_path_after_writing_the_envelopes() {
+    use faucet_core::dlq::DlqConfig;
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+
+    struct CapturingDlq {
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    #[async_trait]
+    impl Sink for CapturingDlq {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.seen.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn connector_name(&self) -> &'static str {
+            "capturing-dlq"
+        }
+    }
+
+    let source = ColumnarOnlySource {
+        rows: vec![
+            json!({"id": 1, "email": null}),
+            json!({"id": 2, "email": null}),
+        ],
+    };
+    let sink = ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let dlq_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let spec = QualitySpec {
+        record: vec![RecordCheck::NotNull {
+            field: "email".into(),
+            treat_missing_as_null: true,
+            on_failure: OnFailure::Quarantine,
+        }],
+        batch: vec![],
+    };
+    let mut dlq = DlqConfig::new(Arc::new(CapturingDlq {
+        seen: Arc::clone(&dlq_seen),
+    }));
+    dlq.max_failures_per_page = Some(1); // 2 quarantined > 1 → trips
+
+    let err = Pipeline::new(&source, &sink)
+        .with_quality(Arc::new(CompiledQuality::compile(&spec).unwrap()))
+        .with_dlq(dlq)
+        .run()
+        .await
+        .expect_err("exceeding the budget must abort");
+    assert!(err.to_string().contains("budget exceeded"), "{err}");
+    assert_eq!(
+        dlq_seen.lock().unwrap().len(),
+        2,
+        "the overshoot is written before aborting — losing those rows would be worse"
     );
 }
 
