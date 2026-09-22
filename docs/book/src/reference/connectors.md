@@ -299,17 +299,26 @@ Arrow-native connectors:
   object is a self-contained ZSTD-compressed Parquet file).
 - **Databricks SQL** source — with `arrow_native: true` (fetches
   `EXTERNAL_LINKS` + `ARROW_STREAM`; requires `replication: full`).
+- **REST** source — with an `async_job:` (Salesforce Bulk-style) CSV extract,
+  no custom `decode:` chain, and a **header** locator (#635). Every column is
+  `Utf8`: types are never inferred, so a batch's columns match the `Value`
+  path's keys exactly.
 - **BigQuery** source — with `read_api: true` + `read_table` (reads the table
   via the Storage Read API gRPC service as Arrow; full extract only).
-- **BigQuery** sink — with a `bulk_load` block (Parquet on a GCS staging bucket
-  then a `PARQUET` load job; append only).
+- **BigQuery** sink — a `PARQUET` load job, for `append` **and** `overwrite`.
+  A `bulk_load` block stages the Parquet on a GCS bucket first; **without one
+  the Parquet is uploaded with the job itself** (bucket-free, #635), so a
+  bucket is now only worth configuring for very large batches. Under
+  `overwrite` the first batch truncates and the rest append, so a mid-run
+  failure leaves the prior table intact.
 - **Snowflake** sink — with a `bulk_load` block (Parquet uploaded to an external
   stage then `COPY INTO … FILE_FORMAT=(TYPE=PARQUET)`; append only). The
   Snowflake *source* has no Arrow path (its v2 SQL API is jsonv2-only).
 
 So chains like `s3(parquet) → parquet`, `gcs(parquet) → delta`,
-`databricks(arrow) → parquet`, `bigquery(read-api) → parquet`, or
-`parquet → snowflake(bulk-load)` run Arrow end-to-end. See each connector's
+`databricks(arrow) → parquet`, `bigquery(read-api) → parquet`,
+`rest(async_job csv) → bigquery`, or `parquet → snowflake(bulk-load)` run
+Arrow end-to-end. See each connector's
 README for the exact config field and feature flag.
 
 ## Data-integrity notes

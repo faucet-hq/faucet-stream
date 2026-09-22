@@ -2718,6 +2718,109 @@ impl faucet_core::Source for RestStream {
         })
     }
 
+    /// Arrow-columnar streaming (#635): the same CSV `async_job` shape the
+    /// native byte path serves, but emitted as Arrow `RecordBatch`es so a
+    /// columnar sink (BigQuery's Parquet load) receives typed columns instead
+    /// of bytes it must re-parse.
+    ///
+    /// Gated on exactly the conditions under which a Bulk page can be decoded
+    /// row-at-a-time: an `async_job`, `response_format: csv`, no custom
+    /// `decode` chain, and the locator in a **header** — a body locator would
+    /// need the parsed document this path deliberately never materializes.
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.config.async_job.is_some()
+            && self.config.response_format == crate::config::ResponseFormat::Csv
+            && self.config.decode.is_empty()
+            && self
+                .config
+                .async_job
+                .as_ref()
+                .is_some_and(|j| j.fetch.locator_body.is_none())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn stream_batches<'a>(
+        &'a self,
+        _context: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async_stream::try_stream! {
+            let job = self.config.async_job.as_ref().ok_or_else(|| {
+                FaucetError::Source(
+                    "rest: stream_batches invoked without an async_job config".into(),
+                )
+            })?;
+            // Mirrors the locator loop in `stream_native` / `stream_pages_inner`;
+            // only the per-page decoder differs.
+            use futures::TryStreamExt as _;
+            let new_bookmark = self.async_job_new_bookmark();
+            let fetch_url = self.prepare_async_job().await?;
+            let mut locator: Option<String> = None;
+            // `batch_size = 0` is the documented "no batching" sentinel: one
+            // batch per locator page.
+            let rows_per_batch = batch_size;
+            loop {
+                let mut query = job.fetch.query.clone();
+                if let (Some(loc), Some(param)) = (&locator, &job.fetch.locator_param) {
+                    query.insert(param.clone(), loc.clone());
+                }
+                let resp = self
+                    .job_request_response(
+                        "fetch",
+                        &job.fetch.method,
+                        &fetch_url,
+                        &job.fetch.headers,
+                        &query,
+                        job.fetch.json.as_ref(),
+                    )
+                    .await?;
+                // Read the locator from headers *before* the body is consumed.
+                let resp_headers = resp.headers().clone();
+                let delimiter = self.config.csv_delimiter;
+                let has_headers = self.config.csv_has_headers;
+                let body = resp.bytes_stream().map_err(std::io::Error::other);
+                let reader = tokio_util::io::StreamReader::new(body);
+                let batches = crate::format::csv_reader_to_record_batches(
+                    reader,
+                    delimiter,
+                    has_headers,
+                    rows_per_batch,
+                );
+                futures::pin_mut!(batches);
+                use futures::StreamExt as _;
+                while let Some(batch) = batches.next().await {
+                    // Per-page bookmark stays `None`; the incremental bookmark
+                    // (#630) is emitted once at the end, as on every other path.
+                    yield faucet_core::columnar::ColumnarPage::new(batch?, None);
+                }
+                // A header-only page yields no batch at all — unlike the `Value`
+                // path there is no empty `RecordBatch` to emit without inventing
+                // a schema, and a zero-row batch would give the sink a schema the
+                // data never had. The locator loop below still advances.
+
+                let next = next_locator(&resp_headers, None, job);
+                match next {
+                    Some(loc) if locator.as_deref() != Some(loc.as_str()) => {
+                        locator = Some(loc);
+                    }
+                    _ => break,
+                }
+            }
+            // Incremental (#630): a final zero-row batch carrying the run-start
+            // bookmark, so the pipeline checkpoints exactly as on the other paths.
+            if let Some(bm) = new_bookmark {
+                let schema = std::sync::Arc::new(arrow::datatypes::Schema::empty());
+                let empty = arrow::record_batch::RecordBatch::new_empty(schema);
+                yield faucet_core::columnar::ColumnarPage::new(empty, Some(bm));
+            }
+        })
+    }
+
     fn supports_discover(&self) -> bool {
         // A generic `discovery:` recipe or an OData `$metadata` catalog. A plain
         // REST API has neither.

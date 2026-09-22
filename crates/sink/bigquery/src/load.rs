@@ -19,6 +19,7 @@ use google_cloud_storage::client::Storage;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
@@ -108,6 +109,101 @@ pub async fn write_columnar(
         rows = batch.num_rows(),
         uri = %source_uri,
         "BigQuery columnar Parquet load job complete"
+    );
+    Ok(batch.num_rows())
+}
+
+/// Bucket-free columnar write (#635): encode `batch` to Parquet and POST it
+/// straight to BigQuery's media-upload endpoint as a `multipart` load job.
+///
+/// The GCS-staged [`write_columnar`] needs a `bulk_load` bucket, which is real
+/// operational friction — a bucket to create, grant, and garbage-collect — for
+/// a file that exists only to be read once, immediately, by the load job that
+/// follows it. Uploading the bytes with the job removes the bucket from the
+/// picture entirely, exactly as the NDJSON byte path (#633) does.
+///
+/// `multipart` rather than `resumable`: a Parquet file is produced whole, in
+/// memory, per batch, so there is no incremental stream to feed — and the
+/// resumable machinery here is built around a gzip encoder that must not touch
+/// Parquet bytes. Batch size is what bounds the body; a very large batch is
+/// what `bulk_load` staging remains for.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_columnar_media(
+    client: &Client,
+    config: &BigQuerySinkConfig,
+    upload_base: &str,
+    token: &str,
+    table_id: &str,
+    write_disposition: &str,
+    batch: &RecordBatch,
+) -> Result<usize, FaucetError> {
+    if batch.num_rows() == 0 {
+        return Ok(0);
+    }
+    // Parquet encode is CPU-bound — off the async runtime.
+    let batch_owned = batch.clone();
+    let media = tokio::task::spawn_blocking(move || encode_parquet(&batch_owned))
+        .await
+        .map_err(|e| FaucetError::Sink(format!("parquet encode task panicked: {e}")))??;
+
+    let job_json = serde_json::json!({
+        "configuration": {
+            "load": {
+                "sourceFormat": "PARQUET",
+                "writeDisposition": write_disposition,
+                "createDisposition": "CREATE_IF_NEEDED",
+                "destinationTable": {
+                    "projectId": config.project_id,
+                    "datasetId": config.dataset_id,
+                    "tableId": table_id,
+                },
+            }
+        }
+    })
+    .to_string();
+
+    // Reuse the sink's multipart framing rather than hand-rolling a second
+    // copy — the same "one escaper, one convention" rule #654 M14 was about.
+    let boundary = crate::sink::media_boundary(&media);
+    let body = crate::sink::build_multipart_related(&boundary, &job_json, &media);
+    let url = format!(
+        "{upload_base}/upload/bigquery/v2/projects/{}/jobs?uploadType=multipart",
+        config.project_id
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(token)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/related; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| FaucetError::Sink(format!("BigQuery Parquet media upload failed: {e}")))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(FaucetError::Sink(format!(
+            "BigQuery Parquet media upload returned HTTP {status}: {text}"
+        )));
+    }
+    // A load job returns 200 with the job resource; the job itself can still
+    // fail later, so poll it rather than trusting the upload's status code.
+    let job: Value = serde_json::from_str(&text)
+        .map_err(|e| FaucetError::Sink(format!("BigQuery media upload returned non-JSON: {e}")))?;
+    let job_id = job["jobReference"]["jobId"].as_str().ok_or_else(|| {
+        FaucetError::Sink("BigQuery media load job returned no jobReference.jobId".into())
+    })?;
+    let location = job["jobReference"]["location"].as_str();
+    await_load_job(client, &config.project_id, job_id, location).await?;
+
+    tracing::info!(
+        table = %format!("{}.{}.{table_id}", config.project_id, config.dataset_id),
+        rows = batch.num_rows(),
+        bytes = media.len(),
+        disposition = write_disposition,
+        "BigQuery bucket-free Parquet load job complete"
     );
     Ok(batch.num_rows())
 }

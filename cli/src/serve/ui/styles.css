@@ -1108,13 +1108,14 @@ select {
    fade hinting there is more to the right. */
 .lnode-label {
   height: 100%;
-  line-height: 30px; /* NODE_H (32) − 2 border */
-  padding: 0 12px;
+  line-height: 24px; /* NODE_H (26) − 2 border (#646) */
+  padding: 0 10px;
   overflow-x: auto;
   overflow-y: hidden;
   white-space: nowrap;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10.5px; /* #646: lighter, cleaner type — was 11px */
+  letter-spacing: -0.1px;
   color: var(--ink-dim);
   cursor: pointer;
   scrollbar-width: none;
@@ -1123,7 +1124,7 @@ select {
 }
 .lnode-label::-webkit-scrollbar { display: none; }
 .lineage-node:hover rect { stroke: var(--brand-strong); }
-.lineage-root rect { stroke: var(--ok); stroke-width: 2.5; }
+.lineage-root rect { stroke: var(--ok); stroke-width: 2; } /* #646: was 2.5 */
 /* Click-to-highlight: the selected node, its neighbours, and their edges stay
    bright while everything else dims, so a dataset's connections read at a glance.
    Selected = solid brand; neighbour = brand tint; active edge = brand line. */

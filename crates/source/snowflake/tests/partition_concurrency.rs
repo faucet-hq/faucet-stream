@@ -23,6 +23,21 @@ use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 const PARTITIONS: usize = 6;
 
+/// How long the mock holds each response before delivering it.
+const RESPONSE_DELAY_MS: u64 = 200;
+/// How long a request counts as "in flight" — deliberately **shorter** than
+/// [`RESPONSE_DELAY_MS`]. `wiremock`'s `Respond` is synchronous and cannot hook
+/// response *delivery*, so the close of the in-flight window is a timer of its
+/// own. Making the two equal (as this first did) sets both to fire at the same
+/// instant with no ordering: on a sequential run the client can receive its
+/// response and issue the next request before the previous decrement is polled,
+/// so `in_flight` reads 2 and the sequential assertions fail — a defect in the
+/// measurement, surfaced under coverage instrumentation, which widens every
+/// scheduling window. With the window closing well before delivery, the count
+/// can only ever under-report overlap (the safe direction). Mirrors the REST
+/// fix in #669.
+const IN_FLIGHT_WINDOW_MS: u64 = 40;
+
 /// Counts concurrent in-flight partition requests and records the peak.
 struct CountingResponder {
     in_flight: Arc<AtomicUsize>,
@@ -35,11 +50,11 @@ impl Respond for CountingResponder {
         self.peak.fetch_max(now, Ordering::SeqCst);
         let in_flight = Arc::clone(&self.in_flight);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(IN_FLIGHT_WINDOW_MS)).await;
             in_flight.fetch_sub(1, Ordering::SeqCst);
         });
         ResponseTemplate::new(200)
-            .set_delay(std::time::Duration::from_millis(120))
+            .set_delay(std::time::Duration::from_millis(RESPONSE_DELAY_MS))
             .set_body_json(json!({ "data": [["9", "row"]] }))
     }
 }

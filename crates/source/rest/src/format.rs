@@ -314,6 +314,103 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
     }
 }
 
+/// Stream a CSV body as Arrow `RecordBatch`es of `batch_size` rows (#635).
+///
+/// The columnar twin of [`csv_reader_to_value_pages`], and deliberately built
+/// on the same `csv_async` reader rather than `arrow-csv`: `arrow-csv` is
+/// synchronous and wants a whole `Read`, which would reintroduce the buffering
+/// #626 removed, and its type **inference** would break column parity with the
+/// `Value` path. Every column is `Utf8`, matching the all-STRING behaviour the
+/// NDJSON path had to be pinned to — BigQuery autodetect on a Bulk export
+/// guesses types per file and disagrees across pages.
+///
+/// Column names come from the header row, or `column_<i>` without one, so a
+/// batch's schema is field-for-field what `csv_record_to_object` produces.
+/// A short row is padded with nulls and a long one widens no schema — the
+/// header fixes the column set for the whole stream, exactly as it fixes the
+/// key set on the `Value` path.
+#[cfg(feature = "arrow")]
+pub fn csv_reader_to_record_batches<R>(
+    reader: R,
+    delimiter: u8,
+    has_headers: bool,
+    batch_size: usize,
+) -> impl futures::Stream<Item = Result<arrow::record_batch::RecordBatch, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::StreamExt as _;
+    use std::sync::Arc;
+
+    async_stream::try_stream! {
+        let mut rdr = csv_async::AsyncReaderBuilder::new()
+            .has_headers(false)
+            .delimiter(delimiter)
+            .flexible(true)
+            .create_reader(reader);
+        let mut records = rdr.records();
+        let mut headers: Option<Vec<String>> = None;
+        // One `Vec<Option<String>>` per column; transposed into arrays on flush.
+        let mut cols: Vec<Vec<Option<String>>> = Vec::new();
+        let mut schema: Option<Arc<Schema>> = None;
+        let mut rows = 0usize;
+        let cap = if batch_size == 0 { 1024 } else { batch_size };
+
+        while let Some(rec) = records.next().await {
+            let rec = rec
+                .map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
+            if has_headers && headers.is_none() {
+                headers = Some(rec.iter().map(str::to_string).collect());
+                continue;
+            }
+            // The first data row fixes the column set when there is no header.
+            if schema.is_none() {
+                let names: Vec<String> = match &headers {
+                    Some(h) => h.clone(),
+                    None => (0..rec.len()).map(|i| format!("column_{i}")).collect(),
+                };
+                cols = vec![Vec::with_capacity(cap); names.len()];
+                schema = Some(Arc::new(Schema::new(
+                    names
+                        .into_iter()
+                        .map(|n| Field::new(n, DataType::Utf8, true))
+                        .collect::<Vec<_>>(),
+                )));
+            }
+            for (i, col) in cols.iter_mut().enumerate() {
+                // A field the row does not have is null, never a silent shift.
+                col.push(rec.get(i).map(str::to_string));
+            }
+            rows += 1;
+            if batch_size != 0 && rows >= batch_size {
+                let sch = schema.clone().expect("schema set above");
+                let arrays: Vec<arrow::array::ArrayRef> = cols
+                    .iter_mut()
+                    .map(|c| Arc::new(StringArray::from(std::mem::take(c))) as arrow::array::ArrayRef)
+                    .collect();
+                rows = 0;
+                yield arrow::record_batch::RecordBatch::try_new(sch, arrays).map_err(|e| {
+                    FaucetError::Source(format!("rest: building an Arrow batch: {e}"))
+                })?;
+            }
+        }
+        // Trailing partial batch. A header-only or zero-byte body yields
+        // nothing, matching `csv_reader_to_value_pages`.
+        if rows > 0 {
+            let sch = schema.clone().expect("schema set with the first row");
+            let arrays: Vec<arrow::array::ArrayRef> = cols
+                .iter_mut()
+                .map(|c| Arc::new(StringArray::from(std::mem::take(c))) as arrow::array::ArrayRef)
+                .collect();
+            yield arrow::record_batch::RecordBatch::try_new(sch, arrays).map_err(|e| {
+                FaucetError::Source(format!("rest: building an Arrow batch: {e}"))
+            })?;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -590,5 +687,132 @@ mod tests {
         );
         // Malformed workbook bytes.
         assert!(parse_excel(b"not-a-workbook", None, 0).is_err());
+    }
+
+    /// #635 — the Arrow-columnar CSV decoder. Every test here asserts against
+    /// the `Value` path, because the only thing that makes the columnar path
+    /// safe to select automatically is that it produces the *same data*.
+    #[cfg(feature = "arrow")]
+    mod record_batches {
+        use super::super::*;
+        use futures::StreamExt as _;
+
+        async fn batches(
+            csv: &str,
+            has_headers: bool,
+            batch_size: usize,
+        ) -> Vec<arrow::record_batch::RecordBatch> {
+            let r = std::io::Cursor::new(csv.as_bytes().to_vec());
+            let s = csv_reader_to_record_batches(r, b',', has_headers, batch_size);
+            futures::pin_mut!(s);
+            let mut out = Vec::new();
+            while let Some(b) = s.next().await {
+                out.push(b.expect("batch"));
+            }
+            out
+        }
+
+        async fn values(csv: &str, has_headers: bool, page_size: usize) -> Vec<Value> {
+            let r = std::io::Cursor::new(csv.as_bytes().to_vec());
+            let s = csv_reader_to_value_pages(r, b',', has_headers, page_size);
+            futures::pin_mut!(s);
+            let mut out = Vec::new();
+            while let Some(p) = s.next().await {
+                out.extend(p.expect("page"));
+            }
+            out
+        }
+
+        /// The property the automatic path selection rests on: same rows, same
+        /// columns, same strings as the `Value` decoder.
+        #[tokio::test]
+        async fn a_batch_carries_exactly_what_the_value_path_carries() {
+            let csv = "id,name\n1,ada\n2,grace\n3,hopper\n";
+            let bs = batches(csv, true, 2).await;
+            let vs = values(csv, true, 2).await;
+
+            let rows: usize = bs.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, vs.len(), "row count must match the Value path");
+
+            let back: Vec<Value> = bs
+                .iter()
+                .flat_map(|b| faucet_core::columnar::record_batch_to_values(b).expect("to values"))
+                .collect();
+            assert_eq!(back, vs, "columnar and Value decoders must agree");
+        }
+
+        /// Every column is Utf8 — never inferred. Inference is what made the
+        /// NDJSON path disagree with itself across pages of one Bulk export.
+        #[tokio::test]
+        async fn every_column_is_utf8_and_named_from_the_header() {
+            let bs = batches("id,amount,ok\n1,2.5,true\n", true, 0).await;
+            assert_eq!(bs.len(), 1);
+            let sch = bs[0].schema();
+            let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, vec!["id", "amount", "ok"]);
+            for f in sch.fields() {
+                assert_eq!(
+                    f.data_type(),
+                    &arrow::datatypes::DataType::Utf8,
+                    "column `{}` must stay Utf8, not be inferred",
+                    f.name()
+                );
+                assert!(f.is_nullable(), "a short row must be expressible as null");
+            }
+        }
+
+        /// Without a header the columns are positional, matching
+        /// `csv_record_to_object`'s `column_<i>`.
+        #[tokio::test]
+        async fn headerless_columns_are_positional_and_match_the_value_path() {
+            let csv = "1,ada\n2,grace\n";
+            let bs = batches(csv, false, 0).await;
+            let sch = bs[0].schema();
+            let names: Vec<&str> = sch.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, vec!["column_0", "column_1"]);
+            let back = faucet_core::columnar::record_batch_to_values(&bs[0]).expect("values");
+            assert_eq!(back, values(csv, false, 0).await);
+        }
+
+        /// `batch_size` bounds the batch, which is the whole point: peak memory
+        /// is one batch, not one Bulk export.
+        #[tokio::test]
+        async fn batch_size_bounds_each_batch_and_zero_means_one_batch() {
+            let mut csv = String::from("id\n");
+            for i in 0..5 {
+                csv.push_str(&format!("{i}\n"));
+            }
+            let bs = batches(&csv, true, 2).await;
+            assert_eq!(
+                bs.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+                vec![2, 2, 1],
+                "the trailing partial batch must still be emitted"
+            );
+            let one = batches(&csv, true, 0).await;
+            assert_eq!(one.len(), 1);
+            assert_eq!(one[0].num_rows(), 5);
+        }
+
+        /// A header-only or empty body yields no batch at all — the caller
+        /// turns that into the same empty page the `Value` path emits.
+        #[tokio::test]
+        async fn a_header_only_or_empty_body_yields_no_batch() {
+            assert!(batches("id,name\n", true, 0).await.is_empty());
+            assert!(batches("", true, 0).await.is_empty());
+            assert!(values("id,name\n", true, 0).await.is_empty());
+        }
+
+        /// A ragged row must null-pad, never shift a value into the wrong
+        /// column — the failure mode that silently corrupts a whole export.
+        #[tokio::test]
+        async fn a_short_row_pads_with_null_rather_than_shifting() {
+            let csv = "a,b,c\n1,2,3\n4,5\n";
+            let bs = batches(csv, true, 0).await;
+            let back = faucet_core::columnar::record_batch_to_values(&bs[0]).expect("values");
+            assert_eq!(back[0]["c"], Value::String("3".into()));
+            assert_eq!(back[1]["a"], Value::String("4".into()));
+            assert_eq!(back[1]["b"], Value::String("5".into()));
+            assert_eq!(back[1]["c"], Value::Null, "the missing field is null");
+        }
     }
 }

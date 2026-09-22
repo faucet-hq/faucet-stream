@@ -109,6 +109,76 @@ async fn stream_native_emits_ndjson_per_locator_page() {
     assert_eq!(bodies[1], b"{\"id\":\"2\",\"name\":\"bob\"}\n".to_vec());
 }
 
+/// #635 — the Arrow-columnar twin of the native path, over the same job.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn stream_batches_emits_record_batches_matching_the_value_path() {
+    let server = MockServer::start().await;
+    mount_csv_job(&server).await;
+    let stream = RestStream::new(csv_native_config(&server)).unwrap();
+    assert!(
+        stream.supports_columnar(),
+        "a CSV async job with a header locator and no custom decode is columnar"
+    );
+
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut batches = stream.stream_batches(&ctx, 1000);
+    let mut rows: Vec<Value> = Vec::new();
+    let mut pages = 0usize;
+    while let Some(p) = batches.next().await {
+        let p = p.unwrap();
+        pages += 1;
+        rows.extend(faucet_core::columnar::record_batch_to_values(&p.batch).unwrap());
+    }
+    assert_eq!(pages, 2, "one batch per locator page");
+
+    // The guarantee that makes automatic path selection safe: identical data
+    // to the `Value` path over the same job.
+    let server2 = MockServer::start().await;
+    mount_csv_job(&server2).await;
+    let value_stream = RestStream::new(csv_native_config(&server2)).unwrap();
+    let mut vpages = <RestStream as faucet_core::Source>::stream_pages(&value_stream, &ctx, 1000);
+    let mut vrows: Vec<Value> = Vec::new();
+    while let Some(p) = vpages.next().await {
+        vrows.extend(p.unwrap().records);
+    }
+    assert_eq!(rows, vrows, "columnar and Value paths must agree exactly");
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "1", "name": "alice" }),
+            json!({ "id": "2", "name": "bob" }),
+        ]
+    );
+}
+
+/// The gate must be closed for every shape the row-at-a-time decoder cannot
+/// serve, or the pipeline silently selects a path that mis-decodes.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn the_columnar_gate_is_closed_for_shapes_it_cannot_serve() {
+    let server = MockServer::start().await;
+
+    // No async job at all.
+    let plain = RestStream::new(RestStreamConfig::new(&server.uri(), "/x")).unwrap();
+    assert!(!plain.supports_columnar());
+
+    // JSON async job — only CSV decodes row-at-a-time.
+    let mut json_job = csv_native_config(&server);
+    json_job.response_format = faucet_source_rest::ResponseFormat::Json;
+    assert!(!RestStream::new(json_job).unwrap().supports_columnar());
+
+    // A body locator needs the parsed document this path never materializes.
+    let mut body_loc = csv_native_config(&server);
+    let mut job = csv_job(&server);
+    job["fetch"]["locator_body"] = json!("$.next");
+    body_loc.async_job = Some(serde_json::from_value(job).unwrap());
+    assert!(
+        !RestStream::new(body_loc).unwrap().supports_columnar(),
+        "a body locator must fall back to the Value path"
+    );
+}
+
 #[tokio::test]
 async fn stream_native_rejects_a_format_it_does_not_emit() {
     let server = MockServer::start().await;

@@ -5793,6 +5793,7 @@ dependencies = [
 name = "faucet-source-rest"
 version = "1.7.0"
 dependencies = [
+ "arrow",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
