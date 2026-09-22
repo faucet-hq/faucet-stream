@@ -19,6 +19,8 @@ pub mod check;
 pub mod cleanup;
 #[cfg(feature = "arrow")]
 pub mod columnar;
+#[cfg(feature = "arrow")]
+pub mod columnar_transform;
 pub mod config;
 #[cfg(feature = "contract")]
 pub mod contract;

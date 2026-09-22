@@ -62,14 +62,27 @@ impl TransformingSource {
             .iter()
             .map(compile_stage)
             .collect::<Result<Vec<_>, _>>()?;
+        // Auto-derive the Arrow batch form for each stage (#636): a `Map` over a
+        // vectorizable record transform (select/drop/rename_field/set/redact)
+        // gets a columnar kernel, so a chain of only those over a columnar
+        // source+sink keeps the fast path. Any stage without one (a
+        // value-inspecting transform, filter/explode/cdc-unwrap, a custom or
+        // page fn) leaves a `None`, which makes `supports_columnar` false and
+        // holds the whole chain on the `Value` path.
         #[cfg(feature = "arrow")]
-        let n = compiled.len();
+        let batch_fns: Vec<Option<crate::stage::PageFnBatchBox>> = stages
+            .iter()
+            .map(|s| match s {
+                TransformStage::Map(t) => crate::columnar_transform::batch_form(t),
+                _ => None,
+            })
+            .collect();
         Ok(Self {
             inner,
             stages: compiled,
             labels,
             #[cfg(feature = "arrow")]
-            batch_fns: vec![None; n],
+            batch_fns,
         })
     }
 
@@ -192,12 +205,29 @@ impl Source for TransformingSource {
     ) -> Pin<Box<dyn Stream<Item = Result<crate::columnar::ColumnarPage, FaucetError>> + Send + 'a>>
     {
         Box::pin(async_stream::try_stream! {
+            use metrics::{Label, SharedString, counter};
+            let metric_labels = vec![
+                Label::new("pipeline", SharedString::from(self.labels.pipeline.to_string())),
+                Label::new("row", SharedString::from(self.labels.row.to_string())),
+            ];
             let mut pages = self.inner.stream_batches(ctx, batch_size);
             while let Some(page) = pages.next().await {
                 let crate::columnar::ColumnarPage { mut batch, bookmark } = page?;
+                // Metric parity with the Value path (#636): the same
+                // `faucet_transform_records_{in,out}_total` counters, per page.
+                // A pure-projection kernel is 1→1, so in == out, but emitting
+                // both keeps a dashboard identical across the two paths.
+                let n_in = batch.num_rows();
                 for bf in self.batch_fns.iter().flatten() {
-                    batch = bf(batch)?;
+                    batch = bf(batch).inspect_err(|_| {
+                        counter!("faucet_transform_errors_total", metric_labels.clone())
+                            .increment(1);
+                    })?;
                 }
+                counter!("faucet_transform_records_in_total", metric_labels.clone())
+                    .increment(n_in as u64);
+                counter!("faucet_transform_records_out_total", metric_labels.clone())
+                    .increment(batch.num_rows() as u64);
                 yield crate::columnar::ColumnarPage { batch, bookmark };
             }
         })
@@ -805,6 +835,69 @@ mod columnar_tests {
                     on_collision: crate::transform::KeyCollision::Error,
                 },
             )],
+            Labels::for_named("t"),
+        )
+        .unwrap();
+        assert!(!wrapped.supports_columnar());
+    }
+
+    /// #636: a chain of *built-in vectorizable* transforms (no hand-supplied
+    /// batch fns) over a columnar source keeps the fast path automatically —
+    /// `new` now derives their Arrow kernels. This is the whole point: a
+    /// `parquet → select/drop/set → parquet` run no longer drops to `Value`.
+    #[tokio::test]
+    async fn built_in_vectorizable_transforms_keep_the_columnar_path() {
+        use crate::transform::RecordTransform;
+        let inner: Box<dyn Source> = Box::new(ColumnarMock(vec![
+            json!({"id": 1, "name": "ada", "secret": "x"}),
+            json!({"id": 2, "name": "grace", "secret": "y"}),
+        ]));
+        let mut set_vals = serde_json::Map::new();
+        set_vals.insert("stage".into(), json!("prod"));
+        let wrapped = TransformingSource::new(
+            inner,
+            vec![
+                TransformStage::Map(RecordTransform::Drop {
+                    fields: vec!["secret".into()],
+                }),
+                TransformStage::Map(RecordTransform::Set { values: set_vals }),
+            ],
+            Labels::for_named("t"),
+        )
+        .unwrap();
+        assert!(
+            wrapped.supports_columnar(),
+            "a chain of vectorizable built-ins must stay columnar"
+        );
+        let ctx = HashMap::new();
+        let mut s = wrapped.stream_batches(&ctx, 0);
+        let page = s.next().await.unwrap().unwrap();
+        let rows = record_batch_to_values(&page.batch).unwrap();
+        assert_eq!(rows.len(), 2);
+        // `drop` removed `secret`, `set` added `stage` — the transforms really
+        // ran on the columnar path, not just passed through.
+        assert!(rows[0].get("secret").is_none(), "drop ran: {:?}", rows[0]);
+        assert_eq!(rows[0]["stage"], json!("prod"), "set ran: {:?}", rows[0]);
+    }
+
+    /// One non-vectorizable transform anywhere in the chain holds the whole
+    /// chain on the `Value` path — the vectorizable ones must not silently run
+    /// columnar while the opaque one is skipped.
+    #[tokio::test]
+    async fn a_mixed_chain_with_one_opaque_transform_stays_on_value() {
+        use crate::transform::RecordTransform;
+        let inner: Box<dyn Source> = Box::new(ColumnarMock(vec![json!({"id": 1})]));
+        let wrapped = TransformingSource::new(
+            inner,
+            vec![
+                TransformStage::Map(RecordTransform::Select {
+                    fields: vec!["id".into()],
+                }),
+                // `flatten` has no kernel → None → whole chain off columnar.
+                TransformStage::Map(RecordTransform::Flatten {
+                    separator: "_".into(),
+                }),
+            ],
             Labels::for_named("t"),
         )
         .unwrap();
