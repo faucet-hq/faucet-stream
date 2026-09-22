@@ -1248,6 +1248,13 @@ mod tests {
         // column list, a contract, a drift allowlist) are written against this
         // literal — renaming it is a wire-format change, not a refactor.
         assert_eq!(UNCHANGED_TOAST_FIELD, "__unchanged_toast__");
+        // `faucet-core` cannot depend on a connector, so `cdc_unwrap` carries
+        // its own copy of this reserved name to strip. If the two ever drift,
+        // the marker silently reaches the sink as a real column (#670 L27).
+        assert_eq!(
+            UNCHANGED_TOAST_FIELD,
+            faucet_core::stage::CDC_UNCHANGED_TOAST_FIELD
+        );
     }
 
     // dataset_uri is a pure-config method; the source requires a live DB to

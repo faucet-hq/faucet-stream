@@ -659,6 +659,16 @@ impl CompiledExplode {
 /// consumers that never compile the transform still need the name (#654 M17).
 pub const CDC_DEFAULT_MARKER_FIELD: &str = "__op";
 
+/// Reserved key a CDC source stamps on a row image to list the columns the WAL
+/// did **not** carry (Postgres TOAST columns whose value was unchanged).
+///
+/// It is envelope metadata, not data, so [`TransformStage::CdcUnwrap`] strips
+/// it rather than letting it reach a sink as a real column (#670 L27). The
+/// canonical producer is `faucet-source-postgres-cdc`; the name is duplicated
+/// here (rather than depended on) because `faucet-core` must not depend on a
+/// connector — the two are pinned equal by a test in that crate.
+pub const CDC_UNCHANGED_TOAST_FIELD: &str = "__unchanged_toast__";
+
 /// Spec for [`TransformStage::CdcUnwrap`]. Normalizes a CDC change-event
 /// envelope (`{op, before, after, …}`) into a flat row plus a marker field,
 /// so a downstream upsert sink never needs to understand CDC. A 1→0|1 stage:
@@ -792,6 +802,14 @@ impl CompiledCdcUnwrap {
             }
             return Ok(vec![]);
         };
+        // Drop the source's unchanged-TOAST marker (#670 L27). It is *envelope
+        // metadata* — postgres-cdc stamps it to say which columns the WAL did
+        // not carry — not a column of the row. Left in place it reaches an
+        // upsert sink as a literal `__unchanged_toast__` column, which either
+        // fails the write or creates a junk column nobody asked for. The
+        // columns it names still carry their (stale) values; handling that is
+        // the upsert key's job, not this stage's.
+        map.remove(CDC_UNCHANGED_TOAST_FIELD);
         let marker = if is_delete { "d" } else { "u" };
         map.insert(s.marker_field.clone(), Value::String(marker.to_string()));
         Ok(vec![Value::Object(map)])
@@ -2070,6 +2088,47 @@ mod tests {
     }
 
     #[cfg(feature = "transform-cdc-unwrap")]
+    /// #670 L27 — the unchanged-TOAST marker is envelope metadata, so it must
+    /// not survive into the flattened row. Left in, an upsert sink tries to
+    /// write a literal `__unchanged_toast__` column.
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_strips_the_unchanged_toast_marker() {
+        let stages =
+            vec![compile_stage(&TransformStage::CdcUnwrap(CdcUnwrapSpec::default())).unwrap()];
+        let env = json!({
+            "op": "update",
+            "after": { "id": 1, "name": "a", CDC_UNCHANGED_TOAST_FIELD: ["blob"] },
+        });
+        let out = apply_stages(env, &stages).unwrap();
+        assert_eq!(out.len(), 1);
+        let row = out[0].as_object().unwrap();
+        assert!(
+            !row.contains_key(CDC_UNCHANGED_TOAST_FIELD),
+            "the marker must not reach the sink: {row:?}"
+        );
+        // The real columns and the op marker survive.
+        assert_eq!(row["id"], json!(1));
+        assert_eq!(row["name"], json!("a"));
+        assert_eq!(row[CDC_DEFAULT_MARKER_FIELD], json!("u"));
+    }
+
+    /// Deletes take the `before` image, which carries the marker too.
+    #[cfg(feature = "transform-cdc-unwrap")]
+    #[test]
+    fn cdc_unwrap_strips_the_marker_from_a_delete_image_too() {
+        let stages =
+            vec![compile_stage(&TransformStage::CdcUnwrap(CdcUnwrapSpec::default())).unwrap()];
+        let env = json!({
+            "op": "delete",
+            "before": { "id": 7, CDC_UNCHANGED_TOAST_FIELD: ["blob"] },
+        });
+        let out = apply_stages(env, &stages).unwrap();
+        let row = out[0].as_object().unwrap();
+        assert!(!row.contains_key(CDC_UNCHANGED_TOAST_FIELD));
+        assert_eq!(row[CDC_DEFAULT_MARKER_FIELD], json!("d"));
+    }
+
     #[test]
     fn cdc_unwrap_non_object_after_for_insert_is_dropped() {
         let stages = compile(&[cdc_unwrap_default()]);
