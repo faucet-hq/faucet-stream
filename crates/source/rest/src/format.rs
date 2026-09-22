@@ -314,7 +314,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
     }
 }
 
-/// Stream a CSV body as Arrow [`RecordBatch`]es of `batch_size` rows (#635).
+/// Stream a CSV body as Arrow `RecordBatch`es of `batch_size` rows (#635).
 ///
 /// The columnar twin of [`csv_reader_to_value_pages`], and deliberately built
 /// on the same `csv_async` reader rather than `arrow-csv`: `arrow-csv` is
@@ -325,7 +325,7 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
 /// guesses types per file and disagrees across pages.
 ///
 /// Column names come from the header row, or `column_<i>` without one, so a
-/// batch's schema is field-for-field what [`csv_record_to_object`] produces.
+/// batch's schema is field-for-field what `csv_record_to_object` produces.
 /// A short row is padded with nulls and a long one widens no schema — the
 /// header fixes the column set for the whole stream, exactly as it fixes the
 /// key set on the `Value` path.
