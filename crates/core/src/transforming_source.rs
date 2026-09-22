@@ -845,6 +845,7 @@ mod columnar_tests {
     /// batch fns) over a columnar source keeps the fast path automatically —
     /// `new` now derives their Arrow kernels. This is the whole point: a
     /// `parquet → select/drop/set → parquet` run no longer drops to `Value`.
+    #[cfg(all(feature = "transform-drop", feature = "transform-set"))]
     #[tokio::test]
     async fn built_in_vectorizable_transforms_keep_the_columnar_path() {
         use crate::transform::RecordTransform;
@@ -883,6 +884,7 @@ mod columnar_tests {
     /// One non-vectorizable transform anywhere in the chain holds the whole
     /// chain on the `Value` path — the vectorizable ones must not silently run
     /// columnar while the opaque one is skipped.
+    #[cfg(all(feature = "transform-select", feature = "transform-flatten"))]
     #[tokio::test]
     async fn a_mixed_chain_with_one_opaque_transform_stays_on_value() {
         use crate::transform::RecordTransform;

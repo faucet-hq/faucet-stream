@@ -17,14 +17,21 @@ pub struct KafkaSourceConfig {
     /// Consumer group ID; required by librdkafka and used for partition assignment.
     pub group_id: String,
     #[serde(default)]
+    /// How to authenticate to the brokers. Defaults to `none` (PLAINTEXT) —
+    /// override for SASL/TLS clusters.
     pub auth: KafkaAuth,
     #[serde(default)]
+    /// How to decode the message **value**. Defaults to `json`; the
+    /// schema-registry formats need the `kafka-schema-registry` feature.
     pub value_format: KafkaValueFormat,
     /// Format for the message key. `None` (the default) decodes key bytes as
     /// UTF-8 (or `null` if there is no key on the message).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_format: Option<KafkaValueFormat>,
     #[serde(default)]
+    /// Where to start when the group has no committed offset: `earliest`
+    /// (default) replays the retained log, `latest` consumes only new messages.
+    /// Ignored once a bookmark or committed offset exists.
     pub auto_offset_reset: OffsetReset,
     /// Stop after this many messages have been consumed.
     /// At least one of `max_messages` and `idle_timeout` must be set.
@@ -53,6 +60,8 @@ pub struct KafkaSourceConfig {
     #[schemars(with = "u64")]
     pub session_timeout: Duration,
     #[serde(default)]
+    /// What a message that fails to decode does: fail the run (default), or
+    /// skip the message and continue.
     pub on_decode_error: OnDecodeError,
     /// Raw librdkafka client properties to pass through. Use with care —
     /// these can override anything set by `auth` or the typed fields above.

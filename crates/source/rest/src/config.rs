@@ -59,6 +59,10 @@ fn default_schema_sample_size() -> usize {
 fn default_csv_delimiter() -> u8 {
     b','
 }
+fn default_csv_quote() -> u8 {
+    b'"'
+}
+
 fn default_csv_has_headers() -> bool {
     true
 }
@@ -80,11 +84,15 @@ fn default_csv_has_headers() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestStreamConfig {
     // ── Core request ──────────────────────────────────────────────────────────
+    /// Base URL of the API, e.g. `https://api.example.com/v2`. Required. Joined
+    /// with [`path`](Self::path); any trailing slash is handled either way.
     pub base_url: String,
     /// URL path, relative to `base_url`. May contain `{key}` placeholders that
     /// are substituted per-partition (e.g. `"/orgs/{org_id}/users"`).
     #[serde(default)]
     pub path: String,
+    /// HTTP method for the data request. Defaults to `GET`; use `POST` for
+    /// search-style APIs that take a query `body`.
     #[serde(with = "crate::serde_helpers::http_method")]
     #[schemars(with = "String")]
     #[serde(default = "default_method")]
@@ -130,18 +138,34 @@ pub struct RestStreamConfig {
     /// use this for APIs that need a key to appear more than once (`group_by[]`,
     /// repeated `expand`/`fields`). Values honor `{placeholder}` context
     /// substitution for child sources, like `query_params`. Empty by default.
+    /// Query parameters that may repeat, e.g. `{ "fields": ["id", "name"] }`
+    /// renders `?fields=id&fields=name`. Use this rather than `query_params`
+    /// when the API expects a key more than once.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub query_params_multi: HashMap<String, Vec<String>>,
+    /// JSON request body, for `POST`/`PUT`-style reads. Ignored for `GET`.
     #[serde(default)]
     pub body: Option<Value>,
 
     // ── Pagination ────────────────────────────────────────────────────────────
+    /// How to walk pages. Defaults to `none` (a single request). Each style
+    /// carries its own termination guard — see the crate README's pagination
+    /// table.
     #[serde(default = "default_pagination")]
     pub pagination: PaginationStyle,
+    /// JSONPath to the array of records inside the response body, e.g.
+    /// `$.data.items`. When unset the body is expected to *be* the array (or a
+    /// single object, which is emitted as one record).
     #[serde(default)]
     pub records_path: Option<String>,
+    /// Hard cap on pages fetched per run, across every pagination style — the
+    /// backstop against a feed that never signals completion. `None` removes
+    /// the cap.
     #[serde(default = "default_max_pages")]
     pub max_pages: Option<usize>,
+    /// Fixed delay between page requests, in seconds — a politeness knob for
+    /// APIs that rate-limit by request frequency. Applied *in addition* to any
+    /// `Retry-After` honoured by the retry path.
     #[serde(with = "faucet_core::config::duration_secs_option", default)]
     #[schemars(with = "Option<u64>")]
     pub request_delay: Option<Duration>,
@@ -151,6 +175,8 @@ pub struct RestStreamConfig {
         with = "faucet_core::config::duration_secs_option",
         default = "default_timeout"
     )]
+    /// Per-request timeout in seconds. Covers one HTTP request, not the whole
+    /// run, so a paginated extract is bounded per page.
     #[schemars(with = "Option<u64>")]
     pub timeout: Option<Duration>,
     /// Number of retries (after the first attempt) for transient request
@@ -178,6 +204,9 @@ pub struct RestStreamConfig {
     pub tolerated_http_errors: Vec<u16>,
 
     // ── Replication ───────────────────────────────────────────────────────────
+    /// `full_table` (default) re-reads everything each run; `incremental`
+    /// filters on [`replication_key`](Self::replication_key) and emits a
+    /// bookmark so the next run resumes.
     #[serde(default = "default_replication_method")]
     pub replication_method: ReplicationMethod,
     /// Field name (not a JSONPath) used for incremental replication bookmarking.
@@ -259,6 +288,12 @@ pub struct RestStreamConfig {
     /// (default `true`). When `false`, fields are named `column_0`, `column_1`, …
     #[serde(default = "default_csv_has_headers")]
     pub csv_has_headers: bool,
+    /// CSV quote character (default `"`). Set it when the export quotes with
+    /// something else — without this knob a `'`-quoted export parsed as literal
+    /// quote characters inside every field (#670 L29). `response_format: csv`
+    /// and the `parse: csv` decode step both honour it.
+    #[serde(default = "default_csv_quote")]
+    pub csv_quote: u8,
     /// Excel worksheet to read: a sheet name, or a 0-based index as a string.
     /// When omitted, the first worksheet is used. `response_format: excel` only.
     #[serde(default)]
@@ -673,6 +708,7 @@ impl Default for RestStreamConfig {
             response_format: ResponseFormat::Json,
             csv_delimiter: b',',
             csv_has_headers: true,
+            csv_quote: b'"',
             excel_sheet: None,
             excel_header_row: 0,
             replication_bind: None,

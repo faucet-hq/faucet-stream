@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 pub struct TriggersFile {
     /// Schema version; must be `1`.
     pub version: u32,
+    /// The triggers to run. Each is supervised independently: one watcher
+    /// erroring backs off and marks itself unhealthy without stopping the rest.
     pub triggers: Vec<TriggerSpec>,
 }
 

@@ -312,14 +312,44 @@ fn constant_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the feature-gated kernel tests below use these; a bare `arrow` build
+    // compiles none of them.
+    #[cfg(any(
+        feature = "transform-select",
+        feature = "transform-drop",
+        feature = "transform-rename-field",
+        feature = "transform-set",
+        feature = "transform-redact"
+    ))]
     use crate::columnar::{record_batch_to_values, values_to_record_batch_inferred};
+    #[cfg(any(
+        feature = "transform-select",
+        feature = "transform-drop",
+        feature = "transform-rename-field",
+        feature = "transform-set",
+        feature = "transform-redact"
+    ))]
     use crate::stage::{CompiledStage, TransformStage, apply_stages_to_page, compile_stage};
     use crate::transform::RecordTransform;
+    #[cfg(any(
+        feature = "transform-select",
+        feature = "transform-drop",
+        feature = "transform-rename-field",
+        feature = "transform-set",
+        feature = "transform-redact"
+    ))]
     use serde_json::{Value, json};
 
     /// The whole point of this module: the columnar kernel must produce exactly
     /// what running the `Value` stage on the same batch produces. Both start
     /// from `records`, so any divergence is the kernel's.
+    #[cfg(any(
+        feature = "transform-select",
+        feature = "transform-drop",
+        feature = "transform-rename-field",
+        feature = "transform-set",
+        feature = "transform-redact"
+    ))]
     fn assert_parity(records: Vec<Value>, t: RecordTransform) {
         let batch = values_to_record_batch_inferred(&records).expect("to batch");
 
@@ -340,6 +370,13 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        feature = "transform-select",
+        feature = "transform-drop",
+        feature = "transform-rename-field",
+        feature = "transform-set",
+        feature = "transform-redact"
+    ))]
     fn corpus() -> Vec<Value> {
         vec![
             json!({ "id": 1, "name": "ada", "email": "a@x.io", "score": 1.5, "ok": true }),

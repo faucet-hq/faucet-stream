@@ -6118,9 +6118,11 @@
       "type": "object",
       "properties": {
         "key": {
+          "description": "Metadata key. gRPC lowercases keys on the wire; a `-bin` suffix marks a\nbinary value.",
           "type": "string"
         },
         "value": {
+          "description": "Metadata value, sent verbatim. Use `${env:…}` / `${secret:…}` for\ncredentials rather than inlining them.",
           "type": "string"
         }
       },
@@ -13067,6 +13069,7 @@
                 {
                   "properties": {
                     "base_url": {
+                      "description": "Base URL of the API, e.g. `https://api.example.com/v2`. Required. Joined\nwith [`path`](Self::path); any trailing slash is handled either way.",
                       "type": "string"
                     },
                     "path": {
@@ -13075,6 +13078,7 @@
                       "default": ""
                     },
                     "method": {
+                      "description": "HTTP method for the data request. Defaults to `GET`; use `POST` for\nsearch-style APIs that take a query `body`.",
                       "type": "string",
                       "default": "GET"
                     },
@@ -13100,7 +13104,7 @@
                       }
                     },
                     "query_params_multi": {
-                      "description": "Repeated / array-valued query params (#536), rendered as repeated keys —\ne.g. `{ \"group_by[]\": [\"api_key_id\", \"model\"] }` → `?group_by[]=api_key_id&group_by[]=model`.\nApplied alongside (in addition to) [`query_params`](Self::query_params);\nuse this for APIs that need a key to appear more than once (`group_by[]`,\nrepeated `expand`/`fields`). Values honor `{placeholder}` context\nsubstitution for child sources, like `query_params`. Empty by default.",
+                      "description": "Repeated / array-valued query params (#536), rendered as repeated keys —\ne.g. `{ \"group_by[]\": [\"api_key_id\", \"model\"] }` → `?group_by[]=api_key_id&group_by[]=model`.\nApplied alongside (in addition to) [`query_params`](Self::query_params);\nuse this for APIs that need a key to appear more than once (`group_by[]`,\nrepeated `expand`/`fields`). Values honor `{placeholder}` context\nsubstitution for child sources, like `query_params`. Empty by default.\nQuery parameters that may repeat, e.g. `{ \"fields\": [\"id\", \"name\"] }`\nrenders `?fields=id&fields=name`. Use this rather than `query_params`\nwhen the API expects a key more than once.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "array",
@@ -13110,15 +13114,18 @@
                       }
                     },
                     "body": {
+                      "description": "JSON request body, for `POST`/`PUT`-style reads. Ignored for `GET`.",
                       "default": null
                     },
                     "pagination": {
+                      "description": "How to walk pages. Defaults to `none` (a single request). Each style\ncarries its own termination guard — see the crate README's pagination\ntable.",
                       "$ref": "#/$defs/source_rest__PaginationStyle",
                       "default": {
                         "type": "None"
                       }
                     },
                     "records_path": {
+                      "description": "JSONPath to the array of records inside the response body, e.g.\n`$.data.items`. When unset the body is expected to *be* the array (or a\nsingle object, which is emitted as one record).",
                       "type": [
                         "string",
                         "null"
@@ -13126,6 +13133,7 @@
                       "default": null
                     },
                     "max_pages": {
+                      "description": "Hard cap on pages fetched per run, across every pagination style — the\nbackstop against a feed that never signals completion. `None` removes\nthe cap.",
                       "type": [
                         "integer",
                         "null",
@@ -13136,6 +13144,7 @@
                       "default": 100
                     },
                     "request_delay": {
+                      "description": "Fixed delay between page requests, in seconds — a politeness knob for\nAPIs that rate-limit by request frequency. Applied *in addition* to any\n`Retry-After` honoured by the retry path.",
                       "type": [
                         "integer",
                         "null",
@@ -13146,6 +13155,7 @@
                       "default": null
                     },
                     "timeout": {
+                      "description": "Per-request timeout in seconds. Covers one HTTP request, not the whole\nrun, so a paginated extract is bounded per page.",
                       "type": [
                         "integer",
                         "null",
@@ -13190,6 +13200,7 @@
                       "default": []
                     },
                     "replication_method": {
+                      "description": "`full_table` (default) re-reads everything each run; `incremental`\nfilters on [`replication_key`](Self::replication_key) and emits a\nbookmark so the next run resumes.",
                       "$ref": "#/$defs/source_rest__ReplicationMethod",
                       "default": {
                         "type": "FullTable"
@@ -13300,6 +13311,17 @@
                         "string"
                       ],
                       "default": true
+                    },
+                    "csv_quote": {
+                      "description": "CSV quote character (default `\"`). Set it when the export quotes with\nsomething else — without this knob a `'`-quoted export parsed as literal\nquote characters inside every field (#670 L29). `response_format: csv`\nand the `parse: csv` decode step both honour it.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint8",
+                      "minimum": 0,
+                      "maximum": 255,
+                      "default": 34
                     },
                     "excel_sheet": {
                       "description": "Excel worksheet to read: a sheet name, or a 0-based index as a string.\nWhen omitted, the first worksheet is used. `response_format: excel` only.",
@@ -16518,12 +16540,14 @@
                       "type": "string"
                     },
                     "auth": {
+                      "description": "How to authenticate to the brokers. Defaults to `none` (PLAINTEXT) —\noverride for SASL/TLS clusters.",
                       "$ref": "#/$defs/source_kafka__KafkaAuth",
                       "default": {
                         "type": "none"
                       }
                     },
                     "value_format": {
+                      "description": "How to decode the message **value**. Defaults to `json`; the\nschema-registry formats need the `kafka-schema-registry` feature.",
                       "$ref": "#/$defs/source_kafka__KafkaValueFormat",
                       "default": {
                         "type": "json"
@@ -16541,6 +16565,7 @@
                       ]
                     },
                     "auto_offset_reset": {
+                      "description": "Where to start when the group has no committed offset: `earliest`\n(default) replays the retained log, `latest` consumes only new messages.\nIgnored once a bookmark or committed offset exists.",
                       "$ref": "#/$defs/source_kafka__OffsetReset",
                       "default": "latest"
                     },
@@ -16585,6 +16610,7 @@
                       "default": 30
                     },
                     "on_decode_error": {
+                      "description": "What a message that fails to decode does: fail the run (default), or\nskip the message and continue.",
                       "$ref": "#/$defs/source_kafka__OnDecodeError",
                       "default": "fail"
                     },

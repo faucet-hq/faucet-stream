@@ -12,15 +12,61 @@ use serde_json::{Map, Value};
 /// field names; otherwise fields are named `column_0`, `column_1`, … Values are
 /// strings (matching the `csv` source). Streaming RFC-4180 via `csv-async`, so
 /// quoted fields with embedded newlines are handled correctly.
+/// CSV dialect for the REST reader. `flexible` is always on — a short or long
+/// row is padded/kept rather than erroring, matching every other CSV path in
+/// the repo — so only the three characters that actually vary live here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CsvDialect {
+    /// Field delimiter.
+    pub delimiter: u8,
+    /// Whether the first row names the fields.
+    pub has_headers: bool,
+    /// Quote character.
+    pub quote: u8,
+}
+
+impl Default for CsvDialect {
+    fn default() -> Self {
+        Self {
+            delimiter: b',',
+            has_headers: true,
+            quote: b'"',
+        }
+    }
+}
+
+/// Parse CSV bytes with an explicit dialect (#670 L29).
+pub async fn parse_csv_with(bytes: &[u8], dialect: CsvDialect) -> Result<Vec<Value>, FaucetError> {
+    parse_csv_inner(bytes, dialect).await
+}
+
 pub async fn parse_csv(
     bytes: &[u8],
     delimiter: u8,
     has_headers: bool,
 ) -> Result<Vec<Value>, FaucetError> {
+    parse_csv_inner(
+        bytes,
+        CsvDialect {
+            delimiter,
+            has_headers,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn parse_csv_inner(bytes: &[u8], dialect: CsvDialect) -> Result<Vec<Value>, FaucetError> {
+    let CsvDialect {
+        delimiter,
+        has_headers,
+        quote,
+    } = dialect;
     use futures::StreamExt as _;
     let mut rdr = csv_async::AsyncReaderBuilder::new()
         .has_headers(false)
         .delimiter(delimiter)
+        .quote(quote)
         .flexible(true)
         .create_reader(bytes);
     let mut records = rdr.records();
@@ -174,11 +220,37 @@ pub fn csv_reader_to_value_pages<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    csv_reader_to_value_pages_with(
+        reader,
+        CsvDialect {
+            delimiter,
+            has_headers,
+            ..Default::default()
+        },
+        page_size,
+    )
+}
+
+/// [`csv_reader_to_value_pages`] with an explicit dialect (#670 L29).
+pub fn csv_reader_to_value_pages_with<R>(
+    reader: R,
+    dialect: CsvDialect,
+    page_size: usize,
+) -> impl futures::Stream<Item = Result<Vec<Value>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let CsvDialect {
+        delimiter,
+        has_headers,
+        quote,
+    } = dialect;
     use futures::StreamExt as _;
     async_stream::try_stream! {
         let mut rdr = csv_async::AsyncReaderBuilder::new()
             .has_headers(false)
             .delimiter(delimiter)
+            .quote(quote)
             .flexible(true)
             .create_reader(reader);
         let mut records = rdr.records();
@@ -339,6 +411,32 @@ pub fn csv_reader_to_record_batches<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    csv_reader_to_record_batches_with(
+        reader,
+        CsvDialect {
+            delimiter,
+            has_headers,
+            ..Default::default()
+        },
+        batch_size,
+    )
+}
+
+/// [`csv_reader_to_record_batches`] with an explicit dialect (#670 L29).
+#[cfg(feature = "arrow")]
+pub fn csv_reader_to_record_batches_with<R>(
+    reader: R,
+    dialect: CsvDialect,
+    batch_size: usize,
+) -> impl futures::Stream<Item = Result<arrow::record_batch::RecordBatch, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let CsvDialect {
+        delimiter,
+        has_headers,
+        quote,
+    } = dialect;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use futures::StreamExt as _;
@@ -348,6 +446,7 @@ where
         let mut rdr = csv_async::AsyncReaderBuilder::new()
             .has_headers(false)
             .delimiter(delimiter)
+            .quote(quote)
             .flexible(true)
             .create_reader(reader);
         let mut records = rdr.records();
@@ -813,6 +912,60 @@ mod tests {
             assert_eq!(back[1]["a"], Value::String("4".into()));
             assert_eq!(back[1]["b"], Value::String("5".into()));
             assert_eq!(back[1]["c"], Value::Null, "the missing field is null");
+        }
+    }
+
+    /// #670 L29 — a CSV export quoted with something other than `"` was
+    /// unreadable: the quote characters were parsed as literal content and any
+    /// delimiter inside a quoted field split the row. The dialect's `quote`
+    /// fixes that; the default stays `"`.
+    mod quote_dialect {
+        use super::super::*;
+
+        #[tokio::test]
+        async fn a_non_default_quote_char_is_honoured() {
+            // `'`-quoted, with the delimiter *inside* a quoted field.
+            let csv = b"id,name\n1,'Doe, Jane'\n";
+            let out = parse_csv_with(
+                csv,
+                CsvDialect {
+                    delimiter: b',',
+                    has_headers: true,
+                    quote: b'\'',
+                },
+            )
+            .await
+            .expect("parse");
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                out[0]["name"],
+                serde_json::json!("Doe, Jane"),
+                "the quoted comma must not split the row: {:?}",
+                out[0]
+            );
+        }
+
+        /// The old behaviour, pinned: with the default `"` quote the same bytes
+        /// are mis-parsed — which is exactly why the knob was needed.
+        #[tokio::test]
+        async fn the_default_quote_still_treats_apostrophes_literally() {
+            let csv = b"id,name\n1,'Doe, Jane'\n";
+            let out = parse_csv(csv, b',', true).await.expect("parse");
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                out[0]["name"],
+                serde_json::json!("'Doe"),
+                "default dialect splits on the embedded comma: {:?}",
+                out[0]
+            );
+        }
+
+        #[tokio::test]
+        async fn the_dialect_default_matches_the_legacy_signature() {
+            let csv = b"a,b\n1,2\n";
+            let via_default = parse_csv_with(csv, CsvDialect::default()).await.unwrap();
+            let via_legacy = parse_csv(csv, b',', true).await.unwrap();
+            assert_eq!(via_default, via_legacy);
         }
     }
 }

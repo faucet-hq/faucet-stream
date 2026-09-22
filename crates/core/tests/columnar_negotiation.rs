@@ -73,6 +73,19 @@ impl Source for ColumnarOnlySource {
 struct ColumnarOnlySink {
     rows: Arc<AtomicUsize>,
     columnar_calls: Arc<AtomicUsize>,
+    /// Records the sink actually received, materialized back to `Value` so a
+    /// test can assert on the *content* the columnar path delivered.
+    seen: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+impl ColumnarOnlySink {
+    fn new(rows: Arc<AtomicUsize>, columnar_calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            rows,
+            columnar_calls,
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
 }
 
 #[async_trait]
@@ -96,6 +109,9 @@ impl Sink for ColumnarOnlySink {
         self.columnar_calls.fetch_add(1, Ordering::SeqCst);
         let n = batch.num_rows();
         self.rows.fetch_add(n, Ordering::SeqCst);
+        if let Ok(vals) = faucet_core::columnar::record_batch_to_values(batch) {
+            self.seen.lock().expect("seen lock").extend(vals);
+        }
         Ok(n)
     }
 }
@@ -111,10 +127,7 @@ async fn pipeline_negotiates_columnar_path_when_both_sides_support_it() {
     };
     let rows = Arc::new(AtomicUsize::new(0));
     let columnar_calls = Arc::new(AtomicUsize::new(0));
-    let sink = ColumnarOnlySink {
-        rows: Arc::clone(&rows),
-        columnar_calls: Arc::clone(&columnar_calls),
-    };
+    let sink = ColumnarOnlySink::new(Arc::clone(&rows), Arc::clone(&columnar_calls));
 
     // If the pipeline used the Value path, stream_pages / write_batch would
     // error and this would be `Err`.
@@ -181,10 +194,7 @@ async fn columnar_path_persists_bookmark_to_state_store() {
     let source = ColumnarOnlySource {
         rows: vec![json!({"id": 1}), json!({"id": 2})],
     };
-    let sink = ColumnarOnlySink {
-        rows: Arc::new(AtomicUsize::new(0)),
-        columnar_calls: Arc::new(AtomicUsize::new(0)),
-    };
+    let sink = ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
 
     let result = Pipeline::new(&source, &sink)
@@ -225,10 +235,7 @@ async fn columnar_source_without_stream_batches_override_errors() {
         // stream_batches intentionally NOT overridden → defaulted error stream.
     }
 
-    let sink = ColumnarOnlySink {
-        rows: Arc::new(AtomicUsize::new(0)),
-        columnar_calls: Arc::new(AtomicUsize::new(0)),
-    };
+    let sink = ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let result = Pipeline::new(&BadColumnarSource, &sink).run().await;
     match result {
         Err(FaucetError::Source(msg)) => {
@@ -239,4 +246,321 @@ async fn columnar_source_without_stream_batches_override_errors() {
         }
         other => panic!("expected a Source error from the default stream_batches, got: {other:?}"),
     }
+}
+
+// ── Governance on the columnar path (#636) ──────────────────────────────────
+//
+// The mocks are columnar-only, so a run that *succeeds* proves the columnar
+// path was taken. That is what makes these assertions meaningful: governance is
+// not merely "configured", it ran without the pipeline falling back to `Value`.
+
+#[cfg(feature = "masking")]
+#[tokio::test]
+async fn masking_runs_on_the_columnar_path_and_the_sink_sees_masked_values() {
+    use faucet_core::masking::{CompiledMasking, MaskAction, MaskRule, MaskingSpec, MatchSpec};
+
+    let source = ColumnarOnlySource {
+        rows: vec![
+            json!({"id": 1, "email": "ada@example.com"}),
+            json!({"id": 2, "email": "grace@example.com"}),
+        ],
+    };
+    let rows = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sink = ColumnarOnlySink::new(Arc::clone(&rows), Arc::clone(&calls));
+    let seen = Arc::clone(&sink.seen);
+
+    let spec = MaskingSpec {
+        description: None,
+        key: None,
+        rules: vec![MaskRule {
+            name: Some("email".into()),
+            matcher: MatchSpec {
+                fields: vec!["email".into()],
+                ..Default::default()
+            },
+            action: MaskAction::Redact { mask: json!("***") },
+            applies_to: vec![],
+        }],
+    };
+    let masking = Arc::new(CompiledMasking::compile(&spec).expect("compile masking"));
+
+    let result = Pipeline::new(&source, &sink)
+        .with_masking(masking)
+        .run()
+        .await
+        .expect("masking must not disqualify the columnar path");
+
+    assert_eq!(result.records_written, 2);
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 2);
+    for r in &got {
+        assert_eq!(
+            r["email"],
+            json!("***"),
+            "PII must be masked before the sink: {r}"
+        );
+    }
+    assert_eq!(got[0]["id"], json!(1), "untouched columns survive");
+}
+
+/// A non-quarantining quality policy (`abort`) must run *on* the columnar path
+/// and stop the run — proving the pass executed rather than being skipped.
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn a_quality_abort_fires_on_the_columnar_path() {
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+
+    let source = ColumnarOnlySource {
+        rows: vec![json!({"id": 1, "email": null})],
+    };
+    let rows = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sink = ColumnarOnlySink::new(Arc::clone(&rows), Arc::clone(&calls));
+
+    let spec = QualitySpec {
+        record: vec![RecordCheck::NotNull {
+            field: "email".into(),
+            treat_missing_as_null: true,
+            on_failure: OnFailure::Abort,
+        }],
+        batch: vec![],
+    };
+    let quality = Arc::new(CompiledQuality::compile(&spec).expect("compile quality"));
+
+    let err = Pipeline::new(&source, &sink)
+        .with_quality(quality)
+        .run()
+        .await
+        .expect_err("the abort check must fail the run");
+    assert!(
+        matches!(err, FaucetError::QualityFailure { .. }),
+        "quality must run on the columnar path; got {err:?}"
+    );
+    assert_eq!(
+        rows.load(Ordering::SeqCst),
+        0,
+        "an abort writes nothing from the page"
+    );
+}
+
+/// Quarantine now runs **on** the columnar path: the offending rows go to the
+/// DLQ, the survivors are written, and the run stays green. With columnar-only
+/// mocks a successful run is itself proof the fast path was taken.
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn a_quarantining_quality_policy_routes_to_the_dlq_on_the_columnar_path() {
+    use faucet_core::dlq::DlqConfig;
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+
+    struct CapturingDlq {
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    #[async_trait]
+    impl Sink for CapturingDlq {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.seen.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn connector_name(&self) -> &'static str {
+            "capturing-dlq"
+        }
+    }
+
+    let source = ColumnarOnlySource {
+        rows: vec![
+            json!({"id": 1, "email": "ada@example.com"}),
+            json!({"id": 2, "email": null}),
+            json!({"id": 3, "email": "hopper@example.com"}),
+        ],
+    };
+    let rows = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sink = ColumnarOnlySink::new(Arc::clone(&rows), Arc::clone(&calls));
+    let seen = Arc::clone(&sink.seen);
+    let dlq_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let spec = QualitySpec {
+        record: vec![RecordCheck::NotNull {
+            field: "email".into(),
+            treat_missing_as_null: true,
+            on_failure: OnFailure::Quarantine,
+        }],
+        batch: vec![],
+    };
+    let quality = Arc::new(CompiledQuality::compile(&spec).expect("compile quality"));
+
+    let result = Pipeline::new(&source, &sink)
+        .with_quality(quality)
+        .with_dlq(DlqConfig::new(Arc::new(CapturingDlq {
+            seen: Arc::clone(&dlq_seen),
+        })))
+        .run()
+        .await
+        .expect("quarantine must not fail the run on the columnar path");
+
+    // Two survivors written columnar, one row dead-lettered.
+    assert_eq!(result.records_written, 2);
+    let written = seen.lock().unwrap().clone();
+    assert_eq!(written.len(), 2);
+    assert!(
+        written.iter().all(|r| r["email"] != json!(null)),
+        "the offending row must not reach the sink: {written:?}"
+    );
+    let envelopes = dlq_seen.lock().unwrap().clone();
+    assert_eq!(envelopes.len(), 1, "exactly one envelope: {envelopes:?}");
+    assert_eq!(
+        result.dlq.map(|d| d.records_dlq),
+        Some(1),
+        "the run result reports the DLQ count"
+    );
+}
+
+/// The per-page DLQ budget is enforced on the columnar path too — and the
+/// overshoot is still **written** before the run aborts, so quarantined rows
+/// are never dropped on the way out.
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn the_dlq_budget_aborts_on_the_columnar_path_after_writing_the_envelopes() {
+    use faucet_core::dlq::DlqConfig;
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+
+    struct CapturingDlq {
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    #[async_trait]
+    impl Sink for CapturingDlq {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.seen.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn connector_name(&self) -> &'static str {
+            "capturing-dlq"
+        }
+    }
+
+    let source = ColumnarOnlySource {
+        rows: vec![
+            json!({"id": 1, "email": null}),
+            json!({"id": 2, "email": null}),
+        ],
+    };
+    let sink = ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let dlq_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let spec = QualitySpec {
+        record: vec![RecordCheck::NotNull {
+            field: "email".into(),
+            treat_missing_as_null: true,
+            on_failure: OnFailure::Quarantine,
+        }],
+        batch: vec![],
+    };
+    let mut dlq = DlqConfig::new(Arc::new(CapturingDlq {
+        seen: Arc::clone(&dlq_seen),
+    }));
+    dlq.max_failures_per_page = Some(1); // 2 quarantined > 1 → trips
+
+    let err = Pipeline::new(&source, &sink)
+        .with_quality(Arc::new(CompiledQuality::compile(&spec).unwrap()))
+        .with_dlq(dlq)
+        .run()
+        .await
+        .expect_err("exceeding the budget must abort");
+    assert!(err.to_string().contains("budget exceeded"), "{err}");
+    assert_eq!(
+        dlq_seen.lock().unwrap().len(),
+        2,
+        "the overshoot is written before aborting — losing those rows would be worse"
+    );
+}
+
+/// The governance result must be identical whichever path ran it. Same records,
+/// same masking policy, through the columnar mocks and through `Value`-capable
+/// ones — the outputs must match exactly.
+#[cfg(feature = "masking")]
+#[tokio::test]
+async fn columnar_governance_matches_the_value_path() {
+    use faucet_core::masking::{CompiledMasking, MaskAction, MaskRule, MaskingSpec, MatchSpec};
+
+    /// A source/sink pair that works on the `Value` path only.
+    struct ValueSource {
+        rows: Vec<Value>,
+    }
+    #[async_trait]
+    impl Source for ValueSource {
+        async fn fetch_with_context(
+            &self,
+            _c: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(self.rows.clone())
+        }
+    }
+    struct ValueSink {
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    #[async_trait]
+    impl Sink for ValueSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.seen.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn connector_name(&self) -> &'static str {
+            "value-sink"
+        }
+    }
+
+    let records = vec![
+        json!({"id": 1, "email": "ada@example.com", "note": "keep"}),
+        json!({"id": 2, "email": "grace@example.com", "note": "keep"}),
+    ];
+    let spec = MaskingSpec {
+        description: None,
+        key: None,
+        rules: vec![MaskRule {
+            name: Some("email".into()),
+            matcher: MatchSpec {
+                fields: vec!["email".into()],
+                ..Default::default()
+            },
+            action: MaskAction::Redact { mask: json!("***") },
+            applies_to: vec![],
+        }],
+    };
+
+    // Columnar path.
+    let c_sink =
+        ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let c_seen = Arc::clone(&c_sink.seen);
+    Pipeline::new(
+        &ColumnarOnlySource {
+            rows: records.clone(),
+        },
+        &c_sink,
+    )
+    .with_masking(Arc::new(CompiledMasking::compile(&spec).unwrap()))
+    .run()
+    .await
+    .expect("columnar run");
+
+    // Value path.
+    let v_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Pipeline::new(
+        &ValueSource {
+            rows: records.clone(),
+        },
+        &ValueSink {
+            seen: Arc::clone(&v_seen),
+        },
+    )
+    .with_masking(Arc::new(CompiledMasking::compile(&spec).unwrap()))
+    .run()
+    .await
+    .expect("value run");
+
+    assert_eq!(
+        c_seen.lock().unwrap().clone(),
+        v_seen.lock().unwrap().clone(),
+        "governance output must be identical across paths"
+    );
 }
