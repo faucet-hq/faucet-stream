@@ -2032,14 +2032,6 @@ fn maybe_warn_noop_sink(sink_name: &str, warned: &mut bool) {
     }
 }
 
-/// Apply the schema-drift policy to a page (#194). Returns the (possibly
-/// trimmed) records and an optional deferred abort error. The caller raises the
-/// error after this page is durable: with a DLQ it is threaded into the same
-/// post-commit raise site as the budget/circuit aborts (so the page's
-/// quality/drift quarantine envelopes reach the DLQ first); with no DLQ — where
-/// no envelopes can exist — it is raised immediately and the page is not written.
-/// Appends drift quarantine envelopes to `drift_envelopes`.
-#[allow(clippy::too_many_arguments)]
 /// Compiled governance specs for one run, borrowed per page.
 ///
 /// Bundled into a struct rather than passed as loose arguments because the set
@@ -2098,7 +2090,6 @@ pub(crate) struct GovernanceOutcome {
 /// remove rows, and `page_indices` is carried in lockstep so a later drift
 /// quarantine annotates an envelope with the record's **true** page position
 /// rather than a survivor-relative one (#321 L6, #466 M1).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     records: Vec<Value>,
     specs: &GovernanceSpecs<'_>,
@@ -2300,6 +2291,14 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     })
 }
 
+/// Apply the schema-drift policy to a page (#194). Returns the (possibly
+/// trimmed) records and an optional deferred abort error. The caller raises the
+/// error after this page is durable: with a DLQ it is threaded into the same
+/// post-commit raise site as the budget/circuit aborts (so the page's
+/// quality/drift quarantine envelopes reach the DLQ first); with no DLQ — where
+/// no envelopes can exist — it is raised immediately and the page is not written.
+/// Appends drift quarantine envelopes to `drift_envelopes`.
+#[allow(clippy::too_many_arguments)]
 async fn apply_drift_policy<Si: Sink + ?Sized>(
     policy: &crate::drift::SchemaDriftPolicy,
     diff: &crate::drift::SchemaDiff,
