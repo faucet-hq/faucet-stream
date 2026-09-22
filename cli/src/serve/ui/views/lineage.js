@@ -128,9 +128,9 @@ export function layout(edges) {
   return { nodes, edges };
 }
 
-const NODE_H = 32;
+const NODE_H = 26; // #646: lighter nodes — was 32
 const GAP_X = 120;
-const GAP_Y = 14;
+const GAP_Y = 12; // #646: tighter vertical rhythm — was 14
 const FONT_PX = 11;
 const CHAR_W = 6.7; // ≈ px per char at 11px mono
 const LABEL_PAD = 24; // text inset left+right
@@ -153,7 +153,7 @@ function buildSvg({ nodes, edges }, rootId, containerWidth = 1000) {
   // it (the foreignObject label below), mirroring the datasets-table URI cells.
   const avail = Math.max(560, containerWidth - 16); // minus .lineage-graph padding
   let NODE_W = Math.floor((avail - 32 - (layers - 1) * GAP_X) / layers);
-  NODE_W = Math.max(320, Math.min(NODE_W, 720));
+  NODE_W = Math.max(280, Math.min(NODE_W, 640)); // #646: lighter — was 320..720
 
   const width = layers * NODE_W + (layers - 1) * GAP_X + 32;
   const height = rows * (NODE_H + GAP_Y) + 32;
