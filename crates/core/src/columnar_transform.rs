@@ -16,11 +16,54 @@
 //! `hash`, …) and the opaque ones (`flatten`, `explode`, …) return `None` and
 //! keep the chain on the `Value` path until they gain their own kernels.
 
-use crate::FaucetError;
 use crate::stage::PageFnBatchBox;
 use crate::transform::RecordTransform;
-use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
+
+// Everything below the always-present `batch_form` signature is used only when a
+// vectorizable transform feature is on. Under bare `arrow` (how the rest and
+// bigquery crates pull core) `batch_form` is just `_ => None`, so these imports
+// and helpers would otherwise be unused. Each gate matches its real usage.
+#[cfg(any(
+    feature = "transform-select",
+    feature = "transform-drop",
+    feature = "transform-rename-field",
+    feature = "transform-set",
+    feature = "transform-redact"
+))]
+use crate::FaucetError;
+#[cfg(any(feature = "transform-set", feature = "transform-redact"))]
+use arrow::array::ArrayRef;
+#[cfg(any(
+    feature = "transform-select",
+    feature = "transform-drop",
+    feature = "transform-rename-field",
+    feature = "transform-set",
+    feature = "transform-redact"
+))]
+use arrow::array::RecordBatch;
+#[cfg(any(feature = "transform-set", feature = "transform-redact"))]
+use arrow::datatypes::DataType;
+#[cfg(any(
+    feature = "transform-rename-field",
+    feature = "transform-set",
+    feature = "transform-redact"
+))]
+use arrow::datatypes::Field;
+#[cfg(any(
+    feature = "transform-select",
+    feature = "transform-drop",
+    feature = "transform-rename-field",
+    feature = "transform-set",
+    feature = "transform-redact"
+))]
+use arrow::datatypes::Schema;
+#[cfg(any(
+    feature = "transform-select",
+    feature = "transform-drop",
+    feature = "transform-rename-field",
+    feature = "transform-set",
+    feature = "transform-redact"
+))]
 use std::sync::Arc;
 
 /// The Arrow `RecordBatch → RecordBatch` form of `t`, or `None` when `t` has no
@@ -63,6 +106,13 @@ pub fn batch_form(t: &RecordTransform) -> Option<PageFnBatchBox> {
 }
 
 /// Column index of `name` in `schema`, if present.
+#[cfg(any(
+    feature = "transform-select",
+    feature = "transform-drop",
+    feature = "transform-rename-field",
+    feature = "transform-set",
+    feature = "transform-redact"
+))]
 fn index_of(schema: &Schema, name: &str) -> Option<usize> {
     schema.fields().iter().position(|f| f.name() == name)
 }
@@ -191,6 +241,7 @@ fn redact(
         .map_err(|e| FaucetError::Transform(format!("columnar redact: {e}")))
 }
 
+#[cfg(any(feature = "transform-set", feature = "transform-redact"))]
 /// Build a length-`rows` column holding the constant JSON scalar `v`, typed so
 /// that `record_batch_to_values` reproduces `v` exactly. Non-scalar or null
 /// values are rendered as their JSON text in a Utf8 column — the same shape the
