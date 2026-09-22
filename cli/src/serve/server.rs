@@ -105,6 +105,19 @@ pub fn build_router(
                 "/v1/templates/{id}/deprecate",
                 post(templates::deprecate_template),
             );
+        // Template hosting + sync (RFC 0006 / #589). Static `/sync` is matched
+        // ahead of the `{id}` parameter by the router, so a template can never
+        // be named `sync` on the wire (the id charset allows it; the route
+        // wins, which is the documented reservation).
+        #[cfg(feature = "templates-sync")]
+        {
+            api = api
+                .route("/v1/templates/sync", post(templates::sync_templates))
+                .route(
+                    "/v1/templates/{id}/publish",
+                    post(templates::publish_template),
+                );
+        }
     }
     // MCP endpoint (#420): mounted only with `--mcp`. Placed on `api` so it
     // inherits the bearer-auth + RBAC route-layer below; the per-request
@@ -491,6 +504,24 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             "--triggers requires a build with the `triggers` feature".into(),
         ));
     }
+    // Template origins (RFC 0006 / #589): load + validate the sync file
+    // fail-fast; the pull itself runs after the state exists.
+    #[cfg(feature = "templates-sync")]
+    let templates_sync = match &config.templates_sync_path {
+        Some(path) => {
+            crate::templates::sync::describe_metrics();
+            Some(std::sync::Arc::new(
+                crate::templates::sync::load_sync_file(path).await?,
+            ))
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "templates-sync"))]
+    if config.templates_sync_path.is_some() {
+        return Err(CliError::Serve(
+            "--templates-sync requires a build with the `templates-sync` feature".into(),
+        ));
+    }
 
     let shutdown = CancellationToken::new();
     let state = ServerState::new(
@@ -503,6 +534,37 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    // Attach the origins, pull each once so the registry is populated before
+    // the listener opens, then start the periodic pulls. A network failure on
+    // the initial pull is logged and counted, not fatal — the server must come
+    // up on a stale registry rather than not at all; the file itself was
+    // already validated above.
+    #[cfg(feature = "templates-sync")]
+    let sync_handles = match &templates_sync {
+        Some(file) => {
+            state.set_templates_sync(std::sync::Arc::clone(file));
+            let store: crate::templates::TemplateStore = state.history();
+            for origin in &file.origins {
+                match crate::templates::sync::sync_origin(&store, origin, false, None).await {
+                    Ok(r) => tracing::info!(
+                        origin = %r.origin,
+                        mutations = r.mutations(),
+                        failed = r.failed(),
+                        "initial template sync"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(origin = %origin.name, error = %e, "initial template sync failed")
+                    }
+                }
+            }
+            crate::templates::sync::spawn_interval_syncs(
+                store,
+                std::sync::Arc::clone(file),
+                shutdown.clone(),
+            )
+        }
+        None => Vec::new(),
+    };
     let app = build_router(state.clone(), &config, &mcp);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
@@ -643,6 +705,10 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     }
     #[cfg(feature = "triggers")]
     for h in trigger_handles {
+        h.abort();
+    }
+    #[cfg(feature = "templates-sync")]
+    for h in sync_handles {
         h.abort();
     }
     // Flush any buffered OTLP telemetry after in-flight runs drain (no-op without

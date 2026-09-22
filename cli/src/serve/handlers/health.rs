@@ -102,6 +102,7 @@ mod tests {
             ui_enabled: true,
             cluster,
             triggers_path: None,
+            templates_sync_path: None,
             callback_allow_hosts: Vec::new(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;

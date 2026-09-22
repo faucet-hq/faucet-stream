@@ -32,6 +32,8 @@ pub fn schema_targets() -> Vec<&'static str> {
     targets.push("test");
     #[cfg(feature = "templates")]
     targets.push("template-test");
+    #[cfg(feature = "templates-sync")]
+    targets.push("templates-sync");
     targets.push("secrets");
     #[cfg(feature = "schedule")]
     targets.push("schedule");
@@ -143,6 +145,11 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         #[cfg(feature = "templates")]
         SchemaTarget::TemplateTest => serde_json::to_value(faucet_core::schema_for!(
             crate::templates::suite::spec::SuiteFile
+        ))
+        .expect("schema serialization"),
+        #[cfg(feature = "templates-sync")]
+        SchemaTarget::TemplatesSync => serde_json::to_value(faucet_core::schema_for!(
+            crate::templates::sync::spec::SyncFile
         ))
         .expect("schema serialization"),
         #[cfg(feature = "notify")]

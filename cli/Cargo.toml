@@ -433,6 +433,13 @@ triggers-kafka = ["triggers", "dep:rdkafka"]
 # interpolation are always available — this feature is only the registry.
 # CLI-only; not in `default`; included in `full`.
 templates = ["serve"]
+# Template hosting + sync (RFC 0006 / #589): pull templates into the registry
+# from a remote origin (GitHub, S3, GCS, Azure Blob) and publish one back.
+# GitHub goes over the HTTP client already linked; the object-store origins
+# need `object_store`, so they sit behind the second feature like the
+# `triggers-object-store` watcher does.
+templates-sync = ["templates", "dep:base64"]
+templates-sync-object-store = ["templates-sync", "dep:object_store"]
 
 [dependencies]
 faucet-core.workspace = true
@@ -575,7 +582,7 @@ rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 # faucet serve event-driven triggers (#196). object_store lists S3/GCS prefixes
 # for the object_arrival trigger; redis/rdkafka poll queue depth. All optional,
 # pulled only by the matching `triggers-*` feature.
-object_store = { workspace = true, optional = true, features = ["aws", "gcp"] }
+object_store = { workspace = true, optional = true, features = ["aws", "gcp", "azure"] }
 redis = { workspace = true, optional = true }
 rdkafka = { workspace = true, optional = true }
 

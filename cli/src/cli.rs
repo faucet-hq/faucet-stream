@@ -493,6 +493,52 @@ pub enum TemplateCommand {
     Run(TemplateRunArgs),
     /// Run a parameter-combination test suite against a template (#648).
     Test(TemplateTestArgs),
+    /// Pull templates from the origins in a `--config` sync file into the
+    /// registry (RFC 0006). Appends new versions, never deletes.
+    #[cfg(feature = "templates-sync")]
+    Sync(TemplateSyncArgs),
+    /// Write one registered version back to an origin (the manual reverse of
+    /// `sync`).
+    #[cfg(feature = "templates-sync")]
+    Publish(TemplatePublishArgs),
+}
+
+/// `faucet template sync` — pull remote origins into the registry.
+#[cfg(feature = "templates-sync")]
+#[derive(Debug, Parser)]
+pub struct TemplateSyncArgs {
+    /// Sync file listing the origins (`faucet schema templates-sync`). The same
+    /// file `faucet serve --templates-sync` takes.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub config: PathBuf,
+    /// Pull only this origin (by `name`). Default: every origin in the file.
+    #[arg(long)]
+    pub origin: Option<String>,
+    /// Plan and print what would change without touching the registry.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub common: TemplateStoreArgs,
+}
+
+/// `faucet template publish <id>` — push one version to an origin.
+#[cfg(feature = "templates-sync")]
+#[derive(Debug, Parser)]
+pub struct TemplatePublishArgs {
+    /// Template id. Must carry the origin's `prefix`, which is stripped to form
+    /// the file name.
+    pub id: String,
+    /// Sync file naming the origins.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub config: PathBuf,
+    /// Origin `name` to publish to.
+    #[arg(long)]
+    pub origin: String,
+    /// Version to publish: a number or a channel. Defaults to `stable`.
+    #[arg(long, default_value = "stable")]
+    pub version: String,
+    #[command(flatten)]
+    pub common: TemplateStoreArgs,
 }
 
 /// `faucet template test` — run a suite across a template's parameter space.
@@ -1192,6 +1238,13 @@ pub struct ServeArgs {
     /// the `triggers` feature. See `faucet schema triggers`.
     #[arg(long)]
     pub triggers: Option<std::path::PathBuf>,
+    /// Path to a template-sync file (YAML/JSON) listing remote origins to pull
+    /// pipeline templates from (GitHub / S3 / GCS / Azure Blob). Pulled on
+    /// start, on `POST /v1/templates/sync`, and on each origin's
+    /// `interval_secs`. Requires a build with the `templates-sync` feature.
+    /// See `faucet schema templates-sync`.
+    #[arg(long)]
+    pub templates_sync: Option<std::path::PathBuf>,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless
@@ -1602,6 +1655,9 @@ pub enum SchemaTarget {
     /// JSON Schema for a `faucet template test` suite file (#648).
     #[cfg(feature = "templates")]
     TemplateTest,
+    /// JSON Schema for the `--templates-sync` file (template origins, RFC 0006).
+    #[cfg(feature = "templates-sync")]
+    TemplatesSync,
     /// Grammar reference for secrets-manager interpolation directives.
     Secrets,
     /// JSON Schema for the `schedule:` block.

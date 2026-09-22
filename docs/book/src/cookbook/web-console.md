@@ -129,6 +129,12 @@ Clicking one opens its **versions page** — the release console for that templa
 
 ![The versions page for orders-by-country: v2 carrying stable/newest/dev/prod/staging, v1 as previous with its config expanded, a typed trigger form, and the launch history table](../assets/console/template-detail.png)
 
+When the server was started with `--templates-sync`, the Templates page also
+shows **Sync from origins**: the configured remote origins (repo or bucket,
+prefix, launch / prune policy), a **Dry run** that lists exactly what a pull
+would register, launch, deprecate, or skip, and **Pull now** to apply it — see
+[Hosting templates in a repo or bucket](./templates.md#hosting-templates-in-a-repo-or-bucket-sync).
+
 Registering is in the UI too — **Register a template** opens an editor with `id` /
 format / description and a **launch it** checkbox, so a template can go from
 config to live without leaving the browser.

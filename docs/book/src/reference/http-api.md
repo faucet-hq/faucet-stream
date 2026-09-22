@@ -84,6 +84,7 @@ someone does.
 | `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
 | `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | ✓ | ✓ |
 | `POST /v1/templates/{id}/{runs,tags,launch,rollback,deprecate}` | — | ✓ | ✓ |
+| `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | ✓ | ✓ |
 | `POST /mcp` | ✓ | ✓ | ✓ |
 | `GET /v1/audit` | — | — | ✓ |
 | `POST /v1/reload` | — | — | ✓ |
@@ -141,6 +142,8 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/templates/{id}/launch` | `200` | Make a version live — moves `stable` and so unpinned callers (operator / `TemplateWrite`) |
 | `POST` | `/v1/templates/{id}/rollback` | `200` | Re-launch `previous` (operator / `TemplateWrite`) |
 | `POST` | `/v1/templates/{id}/deprecate` | `200` | Retire a template, or revive it with `{"undo":true}` (operator / `TemplateWrite`) |
+| `POST` | `/v1/templates/sync` | `200` | Pull the `--templates-sync` origins into the registry — `{origin?, dry_run?}`; one report per origin, appends only (operator / `TemplateWrite`; requires the `templates-sync` feature; `422` when the server has no origins) |
+| `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (operator / `TemplateWrite`; `templates-sync`) |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |

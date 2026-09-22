@@ -1,0 +1,46 @@
+# Template hosting + sync (RFC 0006): where `faucet serve` pulls pipeline
+# templates from. Each origin owns the id namespace named by its `prefix`, so
+# a template can never have two owners; prefixes must not overlap.
+#
+#   faucet serve --history sqlite:./faucet.db --templates-sync cli/examples/templates/sync.yaml
+#   faucet template sync --store sqlite:./faucet.db --config cli/examples/templates/sync.yaml --dry-run
+#   faucet template publish platform-nightly --store sqlite:./faucet.db --config cli/examples/templates/sync.yaml --origin platform
+#
+# Layout at every origin: `<id>.yaml` (or `.json`) is the template; an optional
+# `<id>.faucet.yaml` sidecar beside it carries release intent:
+#
+#   description: Nightly account sync
+#   launch: true            # make this version `stable` on pull (needs launch: follow)
+#   tags: [staging]         # assignable channels to point at it
+#
+# A pull only ever APPENDS versions (an unchanged body is a no-op); nothing is
+# deleted. `faucet template publish` is the manual reverse direction.
+version: 1
+origins:
+  # Reviewed-in-a-repo templates. A private repo needs only a token — no git
+  # binary. `${env:…}` is resolved when the file is loaded.
+  - name: platform
+    source:
+      type: github
+      config:
+        repo: acme/data-templates
+        ref: main
+        path: templates/
+        token: "${env:GITHUB_TOKEN}"
+    prefix: platform-
+    launch: follow          # a sidecar's `launch: true` moves `stable`
+    prune: deprecate        # a template removed upstream is deprecated, never deleted
+    interval_secs: 300
+
+  # Drop-a-file templates from a partner team's bucket. Credentials come from
+  # the SDK default chain (env, profile, IAM role).
+  - name: partner
+    source:
+      type: s3
+      config:
+        bucket: acme-templates
+        prefix: shared/
+        region: us-east-1
+    prefix: partner-
+    # launch defaults to `ignore`: pull registers, an operator launches.
+    # prune defaults to `keep`: vanished templates are only reported.

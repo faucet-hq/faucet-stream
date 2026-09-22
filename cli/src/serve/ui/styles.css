@@ -1439,3 +1439,64 @@ select {
   .lo-row { grid-template-columns: auto minmax(0, 1fr) auto; row-gap: 8px; }
   .lo-bar .run-meta { margin-right: 0; width: 100%; }
 }
+
+/* ── templates: remote-origin sync panel (RFC 0006) ─────────────────────── */
+.tpl-sync {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 0 0 14px;
+  background: var(--surface);
+  display: grid;
+  gap: 10px;
+}
+.tpl-sync-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.tpl-sync-head h2 {
+  font-size: 14px;
+  margin: 0;
+  flex: 1 1 auto;
+}
+.tpl-sync-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-dim);
+}
+.tpl-sync-origins {
+  display: grid;
+  gap: 4px;
+}
+.tpl-sync-origin {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+.tpl-sync-out {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.tpl-sync-report ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.tpl-sync-report-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.tpl-sync-mut { color: var(--ink); }
+.tpl-sync-quiet { color: var(--ink-faint); }
+.tpl-sync-warn { color: var(--queued); }
+.tpl-sync-fail { color: var(--fail); }

@@ -671,6 +671,9 @@ faucet template run       tenant-sync --store sqlite:./faucet-templates.db \
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
 faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
+faucet template sync      --store sqlite:./faucet-templates.db --config sync.yaml --dry-run   # pull remote origins (RFC 0006)
+faucet template sync      --store sqlite:./faucet-templates.db --config sync.yaml --origin platform
+faucet template publish   platform-nightly --store sqlite:./faucet-templates.db --config sync.yaml --origin platform
 ```
 
 Register a config declaring [`params:`](config.md#params) **once**, then trigger
@@ -689,11 +692,13 @@ runs by id — the register-once / trigger-by-id model. See the
 | `--undo` | *(deprecate)* Revive instead of retire. |
 | `--param <NAME=VALUE>` | *(run)* Supply a declared param. Repeatable. |
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
-| `--dry-run` | *(run)* Materialize and validate without writing to any sink. |
 | `--limit <n>` | *(run)* Stop after writing this many records. |
 | `--suite <path>` | *(test)* Positional: the suite file (YAML or JSON). `faucet schema template-test` prints its schema. |
 | `--select <n\|channel>` | *(test)* Override the suite's own `select:`. Ignored when the suite's `template:` is a path. |
 | `--filter <pattern>` | *(test)* Run only cases whose name matches; `*` wildcards, otherwise an exact match. |
+| `--config <path>` | *(sync / publish)* The sync file naming the remote origins — the same file `faucet serve --templates-sync` takes. `faucet schema templates-sync` prints its schema. Requires the `templates-sync` feature. |
+| `--origin <name>` | *(sync)* Pull only this origin (default: all). *(publish)* The origin to write to (required). |
+| `--dry-run` | *(sync)* Plan and print what would change without touching the registry. *(run)* Materialize and validate without writing to any sink. |
 | `--json` | Machine-readable output for every subcommand. |
 
 Every `register` appends a new **numeric version** (auto-incrementing from 1) and
