@@ -59,6 +59,10 @@ fn default_schema_sample_size() -> usize {
 fn default_csv_delimiter() -> u8 {
     b','
 }
+fn default_csv_quote() -> u8 {
+    b'"'
+}
+
 fn default_csv_has_headers() -> bool {
     true
 }
@@ -284,6 +288,12 @@ pub struct RestStreamConfig {
     /// (default `true`). When `false`, fields are named `column_0`, `column_1`, …
     #[serde(default = "default_csv_has_headers")]
     pub csv_has_headers: bool,
+    /// CSV quote character (default `"`). Set it when the export quotes with
+    /// something else — without this knob a `'`-quoted export parsed as literal
+    /// quote characters inside every field (#670 L29). `response_format: csv`
+    /// and the `parse: csv` decode step both honour it.
+    #[serde(default = "default_csv_quote")]
+    pub csv_quote: u8,
     /// Excel worksheet to read: a sheet name, or a 0-based index as a string.
     /// When omitted, the first worksheet is used. `response_format: excel` only.
     #[serde(default)]
@@ -698,6 +708,7 @@ impl Default for RestStreamConfig {
             response_format: ResponseFormat::Json,
             csv_delimiter: b',',
             csv_has_headers: true,
+            csv_quote: b'"',
             excel_sheet: None,
             excel_header_row: 0,
             replication_bind: None,

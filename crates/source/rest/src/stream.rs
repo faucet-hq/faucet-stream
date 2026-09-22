@@ -891,10 +891,13 @@ impl RestStream {
                         use futures::TryStreamExt as _;
                         let body = resp.bytes_stream().map_err(std::io::Error::other);
                         let reader = tokio_util::io::StreamReader::new(body);
-                        let mut pages = Box::pin(crate::format::csv_reader_to_value_pages(
+                        let mut pages = Box::pin(crate::format::csv_reader_to_value_pages_with(
                             reader,
-                            plan.delimiter,
-                            plan.has_headers,
+                            crate::format::CsvDialect {
+                                delimiter: plan.delimiter,
+                                has_headers: plan.has_headers,
+                                quote: self.config.csv_quote,
+                            },
                             csv_page_size,
                         ));
                         use futures::StreamExt as _;
@@ -1769,10 +1772,13 @@ impl RestStream {
                 Ok((records, Some(v)))
             }
             crate::config::ResponseFormat::Csv => {
-                let records = crate::format::parse_csv(
+                let records = crate::format::parse_csv_with(
                     bytes,
-                    self.config.csv_delimiter,
-                    self.config.csv_has_headers,
+                    crate::format::CsvDialect {
+                        delimiter: self.config.csv_delimiter,
+                        has_headers: self.config.csv_has_headers,
+                        quote: self.config.csv_quote,
+                    },
                 )
                 .await?;
                 Ok((records, None))
@@ -2304,10 +2310,13 @@ impl RestStream {
         let body: Value = match self.config.response_format {
             crate::config::ResponseFormat::Json => serde_json::from_slice(&bytes)?,
             crate::config::ResponseFormat::Csv => Value::Array(
-                crate::format::parse_csv(
+                crate::format::parse_csv_with(
                     &bytes,
-                    self.config.csv_delimiter,
-                    self.config.csv_has_headers,
+                    crate::format::CsvDialect {
+                        delimiter: self.config.csv_delimiter,
+                        has_headers: self.config.csv_has_headers,
+                        quote: self.config.csv_quote,
+                    },
                 )
                 .await?,
             ),
@@ -2783,12 +2792,12 @@ impl faucet_core::Source for RestStream {
                 let resp_headers = resp.headers().clone();
                 let delimiter = self.config.csv_delimiter;
                 let has_headers = self.config.csv_has_headers;
+                let quote = self.config.csv_quote;
                 let body = resp.bytes_stream().map_err(std::io::Error::other);
                 let reader = tokio_util::io::StreamReader::new(body);
-                let batches = crate::format::csv_reader_to_record_batches(
+                let batches = crate::format::csv_reader_to_record_batches_with(
                     reader,
-                    delimiter,
-                    has_headers,
+                    crate::format::CsvDialect { delimiter, has_headers, quote },
                     rows_per_batch,
                 );
                 futures::pin_mut!(batches);

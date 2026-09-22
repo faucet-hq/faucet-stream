@@ -13312,6 +13312,17 @@
                       ],
                       "default": true
                     },
+                    "csv_quote": {
+                      "description": "CSV quote character (default `\"`). Set it when the export quotes with\nsomething else — without this knob a `'`-quoted export parsed as literal\nquote characters inside every field (#670 L29). `response_format: csv`\nand the `parse: csv` decode step both honour it.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint8",
+                      "minimum": 0,
+                      "maximum": 255,
+                      "default": 34
+                    },
                     "excel_sheet": {
                       "description": "Excel worksheet to read: a sheet name, or a 0-based index as a string.\nWhen omitted, the first worksheet is used. `response_format: excel` only.",
                       "type": [
