@@ -582,7 +582,6 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     && wrapped_sink.supports_columnar()
                     && self.dlq.is_none()
                     && self.delivery == crate::idempotency::DeliveryMode::AtLeastOnce
-                    && self.schema_drift.is_none()
                     && self.adaptive.is_none()
                     && self.resilience.is_none()
                     // The columnar fast-path bypasses `run_stream`, which is
@@ -595,16 +594,54 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     // wired below; the columnar path would append straight to
                     // the destination and skip the atomic swap.
                     && !wrapped_sink.is_overwrite();
+                // Governance no longer disqualifies the fast path outright
+                // (#636) — it runs *inside* the columnar loop via the same
+                // `apply_governance` the `Value` loop uses. A **quarantining**
+                // policy still falls back, because quarantine needs the DLQ
+                // envelope/budget machinery that only `run_stream` has (and
+                // `dlq.is_none()` above already excludes it).
+                let columnar_ok =
+                    columnar_ok && self.schema_drift.as_ref().is_none_or(|p| !p.requires_dlq());
                 #[cfg(feature = "quality")]
-                let columnar_ok = columnar_ok && self.quality.is_none();
+                let columnar_ok =
+                    columnar_ok && self.quality.as_ref().is_none_or(|q| !q.requires_dlq());
                 #[cfg(feature = "contract")]
-                let columnar_ok = columnar_ok && self.contract.is_none();
-                #[cfg(feature = "masking")]
-                let columnar_ok = columnar_ok && self.masking.is_none();
+                let columnar_ok =
+                    columnar_ok && self.contract.as_ref().is_none_or(|c| !c.requires_dlq());
                 if columnar_ok {
                     let state = match (wrapped_state_store.clone(), state_key.clone()) {
                         (Some(store), Some(key)) => Some((store, key)),
                         _ => None,
+                    };
+                    #[allow(unused_mut)]
+                    let mut has_governance = self.schema_drift.is_some();
+                    #[cfg(feature = "quality")]
+                    {
+                        has_governance = has_governance || self.quality.is_some();
+                    }
+                    #[cfg(feature = "contract")]
+                    {
+                        has_governance = has_governance || self.contract.is_some();
+                    }
+                    #[cfg(feature = "masking")]
+                    {
+                        has_governance = has_governance || self.masking.is_some();
+                    }
+                    let sink_name = wrapped_sink.connector_name();
+                    let specs = GovernanceSpecs {
+                        #[cfg(feature = "masking")]
+                        masking: self.masking.as_ref(),
+                        #[cfg(feature = "quality")]
+                        quality: self.quality.as_ref(),
+                        #[cfg(feature = "contract")]
+                        contract: self.contract.as_ref(),
+                        schema_drift: self.schema_drift.as_ref(),
+                        pipeline: &name,
+                        row: &row,
+                        run_id: &run_id,
+                        sink_name,
+                        // No DLQ on this path, so a drift abort raises directly.
+                        has_dlq: false,
                     };
                     return run_stream_columnar(
                         &wrapped_source,
@@ -614,6 +651,8 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         &name,
                         &row,
                         &run_id,
+                        specs,
+                        has_governance,
                     )
                     .await;
                 }
@@ -810,6 +849,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
 /// Emits the source/sink record counters; the richer per-page histograms of the
 /// `Value` path are not layered on this loop yet.
 #[cfg(feature = "arrow")]
+#[allow(clippy::too_many_arguments)]
 async fn run_stream_columnar<S, Si>(
     source: &S,
     sink: &Si,
@@ -818,6 +858,8 @@ async fn run_stream_columnar<S, Si>(
     pipeline: &str,
     row: &str,
     run_id: &str,
+    specs: GovernanceSpecs<'_>,
+    has_governance: bool,
 ) -> Result<PipelineResult, FaucetError>
 where
     S: crate::Source + ?Sized,
@@ -841,6 +883,7 @@ where
     let mut batches = source.stream_batches(&ctx, DEFAULT_BATCH_SIZE);
     let mut records_written = 0usize;
     let mut last_bookmark: Option<Value> = None;
+    let mut gov_state = GovernanceState::default();
 
     loop {
         // Cooperative cancellation: race the next batch against the token so a
@@ -860,8 +903,34 @@ where
         let rows = page.num_rows();
         counter!("faucet_source_records_total", src_labels.clone()).increment(rows as u64);
 
+        // Governance on the columnar path (#636). Only reached for policies
+        // that never quarantine (`requires_dlq()` false) — `Pipeline::run`
+        // keeps every quarantining config on the `Value` path, so there are no
+        // envelopes to route and no DLQ machinery to duplicate here. The pass
+        // itself is the *same* `apply_governance` the `Value` loop runs, so the
+        // two cannot drift apart.
+        //
+        // The batch is materialized to `Value` only when a policy is actually
+        // configured; with none, the batch goes to the sink untouched and the
+        // run stays pure-columnar end to end.
+        let batch = if has_governance && rows > 0 {
+            let records = crate::columnar::record_batch_to_values(&page.batch)?;
+            let schema = page.batch.schema();
+            let gov = apply_governance(records, &specs, &mut gov_state, sink).await?;
+            debug_assert!(
+                gov.envelopes.is_empty() && gov.deferred_abort.is_none(),
+                "columnar governance is gated to non-quarantining policies"
+            );
+            // Re-encode against the *incoming* schema so a pass that only
+            // removes rows cannot silently re-type a column via inference.
+            crate::columnar::values_to_record_batch(&gov.records, schema)?
+        } else {
+            page.batch
+        };
+        let rows = batch.num_rows();
+
         if rows > 0 {
-            let n = sink.write_batch_columnar(&page.batch).await?;
+            let n = sink.write_batch_columnar(&batch).await?;
             records_written += n;
             counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
             counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
@@ -2048,6 +2117,12 @@ pub(crate) struct GovernanceSpecs<'a> {
     pub schema_drift: Option<&'a crate::drift::SchemaDriftPolicy>,
     pub pipeline: &'a str,
     pub row: &'a str,
+    /// Only read by the masking/quality/contract label builders, so it is
+    /// dead under a build with none of those features.
+    #[cfg_attr(
+        not(any(feature = "masking", feature = "quality", feature = "contract")),
+        allow(dead_code)
+    )]
     pub run_id: &'a str,
     pub sink_name: &'a str,
     /// Whether a DLQ is configured. A drift/incompatible `fail` is **deferred**
@@ -2096,6 +2171,9 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     state: &mut GovernanceState,
     sink: &Si,
 ) -> Result<GovernanceOutcome, FaucetError> {
+    // Envelope construction is entirely feature-gated (quality/contract), so
+    // this import is too — otherwise a bare `arrow` build warns.
+    #[cfg(any(feature = "quality", feature = "contract"))]
     use crate::dlq::{DlqReason, build_envelope};
 
     let pipeline_name = specs.pipeline;
