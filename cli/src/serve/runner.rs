@@ -1579,6 +1579,7 @@ mod tests {
             ui_enabled: true,
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
+            templates_sync_path: None,
             callback_allow_hosts: Vec::new(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -1660,6 +1661,7 @@ mod tests {
             ui_enabled: true,
             cluster,
             triggers_path: None,
+            templates_sync_path: None,
             callback_allow_hosts: Vec::new(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -1731,6 +1733,7 @@ mod tests {
             ui_enabled: true,
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
+            templates_sync_path: None,
             callback_allow_hosts: Vec::new(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -1852,6 +1855,7 @@ mod tests {
             ui_enabled: true,
             cluster,
             triggers_path: None,
+            templates_sync_path: None,
             callback_allow_hosts: Vec::new(),
         };
         // A backend that is degraded from startup (primary unreachable).
@@ -1947,6 +1951,7 @@ mod tests {
                 ui_enabled: true,
                 cluster: crate::serve::cluster::ClusterConfig::disabled(),
                 triggers_path: None,
+                templates_sync_path: None,
                 callback_allow_hosts: Vec::new(),
             };
             ServerState::new(

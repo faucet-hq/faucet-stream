@@ -53,6 +53,8 @@
 pub mod store;
 #[cfg(feature = "templates")]
 pub mod suite;
+#[cfg(feature = "templates-sync")]
+pub mod sync;
 
 pub use store::{
     LaunchOutcome, Materialize, MaterializedConfig, RegisterRequest, TemplateStore, launch,

@@ -31,7 +31,78 @@ pub async fn run(args: TemplateArgs) -> CliResult<()> {
         TemplateCommand::Delete(a) => delete(a).await,
         TemplateCommand::Run(a) => run_template(a).await,
         TemplateCommand::Test(a) => test_suite(a).await,
+        #[cfg(feature = "templates-sync")]
+        TemplateCommand::Sync(a) => sync(a).await,
+        #[cfg(feature = "templates-sync")]
+        TemplateCommand::Publish(a) => publish(a).await,
     }
+}
+
+/// `faucet template sync`: pull every origin (or `--origin`) and print one
+/// report per origin. Exit non-zero when an origin could not be read or any
+/// template failed to apply — a partial pull must not look green.
+#[cfg(feature = "templates-sync")]
+async fn sync(args: crate::cli::TemplateSyncArgs) -> CliResult<()> {
+    use crate::templates::sync as tsync;
+    let store = connect(&args.common).await?;
+    let file = tsync::load_sync_file(&args.config).await?;
+    let results =
+        tsync::sync_all(&store, &file, args.origin.as_deref(), args.dry_run, None).await?;
+    let mut origin_errors = Vec::new();
+    let mut failed = 0usize;
+    let mut reports = Vec::new();
+    for r in results {
+        match r {
+            Ok(rep) => {
+                failed += rep.failed();
+                reports.push(rep);
+            }
+            Err((name, e)) => origin_errors.push((name, e.to_string())),
+        }
+    }
+    if args.common.json {
+        println!(
+            "{}",
+            to_pretty(&serde_json::json!({
+                "dry_run": args.dry_run,
+                "reports": reports,
+                "origin_errors": origin_errors.iter().map(|(n, e)| serde_json::json!({"origin": n, "error": e})).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        for rep in &reports {
+            print!("{}", rep.render_human());
+        }
+        for (name, e) in &origin_errors {
+            println!("origin '{name}': ERROR {e}");
+        }
+    }
+    if !origin_errors.is_empty() || failed > 0 {
+        return Err(CliError::Config(format!(
+            "template sync: {} origin(s) unreadable, {failed} template(s) failed to apply",
+            origin_errors.len()
+        )));
+    }
+    Ok(())
+}
+
+/// `faucet template publish <id> --origin X`: write one version to an origin.
+#[cfg(feature = "templates-sync")]
+async fn publish(args: crate::cli::TemplatePublishArgs) -> CliResult<()> {
+    use crate::templates::sync as tsync;
+    let store = connect(&args.common).await?;
+    let file = tsync::load_sync_file(&args.config).await?;
+    let selector = VersionSelector::parse(&args.version)?;
+    let rep = tsync::publish(&store, &file, &args.id, &args.origin, selector).await?;
+    if args.common.json {
+        println!("{}", to_pretty(&rep)?);
+    } else {
+        println!(
+            "published {} v{} → origin '{}' as {} ({})",
+            rep.id, rep.version, rep.origin, rep.name, rep.location
+        );
+    }
+    Ok(())
 }
 
 /// Load `.env` (so a `${env:…}` in a materialized template resolves) and connect

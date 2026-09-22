@@ -77,6 +77,12 @@ const ROUTES_TEMPLATES: &[(&str, &str)] = &[
     ("POST", "/v1/templates/{id}/deprecate"),
 ];
 
+#[cfg(feature = "templates-sync")]
+const ROUTES_TEMPLATES_SYNC: &[(&str, &str)] = &[
+    ("POST", "/v1/templates/sync"),
+    ("POST", "/v1/templates/{id}/publish"),
+];
+
 /// Returns the full canonical route set for the current feature configuration.
 fn canonical_routes() -> BTreeSet<(String, String)> {
     #[allow(unused_mut)]
@@ -94,6 +100,10 @@ fn canonical_routes() -> BTreeSet<(String, String)> {
     }
     #[cfg(feature = "templates")]
     for (m, p) in ROUTES_TEMPLATES {
+        set.insert((m.to_string(), p.to_string()));
+    }
+    #[cfg(feature = "templates-sync")]
+    for (m, p) in ROUTES_TEMPLATES_SYNC {
         set.insert((m.to_string(), p.to_string()));
     }
     set
@@ -126,6 +136,11 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         // …and the `templates` feature's routes (#444).
         #[cfg(not(feature = "templates"))]
         if path.starts_with("/v1/templates") {
+            continue;
+        }
+        // …and the `templates-sync` routes (RFC 0006 / #589).
+        #[cfg(not(feature = "templates-sync"))]
+        if path == "/v1/templates/sync" || path.ends_with("/publish") {
             continue;
         }
         let ops = ops.as_mapping().unwrap();
@@ -200,6 +215,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers: None,
+        templates_sync: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

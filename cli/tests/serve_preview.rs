@@ -92,6 +92,7 @@ fn serve_args(
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers: None,
+        templates_sync: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

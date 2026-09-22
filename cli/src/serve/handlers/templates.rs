@@ -124,6 +124,59 @@ pub async fn register_template(
 #[derive(Debug, Serialize)]
 pub struct ListResponse {
     pub templates: Vec<TemplateSummary>,
+    /// Remote origins this server pulls templates from (`--templates-sync`),
+    /// so a client can offer "sync now" / "publish" only when they exist.
+    /// Omitted when the server has no origins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncInfo>,
+}
+
+/// Summary of the server's template origins.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncInfo {
+    pub origins: Vec<SyncOriginInfo>,
+}
+
+/// One origin, as the console shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncOriginInfo {
+    pub name: String,
+    pub kind: &'static str,
+    pub prefix: String,
+    pub launch: String,
+    pub prune: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+}
+
+#[cfg(feature = "templates-sync")]
+fn sync_info(state: &ServerState) -> Option<SyncInfo> {
+    let file = state.templates_sync()?;
+    Some(SyncInfo {
+        origins: file
+            .origins
+            .iter()
+            .map(|o| SyncOriginInfo {
+                name: o.name.clone(),
+                kind: o.source.kind(),
+                prefix: o.prefix.clone(),
+                launch: serde_json::to_value(o.launch)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                prune: serde_json::to_value(o.prune)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                interval_secs: o.interval_secs,
+            })
+            .collect(),
+    })
+}
+
+#[cfg(not(feature = "templates-sync"))]
+fn sync_info(_state: &ServerState) -> Option<SyncInfo> {
+    None
 }
 
 /// `GET /v1/templates` → 200. Latest version of each registered template.
@@ -133,7 +186,10 @@ pub async fn list_templates(
     let templates = crate::templates::list_with_state(&store(&state))
         .await
         .map_err(map_err)?;
-    Ok(Json(ListResponse { templates }))
+    Ok(Json(ListResponse {
+        templates,
+        sync: sync_info(&state),
+    }))
 }
 
 // ── GET /v1/templates/{id} ──────────────────────────────────────────────────
@@ -1391,4 +1447,137 @@ mod tests {
             vec![2]
         );
     }
+}
+
+// ── POST /v1/templates/sync · POST /v1/templates/{id}/publish ───────────────
+
+/// `POST /v1/templates/sync` request body.
+#[cfg(feature = "templates-sync")]
+#[derive(Debug, Default, Deserialize)]
+pub struct SyncBody {
+    /// Pull only this origin. Default: every origin.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Plan without applying.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /v1/templates/sync` response body.
+#[cfg(feature = "templates-sync")]
+#[derive(Debug, Serialize)]
+pub struct SyncResponse {
+    pub dry_run: bool,
+    pub reports: Vec<crate::templates::sync::SyncReport>,
+    /// Origins that could not be read at all (the others still synced).
+    pub origin_errors: Vec<OriginError>,
+}
+
+/// An origin whose listing failed.
+#[cfg(feature = "templates-sync")]
+#[derive(Debug, Serialize)]
+pub struct OriginError {
+    pub origin: String,
+    pub error: String,
+}
+
+#[cfg(feature = "templates-sync")]
+fn require_sync(
+    state: &ServerState,
+) -> Result<std::sync::Arc<crate::templates::sync::SyncFile>, ServeError> {
+    state
+        .templates_sync()
+        .ok_or_else(|| ServeError::Unprocessable {
+            message:
+                "this server has no template origins — start it with `--templates-sync <file>`"
+                    .into(),
+            details: None,
+        })
+}
+
+/// `POST /v1/templates/sync` → 200 with one report per origin. Registers,
+/// launches, and deprecations are attributed to the calling principal.
+/// Requires `TemplateWrite`; audited as `template.sync`.
+#[cfg(feature = "templates-sync")]
+pub async fn sync_templates(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    body: Option<Json<SyncBody>>,
+) -> Result<Json<SyncResponse>, ServeError> {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let file = require_sync(&state)?;
+    let results = crate::templates::sync::sync_all(
+        &store(&state),
+        &file,
+        body.origin.as_deref(),
+        body.dry_run,
+        Some(&actor.principal),
+    )
+    .await
+    .map_err(map_err)?;
+    let mut reports = Vec::new();
+    let mut origin_errors = Vec::new();
+    for r in results {
+        match r {
+            Ok(rep) => reports.push(rep),
+            Err((origin, e)) => origin_errors.push(OriginError {
+                origin,
+                error: e.to_string(),
+            }),
+        }
+    }
+    let result = if origin_errors.is_empty() && reports.iter().all(|r| r.failed() == 0) {
+        "ok"
+    } else {
+        "partial"
+    };
+    tracing::info!(
+        principal = %actor.principal,
+        origins = reports.len(),
+        errors = origin_errors.len(),
+        dry_run = body.dry_run,
+        "template sync requested"
+    );
+    crate::serve::audit::write(&state, &actor, "template.sync", None, None, result).await;
+    Ok(Json(SyncResponse {
+        dry_run: body.dry_run,
+        reports,
+        origin_errors,
+    }))
+}
+
+/// `POST /v1/templates/{id}/publish` request body.
+#[cfg(feature = "templates-sync")]
+#[derive(Debug, Deserialize)]
+pub struct PublishBody {
+    /// Origin `name` to write to.
+    pub origin: String,
+    /// Version to publish (channel or number). Default `stable`.
+    #[serde(default)]
+    pub version: VersionSelector,
+}
+
+/// `POST /v1/templates/{id}/publish` → 200 with where the file landed.
+/// Requires `TemplateWrite`; audited as `template.publish`.
+#[cfg(feature = "templates-sync")]
+pub async fn publish_template(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(id): Path<String>,
+    Json(body): Json<PublishBody>,
+) -> Result<Json<crate::templates::sync::PublishReport>, ServeError> {
+    let file = require_sync(&state)?;
+    let report =
+        crate::templates::sync::publish(&store(&state), &file, &id, &body.origin, body.version)
+            .await
+            .map_err(map_err)?;
+    tracing::info!(
+        principal = %actor.principal,
+        template = %id,
+        version = report.version,
+        origin = %report.origin,
+        "template published"
+    );
+    crate::serve::audit::write(&state, &actor, "template.publish", None, None, "ok").await;
+    Ok(Json(report))
 }

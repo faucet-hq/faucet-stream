@@ -47,6 +47,11 @@ struct Inner {
     cluster: crate::serve::cluster::ClusterHandle,
     #[cfg(feature = "triggers")]
     triggers: crate::serve::triggers::health::TriggersHandle,
+    /// The loaded `--templates-sync` file (RFC 0006), when the server was
+    /// started with one. Set once after construction; read by the sync/publish
+    /// handlers and the console.
+    #[cfg(feature = "templates-sync")]
+    templates_sync: RwLock<Option<Arc<crate::templates::sync::SyncFile>>>,
 }
 
 impl ServerState {
@@ -80,8 +85,30 @@ impl ServerState {
                 cluster: crate::serve::cluster::ClusterHandle::from_config(config),
                 #[cfg(feature = "triggers")]
                 triggers,
+                #[cfg(feature = "templates-sync")]
+                templates_sync: RwLock::new(None),
             }),
         }
+    }
+
+    /// Attach the loaded template-sync file (server startup).
+    #[cfg(feature = "templates-sync")]
+    pub fn set_templates_sync(&self, file: Arc<crate::templates::sync::SyncFile>) {
+        *self
+            .inner
+            .templates_sync
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(file);
+    }
+
+    /// The template-sync file, if the server was started with one.
+    #[cfg(feature = "templates-sync")]
+    pub fn templates_sync(&self) -> Option<Arc<crate::templates::sync::SyncFile>> {
+        self.inner
+            .templates_sync
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn auth_token(&self) -> Option<&str> {
@@ -211,6 +238,7 @@ mod tests {
             ui_enabled: true,
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
+            templates_sync_path: None,
             callback_allow_hosts: Vec::new(),
         }
     }

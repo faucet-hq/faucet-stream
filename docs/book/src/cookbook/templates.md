@@ -537,6 +537,103 @@ value in the shared history database. A clustered trigger of a template declarin
 alternatives (reference the secret from the body, or trigger on a non-clustered
 server). Non-clustered servers store no config body and are unaffected.
 
+## Hosting templates in a repo or bucket (sync)
+
+*(requires the `templates-sync` build feature; S3 / GCS / Azure Blob origins
+additionally need `templates-sync-object-store`)*
+
+The registry is where templates *run from*; a repo or bucket is where they are
+*authored* — reviewed in a pull request, or dropped in a partner's bucket. A
+**sync file** names those **origins**, and `faucet serve --templates-sync` pulls
+them into the registry: on start, on demand, and on a per-origin interval.
+
+```yaml
+# sync.yaml — see cli/examples/templates/sync.yaml
+version: 1
+origins:
+  - name: platform
+    source:
+      type: github
+      config: { repo: acme/data-templates, ref: main, path: templates/, token: "${env:GITHUB_TOKEN}" }
+    prefix: platform-        # this origin owns every `platform-*` id
+    launch: follow           # a sidecar's `launch: true` moves `stable`
+    prune: deprecate         # removed upstream → deprecated here (never deleted)
+    interval_secs: 300
+  - name: partner
+    source:
+      type: s3
+      config: { bucket: acme-templates, prefix: shared/, region: us-east-1 }
+    prefix: partner-
+```
+
+```bash
+faucet serve --history sqlite:./faucet.db --templates-sync sync.yaml
+faucet template sync    --store sqlite:./faucet.db --config sync.yaml --dry-run   # plan only
+faucet template sync    --store sqlite:./faucet.db --config sync.yaml --origin platform
+faucet template publish platform-nightly --store sqlite:./faucet.db --config sync.yaml --origin platform
+```
+
+Over HTTP the same two verbs are `POST /v1/templates/sync` (`{origin?, dry_run?}`)
+and `POST /v1/templates/{id}/publish` (`{origin, version?}`), both
+`TemplateWrite` and audited as `template.sync` / `template.publish`; the console's
+Templates page grows a **Sync from origins** panel when the server has any.
+
+**Layout at an origin.** The template id is the file **stem**, with the origin's
+`prefix` prepended: `templates/nightly.yaml` under `prefix: platform-` registers
+as `platform-nightly`. Only `*.yaml` / `*.yml` / `*.json` files directly in the
+directory are read. An optional sidecar `<stem>.faucet.yaml` beside the template
+carries release intent, kept out of the config body so the body stays runnable
+with `faucet run`:
+
+```yaml
+# nightly.faucet.yaml
+description: Nightly account sync
+launch: true          # make this version `stable` on pull (honoured under `launch: follow`)
+tags: [staging]       # assignable channels to point at the pulled version
+```
+
+**What a pull does — and never does.**
+
+| Upstream state | Registry action |
+|---|---|
+| New file | `register` a version (launched only if the policy says so) |
+| Body changed (comments/whitespace ignored — the canonical body is hashed) | `register` the next version |
+| Body unchanged | nothing — re-pulling is free and never inflates the version counter |
+| Unchanged, but `stable` lags the policy (`always`, or a sidecar flipped `launch`) | `launch` the existing version |
+| File removed | `prune: keep` → reported as orphaned; `prune: deprecate` → deprecated |
+| Removed file returns | under `prune: deprecate` the deprecation is lifted (the origin owns that marker) |
+| Bad id / unparseable body / bad sidecar tag | skipped and reported — one broken file never blocks the origin |
+
+A pull **only appends**: nothing is overwritten and nothing is deleted (a delete
+would cascade to the launch log and silently repoint `stable`). Under the default
+`launch: ignore` a pull moves nobody — exactly like a manual `register`;
+`follow` lets the sidecar decide; `always` is GitOps mode, where merging upstream
+is the release. Every register is attributed (`created_by: sync:<origin>`, or the
+principal who called the HTTP endpoint).
+
+**One owner per template.** Each origin owns the id namespace named by its
+`prefix`; two origins with overlapping prefixes (including an empty prefix beside
+any other) are refused when the file loads, so "who wins" never has to be decided
+at runtime, and an origin never touches ids outside its prefix.
+
+**Publish is manual.** `faucet template publish <id> --origin X [--version stable]`
+writes one registered version back as `<id minus prefix>.<yaml|json>` — a
+deliberate operator step (audited), never automatic, so the registry can never
+overwrite a reviewed file on its own. The next pull sees the identical body and
+plans `unchanged`.
+
+**Credentials.** GitHub uses the contents API — no git binary; a private repo
+needs only a `token` (use `${env:…}` / `${secret:…}`; the value is registered for
+log redaction). Object-store origins use the SDK default chain (`AWS_*`,
+Application Default Credentials, `AZURE_*`), like the trigger watchers. A
+transport failure on the initial pull is logged and counted, not fatal — the
+server comes up on the registry it has; an invalid sync file *is* fatal.
+
+Metrics: `faucet_serve_template_sync_runs_total{origin,outcome=ok|partial|error}`,
+`faucet_serve_template_sync_mutations_total{origin}`,
+`faucet_serve_template_sync_last_unix_seconds{origin}`. Schema:
+`faucet schema templates-sync`.
+
 ## Safety properties
 
 - **Structure safety.** Params are substituted per JSON/YAML scalar, before the
@@ -561,6 +658,8 @@ server). Non-clustered servers store no config body and are unaffected.
 |---|---|
 | *(none)* | The `params:` block, `${param.*}`, `--param` / `--param-env`, `faucet schema params` |
 | `templates` | `faucet template …`, `/v1/templates*`, the MCP template tools (implies `serve`) |
+| `templates-sync` | `faucet template sync\|publish`, `faucet serve --templates-sync`, `POST /v1/templates/sync` + `/{id}/publish`, GitHub origins (implies `templates`) |
+| `templates-sync-object-store` | S3 / GCS / Azure Blob origins (implies `templates-sync`; pulls `object_store`) |
 | `serve-history-sqlite` / `serve-history-postgres` | A registry that survives a restart |
 
 `templates` is in `--features full`, not in `default`.
@@ -568,7 +667,9 @@ server). Non-clustered servers store no config body and are unaffected.
 ## See also
 
 - Runnable example: [`cli/examples/rest_to_jsonl_templated.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/rest_to_jsonl_templated.yaml)
-  and its suite [`cli/examples/tests/template_suite.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/tests/template_suite.yaml)
+  and its suite [`cli/examples/tests/template_suite.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/tests/template_suite.yaml);
+  sync file [`cli/examples/templates/sync.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/templates/sync.yaml)
+- [RFC 0006 — template hosting + sync](https://github.com/faucet-hq/faucet-stream/blob/main/rfcs/0006-template-hosting-sync.md)
 - [`params:` reference](../reference/config.md#params) · [CLI reference](../reference/cli.md) · [HTTP API](../reference/http-api.md)
 - [Config composition](./composition.md) — `extends` / `profiles` / `!include`, for
   variation that is *static* rather than per-run

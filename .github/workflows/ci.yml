@@ -447,6 +447,9 @@ jobs:
           - triggers-kafka
           # Pipeline template registry + parameterized triggers (CLI-only; implies serve)
           - templates
+          # Template hosting + sync from remote origins (CLI-only; implies templates)
+          - templates-sync
+          - templates-sync-object-store
           # Notification / incident routing (CLI-only)
           - notify
           # Local dev loop — `faucet dev` filesystem watch (CLI-only)
@@ -484,7 +487,7 @@ jobs:
           # Secrets, schedule, serve, catalog, templates, and triggers features
           # live in faucet-cli (CLI layer), not in the faucet-stream umbrella
           # crate. Route accordingly.
-          if [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == "templates" || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
+          if [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == templates* || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
             cargo check -p faucet-cli --no-default-features --features ${{ matrix.feature }}
           else
             cargo check -p faucet-stream --no-default-features --features ${{ matrix.feature }}

@@ -58,6 +58,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf) -> faucet_cli::cli::Se
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers: None,
+        templates_sync: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

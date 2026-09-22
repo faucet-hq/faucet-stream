@@ -37,9 +37,11 @@ export async function renderTemplates(container) {
       <div class="page-head">
         <h1>Templates</h1>
         <button class="btn-ghost" id="t-refresh">↻</button>
+        <button class="btn-ghost" id="t-sync" hidden title="Pull templates from the configured remote origins">Sync from origins</button>
         <button class="btn-primary" id="t-new">Register a template</button>
       </div>
       <div id="t-register" hidden></div>
+      <div id="t-sync-panel" hidden></div>
       <div class="filters" id="t-filters" hidden>
         <input id="t-search" type="search" autocomplete="off"
           placeholder="search templates by id or description…" />
@@ -147,10 +149,25 @@ export async function renderTemplates(container) {
     });
   }
 
+  const syncBtn = container.querySelector("#t-sync");
+  const syncPanel = container.querySelector("#t-sync-panel");
+  syncBtn.onclick = () => {
+    if (!syncPanel.hidden) {
+      syncPanel.hidden = true;
+      return;
+    }
+    syncPanel.innerHTML = "";
+    syncPanel.appendChild(syncControls(syncOrigins, load));
+    syncPanel.hidden = false;
+  };
+  let syncOrigins = [];
+
   async function load() {
     try {
       const data = await api("/v1/templates");
       all = data.templates || [];
+      syncOrigins = (data.sync && data.sync.origins) || [];
+      syncBtn.hidden = syncOrigins.length === 0;
       list.innerHTML = "";
       if (!all.length) {
         filters.hidden = true;
@@ -189,6 +206,107 @@ function listRow(t) {
     <span class="run-meta" title="newest registered build">v${st.newest ?? t.version}</span>
     <span class="run-meta" title="declared params">${params}</span>`;
   return el;
+}
+
+/** The sync panel (RFC 0006): the server's remote origins, a dry-run / pull
+ *  button pair, and the resulting per-origin plan. Only shown when the server
+ *  was started with `--templates-sync`. */
+function syncControls(origins, reload) {
+  const el = document.createElement("div");
+  el.className = "tpl-sync";
+  const rows = origins
+    .map(
+      (o) => `
+      <div class="tpl-sync-origin">
+        <b class="mono">${escapeHtml(o.name)}</b>
+        <span class="run-meta">${escapeHtml(o.kind)}</span>
+        <span class="run-meta" title="id namespace this origin owns">prefix <code>${escapeHtml(o.prefix || "(none)")}</code></span>
+        <span class="run-meta" title="whether a pull may move stable">launch: ${escapeHtml(o.launch)}</span>
+        <span class="run-meta" title="what happens to a template that vanished upstream">prune: ${escapeHtml(o.prune)}</span>
+        ${o.interval_secs ? `<span class="run-meta">every ${o.interval_secs}s</span>` : ""}
+      </div>`
+    )
+    .join("");
+  el.innerHTML = `
+    <div class="tpl-sync-head">
+      <h2>Remote origins</h2>
+      <label class="tpl-sync-pick">origin
+        <select id="ts-origin">
+          <option value="">all</option>
+          ${origins.map((o) => `<option value="${escapeHtml(o.name)}">${escapeHtml(o.name)}</option>`).join("")}
+        </select>
+      </label>
+      <button class="btn-ghost" id="ts-dry">Dry run</button>
+      <button class="btn-primary" id="ts-run">Pull now</button>
+    </div>
+    <div class="tpl-sync-origins">${rows}</div>
+    <div id="ts-out" class="tpl-sync-out" hidden></div>`;
+  const out = el.querySelector("#ts-out");
+  async function go(dryRun) {
+    const origin = el.querySelector("#ts-origin").value || undefined;
+    el.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    try {
+      const res = await api("/v1/templates/sync", { method: "POST", body: { origin, dry_run: dryRun } });
+      out.innerHTML = renderSyncResult(res);
+      out.hidden = false;
+      const changed = res.reports.reduce((n, r) => n + (r.outcome ? countMutations(r.outcome) : r.plan.filter(isMutation).length), 0);
+      toast(dryRun ? `Dry run: ${changed} change(s) planned` : `Synced: ${changed} change(s)`, res.origin_errors.length ? "error" : "info");
+      if (!dryRun) await reload();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      el.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    }
+  }
+  el.querySelector("#ts-dry").onclick = () => go(true);
+  el.querySelector("#ts-run").onclick = () => go(false);
+  return el;
+}
+
+const isMutation = (a) => ["register", "launch", "revive", "deprecate"].includes(a.action);
+const countMutations = (o) => o.registered.length + o.launched.length + o.revived.length + o.deprecated.length;
+
+function renderSyncResult(res) {
+  const verb = res.dry_run ? "would" : "did";
+  const blocks = res.reports.map((r) => {
+    const lines = r.plan
+      .map((a) => {
+        const cls = isMutation(a) ? "tpl-sync-mut" : "";
+        switch (a.action) {
+          case "register":
+            return `<li class="${cls}">register <b class="mono">${escapeHtml(a.id)}</b>${a.replaces != null ? ` (after v${a.replaces})` : ""}${a.launch ? " → launch" : ""}</li>`;
+          case "launch":
+            return `<li class="${cls}">launch <b class="mono">${escapeHtml(a.id)}</b> v${a.version}</li>`;
+          case "revive":
+            return `<li class="${cls}">revive <b class="mono">${escapeHtml(a.id)}</b></li>`;
+          case "deprecate":
+            return `<li class="${cls}">deprecate <b class="mono">${escapeHtml(a.id)}</b> (gone upstream)</li>`;
+          case "orphaned":
+            return `<li>orphaned <b class="mono">${escapeHtml(a.id)}</b> (gone upstream; kept)</li>`;
+          case "unchanged":
+            return `<li class="tpl-sync-quiet">unchanged <b class="mono">${escapeHtml(a.id)}</b> (v${a.version})</li>`;
+          case "skipped":
+            return `<li class="tpl-sync-warn">skipped <b class="mono">${escapeHtml(a.name)}</b>: ${escapeHtml(a.reason)}</li>`;
+          default:
+            return `<li>${escapeHtml(a.action)}</li>`;
+        }
+      })
+      .join("");
+    const warnings = (r.warnings || []).map((w) => `<li class="tpl-sync-warn">${escapeHtml(w)}</li>`).join("");
+    const failed = ((r.outcome && r.outcome.failed) || [])
+      .map((f) => `<li class="tpl-sync-fail">failed <b class="mono">${escapeHtml(f.id)}</b>: ${escapeHtml(f.error)}</li>`)
+      .join("");
+    return `<div class="tpl-sync-report">
+      <div class="tpl-sync-report-head"><b class="mono">${escapeHtml(r.origin)}</b> <span class="run-meta">${escapeHtml(r.kind)} · ${verb} change ${
+        r.outcome ? countMutations(r.outcome) : r.plan.filter(isMutation).length
+      }</span></div>
+      <ul>${lines}${warnings}${failed}${!lines && !warnings ? "<li class=\"tpl-sync-quiet\">nothing at this origin</li>" : ""}</ul>
+    </div>`;
+  });
+  const errs = (res.origin_errors || [])
+    .map((e) => `<div class="tpl-sync-report"><div class="tpl-sync-report-head"><b class="mono">${escapeHtml(e.origin)}</b></div><ul><li class="tpl-sync-fail">${escapeHtml(e.error)}</li></ul></div>`)
+    .join("");
+  return blocks.join("") + errs;
 }
 
 /** The register panel: a raw config editor plus id / description / launch.

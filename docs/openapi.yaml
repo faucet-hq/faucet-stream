@@ -880,6 +880,27 @@ paths:
                   templates:
                     type: array
                     items: { $ref: "#/components/schemas/TemplateSummary" }
+                  sync:
+                    description: >
+                      Present only when the server was started with
+                      `--templates-sync`: the remote origins it pulls templates
+                      from (RFC 0006), so a client can offer "sync now" /
+                      "publish" only where they apply.
+                    type: object
+                    required: [origins]
+                    properties:
+                      origins:
+                        type: array
+                        items:
+                          type: object
+                          required: [name, kind, prefix, launch, prune]
+                          properties:
+                            name: { type: string }
+                            kind: { type: string, enum: [github, s3, gcs, azure_blob] }
+                            prefix: { type: string, description: "Id namespace the origin owns." }
+                            launch: { type: string, enum: [ignore, follow, always] }
+                            prune: { type: string, enum: [keep, deprecate] }
+                            interval_secs: { type: integer, description: "Periodic pull interval; absent = on start / on demand only." }
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
   /v1/templates/{id}:
@@ -1064,6 +1085,99 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "404": { $ref: "#/components/responses/Error" }
+  /v1/templates/sync:
+    post:
+      summary: Pull pipeline templates from the configured remote origins
+      description: >
+        Template hosting + sync (RFC 0006). Lists every origin in the server's
+        `--templates-sync` file (or just `origin`), pairs each `<id>.yaml` /
+        `.json` with its optional `<id>.faucet.yaml` sidecar, and diffs against
+        the registry: a new or changed body **appends** a version, an unchanged
+        one is a no-op (body hash), a template that vanished upstream is
+        reported (`prune: keep`) or deprecated (`prune: deprecate`) — never
+        deleted. `stable` moves only under `launch: follow` / `always`. Every
+        register is attributed to the calling principal. `dry_run: true`
+        returns the plan without applying it. One unreadable origin does not
+        stop the others; it is listed under `origin_errors`. Requires the
+        `TemplateWrite` permission (operator) and the `templates-sync` Cargo
+        feature; `422` when the server has no origins configured.
+      operationId: syncTemplates
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                origin: { type: string, description: "Pull only this origin (by name). Default: all." }
+                dry_run: { type: boolean, default: false }
+      responses:
+        "200":
+          description: One report per origin pulled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dry_run, reports, origin_errors]
+                properties:
+                  dry_run: { type: boolean }
+                  reports:
+                    type: array
+                    items: { $ref: "#/components/schemas/TemplateSyncReport" }
+                  origin_errors:
+                    type: array
+                    items:
+                      type: object
+                      required: [origin, error]
+                      properties:
+                        origin: { type: string }
+                        error: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/templates/{id}/publish:
+    post:
+      summary: Write one registered version back to a remote origin
+      description: >
+        The manual reverse of `sync` (RFC 0006): writes the selected version's
+        body to `origin` as `<id minus the origin's prefix>.<yaml|json>`. Never
+        runs on its own — an operator-driven step, audited as
+        `template.publish`. The id must carry the origin's `prefix`
+        (otherwise the next pull would re-register it under a different id).
+        Requires `TemplateWrite` and the `templates-sync` Cargo feature.
+      operationId: publishTemplate
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [origin]
+              properties:
+                origin: { type: string, description: "Origin name from the sync file." }
+                version: { $ref: "#/components/schemas/VersionSelector" }
+      responses:
+        "200":
+          description: Where the file landed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, version, origin, name, location]
+                properties:
+                  id: { type: string }
+                  version: { type: integer }
+                  origin: { type: string }
+                  name: { type: string, description: "File name written under the origin's directory." }
+                  location: { type: string, description: "Human-readable location (URL or store path)." }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
   /v1/templates/{id}/runs:
     post:
       summary: Trigger a run from a pipeline template
@@ -1720,6 +1834,53 @@ components:
         created_at: '2026-01-01T00:00:00Z'
         created_by: example
         state: example
+    TemplateSyncReport:
+      type: object
+      description: The plan for one origin and, unless `dry_run`, what applying it did.
+      required: [origin, kind, dry_run, warnings, plan]
+      properties:
+        origin: { type: string }
+        kind: { type: string, enum: [github, s3, gcs, azure_blob] }
+        dry_run: { type: boolean }
+        warnings:
+          type: array
+          items: { type: string }
+          description: Remote files that were recognized but could not be used (broken sidecar, ambiguous stem, sidecar without a template).
+        plan:
+          type: array
+          items:
+            type: object
+            required: [action]
+            properties:
+              action: { type: string, enum: [register, launch, revive, unchanged, orphaned, deprecate, skipped] }
+              id: { type: string }
+              version: { type: integer }
+              launch: { type: boolean }
+              replaces: { type: integer, description: "Version a `register` supersedes." }
+              description: { type: string }
+              tags: { type: array, items: { type: string } }
+              name: { type: string, description: "Remote file stem of a `skipped` entry." }
+              reason: { type: string }
+        outcome:
+          type: object
+          description: Present unless `dry_run`.
+          properties:
+            registered:
+              type: array
+              items: { type: object, properties: { id: { type: string }, version: { type: integer }, launched: { type: boolean } } }
+            launched:
+              type: array
+              items: { type: object, properties: { id: { type: string }, version: { type: integer }, launched: { type: boolean } } }
+            revived: { type: array, items: { type: string } }
+            deprecated: { type: array, items: { type: string } }
+            unchanged: { type: integer }
+            orphaned: { type: array, items: { type: string } }
+            skipped:
+              type: array
+              items: { type: array, items: { type: string }, minItems: 2, maxItems: 2 }
+            failed:
+              type: array
+              items: { type: object, required: [id, error], properties: { id: { type: string }, error: { type: string } } }
     TemplateStatus:
       type: string
       description: >
