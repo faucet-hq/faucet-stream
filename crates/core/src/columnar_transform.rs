@@ -90,18 +90,41 @@ pub fn batch_form(t: &RecordTransform) -> Option<PageFnBatchBox> {
             fields.sort();
             Some(Arc::new(move |b| rename_field(b, &fields)))
         }
+        // `set`/`redact` only vectorize when every constant is an
+        // exactly-representable scalar. A float, a u64 above i64::MAX, or a
+        // container has no simple constant Arrow column that round-trips
+        // byte-identically to the `Value` path (a u64 would go lossy through
+        // f64; an object would become JSON text instead of staying an object),
+        // so those fall back to the `Value` path where they are handled
+        // correctly. Common cases — a status string, a flag, an int, a null —
+        // stay columnar.
         #[cfg(feature = "transform-set")]
-        RecordTransform::Set { values } => {
+        RecordTransform::Set { values } if values.values().all(is_columnar_safe_scalar) => {
             let values = values.clone();
             Some(Arc::new(move |b| set(b, &values)))
         }
         #[cfg(feature = "transform-redact")]
-        RecordTransform::Redact { fields, mask } => {
+        RecordTransform::Redact { fields, mask } if is_columnar_safe_scalar(mask) => {
             let fields = fields.clone();
             let mask = mask.clone();
             Some(Arc::new(move |b| redact(b, &fields, &mask)))
         }
         _ => None,
+    }
+}
+
+/// Whether `v` is a scalar that [`constant_column`] can represent as an Arrow
+/// column that round-trips byte-identically to the `Value` path: a bool, an
+/// integer that fits `i64`, a string, or null. A float, a `u64` above
+/// `i64::MAX`, or any container is **not** safe (see the gate in
+/// [`batch_form`]).
+#[cfg(any(feature = "transform-set", feature = "transform-redact"))]
+fn is_columnar_safe_scalar(v: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::Bool(_) | Value::Null | Value::String(_) => true,
+        Value::Number(n) => n.is_i64(),
+        _ => false,
     }
 }
 
@@ -252,8 +275,11 @@ fn constant_column(
     v: &serde_json::Value,
     rows: usize,
 ) -> Result<(Field, ArrayRef), FaucetError> {
-    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow::array::{BooleanArray, Int64Array, StringArray};
     use serde_json::Value;
+    // Only the exactly-representable scalar kinds reach here — `batch_form`
+    // gates `set`/`redact` on `is_columnar_safe_scalar`, so a float, a wide
+    // integer, or a container has already fallen back to the `Value` path.
     let (dt, arr): (DataType, ArrayRef) = match v {
         Value::Bool(b) => (
             DataType::Boolean,
@@ -262,15 +288,6 @@ fn constant_column(
         Value::Number(n) if n.is_i64() => (
             DataType::Int64,
             Arc::new(Int64Array::from(vec![n.as_i64().unwrap(); rows])),
-        ),
-        Value::Number(n) => (
-            DataType::Float64,
-            // A non-i64 number is a float (or a u64 above i64::MAX, which has no
-            // exact i64 column); f64 matches how arrow-json rounds it back.
-            Arc::new(Float64Array::from(vec![
-                n.as_f64().unwrap_or(f64::NAN);
-                rows
-            ])),
         ),
         Value::String(s) => (
             DataType::Utf8,
@@ -281,15 +298,14 @@ fn constant_column(
             DataType::Utf8,
             Arc::new(StringArray::from(vec![None::<String>; rows])),
         ),
-        // An object/array literal has no scalar column; store its JSON text,
-        // matching what a `set`/`redact` of a container renders to on read.
-        other => (
-            DataType::Utf8,
-            Arc::new(StringArray::from(vec![other.to_string(); rows])),
-        ),
+        // Unreachable: gated out by `is_columnar_safe_scalar`. Fail loudly
+        // rather than silently corrupt if that gate is ever weakened.
+        other => {
+            return Err(FaucetError::Transform(format!(
+                "columnar set/redact: value {other} is not a columnar-safe scalar                  (should have fallen back to the Value path)"
+            )));
+        }
     };
-    // A constant is never null (except the explicit-null case above, which is a
-    // nullable Utf8), so mark the field nullable to be safe for downstream merges.
     Ok((Field::new(name, dt, true), arr))
 }
 
@@ -408,6 +424,69 @@ mod tests {
         fields.insert("id".to_string(), "name".to_string());
         fields.insert("name".to_string(), "id".to_string());
         assert_parity(corpus(), RecordTransform::RenameField { fields });
+    }
+
+    /// Two fields renaming to the *same* target must error, matching the Value
+    /// path — otherwise one silently clobbers the other.
+    #[cfg(feature = "transform-rename-field")]
+    #[test]
+    fn rename_field_two_to_one_target_errors_like_the_value_path() {
+        let batch = values_to_record_batch_inferred(&corpus()).unwrap();
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("id".to_string(), "merged".to_string());
+        fields.insert("name".to_string(), "merged".to_string());
+        let err = batch_form(&RecordTransform::RenameField { fields }).unwrap()(batch)
+            .expect_err("two renames to one target must error");
+        assert!(err.to_string().contains("same target key"), "{err}");
+    }
+
+    /// `set` vectorizes every exactly-representable scalar kind — int, string,
+    /// bool, null — byte-identically to the Value path.
+    #[cfg(feature = "transform-set")]
+    #[test]
+    fn set_covers_every_columnar_safe_scalar_kind() {
+        let mut values = serde_json::Map::new();
+        values.insert("n".into(), json!(7)); // Int64
+        values.insert("label".into(), json!("prod")); // Utf8
+        values.insert("flag".into(), json!(true)); // Boolean
+        values.insert("cleared".into(), Value::Null); // null → nullable Utf8
+        assert_parity(corpus(), RecordTransform::Set { values });
+    }
+
+    /// The correctness gate: a `set` whose value is NOT an exactly-representable
+    /// scalar (a float, a u64 above i64::MAX, or a container) must NOT vectorize
+    /// — it falls back to the Value path, which handles it losslessly. Without
+    /// this gate the columnar kernel silently made u64::MAX a lossy float and a
+    /// nested object a JSON string.
+    #[cfg(feature = "transform-set")]
+    #[test]
+    fn set_with_an_unsafe_constant_falls_back_to_the_value_path() {
+        for v in [
+            json!(1.5),
+            json!(u64::MAX),
+            json!({ "a": [1, 2] }),
+            json!([1, 2]),
+        ] {
+            let mut values = serde_json::Map::new();
+            values.insert("x".into(), v.clone());
+            assert!(
+                batch_form(&RecordTransform::Set { values }).is_none(),
+                "set of {v} must fall back to Value, not vectorize losslessly"
+            );
+        }
+    }
+
+    /// `redact` likewise only vectorizes a safe scalar mask.
+    #[cfg(feature = "transform-redact")]
+    #[test]
+    fn redact_with_an_unsafe_mask_falls_back_to_the_value_path() {
+        assert!(
+            batch_form(&RecordTransform::Redact {
+                fields: vec!["email".into()],
+                mask: json!({ "hidden": true }),
+            })
+            .is_none()
+        );
     }
 
     /// A rename onto an occupied, non-renamed key must error identically to the

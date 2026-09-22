@@ -226,3 +226,65 @@ async fn overwrite_truncates_once_then_appends() {
         "only the first batch of an overwrite run may truncate"
     );
 }
+
+/// A non-2xx upload must surface as an error, not a silent success — the load
+/// never happened.
+#[tokio::test]
+async fn a_failed_upload_is_an_error() {
+    let server = MockServer::start().await;
+    // Token endpoint only; the upload endpoint returns 500.
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(FakeToken {
+            access_token: "fake-token",
+            token_type: "bearer",
+            expires_in: 9_999_999,
+        }))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
+        .and(query_param("uploadType", "multipart"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("quota exceeded"))
+        .mount(&server)
+        .await;
+    let sink = build_sink(&server, config(&server)).await;
+    let err = sink
+        .write_batch_columnar(&batch(&["1"]))
+        .await
+        .expect_err("a 500 upload must error");
+    assert!(err.to_string().contains("500"), "{err}");
+    assert!(err.to_string().contains("quota exceeded"), "{err}");
+}
+
+/// A 200 upload whose body carries no `jobReference.jobId` must error — there
+/// is no job to poll, so trusting it would report a load that never ran.
+#[tokio::test]
+async fn a_200_upload_without_a_job_id_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(FakeToken {
+            access_token: "fake-token",
+            token_type: "bearer",
+            expires_in: 9_999_999,
+        }))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
+        .and(query_param("uploadType", "multipart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "kind": "bigquery#job" })))
+        .mount(&server)
+        .await;
+    let sink = build_sink(&server, config(&server)).await;
+    let err = sink
+        .write_batch_columnar(&batch(&["1"]))
+        .await
+        .expect_err("a job with no jobId must error");
+    assert!(err.to_string().contains("jobId"), "{err}");
+}
