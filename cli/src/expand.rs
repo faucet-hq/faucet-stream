@@ -583,31 +583,49 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     .and_then(|p| p.config.as_ref())
                     .is_some_and(has_discovery_recipe)
         });
+    // Connector-level runtime placeholders: bare `${name}` tokens a connector
+    // substitutes itself — `${next_token}` in an XML `BodyCursor` request
+    // template, and every value a `type: flow` auth provider captures
+    // (`${session}` in a header). They are legal only in connector configs,
+    // and only the names the config actually declares.
+    let connector_tokens = connector_placeholders(cfg);
     for (i, row) in rows.iter().enumerate() {
         let id = ids[i].as_str();
         if let Some(p) = &row.source
             && let Some(c) = &p.config
         {
-            check_refs(c, &id_set, id, any_source_recipe)?;
+            check_refs(c, &id_set, id, any_source_recipe, &connector_tokens)?;
         }
         if let Some(p) = &row.sink
             && let Some(c) = &p.config
         {
-            check_refs(c, &id_set, id, any_source_recipe)?;
+            check_refs(c, &id_set, id, any_source_recipe, &connector_tokens)?;
         }
         // A chained `discover:` row's source config (#531) references its upstream
         // dimension (`${types.name}`); validate those refs too.
         if let Some(disc) = &row.discover
             && let Some(c) = &disc.source.config
         {
-            check_refs(c, &id_set, id, true)?;
+            check_refs(c, &id_set, id, true, &connector_tokens)?;
         }
     }
     if let Some(s) = &cfg.pipeline.source {
-        check_refs(&s.config, &id_set, "pipeline.source", any_source_recipe)?;
+        check_refs(
+            &s.config,
+            &id_set,
+            "pipeline.source",
+            any_source_recipe,
+            &connector_tokens,
+        )?;
     }
     if let Some(s) = &cfg.pipeline.sink {
-        check_refs(&s.config, &id_set, "pipeline.sink", any_source_recipe)?;
+        check_refs(
+            &s.config,
+            &id_set,
+            "pipeline.sink",
+            any_source_recipe,
+            &connector_tokens,
+        )?;
     }
     for (name, s) in &cfg.pipeline.sources {
         check_refs(
@@ -615,6 +633,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             &id_set,
             &format!("pipeline.sources.{name}"),
             any_source_recipe,
+            &connector_tokens,
         )?;
     }
     for (name, s) in &cfg.pipeline.sinks {
@@ -623,6 +642,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             &id_set,
             &format!("pipeline.sinks.{name}"),
             any_source_recipe,
+            &connector_tokens,
         )?;
     }
 
@@ -831,6 +851,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 &id_set,
                 &format!("row `{row_id}` transform[{ti}] (`{}`)", t.kind),
                 false,
+                &HashSet::new(),
             )?;
         }
         if let Some(ref st) = state {
@@ -1528,11 +1549,43 @@ fn has_discovery_recipe(config: &Value) -> bool {
     })
 }
 
+/// Bare `${name}` placeholders that connectors resolve themselves, so they are
+/// legal in a source/sink config: the XML source's `BodyCursor` pagination
+/// substitutes `${next_token}` into its request template, and a `type: flow`
+/// auth provider exposes every `capture`d value (plus the signing context
+/// `${sig}` / `${ts}` / `${nonce}`) to the connector that references it.
+/// Only names the config actually declares are allowed, so a typo'd
+/// `${vars.name}` stays a hard error.
+fn connector_placeholders(cfg: &PipelineConfig) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    out.insert("next_token".into());
+    for provider in cfg.auth.iter().flat_map(|m| m.values()) {
+        if provider.get("type").and_then(Value::as_str) != Some("flow") {
+            continue;
+        }
+        for name in ["sig", "ts", "nonce"] {
+            out.insert(name.into());
+        }
+        let steps = provider
+            .pointer("/config/steps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for step in steps {
+            if let Some(cap) = step.get("capture").and_then(Value::as_object) {
+                out.extend(cap.keys().cloned());
+            }
+        }
+    }
+    out
+}
+
 fn check_refs(
     value: &Value,
     id_set: &HashSet<&str>,
     owner: &str,
     allow_recipe_tokens: bool,
+    connector_tokens: &HashSet<String>,
 ) -> CliResult<()> {
     walk_strings(value, &mut |s| {
         for (token, dir) in iter_directives(s) {
@@ -1556,7 +1609,7 @@ fn check_refs(
                      bound before expansion"
                 )));
             }
-            if let Directive::Deferred { id, .. } = dir
+            if let Directive::Deferred { id, path } = dir
                 && id != "now"
                 && id != "backfill"
                 && id != "partition"
@@ -1570,6 +1623,7 @@ fn check_refs(
                 // hard error (it is almost always a typo'd `${vars.name}`).
                 && !(allow_recipe_tokens
                     && matches!(id, "name" | "name_snake" | "name_lower" | "field_names"))
+                && !(path.is_empty() && connector_tokens.contains(id))
                 && !id_set.contains(id)
             {
                 return Err(CliError::UnknownInterpolationId {
@@ -1702,6 +1756,64 @@ mod tests {
 
     fn cfg(yaml: &str) -> PipelineConfig {
         parse_with_extension(yaml, "yaml").unwrap()
+    }
+
+    /// Bare `${name}` tokens are connector placeholders only when the config
+    /// declares them: `${next_token}` (XML BodyCursor) always, a `type: flow`
+    /// auth provider's captures + signing context when such a provider exists.
+    /// Anything else stays the typo'd-`${vars.name}` hard error.
+    #[test]
+    fn declared_connector_placeholders_pass_ref_validation() {
+        let with_flow = |token: &str| {
+            cfg(&format!(
+                r#"
+version: 1
+auth:
+  login:
+    type: flow
+    config:
+      steps:
+        - request: {{ method: POST, url: "https://x/login" }}
+          capture: {{ session: "$.Session" }}
+pipeline:
+  source:
+    type: rest
+    config: {{ base_url: "https://x", path: /v1, headers: {{ Authorization: "Bearer {token}" }} }}
+  sink: {{ type: stdout, config: {{}} }}
+"#
+            ))
+        };
+        expand(&with_flow("${session}")).expect("captured name is a legal placeholder");
+        expand(&with_flow("${sig}-${ts}")).expect("signing context is legal with a flow");
+        let err = expand(&with_flow("${sessoin}")).unwrap_err();
+        assert!(
+            matches!(err, CliError::UnknownInterpolationId { ref id, .. } if id == "sessoin"),
+            "{err}"
+        );
+
+        let plain = |token: &str| {
+            cfg(&format!(
+                r#"
+version: 1
+pipeline:
+  source:
+    type: xml
+    config: {{ endpoint: "https://x/api", body: "<q>{token}</q>", records_path: r }}
+  sink: {{ type: stdout, config: {{}} }}
+"#
+            ))
+        };
+        expand(&plain("${next_token}")).expect("the XML BodyCursor token is always legal");
+        let err = expand(&plain("${session}")).unwrap_err();
+        assert!(
+            matches!(err, CliError::UnknownInterpolationId { ref id, .. } if id == "session"),
+            "without a flow, a capture-looking token is still an error: {err}"
+        );
+        assert!(connector_placeholders(&plain("x")).contains("next_token"));
+        let names = connector_placeholders(&with_flow("x"));
+        for n in ["next_token", "session", "sig", "ts", "nonce"] {
+            assert!(names.contains(n), "{n}");
+        }
     }
 
     #[test]
