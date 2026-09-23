@@ -939,26 +939,24 @@ mod tests {
         });
         let s = store();
         let shutdown = tokio_util::sync::CancellationToken::new();
-        tokio::time::pause();
+        // Real time, not `tokio::time::pause()`: the pull is a real HTTP
+        // round-trip to the mock server, which paused time cannot drive
+        // deterministically (it flaked on CI). One-second interval, bounded
+        // real-time wait.
         let handles = spawn_interval_syncs(s.clone(), file, shutdown.clone());
         assert_eq!(
             handles.len(),
             1,
             "only origins with interval_secs get a task"
         );
-        // Advance past one interval and let the pull run.
-        tokio::time::advance(Duration::from_millis(1100)).await;
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-            if s.template_get("i-t", None).await.unwrap().is_some() {
-                break;
-            }
-            tokio::time::advance(Duration::from_millis(50)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while s.template_get("i-t", None).await.unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "periodic pull did not register the template within 20s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(
-            s.template_get("i-t", None).await.unwrap().is_some(),
-            "periodic pull registered the template"
-        );
         shutdown.cancel();
         for h in handles {
             h.await.unwrap();
