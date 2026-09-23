@@ -186,18 +186,27 @@ pub fn resolve_mode(
 
 /// Replace `${stream}` / `${source}` in every string of a value tree.
 pub fn render_per_stream(v: &Value, stream: &str, source: &str) -> Value {
+    render_per_stream_owned(v, stream, source, "")
+}
+
+/// [`render_per_stream`] with the source template's `owner` for `${owner}`
+/// (empty for an official template). `${source}` stays the short name so a
+/// destination table name never receives a `/`.
+pub fn render_per_stream_owned(v: &Value, stream: &str, source: &str, owner: &str) -> Value {
     match v {
-        Value::String(s) => {
-            Value::String(s.replace("${stream}", stream).replace("${source}", source))
-        }
+        Value::String(s) => Value::String(
+            s.replace("${stream}", stream)
+                .replace("${source}", source)
+                .replace("${owner}", owner),
+        ),
         Value::Array(a) => Value::Array(
             a.iter()
-                .map(|x| render_per_stream(x, stream, source))
+                .map(|x| render_per_stream_owned(x, stream, source, owner))
                 .collect(),
         ),
         Value::Object(o) => Value::Object(
             o.iter()
-                .map(|(k, x)| (k.clone(), render_per_stream(x, stream, source)))
+                .map(|(k, x)| (k.clone(), render_per_stream_owned(x, stream, source, owner)))
                 .collect(),
         ),
         other => other.clone(),
@@ -313,8 +322,8 @@ pub fn compose_with(
     if !failures.is_empty() {
         return Err(CliError::Config(
             Incompatible {
-                source: source.name.clone(),
-                sink: sink.name.clone(),
+                source: source.id(),
+                sink: sink.id(),
                 streams: failures,
             }
             .render(),
@@ -339,7 +348,15 @@ pub fn compose_with(
     for (s, plan) in source.streams.iter().zip(&plans) {
         let mut sink_cfg = Map::new();
         for (k, v) in &sink.per_stream {
-            sink_cfg.insert(k.clone(), render_per_stream(v, &s.name, &source.name));
+            sink_cfg.insert(
+                k.clone(),
+                render_per_stream_owned(
+                    v,
+                    &s.name,
+                    &source.name,
+                    source.owner.as_deref().unwrap_or(""),
+                ),
+            );
         }
         if sink_takes_write_mode {
             sink_cfg.insert(
@@ -415,7 +432,7 @@ pub fn compose_with(
 
     let mut doc = Map::new();
     doc.insert("version".into(), json!(1));
-    doc.insert("name".into(), Value::String(source.name.clone()));
+    doc.insert("name".into(), Value::String(source.id()));
     if !params.is_empty() {
         doc.insert(
             "params".into(),
@@ -429,9 +446,9 @@ pub fn compose_with(
     doc.insert("matrix".into(), Value::Array(rows));
 
     Ok(Composition {
-        name: source.name.clone(),
-        source: source.name.clone(),
-        sink: sink.name.clone(),
+        name: source.id(),
+        source: source.id(),
+        sink: sink.id(),
         sink_kind: sink.sink.kind.clone(),
         streams: plans,
         document: Value::Object(doc),

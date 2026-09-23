@@ -71,7 +71,7 @@ pub fn validate_state_key(key: &str) -> Result<(), FaucetError> {
         )));
     }
     for (i, c) in key.char_indices() {
-        let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.');
+        let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.' | '/');
         if !ok {
             return Err(FaucetError::State(format!(
                 "state key '{key}' contains illegal character {c:?} at byte {i}"
@@ -81,6 +81,18 @@ pub fn validate_state_key(key: &str) -> Result<(), FaucetError> {
     if key == "." || key == ".." || key.starts_with('.') {
         return Err(FaucetError::State(format!(
             "state key '{key}' must not begin with a dot"
+        )));
+    }
+    // `/` separates a hub owner namespace from a name (`acme/netsuite::…`);
+    // it must never read as a path: no empty, `.` or `..` segments, no
+    // leading or trailing separator.
+    if key.contains('/')
+        && key
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == ".." || seg.starts_with('.'))
+    {
+        return Err(FaucetError::State(format!(
+            "state key '{key}' has a path-like segment — `/` may only separate non-empty, non-dot segments"
         )));
     }
     Ok(())
@@ -142,7 +154,7 @@ impl StateStore for MemoryStateStore {
 /// percent-encoded as `%3A`. This is collision-free because `%` can never
 /// appear in a valid key (see [`validate_state_key`]) (#78 LOW).
 fn safe_filename(key: &str) -> String {
-    key.replace(':', "%3A")
+    key.replace(':', "%3A").replace('/', "%2F")
 }
 
 /// File-backed `StateStore`. Each key maps to a JSON file at
@@ -443,9 +455,22 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal_segments() {
-        for k in ["../etc/passwd", "a/b", "a\\b", "..", "."] {
+        for k in [
+            "../etc/passwd",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "/a",
+            "a/",
+            "a/.x",
+            "a\\b",
+            "..",
+            ".",
+        ] {
             assert!(validate_state_key(k).is_err(), "expected reject for {k:?}");
         }
+        // A `/` that separates a hub owner from a name is fine (#682).
+        assert!(validate_state_key("acme/netsuite::invoices").is_ok());
     }
 
     #[test]
@@ -514,9 +539,9 @@ mod tests {
     #[tokio::test]
     async fn memory_rejects_invalid_keys() {
         let s = MemoryStateStore::new();
-        assert!(s.get("a/b").await.is_err());
-        assert!(s.put("a/b", &json!(1)).await.is_err());
-        assert!(s.delete("a/b").await.is_err());
+        assert!(s.get("a b").await.is_err());
+        assert!(s.put("a b", &json!(1)).await.is_err());
+        assert!(s.delete("a b").await.is_err());
     }
 
     // ── FileStateStore ──────────────────────────────────────────────────────
@@ -579,6 +604,14 @@ mod tests {
             "pipeline%3Arest%3Aissues"
         );
         assert_eq!(safe_filename("plain_key-1.v2"), "plain_key-1.v2");
+        // Owner-scoped hub ids (`acme/netsuite::invoices`) must not become
+        // nested directories.
+        assert_eq!(
+            safe_filename("acme/netsuite::invoices"),
+            "acme%2Fnetsuite%3A%3Ainvoices"
+        );
+        assert!(validate_state_key("acme/netsuite::invoices").is_ok());
+        assert!(validate_state_key("a b").is_err());
     }
 
     #[tokio::test]

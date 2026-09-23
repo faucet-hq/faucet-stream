@@ -20,6 +20,9 @@ use crate::error::{CliError, CliResult};
 const HUB_DIRS: &[&str] = &["source-templates", "sink-templates", "examples"];
 const FETCH_CONCURRENCY: usize = 8;
 const COMPLETE_MARKER: &str = ".complete";
+/// Written into every snapshot so a later `@version` lookup knows which remote
+/// to fetch an older catalog commit from.
+const LOCATION_MARKER: &str = ".hub-location";
 const CURRENT_FILE: &str = "current";
 /// Set to any non-empty value to skip the network and use the cache only.
 pub const OFFLINE_ENV: &str = "FAUCET_HUB_OFFLINE";
@@ -289,10 +292,85 @@ impl GithubHub {
             .collect()
             .await;
         results.into_iter().collect::<CliResult<Vec<()>>>()?;
+        std::fs::write(
+            dest.join(LOCATION_MARKER),
+            format!(
+                "github:{}@{}{}",
+                self.repo,
+                self.r#ref,
+                if self.path.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{}", self.path)
+                }
+            ),
+        )
+        .map_err(|e| net_err("writing location marker", e))?;
         std::fs::write(dest.join(COMPLETE_MARKER), b"")
             .map_err(|e| net_err("writing cache marker", e))?;
         Ok(())
     }
+
+    /// Read one file at an exact commit through the contents API (raw body).
+    pub async fn read_file_at(&self, commit: &str, rel: &str) -> CliResult<Vec<u8>> {
+        let mut p = self.path.clone();
+        if !p.is_empty() {
+            p.push('/');
+        }
+        p.push_str(rel.trim_matches('/'));
+        let url = format!(
+            "{}/repos/{}/contents/{p}?ref={commit}",
+            self.api_base, self.repo
+        );
+        let resp = self
+            .send(
+                self.get(&url, "application/vnd.github.raw+json"),
+                &format!("fetching {rel} @ {}", &commit[..7.min(commit.len())]),
+            )
+            .await?;
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| net_err(&format!("fetching {rel}"), e))
+    }
+}
+
+/// The remote a cached snapshot was fetched from, when `dir` is one.
+pub fn snapshot_location(dir: &Path) -> Option<HubLocation> {
+    let text = std::fs::read_to_string(dir.join(LOCATION_MARKER)).ok()?;
+    HubLocation::parse(text.trim())
+        .ok()
+        .filter(HubLocation::is_remote)
+}
+
+/// Fetch one catalog file at an exact commit into the cache
+/// (`<key>/files/<commit>/<rel>`) and return its path; a cached copy is reused.
+pub async fn fetch_file_at(
+    loc: &HubLocation,
+    cache_root: &Path,
+    api_base: &str,
+    commit: &str,
+    rel: &str,
+) -> CliResult<PathBuf> {
+    let target = cache_root
+        .join(loc.cache_key())
+        .join("files")
+        .join(commit)
+        .join(rel.trim_matches('/'));
+    if target.is_file() {
+        return Ok(target);
+    }
+    let hub = GithubHub::new(loc, api_base)?;
+    let bytes = hub.read_file_at(commit, rel).await?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| net_err(&format!("creating {}", parent.display()), e))?;
+    }
+    let tmp = target.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, &bytes).map_err(|e| net_err(&format!("writing {}", tmp.display()), e))?;
+    std::fs::rename(&tmp, &target)
+        .map_err(|e| net_err(&format!("installing {}", target.display()), e))?;
+    Ok(target)
 }
 
 fn is_complete(dir: &Path) -> bool {
@@ -479,6 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hub_env)]
     async fn fetches_caches_and_reuses_a_snapshot() {
         let server = MockServer::start().await;
         mock_hub(&server, "0123456789abcdef").await;
@@ -527,6 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hub_env)]
     async fn unreachable_falls_back_to_the_cache_or_errors_clearly() {
         let server = MockServer::start().await;
         mock_hub(&server, "0123456789abcdef").await;
@@ -554,6 +634,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hub_env)]
     async fn a_repo_without_hub_directories_is_refused() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -585,6 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hub_env)]
     async fn api_errors_carry_a_hint() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -613,6 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hub_env)]
     async fn listing_errors_and_file_bodies_are_reported_and_a_token_is_sent() {
         // A local location is a programming error, not a network one.
         let err = match GithubHub::new(&HubLocation::Dir(PathBuf::from("/x")), "http://127.0.0.1:1")
@@ -696,6 +779,76 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(hub_env)]
+    async fn snapshots_remember_their_remote_and_old_versions_fetch_by_commit() {
+        let server = MockServer::start().await;
+        mock_hub(&server, "0123456789abcdef").await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/contents/source-templates/acme.yaml"))
+            .and(query_param("ref", "aaaa1111"))
+            .and(header("Accept", "application/vnd.github.raw+json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("kind: source-template\nname: acme\n# v1\n"),
+            )
+            .mount(&server)
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let dir = fetch_cached(&loc(), cache.path(), &server.uri())
+            .await
+            .expect("fetch");
+        assert_eq!(
+            snapshot_location(&dir),
+            Some(loc()),
+            "the snapshot names its remote"
+        );
+        assert_eq!(snapshot_location(cache.path()), None);
+
+        let f = fetch_file_at(
+            &loc(),
+            cache.path(),
+            &server.uri(),
+            "aaaa1111",
+            "source-templates/acme.yaml",
+        )
+        .await
+        .expect("fetch at commit");
+        assert!(f.ends_with("files/aaaa1111/source-templates/acme.yaml"));
+        assert!(std::fs::read_to_string(&f).unwrap().contains("# v1"));
+        let before = server.received_requests().await.unwrap().len();
+        let again = fetch_file_at(
+            &loc(),
+            cache.path(),
+            &server.uri(),
+            "aaaa1111",
+            "source-templates/acme.yaml",
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, f);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before,
+            "cached: no request"
+        );
+        let err = fetch_file_at(
+            &loc(),
+            cache.path(),
+            &server.uri(),
+            "bbbb2222",
+            "source-templates/acme.yaml",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("fetching source-templates/acme.yaml @ bbbb222"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hub_env)]
     async fn offline_mode_uses_the_cache_and_never_the_network() {
         let server = MockServer::start().await;
         mock_hub(&server, "0123456789abcdef").await;
@@ -724,6 +877,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(hub_env)]
     fn cache_root_honours_overrides() {
         // SAFETY: single-threaded assertions over env vars this test owns.
         unsafe {

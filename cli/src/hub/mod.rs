@@ -283,37 +283,122 @@ pub fn parse_sink_file(path: &Path) -> CliResult<SinkTemplate> {
     Ok(t)
 }
 
+/// Every hub id under `base`: top-level stems plus `owner/stem` one level down.
+fn known_ids(base: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(n) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if n.starts_with('.') {
+            continue;
+        }
+        if p.is_dir() {
+            if let Ok(sub) = std::fs::read_dir(&p) {
+                for f in sub.flatten() {
+                    if let Some(stem) = f.path().file_stem().and_then(|s| s.to_str())
+                        && !stem.starts_with('.')
+                        && f.path().is_file()
+                    {
+                        out.push(format!("{n}/{stem}"));
+                    }
+                }
+            }
+        } else if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            out.push(stem.to_string());
+        }
+    }
+    out
+}
+
+/// A version selector on a hub locator: `id@stable` (the default), `id@newest`,
+/// or `id@N` (#682). Versions are the catalog's — each accepted change to a
+/// template is the next number — and live in the hub's `index.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubVersion {
+    Stable,
+    Newest,
+    Pinned(u32),
+}
+
+/// Split `id[@selector]`. A locator that is an existing file path is never
+/// split.
+pub fn split_selector(locator: &str) -> CliResult<(&str, Option<HubVersion>)> {
+    if Path::new(locator).is_file() {
+        return Ok((locator, None));
+    }
+    let Some((id, sel)) = locator.rsplit_once('@') else {
+        return Ok((locator, None));
+    };
+    let v = match sel {
+        "stable" => HubVersion::Stable,
+        "newest" => HubVersion::Newest,
+        n => match n.parse::<u32>() {
+            Ok(n) if n > 0 => HubVersion::Pinned(n),
+            _ => {
+                return Err(CliError::Config(format!(
+                    "hub locator '{locator}': `@{sel}` is not a version — use `@stable`, `@newest`, or `@<number>`"
+                )));
+            }
+        },
+    };
+    Ok((id, Some(v)))
+}
+
 /// Turn a `--source` / `--sink` value into a file: an existing path is used
-/// as-is; otherwise it is a hub id looked up as `<hub>/<subdir>/<id>.{yaml,yml,json}`.
+/// as-is; otherwise it is a hub id looked up as `<hub>/<subdir>/<id>.{yaml,yml,json}`
+/// — `owner/name` resolves under `<subdir>/<owner>/`, a bare `name` at the top
+/// level (the hub's official templates).
 pub fn resolve_locator(locator: &str, hub: &Path, subdir: &str) -> CliResult<PathBuf> {
     let as_path = Path::new(locator);
     if as_path.is_file() {
         return Ok(as_path.to_path_buf());
     }
     let base = hub.join(subdir);
+    let (owner, name) = spec::split_hub_id(locator);
+    let dir = match owner {
+        Some(o) => base.join(o),
+        None => base.clone(),
+    };
     for ext in ["yaml", "yml", "json"] {
-        let candidate = base.join(format!("{locator}.{ext}"));
+        let candidate = dir.join(format!("{name}.{ext}"));
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    let known: Vec<String> = std::fs::read_dir(&base)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    e.path()
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                })
-                .filter(|s| !s.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut known = known;
+    let mut known = known_ids(&base);
     known.sort();
+    if let (None, Some(_)) = (
+        owner,
+        known.iter().find(|k| k.ends_with(&format!("/{name}"))),
+    ) {
+        let variants: Vec<&String> = known
+            .iter()
+            .filter(|k| k.ends_with(&format!("/{name}")))
+            .collect();
+        return Err(CliError::Config(format!(
+            "no official hub template '{name}', but {} published one: {} — pick one with `--{} <owner>/{name}`",
+            variants.len(),
+            variants
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if subdir == catalog::SOURCE_DIR {
+                "source"
+            } else {
+                "sink"
+            }
+        )));
+    }
     Err(CliError::Config(format!(
-        "no hub template '{locator}': not a file, and {} has no {locator}.yaml{}",
+        "no hub template '{locator}': not a file, and {} has no {}{name}.yaml{}",
         base.display(),
+        owner.map(|o| format!("{o}/")).unwrap_or_default(),
         if known.is_empty() {
             " (set --hub / FAUCET_HUB, or pass a path)".to_string()
         } else {
@@ -323,20 +408,182 @@ pub fn resolve_locator(locator: &str, hub: &Path, subdir: &str) -> CliResult<Pat
 }
 
 /// Load the source template named or pathed by `locator`.
-pub fn load_source(locator: &str, hub: &Path) -> CliResult<SourceTemplate> {
-    parse_source_file(&resolve_locator(locator, hub, catalog::SOURCE_DIR)?)
+pub async fn load_source(locator: &str, hub: &Path) -> CliResult<SourceTemplate> {
+    parse_source_file(&locate(locator, hub, catalog::SOURCE_DIR).await?)
 }
 
 /// Load the sink template named or pathed by `locator`.
-pub fn load_sink(locator: &str, hub: &Path) -> CliResult<SinkTemplate> {
-    parse_sink_file(&resolve_locator(locator, hub, catalog::SINK_DIR)?)
+pub async fn load_sink(locator: &str, hub: &Path) -> CliResult<SinkTemplate> {
+    parse_sink_file(&locate(locator, hub, catalog::SINK_DIR).await?)
 }
 
 /// Compose two locators into a [`Composition`].
-pub fn compose_locators(source: &str, sink: &str, hub: &Path) -> CliResult<Composition> {
-    let s = load_source(source, hub)?;
-    let k = load_sink(sink, hub)?;
+pub async fn compose_locators(source: &str, sink: &str, hub: &Path) -> CliResult<Composition> {
+    let s = load_source(source, hub).await?;
+    let k = load_sink(sink, hub).await?;
     compose(&s, &k)
+}
+
+/// The per-template version history a catalog's `index.json` carries (#682):
+/// written by the catalog's CI from git history, read here to honour
+/// `@stable` / `@newest` / `@N`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct IndexVersions {
+    /// The catalog commit the snapshot's files come from.
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<IndexEntry>,
+    #[serde(default)]
+    pub sinks: Vec<IndexEntry>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct IndexEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub stable: Option<u32>,
+    #[serde(default)]
+    pub newest: Option<u32>,
+    #[serde(default)]
+    pub versions: Vec<IndexVersion>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct IndexVersion {
+    pub version: u32,
+    pub commit: String,
+}
+
+impl IndexVersions {
+    /// `<hub>/index.json`, when the catalog ships one.
+    pub fn load(hub: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(hub.join("index.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    pub fn entry(&self, subdir: &str, id: &str) -> Option<&IndexEntry> {
+        let list = if subdir == catalog::SOURCE_DIR {
+            &self.sources
+        } else {
+            &self.sinks
+        };
+        list.iter()
+            .find(|e| e.id == id || (e.id.is_empty() && e.name == id))
+    }
+}
+
+impl IndexEntry {
+    /// The commit a selector resolves to, when this entry carries history.
+    pub fn commit_for(&self, sel: HubVersion) -> CliResult<Option<&IndexVersion>> {
+        if self.versions.is_empty() {
+            return Ok(None);
+        }
+        let want = match sel {
+            HubVersion::Newest => self
+                .newest
+                .or_else(|| self.versions.iter().map(|v| v.version).max()),
+            HubVersion::Stable => self
+                .stable
+                .or(self.newest)
+                .or_else(|| self.versions.iter().map(|v| v.version).max()),
+            HubVersion::Pinned(n) => Some(n),
+        };
+        let Some(want) = want else { return Ok(None) };
+        self.versions
+            .iter()
+            .find(|v| v.version == want)
+            .map(Some)
+            .ok_or_else(|| {
+                let have: Vec<String> = self
+                    .versions
+                    .iter()
+                    .map(|v| v.version.to_string())
+                    .collect();
+                CliError::Config(format!(
+                    "hub template '{}' has no version {want} (versions: {})",
+                    self.id,
+                    have.join(", ")
+                ))
+            })
+    }
+}
+
+/// Resolve a locator to a file, honouring an `@selector` against the hub's
+/// `index.json`. With no selector the catalog's **stable** version is used
+/// when the index names one; a version whose commit is not the snapshot's is
+/// fetched from the remote hub the snapshot was taken from (a local directory
+/// hub has no history, so a selector is an error there).
+pub async fn locate(locator: &str, hub: &Path, subdir: &str) -> CliResult<PathBuf> {
+    let (id, sel) = split_selector(locator)?;
+    let head = resolve_locator(id, hub, subdir);
+    let index = IndexVersions::load(hub);
+    let entry = index.as_ref().and_then(|i| i.entry(subdir, id));
+    let target = match (entry, sel) {
+        (Some(e), sel) => e.commit_for(sel.unwrap_or(HubVersion::Stable))?,
+        (None, Some(_)) => {
+            return Err(CliError::Config(format!(
+                "hub locator '{locator}': this hub has no version history for '{id}' — selectors need a catalog whose index.json records versions (the public hub does); drop the `@…` to use the file as-is"
+            )));
+        }
+        (None, None) => None,
+    };
+    let Some(target) = target else { return head };
+    let snapshot_commit = index.as_ref().and_then(|i| i.commit.clone());
+    if snapshot_commit.as_deref() == Some(target.commit.as_str()) {
+        return head;
+    }
+    fetch_version(hub, subdir, id, target, head.ok().as_deref()).await
+}
+
+#[cfg(feature = "hub-remote")]
+async fn fetch_version(
+    hub: &Path,
+    subdir: &str,
+    id: &str,
+    target: &IndexVersion,
+    head_file: Option<&Path>,
+) -> CliResult<PathBuf> {
+    let loc = remote::snapshot_location(hub).ok_or_else(|| {
+        CliError::Config(format!(
+            "hub template '{id}' v{} lives at catalog commit {} — a local directory hub cannot fetch it; use a remote hub (`--hub github:…`)",
+            target.version,
+            &target.commit[..7.min(target.commit.len())]
+        ))
+    })?;
+    let ext = head_file
+        .and_then(|p| p.extension().and_then(|e| e.to_str()))
+        .unwrap_or("yaml");
+    let (owner, name) = spec::split_hub_id(id);
+    let rel = match owner {
+        Some(o) => format!("{subdir}/{o}/{name}.{ext}"),
+        None => format!("{subdir}/{name}.{ext}"),
+    };
+    remote::fetch_file_at(
+        &loc,
+        &remote::cache_root(),
+        "https://api.github.com",
+        &target.commit,
+        &rel,
+    )
+    .await
+}
+
+#[cfg(not(feature = "hub-remote"))]
+async fn fetch_version(
+    _hub: &Path,
+    _subdir: &str,
+    id: &str,
+    target: &IndexVersion,
+    _head_file: Option<&Path>,
+) -> CliResult<PathBuf> {
+    Err(CliError::Config(format!(
+        "hub template '{id}' v{} lives at another catalog commit; fetching it needs the `hub-remote` build feature",
+        target.version
+    )))
 }
 
 /// The synthetic path a composed document is loaded under (error messages
@@ -492,11 +739,11 @@ mod tests {
         assert!(err.contains("set --hub / FAUCET_HUB"), "{err}");
     }
 
-    #[test]
-    fn parsers_check_kind_and_validate() {
+    #[tokio::test]
+    async fn parsers_check_kind_and_validate() {
         let d = hub();
-        assert_eq!(load_source("acme", d.path()).unwrap().name, "acme");
-        assert_eq!(load_sink("files", d.path()).unwrap().name, "files");
+        assert_eq!(load_source("acme", d.path()).await.unwrap().name, "acme");
+        assert_eq!(load_sink("files", d.path()).await.unwrap().name, "files");
         // Wrong kind for the slot.
         let err = parse_source_file(&d.path().join("sink-templates/files.yml"))
             .unwrap_err()
@@ -556,10 +803,159 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compose_locators_yields_a_loadable_pipeline() {
+    const OWNED_SRC: &str = "kind: source-template\nname: acme\nowner: octo\nsource: {type: rest, config: {base_url: \"https://o\", path: /}}\nstreams: [{name: t}]\n";
+
+    #[tokio::test]
+    async fn owner_namespaces_resolve_and_ambiguity_is_named() {
         let d = hub();
-        let c = compose_locators("acme", "files", d.path()).unwrap();
+        std::fs::create_dir_all(d.path().join("source-templates/octo")).unwrap();
+        std::fs::write(d.path().join("source-templates/octo/acme.yaml"), OWNED_SRC).unwrap();
+        // Same short name, two namespaces: both resolve, to different files.
+        let official = resolve_locator("acme", d.path(), catalog::SOURCE_DIR).unwrap();
+        let owned = resolve_locator("octo/acme", d.path(), catalog::SOURCE_DIR).unwrap();
+        assert!(official.ends_with("source-templates/acme.yaml"));
+        assert!(owned.ends_with("source-templates/octo/acme.yaml"));
+        let t = load_source("octo/acme", d.path()).await.unwrap();
+        assert_eq!(t.id(), "octo/acme");
+        let c = compose_locators("octo/acme", "files", d.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            c.name, "octo/acme",
+            "the pipeline (and state-key prefix) is the full id"
+        );
+        assert_eq!(c.document["name"], serde_json::json!("octo/acme"));
+
+        // No official template of that name, but a community one exists.
+        std::fs::write(
+            d.path().join("source-templates/octo/hr.yaml"),
+            OWNED_SRC.replace("name: acme", "name: hr"),
+        )
+        .unwrap();
+        let err = resolve_locator("hr", d.path(), catalog::SOURCE_DIR)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no official hub template 'hr'") && err.contains("octo/hr"),
+            "{err}"
+        );
+        let err = resolve_locator("octo/nope", d.path(), catalog::SOURCE_DIR)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("octo/nope.yaml"), "{err}");
+    }
+
+    #[test]
+    fn selectors_split_off_the_locator() {
+        assert_eq!(split_selector("acme").unwrap(), ("acme", None));
+        assert_eq!(
+            split_selector("octo/acme@stable").unwrap(),
+            ("octo/acme", Some(HubVersion::Stable))
+        );
+        assert_eq!(
+            split_selector("acme@newest").unwrap(),
+            ("acme", Some(HubVersion::Newest))
+        );
+        assert_eq!(
+            split_selector("acme@3").unwrap(),
+            ("acme", Some(HubVersion::Pinned(3)))
+        );
+        for bad in ["acme@", "acme@0", "acme@latest", "acme@v3"] {
+            assert!(split_selector(bad).is_err(), "{bad}");
+        }
+        // An existing file path is never split, whatever it contains.
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("x@2.yaml");
+        std::fs::write(&f, "kind: sink-template\n").unwrap();
+        assert_eq!(split_selector(f.to_str().unwrap()).unwrap().1, None);
+    }
+
+    #[tokio::test]
+    async fn locate_honours_the_catalog_index_versions() {
+        let d = hub();
+        // No index: a selector is an error, no selector is the file.
+        let err = locate("acme@2", d.path(), catalog::SOURCE_DIR)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no version history"), "{err}");
+        assert!(locate("acme", d.path(), catalog::SOURCE_DIR).await.is_ok());
+
+        // An index whose stable version IS the snapshot commit → the file as-is.
+        let index = serde_json::json!({
+            "commit": "head000",
+            "sources": [{"id": "acme", "name": "acme", "newest": 2, "stable": 2,
+                          "versions": [{"version": 1, "commit": "old000"}, {"version": 2, "commit": "head000"}]}],
+            "sinks": []
+        });
+        std::fs::write(d.path().join("index.json"), index.to_string()).unwrap();
+        assert!(
+            locate("acme", d.path(), catalog::SOURCE_DIR)
+                .await
+                .unwrap()
+                .ends_with("acme.yaml")
+        );
+        assert!(
+            locate("acme@newest", d.path(), catalog::SOURCE_DIR)
+                .await
+                .unwrap()
+                .ends_with("acme.yaml")
+        );
+        // A version at another commit needs a remote hub; a directory hub says so.
+        let err = locate("acme@1", d.path(), catalog::SOURCE_DIR)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("catalog commit old000") || err.contains("hub-remote"),
+            "{err}"
+        );
+        let err = locate("acme@9", d.path(), catalog::SOURCE_DIR)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no version 9") && err.contains("1, 2"),
+            "{err}"
+        );
+
+        // `stable` behind `newest`: the default selector follows stable.
+        let e = IndexEntry {
+            id: "acme".into(),
+            name: "acme".into(),
+            stable: Some(1),
+            newest: Some(2),
+            versions: vec![
+                IndexVersion {
+                    version: 1,
+                    commit: "a".into(),
+                },
+                IndexVersion {
+                    version: 2,
+                    commit: "b".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            e.commit_for(HubVersion::Stable).unwrap().unwrap().commit,
+            "a"
+        );
+        assert_eq!(
+            e.commit_for(HubVersion::Newest).unwrap().unwrap().commit,
+            "b"
+        );
+        assert_eq!(
+            e.commit_for(HubVersion::Pinned(2)).unwrap().unwrap().commit,
+            "b"
+        );
+        let none = IndexEntry::default();
+        assert!(none.commit_for(HubVersion::Stable).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn compose_locators_yields_a_loadable_pipeline() {
+        let d = hub();
+        let c = compose_locators("acme", "files", d.path()).await.unwrap();
         assert_eq!(c.name, "acme");
         let cfg = load_composed(&c, &RunInputs::default()).unwrap();
         assert_eq!(cfg.name.as_deref(), Some("acme"));

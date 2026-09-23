@@ -254,31 +254,33 @@ function renderMatrix(idx) {
   const sources = idx.sources || [];
   const sinks = idx.sinks || [];
   const cells = new Map((idx.matrix || []).map((c) => [`${c.source}\u0000${c.sink}`, c]));
+  const idOf = (t) => t.id || t.name;
+  const ownerTag = (t) => (t.owner ? `<span class="tpl-matrix-kind">@${escapeHtml(t.owner)}</span>` : "");
   const el = document.createElement("section");
   el.className = "tpl-matrix";
   const head = sinks
-    .map((k) => `<th title="${escapeHtml(k.description || "")}"><a href="#/templates/${encodeURIComponent(k.id || k.name)}" class="mono">${escapeHtml(k.name)}</a><span class="tpl-matrix-kind">${escapeHtml(k.sink_type || "")}</span></th>`)
+    .map((k) => `<th title="${escapeHtml(k.description || "")}"><a href="#/templates/${encodeURIComponent(idOf(k))}" class="mono">${escapeHtml(k.name)}</a>${ownerTag(k)}<span class="tpl-matrix-kind">${escapeHtml(k.sink_type || "")}</span></th>`)
     .join("");
   const rows = sources
     .map((s) => {
       const tds = sinks
         .map((k) => {
-          const c = cells.get(`${s.name}\u0000${k.name}`);
+          const c = cells.get(`${idOf(s)}\u0000${idOf(k)}`);
           if (!c) return `<td class="tpl-cell tpl-cell-none">—</td>`;
           const total = (s.streams || []).length;
           const plan = (c.streams || [])
             .map((p) => `${p.stream}: ${p.write_mode}${p.satisfies ? ` (for ${p.satisfies})` : ""}`)
             .concat((c.incompatible || []).map((i) => `${i.stream}: ✗ ${i.reason}`))
             .join("\n");
-          const href = `#/templates/${encodeURIComponent(s.name)}?sink=${encodeURIComponent(k.name)}`;
+          const href = `#/templates/${encodeURIComponent(idOf(s))}?sink=${encodeURIComponent(idOf(k))}`;
           if (c.compatible) {
-            return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(s.name)} into ${escapeHtml(k.name)}">✓</a></td>`;
+            return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(idOf(s))} into ${escapeHtml(idOf(k))}">✓</a></td>`;
           }
           const ok = (c.streams || []).length;
           return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(plan)}">${ok ? `<a href="${href}">${ok}/${total}</a>` : "✗"}</td>`;
         })
         .join("");
-      return `<tr><th scope="row"><a href="#/templates/${encodeURIComponent(s.name)}" class="mono">${escapeHtml(s.name)}</a><span class="tpl-matrix-kind">${escapeHtml(s.source_type || "")} · ${(s.streams || []).length} stream${(s.streams || []).length === 1 ? "" : "s"}</span></th>${tds}</tr>`;
+      return `<tr><th scope="row"><a href="#/templates/${encodeURIComponent(idOf(s))}" class="mono">${escapeHtml(s.name)}</a>${ownerTag(s)}<span class="tpl-matrix-kind">${escapeHtml(s.source_type || "")} · ${(s.streams || []).length} stream${(s.streams || []).length === 1 ? "" : "s"}</span></th>${tds}</tr>`;
     })
     .join("");
   el.innerHTML = `

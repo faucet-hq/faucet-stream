@@ -51,7 +51,7 @@
 
 ### example-csv
 
-Example — two CSV exports as two streams (runs offline, no credentials)
+<a id="example-csv"></a>Example — two CSV exports as two streams (runs offline, no credentials)
 
 - tags: `example`, `file`
 - connector: `csv` · 2 stream(s)
@@ -92,7 +92,7 @@ faucet run --source example-csv --sink sqlite
 
 ### example-rest-api
 
-Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint
+<a id="example-rest-api"></a>Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint
 
 - tags: `example`, `rest`
 - connector: `rest` · 2 stream(s)

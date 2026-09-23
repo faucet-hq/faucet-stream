@@ -128,15 +128,15 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
             let t: crate::hub::SourceTemplate = serde_json::from_value(doc.clone())
                 .map_err(|e| CliError::Config(format!("source-template: {e}")))?;
             t.validate()?;
-            registry_lint(&t.name, crate::hub::catalog::lint_source(&t))?;
-            (TemplateKind::SourceTemplate, Some(t.name.clone()))
+            registry_lint(&t.id(), crate::hub::catalog::lint_source(&t))?;
+            (TemplateKind::SourceTemplate, Some(t.id()))
         }
         Some(TemplateKind::SinkTemplate) => {
             let t: crate::hub::SinkTemplate = serde_json::from_value(doc.clone())
                 .map_err(|e| CliError::Config(format!("sink-template: {e}")))?;
             t.validate()?;
-            registry_lint(&t.name, crate::hub::catalog::lint_sink(&t))?;
-            (TemplateKind::SinkTemplate, Some(t.name.clone()))
+            registry_lint(&t.id(), crate::hub::catalog::lint_sink(&t))?;
+            (TemplateKind::SinkTemplate, Some(t.id()))
         }
         Some(TemplateKind::Pipeline) | None => {
             if detected.is_none() {
@@ -160,7 +160,7 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
             let id = TemplateId::parse(raw)?;
             if Some(id.as_str()) != name.as_deref() {
                 return Err(CliError::Config(format!(
-                    "a {kind} is registered under its own `name` ('{}'); drop `--id` or make it match",
+                    "a {kind} is registered under its own hub id ('{}' — `owner/name`, or `name` for an official template); drop `--id` or make it match",
                     name.as_deref().unwrap_or("")
                 )));
             }
@@ -1754,7 +1754,7 @@ write_mode_aliases:
         let mut wrong_id = req(&sink_template(dir.path()));
         wrong_id.id = Some("elsewhere".into());
         let err = register(&s, wrong_id).await.unwrap_err().to_string();
-        assert!(err.contains("registered under its own `name`"), "{err}");
+        assert!(err.contains("registered under its own hub id"), "{err}");
 
         // A pipeline cannot take over a source template's id (or vice versa).
         let mut takeover = req(PARAMETERIZED);

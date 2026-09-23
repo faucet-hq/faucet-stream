@@ -69,7 +69,8 @@ streams:
 
 | Field | Purpose |
 |---|---|
-| `name` | Hub id (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem) **and** the composed pipeline's `name:` — so per-stream state keys are `{source}::{stream}` and bookmarks survive swapping the sink. |
+| `name` | Short name (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem). With `owner`, the hub id is `owner/name`; the id is the composed pipeline's `name:` — so per-stream state keys are `{id}::{stream}` and bookmarks survive swapping the sink. |
+| `owner` | Publisher namespace — the GitHub user or org login the file lives under (`source-templates/<owner>/`). Absent on the hub's official templates. |
 | `params`, `auth` | Same grammar as a pipeline's `params:` / `auth:` blocks. Merged with the sink template's at compose time; a name declared by both with different specs is an error. |
 | `source` | The connector every stream reads through. Shared transforms go in the top-level `transforms`, not here. |
 | `sources` | Additional named connectors for streams that read a second endpoint family (a reports API beside the entity API). A stream picks one with `source.ref`. |
@@ -209,6 +210,47 @@ with a warning (`FAUCET_HUB_OFFLINE=1` skips the network altogether); it never
 falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
 sent when set — needed for a private catalog, and it lifts the anonymous API
 rate limit.
+
+### Namespaces: `owner/name`
+
+A hundred teams will want their own NetSuite template, so a template's hub id
+is **`owner/name`** — the owner being the publisher's GitHub user or org login
+— and the catalog is laid out to match: `source-templates/acme/netsuite.yaml`
+carries `owner: acme` and is addressed as `acme/netsuite`. Top-level files
+with no `owner` are the hub's **official** templates, addressed by name alone.
+`--source netsuite` means the official one; when there is none, the CLI lists
+the community variants instead of guessing.
+
+The full id names the composed pipeline, so state keys are
+`acme/netsuite::invoices` and two publishers' templates never collide in a
+shared state store or registry (`/` is a legal state-key character; the file
+store encodes it). In `per_stream` addressing `${source}` stays the short
+name — a table cannot contain `/` — and `${owner}` is available for paths
+(`"${param.out_dir}/${owner}/${source}/${stream}.jsonl"`).
+
+Ownership is enforced by the catalog's CI: the first pull request into a
+namespace adds `<owner>/OWNERS` with the author's numeric GitHub id, and every
+later change must come from a listed id. Official templates are
+maintainers-only.
+
+### Versions: v1, v2, v3 and `stable`
+
+Every merged change to a template's meaning is its next numeric version —
+computed from git history by the catalog, never written by the author.
+A sidecar beside the template decides what is **stable**: `launch: false`
+publishes a version as a preview without moving `stable`; `stable: 3` pins
+it. The catalog records all of this in its `index.json`, and the CLI honours
+it:
+
+```bash
+faucet run --source acme/netsuite --sink bigquery …          # stable (the default)
+faucet run --source acme/netsuite@newest --sink bigquery …   # the tip
+faucet run --source acme/netsuite@3 --sink bigquery …        # pinned — always the same body
+```
+
+A version whose body is not the snapshot's is fetched from the catalog at that
+commit and cached, so a pinned run composes the same document every time. A
+local directory hub has no history: selectors are an error there.
 
 ### Mirror the hub into your server
 

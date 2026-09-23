@@ -41,8 +41,12 @@ into the docs site:
 
 ## Contributing a template
 
+Real templates go to the public catalog, under your own namespace
+(`source-templates/<your-github-login>/<name>.yaml` with `owner: <login>`; the
+hub id is `<owner>/<name>`). Top-level files are the official set. The rules:
+
 1. Copy the closest existing file; keep `name` equal to the file stem
-   (`^[a-z0-9][a-z0-9_-]*$`).
+   (`^[a-z0-9][a-z0-9_-]*$`) and `owner` equal to the directory.
 2. Credentials are **always** `${param.NAME}` with `secret: true` — never a
    literal, never a private hostname or placeholder value.
 3. Declare every stream with its `write` preference and `primary_keys`; use

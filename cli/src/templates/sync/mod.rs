@@ -483,6 +483,13 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(entries))
             .mount(server)
             .await;
+        // Subdirectories are read one level down (owner namespaces, #682);
+        // this one is empty, so it contributes nothing.
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/tpl/contents/templates/sub"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(server)
+            .await;
         for (n, body) in files {
             Mock::given(method("GET"))
                 .and(path(format!("/repos/acme/tpl/contents/templates/{n}")))

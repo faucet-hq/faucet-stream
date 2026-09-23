@@ -78,6 +78,22 @@ fn default_version() -> u32 {
 /// Slug rule shared by template names and stream names: lowercase, digits,
 /// `-`/`_`, first character alphanumeric. Stream names additionally become
 /// table names, so `-` is rejected there (see [`Stream::validate`]).
+/// The hub id of a template: `owner/name`, or `name` for an official one.
+pub fn hub_id(owner: Option<&str>, name: &str) -> String {
+    match owner {
+        Some(o) => format!("{o}/{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// Split a hub id into `(owner, name)`.
+pub fn split_hub_id(id: &str) -> (Option<&str>, &str) {
+    match id.split_once('/') {
+        Some((o, n)) => (Some(o), n),
+        None => (None, id),
+    }
+}
+
 fn check_slug(what: &str, raw: &str, allow_dash: bool) -> CliResult<()> {
     let ok = !raw.is_empty()
         && raw.len() <= 64
@@ -263,9 +279,16 @@ pub struct SourceTemplate {
     /// Document version; must be `1`.
     #[serde(default = "default_version")]
     pub version: u32,
-    /// Hub id and the composed pipeline's `name:` — so per-stream state keys
-    /// (`{name}::{stream}`) stay stable no matter which sink is composed in.
+    /// Short name (`netsuite`). With `owner`, the hub id is `owner/name`; an
+    /// official template (no owner) is addressed by `name` alone. The id is the
+    /// composed pipeline's `name:`, so per-stream state keys
+    /// (`{id}::{stream}`) stay stable no matter which sink is composed in.
     pub name: String,
+    /// Publisher namespace — a GitHub user or org login (#682). Set on every
+    /// community template (`source-templates/<owner>/<name>.yaml`); absent on
+    /// the hub's official templates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Free-form discovery tags (`finance`, `hr`, `saas`, …).
@@ -303,6 +326,11 @@ pub struct SourceTemplate {
 }
 
 impl SourceTemplate {
+    /// `owner/name`, or `name` for an official template.
+    pub fn id(&self) -> String {
+        hub_id(self.owner.as_deref(), &self.name)
+    }
+
     pub fn validate(&self) -> CliResult<()> {
         if self.kind != TemplateKind::SourceTemplate {
             return Err(CliError::Config(format!(
@@ -318,6 +346,9 @@ impl SourceTemplate {
             )));
         }
         check_slug("source-template name", &self.name, true)?;
+        if let Some(o) = &self.owner {
+            check_slug("source-template owner", o, true)?;
+        }
         crate::params::spec::validate(&self.params)?;
         if self.streams.is_empty() {
             return Err(CliError::Config(format!(
@@ -398,6 +429,10 @@ pub struct SinkTemplate {
     pub version: u32,
     /// Hub id.
     pub name: String,
+    /// Publisher namespace — a GitHub user or org login (#682); absent on the
+    /// hub's official templates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -429,6 +464,11 @@ pub struct SinkTemplate {
 }
 
 impl SinkTemplate {
+    /// `owner/name`, or `name` for an official template.
+    pub fn id(&self) -> String {
+        hub_id(self.owner.as_deref(), &self.name)
+    }
+
     pub fn validate(&self) -> CliResult<()> {
         if self.kind != TemplateKind::SinkTemplate {
             return Err(CliError::Config(format!(
@@ -444,6 +484,9 @@ impl SinkTemplate {
             )));
         }
         check_slug("sink-template name", &self.name, true)?;
+        if let Some(o) = &self.owner {
+            check_slug("sink-template owner", o, true)?;
+        }
         crate::params::spec::validate(&self.params)?;
         if self.sink.transforms.is_some() || !self.sink.inherit_transforms {
             return Err(CliError::Config(format!(

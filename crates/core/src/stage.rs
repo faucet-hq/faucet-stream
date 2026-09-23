@@ -2129,6 +2129,7 @@ mod tests {
         assert_eq!(row[CDC_DEFAULT_MARKER_FIELD], json!("d"));
     }
 
+    #[cfg(feature = "transform-cdc-unwrap")]
     #[test]
     fn cdc_unwrap_non_object_after_for_insert_is_dropped() {
         let stages = compile(&[cdc_unwrap_default()]);

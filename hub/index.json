@@ -158,7 +158,10 @@
       "description": "Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert",
       "docs": "https://faucet-hq.github.io/faucet-stream/reference/connectors.html",
       "file": "sink-templates/bigquery.yaml",
+      "id": "bigquery",
       "name": "bigquery",
+      "official": true,
+      "owner": null,
       "params": [
         {
           "default": "raw",
@@ -201,7 +204,10 @@
       "description": "Local JSON Lines files, one per stream — the local validation destination",
       "docs": null,
       "file": "sink-templates/jsonl.yaml",
+      "id": "jsonl",
       "name": "jsonl",
+      "official": true,
+      "owner": null,
       "params": [
         {
           "default": "./out",
@@ -225,7 +231,10 @@
       "description": "PostgreSQL — one auto-mapped table per stream, transactional overwrite or ON CONFLICT upsert",
       "docs": null,
       "file": "sink-templates/postgres.yaml",
+      "id": "postgres",
       "name": "postgres",
+      "official": true,
+      "owner": null,
       "params": [
         {
           "default": "public",
@@ -259,7 +268,10 @@
       "description": "Local SQLite database — one auto-mapped table per stream, real overwrite/upsert semantics without infrastructure",
       "docs": null,
       "file": "sink-templates/sqlite.yaml",
+      "id": "sqlite",
       "name": "sqlite",
+      "official": true,
+      "owner": null,
       "params": [
         {
           "default": "./out/faucet.db",
@@ -288,7 +300,10 @@
       "description": "Example — two CSV exports as two streams (runs offline, no credentials)",
       "docs": null,
       "file": "source-templates/example-csv.yaml",
+      "id": "example-csv",
       "name": "example-csv",
+      "official": true,
+      "owner": null,
       "params": [
         {
           "default": "./hub/examples/data",
@@ -333,7 +348,10 @@
       "description": "Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint",
       "docs": null,
       "file": "source-templates/example-rest-api.yaml",
+      "id": "example-rest-api",
       "name": "example-rest-api",
+      "official": true,
+      "owner": null,
       "params": [
         {
           "default": null,

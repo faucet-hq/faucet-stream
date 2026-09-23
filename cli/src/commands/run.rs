@@ -89,7 +89,7 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
 
     let cfg = if let Some((source, sink)) = hub_pair {
         let hub_dir = crate::hub::resolve_hub(args.hub.as_deref()).await?;
-        let composition = crate::hub::compose_locators(&source, &sink, &hub_dir)?;
+        let composition = crate::hub::compose_locators(&source, &sink, &hub_dir).await?;
         let inputs = crate::config::RunInputs {
             params: crate::params::collect_cli_params(&args.param)?,
             env: crate::params::collect_env_overrides(&args.param_env)?
