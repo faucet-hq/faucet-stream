@@ -346,7 +346,9 @@ impl Serialize for VersionSelector {
     }
 }
 
-/// A validated template id: lowercase kebab/snake slug, `^[a-z0-9][a-z0-9_-]*$`.
+/// A validated template id: lowercase kebab/snake slug, `^[a-z0-9][a-z0-9_-]*$`,
+/// optionally prefixed by an `owner/` namespace of the same shape (hub
+/// templates, #682).
 ///
 /// Ids appear in URL paths (`/v1/templates/{id}`) and as CLI arguments, so the
 /// charset is deliberately narrow — no slashes, dots, whitespace, or uppercase,
@@ -364,22 +366,32 @@ impl TemplateId {
                     .into(),
             ));
         }
-        if s.len() > MAX_ID_LEN {
+        let longest_segment = s.split('/').map(str::len).max().unwrap_or(0);
+        if longest_segment > MAX_ID_LEN {
             return Err(CliError::Config(format!(
-                "template id '{s}' is longer than {MAX_ID_LEN} characters"
+                "template id '{s}' has a segment longer than {MAX_ID_LEN} characters"
             )));
         }
-        let mut chars = s.chars();
-        let ok = match chars.next() {
-            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {
-                chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        // One optional `owner/` segment (a hub namespace, #682), then the slug.
+        let slug_ok = |seg: &str| {
+            let mut chars = seg.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => chars
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'),
+                _ => false,
             }
-            _ => false,
+        };
+        let ok = match s.split_once('/') {
+            None => slug_ok(s),
+            Some((owner, name)) => {
+                !owner.is_empty() && !name.is_empty() && slug_ok(owner) && slug_ok(name)
+            }
         };
         if !ok {
             return Err(CliError::Config(format!(
-                "invalid template id '{s}' — ids must match ^[a-z0-9][a-z0-9_-]*$ (lowercase \
-                 letters, digits, `-`, `_`; first character alphanumeric)"
+                "invalid template id '{s}' — ids must match ^[a-z0-9][a-z0-9_-]*$, optionally \
+                 prefixed by an `owner/` namespace of the same shape (lowercase letters, digits, \
+                 `-`, `_`; first character alphanumeric)"
             )));
         }
         Ok(Self(s.to_string()))
@@ -913,7 +925,6 @@ mod tests {
             "_lead",
             "Upper",
             "has space",
-            "has/slash",
             "has.dot",
             "../etc/passwd",
         ] {
@@ -926,6 +937,29 @@ mod tests {
         assert_eq!(TemplateId::parse("  ok  ").unwrap().as_str(), "ok");
         assert!(TemplateId::parse(&"a".repeat(MAX_ID_LEN + 1)).is_err());
         assert!(TemplateId::parse(&"a".repeat(MAX_ID_LEN)).is_ok());
+        // Owner-scoped hub ids (#682): exactly one `/`, both halves slugs.
+        assert_eq!(
+            TemplateId::parse("acme/netsuite").unwrap().as_str(),
+            "acme/netsuite"
+        );
+        assert!(
+            TemplateId::parse(&format!(
+                "{}/{}",
+                "a".repeat(MAX_ID_LEN),
+                "b".repeat(MAX_ID_LEN)
+            ))
+            .is_ok()
+        );
+        for bad in [
+            "/netsuite",
+            "acme/",
+            "acme//netsuite",
+            "a/b/c",
+            "Acme/netsuite",
+            "acme/Net",
+        ] {
+            assert!(TemplateId::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

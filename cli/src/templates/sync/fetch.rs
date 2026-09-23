@@ -58,9 +58,13 @@ pub fn is_candidate(name: &str) -> bool {
     template_format(name).is_some() || sidecar_stem(name).is_some()
 }
 
+fn basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
 fn template_format(name: &str) -> Option<ConfigFormat> {
     let lower = name.to_ascii_lowercase();
-    if lower.starts_with('.') || sidecar_stem(&lower).is_some() {
+    if basename(&lower).starts_with('.') || sidecar_stem(&lower).is_some() {
         return None;
     }
     if lower.ends_with(".yaml") || lower.ends_with(".yml") {
@@ -73,7 +77,7 @@ fn template_format(name: &str) -> Option<ConfigFormat> {
 }
 
 fn sidecar_stem(name: &str) -> Option<&str> {
-    if name.starts_with('.') {
+    if basename(name).starts_with('.') {
         return None;
     }
     SIDECAR_SUFFIXES
@@ -315,9 +319,28 @@ impl GithubFetcher {
 #[async_trait]
 impl Fetcher for GithubFetcher {
     async fn list(&self) -> CliResult<Vec<RemoteFile>> {
+        // Files directly in each directory, plus one level of subdirectories —
+        // a Template Hub's `<owner>/<name>.yaml` layout (#682), whose stems
+        // become `owner/name` ids.
         let mut entries: Vec<ContentsEntry> = Vec::new();
         for dir in self.dirs() {
-            entries.extend(self.list_dir(dir).await?);
+            for e in self.list_dir(dir).await? {
+                if e.kind == "dir" && !e.name.starts_with('.') {
+                    let sub = if dir.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{dir}/{}", e.name)
+                    };
+                    for mut f in self.list_dir(&sub).await? {
+                        if f.kind == "file" {
+                            f.name = format!("{}/{}", e.name, f.name);
+                            entries.push(f);
+                        }
+                    }
+                } else {
+                    entries.push(e);
+                }
+            }
         }
         let wanted: Vec<ContentsEntry> = entries
             .into_iter()
@@ -860,12 +883,22 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         let entry = |name: &str| serde_json::json!({"name": name, "type": "file", "url": format!("{}/raw/{name}", server.uri()), "sha": "abc"});
+        // An owner directory (#682) lists as `owner/name` stems.
         Mock::given(method("GET"))
             .and(path("/repos/acme/hub/contents/source-templates"))
             .and(query_param("ref", "main"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([entry("acme.yaml")])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                entry("acme.yaml"),
+                {"name": "octo", "type": "dir", "url": format!("{}/x", server.uri())}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/contents/source-templates/octo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                entry("hr.yaml"),
+                entry("hr.faucet.yaml")
+            ])))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -875,10 +908,15 @@ mod tests {
             )
             .mount(&server)
             .await;
-        for name in ["acme.yaml", "files.yaml"] {
+        for name in ["acme.yaml", "files.yaml", "hr.yaml", "hr.faucet.yaml"] {
+            let body = if name.contains(".faucet.") {
+                "launch: true\n".to_string()
+            } else {
+                format!("name: {name}")
+            };
             Mock::given(method("GET"))
                 .and(path(format!("/raw/{name}")))
-                .respond_with(ResponseTemplate::new(200).set_body_string(format!("name: {name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
                 .mount(&server)
                 .await;
         }
@@ -895,7 +933,19 @@ mod tests {
         files.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
-            ["acme.yaml", "files.yaml"]
+            [
+                "acme.yaml",
+                "files.yaml",
+                "octo/hr.faucet.yaml",
+                "octo/hr.yaml"
+            ]
+        );
+        let paired = pair_files(files);
+        let stems: Vec<&str> = paired.templates.iter().map(|t| t.stem.as_str()).collect();
+        assert_eq!(stems, ["acme", "files", "octo/hr"]);
+        assert!(
+            paired.templates[2].sidecar.is_some(),
+            "the sidecar pairs across the owner directory"
         );
         // `publish` targets the first directory.
         assert_eq!(fetcher.dir(), "source-templates");

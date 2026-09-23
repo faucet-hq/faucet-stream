@@ -29,7 +29,7 @@ fn pretty<T: serde::Serialize>(v: &T) -> CliResult<String> {
 /// `faucet validate` / `run` / `template register` all take it.
 async fn compose(a: HubComposeArgs) -> CliResult<()> {
     let hub_dir = hub::resolve_hub(a.pair.hub.as_deref()).await?;
-    let c = hub::compose_locators(&a.pair.source, &a.pair.sink, &hub_dir)?;
+    let c = hub::compose_locators(&a.pair.source, &a.pair.sink, &hub_dir).await?;
     if a.json {
         println!("{}", pretty(&c)?);
         return Ok(());
@@ -57,8 +57,8 @@ async fn compose(a: HubComposeArgs) -> CliResult<()> {
 /// incompatible.
 async fn check(a: HubCheckArgs) -> CliResult<()> {
     let hub_dir = hub::resolve_hub(a.pair.hub.as_deref()).await?;
-    let s = hub::load_source(&a.pair.source, &hub_dir)?;
-    let k = hub::load_sink(&a.pair.sink, &hub_dir)?;
+    let s = hub::load_source(&a.pair.source, &hub_dir).await?;
+    let k = hub::load_sink(&a.pair.sink, &hub_dir).await?;
     let cell = hub::catalog::cell(&s, &k);
     if a.json {
         println!("{}", pretty(&cell)?);

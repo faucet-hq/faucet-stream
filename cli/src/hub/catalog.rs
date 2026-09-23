@@ -35,16 +35,39 @@ fn is_template_file(p: &Path) -> bool {
             .is_some_and(|n| n.starts_with('.'))
 }
 
-fn list_dir(dir: &Path) -> CliResult<Vec<PathBuf>> {
+/// Template files directly in `dir` (official templates) plus one level of
+/// owner subdirectories (`<dir>/<owner>/<name>.yaml`, #682). Returns
+/// `(path, owner)`.
+fn list_dir(dir: &Path) -> CliResult<Vec<(PathBuf, Option<String>)>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
-    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CliError::Config(format!("reading {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
+    let read = |d: &Path| -> CliResult<Vec<PathBuf>> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+            .map_err(|e| CliError::Config(format!("reading {}: {e}", d.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        v.sort();
+        Ok(v)
+    };
+    let entries = read(dir)?;
+    let mut out: Vec<(PathBuf, Option<String>)> = entries
+        .iter()
         .filter(|p| p.is_file() && is_template_file(p))
+        .map(|p| (p.clone(), None))
         .collect();
-    out.sort();
+    for p in &entries {
+        if p.is_dir()
+            && let Some(owner) = p.file_name().and_then(|n| n.to_str())
+            && !owner.starts_with('.')
+        {
+            for f in read(p)? {
+                if f.is_file() && is_template_file(&f) {
+                    out.push((f, Some(owner.to_string())));
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -58,12 +81,14 @@ impl Catalog {
             root: root.to_path_buf(),
             ..Default::default()
         };
-        for p in list_dir(&root.join(SOURCE_DIR))? {
+        for (p, owner) in list_dir(&root.join(SOURCE_DIR))? {
             let t = super::parse_source_file(&p)?;
+            check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
             cat.sources.push((p, t));
         }
-        for p in list_dir(&root.join(SINK_DIR))? {
+        for (p, owner) in list_dir(&root.join(SINK_DIR))? {
             let t = super::parse_sink_file(&p)?;
+            check_owner(&p, t.owner.as_deref(), owner.as_deref())?;
             cat.sinks.push((p, t));
         }
         if cat.sources.is_empty() && cat.sinks.is_empty() {
@@ -76,26 +101,28 @@ impl Catalog {
         // resolves unambiguously to one file.
         let mut seen = BTreeMap::new();
         for (p, t) in &cat.sources {
-            check_stem(p, &t.name, &mut seen)?;
+            check_stem(p, &t.name, &t.id(), &mut seen)?;
         }
         seen.clear();
         for (p, t) in &cat.sinks {
-            check_stem(p, &t.name, &mut seen)?;
+            check_stem(p, &t.name, &t.id(), &mut seen)?;
         }
         Ok(cat)
     }
 
-    pub fn source(&self, name: &str) -> Option<&SourceTemplate> {
+    /// Look a source template up by hub id (`owner/name`, or `name`).
+    pub fn source(&self, id: &str) -> Option<&SourceTemplate> {
         self.sources
             .iter()
-            .find(|(_, t)| t.name == name)
+            .find(|(_, t)| t.id() == id)
             .map(|(_, t)| t)
     }
 
-    pub fn sink(&self, name: &str) -> Option<&SinkTemplate> {
+    /// Look a sink template up by hub id (`owner/name`, or `name`).
+    pub fn sink(&self, id: &str) -> Option<&SinkTemplate> {
         self.sinks
             .iter()
-            .find(|(_, t)| t.name == name)
+            .find(|(_, t)| t.id() == id)
             .map(|(_, t)| t)
     }
 
@@ -111,22 +138,51 @@ impl Catalog {
     }
 }
 
-fn check_stem(p: &Path, name: &str, seen: &mut BTreeMap<String, PathBuf>) -> CliResult<()> {
+fn check_stem(
+    p: &Path,
+    name: &str,
+    id: &str,
+    seen: &mut BTreeMap<String, PathBuf>,
+) -> CliResult<()> {
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     if stem != name {
         return Err(CliError::Config(format!(
-            "{}: file stem '{stem}' must equal the template's `name: {name}` so `--source/--sink {name}` finds it",
+            "{}: file stem '{stem}' must equal the template's `name: {name}` so `--source/--sink {id}` finds it",
             p.display()
         )));
     }
-    if let Some(prev) = seen.insert(name.to_string(), p.to_path_buf()) {
+    if let Some(prev) = seen.insert(id.to_string(), p.to_path_buf()) {
         return Err(CliError::Config(format!(
-            "template '{name}' is defined twice: {} and {}",
+            "template '{id}' is defined twice: {} and {}",
             prev.display(),
             p.display()
         )));
     }
     Ok(())
+}
+
+/// The `owner:` field must agree with the directory a template lives in (#682):
+/// a file under `<owner>/` carries `owner: <owner>`; a top-level (official)
+/// file carries none. The field is what makes a template self-describing once
+/// it leaves the catalog (registry, sync, remote fetch).
+fn check_owner(p: &Path, declared: Option<&str>, dir: Option<&str>) -> CliResult<()> {
+    match (declared, dir) {
+        (None, None) => Ok(()),
+        (Some(d), Some(dir)) if d == dir => Ok(()),
+        (Some(d), Some(dir)) => Err(CliError::Config(format!(
+            "{}: `owner: {d}` but the file lives under '{dir}/' — the two must match",
+            p.display()
+        ))),
+        (Some(d), None) => Err(CliError::Config(format!(
+            "{}: declares `owner: {d}` but lives at the top level — move it to '{d}/{}' (top-level templates are the hub's official, owner-less set)",
+            p.display(),
+            p.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+        ))),
+        (None, Some(dir)) => Err(CliError::Config(format!(
+            "{}: lives under '{dir}/' but has no `owner:` — add `owner: {dir}` so the template stays owned once it leaves the catalog",
+            p.display()
+        ))),
+    }
 }
 
 /// One source × sink cell of the matrix.
@@ -159,8 +215,8 @@ pub fn cell(source: &SourceTemplate, sink: &SinkTemplate) -> Cell {
         }
     }
     Cell {
-        source: source.name.clone(),
-        sink: sink.name.clone(),
+        source: source.id(),
+        sink: sink.id(),
         sink_kind: sink.sink.kind.clone(),
         compatible: incompatible.is_empty(),
         streams,
@@ -174,7 +230,7 @@ pub fn compose_all(cat: &Catalog) -> Vec<(String, String, CliResult<super::compo
     let mut out = Vec::new();
     for (_, s) in &cat.sources {
         for (_, k) in &cat.sinks {
-            out.push((s.name.clone(), k.name.clone(), compose(s, k)));
+            out.push((s.id(), k.id(), compose(s, k)));
         }
     }
     out
@@ -358,13 +414,13 @@ pub fn lint_catalog(cat: &Catalog) -> Vec<(String, Vec<String>)> {
     for (_, s) in &cat.sources {
         let f = lint_source(s);
         if !f.is_empty() {
-            out.push((format!("source-template {}", s.name), f));
+            out.push((format!("source-template {}", s.id()), f));
         }
     }
     for (_, k) in &cat.sinks {
         let f = lint_sink(k);
         if !f.is_empty() {
-            out.push((format!("sink-template {}", k.name), f));
+            out.push((format!("sink-template {}", k.id()), f));
         }
     }
     out
@@ -375,7 +431,7 @@ pub fn lint_catalog(cat: &Catalog) -> Vec<(String, Vec<String>)> {
 /// The copy-paste command for one pairing: every required param listed with
 /// a `<placeholder>`, secrets pointed at an environment variable.
 pub fn run_command(source: &SourceTemplate, sink: &SinkTemplate) -> String {
-    let mut cmd = format!("faucet run --source {} --sink {}", source.name, sink.name);
+    let mut cmd = format!("faucet run --source {} --sink {}", source.id(), sink.id());
     let mut params: Vec<(&String, &crate::params::ParamSpec)> = source.params.iter().collect();
     params.extend(sink.params.iter());
     for (name, p) in params {
@@ -433,8 +489,8 @@ pub fn index_json_with(
 /// The copy-paste command for a pairing held in a template registry.
 pub fn registry_run_command(source: &SourceTemplate, sink: &SinkTemplate) -> String {
     run_command(source, sink).replacen(
-        &format!("faucet run --source {} --sink {}", source.name, sink.name),
-        &format!("faucet template run {} --sink {}", source.name, sink.name),
+        &format!("faucet run --source {} --sink {}", source.id(), sink.id()),
+        &format!("faucet template run {} --sink {}", source.id(), sink.id()),
         1,
     )
 }
@@ -447,6 +503,9 @@ fn index_json_unsorted(
     json!({
         "version": 1,
         "sources": cat.sources.iter().map(|(p, s)| json!({
+            "id": s.id(),
+            "owner": s.owner,
+            "official": s.owner.is_none(),
             "name": s.name,
             "description": s.description,
             "tags": s.tags,
@@ -465,6 +524,9 @@ fn index_json_unsorted(
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "sinks": cat.sinks.iter().map(|(p, k)| json!({
+            "id": k.id(),
+            "owner": k.owner,
+            "official": k.owner.is_none(),
             "name": k.name,
             "description": k.description,
             "tags": k.tags,
@@ -497,6 +559,11 @@ fn rel(root: &Path, p: &Path) -> String {
 
 /// The docs-site page: the matrix as a table, then one section per source
 /// with its streams and a copy-paste command per compatible sink.
+/// Markdown heading anchor for a hub id (`acme/netsuite` → `acme-netsuite`).
+fn anchor(id: &str) -> String {
+    id.replace('/', "-")
+}
+
 pub fn render_markdown(cat: &Catalog) -> String {
     let cells = cat.matrix();
     let mut md = String::new();
@@ -513,7 +580,7 @@ pub fn render_markdown(cat: &Catalog) -> String {
     // Table.
     md.push_str("| source \\ sink |");
     for (_, k) in &cat.sinks {
-        md.push_str(&format!(" [{}](#sink-{}) |", k.name, k.name));
+        md.push_str(&format!(" [{}](#sink-{}) |", k.id(), anchor(&k.id())));
     }
     md.push_str("\n|---|");
     for _ in &cat.sinks {
@@ -521,11 +588,11 @@ pub fn render_markdown(cat: &Catalog) -> String {
     }
     md.push('\n');
     for (_, s) in &cat.sources {
-        md.push_str(&format!("| [{}](#{}) |", s.name, s.name));
+        md.push_str(&format!("| [{}](#{}) |", s.id(), anchor(&s.id())));
         for (_, k) in &cat.sinks {
             let c = cells
                 .iter()
-                .find(|c| c.source == s.name && c.sink == k.name)
+                .find(|c| c.source == s.id() && c.sink == k.id())
                 .expect("cell");
             let mark = if c.compatible {
                 "✓"
@@ -544,8 +611,8 @@ pub fn render_markdown(cat: &Catalog) -> String {
     for (_, k) in &cat.sinks {
         md.push_str(&format!(
             "### sink: {}\n\n<a id=\"sink-{}\"></a>{}\n\n- connector: `{}` · write modes: {}\n",
-            k.name,
-            k.name,
+            k.id(),
+            anchor(&k.id()),
             k.description.as_deref().unwrap_or(""),
             k.sink.kind,
             crate::registry::sink_supported_write_modes(&k.sink.kind)
@@ -571,8 +638,9 @@ pub fn render_markdown(cat: &Catalog) -> String {
     md.push_str("## Sources\n\n");
     for (_, s) in &cat.sources {
         md.push_str(&format!(
-            "### {}\n\n{}\n\n",
-            s.name,
+            "### {}\n\n<a id=\"{}\"></a>{}\n\n",
+            s.id(),
+            anchor(&s.id()),
             s.description.as_deref().unwrap_or("")
         ));
         if !s.tags.is_empty() {
@@ -620,7 +688,7 @@ pub fn render_markdown(cat: &Catalog) -> String {
         for (_, k) in &cat.sinks {
             let c = cells
                 .iter()
-                .find(|c| c.source == s.name && c.sink == k.name)
+                .find(|c| c.source == s.id() && c.sink == k.id())
                 .expect("cell");
             if c.compatible {
                 let aliased: Vec<String> = c
@@ -631,7 +699,7 @@ pub fn render_markdown(cat: &Catalog) -> String {
                     .collect();
                 md.push_str(&format!(
                     "**→ {}**{}\n\n```bash\n{}\n```\n\n",
-                    k.name,
+                    k.id(),
                     if aliased.is_empty() {
                         String::new()
                     } else {
@@ -644,7 +712,7 @@ pub fn render_markdown(cat: &Catalog) -> String {
                     run_command(s, k)
                 ));
             } else {
-                md.push_str(&format!("**→ {}** — incompatible:\n\n", k.name));
+                md.push_str(&format!("**→ {}** — incompatible:\n\n", k.id()));
                 for i in &c.incompatible {
                     md.push_str(&format!("- `{}`: {}\n", i.stream, i.reason));
                 }
@@ -856,6 +924,94 @@ per_stream:
         assert_eq!(
             sort_keys(json!({"b": 1, "a": {"z": [ {"y": 1, "x": 2} ], "c": 3}})).to_string(),
             r#"{"a":{"c":3,"z":[{"x":2,"y":1}]},"b":1}"#
+        );
+    }
+
+    #[test]
+    fn owner_directories_load_and_owner_must_match_the_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("source-templates/octo")).unwrap();
+        std::fs::create_dir_all(root.join("sink-templates")).unwrap();
+        let src = |owner: &str| {
+            format!(
+                "kind: source-template\nname: shop\n{owner}description: d\nsource: {{type: csv, config: {{path: ./x.csv}}}}\nstreams: [{{name: t}}]\n"
+            )
+        };
+        std::fs::write(root.join("source-templates/shop.yaml"), src("")).unwrap();
+        std::fs::write(
+            root.join("source-templates/octo/shop.yaml"),
+            src("owner: octo\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sink-templates/files.yaml"),
+            "kind: sink-template\nname: files\ndescription: d\nsink: {type: jsonl, config: {}}\nper_stream: {path: \"./out/${owner}/${source}/${stream}.jsonl\"}\n",
+        )
+        .unwrap();
+        let cat = Catalog::load(root).expect("two namespaces, same short name");
+        let ids: Vec<String> = cat.sources.iter().map(|(_, s)| s.id()).collect();
+        assert_eq!(ids, ["shop", "octo/shop"]);
+        assert!(cat.source("octo/shop").unwrap().owner.as_deref() == Some("octo"));
+        let idx = index_json(&cat);
+        assert_eq!(idx["sources"][0]["official"], serde_json::json!(true));
+        assert_eq!(idx["sources"][1]["id"], serde_json::json!("octo/shop"));
+        assert_eq!(idx["sources"][1]["owner"], serde_json::json!("octo"));
+        assert_eq!(idx["matrix"][1]["source"], serde_json::json!("octo/shop"));
+        assert!(
+            idx["matrix"][1]["command"]
+                .as_str()
+                .unwrap()
+                .starts_with("faucet run --source octo/shop --sink files")
+        );
+        let md = render_markdown(&cat);
+        assert!(md.contains("[octo/shop](#octo-shop)"), "{md}");
+        // `${owner}` renders in per-stream addressing; `${source}` stays the short name.
+        let c = compose(cat.source("octo/shop").unwrap(), cat.sink("files").unwrap()).unwrap();
+        assert_eq!(
+            c.document["matrix"][0]["sink"]["config"]["path"],
+            serde_json::json!("./out/octo/shop/t.jsonl")
+        );
+        let c = compose(cat.source("shop").unwrap(), cat.sink("files").unwrap()).unwrap();
+        assert_eq!(
+            c.document["matrix"][0]["sink"]["config"]["path"],
+            serde_json::json!("./out//shop/t.jsonl")
+        );
+
+        // Owner declared but at the top level.
+        std::fs::write(
+            root.join("source-templates/stray.yaml"),
+            src("owner: octo\n").replace("name: shop", "name: stray"),
+        )
+        .unwrap();
+        let err = Catalog::load(root).unwrap_err().to_string();
+        assert!(
+            err.contains("lives at the top level") && err.contains("octo/stray.yaml"),
+            "{err}"
+        );
+        std::fs::remove_file(root.join("source-templates/stray.yaml")).unwrap();
+        // Under an owner directory without the field.
+        std::fs::write(
+            root.join("source-templates/octo/bare.yaml"),
+            src("").replace("name: shop", "name: bare"),
+        )
+        .unwrap();
+        let err = Catalog::load(root).unwrap_err().to_string();
+        assert!(
+            err.contains("has no `owner:`") && err.contains("add `owner: octo`"),
+            "{err}"
+        );
+        std::fs::remove_file(root.join("source-templates/octo/bare.yaml")).unwrap();
+        // Owner disagreeing with the directory.
+        std::fs::write(
+            root.join("source-templates/octo/other.yaml"),
+            src("owner: someone\n").replace("name: shop", "name: other"),
+        )
+        .unwrap();
+        let err = Catalog::load(root).unwrap_err().to_string();
+        assert!(
+            err.contains("`owner: someone` but the file lives under 'octo/'"),
+            "{err}"
         );
     }
 

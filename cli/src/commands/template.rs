@@ -811,7 +811,7 @@ pipeline:
         .await
         .unwrap_err()
         .to_string();
-        assert!(err.contains("registered under its own `name`"), "{err}");
+        assert!(err.contains("registered under its own hub id"), "{err}");
 
         for kind in [
             None,

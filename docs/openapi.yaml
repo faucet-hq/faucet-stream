@@ -1874,12 +1874,27 @@ components:
       required: [version, sources, sinks, matrix]
       properties:
         version: { type: integer, enum: [1] }
+        commit: { type: string, nullable: true, description: "The catalog commit the index describes (catalog-generated indexes only)." }
         sources:
           type: array
           items:
             type: object
             required: [name, streams, params]
             properties:
+              id: { type: string, description: "Hub id — `owner/name`, or `name` for an official template." }
+              owner: { type: string, nullable: true, description: "Publisher namespace (GitHub user or org login); null for an official template." }
+              official: { type: boolean }
+              newest: { type: integer, nullable: true, description: "Catalog version count (v1, v2, …); present when the index carries history." }
+              stable: { type: integer, nullable: true, description: "The version an unpinned run uses." }
+              versions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    version: { type: integer }
+                    commit: { type: string }
+                    date: { type: string, nullable: true }
+                    pr: { type: integer, nullable: true }
               name: { type: string }
               description: { type: string, nullable: true }
               tags: { type: array, items: { type: string } }
@@ -1902,6 +1917,11 @@ components:
             type: object
             required: [name, write_modes, params]
             properties:
+              id: { type: string, description: "Hub id — `owner/name`, or `name` for an official template." }
+              owner: { type: string, nullable: true }
+              official: { type: boolean }
+              newest: { type: integer, nullable: true }
+              stable: { type: integer, nullable: true }
               name: { type: string }
               description: { type: string, nullable: true }
               tags: { type: array, items: { type: string } }
@@ -2104,7 +2124,7 @@ components:
       type: object
       required: [config]
       properties:
-        id: { type: string, description: "Registry id. Derived from the config's `name:` when omitted. A `source-template` / `sink-template` is always registered under its own `name` (an explicit id must match it)." }
+        id: { type: string, description: "Registry id. Derived from the config's `name:` when omitted. A `source-template` / `sink-template` is always registered under its own hub id — `owner/name`, or `name` for an official template (an explicit id must match it)." }
         config: { type: string, description: "The template document, stored verbatim. Its `kind:` decides how it is validated and run: `source-template` (a system and its streams), `sink-template` (a destination), or `pipeline` (a complete config). A document without `kind:` is registered as a pipeline and flagged as deprecated input." }
         config_format: { type: string, enum: [yaml, json], default: yaml }
         description: { type: string }
