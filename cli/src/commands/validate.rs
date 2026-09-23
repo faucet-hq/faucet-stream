@@ -24,7 +24,7 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
     // binding unless `--param` is given, exactly like a file. A single
     // `report` await at the end keeps the future small (see `run`).
     let cfg = if let (Some(source), Some(sink)) = (&args.source, &args.sink) {
-        let hub_dir = crate::hub::hub_dir(args.hub.as_deref());
+        let hub_dir = crate::hub::resolve_hub(args.hub.as_deref()).await?;
         let composition = crate::hub::compose_locators(source, sink, &hub_dir)?;
         if args.show_composed {
             print!("{}", composition.to_yaml()?);

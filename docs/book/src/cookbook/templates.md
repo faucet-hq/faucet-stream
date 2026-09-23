@@ -643,7 +643,10 @@ Templates page grows a **Sync from origins** panel when the server has any.
 **Layout at an origin.** The template id is the file **stem**, with the origin's
 `prefix` prepended: `templates/nightly.yaml` under `prefix: platform-` registers
 as `platform-nightly`. Only `*.yaml` / `*.yml` / `*.json` files directly in the
-directory are read. An optional sidecar `<stem>.faucet.yaml` beside the template
+directory are read; a GitHub origin may name several directories with
+`paths: [source-templates, sink-templates]` instead of one `path` (a Template
+Hub catalog — stems must be unique across them, and `publish` writes to the
+first). An optional sidecar `<stem>.faucet.yaml` beside the template
 carries release intent, kept out of the config body so the body stays runnable
 with `faucet run`:
 
@@ -730,7 +733,10 @@ Metrics: `faucet_serve_template_sync_runs_total{origin,outcome=ok|partial|error}
 
 - Runnable example: [`cli/examples/rest_to_jsonl_templated.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/rest_to_jsonl_templated.yaml)
   and its suite [`cli/examples/tests/template_suite.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/tests/template_suite.yaml);
-  sync file [`cli/examples/templates/sync.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/templates/sync.yaml)
+  sync file [`cli/examples/templates/sync.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/templates/sync.yaml);
+  [`cli/examples/templates/hub-sync.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/templates/hub-sync.yaml)
+  mirrors the [public Template Hub](./template-hub.md#the-public-hub) with one GitHub origin whose
+  `paths: [source-templates, sink-templates]` reads both catalog directories
 - [RFC 0006 — template hosting + sync](https://github.com/faucet-hq/faucet-stream/blob/main/rfcs/0006-template-hosting-sync.md)
 - [`params:` reference](../reference/config.md#params) · [CLI reference](../reference/cli.md) · [HTTP API](../reference/http-api.md)
 - [Config composition](./composition.md) — `extends` / `profiles` / `!include`, for

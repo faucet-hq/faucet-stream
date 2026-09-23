@@ -417,10 +417,32 @@ pub fn sort_keys(v: Value) -> Value {
 /// Machine-readable index of the catalog (what a website consumes). Keys are
 /// sorted at every level (see [`sort_keys`]).
 pub fn index_json(cat: &Catalog) -> Value {
-    sort_keys(index_json_unsorted(cat))
+    index_json_with(cat, run_command)
 }
 
-fn index_json_unsorted(cat: &Catalog) -> Value {
+/// `index_json` with a caller-chosen per-pairing command renderer — the
+/// registry uses `faucet template run … --sink …` where a directory hub uses
+/// `faucet run --source … --sink …`.
+pub fn index_json_with(
+    cat: &Catalog,
+    command: fn(&SourceTemplate, &SinkTemplate) -> String,
+) -> Value {
+    sort_keys(index_json_unsorted(cat, command))
+}
+
+/// The copy-paste command for a pairing held in a template registry.
+pub fn registry_run_command(source: &SourceTemplate, sink: &SinkTemplate) -> String {
+    run_command(source, sink).replacen(
+        &format!("faucet run --source {} --sink {}", source.name, sink.name),
+        &format!("faucet template run {} --sink {}", source.name, sink.name),
+        1,
+    )
+}
+
+fn index_json_unsorted(
+    cat: &Catalog,
+    command: fn(&SourceTemplate, &SinkTemplate) -> String,
+) -> Value {
     let cells = cat.matrix();
     json!({
         "version": 1,
@@ -461,7 +483,7 @@ fn index_json_unsorted(cat: &Catalog) -> Value {
             "compatible": c.compatible,
             "streams": c.streams.iter().map(|p| json!({"stream": p.stream, "write_mode": p.chosen.as_str(), "satisfies": p.satisfies.map(|m| m.as_str())})).collect::<Vec<_>>(),
             "incompatible": c.incompatible,
-            "command": cat.source(&c.source).zip(cat.sink(&c.sink)).map(|(s, k)| run_command(s, k)),
+            "command": cat.source(&c.source).zip(cat.sink(&c.sink)).map(|(s, k)| command(s, k)),
         })).collect::<Vec<_>>(),
     })
 }

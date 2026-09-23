@@ -2,8 +2,6 @@
 //! with a sink template, check a pairing, list a catalog, render its
 //! compatibility matrix, and lint templates for publication.
 
-use std::path::Path;
-
 use crate::cli::{
     HubArgs, HubCheckArgs, HubCommand, HubComposeArgs, HubLintArgs, HubListArgs, HubMatrixArgs,
     MatrixFormat,
@@ -13,11 +11,11 @@ use crate::hub::{self, Catalog};
 
 pub async fn run(args: HubArgs) -> CliResult<()> {
     match args.command {
-        HubCommand::Compose(a) => compose(a),
-        HubCommand::Check(a) => check(a),
-        HubCommand::List(a) => list(a),
-        HubCommand::Matrix(a) => matrix(a),
-        HubCommand::Lint(a) => lint(a),
+        HubCommand::Compose(a) => compose(a).await,
+        HubCommand::Check(a) => check(a).await,
+        HubCommand::List(a) => list(a).await,
+        HubCommand::Matrix(a) => matrix(a).await,
+        HubCommand::Lint(a) => lint(a).await,
     }
 }
 
@@ -29,8 +27,8 @@ fn pretty<T: serde::Serialize>(v: &T) -> CliResult<String> {
 /// `faucet hub compose --source X --sink Y [--out F] [--json]` — print (or
 /// write) the composed pipeline config. The output is an ordinary config:
 /// `faucet validate` / `run` / `template register` all take it.
-fn compose(a: HubComposeArgs) -> CliResult<()> {
-    let hub_dir = hub::hub_dir(a.pair.hub.as_deref());
+async fn compose(a: HubComposeArgs) -> CliResult<()> {
+    let hub_dir = hub::resolve_hub(a.pair.hub.as_deref()).await?;
     let c = hub::compose_locators(&a.pair.source, &a.pair.sink, &hub_dir)?;
     if a.json {
         println!("{}", pretty(&c)?);
@@ -57,8 +55,8 @@ fn compose(a: HubComposeArgs) -> CliResult<()> {
 /// `faucet hub check --source X --sink Y` — the per-stream write-mode
 /// resolution for one pairing; exits non-zero when any stream is
 /// incompatible.
-fn check(a: HubCheckArgs) -> CliResult<()> {
-    let hub_dir = hub::hub_dir(a.pair.hub.as_deref());
+async fn check(a: HubCheckArgs) -> CliResult<()> {
+    let hub_dir = hub::resolve_hub(a.pair.hub.as_deref()).await?;
     let s = hub::load_source(&a.pair.source, &hub_dir)?;
     let k = hub::load_sink(&a.pair.sink, &hub_dir)?;
     let cell = hub::catalog::cell(&s, &k);
@@ -107,13 +105,13 @@ fn check(a: HubCheckArgs) -> CliResult<()> {
     }
 }
 
-fn load_catalog(hub_flag: Option<&Path>) -> CliResult<Catalog> {
-    Catalog::load(&hub::hub_dir(hub_flag))
+async fn load_catalog(hub_flag: Option<&str>) -> CliResult<Catalog> {
+    Catalog::load(&hub::resolve_hub(hub_flag).await?)
 }
 
 /// `faucet hub list` — every source and sink template in the catalog.
-fn list(a: HubListArgs) -> CliResult<()> {
-    let cat = load_catalog(a.hub.as_deref())?;
+async fn list(a: HubListArgs) -> CliResult<()> {
+    let cat = load_catalog(a.hub.as_deref()).await?;
     if a.json {
         println!("{}", pretty(&hub::catalog::index_json(&cat))?);
         return Ok(());
@@ -147,8 +145,8 @@ fn list(a: HubListArgs) -> CliResult<()> {
 
 /// `faucet hub matrix [--format table|markdown|json]` — the source × sink
 /// compatibility matrix. `markdown` is the docs page; `json` is `index.json`.
-fn matrix(a: HubMatrixArgs) -> CliResult<()> {
-    let cat = load_catalog(a.hub.as_deref())?;
+async fn matrix(a: HubMatrixArgs) -> CliResult<()> {
+    let cat = load_catalog(a.hub.as_deref()).await?;
     let out = match a.format {
         MatrixFormat::Json => pretty(&hub::catalog::index_json(&cat))?,
         MatrixFormat::Markdown => hub::catalog::render_markdown(&cat),
@@ -193,10 +191,10 @@ fn matrix(a: HubMatrixArgs) -> CliResult<()> {
 /// `faucet hub lint [--hub DIR] [FILE…]` — publishability lint. With files,
 /// lint just those (kind detected from `kind:`); otherwise the whole catalog.
 /// Exit non-zero on any finding.
-fn lint(a: HubLintArgs) -> CliResult<()> {
+async fn lint(a: HubLintArgs) -> CliResult<()> {
     let mut findings: Vec<(String, Vec<String>)> = Vec::new();
     if a.files.is_empty() {
-        let cat = load_catalog(a.hub.as_deref())?;
+        let cat = load_catalog(a.hub.as_deref()).await?;
         findings = hub::catalog::lint_catalog(&cat);
         if !a.json {
             println!(
@@ -257,5 +255,155 @@ fn lint(a: HubLintArgs) -> CliResult<()> {
             "hub lint: {} template(s) with findings",
             findings.len()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{HubPairArgs, MatrixFormat};
+    use std::path::PathBuf;
+
+    fn repo_hub() -> String {
+        // The engine's own `hub/` — the catalog the docs and the hub tests use.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("hub");
+        root.canonicalize().unwrap().display().to_string()
+    }
+
+    fn pair(source: &str, sink: &str) -> HubPairArgs {
+        HubPairArgs {
+            source: source.into(),
+            sink: sink.into(),
+            hub: Some(repo_hub()),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_hub_verb_runs_against_a_directory_hub() {
+        let out = tempfile::tempdir().unwrap();
+        let composed = out.path().join("composed.yaml");
+        run(HubArgs {
+            command: HubCommand::Compose(HubComposeArgs {
+                pair: pair("example-csv", "jsonl"),
+                out: Some(composed.clone()),
+                json: false,
+            }),
+        })
+        .await
+        .expect("compose to a file");
+        assert!(
+            std::fs::read_to_string(&composed)
+                .unwrap()
+                .contains("name: example-csv")
+        );
+        run(HubArgs {
+            command: HubCommand::Compose(HubComposeArgs {
+                pair: pair("example-csv", "sqlite"),
+                out: None,
+                json: true,
+            }),
+        })
+        .await
+        .expect("compose as json");
+
+        run(HubArgs {
+            command: HubCommand::Check(HubCheckArgs {
+                pair: pair("example-csv", "sqlite"),
+                json: false,
+            }),
+        })
+        .await
+        .expect("compatible pairing");
+        run(HubArgs {
+            command: HubCommand::Check(HubCheckArgs {
+                pair: pair("example-rest-api", "bigquery"),
+                json: true,
+            }),
+        })
+        .await
+        .expect("compatible pairing as json");
+
+        for json in [false, true] {
+            run(HubArgs {
+                command: HubCommand::List(HubListArgs {
+                    hub: Some(repo_hub()),
+                    json,
+                }),
+            })
+            .await
+            .expect("list");
+        }
+        for format in [
+            MatrixFormat::Table,
+            MatrixFormat::Markdown,
+            MatrixFormat::Json,
+        ] {
+            run(HubArgs {
+                command: HubCommand::Matrix(HubMatrixArgs {
+                    hub: Some(repo_hub()),
+                    format,
+                    out: None,
+                }),
+            })
+            .await
+            .expect("matrix");
+        }
+        let matrix_file = out.path().join("index.json");
+        run(HubArgs {
+            command: HubCommand::Matrix(HubMatrixArgs {
+                hub: Some(repo_hub()),
+                format: MatrixFormat::Json,
+                out: Some(matrix_file.clone()),
+            }),
+        })
+        .await
+        .expect("matrix to a file");
+        assert!(matrix_file.is_file());
+
+        run(HubArgs {
+            command: HubCommand::Lint(HubLintArgs {
+                hub: Some(repo_hub()),
+                files: vec![],
+                json: false,
+            }),
+        })
+        .await
+        .expect("the shipped catalog lints clean");
+        run(HubArgs {
+            command: HubCommand::Lint(HubLintArgs {
+                hub: Some(repo_hub()),
+                files: vec![PathBuf::from(repo_hub()).join("sink-templates/jsonl.yaml")],
+                json: true,
+            }),
+        })
+        .await
+        .expect("one file lints clean");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pairing_and_a_missing_hub_are_errors() {
+        let err = run(HubArgs {
+            command: HubCommand::Check(HubCheckArgs {
+                pair: pair("nope", "jsonl"),
+                json: false,
+            }),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no hub template 'nope'"), "{err}");
+
+        let err = run(HubArgs {
+            command: HubCommand::List(HubListArgs {
+                hub: Some("/definitely/not/a/hub".into()),
+                json: false,
+            }),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!err.is_empty());
     }
 }

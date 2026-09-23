@@ -58,6 +58,7 @@ export async function renderTemplates(container) {
       </div>
       <div id="t-register" hidden></div>
       <div id="t-sync-panel" hidden></div>
+      <div id="t-matrix" hidden></div>
       <div class="filters" id="t-filters" hidden>
         <input id="t-search" type="search" autocomplete="off"
           placeholder="search templates by id or description…" />
@@ -196,12 +197,36 @@ export async function renderTemplates(container) {
   };
   let syncOrigins = [];
 
+  const matrixHost = container.querySelector("#t-matrix");
+  // The source × sink compatibility matrix — shown as soon as the registry
+  // holds at least one of each kind, fetched separately so the list never
+  // waits on composition.
+  async function loadMatrix() {
+    const hasSources = all.some((t) => kindOf(t) === "source-template");
+    const hasSinks = all.some((t) => kindOf(t) === "sink-template");
+    if (!hasSources || !hasSinks) {
+      matrixHost.hidden = true;
+      matrixHost.innerHTML = "";
+      return;
+    }
+    try {
+      const idx = await api("/v1/templates/matrix");
+      matrixHost.innerHTML = "";
+      matrixHost.appendChild(renderMatrix(idx));
+      matrixHost.hidden = false;
+    } catch (e) {
+      matrixHost.hidden = true;
+      toast(`matrix: ${e.message}`, "error");
+    }
+  }
+
   async function load() {
     try {
       const data = await api("/v1/templates");
       all = data.templates || [];
       syncOrigins = (data.sync && data.sync.origins) || [];
       syncBtn.hidden = syncOrigins.length === 0;
+      loadMatrix();
       list.innerHTML = "";
       if (!all.length) {
         filters.hidden = true;
@@ -220,6 +245,54 @@ export async function renderTemplates(container) {
   }
 
   await load();
+}
+
+/** Source × sink compatibility grid (RFC 0008 / #677). A ✓ cell opens the
+ *  source template's page with that sink preselected; a partial cell shows
+ *  how many streams have a viable write mode; the tooltip lists the plan. */
+function renderMatrix(idx) {
+  const sources = idx.sources || [];
+  const sinks = idx.sinks || [];
+  const cells = new Map((idx.matrix || []).map((c) => [`${c.source}\u0000${c.sink}`, c]));
+  const el = document.createElement("section");
+  el.className = "tpl-matrix";
+  const head = sinks
+    .map((k) => `<th title="${escapeHtml(k.description || "")}"><a href="#/templates/${encodeURIComponent(k.id || k.name)}" class="mono">${escapeHtml(k.name)}</a><span class="tpl-matrix-kind">${escapeHtml(k.sink_type || "")}</span></th>`)
+    .join("");
+  const rows = sources
+    .map((s) => {
+      const tds = sinks
+        .map((k) => {
+          const c = cells.get(`${s.name}\u0000${k.name}`);
+          if (!c) return `<td class="tpl-cell tpl-cell-none">—</td>`;
+          const total = (s.streams || []).length;
+          const plan = (c.streams || [])
+            .map((p) => `${p.stream}: ${p.write_mode}${p.satisfies ? ` (for ${p.satisfies})` : ""}`)
+            .concat((c.incompatible || []).map((i) => `${i.stream}: ✗ ${i.reason}`))
+            .join("\n");
+          const href = `#/templates/${encodeURIComponent(s.name)}?sink=${encodeURIComponent(k.name)}`;
+          if (c.compatible) {
+            return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(s.name)} into ${escapeHtml(k.name)}">✓</a></td>`;
+          }
+          const ok = (c.streams || []).length;
+          return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(plan)}">${ok ? `<a href="${href}">${ok}/${total}</a>` : "✗"}</td>`;
+        })
+        .join("");
+      return `<tr><th scope="row"><a href="#/templates/${encodeURIComponent(s.name)}" class="mono">${escapeHtml(s.name)}</a><span class="tpl-matrix-kind">${escapeHtml(s.source_type || "")} · ${(s.streams || []).length} stream${(s.streams || []).length === 1 ? "" : "s"}</span></th>${tds}</tr>`;
+    })
+    .join("");
+  el.innerHTML = `
+    <div class="tpl-matrix-head">
+      <h2 class="tpl-h2">Compatibility</h2>
+      <span class="run-meta">source × sink — ✓ every stream has a write mode the sink supports; click a cell to run that pairing</span>
+    </div>
+    <div class="tpl-matrix-scroll">
+      <table class="tbl tpl-matrix-table">
+        <thead><tr><th class="tpl-matrix-corner">source \\ sink</th>${head}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  return el;
 }
 
 function listRow(t) {
@@ -403,7 +476,8 @@ streams:
 
 // ── detail / versions page ──────────────────────────────────────────────────
 
-export async function renderTemplateDetail(container, { id }) {
+export async function renderTemplateDetail(container, { id, query }) {
+  const preselectSink = query && query.get("sink");
   container.innerHTML = `<div class="page"><div class="empty">loading…</div></div>`;
 
   // The detail response carries the whole release state, so one request is
@@ -419,7 +493,7 @@ export async function renderTemplateDetail(container, { id }) {
     return;
   }
 
-  const reload = () => renderTemplateDetail(container, { id });
+  const reload = () => renderTemplateDetail(container, { id, query });
   const st = { status: d.status, versions: d.versions, stable: d.stable, previous: d.previous, newest: d.newest, tags: d.tags || {}, deprecation: d.deprecation };
 
   container.innerHTML = `
@@ -510,7 +584,7 @@ export async function renderTemplateDetail(container, { id }) {
   renderVersions(container.querySelector("#t-versions"), id, st, d, reload);
   const kind = kindOf(d);
   if (kind === "sink-template") renderSinkPairings(container.querySelector("#t-trigger"), id);
-  else renderTrigger(container.querySelector("#t-trigger"), id, st, d, kind === "source-template");
+  else renderTrigger(container.querySelector("#t-trigger"), id, st, d, kind === "source-template", preselectSink);
   renderLaunches(container.querySelector("#t-launches"), d.launches || []);
 }
 
@@ -634,7 +708,7 @@ async function renderSinkPairings(host, id) {
 /** A typed form over the template's declared `params:`, plus a version selector.
  *  For a source template (`withSink`) the form also picks a registered sink
  *  template + version, and the param fields are the union of both. */
-async function renderTrigger(host, id, st, d, withSink = false) {
+async function renderTrigger(host, id, st, d, withSink = false, preselectSink = null) {
   const ownParams = d.params || {};
   // Only offer channels that actually resolve — an unset one would just 422.
   const choices = ["stable", "newest", "previous", ...Object.keys(st.tags).sort()].filter(
@@ -684,6 +758,7 @@ async function renderTrigger(host, id, st, d, withSink = false) {
 
   const paramHost = host.querySelector("#tg-params");
   const sinkSel = host.querySelector("#tg-sink");
+  if (sinkSel && preselectSink && sinks.some((s) => s.id === preselectSink)) sinkSel.value = preselectSink;
   // The params the trigger binds: the template's own, plus (for a source
   // template) the selected sink's — the same merge the server performs.
   let params = ownParams;

@@ -204,6 +204,65 @@ pub async fn list_templates(
     }))
 }
 
+// ── GET /v1/templates/matrix ────────────────────────────────────────────────
+
+/// `GET /v1/templates/matrix` → 200. Composes every registered
+/// `source-template` with every registered `sink-template` — each at its
+/// `stable` version when launched, else its newest — and returns the hub
+/// index shape (`sources`, `sinks`, `matrix[]`), with `command` set to the
+/// `faucet template run … --sink …` invocation. Static route, matched ahead
+/// of `{id}`, so no template can be addressed as `matrix`.
+pub async fn template_matrix(State(state): State<ServerState>) -> Result<Json<Value>, ServeError> {
+    let store = store(&state);
+    let templates = crate::templates::list_with_state(&store)
+        .await
+        .map_err(map_err)?;
+    let mut sources = Vec::new();
+    let mut sinks = Vec::new();
+    for t in templates {
+        if !t.kind.is_hub() {
+            continue;
+        }
+        // What an unpinned trigger would compose: the launched build, else the tip.
+        let version = t.state.as_ref().and_then(|s| s.stable).unwrap_or(t.version);
+        let Some(rec) = store
+            .template_get(&t.id, Some(version))
+            .await
+            .map_err(|e| ServeError::Internal(format!("template registry read: {e}")))?
+        else {
+            continue;
+        };
+        let doc = crate::templates::parse_body(&rec.body, rec.format).map_err(map_err)?;
+        let path = std::path::PathBuf::from(&t.id);
+        match t.kind {
+            crate::hub::TemplateKind::SourceTemplate => {
+                let s: crate::hub::SourceTemplate = serde_json::from_value(doc).map_err(|e| {
+                    ServeError::Internal(format!("stored source-template '{}': {e}", t.id))
+                })?;
+                sources.push((path, s));
+            }
+            crate::hub::TemplateKind::SinkTemplate => {
+                let k: crate::hub::SinkTemplate = serde_json::from_value(doc).map_err(|e| {
+                    ServeError::Internal(format!("stored sink-template '{}': {e}", t.id))
+                })?;
+                sinks.push((path, k));
+            }
+            crate::hub::TemplateKind::Pipeline => {}
+        }
+    }
+    sources.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    sinks.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    let cat = crate::hub::Catalog {
+        root: std::path::PathBuf::new(),
+        sources,
+        sinks,
+    };
+    Ok(Json(crate::hub::catalog::index_json_with(
+        &cat,
+        crate::hub::catalog::registry_run_command,
+    )))
+}
+
 // ── GET /v1/templates/{id} ──────────────────────────────────────────────────
 
 /// Optional `?version=` selector shared by get + delete. Accepts a channel name
@@ -1053,6 +1112,38 @@ write_mode_aliases:
         assert_eq!(rec.labels[LABEL_SINK_TEMPLATE], "local-jsonl");
         assert_eq!(rec.labels[LABEL_SINK_TEMPLATE_VERSION], "1");
         assert_eq!(rec.name.as_deref(), Some("acme-exports"));
+    }
+
+    #[tokio::test]
+    async fn the_matrix_composes_registered_sources_with_registered_sinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        // Empty registry → an empty, well-formed index.
+        let idx = template_matrix(State(state.clone())).await.unwrap().0;
+        assert_eq!(idx["sources"].as_array().map(Vec::len), Some(0));
+        assert_eq!(idx["matrix"].as_array().map(Vec::len), Some(0));
+
+        register_body(&state, source_template(dir.path())).await;
+        register_body(&state, sink_template(dir.path())).await;
+        register_demo(&state, &dir.path().join("o.jsonl")).await; // a pipeline is not part of the matrix
+
+        let idx = template_matrix(State(state.clone())).await.unwrap().0;
+        assert_eq!(idx["sources"][0]["name"], json!("acme-exports"));
+        assert_eq!(
+            idx["sources"][0]["file"],
+            json!("acme-exports"),
+            "registry id where a catalog has a path"
+        );
+        assert_eq!(idx["sinks"][0]["name"], json!("local-jsonl"));
+        let cell = &idx["matrix"][0];
+        assert_eq!(cell["compatible"], json!(true));
+        assert_eq!(cell["streams"][0]["write_mode"], json!("append"));
+        assert_eq!(cell["streams"][0]["satisfies"], json!("overwrite"));
+        let cmd = cell["command"].as_str().unwrap();
+        assert!(
+            cmd.starts_with("faucet template run acme-exports --sink local-jsonl"),
+            "{cmd}"
+        );
     }
 
     #[tokio::test]

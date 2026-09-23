@@ -2,9 +2,11 @@
 
 The **hub layout** for reusable pipeline templates, split so a template written
 once serves every destination. This directory ships the sink templates and two
-example source templates; real source templates are contributed to a shared
-catalog (a repository with the same layout that you point `--hub` at, or
-publish through the registry) rather than committed to the engine repo.
+example source templates; real source templates are contributed to the public
+catalog at [faucet-hq/template-hub](https://github.com/faucet-hq/template-hub)
+(the default `--hub` when this directory is not present; browse it at
+[faucet-hq.github.io/hub](https://faucet-hq.github.io/hub)) rather than
+committed to the engine repo.
 
 - **`source-templates/`** — one file per system. Owns the hard part: how to
   talk to the API (auth, pagination, incremental cursors), how records are

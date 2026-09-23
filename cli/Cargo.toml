@@ -24,11 +24,17 @@ path = "src/main.rs"
 # `serve` (HTTP control plane; links a web-server dependency tree and opens a
 # network listener). Opt in with `--features schedule` / `--features serve`, or
 # take everything with `--features full`.
-default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "cli-progress"]
+default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "cli-progress", "hub-remote"]
 
 # Everything the default build ships, plus the long-running runtime modes:
 # `schedule` (cron scheduler) and `serve` (HTTP control plane).
-full = ["default", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "source-rest-excel", "source-xml-excel", "file-formats"]
+full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "source-rest-excel", "source-xml-excel", "file-formats"]
+
+# Remote Template Hub catalogs (#677): `--hub github:owner/repo[@ref][/path]`
+# fetches a catalog through the GitHub contents API and caches it locally;
+# without it only directory hubs work. In `default` so `faucet run --source X
+# --sink Y` reaches the public hub out of the box.
+hub-remote = ["dep:reqwest"]
 
 # Data Movement Catalog (#279): the `catalog:` config block + post-run
 # recording (datasets, schema timelines, volume/freshness stats, lineage

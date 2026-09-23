@@ -80,7 +80,7 @@ impl MaterializedConfig {
 }
 
 /// Parse a config document by declared format into an untyped value.
-fn parse_body(body: &str, format: ConfigFormat) -> CliResult<Value> {
+pub fn parse_body(body: &str, format: ConfigFormat) -> CliResult<Value> {
     match format {
         ConfigFormat::Yaml => {
             serde_yaml::from_str(body).map_err(|e| CliError::Config(format!("invalid YAML: {e}")))

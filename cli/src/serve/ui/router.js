@@ -28,10 +28,15 @@ async function dispatch(container) {
     teardown = null;
   }
   const hash = window.location.hash || "#/runs";
+  // `#/path?k=v` — the query never takes part in matching; views read it as
+  // `params.query` (a URLSearchParams).
+  const qIdx = hash.indexOf("?");
+  const path = qIdx === -1 ? hash : hash.slice(0, qIdx);
+  const query = new URLSearchParams(qIdx === -1 ? "" : hash.slice(qIdx + 1));
   for (const r of routes) {
-    const m = hash.match(r.re);
+    const m = path.match(r.re);
     if (m) {
-      const params = {};
+      const params = { query };
       r.names.forEach((n, i) => (params[n] = decodeURIComponent(m[i + 1])));
       teardown = (await r.render(container, params)) || null;
       return;

@@ -492,6 +492,12 @@ curl -sX POST http://127.0.0.1:8080/v1/templates/acme-billing/runs \
 #        "params":{"api_token":"***","bq_project":"my-project"}}
 ```
 
+**Matrix.** `GET /v1/templates/matrix` composes every registered source
+template with every registered sink template and returns the catalog index
+shape (`sources`, `sinks`, `matrix[]` with per-stream write modes and a
+`command` per compatible pairing) — the console's compatibility grid. Like
+`/sync`, `matrix` is a static route, so no template can take that id.
+
 **Kinds.** `GET /v1/templates` rows carry `kind` (`?kind=` filters); rows written
 before kinds existed read as `pipeline`. A source template is registered under
 its `name` (an explicit `id` must match), its document is validated as a hub

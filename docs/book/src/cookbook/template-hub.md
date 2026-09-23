@@ -25,13 +25,14 @@ faucet run --source acme-billing --sink jsonl     # the same source, validated l
 faucet run --source acme-billing --sink postgres  # real upsert/overwrite semantics
 ```
 
-The repository ships the **layout and tooling** under
+The engine repository ships the **layout and tooling** under
 [`hub/`](https://github.com/faucet-hq/faucet-stream/tree/main/hub): sink templates
 for BigQuery, PostgreSQL, SQLite, and JSON Lines, plus two example source
 templates (`example-csv` runs offline; `example-rest-api` is a skeleton to copy).
-Real source templates belong in a shared catalog — a repository with the same
-layout that you point `--hub` (or `$FAUCET_HUB`) at — so the engine repo does
-not become a vendor directory. The generated
+Real source templates live in the **public hub**,
+[faucet-hq/template-hub](https://github.com/faucet-hq/template-hub) — the
+default `--hub`, browsable at [faucet-hq.github.io/hub](https://faucet-hq.github.io/hub) —
+so the engine repo does not become a vendor directory. The generated
 [source × sink matrix](../reference/template-hub-matrix.md) renders whatever
 catalog the docs are built from, with a copy-paste command per pairing.
 
@@ -184,7 +185,70 @@ faucet schema source-template | sink-template
 
 `--source` / `--sink` take a **path** or a **hub id**, resolved as
 `<hub>/source-templates/<id>.yaml` and `<hub>/sink-templates/<id>.yaml`. The
-hub directory is `--hub`, else `$FAUCET_HUB`, else `./hub`.
+hub is `--hub`, else `$FAUCET_HUB`, else `./hub` when that directory exists,
+else the **public hub** (next section).
+
+## The public hub
+
+The shared catalog lives at
+[github.com/faucet-hq/template-hub](https://github.com/faucet-hq/template-hub)
+and is browsable at [faucet-hq.github.io/hub](https://faucet-hq.github.io/hub).
+It is the default hub, so with no `./hub` checkout and no `--hub`:
+
+```bash
+faucet hub list                                   # fetches github:faucet-hq/template-hub (cached)
+faucet run --source acme-billing --sink bigquery --param api_token="$T" …
+```
+
+A remote hub is any GitHub repository laid out like `hub/`:
+`--hub github:owner/repo[@ref][/path]` or a `https://github.com/…[/tree/ref/path]`
+URL. The CLI resolves the ref to a commit with one API request, downloads the
+catalog into `~/.cache/faucet/hub/<repo>/<ref>/<commit>/` the first time, and
+reuses the snapshot until the ref moves. Offline, the last snapshot is used
+with a warning (`FAUCET_HUB_OFFLINE=1` skips the network altogether); it never
+falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
+sent when set — needed for a private catalog, and it lifts the anonymous API
+rate limit.
+
+### Mirror the hub into your server
+
+`faucet serve` pulls the catalog into its template registry with a sync file
+([hosting templates](./templates.md#hosting-templates-in-a-repo-or-bucket-sync)),
+so the console's Templates view lists every hub template with a kind pill, a
+source template's page offers every registered sink in its trigger form, and
+the **Compatibility** grid (`GET /v1/templates/matrix`) shows which pairings
+work:
+
+```yaml
+# cli/examples/templates/hub-sync.yaml
+version: 1
+origins:
+  - name: hub
+    source:
+      type: github
+      config: { repo: faucet-hq/template-hub, paths: [source-templates, sink-templates] }
+    launch: always
+    interval_secs: 3600
+```
+
+```bash
+faucet serve --history sqlite:./faucet.db --templates-sync cli/examples/templates/hub-sync.yaml
+```
+
+`paths` reads both catalog directories as one origin. A hub's source and sink
+names share the registry's id namespace, so a stem may appear in only one of
+them.
+
+### Publish a template
+
+Registering a template in the public hub is a pull request to the catalog
+repository — the lint is the review bar, and CI composes every pairing. The
+website's **Publish** button opens a pre-filled new-file form; or copy the
+closest existing file and follow
+[CONTRIBUTING](https://github.com/faucet-hq/template-hub/blob/main/CONTRIBUTING.md).
+Your own organisation's templates can live in a private repository with the
+same layout: point `--hub github:org/catalog` (with `GITHUB_TOKEN`) or a sync
+origin at it.
 
 ## Registering hub templates
 

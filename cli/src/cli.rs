@@ -893,9 +893,12 @@ pub struct HubPairArgs {
     /// Sink template: a path, or an id resolved as `<hub>/sink-templates/<id>.yaml`.
     #[arg(long)]
     pub sink: String,
-    /// Hub catalog directory. Default: `$FAUCET_HUB`, else `./hub`.
-    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
-    pub hub: Option<PathBuf>,
+    /// Hub catalog: a directory, `github:owner/repo[@ref][/path]`, or a GitHub
+    /// URL. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the
+    /// public hub `github:faucet-hq/template-hub` (cached under
+    /// `~/.cache/faucet/hub`).
+    #[arg(long, env = "FAUCET_HUB")]
+    pub hub: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -920,9 +923,12 @@ pub struct HubCheckArgs {
 
 #[derive(Debug, Parser)]
 pub struct HubListArgs {
-    /// Hub catalog directory. Default: `$FAUCET_HUB`, else `./hub`.
-    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
-    pub hub: Option<PathBuf>,
+    /// Hub catalog: a directory, `github:owner/repo[@ref][/path]`, or a GitHub
+    /// URL. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the
+    /// public hub `github:faucet-hq/template-hub` (cached under
+    /// `~/.cache/faucet/hub`).
+    #[arg(long, env = "FAUCET_HUB")]
+    pub hub: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -941,8 +947,12 @@ pub enum MatrixFormat {
 
 #[derive(Debug, Parser)]
 pub struct HubMatrixArgs {
-    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
-    pub hub: Option<PathBuf>,
+    /// Hub catalog: a directory, `github:owner/repo[@ref][/path]`, or a GitHub
+    /// URL. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the
+    /// public hub `github:faucet-hq/template-hub` (cached under
+    /// `~/.cache/faucet/hub`).
+    #[arg(long, env = "FAUCET_HUB")]
+    pub hub: Option<String>,
     #[arg(long, value_enum, default_value_t = MatrixFormat::Table)]
     pub format: MatrixFormat,
     /// Write to this file instead of stdout.
@@ -952,8 +962,12 @@ pub struct HubMatrixArgs {
 
 #[derive(Debug, Parser)]
 pub struct HubLintArgs {
-    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
-    pub hub: Option<PathBuf>,
+    /// Hub catalog: a directory, `github:owner/repo[@ref][/path]`, or a GitHub
+    /// URL. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the
+    /// public hub `github:faucet-hq/template-hub` (cached under
+    /// `~/.cache/faucet/hub`).
+    #[arg(long, env = "FAUCET_HUB")]
+    pub hub: Option<String>,
     /// Template files to lint (kind read from `kind:`). Default: the whole catalog.
     #[arg(value_hint = clap::ValueHint::FilePath)]
     pub files: Vec<PathBuf>,
@@ -1527,10 +1541,12 @@ pub struct RunArgs {
     /// Template Hub: the `sink-template` (path or hub id) to compose with `--source`.
     #[arg(long, requires = "source")]
     pub sink: Option<String>,
-    /// Hub catalog directory for `--source` / `--sink` ids. Default:
-    /// `$FAUCET_HUB`, else `./hub`.
-    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
-    pub hub: Option<PathBuf>,
+    /// Hub catalog for `--source` / `--sink` ids: a directory,
+    /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Default:
+    /// `$FAUCET_HUB`, else `./hub` when it exists, else the public hub
+    /// `github:faucet-hq/template-hub`.
+    #[arg(long, env = "FAUCET_HUB")]
+    pub hub: Option<String>,
 }
 
 /// Format for `faucet run`'s end-of-run summary.
@@ -1743,10 +1759,12 @@ pub struct ValidateArgs {
     /// Template Hub: the `sink-template` (path or hub id) to compose with `--source`.
     #[arg(long, requires = "source")]
     pub sink: Option<String>,
-    /// Hub catalog directory for `--source` / `--sink` ids. Default:
-    /// `$FAUCET_HUB`, else `./hub`.
-    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
-    pub hub: Option<PathBuf>,
+    /// Hub catalog for `--source` / `--sink` ids: a directory,
+    /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Default:
+    /// `$FAUCET_HUB`, else `./hub` when it exists, else the public hub
+    /// `github:faucet-hq/template-hub`.
+    #[arg(long, env = "FAUCET_HUB")]
+    pub hub: Option<String>,
 }
 
 /// `faucet schema` arguments.

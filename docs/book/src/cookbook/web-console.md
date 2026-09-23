@@ -113,9 +113,13 @@ carries a **kind** pill — `source` (a system and its streams), `sink` (a
 destination), or `pipeline` (a complete config) — beside its lifecycle status
 (`draft` / `launched` / `deprecated`), which version is live, the build tip, and
 its parameter count. Chips filter by status and by kind (deprecated templates are
-hidden until their chip is toggled on):
+hidden until their chip is toggled on). As soon as the registry holds a source
+template and a sink template, a **Compatibility** grid sits above the list —
+one row per source, one column per sink, ✓ where every stream has a write mode
+the sink supports (the tooltip lists the per-stream plan); clicking a cell opens
+the source's page with that sink preselected in its trigger form:
 
-![The Templates view listing a source template, a sink template, and two pipeline templates — one launched at v2, one draft — each with a kind pill, its live and newest version, and the status / kind filter chips](../assets/console/templates.png)
+![The Templates view: a Compatibility grid (two source templates × two sink templates, all ✓) above the list of source, sink and pipeline templates, each with a kind pill, its live and newest version, and the status / kind filter chips](../assets/console/templates.png)
 
 Clicking one opens its **versions page** — the release console for that template:
 

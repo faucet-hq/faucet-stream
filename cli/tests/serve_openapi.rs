@@ -68,6 +68,7 @@ const ROUTES_CATALOG: &[(&str, &str)] = &[
 const ROUTES_TEMPLATES: &[(&str, &str)] = &[
     ("POST", "/v1/templates"),
     ("GET", "/v1/templates"),
+    ("GET", "/v1/templates/matrix"),
     ("GET", "/v1/templates/{id}"),
     ("DELETE", "/v1/templates/{id}"),
     ("POST", "/v1/templates/{id}/runs"),

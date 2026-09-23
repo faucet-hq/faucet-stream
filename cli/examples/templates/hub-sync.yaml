@@ -1,0 +1,30 @@
+# Mirror the public Template Hub into a running `faucet serve` (#677).
+#
+#   faucet serve --history sqlite:./faucet.db --templates-sync cli/examples/templates/hub-sync.yaml
+#
+# Every `kind: source-template` and `kind: sink-template` in
+# https://github.com/faucet-hq/template-hub registers into the server's
+# template registry under its own name (RFC 0008), so the console's Templates
+# view lists the whole catalog and a source template's page offers every
+# registered sink in its trigger form. Pulled once at startup, then every
+# `interval_secs`; `POST /v1/templates/sync` pulls on demand.
+#
+# `launch: always` makes each pulled version live immediately — right for a
+# curated public catalog you want usable the moment it syncs. Use `follow` to
+# honour per-template sidecars, or `ignore` to review in the console first.
+#
+# `paths` reads both catalog directories as one origin (source and sink names
+# share the registry's id namespace, so a stem may appear in only one of them).
+version: 1
+origins:
+  - name: hub
+    source:
+      type: github
+      config:
+        repo: faucet-hq/template-hub
+        ref: main
+        paths: [source-templates, sink-templates]
+        # token: "${env:GITHUB_TOKEN}"   # optional — lifts the anonymous API rate limit
+    launch: always
+    prune: keep
+    interval_secs: 3600
