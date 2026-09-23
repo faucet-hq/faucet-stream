@@ -1,0 +1,20 @@
+# Template Hub sink: Google BigQuery. One table per stream (`table_id`); the
+# composer sets `write_mode` per stream (overwrite = atomic in-place replace,
+# upsert = MERGE on the stream's primary keys, append = streaming insert).
+kind: sink-template
+name: bigquery
+description: Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert
+tags: [warehouse, gcp]
+docs: https://faucet-hq.github.io/faucet-stream/reference/connectors.html
+params:
+  bq_project: { type: string, required: true, description: "GCP project id that owns the dataset" }
+  bq_dataset: { type: string, default: raw, description: "Dataset every stream's table lands in" }
+  bq_sa_key:  { type: string, required: true, secret: true, description: "Service-account key JSON, inline. Pass it with --param-env from a secret store; copy this template and switch `auth` to application_default to use ADC instead." }
+sink:
+  type: bigquery
+  config:
+    project_id: "${param.bq_project}"
+    dataset_id: "${param.bq_dataset}"
+    auth: { type: service_account_key, config: { json: "${param.bq_sa_key}" } }
+per_stream:
+  table_id: "${stream}"

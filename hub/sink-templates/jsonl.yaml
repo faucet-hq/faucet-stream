@@ -1,0 +1,19 @@
+# Template Hub sink: local JSON Lines files — the "validate locally first"
+# destination. One file per stream under `<out_dir>/<source>/`. The file is
+# rewritten on every run (`append: false`), which is a full refresh — so a
+# stream that wants `overwrite` is satisfied by running it as `append`
+# (declared below). Keyed modes (`upsert`) cannot be satisfied by a file.
+kind: sink-template
+name: jsonl
+description: Local JSON Lines files, one per stream — the local validation destination
+tags: [file, local]
+params:
+  out_dir: { type: string, default: ./out, description: "Directory to write <source>/<stream>.jsonl under" }
+sink:
+  type: jsonl
+  config:
+    append: false
+per_stream:
+  path: "${param.out_dir}/${source}/${stream}.jsonl"
+write_mode_aliases:
+  overwrite: append

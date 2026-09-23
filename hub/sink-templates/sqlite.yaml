@@ -1,0 +1,16 @@
+# Template Hub sink: a local SQLite file — zero-infrastructure validation with
+# real write semantics (transactional overwrite, ON CONFLICT upsert). One
+# auto-mapped table per stream.
+kind: sink-template
+name: sqlite
+description: Local SQLite database — one auto-mapped table per stream, real overwrite/upsert semantics without infrastructure
+tags: [database, local]
+params:
+  sqlite_path: { type: string, default: ./out/faucet.db, description: "Database file (created if missing)" }
+sink:
+  type: sqlite
+  config:
+    database_url: "sqlite:${param.sqlite_path}"
+    column_mapping: auto_map
+per_stream:
+  table_name: "${stream}"

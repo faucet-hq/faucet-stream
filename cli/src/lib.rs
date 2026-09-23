@@ -30,6 +30,7 @@ pub mod error;
 pub mod exec_metrics;
 pub mod executor;
 pub mod expand;
+pub mod hub;
 pub mod init_template;
 pub mod interpolate;
 #[cfg(feature = "lineage")]
@@ -211,6 +212,7 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         Command::Doctor(args) => commands::doctor::run(args).await,
         Command::Test(args) => commands::test::run(args).await,
         Command::Dlq(args) => commands::dlq::run(args).await,
+        Command::Hub(args) => commands::hub::run(args).await,
         #[cfg(feature = "contract")]
         Command::Contract(args) => commands::contract::run(args).await,
         #[cfg(feature = "masking")]

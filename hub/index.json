@@ -1,0 +1,387 @@
+{
+  "matrix": [
+    {
+      "command": "faucet run --source example-csv --sink bigquery \\\n  --param bq_project=<bq_project> \\\n  --param bq_sa_key=\"$BQ_SA_KEY\"",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "bigquery",
+      "source": "example-csv",
+      "streams": [
+        {
+          "satisfies": null,
+          "stream": "orders",
+          "write_mode": "overwrite"
+        },
+        {
+          "satisfies": null,
+          "stream": "customers",
+          "write_mode": "overwrite"
+        }
+      ]
+    },
+    {
+      "command": "faucet run --source example-csv --sink jsonl",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "jsonl",
+      "source": "example-csv",
+      "streams": [
+        {
+          "satisfies": "overwrite",
+          "stream": "orders",
+          "write_mode": "append"
+        },
+        {
+          "satisfies": "overwrite",
+          "stream": "customers",
+          "write_mode": "append"
+        }
+      ]
+    },
+    {
+      "command": "faucet run --source example-csv --sink postgres \\\n  --param pg_url=\"$PG_URL\"",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "postgres",
+      "source": "example-csv",
+      "streams": [
+        {
+          "satisfies": null,
+          "stream": "orders",
+          "write_mode": "overwrite"
+        },
+        {
+          "satisfies": null,
+          "stream": "customers",
+          "write_mode": "overwrite"
+        }
+      ]
+    },
+    {
+      "command": "faucet run --source example-csv --sink sqlite",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "sqlite",
+      "source": "example-csv",
+      "streams": [
+        {
+          "satisfies": null,
+          "stream": "orders",
+          "write_mode": "overwrite"
+        },
+        {
+          "satisfies": null,
+          "stream": "customers",
+          "write_mode": "overwrite"
+        }
+      ]
+    },
+    {
+      "command": "faucet run --source example-rest-api --sink bigquery \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url> \\\n  --param bq_project=<bq_project> \\\n  --param bq_sa_key=\"$BQ_SA_KEY\"",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "bigquery",
+      "source": "example-rest-api",
+      "streams": [
+        {
+          "satisfies": null,
+          "stream": "accounts",
+          "write_mode": "overwrite"
+        },
+        {
+          "satisfies": null,
+          "stream": "events",
+          "write_mode": "upsert"
+        }
+      ]
+    },
+    {
+      "command": "faucet run --source example-rest-api --sink jsonl \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url>",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "jsonl",
+      "source": "example-rest-api",
+      "streams": [
+        {
+          "satisfies": "overwrite",
+          "stream": "accounts",
+          "write_mode": "append"
+        },
+        {
+          "satisfies": null,
+          "stream": "events",
+          "write_mode": "append"
+        }
+      ]
+    },
+    {
+      "command": "faucet run --source example-rest-api --sink postgres \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url> \\\n  --param pg_url=\"$PG_URL\"",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "postgres",
+      "source": "example-rest-api",
+      "streams": [
+        {
+          "satisfies": null,
+          "stream": "accounts",
+          "write_mode": "overwrite"
+        },
+        {
+          "satisfies": null,
+          "stream": "events",
+          "write_mode": "upsert"
+        }
+      ]
+    },
+    {
+      "command": "faucet run --source example-rest-api --sink sqlite \\\n  --param api_token=\"$API_TOKEN\" \\\n  --param base_url=<base_url>",
+      "compatible": true,
+      "incompatible": [],
+      "sink": "sqlite",
+      "source": "example-rest-api",
+      "streams": [
+        {
+          "satisfies": null,
+          "stream": "accounts",
+          "write_mode": "overwrite"
+        },
+        {
+          "satisfies": null,
+          "stream": "events",
+          "write_mode": "upsert"
+        }
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "description": "Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert",
+      "docs": "https://faucet-hq.github.io/faucet-stream/reference/connectors.html",
+      "file": "sink-templates/bigquery.yaml",
+      "name": "bigquery",
+      "params": [
+        {
+          "default": "raw",
+          "description": "Dataset every stream's table lands in",
+          "name": "bq_dataset",
+          "required": false,
+          "secret": false,
+          "type": "string"
+        },
+        {
+          "default": null,
+          "description": "GCP project id that owns the dataset",
+          "name": "bq_project",
+          "required": true,
+          "secret": false,
+          "type": "string"
+        },
+        {
+          "default": null,
+          "description": "Service-account key JSON, inline. Pass it with --param-env from a secret store; copy this template and switch `auth` to application_default to use ADC instead.",
+          "name": "bq_sa_key",
+          "required": true,
+          "secret": true,
+          "type": "string"
+        }
+      ],
+      "sink_type": "bigquery",
+      "tags": [
+        "warehouse",
+        "gcp"
+      ],
+      "write_modes": [
+        "append",
+        "upsert",
+        "delete",
+        "overwrite"
+      ]
+    },
+    {
+      "description": "Local JSON Lines files, one per stream — the local validation destination",
+      "docs": null,
+      "file": "sink-templates/jsonl.yaml",
+      "name": "jsonl",
+      "params": [
+        {
+          "default": "./out",
+          "description": "Directory to write <source>/<stream>.jsonl under",
+          "name": "out_dir",
+          "required": false,
+          "secret": false,
+          "type": "string"
+        }
+      ],
+      "sink_type": "jsonl",
+      "tags": [
+        "file",
+        "local"
+      ],
+      "write_modes": [
+        "append"
+      ]
+    },
+    {
+      "description": "PostgreSQL — one auto-mapped table per stream, transactional overwrite or ON CONFLICT upsert",
+      "docs": null,
+      "file": "sink-templates/postgres.yaml",
+      "name": "postgres",
+      "params": [
+        {
+          "default": "public",
+          "description": "Schema every stream's table is created in",
+          "name": "pg_schema",
+          "required": false,
+          "secret": false,
+          "type": "string"
+        },
+        {
+          "default": null,
+          "description": "postgres://user:pass@host:5432/db connection URL",
+          "name": "pg_url",
+          "required": true,
+          "secret": true,
+          "type": "string"
+        }
+      ],
+      "sink_type": "postgres",
+      "tags": [
+        "database"
+      ],
+      "write_modes": [
+        "append",
+        "upsert",
+        "delete",
+        "overwrite"
+      ]
+    },
+    {
+      "description": "Local SQLite database — one auto-mapped table per stream, real overwrite/upsert semantics without infrastructure",
+      "docs": null,
+      "file": "sink-templates/sqlite.yaml",
+      "name": "sqlite",
+      "params": [
+        {
+          "default": "./out/faucet.db",
+          "description": "Database file (created if missing)",
+          "name": "sqlite_path",
+          "required": false,
+          "secret": false,
+          "type": "string"
+        }
+      ],
+      "sink_type": "sqlite",
+      "tags": [
+        "database",
+        "local"
+      ],
+      "write_modes": [
+        "append",
+        "upsert",
+        "delete",
+        "overwrite"
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "description": "Example — two CSV exports as two streams (runs offline, no credentials)",
+      "docs": null,
+      "file": "source-templates/example-csv.yaml",
+      "name": "example-csv",
+      "params": [
+        {
+          "default": "./hub/examples/data",
+          "description": "Directory holding orders.csv and customers.csv",
+          "name": "data_dir",
+          "required": false,
+          "secret": false,
+          "type": "string"
+        }
+      ],
+      "source_type": "csv",
+      "streams": [
+        {
+          "description": null,
+          "name": "orders",
+          "primary_keys": [
+            "id"
+          ],
+          "write": [
+            "overwrite",
+            "upsert"
+          ]
+        },
+        {
+          "description": null,
+          "name": "customers",
+          "primary_keys": [
+            "id"
+          ],
+          "write": [
+            "overwrite",
+            "upsert"
+          ]
+        }
+      ],
+      "tags": [
+        "example",
+        "file"
+      ]
+    },
+    {
+      "description": "Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint",
+      "docs": null,
+      "file": "source-templates/example-rest-api.yaml",
+      "name": "example-rest-api",
+      "params": [
+        {
+          "default": null,
+          "description": "Bearer token",
+          "name": "api_token",
+          "required": true,
+          "secret": true,
+          "type": "string"
+        },
+        {
+          "default": null,
+          "description": "API root, e.g. https://api.example.com/v1",
+          "name": "base_url",
+          "required": true,
+          "secret": false,
+          "type": "string"
+        }
+      ],
+      "source_type": "rest",
+      "streams": [
+        {
+          "description": null,
+          "name": "accounts",
+          "primary_keys": [
+            "id"
+          ],
+          "write": [
+            "overwrite",
+            "upsert"
+          ]
+        },
+        {
+          "description": null,
+          "name": "events",
+          "primary_keys": [
+            "id"
+          ],
+          "write": [
+            "upsert",
+            "append"
+          ]
+        }
+      ],
+      "tags": [
+        "example",
+        "rest"
+      ]
+    }
+  ],
+  "version": 1
+}

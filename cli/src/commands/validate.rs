@@ -20,52 +20,109 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
         crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
     crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
 
-    let path = match args.config {
-        Some(p) => p,
-        None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
-    };
-
-    if args.show_composed {
-        let composed = crate::compose::compose(&path, args.profile.as_deref())?;
-        // Normalize to exactly one trailing newline: the YAML serializer appends
-        // one but `serde_json::to_string_pretty` (JSON-format configs) does not,
-        // and the fast path echoes the file verbatim. A single `\n` keeps
-        // `faucet validate … --show-composed > out.{yaml,json}` well-formed.
-        println!("{}", composed.trim_end_matches('\n'));
-        return Ok(());
-    }
-
-    // Typed run params (#444). With no `--param`, required params bind to
-    // type-shaped placeholders so a parameterized config still validates in CI;
-    // supplying any `--param` opts into strict binding, which is how you check a
-    // concrete invocation.
-    let inputs = crate::config::RunInputs {
-        params: crate::params::collect_cli_params(&args.param)?,
-        env: crate::params::collect_env_overrides(&args.param_env)?
-            .into_iter()
-            .collect(),
-        mode: if args.param.is_empty() {
-            crate::params::BindMode::Placeholder
-        } else {
-            crate::params::BindMode::Strict
-        },
-    };
-
-    let cfg = if args.no_secrets {
-        // Grammar / structure only — never touch the network.
-        PipelineConfig::from_path_tolerating_secrets_with(&path, args.profile.as_deref(), &inputs)?
-    } else {
-        // Real preflight: report each secret reference, then resolve.
-        let refs = crate::secrets::scan_path_refs_with(&path, args.profile.as_deref(), &inputs)?;
-        let cfg =
-            PipelineConfig::from_path_async_with(&path, args.profile.as_deref(), &inputs).await?;
+    // Template Hub (#571): validate a composed pairing offline. Placeholder
+    // binding unless `--param` is given, exactly like a file. A single
+    // `report` await at the end keeps the future small (see `run`).
+    let cfg = if let (Some(source), Some(sink)) = (&args.source, &args.sink) {
+        let hub_dir = crate::hub::hub_dir(args.hub.as_deref());
+        let composition = crate::hub::compose_locators(source, sink, &hub_dir)?;
+        if args.show_composed {
+            print!("{}", composition.to_yaml()?);
+            return Ok(());
+        }
+        let inputs = crate::config::RunInputs {
+            params: crate::params::collect_cli_params(&args.param)?,
+            env: crate::params::collect_env_overrides(&args.param_env)?
+                .into_iter()
+                .collect(),
+            mode: if args.param.is_empty() {
+                crate::params::BindMode::Placeholder
+            } else {
+                crate::params::BindMode::Strict
+            },
+        };
+        let cfg = crate::hub::load_composed(&composition, &inputs)?;
         if !args.json {
-            for (scheme, reference) in &refs {
-                println!("secret: {scheme}:{reference} → resolved");
+            println!(
+                "hub: composed source-template '{}' × sink-template '{}' ({}) — {} stream(s)",
+                composition.source,
+                composition.sink,
+                composition.sink_kind,
+                composition.streams.len()
+            );
+            for p in &composition.streams {
+                println!("  {:<32} write_mode: {}", p.stream, p.describe());
             }
         }
         cfg
+    } else {
+        let path = match args.config.clone() {
+            Some(p) => p,
+            None => {
+                crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?
+            }
+        };
+        if let Some(kind) = crate::hub::detect_kind_in_file(&path) {
+            return Err(CliError::Config(format!(
+                "{} is a hub {} — validate a pairing: `faucet validate --source <source-template> --sink <sink-template>`",
+                path.display(),
+                kind.as_str()
+            )));
+        }
+
+        if args.show_composed {
+            let composed = crate::compose::compose(&path, args.profile.as_deref())?;
+            // Normalize to exactly one trailing newline: the YAML serializer appends
+            // one but `serde_json::to_string_pretty` (JSON-format configs) does not,
+            // and the fast path echoes the file verbatim. A single `\n` keeps
+            // `faucet validate … --show-composed > out.{yaml,json}` well-formed.
+            println!("{}", composed.trim_end_matches('\n'));
+            return Ok(());
+        }
+
+        // Typed run params (#444). With no `--param`, required params bind to
+        // type-shaped placeholders so a parameterized config still validates in CI;
+        // supplying any `--param` opts into strict binding, which is how you check a
+        // concrete invocation.
+        let inputs = crate::config::RunInputs {
+            params: crate::params::collect_cli_params(&args.param)?,
+            env: crate::params::collect_env_overrides(&args.param_env)?
+                .into_iter()
+                .collect(),
+            mode: if args.param.is_empty() {
+                crate::params::BindMode::Placeholder
+            } else {
+                crate::params::BindMode::Strict
+            },
+        };
+
+        if args.no_secrets {
+            // Grammar / structure only — never touch the network.
+            PipelineConfig::from_path_tolerating_secrets_with(
+                &path,
+                args.profile.as_deref(),
+                &inputs,
+            )?
+        } else {
+            // Real preflight: report each secret reference, then resolve.
+            let refs =
+                crate::secrets::scan_path_refs_with(&path, args.profile.as_deref(), &inputs)?;
+            let cfg = PipelineConfig::from_path_async_with(&path, args.profile.as_deref(), &inputs)
+                .await?;
+            if !args.json {
+                for (scheme, reference) in &refs {
+                    println!("secret: {scheme}:{reference} → resolved");
+                }
+            }
+            cfg
+        }
     };
+    report(cfg, args).await
+}
+
+/// Everything `validate` prints once a config is loaded — shared by the
+/// file path and the hub-composed path so both report identically.
+async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
     if !cfg.params.is_empty() && !args.json {
         let required: Vec<&str> = cfg
             .params

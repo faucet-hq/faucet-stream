@@ -65,7 +65,18 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
         crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
     crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
 
-    let resolved_config_path: Option<std::path::PathBuf> = if args.from_env {
+    // Template Hub (#571): `--source X --sink Y` composes two hub templates
+    // into a config document and runs it through the identical path a file
+    // would take — params binding, secret resolution, expand, execute.
+    // (One `execute` await below, not an early return here: the run future is
+    // large, and awaiting it twice doubles the frame — enough to overflow a
+    // test thread's stack.)
+    let hub_pair = match (&args.source, &args.sink) {
+        (Some(s), Some(k)) => Some((s.clone(), k.clone())),
+        _ => None,
+    };
+
+    let resolved_config_path: Option<std::path::PathBuf> = if args.from_env || hub_pair.is_some() {
         None
     } else {
         Some(match args.config.as_ref() {
@@ -76,7 +87,20 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
         })
     };
 
-    let cfg = if args.from_env {
+    let cfg = if let Some((source, sink)) = hub_pair {
+        let hub_dir = crate::hub::hub_dir(args.hub.as_deref());
+        let composition = crate::hub::compose_locators(&source, &sink, &hub_dir)?;
+        let inputs = crate::config::RunInputs {
+            params: crate::params::collect_cli_params(&args.param)?,
+            env: crate::params::collect_env_overrides(&args.param_env)?
+                .into_iter()
+                .collect(),
+            mode: crate::params::BindMode::Strict,
+        };
+        // Heap-pin the secret-resolving load so the hub branch adds no stack
+        // to the run future.
+        Box::pin(crate::hub::load_composed_async(&composition, &inputs)).await?
+    } else if args.from_env {
         if args.profile.is_some() {
             tracing::warn!(
                 "--profile / FAUCET_PROFILE has no effect in --from-env mode (no config file to compose); ignoring"
@@ -101,14 +125,19 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
                 .collect(),
             mode: crate::params::BindMode::Strict,
         };
-        PipelineConfig::from_path_async_with(
-            resolved_config_path
-                .as_ref()
-                .expect("YAML mode always resolves a path above"),
-            args.profile.as_deref(),
-            &inputs,
-        )
-        .await?
+        let path = resolved_config_path
+            .as_ref()
+            .expect("YAML mode always resolves a path above");
+        // A hub template handed to `run` directly would fail on `kind:` as an
+        // unknown field; say what it is and how to run it instead.
+        if let Some(kind) = crate::hub::detect_kind_in_file(path) {
+            return Err(CliError::Config(format!(
+                "{} is a hub {} — compose it: `faucet run --source <source-template> --sink <sink-template>`",
+                path.display(),
+                kind.as_str()
+            )));
+        }
+        PipelineConfig::from_path_async_with(path, args.profile.as_deref(), &inputs).await?
     };
 
     execute(cfg, args, resolved_config_path).await

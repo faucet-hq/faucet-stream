@@ -52,7 +52,7 @@ impl ParamType {
 }
 
 /// One declared parameter.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSpec {
     /// Value type. Governs coercion of the supplied value and the type

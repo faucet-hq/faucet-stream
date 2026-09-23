@@ -30,6 +30,8 @@ pub fn schema_targets() -> Vec<&'static str> {
     #[cfg(feature = "masking")]
     targets.push("masking");
     targets.push("test");
+    targets.push("source-template");
+    targets.push("sink-template");
     #[cfg(feature = "templates")]
     targets.push("template-test");
     #[cfg(feature = "templates-sync")]
@@ -137,6 +139,14 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         SchemaTarget::Triggers => {
             let s = faucet_core::schema_for!(crate::serve::triggers::spec::TriggersFile);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
+        SchemaTarget::SourceTemplate => {
+            serde_json::to_value(faucet_core::schema_for!(crate::hub::spec::SourceTemplate))
+                .expect("schema serialization")
+        }
+        SchemaTarget::SinkTemplate => {
+            serde_json::to_value(faucet_core::schema_for!(crate::hub::spec::SinkTemplate))
+                .expect("schema serialization")
         }
         SchemaTarget::Test => {
             let s = faucet_core::schema_for!(crate::pipeline_test::spec::TestSpecFile);

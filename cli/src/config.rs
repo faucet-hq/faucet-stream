@@ -1371,6 +1371,30 @@ impl PipelineConfig {
         Ok(cfg)
     }
 
+    /// Load a config from **text** the way [`Self::from_path_with`] loads a
+    /// file — env/file interpolation + params binding, then the typed parse,
+    /// rejecting unresolved secret directives. For documents that never lived
+    /// on disk (a hub composition); `path` picks the parser and labels errors.
+    pub fn from_text_with(text: &str, path: &Path, inputs: &RunInputs) -> CliResult<Self> {
+        let interpolated = resolve_document(text, path, inputs)?;
+        let cfg = Self::from_text(&interpolated, path)?;
+        crate::secrets::ensure_no_secret_directives(&cfg)?;
+        Ok(cfg)
+    }
+
+    /// [`Self::from_text_with`] with async secret resolution — the text
+    /// counterpart of [`Self::from_path_async_with`].
+    pub async fn from_text_async_with(
+        text: &str,
+        path: &Path,
+        inputs: &RunInputs,
+    ) -> CliResult<Self> {
+        let interpolated = resolve_document(text, path, inputs)?;
+        let mut cfg = Self::from_text(&interpolated, path)?;
+        crate::secrets::resolve_secrets(&mut cfg).await?;
+        Ok(cfg)
+    }
+
     /// Parse an already-interpolated config string. `path` is only used for
     /// error messages and to pick the parser by file extension.
     pub fn from_text(text: &str, path: &Path) -> CliResult<Self> {

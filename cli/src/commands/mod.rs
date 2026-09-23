@@ -19,6 +19,7 @@ pub mod explain;
 pub mod fmt;
 #[cfg(feature = "catalog")]
 pub mod history;
+pub mod hub;
 pub mod init;
 pub mod install;
 pub mod list;
