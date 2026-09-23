@@ -24,6 +24,22 @@ export function templatesUnavailable(e) {
   return e && e.status === 404 && !e.code;
 }
 
+/** Template kind → pill. Old rows without a stored kind are pipelines. */
+const KINDS = ["source-template", "sink-template", "pipeline"];
+const KIND_LABEL = { "source-template": "source", "sink-template": "sink", pipeline: "pipeline" };
+function kindOf(t) {
+  return KINDS.includes(t.kind) ? t.kind : "pipeline";
+}
+function kindPill(kind) {
+  const k = KINDS.includes(kind) ? kind : "pipeline";
+  const title = {
+    "source-template": "source template — a system and its streams; runs composed with a sink template",
+    "sink-template": "sink template — a destination; composed into a source template's run",
+    pipeline: "complete pipeline config",
+  }[k];
+  return `<span class="pill tpl-kind tpl-kind-${escapeHtml(k)}" title="${escapeHtml(title)}">${KIND_LABEL[k]}</span>`;
+}
+
 function statusPill(status) {
   const cls = { launched: "pill-completed", draft: "pill-queued", deprecated: "pill-cancelled" };
   return `<span class="pill ${cls[status] || ""}">${escapeHtml(status)}</span>`;
@@ -49,6 +65,11 @@ export async function renderTemplates(container) {
           <button type="button" class="tpl-chip is-on" data-status="launched">launched</button>
           <button type="button" class="tpl-chip is-on" data-status="draft">draft</button>
           <button type="button" class="tpl-chip" data-status="deprecated">deprecated</button>
+        </div>
+        <div class="tpl-status-filter" id="t-kind-filter" role="group" aria-label="Filter by kind">
+          <button type="button" class="tpl-chip is-on" data-kind="source-template">source</button>
+          <button type="button" class="tpl-chip is-on" data-kind="sink-template">sink</button>
+          <button type="button" class="tpl-chip is-on" data-kind="pipeline">pipeline</button>
         </div>
       </div>
       <div class="tpl-list-head" id="t-list-head" hidden>
@@ -99,6 +120,18 @@ export async function renderTemplates(container) {
     };
   });
 
+  // Kind filter — all three kinds on by default.
+  const kindFilter = new Set(KINDS);
+  container.querySelectorAll("#t-kind-filter .tpl-chip").forEach((chip) => {
+    chip.onclick = () => {
+      const k = chip.dataset.kind;
+      if (kindFilter.has(k)) kindFilter.delete(k);
+      else kindFilter.add(k);
+      chip.classList.toggle("is-on", kindFilter.has(k));
+      render();
+    };
+  });
+
   container.querySelector("#t-new").onclick = () => {
     registerHost.hidden = !registerHost.hidden;
     if (!registerHost.hidden && !registerHost.childElementCount) {
@@ -115,6 +148,7 @@ export async function renderTemplates(container) {
     const rows = all.filter((t) => {
       const status = (t.state || {}).status || "draft";
       if (!statusFilter.has(status)) return false;
+      if (!kindFilter.has(kindOf(t))) return false;
       if (q && !((t.id || "").toLowerCase().includes(q) || (t.description || "").toLowerCase().includes(q))) return false;
       return true;
     });
@@ -131,7 +165,7 @@ export async function renderTemplates(container) {
     if (!rows.length) {
       const why = q
         ? `No templates match “${escapeHtml(search.value.trim())}”.`
-        : "No templates match the selected status filter.";
+        : "No templates match the selected status / kind filters.";
       list.innerHTML = `<div class="empty">${why}</div>`;
       return;
     }
@@ -172,7 +206,7 @@ export async function renderTemplates(container) {
       if (!all.length) {
         filters.hidden = true;
         listHead.hidden = true;
-        list.innerHTML = `<div class="empty">No templates registered yet — register one to give operators a parameterized, versioned pipeline to trigger.</div>`;
+        list.innerHTML = `<div class="empty">No templates registered yet — register a <b>source template</b> (a system and its streams), a <b>sink template</b> (a destination), or a complete pipeline to give operators something versioned to trigger.</div>`;
         return;
       }
       filters.hidden = false;
@@ -198,7 +232,7 @@ function listRow(t) {
   el.innerHTML = `
     ${statusPill(st.status || "draft")}
     <span class="tpl-row-id">
-      <b class="mono">${escapeHtml(t.id)}</b>
+      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b>${kindPill(kindOf(t))}</span>
       ${t.description ? `<span class="tpl-row-desc">${escapeHtml(t.description)}</span>` : ""}
     </span>
     <span class="run-meta" title="last registered / updated">${fmtTime(t.created_at)}</span>
@@ -319,12 +353,16 @@ function registerPanel(onDone, opts = {}) {
   el.className = "tpl-register";
   el.innerHTML = `
     ${newVersion ? `<p class="tpl-desc">Appends a new version to <b class="mono">${escapeHtml(presetId)}</b> — registering does <b>not</b> change what <code>stable</code> resolves to. Tick “launch” to make the new version live immediately.</p>` : ""}
-    <textarea id="tr-cfg" class="code" spellcheck="false" placeholder="version: 1
+    <textarea id="tr-cfg" class="code" spellcheck="false" placeholder="kind: source-template        # or sink-template, or pipeline
+name: acme-billing
 params:
-  table: { type: string, required: true }
-pipeline:
-  source: { type: postgres, config: { query: 'select * from \${param.table}' } }
-  sink: { type: jsonl, config: { path: ./out.jsonl } }">${escapeHtml(presetBody)}</textarea>
+  api_token: { type: string, required: true, secret: true }
+source:
+  type: rest
+  config: { base_url: https://api.example.com/v1, auth: { type: bearer, config: { token: '\${param.api_token}' } } }
+streams:
+  - { name: invoices, source: { config: { path: /invoices } }, primary_keys: [id], write: [overwrite, upsert] }">${escapeHtml(presetBody)}</textarea>
+    <p class="tpl-desc">A <code>kind:</code> line says what the document is: <b>source-template</b> (a system and its streams — run it with any registered sink template), <b>sink-template</b> (a destination), or <b>pipeline</b> (a complete config). A document without <code>kind:</code> is registered as a pipeline with a deprecation notice.</p>
     <fieldset class="submit-opts">
       <label>id <input id="tr-id" value="${escapeHtml(presetId)}" ${lockId ? "readonly" : ""} placeholder="derived from name:" /></label>
       <label>format
@@ -389,6 +427,7 @@ export async function renderTemplateDetail(container, { id }) {
       <div class="page-head">
         <button class="btn-ghost" id="t-back">← Templates</button>
         <h1 class="dataset-title mono">${escapeHtml(d.id)}</h1>
+        ${kindPill(kindOf(d))}
         ${statusPill(st.status)}
         <div class="detail-actions">
           <button class="btn-primary" id="t-newver" title="register a new version of this template">+ New version</button>
@@ -404,6 +443,7 @@ export async function renderTemplateDetail(container, { id }) {
       ${st.status === "deprecated" ? `<div class="tpl-notice tpl-notice-warn">Deprecated${d.deprecation && d.deprecation.reason ? ` — ${escapeHtml(d.deprecation.reason)}` : ""}. Existing callers still resolve <code>stable</code>, but every trigger warns.</div>` : ""}
 
       <div class="detail-grid">
+        <div><label>kind</label><b>${escapeHtml(KIND_LABEL[kindOf(d)])}</b></div>
         <div><label>status</label><b>${escapeHtml(st.status)}</b></div>
         <div><label>live (stable)</label><b>${st.stable == null ? "—" : `v${st.stable}`}</b></div>
         <div><label>previous</label><b>${st.previous == null ? "—" : `v${st.previous}`}</b></div>
@@ -416,7 +456,7 @@ export async function renderTemplateDetail(container, { id }) {
       <h2 class="tpl-h2">Versions</h2>
       <div id="t-versions" class="tpl-versions"></div>
 
-      <h2 class="tpl-h2">Trigger a run</h2>
+      <h2 class="tpl-h2">${kindOf(d) === "sink-template" ? "Compose with a source template" : "Trigger a run"}</h2>
       <div id="t-trigger"></div>
 
       <h2 class="tpl-h2">Launch history</h2>
@@ -468,7 +508,9 @@ export async function renderTemplateDetail(container, { id }) {
   };
 
   renderVersions(container.querySelector("#t-versions"), id, st, d, reload);
-  renderTrigger(container.querySelector("#t-trigger"), id, st, d);
+  const kind = kindOf(d);
+  if (kind === "sink-template") renderSinkPairings(container.querySelector("#t-trigger"), id);
+  else renderTrigger(container.querySelector("#t-trigger"), id, st, d, kind === "source-template");
   renderLaunches(container.querySelector("#t-launches"), d.launches || []);
 }
 
@@ -566,18 +608,58 @@ function renderVersions(host, id, st, d, reload) {
   }
 }
 
-/** A typed form over the template's declared `params:`, plus a version selector. */
-function renderTrigger(host, id, st, d) {
-  const params = d.params || {};
-  // Computed params are derived from other params, not supplied — exclude them
-  // from the trigger form (supplying one is rejected server-side, #573).
-  const names = Object.keys(params).filter((n) => params[n].computed == null);
+/** A sink template has no streams of its own: instead of a trigger form, list
+ *  the registered source templates it can be composed with. */
+async function renderSinkPairings(host, id) {
+  host.innerHTML = `<div class="empty">loading…</div>`;
+  let sources = [];
+  try {
+    const data = await api("/v1/templates?kind=source-template");
+    sources = data.templates || [];
+  } catch (e) {
+    host.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  if (!sources.length) {
+    host.innerHTML = `<div class="tpl-notice">A sink template is run <b>through a source template</b>: open one, pick <b class="mono">${escapeHtml(id)}</b> as its sink, and trigger. No source templates are registered yet.</div>`;
+    return;
+  }
+  host.innerHTML = `
+    <p class="tpl-desc">A sink template is run <b>through a source template</b>: open one below, pick <b class="mono">${escapeHtml(id)}</b> as its sink, and trigger.</p>
+    <div class="runs-list" id="tp-list"></div>`;
+  const list = host.querySelector("#tp-list");
+  for (const s of sources) list.appendChild(listRow(s));
+}
+
+/** A typed form over the template's declared `params:`, plus a version selector.
+ *  For a source template (`withSink`) the form also picks a registered sink
+ *  template + version, and the param fields are the union of both. */
+async function renderTrigger(host, id, st, d, withSink = false) {
+  const ownParams = d.params || {};
   // Only offer channels that actually resolve — an unset one would just 422.
   const choices = ["stable", "newest", "previous", ...Object.keys(st.tags).sort()].filter(
     (c) => channelTarget(c, st) != null,
   );
+  let sinks = [];
+  if (withSink) {
+    try {
+      const data = await api("/v1/templates?kind=sink-template");
+      sinks = (data.templates || []).filter((s) => ((s.state || {}).status || "draft") !== "deprecated");
+    } catch (e) {
+      host.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    if (!sinks.length) {
+      host.innerHTML = `<div class="tpl-notice tpl-notice-warn">This is a <b>source template</b> — it runs composed with a <b>sink template</b>, and none is registered. Register one (<code>kind: sink-template</code>) and come back.</div>`;
+      return;
+    }
+  }
+  const sinkOptions = sinks
+    .map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)}${s.description ? ` — ${escapeHtml(s.description)}` : ""}</option>`)
+    .join("");
   host.innerHTML = `
     <div class="tpl-trigger">
+      ${withSink ? `<p class="tpl-desc">Every stream of <b class="mono">${escapeHtml(id)}</b> lands in the chosen sink; the write mode per stream is resolved against the sink's capabilities when the run is submitted.</p>` : ""}
       <fieldset class="submit-opts">
         <label>version
           <select id="tg-version">
@@ -585,6 +667,14 @@ function renderTrigger(host, id, st, d) {
             ${st.versions.map((v) => `<option value="${v}">v${v} (pinned)</option>`).join("")}
           </select>
         </label>
+        ${withSink ? `
+        <label>sink template <select id="tg-sink">${sinkOptions}</select></label>
+        <label>sink version
+          <select id="tg-sink-version">
+            <option value="stable">stable</option>
+            <option value="newest">newest</option>
+          </select>
+        </label>` : ""}
         <label>run name <input id="tg-name" placeholder="optional" /></label>
       </fieldset>
       <div id="tg-params" class="tpl-params"></div>
@@ -593,30 +683,27 @@ function renderTrigger(host, id, st, d) {
     </div>`;
 
   const paramHost = host.querySelector("#tg-params");
-  if (!names.length) {
-    paramHost.innerHTML = `<p class="tpl-desc">This template declares no parameters.</p>`;
-  }
-  for (const name of names) {
-    const p = params[name] || {};
-    const field = document.createElement("label");
-    field.className = "tpl-param";
-    const type = p.type || "string";
-    const input =
-      type === "bool"
-        ? `<select data-name="${escapeHtml(name)}"><option value="">—</option><option value="true">true</option><option value="false">false</option></select>`
-        : `<input data-name="${escapeHtml(name)}" ${p.secret ? 'type="password"' : type === "int" || type === "float" ? 'type="number"' : ""}
-             placeholder="${p.default !== undefined && p.default !== null ? escapeHtml(String(p.default)) : type}" />`;
-    field.innerHTML = `
-      <span class="tpl-param-name mono">${escapeHtml(name)}</span>
-      <span class="tpl-param-tags">
-        <span class="pill">${escapeHtml(type)}</span>
-        ${p.required ? `<span class="pill pill-failed">required</span>` : ""}
-        ${p.secret ? `<span class="pill pill-cancelled">secret</span>` : ""}
-      </span>
-      ${input}
-      ${p.description ? `<span class="help">${mdInline(p.description)}</span>` : ""}`;
-    paramHost.appendChild(field);
-  }
+  const sinkSel = host.querySelector("#tg-sink");
+  // The params the trigger binds: the template's own, plus (for a source
+  // template) the selected sink's — the same merge the server performs.
+  let params = ownParams;
+  const renderParams = () => {
+    params = { ...ownParams };
+    if (sinkSel) {
+      const sink = sinks.find((s) => s.id === sinkSel.value);
+      for (const [n, spec] of Object.entries((sink && sink.params) || {})) params[n] = { ...spec, fromSink: sink.id };
+    }
+    // Computed params are derived from other params, not supplied — exclude them
+    // from the trigger form (supplying one is rejected server-side, #573).
+    const names = Object.keys(params).filter((n) => params[n].computed == null);
+    paramHost.innerHTML = "";
+    if (!names.length) {
+      paramHost.innerHTML = `<p class="tpl-desc">${withSink ? "Neither template declares parameters." : "This template declares no parameters."}</p>`;
+    }
+    for (const name of names) paramHost.appendChild(paramField(name, params[name] || {}));
+  };
+  renderParams();
+  if (sinkSel) sinkSel.onchange = renderParams;
 
   const out = host.querySelector("#tg-out");
   host.querySelector("#tg-go").onclick = async () => {
@@ -627,6 +714,10 @@ function renderTrigger(host, id, st, d) {
       supplied[el.dataset.name] = coerce(raw, (params[el.dataset.name] || {}).type);
     }
     const body = { version: host.querySelector("#tg-version").value };
+    if (sinkSel) {
+      body.sink = sinkSel.value;
+      body.sink_version = host.querySelector("#tg-sink-version").value;
+    }
     if (Object.keys(supplied).length) body.params = supplied;
     const name = host.querySelector("#tg-name").value.trim();
     if (name) body.name = name;
@@ -635,7 +726,9 @@ function renderTrigger(host, id, st, d) {
       // and `status` sit at the top level alongside `template_version`.
       const resp = await api(`/v1/templates/${encodeURIComponent(id)}/runs`, { method: "POST", body });
       if (resp.deprecated) toast(`deprecated template: ${resp.deprecated}`, "error");
-      toast(`run ${resp.run_id} from v${resp.template_version}`);
+      const via = resp.sink_template ? ` → ${resp.sink_template} v${resp.sink_template_version}` : "";
+      const streams = (resp.streams || []).length;
+      toast(`run ${resp.run_id} from v${resp.template_version}${via}${streams ? ` (${streams} stream${streams === 1 ? "" : "s"})` : ""}`);
       navigate(`#/runs/${resp.run_id}`);
     } catch (e) {
       out.hidden = false;
@@ -643,6 +736,30 @@ function renderTrigger(host, id, st, d) {
       toast(e.message, "error");
     }
   };
+}
+
+/** One typed input for a declared param. `fromSink` marks a field the selected
+ *  sink template contributed. */
+function paramField(name, p) {
+  const field = document.createElement("label");
+  field.className = "tpl-param";
+  const type = p.type || "string";
+  const input =
+    type === "bool"
+      ? `<select data-name="${escapeHtml(name)}"><option value="">—</option><option value="true">true</option><option value="false">false</option></select>`
+      : `<input data-name="${escapeHtml(name)}" ${p.secret ? 'type="password"' : type === "int" || type === "float" ? 'type="number"' : ""}
+           placeholder="${p.default !== undefined && p.default !== null ? escapeHtml(String(p.default)) : type}" />`;
+  field.innerHTML = `
+    <span class="tpl-param-name mono">${escapeHtml(name)}</span>
+    <span class="tpl-param-tags">
+      <span class="pill">${escapeHtml(type)}</span>
+      ${p.required ? `<span class="pill pill-failed">required</span>` : ""}
+      ${p.secret ? `<span class="pill pill-cancelled">secret</span>` : ""}
+      ${p.fromSink ? `<span class="pill tpl-kind tpl-kind-sink-template" title="declared by sink template ${escapeHtml(p.fromSink)}">sink</span>` : ""}
+    </span>
+    ${input}
+    ${p.description ? `<span class="help">${mdInline(p.description)}</span>` : ""}`;
+  return field;
 }
 
 /** The version a channel currently resolves to, or null when unset. */

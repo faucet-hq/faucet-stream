@@ -661,7 +661,10 @@ Read-only — it never mutates the store.
 faucet template register  tenant-sync.yaml --store sqlite:./faucet-templates.db
 faucet template register  tenant-sync.yaml --id tenant-sync --tag dev --description "per-tenant events"
 faucet template register  tenant-sync.yaml --launch            # register AND make live
+faucet template register  hub/source-templates/acme-billing.yaml --launch   # kind: source-template → id = its name
+faucet template register  hub/sink-templates/bigquery.yaml --launch         # kind: sink-template
 faucet template list      --store sqlite:./faucet-templates.db
+faucet template list      --kind sink-template                  # one kind only
 faucet template show      tenant-sync --store sqlite:./faucet-templates.db --version 2
 faucet template promote   tenant-sync --tag prod --version dev  # move an environment channel
 faucet template launch    tenant-sync --version pre-prod        # move `stable` (the release lever)
@@ -669,6 +672,8 @@ faucet template rollback  tenant-sync                           # re-launch `pre
 faucet template deprecate tenant-sync --reason "superseded"      # retire (`--undo` revives)
 faucet template run       tenant-sync --store sqlite:./faucet-templates.db \
   --version prod --param tenant_id=acme --param-env API_HOST=eu.example.com
+faucet template run       acme-billing --sink bigquery --sink-version stable \
+  --param api_token="$TOKEN" --param bq_project=my-project    # source × sink, composed at run time
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
 faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
@@ -677,14 +682,24 @@ faucet template sync      --store sqlite:./faucet-templates.db --config sync.yam
 faucet template publish   platform-nightly --store sqlite:./faucet-templates.db --config sync.yaml --origin platform
 ```
 
-Register a config declaring [`params:`](config.md#params) **once**, then trigger
-runs by id — the register-once / trigger-by-id model. See the
+Register a template **once**, then trigger runs by id — the register-once /
+trigger-by-id model. The registry holds three kinds of document, told apart by
+their `kind:` line: a **`source-template`** (one system — connector, shared
+transforms, streams with write preferences), a **`sink-template`** (one
+destination), and a complete **`pipeline`**. A source template is run with
+`--sink <id>` and composes with that registered sink template at run time (the
+[Template Hub](../cookbook/template-hub.md) model); a pipeline runs alone; a sink
+template is never run on its own. A document without `kind:` still registers
+as a pipeline but prints a deprecation notice — add `kind: pipeline`. See the
 [Parameters & pipeline templates](../cookbook/templates.md) cookbook page.
 
 | Flag | Purpose |
 |------|---------|
 | `--store <url>` | Registry location: `sqlite:<path>`, a `postgres://…` URL, or `memory`. Same grammar as `catalog.url` and `faucet serve --history` — point `serve` at the same URL to trigger these templates over HTTP/MCP. Env: `FAUCET_TEMPLATE_STORE`. SQL stores need `serve-history-sqlite` / `serve-history-postgres`. |
-| `--id <slug>` | *(register)* Registry id (`^[a-z0-9][a-z0-9_-]*$`). Derived from the config's `name:` when omitted. |
+| `--id <slug>` | *(register)* Registry id (`^[a-z0-9][a-z0-9_-]*$`). Derived from the config's `name:` when omitted. A source / sink template is always registered under its own `name` — an explicit `--id` must match it. |
+| `--kind <source-template\|sink-template\|pipeline>` | *(list)* Show only templates of one kind. `list` prints a KIND column either way. |
+| `--sink <id>` | *(run)* For a source template: the registered sink template to compose with. Required for a source template; refused for a pipeline. |
+| `--sink-version <n\|channel>` | *(run)* Version of the sink template. Default `stable`. |
 | `--description <text>` | *(register)* Shown by `list` / `show`. Carried forward from the previous version when omitted. |
 | `--launch` | *(register)* Launch the new version immediately, making it `stable`. Off by default — registering a build must never move existing callers. |
 | `--tag <channel>` | *(register)* Point an assignable channel at the new version; repeatable. *(promote)* The channel to move. One of the closed set: `dev`, `test`, `staging`, `pre-prod`, `canary`, `prod`. The derived channels (`stable`, `previous`, `newest`) cannot be assigned — `stable` moves only via `launch`. |
@@ -695,7 +710,7 @@ runs by id — the register-once / trigger-by-id model. See the
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
 | `--limit <n>` | *(run)* Stop after writing this many records. |
 | `--suite <path>` | *(test)* Positional: the suite file (YAML or JSON). `faucet schema template-test` prints its schema. |
-| `--select <n\|channel>` | *(test)* Override the suite's own `select:`. Ignored when the suite's `template:` is a path. |
+| `--select <n\|channel>` | *(test)* Override the suite's own `select:`. Ignored when the suite's `template:` is a path. A suite for a source template names its sink under `sink:` (a registered id, or a path when `template:` is a path) and `sink_select:`; every case then exercises the composed pipeline. |
 | `--filter <pattern>` | *(test)* Run only cases whose name matches; `*` wildcards, otherwise an exact match. |
 | `--config <path>` | *(sync / publish)* The sync file naming the remote origins — the same file `faucet serve --templates-sync` takes. `faucet schema templates-sync` prints its schema. Requires the `templates-sync` feature. |
 | `--origin <name>` | *(sync)* Pull only this origin (default: all). *(publish)* The origin to write to (required). |
@@ -728,7 +743,11 @@ a file (`… --clean > template.yaml`); `${param.…}` placeholders are preserve
 `faucet template run` executes through the identical path as `faucet run`, so
 observability, lineage, notifications, the catalog, and SLA evaluation all behave
 the same. The stored body is verbatim — `${env:…}` / `${vault:…}` resolve at
-trigger time, never at registration.
+trigger time, never at registration. For a source template, `run --sink <id>`
+composes the two registered documents (params merged, each stream's write mode
+resolved against the sink's capabilities) and prints the per-stream plan before
+running; the composed pipeline is named after the source template, so its state
+keys survive swapping the sink.
 
 `faucet template test` sweeps a template's **parameter space** offline: each case
 materializes the template exactly as a real trigger would, then expands it and

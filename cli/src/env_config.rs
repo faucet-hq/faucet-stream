@@ -310,6 +310,7 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
         });
     }
     Ok(PipelineConfig {
+        kind: None,
         version: 1,
         name,
         vars,

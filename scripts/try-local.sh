@@ -186,6 +186,13 @@ launch_ui() {
         done
         curl -s -o /dev/null -X POST "${base}/v1/templates/orders-by-country/tags" \
           -H 'content-type: application/json' -d '{"tag":"prod","version":1}'
+        # A source template + a sink template, so the console shows every kind.
+        for hub in "hub/source-templates/example-csv.yaml" "hub/sink-templates/jsonl.yaml"; do
+          [ -f "${REPO_ROOT}/${hub}" ] || continue
+          body="$(python3 -c 'import json,sys;print(json.dumps({"config":open(sys.argv[1]).read(),"launch":True}))' "${REPO_ROOT}/${hub}")"
+          curl -s -o /dev/null -X POST "${base}/v1/templates" \
+            -H 'content-type: application/json' -d "$body"
+        done
       fi
     fi
   else
@@ -711,6 +718,7 @@ YAML
 
 # --- 23. Parameterized config for the pipeline template registry -----------
 cat > 23_templated.yaml <<'YAML'
+kind: pipeline
 version: 1
 name: orders-by-country
 
@@ -900,6 +908,20 @@ if [ "$HAVE_TEMPLATES" -eq 1 ]; then
     "$FAUCET" template deprecate orders-legacy-dump --store "$TPL_STORE" \
       --reason "replaced by orders-by-country"
   step "template list (all three statuses)" "$FAUCET" template list --store "$TPL_STORE"
+  # The hub kinds (RFC 0008): a source template and a sink template register
+  # under their own names and compose at run time — no pre-composed pipeline.
+  if [ -f "${REPO_ROOT}/hub/source-templates/example-csv.yaml" ]; then
+    step "template register a source-template (example-csv)" \
+      "$FAUCET" template register "${REPO_ROOT}/hub/source-templates/example-csv.yaml" --store "$TPL_STORE" --launch
+    step "template register a sink-template (jsonl)" \
+      "$FAUCET" template register "${REPO_ROOT}/hub/sink-templates/jsonl.yaml" --store "$TPL_STORE" --launch
+    step "template register a sink-template (sqlite, left as a draft)" \
+      "$FAUCET" template register "${REPO_ROOT}/hub/sink-templates/sqlite.yaml" --store "$TPL_STORE"
+    step "template list --kind sink-template" "$FAUCET" template list --store "$TPL_STORE" --kind sink-template
+    step "template run source × sink (composed at run time)" \
+      "$FAUCET" template run example-csv --store "$TPL_STORE" --sink jsonl \
+        --param data_dir="${REPO_ROOT}/hub/examples/data" --param out_dir=./out/hub
+  fi
 else
   info "Skipping the template registry (built without the \`templates\` feature)."
 fi

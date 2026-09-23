@@ -222,7 +222,7 @@ fn lint(a: HubLintArgs) -> CliResult<()> {
                         findings.push((f.display().to_string(), r));
                     }
                 }
-                None => {
+                Some(hub::TemplateKind::Pipeline) | None => {
                     return Err(CliError::Config(format!(
                         "{}: not a hub template (no `kind: source-template` / `sink-template`)",
                         f.display()

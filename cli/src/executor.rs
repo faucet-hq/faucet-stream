@@ -3110,6 +3110,7 @@ mod tests {
 
     fn cfg_csv_to_jsonl(input: &Path, output: &Path) -> PipelineConfig {
         PipelineConfig {
+            kind: None,
             version: 1,
             name: Some("test".into()),
             vars: None,

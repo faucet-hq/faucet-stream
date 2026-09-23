@@ -234,6 +234,17 @@
           "type": "null"
         }
       ]
+    },
+    "kind": {
+      "description": "Document kind. A complete pipeline config may declare `kind: pipeline`\n(the registry's explicit kind for a hand-written pipeline template);\n`source-template` / `sink-template` documents are not pipeline configs\nand are composed with `faucet run --source X --sink Y` instead.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConfigKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -20828,6 +20839,13 @@
           ],
           "additionalProperties": false
         }
+      ]
+    },
+    "ConfigKind": {
+      "description": "The only `kind:` a complete pipeline config may carry.",
+      "type": "string",
+      "enum": [
+        "pipeline"
       ]
     }
   }

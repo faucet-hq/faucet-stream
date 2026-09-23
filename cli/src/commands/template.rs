@@ -163,6 +163,15 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
         },
     )
     .await?;
+    if crate::hub::detect_kind_in_file(&args.config).is_none() {
+        eprintln!(
+            "note: '{}' has no `kind:` — registering a complete pipeline config this way is deprecated. \
+             The registry's model is `kind: source-template` + `kind: sink-template` composed at run time \
+             (`faucet template run <source> --sink <sink>`); add `kind: pipeline` to keep registering a \
+             complete config explicitly.",
+            args.config.display()
+        );
+    }
 
     if args.common.json {
         println!("{}", to_pretty(&record.summary())?);
@@ -236,7 +245,11 @@ fn print_params(summary: &TemplateSummary) {
 
 async fn list(args: TemplateListArgs) -> CliResult<()> {
     let store = connect(&args.common).await?;
-    let templates = crate::templates::list_with_state(&store).await?;
+    let mut templates = crate::templates::list_with_state(&store).await?;
+    if let Some(kind) = args.kind {
+        let kind: crate::hub::TemplateKind = kind.into();
+        templates.retain(|t| t.kind == kind);
+    }
     if args.common.json {
         println!(
             "{}",
@@ -252,8 +265,8 @@ async fn list(args: TemplateListArgs) -> CliResult<()> {
     // side by side is the whole point of the model — a nightly can sit at v7 while
     // production still rides v4.
     println!(
-        "{:<26}  {:<11}  {:<6}  {:<7}  {:>6}  DESCRIPTION",
-        "ID", "STATUS", "LIVE", "NEWEST", "PARAMS"
+        "{:<26}  {:<15}  {:<11}  {:<6}  {:<7}  {:>6}  DESCRIPTION",
+        "ID", "KIND", "STATUS", "LIVE", "NEWEST", "PARAMS"
     );
     for t in &templates {
         let (status, live, newest) = match &t.state {
@@ -265,8 +278,9 @@ async fn list(args: TemplateListArgs) -> CliResult<()> {
             None => ("?".into(), "?".into(), format!("v{}", t.version)),
         };
         println!(
-            "{:<26}  {:<11}  {:<6}  {:<7}  {:>6}  {}",
+            "{:<26}  {:<15}  {:<11}  {:<6}  {:<7}  {:>6}  {}",
             t.id,
+            t.kind,
             status,
             live,
             newest,
@@ -322,6 +336,7 @@ async fn show(args: TemplateShowArgs) -> CliResult<()> {
         return Ok(());
     }
     println!("template  {}   [{}]", record.id, state.status);
+    println!("kind      {}", record.kind);
     if let Some(name) = &record.name {
         println!("name      {name}");
     }
@@ -538,10 +553,15 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     let env = crate::params::collect_env_overrides(&args.param_env)?;
     let selector = VersionSelector::parse(&args.version)?;
     let want = crate::templates::resolve_version(&store, &args.id, selector).await?;
-    let materialized = crate::templates::materialize(
+    let sink = crate::templates::SinkChoice {
+        id: args.sink.clone(),
+        version: VersionSelector::parse(&args.sink_version)?,
+    };
+    let materialized = crate::templates::materialize_for_run(
         &store,
         &args.id,
         want,
+        &sink,
         &supplied,
         &env,
         // `faucet template run` executes locally; nothing is persisted.
@@ -552,8 +572,14 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     tracing::info!(
         template = %materialized.template_id,
         version = materialized.version,
+        sink = materialized.sink_id.as_deref().unwrap_or("-"),
         "materialized pipeline template"
     );
+    if !args.common.json {
+        for p in &materialized.streams {
+            eprintln!("  {:<32} write_mode: {}", p.stream, p.describe());
+        }
+    }
 
     // The materialized body is JSON with every `${param.*}` bound; `${env:…}`
     // for overridden variables is bound too. Remaining directives (secrets,
@@ -605,9 +631,20 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
         let body = std::fs::read_to_string(as_path).map_err(|e| {
             CliError::Config(format!("template test: reading {}: {e}", as_path.display()))
         })?;
+        // A file-based suite composes with a file-based sink template.
+        let sink_body = match &file.sink {
+            Some(p) => Some(std::fs::read_to_string(p).map_err(|e| {
+                CliError::Config(format!("template test: reading sink template {p}: {e}"))
+            })?),
+            None => None,
+        };
         (
-            crate::templates::suite::run(&file, Target::Document { body }, args.filter.as_deref())
-                .await?,
+            crate::templates::suite::run(
+                &file,
+                Target::Document { body, sink_body },
+                args.filter.as_deref(),
+            )
+            .await?,
             None,
         )
     } else {
@@ -621,6 +658,18 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
         let store = crate::templates::resolve_store_url(store_url).await?;
         let version =
             crate::templates::suite::resolve_target_version(&store, &file.template, select).await?;
+        let sink = match &file.sink {
+            Some(sink_id) => Some((
+                sink_id.as_str(),
+                crate::templates::suite::resolve_target_version(
+                    &store,
+                    sink_id,
+                    file.sink_select.as_deref(),
+                )
+                .await?,
+            )),
+            None => None,
+        };
         (
             crate::templates::suite::run(
                 &file,
@@ -628,6 +677,7 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
                     store: &store,
                     id: &file.template,
                     version,
+                    sink,
                 },
                 args.filter.as_deref(),
             )
@@ -714,6 +764,117 @@ pipeline:
         }
     }
 
+    #[tokio::test]
+    async fn source_and_sink_templates_register_list_and_run_from_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("orders.csv"), "id,total\n1,10\n2,20\n").unwrap();
+        let src_path = dir.path().join("acme-exports.yaml");
+        std::fs::write(
+            &src_path,
+            format!(
+                "kind: source-template\nname: acme-exports\ndescription: Acme exports\nparams:\n  data_dir: {{ type: string, default: {} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, primary_keys: [id], write: [overwrite, upsert] }}\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let sink_path = dir.path().join("local-jsonl.yaml");
+        std::fs::write(
+            &sink_path,
+            format!(
+                "kind: sink-template\nname: local-jsonl\ndescription: Local files\nparams:\n  out_dir: {{ type: string, default: {} }}\nsink:\n  type: jsonl\n  config: {{ append: false }}\nper_stream:\n  path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"\nwrite_mode_aliases: {{ overwrite: append }}\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let store = format!("sqlite:{}", dir.path().join("registry.db").display());
+        for path in [&src_path, &sink_path] {
+            register(TemplateRegisterArgs {
+                config: path.clone(),
+                id: None,
+                description: None,
+                tag: vec![],
+                launch: true,
+                common: common(&store, false),
+            })
+            .await
+            .expect("register hub template");
+        }
+        // `--id` disagreeing with `name` is refused for a hub template.
+        let err = register(TemplateRegisterArgs {
+            config: src_path.clone(),
+            id: Some("other".into()),
+            description: None,
+            tag: vec![],
+            launch: false,
+            common: common(&store, false),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("registered under its own `name`"), "{err}");
+
+        for kind in [
+            None,
+            Some(crate::cli::TemplateKindArg::SinkTemplate),
+            Some(crate::cli::TemplateKindArg::SourceTemplate),
+        ] {
+            list(TemplateListArgs {
+                common: common(&store, kind.is_none()),
+                kind,
+            })
+            .await
+            .expect("list");
+        }
+        show(TemplateShowArgs {
+            id: "acme-exports".into(),
+            version: "stable".into(),
+            clean: false,
+            common: common(&store, true),
+        })
+        .await
+        .expect("show");
+
+        let run_args = |sink: Option<&str>, dry_run: bool| TemplateRunArgs {
+            id: "acme-exports".into(),
+            version: "stable".into(),
+            sink: sink.map(str::to_string),
+            sink_version: "stable".into(),
+            param: vec![],
+            param_env: vec![],
+            dry_run,
+            limit: None,
+            common: common(&store, false),
+        };
+        let err = run_template(run_args(None, true))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--sink"), "{err}");
+        run_template(run_args(Some("local-jsonl"), true))
+            .await
+            .expect("dry run composes");
+        run_template(run_args(Some("local-jsonl"), false))
+            .await
+            .expect("run composes");
+        let written =
+            std::fs::read_to_string(dir.path().join("acme-exports/orders.jsonl")).unwrap();
+        assert_eq!(
+            written.lines().count(),
+            2,
+            "one file per stream under <out_dir>/<source>/"
+        );
+
+        // A sink template is never run on its own.
+        let err = run_template(TemplateRunArgs {
+            id: "local-jsonl".into(),
+            ..run_args(None, true)
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not runnable on its own"), "{err}");
+    }
+
     const BODY: &str = "\
 version: 1
 name: cli-tpl
@@ -764,6 +925,7 @@ pipeline:
             .expect("register v1");
         list(TemplateListArgs {
             common: common(&store, true),
+            kind: None,
         })
         .await
         .expect("list");
@@ -772,6 +934,8 @@ pipeline:
         let err = run_template(TemplateRunArgs {
             id: "cli-tpl".into(),
             version: "stable".into(),
+            sink: None,
+            sink_version: "stable".into(),
             param: vec!["tag=alpha".into()],
             param_env: vec![],
             dry_run: true,
@@ -794,6 +958,8 @@ pipeline:
         run_template(TemplateRunArgs {
             id: "cli-tpl".into(),
             version: "stable".into(),
+            sink: None,
+            sink_version: "stable".into(),
             param: vec!["tag=alpha".into()],
             param_env: vec![],
             dry_run: false,
@@ -973,6 +1139,7 @@ pipeline:
             },
         );
         let summary = TemplateSummary {
+            kind: crate::hub::TemplateKind::Pipeline,
             state: None,
             id: "t".into(),
             version: 1,
@@ -1023,6 +1190,7 @@ pipeline:
     async fn list_reports_an_empty_store() {
         list(TemplateListArgs {
             common: common("memory", false),
+            kind: None,
         })
         .await
         .expect("empty list is not an error");

@@ -21,12 +21,18 @@ use crate::config::{ConnectorSpec, TransformSpec};
 use crate::error::{CliError, CliResult};
 use crate::params::ParamsSpec;
 
-/// The `kind:` discriminator at the top of a hub template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The `kind:` discriminator at the top of a template document.
+///
+/// `source-template` / `sink-template` are the hub kinds composed at run time;
+/// `pipeline` is a complete, hand-written config registered as-is (the
+/// pre-#571 template model, kept as an explicit kind for graphs that are not
+/// "streams of one source" — topology mode, multi-source DAGs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum TemplateKind {
     SourceTemplate,
     SinkTemplate,
+    Pipeline,
 }
 
 impl TemplateKind {
@@ -34,7 +40,34 @@ impl TemplateKind {
         match self {
             Self::SourceTemplate => "source-template",
             Self::SinkTemplate => "sink-template",
+            Self::Pipeline => "pipeline",
         }
+    }
+
+    /// Parse a `kind:` value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "source-template" => Some(Self::SourceTemplate),
+            "sink-template" => Some(Self::SinkTemplate),
+            "pipeline" => Some(Self::Pipeline),
+            _ => None,
+        }
+    }
+
+    /// The registry's default for a record written before kinds existed.
+    pub const fn pipeline() -> Self {
+        Self::Pipeline
+    }
+
+    /// A hub kind (composed at run time) rather than a complete pipeline.
+    pub fn is_hub(self) -> bool {
+        matches!(self, Self::SourceTemplate | Self::SinkTemplate)
+    }
+}
+
+impl std::fmt::Display for TemplateKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

@@ -2924,6 +2924,7 @@ macro_rules! impl_sql_history {
                     let record = templates::TemplateRecord {
                         id: id.clone(),
                         version: next,
+                        kind: draft.kind,
                         name: draft.name.clone(),
                         description: draft.description.clone(),
                         body: draft.body.clone(),

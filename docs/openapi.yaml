@@ -859,15 +859,22 @@ paths:
         "403": { description: Principal's role lacks the required permission }
         "422": { $ref: "#/components/responses/Error" }
     get:
-      summary: List registered pipeline templates
+      summary: List registered templates
       description: >
         The newest version of every registered template, newest-registered first,
-        each carrying the template's release `state` (status, `stable` /
-        `previous` / `newest`, channel pointers). Bodies are omitted — fetch one
-        with `GET /v1/templates/{id}`. Requires the `TemplateRead` permission
-        (viewer).
+        each carrying its `kind` and the template's release `state` (status,
+        `stable` / `previous` / `newest`, channel pointers). Bodies are omitted —
+        fetch one with `GET /v1/templates/{id}`. `?kind=` narrows to source
+        templates, sink templates, or complete pipelines. Requires the
+        `TemplateRead` permission (viewer).
       operationId: listTemplates
       security: [{ bearerAuth: [] }]
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          schema: { type: string, enum: [source-template, sink-template, pipeline] }
+          description: Return only templates of this kind.
       responses:
         "200":
           description: The template summaries.
@@ -1180,7 +1187,7 @@ paths:
         "422": { $ref: "#/components/responses/Error" }
   /v1/templates/{id}/runs:
     post:
-      summary: Trigger a run from a pipeline template
+      summary: Trigger a run from a template (a source template composed with a sink, or a pipeline)
       description: >
         Materializes the template with the supplied `params` (and optional
         per-request `env` overrides), then submits it through the same path as
@@ -1813,6 +1820,11 @@ components:
       required: [id, version, params, created_at]
       properties:
         id: { type: string, description: "Registry id (slug)." }
+        kind:
+          type: string
+          enum: [source-template, sink-template, pipeline]
+          default: pipeline
+          description: "What the document is. A source template runs composed with a sink template; a sink template is composed into a source template's run; a pipeline runs alone."
         version: { type: integer, description: "The newest registered version (the build tip). `state.stable` is what an unpinned run uses." }
         name: { type: string, nullable: true, description: "The config's own `name:`." }
         description: { type: string, nullable: true }
@@ -1827,6 +1839,7 @@ components:
       example:
         id: orders_to_warehouse
         version: 3
+        kind: pipeline
         name: orders_to_warehouse
         description: Orders -> BigQuery, hourly
         params:
@@ -2003,8 +2016,8 @@ components:
       type: object
       required: [config]
       properties:
-        id: { type: string, description: "Registry id. Derived from the config's `name:` when omitted." }
-        config: { type: string, description: "The config document, stored verbatim." }
+        id: { type: string, description: "Registry id. Derived from the config's `name:` when omitted. A `source-template` / `sink-template` is always registered under its own `name` (an explicit id must match it)." }
+        config: { type: string, description: "The template document, stored verbatim. Its `kind:` decides how it is validated and run: `source-template` (a system and its streams), `sink-template` (a destination), or `pipeline` (a complete config). A document without `kind:` is registered as a pipeline and flagged as deprecated input." }
         config_format: { type: string, enum: [yaml, json], default: yaml }
         description: { type: string }
         tags:
@@ -2034,13 +2047,24 @@ components:
     TriggerTemplateRequest:
       type: object
       description: >
-        Everything after `params` / `env` / `version` mirrors
-        `SubmitRunRequest`, because the run is submitted through the same path.
+        Everything after `params` / `env` / `version` / `sink` / `sink_version`
+        mirrors `SubmitRunRequest`, because the run is submitted through the
+        same path. For a `source-template` the trigger composes it with the
+        named `sink` (a registered `sink-template`) and binds the merged
+        params; a `pipeline` template takes no `sink`; a `sink-template` is
+        never runnable on its own.
       properties:
         params:
           type: object
-          description: "Values for the template's declared params. Scalars; coerced to the declared type."
+          description: "Values for the template's declared params (for a source template: the union of the source's and the sink's). Scalars; coerced to the declared type."
           additionalProperties: true
+        sink:
+          type: string
+          nullable: true
+          description: "For a `source-template`: the registered `sink-template` to compose with. Required for a source template (`422` without it); refused for a `pipeline`."
+        sink_version:
+          description: "Version of the sink template: `stable` (default), another channel, or an exact number."
+          $ref: "#/components/schemas/VersionSelector"
         env:
           type: object
           description: "Values that win over the server's environment for `${env:VAR}` during this materialization only."
@@ -2064,16 +2088,32 @@ components:
         env:
           PG_URL: postgres://user:pass@db:5432/app
         version: stable
+        sink: bigquery
+        sink_version: stable
         idempotency_key: 2026-01-01-orders
     TriggerTemplateResponse:
       type: object
-      required: [run_id, status, submitted_at, template_id, template_version, params]
+      required: [run_id, status, submitted_at, template_id, template_version, params, streams]
       properties:
         run_id: { type: string }
         status: { type: string, enum: [queued, pending] }
         submitted_at: { type: string, format: date-time }
         template_id: { type: string }
         template_version: { type: integer }
+        sink_template: { type: string, nullable: true, description: "The sink template composed in (source-template runs only)." }
+        sink_template_version: { type: integer, nullable: true }
+        streams:
+          type: array
+          description: "Per-stream write-mode plan of a composed run (empty for a `pipeline` template)."
+          items:
+            type: object
+            required: [stream, requested, chosen]
+            properties:
+              stream: { type: string, description: "Stream name — the matrix row id and destination table." }
+              requested: { type: array, items: { type: string }, description: "The stream's write preference list." }
+              chosen: { type: string, description: "The mode the sink runs it as (natively, or through a declared alias)." }
+              satisfies: { type: string, nullable: true, description: "The requested mode `chosen` stands in for, when an alias was used." }
+              key: { type: array, items: { type: string }, description: "The upsert key (the stream's `primary_keys`) for keyed modes." }
         params:
           type: object
           description: "The bound params, with every `secret: true` value replaced by `***`."
@@ -2090,6 +2130,10 @@ components:
         submitted_at: '2026-01-01T00:00:00Z'
         template_id: orders_to_warehouse
         template_version: 3
+        sink_template: bigquery
+        sink_template_version: 1
+        streams:
+          - { stream: orders, requested: [overwrite, upsert], chosen: overwrite, key: [id] }
         params:
           key: value
         deprecated: example

@@ -30,6 +30,14 @@ pub struct SuiteFile {
     /// `newest`, `prod`, …). Ignored when `template` is a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select: Option<String>,
+    /// For a `source-template`: the sink template to compose with — a
+    /// registered id when `template` is an id, a path when `template` is a
+    /// path. The composed pipeline is what every case exercises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink: Option<String>,
+    /// Version of the registered sink template. Default `stable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink_select: Option<String>,
     /// The cases.
     pub suite: Suite,
 }
