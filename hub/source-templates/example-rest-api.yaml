@@ -1,0 +1,29 @@
+# A skeleton source template for a paginated JSON REST API — copy it, fill in
+# the endpoints, and keep every credential a `${param.*}`.
+#   faucet validate --source example-rest-api --sink bigquery
+kind: source-template
+name: example-rest-api
+description: Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint
+tags: [example, rest]
+params:
+  base_url:  { type: string, required: true, description: "API root, e.g. https://api.example.com/v1" }
+  api_token: { type: string, required: true, secret: true, description: "Bearer token" }
+source:
+  type: rest
+  config:
+    base_url: "${param.base_url}"
+    path: /
+    auth: { type: bearer, config: { token: "${param.api_token}" } }
+    records_path: $.data[*]
+    pagination: { type: Cursor, next_token_path: $.next_cursor, param_name: cursor }
+transforms:
+  - { type: keys_case, config: { mode: snake } }
+streams:
+  - name: accounts
+    source: { config: { path: /accounts } }
+    primary_keys: [id]
+    write: [overwrite, upsert]
+  - name: events
+    source: { config: { path: /events, replication_method: { type: Incremental }, replication_key: created_at } }
+    primary_keys: [id]
+    write: [upsert, append]

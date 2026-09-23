@@ -150,7 +150,10 @@ parent/child DAG, **or** `depends_on:` completion ordering between rows), and bo
 concurrency with `execution:`. See [`cli/README.md`](cli/README.md)
 for the full grammar, [`cli/examples/rest_to_bigquery_matrix.yaml`](cli/examples/rest_to_bigquery_matrix.yaml)
 for matrix fan-out, and [`cli/examples/rest_users_posts_dag.yaml`](cli/examples/rest_users_posts_dag.yaml)
-for the DAG pattern. The [`cli/examples/`](cli/examples) directory has runnable configs for
+for the DAG pattern. The [`hub/`](hub) directory is the **Template Hub** layout: a `source-template`
+(one system + its streams) composes with any `sink-template` at run time —
+`faucet run --source <system> --sink bigquery`, or `--sink jsonl` to validate locally first (see the
+[cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html)). The [`cli/examples/`](cli/examples) directory has runnable configs for
 every common source→sink combination.
 
 ## Quickstart — the library

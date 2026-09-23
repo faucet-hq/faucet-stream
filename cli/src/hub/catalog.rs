@@ -1,0 +1,932 @@
+//! The hub **catalog**: a directory of `source-templates/*.yaml` +
+//! `sink-templates/*.yaml`, the source × sink compatibility matrix computed
+//! from it, the lint every published template must pass, and the renderers
+//! that turn the matrix into the docs page and `index.json`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use serde_json::{Value, json};
+
+use super::compose::{StreamIncompatibility, StreamPlan, compose, resolve_mode};
+use super::spec::{SinkTemplate, SourceTemplate};
+use crate::error::{CliError, CliResult};
+
+pub const SOURCE_DIR: &str = "source-templates";
+pub const SINK_DIR: &str = "sink-templates";
+
+/// A loaded catalog.
+#[derive(Debug, Default, Clone)]
+pub struct Catalog {
+    pub root: PathBuf,
+    pub sources: Vec<(PathBuf, SourceTemplate)>,
+    pub sinks: Vec<(PathBuf, SinkTemplate)>,
+}
+
+fn is_template_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|e| matches!(e.as_str(), "yaml" | "yml" | "json"))
+        && !p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+}
+
+fn list_dir(dir: &Path) -> CliResult<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| CliError::Config(format!("reading {}: {e}", dir.display())))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && is_template_file(p))
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+impl Catalog {
+    /// Load every template under `root/source-templates` and
+    /// `root/sink-templates`. Each file is parsed **and validated**; the first
+    /// broken file fails the load with its path, because a catalog with one
+    /// bad template must not be published.
+    pub fn load(root: &Path) -> CliResult<Self> {
+        let mut cat = Self {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        for p in list_dir(&root.join(SOURCE_DIR))? {
+            let t = super::parse_source_file(&p)?;
+            cat.sources.push((p, t));
+        }
+        for p in list_dir(&root.join(SINK_DIR))? {
+            let t = super::parse_sink_file(&p)?;
+            cat.sinks.push((p, t));
+        }
+        if cat.sources.is_empty() && cat.sinks.is_empty() {
+            return Err(CliError::Config(format!(
+                "no hub templates under {} (expected {SOURCE_DIR}/ and {SINK_DIR}/ with *.yaml files)",
+                root.display()
+            )));
+        }
+        // Ids must be unique and match the file stem, so `--source <id>`
+        // resolves unambiguously to one file.
+        let mut seen = BTreeMap::new();
+        for (p, t) in &cat.sources {
+            check_stem(p, &t.name, &mut seen)?;
+        }
+        seen.clear();
+        for (p, t) in &cat.sinks {
+            check_stem(p, &t.name, &mut seen)?;
+        }
+        Ok(cat)
+    }
+
+    pub fn source(&self, name: &str) -> Option<&SourceTemplate> {
+        self.sources
+            .iter()
+            .find(|(_, t)| t.name == name)
+            .map(|(_, t)| t)
+    }
+
+    pub fn sink(&self, name: &str) -> Option<&SinkTemplate> {
+        self.sinks
+            .iter()
+            .find(|(_, t)| t.name == name)
+            .map(|(_, t)| t)
+    }
+
+    /// Compatibility of every source against every sink, in catalog order.
+    pub fn matrix(&self) -> Vec<Cell> {
+        let mut cells = Vec::with_capacity(self.sources.len() * self.sinks.len());
+        for (_, s) in &self.sources {
+            for (_, k) in &self.sinks {
+                cells.push(cell(s, k));
+            }
+        }
+        cells
+    }
+}
+
+fn check_stem(p: &Path, name: &str, seen: &mut BTreeMap<String, PathBuf>) -> CliResult<()> {
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    if stem != name {
+        return Err(CliError::Config(format!(
+            "{}: file stem '{stem}' must equal the template's `name: {name}` so `--source/--sink {name}` finds it",
+            p.display()
+        )));
+    }
+    if let Some(prev) = seen.insert(name.to_string(), p.to_path_buf()) {
+        return Err(CliError::Config(format!(
+            "template '{name}' is defined twice: {} and {}",
+            prev.display(),
+            p.display()
+        )));
+    }
+    Ok(())
+}
+
+/// One source × sink cell of the matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Cell {
+    pub source: String,
+    pub sink: String,
+    pub sink_kind: String,
+    /// Every stream resolved to a mode the sink supports.
+    pub compatible: bool,
+    /// Per-stream resolution (the compatible streams).
+    pub streams: Vec<StreamPlan>,
+    /// Streams with no viable mode.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub incompatible: Vec<StreamIncompatibility>,
+}
+
+/// Compute one cell without building the document — the matrix over a large
+/// catalog stays cheap, and a partially compatible pairing still reports
+/// which streams would work.
+pub fn cell(source: &SourceTemplate, sink: &SinkTemplate) -> Cell {
+    let supported = crate::registry::sink_supported_write_modes(&sink.sink.kind);
+    let aliases = sink.aliases();
+    let mut streams = Vec::new();
+    let mut incompatible = Vec::new();
+    for s in &source.streams {
+        match resolve_mode(s, &sink.sink.kind, supported, &aliases) {
+            Ok(p) => streams.push(p),
+            Err(e) => incompatible.push(e),
+        }
+    }
+    Cell {
+        source: source.name.clone(),
+        sink: sink.name.clone(),
+        sink_kind: sink.sink.kind.clone(),
+        compatible: incompatible.is_empty(),
+        streams,
+        incompatible,
+    }
+}
+
+/// Fully compose every compatible pair (what the catalog test does to prove
+/// each published pairing parses as a `PipelineConfig`).
+pub fn compose_all(cat: &Catalog) -> Vec<(String, String, CliResult<super::compose::Composition>)> {
+    let mut out = Vec::new();
+    for (_, s) in &cat.sources {
+        for (_, k) in &cat.sinks {
+            out.push((s.name.clone(), k.name.clone(), compose(s, k)));
+        }
+    }
+    out
+}
+
+// ── lint ────────────────────────────────────────────────────────────────────
+
+/// Config keys whose literal value would be a leaked credential.
+const SECRET_KEYS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "private_key",
+    "client_secret",
+    "access_key",
+    "secret_key",
+    "consumer_secret",
+    "token_secret",
+    "json",
+    "credentials",
+];
+
+/// A value that is not a credential even though it sits under a secret-ish
+/// key: empty, a `${…}` reference, a JSONPath capture (`$.access_token` in a
+/// login-flow `capture:` block says *where to read* a token), or a one-/two-
+/// character constant (BambooHR's documented `password: x`), which cannot be
+/// a real secret.
+fn looks_like_reference(s: &str) -> bool {
+    s.is_empty()
+        || (s.starts_with("${") && s.ends_with('}'))
+        || s.starts_with("$.")
+        || s.starts_with("$[")
+        || s.chars().count() <= 2
+}
+
+fn walk_secrets(path: &str, v: &Value, findings: &mut Vec<String>) {
+    match v {
+        Value::Object(o) => {
+            for (k, x) in o {
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                let lk = k.to_ascii_lowercase();
+                if SECRET_KEYS
+                    .iter()
+                    .any(|s| lk == *s || lk.ends_with(&format!("_{s}")))
+                    && let Value::String(val) = x
+                    && !looks_like_reference(val)
+                {
+                    findings.push(format!(
+                        "`{child}` holds a literal value — credentials must be `${{param.NAME}}` / `${{env:NAME}}` / `${{secret:NAME}}`"
+                    ));
+                }
+                walk_secrets(&child, x, findings);
+            }
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                walk_secrets(&format!("{path}[{i}]"), x, findings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Markers of private infrastructure that must never ship in a public
+/// template: hostnames of managed databases, private-registry paths, and
+/// the like. A template is config for *someone else's* deployment.
+const PRIVATE_MARKERS: &[&str] = &[
+    ".rds.amazonaws.com",
+    ".internal",
+    "localhost:",
+    "127.0.0.1",
+    "REPLACE_ME",
+];
+
+fn walk_markers(path: &str, v: &Value, findings: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            for m in PRIVATE_MARKERS {
+                if s.contains(m) {
+                    findings.push(format!("`{path}` contains '{m}' — a public template must not point at private infrastructure or placeholders"));
+                }
+            }
+        }
+        Value::Object(o) => {
+            for (k, x) in o {
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                walk_markers(&child, x, findings);
+            }
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                walk_markers(&format!("{path}[{i}]"), x, findings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Publishability lint shared by both kinds. Structural validity is
+/// [`SourceTemplate::validate`] / [`SinkTemplate::validate`]; this is the
+/// policy layer: no literal credentials, no private infrastructure, a
+/// description, and every `secret: true` param actually marked.
+pub fn lint_source(t: &SourceTemplate) -> Vec<String> {
+    let mut f = Vec::new();
+    if t.description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        f.push("missing `description`".into());
+    }
+    let v = serde_json::to_value(t).unwrap_or(Value::Null);
+    walk_secrets("source", &v["source"], &mut f);
+    walk_secrets("auth", &v["auth"], &mut f);
+    walk_markers("source", &v["source"], &mut f);
+    walk_markers("auth", &v["auth"], &mut f);
+    walk_markers("streams", &v["streams"], &mut f);
+    lint_params(&t.params, &mut f);
+    f
+}
+
+pub fn lint_sink(t: &SinkTemplate) -> Vec<String> {
+    let mut f = Vec::new();
+    if t.description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        f.push("missing `description`".into());
+    }
+    let v = serde_json::to_value(t).unwrap_or(Value::Null);
+    walk_secrets("sink", &v["sink"], &mut f);
+    walk_secrets("auth", &v["auth"], &mut f);
+    walk_markers("sink", &v["sink"], &mut f);
+    walk_markers("auth", &v["auth"], &mut f);
+    walk_markers("per_stream", &v["per_stream"], &mut f);
+    lint_params(&t.params, &mut f);
+    f
+}
+
+fn lint_params(params: &crate::params::ParamsSpec, f: &mut Vec<String>) {
+    for (name, p) in params {
+        let ln = name.to_ascii_lowercase();
+        let secret_ish = SECRET_KEYS
+            .iter()
+            .any(|s| ln == *s || ln.ends_with(&format!("_{s}")));
+        if secret_ish && !p.secret {
+            f.push(format!(
+                "param `{name}` looks like a credential but is not `secret: true`"
+            ));
+        }
+        if p.secret
+            && p.default
+                .as_ref()
+                .is_some_and(|d| !d.as_str().is_some_and(str::is_empty))
+        {
+            f.push(format!(
+                "secret param `{name}` has a non-empty default — a baked-in credential"
+            ));
+        }
+    }
+}
+
+/// Lint the whole catalog; returns `(template, findings)` for every template
+/// with at least one finding.
+pub fn lint_catalog(cat: &Catalog) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for (_, s) in &cat.sources {
+        let f = lint_source(s);
+        if !f.is_empty() {
+            out.push((format!("source-template {}", s.name), f));
+        }
+    }
+    for (_, k) in &cat.sinks {
+        let f = lint_sink(k);
+        if !f.is_empty() {
+            out.push((format!("sink-template {}", k.name), f));
+        }
+    }
+    out
+}
+
+// ── renderers ───────────────────────────────────────────────────────────────
+
+/// The copy-paste command for one pairing: every required param listed with
+/// a `<placeholder>`, secrets pointed at an environment variable.
+pub fn run_command(source: &SourceTemplate, sink: &SinkTemplate) -> String {
+    let mut cmd = format!("faucet run --source {} --sink {}", source.name, sink.name);
+    let mut params: Vec<(&String, &crate::params::ParamSpec)> = source.params.iter().collect();
+    params.extend(sink.params.iter());
+    for (name, p) in params {
+        if !p.required {
+            continue;
+        }
+        if p.secret {
+            cmd.push_str(&format!(
+                " \\\n  --param {name}=\"${}\"",
+                name.to_ascii_uppercase()
+            ));
+        } else {
+            cmd.push_str(&format!(" \\\n  --param {name}=<{name}>"));
+        }
+    }
+    cmd
+}
+
+/// Rebuild every object in `v` with its keys in sorted order, so the emitted
+/// JSON is byte-identical whether `serde_json` was compiled with
+/// `preserve_order` (feature-unified in by other crates under
+/// `--all-features`) or not. The committed `index.json` depends on it.
+pub fn sort_keys(v: Value) -> Value {
+    match v {
+        Value::Object(o) => {
+            let mut entries: Vec<(String, Value)> = o.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut out = serde_json::Map::new();
+            for (k, x) in entries {
+                out.insert(k, sort_keys(x));
+            }
+            Value::Object(out)
+        }
+        Value::Array(a) => Value::Array(a.into_iter().map(sort_keys).collect()),
+        other => other,
+    }
+}
+
+/// Machine-readable index of the catalog (what a website consumes). Keys are
+/// sorted at every level (see [`sort_keys`]).
+pub fn index_json(cat: &Catalog) -> Value {
+    sort_keys(index_json_unsorted(cat))
+}
+
+fn index_json_unsorted(cat: &Catalog) -> Value {
+    let cells = cat.matrix();
+    json!({
+        "version": 1,
+        "sources": cat.sources.iter().map(|(p, s)| json!({
+            "name": s.name,
+            "description": s.description,
+            "tags": s.tags,
+            "docs": s.docs,
+            "source_type": s.source.kind,
+            "file": rel(&cat.root, p),
+            "streams": s.streams.iter().map(|st| json!({
+                "name": st.name,
+                "description": st.description,
+                "write": st.write.candidates().iter().map(|m| m.as_str()).collect::<Vec<_>>(),
+                "primary_keys": st.primary_keys,
+            })).collect::<Vec<_>>(),
+            "params": s.params.iter().map(|(n, p)| json!({
+                "name": n, "type": p.kind, "required": p.required, "secret": p.secret,
+                "description": p.description, "default": p.default,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "sinks": cat.sinks.iter().map(|(p, k)| json!({
+            "name": k.name,
+            "description": k.description,
+            "tags": k.tags,
+            "docs": k.docs,
+            "sink_type": k.sink.kind,
+            "file": rel(&cat.root, p),
+            "write_modes": crate::registry::sink_supported_write_modes(&k.sink.kind).iter().map(|m| m.as_str()).collect::<Vec<_>>(),
+            "params": k.params.iter().map(|(n, p)| json!({
+                "name": n, "type": p.kind, "required": p.required, "secret": p.secret,
+                "description": p.description, "default": p.default,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "matrix": cells.iter().map(|c| json!({
+            "source": c.source,
+            "sink": c.sink,
+            "compatible": c.compatible,
+            "streams": c.streams.iter().map(|p| json!({"stream": p.stream, "write_mode": p.chosen.as_str(), "satisfies": p.satisfies.map(|m| m.as_str())})).collect::<Vec<_>>(),
+            "incompatible": c.incompatible,
+            "command": cat.source(&c.source).zip(cat.sink(&c.sink)).map(|(s, k)| run_command(s, k)),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn rel(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// The docs-site page: the matrix as a table, then one section per source
+/// with its streams and a copy-paste command per compatible sink.
+pub fn render_markdown(cat: &Catalog) -> String {
+    let cells = cat.matrix();
+    let mut md = String::new();
+    md.push_str("# Template Hub — source × sink matrix\n\n");
+    md.push_str(
+        "<!-- GENERATED from hub/ by `cargo test -p faucet-cli --test hub_catalog -- --ignored regenerate`; do not edit by hand. -->\n\n",
+    );
+    md.push_str(&format!(
+        "{} source templates × {} sink templates. ✓ = every stream has a write mode the sink supports; \
+         ◐ = some streams do; — = none. Each source section below carries the copy-paste command for every compatible sink.\n\n",
+        cat.sources.len(),
+        cat.sinks.len()
+    ));
+    // Table.
+    md.push_str("| source \\ sink |");
+    for (_, k) in &cat.sinks {
+        md.push_str(&format!(" [{}](#sink-{}) |", k.name, k.name));
+    }
+    md.push_str("\n|---|");
+    for _ in &cat.sinks {
+        md.push_str(":---:|");
+    }
+    md.push('\n');
+    for (_, s) in &cat.sources {
+        md.push_str(&format!("| [{}](#{}) |", s.name, s.name));
+        for (_, k) in &cat.sinks {
+            let c = cells
+                .iter()
+                .find(|c| c.source == s.name && c.sink == k.name)
+                .expect("cell");
+            let mark = if c.compatible {
+                "✓"
+            } else if c.streams.is_empty() {
+                "—"
+            } else {
+                "◐"
+            };
+            md.push_str(&format!(" {mark} |"));
+        }
+        md.push('\n');
+    }
+    md.push('\n');
+
+    md.push_str("## Sinks\n\n");
+    for (_, k) in &cat.sinks {
+        md.push_str(&format!(
+            "### sink: {}\n\n<a id=\"sink-{}\"></a>{}\n\n- connector: `{}` · write modes: {}\n",
+            k.name,
+            k.name,
+            k.description.as_deref().unwrap_or(""),
+            k.sink.kind,
+            crate::registry::sink_supported_write_modes(&k.sink.kind)
+                .iter()
+                .map(|m| format!("`{}`", m.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if !k.write_mode_aliases.is_empty() {
+            md.push_str(&format!(
+                "- satisfies by construction: {}\n",
+                k.aliases()
+                    .iter()
+                    .map(|(f, t)| format!("`{}`→`{}`", f.as_str(), t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        render_params(&mut md, &k.params);
+        md.push('\n');
+    }
+
+    md.push_str("## Sources\n\n");
+    for (_, s) in &cat.sources {
+        md.push_str(&format!(
+            "### {}\n\n{}\n\n",
+            s.name,
+            s.description.as_deref().unwrap_or("")
+        ));
+        if !s.tags.is_empty() {
+            md.push_str(&format!(
+                "- tags: {}\n",
+                s.tags
+                    .iter()
+                    .map(|t| format!("`{t}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        md.push_str(&format!(
+            "- connector: `{}` · {} stream(s)\n",
+            s.source.kind,
+            s.streams.len()
+        ));
+        if let Some(d) = &s.docs {
+            md.push_str(&format!("- upstream docs: <{d}>\n"));
+        }
+        render_params(&mut md, &s.params);
+        md.push_str("\n| stream | write (preference) | primary keys |\n|---|---|---|\n");
+        for st in &s.streams {
+            md.push_str(&format!(
+                "| `{}` | {} | {} |\n",
+                st.name,
+                st.write
+                    .candidates()
+                    .iter()
+                    .map(|m| format!("`{}`", m.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+                if st.primary_keys.is_empty() {
+                    "—".to_string()
+                } else {
+                    st.primary_keys
+                        .iter()
+                        .map(|k| format!("`{k}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ));
+        }
+        md.push('\n');
+        for (_, k) in &cat.sinks {
+            let c = cells
+                .iter()
+                .find(|c| c.source == s.name && c.sink == k.name)
+                .expect("cell");
+            if c.compatible {
+                let aliased: Vec<String> = c
+                    .streams
+                    .iter()
+                    .filter(|p| p.satisfies.is_some())
+                    .map(|p| format!("`{}` {}", p.stream, p.describe()))
+                    .collect();
+                md.push_str(&format!(
+                    "**→ {}**{}\n\n```bash\n{}\n```\n\n",
+                    k.name,
+                    if aliased.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " — {} stream(s) run through an alias: {}",
+                            aliased.len(),
+                            aliased.join(", ")
+                        )
+                    },
+                    run_command(s, k)
+                ));
+            } else {
+                md.push_str(&format!("**→ {}** — incompatible:\n\n", k.name));
+                for i in &c.incompatible {
+                    md.push_str(&format!("- `{}`: {}\n", i.stream, i.reason));
+                }
+                md.push('\n');
+            }
+        }
+    }
+    md
+}
+
+fn render_params(md: &mut String, params: &crate::params::ParamsSpec) {
+    if params.is_empty() {
+        return;
+    }
+    md.push_str("- params:\n");
+    for (n, p) in params {
+        let mut bits = Vec::new();
+        if p.required {
+            bits.push("required".to_string());
+        }
+        if p.secret {
+            bits.push("secret".to_string());
+        }
+        if let Some(d) = &p.default {
+            bits.push(format!("default `{d}`"));
+        }
+        md.push_str(&format!(
+            "  - `{n}`{}{}\n",
+            if bits.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", bits.join(", "))
+            },
+            p.description
+                .as_deref()
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: &str = r#"
+kind: source-template
+name: acme
+description: Acme billing API
+tags: [finance]
+params:
+  api_token: { type: string, required: true, secret: true }
+source:
+  type: rest
+  config: { base_url: https://api.acme.example/v1, path: /, auth: { type: bearer, config: { token: "${param.api_token}" } } }
+streams:
+  - name: invoices
+    source: { config: { path: /invoices } }
+    primary_keys: [id]
+    write: [overwrite, upsert]
+  - name: events
+    source: { config: { path: /events } }
+"#;
+    const BQ: &str = r#"
+kind: sink-template
+name: bigquery
+description: Google BigQuery
+params:
+  bq_project: { type: string, required: true }
+sink:
+  type: bigquery
+  config: { project_id: "${param.bq_project}", dataset_id: raw }
+per_stream:
+  table_id: "${stream}"
+"#;
+    const JSONL: &str = r#"
+kind: sink-template
+name: jsonl
+description: Local JSON Lines files
+params:
+  out_dir: { type: string, default: ./out }
+sink:
+  type: jsonl
+  config: {}
+per_stream:
+  path: "${param.out_dir}/${source}/${stream}.jsonl"
+"#;
+
+    fn write_catalog(dir: &Path) {
+        std::fs::create_dir_all(dir.join(SOURCE_DIR)).unwrap();
+        std::fs::create_dir_all(dir.join(SINK_DIR)).unwrap();
+        std::fs::write(dir.join(SOURCE_DIR).join("acme.yaml"), SRC).unwrap();
+        std::fs::write(dir.join(SINK_DIR).join("bigquery.yaml"), BQ).unwrap();
+        std::fs::write(dir.join(SINK_DIR).join("jsonl.yaml"), JSONL).unwrap();
+        std::fs::write(dir.join(SINK_DIR).join("README.md"), "ignored").unwrap();
+        std::fs::write(dir.join(SINK_DIR).join(".hidden.yaml"), "ignored: true").unwrap();
+    }
+
+    #[test]
+    fn loads_matrix_and_renders() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path());
+        let cat = Catalog::load(dir.path()).unwrap();
+        assert_eq!(cat.sources.len(), 1);
+        assert_eq!(cat.sinks.len(), 2);
+        assert!(
+            cat.source("acme").is_some()
+                && cat.sink("jsonl").is_some()
+                && cat.sink("nope").is_none()
+        );
+
+        let cells = cat.matrix();
+        assert_eq!(cells.len(), 2);
+        let bq = cells.iter().find(|c| c.sink == "bigquery").unwrap();
+        assert!(bq.compatible);
+        assert_eq!(bq.streams.len(), 2);
+        let jl = cells.iter().find(|c| c.sink == "jsonl").unwrap();
+        assert!(!jl.compatible, "invoices needs overwrite|upsert");
+        assert_eq!(jl.streams.len(), 1, "events still resolves");
+        assert_eq!(jl.incompatible[0].stream, "invoices");
+
+        let all = compose_all(&cat);
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .find(|(_, k, _)| k == "bigquery")
+                .unwrap()
+                .2
+                .is_ok()
+        );
+        assert!(
+            all.iter()
+                .find(|(_, k, _)| k == "jsonl")
+                .unwrap()
+                .2
+                .is_err()
+        );
+
+        let cmd = run_command(cat.source("acme").unwrap(), cat.sink("bigquery").unwrap());
+        assert!(
+            cmd.starts_with("faucet run --source acme --sink bigquery"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("--param api_token=\"$API_TOKEN\""), "{cmd}");
+        assert!(cmd.contains("--param bq_project=<bq_project>"), "{cmd}");
+        assert!(
+            !cmd.contains("out_dir"),
+            "optional params are not in the command"
+        );
+
+        let md = render_markdown(&cat);
+        assert!(md.contains("| [acme](#acme) | ✓ | ◐ |"), "{md}");
+        assert!(md.contains("### sink: bigquery"));
+        assert!(md.contains("**→ jsonl** — incompatible:"));
+        assert!(
+            md.contains("- `invoices`: needs overwrite|upsert; sink 'jsonl' supports only append")
+        );
+        assert!(md.contains("| `invoices` | `overwrite` → `upsert` | `id` |"));
+        assert!(md.contains("`api_token` (required, secret)"));
+
+        let idx = index_json(&cat);
+        assert_eq!(idx["version"], 1);
+        assert_eq!(idx["sources"][0]["file"], "source-templates/acme.yaml");
+        assert_eq!(
+            idx["sources"][0]["streams"][0]["write"],
+            json!(["overwrite", "upsert"])
+        );
+        assert_eq!(
+            idx["sinks"][0]["write_modes"],
+            json!(["append", "upsert", "delete", "overwrite"])
+        );
+        let m = idx["matrix"].as_array().unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0]["compatible"], true);
+        assert!(
+            m[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--sink bigquery")
+        );
+        assert_eq!(m[1]["incompatible"][0]["stream"], "invoices");
+    }
+
+    #[test]
+    fn index_json_is_key_order_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path());
+        let cat = Catalog::load(dir.path()).unwrap();
+        let idx = index_json(&cat);
+        fn assert_sorted(v: &Value, path: &str) {
+            match v {
+                Value::Object(o) => {
+                    let keys: Vec<&String> = o.keys().collect();
+                    let mut sorted = keys.clone();
+                    sorted.sort();
+                    assert_eq!(keys, sorted, "keys out of order at {path}");
+                    for (k, x) in o {
+                        assert_sorted(x, &format!("{path}.{k}"));
+                    }
+                }
+                Value::Array(a) => a
+                    .iter()
+                    .enumerate()
+                    .for_each(|(i, x)| assert_sorted(x, &format!("{path}[{i}]"))),
+                _ => {}
+            }
+        }
+        assert_sorted(&idx, "$");
+        assert_eq!(
+            sort_keys(json!({"b": 1, "a": {"z": [ {"y": 1, "x": 2} ], "c": 3}})).to_string(),
+            r#"{"a":{"c":3,"z":[{"x":2,"y":1}]},"b":1}"#
+        );
+    }
+
+    #[test]
+    fn load_rejects_stem_mismatch_duplicates_and_empty_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            Catalog::load(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("no hub templates")
+        );
+        write_catalog(dir.path());
+        std::fs::write(dir.path().join(SOURCE_DIR).join("other.yaml"), SRC).unwrap();
+        let err = Catalog::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("file stem 'other' must equal"), "{err}");
+        std::fs::remove_file(dir.path().join(SOURCE_DIR).join("other.yaml")).unwrap();
+        std::fs::write(dir.path().join(SOURCE_DIR).join("acme.yml"), SRC).unwrap();
+        let err = Catalog::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("defined twice"), "{err}");
+        std::fs::write(
+            dir.path().join(SOURCE_DIR).join("acme.yml"),
+            "kind: source-template\nname: acme\n",
+        )
+        .unwrap();
+        assert!(
+            Catalog::load(dir.path()).is_err(),
+            "a broken file fails the load"
+        );
+    }
+
+    #[test]
+    fn lint_catches_literal_credentials_markers_and_unmarked_secret_params() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path());
+        let cat = Catalog::load(dir.path()).unwrap();
+        assert!(lint_catalog(&cat).is_empty(), "{:?}", lint_catalog(&cat));
+
+        let mut s = cat.source("acme").unwrap().clone();
+        s.description = None;
+        s.source.config["auth"]["config"]["token"] = json!("sk-live-123");
+        s.source.config["base_url"] = json!("https://db.internal/x");
+        s.params.insert(
+            "db_password".into(),
+            crate::params::ParamSpec {
+                kind: Default::default(),
+                required: true,
+                default: None,
+                secret: false,
+                description: None,
+                values: vec![],
+                computed: None,
+            },
+        );
+        s.params.get_mut("api_token").unwrap().default = Some(json!("baked"));
+        let f = lint_source(&s);
+        let joined = f.join("\n");
+        assert!(joined.contains("missing `description`"), "{joined}");
+        assert!(
+            joined.contains("`source.config.auth.config.token` holds a literal value"),
+            "{joined}"
+        );
+        assert!(joined.contains("contains '.internal'"), "{joined}");
+        assert!(
+            joined.contains("param `db_password` looks like a credential"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("secret param `api_token` has a non-empty default"),
+            "{joined}"
+        );
+
+        let mut k = cat.sink("bigquery").unwrap().clone();
+        k.sink.config["auth"] = json!({"type": "service_account_key", "config": {"json": "{\"private_key\": \"...\"}"}});
+        k.per_stream
+            .insert("dataset_id".into(), json!("REPLACE_ME"));
+        let f = lint_sink(&k).join("\n");
+        assert!(
+            f.contains("`sink.config.auth.config.json` holds a literal value"),
+            "{f}"
+        );
+        assert!(f.contains("REPLACE_ME"), "{f}");
+        // Empty strings, references, JSONPath captures, and tiny constants are fine.
+        k.sink.config["auth"]["config"]["json"] = json!("${param.sa_key}");
+        k.per_stream.remove("dataset_id");
+        assert!(lint_sink(&k).is_empty(), "{:?}", lint_sink(&k));
+        let mut s = cat.source("acme").unwrap().clone();
+        s.auth = Some(
+            [("flow".to_string(), json!({"type": "login_flow", "config": {"steps": [{"capture": {"access_token": "$.access_token"}}]}}))]
+                .into_iter()
+                .collect(),
+        );
+        s.source.config["auth"]["config"]["password"] = json!("x");
+        assert!(lint_source(&s).is_empty(), "{:?}", lint_source(&s));
+    }
+}

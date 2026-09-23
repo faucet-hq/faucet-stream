@@ -1,0 +1,18 @@
+# Template Hub sink: PostgreSQL. One auto-mapped table per stream; the
+# composer sets `write_mode` per stream (overwrite = transactional
+# truncate-load swap, upsert = INSERT … ON CONFLICT on the primary keys).
+kind: sink-template
+name: postgres
+description: PostgreSQL — one auto-mapped table per stream, transactional overwrite or ON CONFLICT upsert
+tags: [database]
+params:
+  pg_url:    { type: string, required: true, secret: true, description: "postgres://user:pass@host:5432/db connection URL" }
+  pg_schema: { type: string, default: public, description: "Schema every stream's table is created in" }
+sink:
+  type: postgres
+  config:
+    connection_url: "${param.pg_url}"
+    schema: "${param.pg_schema}"
+    column_mapping: auto_map
+per_stream:
+  table_name: "${stream}"

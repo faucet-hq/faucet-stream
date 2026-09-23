@@ -156,6 +156,10 @@ pub enum Command {
     /// Inspect, replay, or discard dead-letter-queue envelopes written by a
     /// pipeline's `dlq:` sink.
     Dlq(DlqArgs),
+    /// Template Hub: compose a `source-template` with a `sink-template`, check
+    /// a pairing, list a catalog, render its compatibility matrix, or lint
+    /// templates for publication.
+    Hub(HubArgs),
     /// Validate a config's `contract:` block and print a summary, or export
     /// it in a machine-readable format (`--export`).
     #[cfg(feature = "contract")]
@@ -827,6 +831,108 @@ pub struct TestArgs {
     pub resolve_secrets: bool,
 }
 
+/// `faucet hub …` — the Template Hub (#571).
+#[derive(Debug, Parser)]
+pub struct HubArgs {
+    #[command(subcommand)]
+    pub command: HubCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HubCommand {
+    /// Compose a source template with a sink template and print (or write)
+    /// the resulting pipeline config.
+    Compose(HubComposeArgs),
+    /// Show how each stream of a source resolves against a sink's write
+    /// modes; exits non-zero if any stream has no viable mode.
+    Check(HubCheckArgs),
+    /// List the source and sink templates in a hub catalog.
+    List(HubListArgs),
+    /// Render the source × sink compatibility matrix (table, markdown, or the
+    /// machine-readable index).
+    Matrix(HubMatrixArgs),
+    /// Publishability lint: no literal credentials, no private
+    /// infrastructure, secrets marked, descriptions present.
+    Lint(HubLintArgs),
+}
+
+/// The pairing every hub verb takes.
+#[derive(Debug, Parser)]
+pub struct HubPairArgs {
+    /// Source template: a path, or an id resolved as `<hub>/source-templates/<id>.yaml`.
+    #[arg(long)]
+    pub source: String,
+    /// Sink template: a path, or an id resolved as `<hub>/sink-templates/<id>.yaml`.
+    #[arg(long)]
+    pub sink: String,
+    /// Hub catalog directory. Default: `$FAUCET_HUB`, else `./hub`.
+    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
+    pub hub: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+pub struct HubComposeArgs {
+    #[command(flatten)]
+    pub pair: HubPairArgs,
+    /// Write the composed config here instead of stdout.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub out: Option<PathBuf>,
+    /// Emit the composition as JSON (document + per-stream write modes).
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct HubCheckArgs {
+    #[command(flatten)]
+    pub pair: HubPairArgs,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct HubListArgs {
+    /// Hub catalog directory. Default: `$FAUCET_HUB`, else `./hub`.
+    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
+    pub hub: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Output format for `faucet hub matrix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum MatrixFormat {
+    /// Compact terminal table.
+    #[default]
+    Table,
+    /// The docs-site page (matrix + per-source sections with run commands).
+    Markdown,
+    /// `index.json` — the machine-readable catalog + matrix.
+    Json,
+}
+
+#[derive(Debug, Parser)]
+pub struct HubMatrixArgs {
+    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
+    pub hub: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = MatrixFormat::Table)]
+    pub format: MatrixFormat,
+    /// Write to this file instead of stdout.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+pub struct HubLintArgs {
+    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
+    pub hub: Option<PathBuf>,
+    /// Template files to lint (kind read from `kind:`). Default: the whole catalog.
+    #[arg(value_hint = clap::ValueHint::FilePath)]
+    pub files: Vec<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `faucet dlq` arguments.
 #[derive(Debug, Parser)]
 pub struct DlqArgs {
@@ -1385,6 +1491,18 @@ pub struct RunArgs {
     /// `--tag`/`--include-parents`).
     #[command(flatten)]
     pub selection: SelectionArgs,
+
+    /// Template Hub (#571): compose this `source-template` (path or hub id)
+    /// with `--sink` instead of loading a config file.
+    #[arg(long, requires = "sink", conflicts_with_all = ["config", "from_env"])]
+    pub source: Option<String>,
+    /// Template Hub: the `sink-template` (path or hub id) to compose with `--source`.
+    #[arg(long, requires = "source")]
+    pub sink: Option<String>,
+    /// Hub catalog directory for `--source` / `--sink` ids. Default:
+    /// `$FAUCET_HUB`, else `./hub`.
+    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
+    pub hub: Option<PathBuf>,
 }
 
 /// Format for `faucet run`'s end-of-run summary.
@@ -1589,6 +1707,18 @@ pub struct ValidateArgs {
     /// so CI can assert on it programmatically. Suppresses the human lines.
     #[arg(long)]
     pub json: bool,
+
+    /// Template Hub (#571): compose this `source-template` (path or hub id)
+    /// with `--sink` and validate the result instead of loading a config file.
+    #[arg(long, requires = "sink", conflicts_with = "config")]
+    pub source: Option<String>,
+    /// Template Hub: the `sink-template` (path or hub id) to compose with `--source`.
+    #[arg(long, requires = "source")]
+    pub sink: Option<String>,
+    /// Hub catalog directory for `--source` / `--sink` ids. Default:
+    /// `$FAUCET_HUB`, else `./hub`.
+    #[arg(long, env = "FAUCET_HUB", value_hint = clap::ValueHint::DirPath)]
+    pub hub: Option<PathBuf>,
 }
 
 /// `faucet schema` arguments.
@@ -1652,6 +1782,10 @@ pub enum SchemaTarget {
     Masking,
     /// JSON Schema for the `faucet test` spec file.
     Test,
+    /// JSON Schema for a Template Hub `kind: source-template` document (#571).
+    SourceTemplate,
+    /// JSON Schema for a Template Hub `kind: sink-template` document (#571).
+    SinkTemplate,
     /// JSON Schema for a `faucet template test` suite file (#648).
     #[cfg(feature = "templates")]
     TemplateTest,

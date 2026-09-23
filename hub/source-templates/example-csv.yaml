@@ -1,0 +1,24 @@
+# A runnable example source template: two CSV exports become two streams.
+#   faucet run --source example-csv --sink jsonl      # writes ./out/example-csv/{orders,customers}.jsonl
+#   faucet hub check --source example-csv --sink postgres
+kind: source-template
+name: example-csv
+description: Example — two CSV exports as two streams (runs offline, no credentials)
+tags: [example, file]
+params:
+  data_dir: { type: string, default: ./hub/examples/data, description: "Directory holding orders.csv and customers.csv" }
+source:
+  type: csv
+  config:
+    path: "${param.data_dir}/orders.csv"
+    has_headers: true
+transforms:
+  - { type: keys_case, config: { mode: snake } }
+streams:
+  - name: orders
+    primary_keys: [id]
+    write: [overwrite, upsert]
+  - name: customers
+    source: { config: { path: "${param.data_dir}/customers.csv" } }
+    primary_keys: [id]
+    write: [overwrite, upsert]

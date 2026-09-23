@@ -78,6 +78,7 @@ Flags:
 | `--include-parents <off\|eligible\|all>` | Parent/`depends_on` inclusion policy for a narrowed run set (default `off`). Overrides `selection.include_parents:`. Env: `FAUCET_INCLUDE_PARENTS`. |
 | `--param <NAME=VALUE>` | Supply a value for a declared [`params:`](config.md#params) entry. Repeatable; coerced to the declared type. A `required` param with no value is an error naming it. |
 | `--param-env <NAME[=VALUE]>` | Override an environment variable for this run's `${env:VAR}` resolution only. Bare `NAME` takes the value from the caller's environment (so a secret stays out of the process arguments). The process environment is not modified. Repeatable. |
+| `--source <id\|path> --sink <id\|path>` | Template Hub: compose a `source-template` with a `sink-template` and run the result instead of loading a config file. Ids resolve under `--hub` / `$FAUCET_HUB` / `./hub`. See [`hub`](#hub). |
 | `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
 | `--quiet` | Suppress the inline live progress line. |
 
@@ -741,6 +742,36 @@ readable config path, no registry is involved at all, so a template can be teste
 before it is ever registered. The exit code is the failed-case count, mirroring
 `faucet test`. See
 [Testing the parameter space](../cookbook/templates.md#testing-the-parameter-space).
+
+## `hub`
+
+```bash
+faucet hub list      [--hub ./hub] [--json]
+faucet hub check     --source example-rest-api --sink bigquery   # per-stream write modes; exit≠0 if incompatible
+faucet hub compose   --source example-rest-api --sink sqlite --out my-pipeline.yaml
+faucet hub matrix    --format table|markdown|json [--out FILE]
+faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint
+faucet run           --source example-csv --sink jsonl                   # runs offline
+faucet validate      --source example-rest-api --sink bigquery [--show-composed]
+faucet schema source-template | sink-template
+```
+
+The Template Hub composes a `kind: source-template` (one system, its shaping,
+its streams and their write preferences) with a `kind: sink-template` (one
+destination and its `per_stream` addressing) into an ordinary pipeline config
+at run time. See the [Template Hub cookbook](../cookbook/template-hub.md) and
+the generated [source × sink matrix](./template-hub-matrix.md).
+
+| Flag | Purpose |
+|------|---------|
+| `--source <id\|path>` / `--sink <id\|path>` | The pairing. A path is used as-is; an id resolves to `<hub>/source-templates/<id>.yaml` / `<hub>/sink-templates/<id>.yaml`. |
+| `--hub <dir>` | Catalog directory. Default `$FAUCET_HUB`, else `./hub`. |
+| `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
+| `--format table\|markdown\|json` | *(matrix)* Terminal table, the docs page, or `index.json`. |
+| `--json` | Machine-readable output. |
+
+`check` and `lint` exit non-zero on any incompatible stream / finding, so both
+gate a catalog in CI.
 
 ## `notify`
 

@@ -62,6 +62,7 @@ pub enum Auth {
         /// Fraction of `expires_in` after which the cached token is considered
         /// expired and a new one is fetched. Must be in `(0.0, 1.0]`.
         /// Defaults to `0.9` (refresh after 90 % of the token lifetime).
+        #[serde(default = "default_expiry_ratio")]
         expiry_ratio: f64,
     },
     /// Fetch a token from an arbitrary HTTP endpoint.
@@ -91,6 +92,7 @@ pub enum Auth {
         expiry_path: Option<String>,
         /// Fraction of the expiry after which the token is proactively refreshed.
         /// Must be in `(0.0, 1.0]`. Defaults to `0.9`.
+        #[serde(default = "default_expiry_ratio")]
         expiry_ratio: f64,
         /// Body encoding: `json` (default) or `form`
         /// (`application/x-www-form-urlencoded`, required by RFC-6749 OAuth
@@ -144,6 +146,11 @@ impl Auth {
 
 pub use oauth2::fetch_oauth2_token;
 pub use token_endpoint::fetch_token_from_endpoint;
+
+/// The documented `expiry_ratio` default: refresh after 90 % of the token lifetime.
+fn default_expiry_ratio() -> f64 {
+    0.9
+}
 
 #[cfg(test)]
 mod tests {
@@ -231,6 +238,36 @@ mod tests {
         .apply(&mut headers)
         .unwrap();
         assert!(headers.is_empty());
+    }
+
+    /// `expiry_ratio` is optional on the wire (an additive field must never
+    /// break an existing config) and defaults to the documented 0.9.
+    #[test]
+    fn expiry_ratio_defaults_when_omitted() {
+        let a: Auth = serde_json::from_value(serde_json::json!({
+            "type": "oauth2",
+            "config": {"token_url": "https://x/t", "client_id": "i", "client_secret": "s", "scopes": []}
+        }))
+        .unwrap();
+        assert!(
+            matches!(a, Auth::OAuth2 { expiry_ratio, .. } if (expiry_ratio - 0.9).abs() < f64::EPSILON)
+        );
+        let a: Auth = serde_json::from_value(serde_json::json!({
+            "type": "token_endpoint",
+            "config": {"url": "https://x/t", "method": "POST", "token_path": "$.token"}
+        }))
+        .unwrap();
+        assert!(
+            matches!(a, Auth::TokenEndpoint { expiry_ratio, .. } if (expiry_ratio - 0.9).abs() < f64::EPSILON)
+        );
+        let a: Auth = serde_json::from_value(serde_json::json!({
+            "type": "oauth2",
+            "config": {"token_url": "https://x/t", "client_id": "i", "client_secret": "s", "scopes": [], "expiry_ratio": 0.5}
+        }))
+        .unwrap();
+        assert!(
+            matches!(a, Auth::OAuth2 { expiry_ratio, .. } if (expiry_ratio - 0.5).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
