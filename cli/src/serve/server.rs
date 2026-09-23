@@ -91,6 +91,8 @@ pub fn build_router(
                 "/v1/templates/{id}",
                 get(templates::get_template).delete(templates::delete_template),
             )
+            // Static `/matrix` is matched ahead of `{id}` (same reservation as `/sync`).
+            .route("/v1/templates/matrix", get(templates::template_matrix))
             .route("/v1/templates/{id}/runs", post(templates::trigger_template))
             .route("/v1/templates/{id}/tags", post(templates::promote_template))
             .route(

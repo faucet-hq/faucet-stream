@@ -252,6 +252,7 @@ mod tests {
                 repo: "acme/t".into(),
                 r#ref: "main".into(),
                 path: String::new(),
+                paths: Vec::new(),
                 token: None,
                 api_base: "https://api.github.com".into(),
             }),

@@ -18,6 +18,8 @@
 
 pub mod catalog;
 pub mod compose;
+#[cfg(feature = "hub-remote")]
+pub mod remote;
 pub mod spec;
 
 use std::path::{Path, PathBuf};
@@ -31,22 +33,168 @@ pub use catalog::Catalog;
 pub use compose::{Composition, compose};
 pub use spec::{SinkTemplate, SourceTemplate, Stream, TemplateKind, WriteChoice};
 
-/// Default hub directory (relative to the working directory) when neither
-/// `--hub` nor `FAUCET_HUB` is set.
+/// Default hub directory (relative to the working directory), used when it
+/// exists and neither `--hub` nor `FAUCET_HUB` is set.
 pub const DEFAULT_HUB_DIR: &str = "hub";
+/// The public catalog (#677), used when no local hub is configured or present.
+pub const DEFAULT_REMOTE_HUB: &str = "github:faucet-hq/template-hub";
 
-/// Resolve the hub directory: an explicit flag, else `FAUCET_HUB`, else
-/// [`DEFAULT_HUB_DIR`].
-pub fn hub_dir(flag: Option<&Path>) -> PathBuf {
-    if let Some(p) = flag {
-        return p.to_path_buf();
+/// Where a hub catalog lives: a local directory, or a directory in a GitHub
+/// repository fetched through the contents API and cached locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubLocation {
+    Dir(PathBuf),
+    Github {
+        /// `owner/name`.
+        repo: String,
+        /// Branch, tag, or commit. Default `main`.
+        r#ref: String,
+        /// Directory inside the repo holding `source-templates/` etc. Empty =
+        /// the repository root.
+        path: String,
+    },
+}
+
+impl HubLocation {
+    /// Parse a `--hub` / `FAUCET_HUB` value.
+    ///
+    /// - `github:owner/repo[@ref][/path]`
+    /// - `https://github.com/owner/repo[/tree/<ref>[/path]]`
+    /// - anything else is a local directory.
+    pub fn parse(raw: &str) -> CliResult<Self> {
+        let raw = raw.trim();
+        if let Some(rest) = raw.strip_prefix("github:") {
+            return Self::parse_github_spec(rest);
+        }
+        for prefix in ["https://github.com/", "http://github.com/", "github.com/"] {
+            if let Some(rest) = raw.strip_prefix(prefix) {
+                let rest = rest.trim_end_matches('/').trim_end_matches(".git");
+                let mut parts = rest.splitn(3, '/');
+                let owner = parts.next().unwrap_or_default();
+                let name = parts.next().unwrap_or_default();
+                let tail = parts.next().unwrap_or_default();
+                if owner.is_empty() || name.is_empty() {
+                    return Err(CliError::Config(format!(
+                        "hub '{raw}': a GitHub URL needs `owner/repo` after github.com/"
+                    )));
+                }
+                let (r#ref, path) = match tail.strip_prefix("tree/") {
+                    Some(t) => {
+                        let (r, p) = t.split_once('/').unwrap_or((t, ""));
+                        (r.to_string(), p.to_string())
+                    }
+                    None if tail.is_empty() => ("main".to_string(), String::new()),
+                    None => {
+                        return Err(CliError::Config(format!(
+                            "hub '{raw}': only `/tree/<ref>[/path]` is understood after the repository"
+                        )));
+                    }
+                };
+                return Ok(Self::Github {
+                    repo: format!("{owner}/{name}"),
+                    r#ref,
+                    path: path.trim_matches('/').to_string(),
+                });
+            }
+        }
+        Ok(Self::Dir(PathBuf::from(raw)))
+    }
+
+    fn parse_github_spec(rest: &str) -> CliResult<Self> {
+        // owner/repo[@ref][/path]
+        let (repo_and_ref, path) = match rest.find('/').and_then(|i| rest[i + 1..].find('/')) {
+            Some(second) => {
+                let first = rest.find('/').unwrap_or_default();
+                let cut = first + 1 + second;
+                (&rest[..cut], rest[cut + 1..].trim_matches('/'))
+            }
+            None => (rest, ""),
+        };
+        let (repo, r#ref) = match repo_and_ref.split_once('@') {
+            Some((r, v)) if !v.is_empty() => (r, v),
+            Some((_, _)) => {
+                return Err(CliError::Config(format!(
+                    "hub 'github:{rest}': empty ref after '@'"
+                )));
+            }
+            None => (repo_and_ref, "main"),
+        };
+        if repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
+            return Err(CliError::Config(format!(
+                "hub 'github:{rest}': expected `github:owner/repo[@ref][/path]`"
+            )));
+        }
+        Ok(Self::Github {
+            repo: repo.to_string(),
+            r#ref: r#ref.to_string(),
+            path: path.to_string(),
+        })
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Github { .. })
+    }
+
+    /// Human-readable form for messages.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Dir(p) => p.display().to_string(),
+            Self::Github { repo, r#ref, path } if path.is_empty() => format!("github:{repo}@{ref}"),
+            Self::Github { repo, r#ref, path } => format!("github:{repo}@{ref}/{path}"),
+        }
+    }
+
+    /// Stable filesystem-safe key for the cache directory.
+    pub fn cache_key(&self) -> String {
+        let raw = match self {
+            Self::Dir(p) => format!("dir/{}", p.display()),
+            Self::Github { repo, r#ref, path } => format!("github/{repo}/{ref}/{path}"),
+        };
+        raw.trim_end_matches('/')
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+}
+
+/// Decide where the hub is: `--hub`, else `FAUCET_HUB`, else `./hub` when that
+/// directory exists, else the public catalog ([`DEFAULT_REMOTE_HUB`]).
+pub fn hub_location(flag: Option<&str>) -> CliResult<HubLocation> {
+    if let Some(f) = flag {
+        return HubLocation::parse(f);
     }
     if let Ok(env) = std::env::var("FAUCET_HUB")
         && !env.trim().is_empty()
     {
-        return PathBuf::from(env);
+        return HubLocation::parse(&env);
     }
-    PathBuf::from(DEFAULT_HUB_DIR)
+    if Path::new(DEFAULT_HUB_DIR).is_dir() {
+        return Ok(HubLocation::Dir(PathBuf::from(DEFAULT_HUB_DIR)));
+    }
+    HubLocation::parse(DEFAULT_REMOTE_HUB)
+}
+
+/// Resolve the hub to a local directory, fetching (or reusing the cached
+/// snapshot of) a remote one.
+pub async fn resolve_hub(flag: Option<&str>) -> CliResult<PathBuf> {
+    match hub_location(flag)? {
+        HubLocation::Dir(p) => Ok(p),
+        #[cfg(feature = "hub-remote")]
+        loc @ HubLocation::Github { .. } => {
+            remote::fetch_cached(&loc, &remote::cache_root(), "https://api.github.com").await
+        }
+        #[cfg(not(feature = "hub-remote"))]
+        loc @ HubLocation::Github { .. } => Err(CliError::Config(format!(
+            "hub {}: remote hubs need the `hub-remote` build feature; pass --hub <local directory> instead",
+            loc.describe()
+        ))),
+    }
 }
 
 /// Read the `kind:` of a hub document without parsing the rest, so the
@@ -230,15 +378,96 @@ mod tests {
     }
 
     #[test]
-    fn hub_dir_precedence_flag_env_default() {
+    fn hub_location_precedence_flag_env_local_default_remote() {
         // SAFETY (test): env var private to this test binary.
         unsafe { std::env::remove_var("FAUCET_HUB") };
-        assert_eq!(hub_dir(None), PathBuf::from("hub"));
-        assert_eq!(hub_dir(Some(Path::new("/x"))), PathBuf::from("/x"));
+        // No flag, no env: `./hub` exists in the repo checkout the tests run
+        // from, so it wins; otherwise the public catalog does.
+        let default = hub_location(None).unwrap();
+        if Path::new(DEFAULT_HUB_DIR).is_dir() {
+            assert_eq!(default, HubLocation::Dir(PathBuf::from("hub")));
+        } else {
+            assert_eq!(default, HubLocation::parse(DEFAULT_REMOTE_HUB).unwrap());
+        }
+        assert_eq!(
+            hub_location(Some("/x")).unwrap(),
+            HubLocation::Dir(PathBuf::from("/x"))
+        );
         unsafe { std::env::set_var("FAUCET_HUB", "/from-env") };
-        assert_eq!(hub_dir(None), PathBuf::from("/from-env"));
-        assert_eq!(hub_dir(Some(Path::new("/flag"))), PathBuf::from("/flag"));
+        assert_eq!(
+            hub_location(None).unwrap(),
+            HubLocation::Dir(PathBuf::from("/from-env"))
+        );
+        assert_eq!(
+            hub_location(Some("/flag")).unwrap(),
+            HubLocation::Dir(PathBuf::from("/flag"))
+        );
+        unsafe { std::env::set_var("FAUCET_HUB", "github:acme/hub@v2/catalog") };
+        assert!(hub_location(None).unwrap().is_remote());
         unsafe { std::env::remove_var("FAUCET_HUB") };
+    }
+
+    #[test]
+    fn hub_location_parses_github_specs_and_urls() {
+        let gh = |repo: &str, r: &str, path: &str| HubLocation::Github {
+            repo: repo.into(),
+            r#ref: r.into(),
+            path: path.into(),
+        };
+        assert_eq!(
+            HubLocation::parse("github:acme/hub").unwrap(),
+            gh("acme/hub", "main", "")
+        );
+        assert_eq!(
+            HubLocation::parse("github:acme/hub@v2").unwrap(),
+            gh("acme/hub", "v2", "")
+        );
+        assert_eq!(
+            HubLocation::parse("github:acme/hub@v2/catalog/hub").unwrap(),
+            gh("acme/hub", "v2", "catalog/hub")
+        );
+        assert_eq!(
+            HubLocation::parse("github:acme/hub/catalog").unwrap(),
+            gh("acme/hub", "main", "catalog")
+        );
+        assert_eq!(
+            HubLocation::parse("https://github.com/acme/hub").unwrap(),
+            gh("acme/hub", "main", "")
+        );
+        assert_eq!(
+            HubLocation::parse("https://github.com/acme/hub.git/").unwrap(),
+            gh("acme/hub", "main", "")
+        );
+        assert_eq!(
+            HubLocation::parse("https://github.com/acme/hub/tree/dev/catalog").unwrap(),
+            gh("acme/hub", "dev", "catalog")
+        );
+        assert_eq!(
+            HubLocation::parse("./hub").unwrap(),
+            HubLocation::Dir(PathBuf::from("./hub"))
+        );
+
+        for bad in [
+            "github:acme",
+            "github:acme/hub@",
+            "https://github.com/acme",
+            "https://github.com/acme/hub/blob/main/x",
+        ] {
+            assert!(HubLocation::parse(bad).is_err(), "{bad} must be rejected");
+        }
+
+        let loc = gh("acme/hub", "v2", "catalog");
+        assert_eq!(loc.describe(), "github:acme/hub@v2/catalog");
+        assert_eq!(
+            gh("acme/hub", "main", "").describe(),
+            "github:acme/hub@main"
+        );
+        assert_eq!(loc.cache_key(), "github/acme/hub/v2/catalog");
+        assert_eq!(
+            gh("a/b", "feature/x", "").cache_key(),
+            "github/a/b/feature/x"
+        );
+        assert!(!HubLocation::Dir(PathBuf::from("/x")).is_remote());
     }
 
     #[test]

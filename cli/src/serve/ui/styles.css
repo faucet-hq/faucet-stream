@@ -1220,6 +1220,27 @@ select {
 }
 
 .tpl-h2 { margin: 26px 0 10px; font-size: 0.95rem; color: var(--ink-dim); }
+
+/* Source × sink compatibility matrix on the Templates page (#677). */
+.tpl-matrix { margin-bottom: 18px; }
+.tpl-matrix-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.tpl-matrix-head .tpl-h2 { margin: 6px 0 8px; }
+.tpl-matrix-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.tpl-matrix-table { margin: 0; min-width: 100%; }
+.tpl-matrix-table th, .tpl-matrix-table td { text-align: center; white-space: nowrap; }
+.tpl-matrix-table thead th { vertical-align: bottom; }
+.tpl-matrix-table tbody th { text-align: left; font-weight: 600; text-transform: none; letter-spacing: 0; font-size: 0.9rem; }
+.tpl-matrix-table a { color: inherit; text-decoration: none; }
+.tpl-matrix-table a:hover { text-decoration: underline; }
+.tpl-matrix-kind { display: block; font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.03em; color: var(--ink-faint); text-transform: none; font-weight: 500; margin-top: 2px; }
+.tpl-matrix-corner { color: var(--ink-faint); font-weight: 500; }
+.tpl-cell { font-family: var(--font-mono); font-size: 0.85rem; min-width: 64px; }
+.tpl-cell a { display: inline-block; padding: 4px 12px; border-radius: 999px; }
+.tpl-cell-ok a { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.tpl-cell-ok a:hover { background: color-mix(in srgb, var(--ok) 22%, transparent); text-decoration: none; }
+.tpl-cell-partial a { color: var(--queued); background: color-mix(in srgb, var(--queued) 14%, transparent); }
+.tpl-cell-bad { color: var(--fail); }
+.tpl-cell-none { color: var(--ink-faint); }
 .tpl-desc { color: var(--ink-dim); font-size: 0.88rem; margin: 12px 0 0; }
 
 .tpl-notice {

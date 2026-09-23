@@ -205,13 +205,27 @@ impl GithubFetcher {
         })
     }
 
+    /// The directories this origin reads: `paths` when set, else `path`.
+    fn dirs(&self) -> Vec<&str> {
+        if self.cfg.paths.is_empty() {
+            vec![self.cfg.path.trim_matches('/')]
+        } else {
+            self.cfg.paths.iter().map(|p| p.trim_matches('/')).collect()
+        }
+    }
+
+    /// Where `publish` writes: the single `path`, or the first of `paths`.
     fn dir(&self) -> &str {
-        self.cfg.path.trim_matches('/')
+        self.dirs()[0]
     }
 
     fn contents_url(&self, name: Option<&str>) -> String {
+        self.contents_url_in(self.dir(), name)
+    }
+
+    fn contents_url_in(&self, dir: &str, name: Option<&str>) -> String {
         let base = self.cfg.api_base.trim_end_matches('/');
-        let mut path = self.dir().to_string();
+        let mut path = dir.to_string();
         if let Some(n) = name {
             if !path.is_empty() {
                 path.push('/');
@@ -274,10 +288,9 @@ impl GithubFetcher {
     }
 }
 
-#[async_trait]
-impl Fetcher for GithubFetcher {
-    async fn list(&self) -> CliResult<Vec<RemoteFile>> {
-        let url = format!("{}?ref={}", self.contents_url(None), self.cfg.r#ref);
+impl GithubFetcher {
+    async fn list_dir(&self, dir: &str) -> CliResult<Vec<ContentsEntry>> {
+        let url = format!("{}?ref={}", self.contents_url_in(dir, None), self.cfg.r#ref);
         let resp = self
             .send(
                 self.request(reqwest::Method::GET, &url, "application/vnd.github+json"),
@@ -288,17 +301,24 @@ impl Fetcher for GithubFetcher {
             .json()
             .await
             .map_err(|e| io_err("github", format!("decoding directory listing: {e}")))?;
-        let entries: Vec<ContentsEntry> = match body {
+        match body {
             serde_json::Value::Array(_) => serde_json::from_value(body)
-                .map_err(|e| io_err("github", format!("decoding directory listing: {e}")))?,
-            _ => {
-                return Err(CliError::Config(format!(
-                    "templates-sync github: '{}' in {} is a file, not a directory",
-                    self.dir(),
-                    self.cfg.repo
-                )));
-            }
-        };
+                .map_err(|e| io_err("github", format!("decoding directory listing: {e}"))),
+            _ => Err(CliError::Config(format!(
+                "templates-sync github: '{dir}' in {} is a file, not a directory",
+                self.cfg.repo
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl Fetcher for GithubFetcher {
+    async fn list(&self) -> CliResult<Vec<RemoteFile>> {
+        let mut entries: Vec<ContentsEntry> = Vec::new();
+        for dir in self.dirs() {
+            entries.extend(self.list_dir(dir).await?);
+        }
         let wanted: Vec<ContentsEntry> = entries
             .into_iter()
             .filter(|e| e.kind == "file" && is_candidate(&e.name))
@@ -650,6 +670,7 @@ mod tests {
             repo: "nope".into(),
             r#ref: "main".into(),
             path: String::new(),
+            paths: Vec::new(),
             token: None,
             api_base: "https://api.github.com".into(),
         };
@@ -658,6 +679,7 @@ mod tests {
             repo: "acme/t".into(),
             r#ref: "main".into(),
             path: "/templates/".into(),
+            paths: Vec::new(),
             token: Some("tok".into()),
             api_base: "https://ghe.example/api/v3/".into(),
         };
@@ -672,6 +694,7 @@ mod tests {
         );
         let root = GithubFetcher::new(&GithubSource {
             path: String::new(),
+            paths: Vec::new(),
             ..good
         })
         .unwrap();
@@ -823,10 +846,63 @@ mod tests {
                 repo: "a/b".into(),
                 r#ref: "main".into(),
                 path: String::new(),
+                paths: Vec::new(),
                 token: None,
                 api_base: "https://api.github.com".into(),
             });
             assert!(ObjectStoreFetcher::from_source(&gh).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn github_paths_lists_every_directory_as_one_origin() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let entry = |name: &str| serde_json::json!({"name": name, "type": "file", "url": format!("{}/raw/{name}", server.uri()), "sha": "abc"});
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/contents/source-templates"))
+            .and(query_param("ref", "main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([entry("acme.yaml")])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/contents/sink-templates"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([entry("files.yaml")])),
+            )
+            .mount(&server)
+            .await;
+        for name in ["acme.yaml", "files.yaml"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/raw/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!("name: {name}")))
+                .mount(&server)
+                .await;
+        }
+        let fetcher = GithubFetcher::new(&GithubSource {
+            repo: "acme/hub".into(),
+            r#ref: "main".into(),
+            path: String::new(),
+            paths: vec!["source-templates".into(), "sink-templates".into()],
+            token: None,
+            api_base: server.uri(),
+        })
+        .unwrap();
+        let mut files = fetcher.list().await.expect("list");
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["acme.yaml", "files.yaml"]
+        );
+        // `publish` targets the first directory.
+        assert_eq!(fetcher.dir(), "source-templates");
+        assert!(
+            fetcher
+                .contents_url(Some("x.yaml"))
+                .ends_with("/contents/source-templates/x.yaml")
+        );
     }
 }

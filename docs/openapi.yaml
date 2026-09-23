@@ -910,6 +910,27 @@ paths:
                             interval_secs: { type: integer, description: "Periodic pull interval; absent = on start / on demand only." }
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
+  /v1/templates/matrix:
+    get:
+      summary: Source × sink compatibility matrix of the registered templates
+      description: >
+        Composes every registered `source-template` with every registered
+        `sink-template` (each at its `stable` version when launched, else its
+        newest) and reports, per pairing, whether every stream has a write mode
+        the sink supports and which mode each stream resolves to. The same
+        shape as a Template Hub catalog's `index.json`, with `command` set to
+        the `faucet template run … --sink …` invocation. Static route — a
+        template can never be addressed as `matrix`. Requires `TemplateRead`.
+      operationId: templateMatrix
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Sources, sinks, and one cell per pairing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HubIndex" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
   /v1/templates/{id}:
     get:
       summary: Get one pipeline template
@@ -1847,6 +1868,73 @@ components:
         created_at: '2026-01-01T00:00:00Z'
         created_by: example
         state: example
+    HubIndex:
+      type: object
+      description: A Template Hub catalog index — the shape of `hub/index.json` and of `GET /v1/templates/matrix`.
+      required: [version, sources, sinks, matrix]
+      properties:
+        version: { type: integer, enum: [1] }
+        sources:
+          type: array
+          items:
+            type: object
+            required: [name, streams, params]
+            properties:
+              name: { type: string }
+              description: { type: string, nullable: true }
+              tags: { type: array, items: { type: string } }
+              docs: { type: string, nullable: true }
+              source_type: { type: string, description: "Connector kind (rest, csv, …)." }
+              file: { type: string, description: "Catalog path, or the registry id." }
+              streams:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    description: { type: string, nullable: true }
+                    write: { type: array, items: { type: string }, description: "Write preference, in order." }
+                    primary_keys: { type: array, items: { type: string } }
+              params: { type: array, items: { type: object } }
+        sinks:
+          type: array
+          items:
+            type: object
+            required: [name, write_modes, params]
+            properties:
+              name: { type: string }
+              description: { type: string, nullable: true }
+              tags: { type: array, items: { type: string } }
+              docs: { type: string, nullable: true }
+              sink_type: { type: string }
+              file: { type: string }
+              write_modes: { type: array, items: { type: string }, description: "Modes the connector supports natively." }
+              params: { type: array, items: { type: object } }
+        matrix:
+          type: array
+          items:
+            type: object
+            required: [source, sink, compatible, streams]
+            properties:
+              source: { type: string }
+              sink: { type: string }
+              compatible: { type: boolean }
+              streams:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    stream: { type: string }
+                    write_mode: { type: string }
+                    satisfies: { type: string, nullable: true, description: "The requested mode this one stands in for, via an alias." }
+              incompatible:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    stream: { type: string }
+                    reason: { type: string }
+              command: { type: string, nullable: true, description: "Copy-paste run command for a compatible pairing." }
     TemplateSyncReport:
       type: object
       description: The plan for one origin and, unless `dry_run`, what applying it did.

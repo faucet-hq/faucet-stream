@@ -340,6 +340,7 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         // single check suffices and a `viewer` can browse but never trigger.
         (&Method::POST, "/v1/templates") => Some(TemplateWrite),
         (&Method::GET, "/v1/templates") => Some(TemplateRead),
+        (&Method::GET, "/v1/templates/matrix") => Some(TemplateRead),
         (&Method::GET, "/v1/templates/{id}") => Some(TemplateRead),
         (&Method::DELETE, "/v1/templates/{id}") => Some(TemplateWrite),
         (&Method::POST, "/v1/templates/{id}/runs") => Some(RunWrite),

@@ -97,8 +97,15 @@ pub struct GithubSource {
     #[serde(default = "default_ref")]
     pub r#ref: String,
     /// Directory of `*.yaml` / `*.json` templates. Default: the repo root.
+    /// Mutually exclusive with `paths`.
     #[serde(default)]
     pub path: String,
+    /// Several directories read as one origin — e.g. a Template Hub catalog's
+    /// `[source-templates, sink-templates]`. Template stems must be unique
+    /// across them (a hub's source and sink names share one id namespace).
+    /// `publish` writes to the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     /// Personal-access or app token. Use `${env:…}` / `${secret:…}`; the value
     /// is registered for log redaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,6 +226,15 @@ impl SyncFile {
                     o.name
                 )));
             }
+            if let OriginSource::Github(g) = &o.source
+                && !g.path.is_empty()
+                && !g.paths.is_empty()
+            {
+                return Err(CliError::Config(format!(
+                    "templates-sync: origin '{}': set `path` or `paths`, not both",
+                    o.name
+                )));
+            }
             if o.interval_secs == Some(0) {
                 return Err(CliError::Config(format!(
                     "templates-sync: origin '{}': `interval_secs` must be > 0 (omit it to disable)",
@@ -258,6 +274,25 @@ impl SyncFile {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_github_origin_takes_path_or_paths_not_both() {
+        let mut file = SyncFile {
+            version: 1,
+            origins: vec![origin("hub", "")],
+        };
+        let OriginSource::Github(g) = &mut file.origins[0].source else {
+            unreachable!()
+        };
+        g.paths = vec!["source-templates".into(), "sink-templates".into()];
+        file.validate().expect("paths alone is fine");
+        let OriginSource::Github(g) = &mut file.origins[0].source else {
+            unreachable!()
+        };
+        g.path = "templates".into();
+        let err = file.validate().unwrap_err().to_string();
+        assert!(err.contains("set `path` or `paths`, not both"), "{err}");
+    }
+
     fn origin(name: &str, prefix: &str) -> Origin {
         Origin {
             name: name.into(),
@@ -265,6 +300,7 @@ mod tests {
                 repo: "acme/tpl".into(),
                 r#ref: default_ref(),
                 path: String::new(),
+                paths: Vec::new(),
                 token: None,
                 api_base: default_github_api(),
             }),
