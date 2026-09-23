@@ -48,6 +48,7 @@
 # `templates` feature (included in `--features full`), plus
 # `serve-history-sqlite` / `serve-history-postgres` for a persistent registry.
 # The `params:` block itself is always available.
+kind: pipeline            # a complete config; source-template / sink-template are the other kinds
 version: 1
 name: tenant-sync
 

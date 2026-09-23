@@ -22,7 +22,7 @@ use super::combine::{GeneratedCase, generate};
 use super::spec::{Behavioral, SuiteFile};
 use crate::error::{CliError, CliResult};
 use crate::params::SuppliedParams;
-use crate::templates::{Materialize, TemplateStore, materialize, resolve_version};
+use crate::templates::{Materialize, TemplateStore, resolve_version};
 
 /// What one case did.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,15 +53,23 @@ impl SuiteOutcome {
 
 /// Where the template under test comes from.
 pub enum Target<'a> {
-    /// A registered template, resolved through the store.
+    /// A registered template, resolved through the store. `sink` is the
+    /// registered sink template (id, version) a `source-template` composes
+    /// with; ignored by a `pipeline` template.
     Registered {
         store: &'a TemplateStore,
         id: &'a str,
         version: u32,
+        sink: Option<(&'a str, u32)>,
     },
     /// A config file on disk — lets a template be tested **before** it is
     /// registered, which is when these failures are cheapest to fix.
-    Document { body: String },
+    /// `sink_body` is the sink template document a `source-template` file
+    /// composes with.
+    Document {
+        body: String,
+        sink_body: Option<String>,
+    },
 }
 
 /// Run every case in `file` against `target`, optionally filtered by name.
@@ -130,17 +138,59 @@ fn name_matches(name: &str, filter: Option<&str>) -> bool {
 }
 
 /// The template's `params:` declaration, needed by the `auto:` generator.
+/// For a source template this is the **composed** declaration (source + sink
+/// params merged), because that is the surface a trigger binds.
 async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::ParamsSpec> {
-    let body = body_of(target).await?;
-    let doc: Value = serde_yaml::from_str(&body)
-        .map_err(|e| CliError::Config(format!("template test: parsing the template: {e}")))?;
+    let doc = effective_document(target).await?;
     crate::params::declared(&doc)
 }
 
-async fn body_of(target: &Target<'_>) -> CliResult<String> {
+fn parse_template_text(text: &str, what: &str) -> CliResult<Value> {
+    serde_yaml::from_str(text)
+        .map_err(|e| CliError::Config(format!("template test: parsing the {what}: {e}")))
+}
+
+/// The pipeline document the cases run against: a `pipeline` template's body
+/// as-is, or a `source-template` composed with its sink. Composition here is
+/// exactly what a trigger does, so a suite tests the real thing.
+async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
     match target {
-        Target::Document { body } => Ok(body.clone()),
-        Target::Registered { store, id, version } => {
+        Target::Document { body, sink_body } => {
+            let doc = parse_template_text(body, "template")?;
+            match crate::hub::detect_kind(&doc) {
+                Some(crate::hub::TemplateKind::SourceTemplate) => {
+                    let sink_text = sink_body.as_deref().ok_or_else(|| {
+                        CliError::Config(
+                            "template test: the template is a source-template — set `sink:` to the \
+                             sink template (a path here) it should compose with"
+                                .into(),
+                        )
+                    })?;
+                    let source: crate::hub::SourceTemplate =
+                        serde_json::from_value(doc).map_err(|e| {
+                            CliError::Config(format!("template test: source-template: {e}"))
+                        })?;
+                    let sink: crate::hub::SinkTemplate =
+                        serde_json::from_value(parse_template_text(sink_text, "sink template")?)
+                            .map_err(|e| {
+                                CliError::Config(format!("template test: sink-template: {e}"))
+                            })?;
+                    Ok(crate::hub::compose(&source, &sink)?.document)
+                }
+                Some(crate::hub::TemplateKind::SinkTemplate) => Err(CliError::Config(
+                    "template test: a sink-template has no streams to test on its own — point \
+                     `template:` at a source template and name this one under `sink:`"
+                        .into(),
+                )),
+                _ => Ok(doc),
+            }
+        }
+        Target::Registered {
+            store,
+            id,
+            version,
+            sink,
+        } => {
             let rec = store
                 .template_get(id, Some(*version))
                 .await
@@ -149,7 +199,40 @@ async fn body_of(target: &Target<'_>) -> CliResult<String> {
                     id: (*id).to_string(),
                     version: Some(*version),
                 })?;
-            Ok(rec.body)
+            match rec.kind {
+                crate::hub::TemplateKind::Pipeline => parse_template_text(&rec.body, "template"),
+                crate::hub::TemplateKind::SourceTemplate => {
+                    let (sink_id, sink_version) = sink.ok_or_else(|| {
+                        CliError::Config(format!(
+                            "template test: '{id}' is a source-template — set `sink:` to the registered \
+                             sink template it should compose with"
+                        ))
+                    })?;
+                    let sink_rec = store
+                        .template_get(sink_id, Some(sink_version))
+                        .await
+                        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+                        .ok_or_else(|| CliError::UnknownPipelineTemplate {
+                            id: sink_id.to_string(),
+                            version: Some(sink_version),
+                        })?;
+                    let source: crate::hub::SourceTemplate =
+                        serde_json::from_value(parse_template_text(&rec.body, "source-template")?)
+                            .map_err(|e| {
+                                CliError::Internal(format!("stored source-template '{id}': {e}"))
+                            })?;
+                    let sink_t: crate::hub::SinkTemplate = serde_json::from_value(
+                        parse_template_text(&sink_rec.body, "sink-template")?,
+                    )
+                    .map_err(|e| {
+                        CliError::Internal(format!("stored sink-template '{sink_id}': {e}"))
+                    })?;
+                    Ok(crate::hub::compose(&source, &sink_t)?.document)
+                }
+                crate::hub::TemplateKind::SinkTemplate => Err(CliError::Config(format!(
+                    "template test: '{id}' is a sink-template and has no streams to test on its own"
+                ))),
+            }
         }
     }
 }
@@ -282,19 +365,33 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
         // `Materialize::Local` (not `Persisted`): a suite runs in this
         // process, so load-time directives resolve here exactly as they would
         // on a `faucet template run`.
-        Target::Registered { store, id, version } => Ok(materialize(
+        Target::Registered {
             store,
             id,
-            *version,
-            supplied,
-            &BTreeMap::new(),
-            Materialize::Local,
-        )
-        .await?
-        .body),
-        Target::Document { body } => {
-            let mut doc: Value = serde_yaml::from_str(body)
-                .map_err(|e| CliError::Config(format!("template test: {e}")))?;
+            version,
+            sink,
+        } => {
+            let choice = crate::templates::SinkChoice {
+                id: sink.map(|(s, _)| s.to_string()),
+                version: match sink {
+                    Some((_, v)) => crate::serve::history::templates::VersionSelector::Pinned(*v),
+                    None => Default::default(),
+                },
+            };
+            Ok(crate::templates::materialize_for_run(
+                store,
+                id,
+                *version,
+                &choice,
+                supplied,
+                &BTreeMap::new(),
+                Materialize::Local,
+            )
+            .await?
+            .body)
+        }
+        Target::Document { .. } => {
+            let mut doc = effective_document(target).await?;
             crate::params::bind_document(&mut doc, supplied, crate::params::BindMode::Strict)?;
             if let Some(map) = doc.as_object_mut() {
                 map.remove("params");
@@ -369,7 +466,10 @@ pipeline:
     }
 
     fn doc() -> Target<'static> {
-        Target::Document { body: template() }
+        Target::Document {
+            body: template(),
+            sink_body: None,
+        }
     }
 
     fn suite_from(yaml: &str) -> SuiteFile {
@@ -610,6 +710,7 @@ suite:
             body: "this: is: not: valid: yaml:
 "
             .into(),
+            sink_body: None,
         };
         assert!(run(&file, target, None).await.is_err());
     }
@@ -664,6 +765,7 @@ suite:
                 store: &store,
                 id: "suite-fixture",
                 version,
+                sink: None,
             },
             None,
         )
@@ -707,12 +809,164 @@ suite:
                 store: &store,
                 id: "nope",
                 version: 1,
+                sink: None,
             },
             None,
         )
         .await
         .expect_err("unknown id");
         assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    // ── source × sink suites ────────────────────────────────────────────────
+
+    fn hub_pair(dir: &std::path::Path) -> (String, String) {
+        std::fs::write(dir.join("orders.csv"), "id,total\n1,10\n").unwrap();
+        let source = format!(
+            "kind: source-template\nname: acme-exports\ndescription: Acme exports\nparams:\n  data_dir: {{ type: string, default: {} }}\n  region: {{ type: string, values: [eu, us], default: eu }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, primary_keys: [id], write: [overwrite, upsert] }}\n",
+            dir.display()
+        );
+        let sink = "kind: sink-template\nname: local-jsonl\ndescription: Local files\nparams:\n  out_dir: { type: string, required: true }\nsink:\n  type: jsonl\n  config: { append: false }\nper_stream:\n  path: \"${param.out_dir}/${source}/${stream}.jsonl\"\nwrite_mode_aliases: { overwrite: append }\n".to_string();
+        (source, sink)
+    }
+
+    #[tokio::test]
+    async fn a_source_template_file_composes_with_a_sink_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, sink) = hub_pair(dir.path());
+        // The composed param surface is the union: `out_dir` comes from the sink.
+        let file = suite_from(
+            r#"
+version: 1
+template: acme-exports
+suite:
+  cases:
+    - name: eu
+      params: { region: eu, out_dir: ./out }
+    - name: missing-sink-param
+      params: { region: eu }
+      expect: { error: "out_dir" }
+"#,
+        );
+        let out = run(
+            &file,
+            Target::Document {
+                body: source.clone(),
+                sink_body: Some(sink.clone()),
+            },
+            None,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out.passed(), 2, "{:?}", out.cases);
+
+        // Without a sink the file is not testable, and the message says which key to set.
+        let err = run(
+            &file,
+            Target::Document {
+                body: source,
+                sink_body: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("needs a sink")
+        .to_string();
+        assert!(err.contains("`sink:`"), "{err}");
+
+        // A sink template has no streams to test.
+        let err = run(
+            &file,
+            Target::Document {
+                body: sink,
+                sink_body: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("sink alone")
+        .to_string();
+        assert!(err.contains("no streams"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_registered_source_template_composes_with_a_registered_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, sink) = hub_pair(dir.path());
+        let store = crate::templates::resolve_store_url("memory").await.unwrap();
+        for body in [source, sink] {
+            crate::templates::register(
+                &store,
+                crate::templates::RegisterRequest {
+                    id: None,
+                    body,
+                    format: crate::serve::load::ConfigFormat::Yaml,
+                    description: None,
+                    tags: Vec::new(),
+                    launch: true,
+                    created_by: None,
+                },
+            )
+            .await
+            .expect("register");
+        }
+        let file = suite_from(
+            r#"
+version: 1
+template: acme-exports
+sink: local-jsonl
+suite:
+  auto: { enum_coverage: true }
+  cases:
+    - name: eu
+      params: { region: eu, out_dir: ./out }
+"#,
+        );
+        let out = run(
+            &file,
+            Target::Registered {
+                store: &store,
+                id: "acme-exports",
+                version: 1,
+                sink: Some(("local-jsonl", 1)),
+            },
+            None,
+        )
+        .await
+        .expect("runs");
+        // auto enum coverage fills `out_dir` (required, from the sink) with a placeholder.
+        assert!(out.passed() >= 1, "{:?}", out.cases);
+        assert_eq!(out.failed(), 0, "{:?}", out.cases);
+
+        let err = run(
+            &file,
+            Target::Registered {
+                store: &store,
+                id: "acme-exports",
+                version: 1,
+                sink: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("needs a sink")
+        .to_string();
+        assert!(err.contains("`sink:`"), "{err}");
+
+        let err = run(
+            &file,
+            Target::Registered {
+                store: &store,
+                id: "local-jsonl",
+                version: 1,
+                sink: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("sink alone")
+        .to_string();
+        assert!(err.contains("no streams"), "{err}");
     }
 
     #[test]

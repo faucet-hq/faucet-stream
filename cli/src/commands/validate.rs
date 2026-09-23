@@ -62,7 +62,7 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
                 crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?
             }
         };
-        if let Some(kind) = crate::hub::detect_kind_in_file(&path) {
+        if let Some(kind) = crate::hub::detect_kind_in_file(&path).filter(|k| k.is_hub()) {
             return Err(CliError::Config(format!(
                 "{} is a hub {} — validate a pairing: `faucet validate --source <source-template> --sink <sink-template>`",
                 path.display(),

@@ -119,7 +119,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
         if ctx.allow_mutations {
             defs.push(ToolDef {
                 name: "register_template",
-                description: "Register a config (declaring typed `params:`) as a new pipeline-template version. MUTATING — gated behind --allow-mutations.",
+                description: "Register a template document as a new version: `kind: source-template` (a system + its streams), `kind: sink-template` (a destination), or `kind: pipeline` (a complete config). Params are declared with `params:`. MUTATING — gated behind --allow-mutations.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -168,13 +168,15 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
             });
             defs.push(ToolDef {
                 name: "run_template",
-                description: "Run a registered pipeline template with the given params. MUTATING — gated behind --allow-mutations. Pass dry_run:true to materialize + validate only.",
+                description: "Run a registered template with the given params: a source-template composed with `sink` (a registered sink-template), or a complete `pipeline` template. MUTATING — gated behind --allow-mutations. Pass dry_run:true to materialize + validate only.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
                         "version": { "description": "Version: a number, or a named channel. Derived: \"stable\" (the launched version — the default), \"previous\", \"newest\". Assignable: \"dev\", \"test\", \"staging\", \"pre-prod\", \"canary\", \"prod\". Note \"latest\" is deliberately not a channel — use \"stable\" for the current release or \"newest\" for the highest version number.", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
                         "params": { "type": "object", "description": "Values for the template's declared params." },
+                        "sink": { "type": "string", "description": "For a source-template: the registered sink-template to compose in (required for a source template; a `pipeline` template takes none)." },
+                        "sink_version": { "description": "Version of the sink template: a number or a channel. Default \"stable\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
                         "env": { "type": "object", "description": "Per-run overrides for ${env:VAR} resolution." },
                         "dry_run": { "type": "boolean", "description": "If true, materialize + validate only; do not write to any sink." }
                     },
@@ -706,10 +708,18 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         })
         .unwrap_or_default();
 
-    let materialized = crate::templates::materialize(
+    let sink = crate::templates::SinkChoice {
+        id: args.get("sink").and_then(Value::as_str).map(str::to_string),
+        version: match args.get("sink_version") {
+            None | Some(Value::Null) => Default::default(),
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string())?,
+        },
+    };
+    let materialized = crate::templates::materialize_for_run(
         store,
         id,
         version,
+        &sink,
         &supplied,
         &env,
         // The MCP tool runs the pipeline in this process; nothing is persisted.
@@ -728,6 +738,9 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         return Ok(pretty(&json!({
             "template_id": materialized.template_id,
             "template_version": materialized.version,
+            "sink_template": materialized.sink_id,
+            "sink_template_version": materialized.sink_version,
+            "streams": materialized.streams,
             "params": materialized.params_redacted,
             "rows": rows,
             "dry_run": true,
@@ -744,6 +757,8 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
     let doc = json!({
         "template_id": materialized.template_id,
         "template_version": materialized.version,
+        "sink_template": materialized.sink_id,
+        "sink_template_version": materialized.sink_version,
         "params": materialized.params_redacted,
         "invocations": summary.invocations.len(),
         "ok": summary.invocations.len() - failed,
@@ -1051,6 +1066,88 @@ mod tests {
                 csv.display(),
                 dir.join("out-${param.tag}.jsonl").display()
             )
+        }
+
+        fn hub_pair(dir: &std::path::Path) -> (String, String) {
+            std::fs::write(dir.join("orders.csv"), "id,total\n1,10\n").unwrap();
+            let source = format!(
+                "kind: source-template\nname: acme-exports\ndescription: Acme exports\nparams:\n  data_dir: {{ type: string, default: {} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, primary_keys: [id], write: [overwrite, upsert] }}\n",
+                dir.display()
+            );
+            let sink = format!(
+                "kind: sink-template\nname: local-jsonl\ndescription: Local files\nparams:\n  out_dir: {{ type: string, default: {} }}\nsink:\n  type: jsonl\n  config: {{ append: false }}\nper_stream:\n  path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"\nwrite_mode_aliases: {{ overwrite: append }}\n",
+                dir.display()
+            );
+            (source, sink)
+        }
+
+        #[tokio::test]
+        async fn run_template_composes_a_source_with_a_sink() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = tpl_ctx(true);
+            let (source, sink) = hub_pair(dir.path());
+            for config in [source, sink] {
+                let out = call_tool(
+                    &ctx,
+                    "register_template",
+                    &json!({"config": config, "launch": true}),
+                )
+                .await;
+                assert_eq!(out["isError"], false, "{out}");
+            }
+            // The list carries each template's kind.
+            let out = call_tool(&ctx, "list_templates", &json!({})).await;
+            let text = out["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("source-template") && text.contains("sink-template"),
+                "{text}"
+            );
+
+            // A source template needs a sink …
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "acme-exports", "dry_run": true}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
+            assert!(out["content"][0]["text"].as_str().unwrap().contains("sink"));
+
+            // … and composes with one; the dry run reports both halves and the plan.
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "acme-exports", "sink": "local-jsonl", "sink_version": "stable", "dry_run": true}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["sink_template"], json!("local-jsonl"));
+            assert_eq!(doc["sink_template_version"], json!(1));
+            assert_eq!(doc["streams"][0]["stream"], json!("orders"));
+            assert_eq!(doc["rows"], json!(1));
+
+            // A real run writes the stream file under <out_dir>/<source>/.
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "acme-exports", "sink": "local-jsonl"}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let written =
+                std::fs::read_to_string(dir.path().join("acme-exports/orders.jsonl")).unwrap();
+            assert_eq!(written.lines().count(), 1);
+
+            // A malformed sink version is a tool error, not a panic.
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "acme-exports", "sink": "local-jsonl", "sink_version": "latest", "dry_run": true}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
         }
 
         #[tokio::test]

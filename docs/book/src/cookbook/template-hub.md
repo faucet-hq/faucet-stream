@@ -186,8 +186,33 @@ faucet schema source-template | sink-template
 `<hub>/source-templates/<id>.yaml` and `<hub>/sink-templates/<id>.yaml`. The
 hub directory is `--hub`, else `$FAUCET_HUB`, else `./hub`.
 
-A composed config is just a config: `faucet hub compose … --out f.yaml` and
-register it (`faucet template register f.yaml`), hand-edit it, or commit it.
+## Registering hub templates
+
+The [template registry](./templates.md) stores source and sink templates as
+first-class kinds — there is no need to compose first. Register each file
+(its id is its `name`), then run any pairing by id; the server composes at
+trigger time, so a new sink template is immediately usable with every
+registered source template:
+
+```bash
+faucet template register hub/source-templates/acme-billing.yaml --launch
+faucet template register hub/sink-templates/bigquery.yaml --launch
+faucet template register hub/sink-templates/postgres.yaml --launch
+faucet template list --kind source-template
+faucet template run acme-billing --sink bigquery --param api_token="$T" --param bq_project=p --param bq_sa_key="$K"
+faucet template run acme-billing --sink postgres --param api_token="$T" --param pg_url="$PG"
+```
+
+Over HTTP the trigger is `POST /v1/templates/acme-billing/runs` with
+`{"sink": "bigquery", "params": {…}}`; the console's template page offers the
+registered sink templates in a dropdown. Registration runs the same
+publishability lint as `faucet hub lint`, so a literal credential never lands in
+a shared registry. A sync origin ([hosting templates](./templates.md#hosting-templates-in-a-repo-or-bucket-sync))
+may hold hub templates too — a repository laid out like `hub/` syncs straight
+into the registry.
+
+A composed config is also just a config: `faucet hub compose … --out f.yaml` to
+inspect it, hand-edit it, or commit it as a complete `kind: pipeline` template.
 
 ## Publishing rules
 

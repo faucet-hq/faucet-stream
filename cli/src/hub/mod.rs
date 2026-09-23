@@ -52,11 +52,7 @@ pub fn hub_dir(flag: Option<&Path>) -> PathBuf {
 /// Read the `kind:` of a hub document without parsing the rest, so the
 /// ordinary loaders can recognise a template handed to them by mistake.
 pub fn detect_kind(value: &Value) -> Option<TemplateKind> {
-    match value.get("kind")?.as_str()? {
-        "source-template" => Some(TemplateKind::SourceTemplate),
-        "sink-template" => Some(TemplateKind::SinkTemplate),
-        _ => None,
-    }
+    TemplateKind::parse(value.get("kind")?.as_str()?)
 }
 
 /// Peek at a config file: if it is a hub template, return its kind so the

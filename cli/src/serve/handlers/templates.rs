@@ -179,13 +179,25 @@ fn sync_info(_state: &ServerState) -> Option<SyncInfo> {
     None
 }
 
-/// `GET /v1/templates` → 200. Latest version of each registered template.
+/// `GET /v1/templates` query: `?kind=source-template|sink-template|pipeline`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub kind: Option<crate::hub::TemplateKind>,
+}
+
+/// `GET /v1/templates` → 200. Latest version of each registered template,
+/// optionally filtered by kind.
 pub async fn list_templates(
     State(state): State<ServerState>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ServeError> {
-    let templates = crate::templates::list_with_state(&store(&state))
+    let mut templates = crate::templates::list_with_state(&store(&state))
         .await
         .map_err(map_err)?;
+    if let Some(kind) = query.kind {
+        templates.retain(|t| t.kind == kind);
+    }
     Ok(Json(ListResponse {
         templates,
         sync: sync_info(&state),
@@ -514,6 +526,13 @@ pub struct TriggerBody {
     /// this materialization only.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// For a `source-template`: the registered `sink-template` to compose in.
+    /// Required for a source template; refused for a `pipeline`.
+    #[serde(default)]
+    pub sink: Option<String>,
+    /// Version of the sink template (a number or a channel). Default `stable`.
+    #[serde(default)]
+    pub sink_version: Option<VersionSelector>,
     /// Version to run: a number, or a named channel (`"latest"` — the default
     /// when omitted — `"prod"`, `"pre-prod"`, `"dev"`, …).
     #[serde(default)]
@@ -562,6 +581,14 @@ pub struct TriggerResponse {
     pub run: SubmitResponse,
     pub template_id: String,
     pub template_version: u32,
+    /// The sink template composed in (a source-template run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink_template_version: Option<u32>,
+    /// Per-stream write-mode resolution of a composed run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<crate::hub::compose::StreamPlan>,
     /// Bound params with every `secret: true` value replaced by `"***"`.
     pub params: BTreeMap<String, Value>,
     /// Present only when the template is deprecated — the run still started, but
@@ -574,6 +601,8 @@ pub struct TriggerResponse {
 /// by provenance.
 const LABEL_TEMPLATE: &str = "template";
 const LABEL_TEMPLATE_VERSION: &str = "template_version";
+const LABEL_SINK_TEMPLATE: &str = "sink_template";
+const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
 
 /// `POST /v1/templates/{id}/runs` → 202 / 404 / 422 / 429.
 pub async fn trigger_template(
@@ -619,9 +648,22 @@ pub async fn trigger_template(
     } else {
         crate::templates::Materialize::Local
     };
-    let materialized = crate::templates::materialize(&s, &id, want, &supplied, &body.env, mode)
-        .await
-        .map_err(map_err)?;
+    let sink = crate::templates::SinkChoice {
+        id: body.sink.clone(),
+        version: body.sink_version.unwrap_or_default(),
+    };
+    if let Some(sink_id) = &sink.id {
+        let sink_state = crate::templates::template_state(&s, sink_id)
+            .await
+            .map_err(map_err)?;
+        if sink_state.status == crate::serve::history::templates::TemplateStatus::Deprecated {
+            tracing::warn!(sink_template = %sink_id, "composing a DEPRECATED sink template");
+        }
+    }
+    let materialized =
+        crate::templates::materialize_for_run(&s, &id, want, &sink, &supplied, &body.env, mode)
+            .await
+            .map_err(map_err)?;
 
     // Caller-supplied values that would land in the persisted body: a
     // `secret: true` param, or an `env:` override (which substitutes into the
@@ -652,6 +694,10 @@ pub async fn trigger_template(
         LABEL_TEMPLATE_VERSION.into(),
         materialized.version.to_string(),
     );
+    if let (Some(sid), Some(sv)) = (&materialized.sink_id, materialized.sink_version) {
+        labels.insert(LABEL_SINK_TEMPLATE.into(), sid.clone());
+        labels.insert(LABEL_SINK_TEMPLATE_VERSION.into(), sv.to_string());
+    }
 
     let req = SubmitRequest {
         config: materialized.body.clone(),
@@ -684,6 +730,9 @@ pub async fn trigger_template(
             run,
             template_id: materialized.template_id,
             template_version: materialized.version,
+            sink_template: materialized.sink_id,
+            sink_template_version: materialized.sink_version,
+            streams: materialized.streams,
             params: materialized.params_redacted,
             deprecated: (tstate.status
                 == crate::serve::history::templates::TemplateStatus::Deprecated)
@@ -769,7 +818,10 @@ mod tests {
         assert_eq!(summary.created_by.as_deref(), Some("tester"));
         assert!(summary.params["tag"].required);
 
-        let listed = list_templates(State(state.clone())).await.unwrap().0;
+        let listed = list_templates(State(state.clone()), Query(ListQuery::default()))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(listed.templates.len(), 1);
         let st = listed.templates[0]
             .state
@@ -836,6 +888,171 @@ mod tests {
         let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
         assert!(actions.contains(&"template.register"), "{actions:?}");
         assert!(actions.contains(&"template.delete"), "{actions:?}");
+    }
+
+    /// A runnable source template: two CSV exports become two streams.
+    fn source_template(dir: &std::path::Path) -> String {
+        std::fs::write(dir.join("orders.csv"), "id,total\n1,10\n2,20\n").unwrap();
+        std::fs::write(dir.join("customers.csv"), "id,name\n1,alice\n").unwrap();
+        format!(
+            "kind: source-template
+name: acme-exports
+description: Acme — orders and customers exports
+params:
+  data_dir: {{ type: string, default: {} }}
+source:
+  type: csv
+  config:
+    path: \"${{param.data_dir}}/orders.csv\"
+transforms:
+  - {{ type: keys_case, config: {{ mode: snake }} }}
+streams:
+  - name: orders
+    primary_keys: [id]
+    write: [overwrite, upsert]
+  - name: customers
+    source: {{ config: {{ path: \"${{param.data_dir}}/customers.csv\" }} }}
+    primary_keys: [id]
+    write: [overwrite, upsert]
+",
+            dir.display()
+        )
+    }
+
+    /// A local JSON Lines sink template; `overwrite` satisfied by rewriting the file.
+    fn sink_template(dir: &std::path::Path) -> String {
+        format!(
+            "kind: sink-template
+name: local-jsonl
+description: Local JSON Lines files, one per stream
+params:
+  out_dir: {{ type: string, default: {} }}
+sink:
+  type: jsonl
+  config:
+    append: false
+per_stream:
+  path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"
+write_mode_aliases:
+  overwrite: append
+",
+            dir.display()
+        )
+    }
+
+    async fn register_body(state: &ServerState, config: String) -> TemplateSummary {
+        register_template(
+            State(state.clone()),
+            Extension(actor()),
+            Json(RegisterBody {
+                id: None,
+                config,
+                config_format: ConfigFormatWire::Yaml,
+                description: None,
+                tags: vec![],
+                launch: true,
+            }),
+        )
+        .await
+        .expect("register")
+        .1
+        .0
+    }
+
+    #[tokio::test]
+    async fn a_source_template_triggers_composed_with_a_sink_and_lists_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        let src = register_body(&state, source_template(dir.path())).await;
+        assert_eq!(src.kind, crate::hub::TemplateKind::SourceTemplate);
+        assert_eq!(
+            src.description.as_deref(),
+            Some("Acme — orders and customers exports")
+        );
+        register_body(&state, sink_template(dir.path())).await;
+        register_demo(&state, &dir.path().join("o.jsonl")).await;
+
+        // `?kind=` narrows the listing; no filter returns all three.
+        let all = list_templates(State(state.clone()), Query(ListQuery::default()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(all.templates.len(), 3);
+        let sinks = list_templates(
+            State(state.clone()),
+            Query(ListQuery {
+                kind: Some(crate::hub::TemplateKind::SinkTemplate),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(sinks.templates.len(), 1);
+        assert_eq!(sinks.templates[0].id, "local-jsonl");
+
+        // Without a sink the source template is unprocessable, naming the field.
+        let err = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("acme-exports".into()),
+            Json(TriggerBody::default()),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ServeError::Unprocessable { message, .. } => {
+                assert!(message.contains("sink"), "{message}")
+            }
+            other => panic!("expected 422, got {other:?}"),
+        }
+
+        // A pipeline template refuses one.
+        let err = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(TriggerBody {
+                sink: Some("local-jsonl".into()),
+                params: [("tag".to_string(), json!("a"))].into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ServeError::Unprocessable { message, .. } => {
+                assert!(message.contains("takes no sink"), "{message}")
+            }
+            other => panic!("expected 422, got {other:?}"),
+        }
+
+        // The pairing runs: provenance carries both halves and the stream plan.
+        let (code, resp) = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("acme-exports".into()),
+            Json(TriggerBody {
+                sink: Some("local-jsonl".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trigger");
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(resp.0.template_id, "acme-exports");
+        assert_eq!(resp.0.sink_template.as_deref(), Some("local-jsonl"));
+        assert_eq!(resp.0.sink_template_version, Some(1));
+        assert_eq!(resp.0.streams.len(), 2);
+        let rec = state
+            .history()
+            .get(&resp.0.run.run_id)
+            .await
+            .unwrap()
+            .expect("run record");
+        assert_eq!(rec.labels[LABEL_TEMPLATE], "acme-exports");
+        assert_eq!(rec.labels[LABEL_SINK_TEMPLATE], "local-jsonl");
+        assert_eq!(rec.labels[LABEL_SINK_TEMPLATE_VERSION], "1");
+        assert_eq!(rec.name.as_deref(), Some("acme-exports"));
     }
 
     #[tokio::test]

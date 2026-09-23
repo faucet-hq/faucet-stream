@@ -108,11 +108,14 @@ the browser.
 ### Templates
 
 When the server is built with the `templates` feature, a **Templates** view browses
-the [pipeline template registry](./templates.md) in the `--history` backend. The
-list shows each template's lifecycle status (`draft` / `launched` / `deprecated`),
-which version is live, the build tip, and its parameter count:
+the [template registry](./templates.md) in the `--history` backend. Every row
+carries a **kind** pill — `source` (a system and its streams), `sink` (a
+destination), or `pipeline` (a complete config) — beside its lifecycle status
+(`draft` / `launched` / `deprecated`), which version is live, the build tip, and
+its parameter count. Chips filter by status and by kind (deprecated templates are
+hidden until their chip is toggled on):
 
-![The Templates view listing three templates — one deprecated, one draft, one launched — each with its live and newest version](../assets/console/templates.png)
+![The Templates view listing a source template, a sink template, and two pipeline templates — one launched at v2, one draft — each with a kind pill, its live and newest version, and the status / kind filter chips](../assets/console/templates.png)
 
 Clicking one opens its **versions page** — the release console for that template:
 
@@ -127,7 +130,15 @@ Clicking one opens its **versions page** — the release console for that templa
   listing only channels that actually resolve
 - the **launch history**: who blessed which build, and when
 
-![The versions page for orders-by-country: v2 carrying stable/newest/dev/prod/staging, v1 as previous with its config expanded, a typed trigger form, and the launch history table](../assets/console/template-detail.png)
+![The versions page for orders-by-country: v2 carrying stable/newest/dev/prod/staging, v1 as previous, a typed trigger form, and the launch history table](../assets/console/template-detail.png)
+
+A **source template**'s page adds a **sink template** selector (plus its version
+channel) to the trigger form: the chosen sink's params join the form, tagged
+`sink`, and the run composes the two at submit time — the same source can be
+sent to BigQuery today and Postgres tomorrow from one page. A **sink template**'s
+page has no trigger form; it lists the source templates it can be composed with.
+
+![The versions page for the example-csv source template: the trigger form with a sink-template dropdown and sink version beside the source's own params, the sink's param tagged](../assets/console/template-source-detail.png)
 
 When the server was started with `--templates-sync`, the Templates page also
 shows **Sync from origins**: the configured remote origins (repo or bucket,

@@ -36,10 +36,24 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The only `kind:` a complete pipeline config may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigKind {
+    Pipeline,
+}
+
 /// Top-level pipeline definition.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
+    /// Document kind. A complete pipeline config may declare `kind: pipeline`
+    /// (the registry's explicit kind for a hand-written pipeline template);
+    /// `source-template` / `sink-template` documents are not pipeline configs
+    /// and are composed with `faucet run --source X --sink Y` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ConfigKind>,
+
     /// Config-format version. Currently always `1`.
     #[serde(default = "default_version")]
     pub version: u32,

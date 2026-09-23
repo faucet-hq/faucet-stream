@@ -772,6 +772,7 @@ mod templates {
             format: ConfigFormat::Yaml,
             params: Default::default(),
             created_by: Some("tester".into()),
+            kind: faucet_cli::hub::TemplateKind::Pipeline,
         }
     }
 

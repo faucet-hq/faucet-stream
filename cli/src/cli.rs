@@ -695,6 +695,27 @@ pub struct TemplateDeprecateArgs {
 pub struct TemplateListArgs {
     #[command(flatten)]
     pub common: TemplateStoreArgs,
+    /// Show only templates of this kind.
+    #[arg(long, value_enum)]
+    pub kind: Option<TemplateKindArg>,
+}
+
+/// `--kind` filter for `faucet template list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TemplateKindArg {
+    SourceTemplate,
+    SinkTemplate,
+    Pipeline,
+}
+
+impl From<TemplateKindArg> for crate::hub::TemplateKind {
+    fn from(k: TemplateKindArg) -> Self {
+        match k {
+            TemplateKindArg::SourceTemplate => Self::SourceTemplate,
+            TemplateKindArg::SinkTemplate => Self::SinkTemplate,
+            TemplateKindArg::Pipeline => Self::Pipeline,
+        }
+    }
 }
 
 /// `faucet template show <id>` arguments.
@@ -756,6 +777,13 @@ pub struct TemplateRunArgs {
     /// Stop after writing this many records to the sink.
     #[arg(long)]
     pub limit: Option<usize>,
+    /// For a `source-template`: the registered `sink-template` to compose in
+    /// (required for a source template; a `pipeline` template takes none).
+    #[arg(long)]
+    pub sink: Option<String>,
+    /// Version of the sink template: a number or a channel. Default `stable`.
+    #[arg(long, default_value = "stable", requires = "sink")]
+    pub sink_version: String,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }

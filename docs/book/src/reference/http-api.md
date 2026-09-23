@@ -447,13 +447,18 @@ curl -sH "Authorization: Bearer $TOKEN" \
   | jq '{row_count, row_limit, truncated, capped_by}'
 ```
 
-### `/v1/templates*` (pipeline template registry)
+### `/v1/templates*` (template registry)
 
-Register a config declaring [`params:`](config.md#params) once, then trigger runs
-by `{id, params}` instead of re-sending the whole config. Storage rides the
-server's `--history` backend, so `faucet template …` and the MCP template tools
-see the same registry. Requires a build with the `templates` feature; see the
-[cookbook page](../cookbook/templates.md).
+Register a template once, then trigger runs by `{id, params}` instead of
+re-sending a config. The registry holds three **kinds** of document, told apart
+by their `kind:` line: a `source-template` (one system — its connector, shared
+transforms, and streams), a `sink-template` (one destination), and a complete
+`pipeline`. A source template runs **composed** with a sink template named in the
+trigger body; a pipeline runs alone; a sink template is never run on its own.
+Storage rides the server's `--history` backend, so `faucet template …` and the
+MCP template tools see the same registry. Requires a build with the `templates`
+feature; see the [cookbook page](../cookbook/templates.md) and the
+[Template Hub](../cookbook/template-hub.md).
 
 ```bash
 # Register (the body is stored verbatim — ${env:…} / ${vault:…} stay unresolved).
@@ -462,14 +467,43 @@ curl -sX POST http://127.0.0.1:8080/v1/templates \
   -d '{"id":"tenant-sync","config":"version: 1\nname: tenant-sync\n…","config_format":"yaml"}'
 # → 201 {"id":"tenant-sync","version":1,"params":{…},"created_at":"…","created_by":"…"}
 
-# Trigger.
+# Trigger a pipeline template.
 curl -sX POST http://127.0.0.1:8080/v1/templates/tenant-sync/runs \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"params":{"tenant_id":"acme"},"env":{"API_HOST":"eu.example.com"},"version":2}'
 # → 202 {"run_id":"…","status":"queued","submitted_at":"…",
 #        "template_id":"tenant-sync","template_version":2,
-#        "params":{"tenant_id":"acme","api_token":"***"}}
+#        "params":{"tenant_id":"acme","api_token":"***"},"streams":[]}
+
+# Register a source template and a sink template (their ids are their `name:`) …
+curl -sX POST http://127.0.0.1:8080/v1/templates -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"config":"kind: source-template\nname: acme-billing\n…","launch":true}'
+curl -sX POST http://127.0.0.1:8080/v1/templates -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"config":"kind: sink-template\nname: bigquery\n…","launch":true}'
+curl -s "http://127.0.0.1:8080/v1/templates?kind=sink-template" -H "Authorization: Bearer $TOKEN"
+
+# … and run the pairing: the trigger names the sink, and binds both halves' params.
+curl -sX POST http://127.0.0.1:8080/v1/templates/acme-billing/runs \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"sink":"bigquery","sink_version":"stable","params":{"api_token":"…","bq_project":"my-project"}}'
+# → 202 {"run_id":"…","template_id":"acme-billing","template_version":1,
+#        "sink_template":"bigquery","sink_template_version":1,
+#        "streams":[{"stream":"bills","requested":["overwrite","upsert"],"chosen":"overwrite","key":["id"]}, …],
+#        "params":{"api_token":"***","bq_project":"my-project"}}
 ```
+
+**Kinds.** `GET /v1/templates` rows carry `kind` (`?kind=` filters); rows written
+before kinds existed read as `pipeline`. A source template is registered under
+its `name` (an explicit `id` must match), its document is validated as a hub
+template and run through the publishability lint (a literal credential or a
+private hostname is a `422`), and a re-register can never change a template's
+kind under the same id. A trigger on a source template without `sink` is a `422`
+naming the field; `sink` on a pipeline template is a `422`; a trigger on a sink
+template is a `422` pointing at the source side. The composed run's `name` is
+the source template's, so its state keys (`{source}::{stream}`) survive a sink
+swap, and the run is labelled `sink_template` / `sink_template_version` beside
+`template` / `template_version`. Registering a document with no `kind:` still
+works as a pipeline but is deprecated: add `kind: pipeline`.
 
 **Registering never moves callers.** `POST /v1/templates` appends a version and
 stops there; `POST /v1/templates/{id}/launch` is the one call that moves `stable`
@@ -502,10 +536,12 @@ target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
 `launches` log — so a client can pin, promote, launch, or roll back without a
 second request. Use `?version=newest` to read a `draft` template.
 
-The trigger body's `params` / `env` / `version` are template-specific; every other
-field (`name`, `labels`, `timeout_secs`, `doctor_first`, `idempotency_key`,
-`clock`, `concurrency`) behaves exactly as in `POST /v1/runs`, because the run is submitted
-through the same path. The run is labelled `template` and `template_version`.
+The trigger body's `params` / `env` / `version` / `sink` / `sink_version` are
+template-specific; every other field (`name`, `labels`, `timeout_secs`,
+`doctor_first`, `idempotency_key`, `clock`, `concurrency`) behaves exactly as in
+`POST /v1/runs`, because the run is submitted through the same path. The run is
+labelled `template` and `template_version` (plus `sink_template` /
+`sink_template_version` for a composed run).
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing
 `required` param or a type mismatch, naming the param; `429` when the queue is

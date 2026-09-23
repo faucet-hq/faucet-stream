@@ -5,6 +5,7 @@
 //! front-ends are thin adapters over the two entry points here.
 
 use crate::error::{CliError, CliResult};
+use crate::hub::TemplateKind;
 use crate::params::{self, BindMode, SuppliedParams};
 use crate::serve::config::HistoryBackendSpec;
 use crate::serve::history::templates::{
@@ -63,6 +64,12 @@ pub struct MaterializedConfig {
     pub params_redacted: BTreeMap<String, Value>,
     /// True when at least one bound param was declared `secret: true`.
     pub used_secret_params: bool,
+    /// The sink template composed in (a source-template run), with its version.
+    pub sink_id: Option<String>,
+    pub sink_version: Option<u32>,
+    /// Per-stream write-mode resolution of a composed run (empty for a
+    /// `kind: pipeline` template).
+    pub streams: Vec<crate::hub::compose::StreamPlan>,
 }
 
 impl MaterializedConfig {
@@ -98,20 +105,177 @@ fn parse_body(body: &str, format: ConfigFormat) -> CliResult<Value> {
 /// when the graph is built, i.e. at trigger time, because building it requires
 /// live connectors that a placeholder-bound config must not create.
 pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<TemplateRecord> {
-    let mut doc = parse_body(&req.body, req.format)?;
+    let doc = parse_body(&req.body, req.format)?;
     if !doc.is_object() {
         return Err(CliError::Config(
-            "a pipeline template must be a config document (a YAML/JSON mapping)".into(),
+            "a template must be a YAML/JSON mapping (`kind: source-template`, `kind: sink-template`, \
+             or `kind: pipeline`)"
+                .into(),
         ));
     }
 
     // The declared trigger surface, validated and stored alongside the body so
-    // callers can discover it without re-parsing.
+    // callers can discover it without re-parsing. Hub templates declare theirs
+    // at the top level too.
     let declared = params::declared(&doc)?;
 
-    // Structural validation on a placeholder-bound copy. `${env:…}` and secret
-    // directives are left untouched — registration must never read the server's
-    // secrets, and the body we persist is the one that was submitted.
+    // Dispatch on `kind:`. A kind-less document is the pre-#571 full-pipeline
+    // template: still accepted, as `pipeline`, but deprecated — the hub kinds
+    // are the model (RFC 0008).
+    let detected = crate::hub::detect_kind(&doc);
+    let (kind, name) = match detected {
+        Some(TemplateKind::SourceTemplate) => {
+            let t: crate::hub::SourceTemplate = serde_json::from_value(doc.clone())
+                .map_err(|e| CliError::Config(format!("source-template: {e}")))?;
+            t.validate()?;
+            registry_lint(&t.name, crate::hub::catalog::lint_source(&t))?;
+            (TemplateKind::SourceTemplate, Some(t.name.clone()))
+        }
+        Some(TemplateKind::SinkTemplate) => {
+            let t: crate::hub::SinkTemplate = serde_json::from_value(doc.clone())
+                .map_err(|e| CliError::Config(format!("sink-template: {e}")))?;
+            t.validate()?;
+            registry_lint(&t.name, crate::hub::catalog::lint_sink(&t))?;
+            (TemplateKind::SinkTemplate, Some(t.name.clone()))
+        }
+        Some(TemplateKind::Pipeline) | None => {
+            if detected.is_none() {
+                tracing::warn!(
+                    id = req.id.as_deref().unwrap_or("<derived>"),
+                    "registering a full pipeline config without `kind:` is deprecated — the \
+                     registry's model is `kind: source-template` composed with `kind: \
+                     sink-template` (RFC 0008); add `kind: pipeline` to keep registering a \
+                     complete config explicitly"
+                );
+            }
+            let cfg = validate_pipeline_body(&doc)?;
+            (TemplateKind::Pipeline, cfg.name.clone())
+        }
+    };
+
+    let id = match (&req.id, kind.is_hub()) {
+        // A hub template's registry id is its `name` — compose uses the name for
+        // the pipeline name / state keys, so the two must not diverge.
+        (Some(raw), true) => {
+            let id = TemplateId::parse(raw)?;
+            if Some(id.as_str()) != name.as_deref() {
+                return Err(CliError::Config(format!(
+                    "a {kind} is registered under its own `name` ('{}'); drop `--id` or make it match",
+                    name.as_deref().unwrap_or("")
+                )));
+            }
+            id
+        }
+        (None, true) => TemplateId::parse(name.as_deref().unwrap_or_default())?,
+        (Some(raw), false) => TemplateId::parse(raw)?,
+        (None, false) => {
+            let name = name.as_deref().ok_or_else(|| {
+                CliError::Config(
+                    "no template id given and the config has no `name:` to derive one from — \
+                     pass an explicit id"
+                        .into(),
+                )
+            })?;
+            TemplateId::from_config_name(name)?
+        }
+    };
+
+    // A re-register must keep the kind: a source template cannot silently
+    // become a pipeline (or vice versa) under the same id — every existing
+    // pairing would break at trigger time.
+    if let Some(prev) = store
+        .template_get(id.as_str(), None)
+        .await
+        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        && prev.kind != kind
+    {
+        return Err(CliError::Config(format!(
+            "template '{id}' is a {} — a {kind} cannot be registered under the same id (use another id, or delete it first)",
+            prev.kind
+        )));
+    }
+
+    // Reject a derived channel before writing anything, so a bad request never
+    // leaves a half-registered version behind.
+    for tag in &req.tags {
+        reject_derived(*tag)?;
+    }
+
+    // A description describes the *template*, not the build, so carry the previous
+    // version's forward when the caller omits one. Without this, a deploy that
+    // re-registers without `--description` blanks the listing for everybody.
+    let description = match &req.description {
+        Some(d) => Some(d.clone()),
+        None => store
+            .template_get(id.as_str(), None)
+            .await
+            .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+            .and_then(|prev| prev.description)
+            .or_else(|| match kind {
+                // Hub templates carry their own description.
+                TemplateKind::SourceTemplate | TemplateKind::SinkTemplate => doc
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                TemplateKind::Pipeline => None,
+            }),
+    };
+
+    let draft = TemplateDraft {
+        id,
+        kind,
+        name,
+        description,
+        body: req.body.clone(),
+        format: req.format,
+        params: declared,
+        created_by: req.created_by.clone(),
+    };
+    let record = store
+        .template_register(&draft)
+        .await
+        .map_err(|e| CliError::Internal(format!("template registry write: {e}")))?;
+
+    // Point the requested channels at the version just created.
+    for tag in &req.tags {
+        store
+            .template_set_tag(&record.id, tag.as_str(), record.version)
+            .await
+            .map_err(|e| CliError::Internal(format!("template channel write: {e}")))?;
+    }
+    // `--launch` is the only way a register makes a version live.
+    if req.launch {
+        store
+            .template_launch(&record.id, record.version, req.created_by.as_deref())
+            .await
+            .map_err(|e| CliError::Internal(format!("template launch write: {e}")))?;
+    }
+    Ok(record)
+}
+
+/// The publishability lint, as a registry gate: a literal credential or a
+/// private hostname must never be stored in a shared registry. A missing
+/// `description` is a catalog-quality nit, not a reason to refuse.
+fn registry_lint(name: &str, findings: Vec<String>) -> CliResult<()> {
+    let blocking: Vec<String> = findings
+        .into_iter()
+        .filter(|f| !f.starts_with("missing `description`"))
+        .collect();
+    if blocking.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::Config(format!(
+            "'{name}' cannot be registered:\n  - {}",
+            blocking.join("\n  - ")
+        )))
+    }
+}
+
+/// Structural validation of a complete pipeline template on a
+/// placeholder-bound copy. `${env:…}` and secret directives are left untouched —
+/// registration must never read the server's secrets, and the body persisted
+/// is the one that was submitted.
+fn validate_pipeline_body(doc: &Value) -> CliResult<crate::config::PipelineConfig> {
     let mut probe = doc.clone();
     params::bind_document(&mut probe, &SuppliedParams::new(), BindMode::Placeholder)?;
     let cfg = crate::config::PipelineConfig::from_value(probe)?;
@@ -153,71 +317,7 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
                 .map_err(|e| CliError::Config(format!("row '{}': {e}", node.id)))?;
         }
     }
-
-    let id = match &req.id {
-        Some(raw) => TemplateId::parse(raw)?,
-        None => {
-            let name = cfg.name.as_deref().ok_or_else(|| {
-                CliError::Config(
-                    "no template id given and the config has no `name:` to derive one from — \
-                     pass an explicit id"
-                        .into(),
-                )
-            })?;
-            TemplateId::from_config_name(name)?
-        }
-    };
-
-    // Keep the persisted body byte-identical to what was submitted.
-    let _ = &mut doc;
-
-    // Reject a derived channel before writing anything, so a bad request never
-    // leaves a half-registered version behind.
-    for tag in &req.tags {
-        reject_derived(*tag)?;
-    }
-
-    // A description describes the *template*, not the build, so carry the previous
-    // version's forward when the caller omits one. Without this, a deploy that
-    // re-registers without `--description` blanks the listing for everybody.
-    let description = match &req.description {
-        Some(d) => Some(d.clone()),
-        None => store
-            .template_get(id.as_str(), None)
-            .await
-            .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
-            .and_then(|prev| prev.description),
-    };
-
-    let draft = TemplateDraft {
-        id,
-        name: cfg.name.clone(),
-        description,
-        body: req.body.clone(),
-        format: req.format,
-        params: declared,
-        created_by: req.created_by.clone(),
-    };
-    let record = store
-        .template_register(&draft)
-        .await
-        .map_err(|e| CliError::Internal(format!("template registry write: {e}")))?;
-
-    // Point the requested channels at the version just created.
-    for tag in &req.tags {
-        store
-            .template_set_tag(&record.id, tag.as_str(), record.version)
-            .await
-            .map_err(|e| CliError::Internal(format!("template channel write: {e}")))?;
-    }
-    // `--launch` is the only way a register makes a version live.
-    if req.launch {
-        store
-            .template_launch(&record.id, record.version, req.created_by.as_deref())
-            .await
-            .map_err(|e| CliError::Internal(format!("template launch write: {e}")))?;
-    }
-    Ok(record)
+    Ok(cfg)
 }
 
 /// `latest` is computed from the version list, so promoting or deleting it makes
@@ -532,7 +632,167 @@ pub async fn materialize(
             version: Some(version),
         })?;
 
-    let mut doc = parse_body(&record.body, record.format)?;
+    match record.kind {
+        TemplateKind::Pipeline => {}
+        TemplateKind::SourceTemplate => {
+            return Err(CliError::Config(format!(
+                "'{id}' is a source-template — it runs composed with a sink template: pass `--sink <id>` \
+                 (HTTP: `sink`), or `faucet template list` to see the registered sink templates"
+            )));
+        }
+        TemplateKind::SinkTemplate => {
+            return Err(CliError::Config(format!(
+                "'{id}' is a sink-template and is not runnable on its own — run a source template with \
+                 `--sink {id}`"
+            )));
+        }
+    }
+    let doc = parse_body(&record.body, record.format)?;
+    let (body, bound) = bind_document_for_run(doc, supplied, env_overrides, mode)?;
+    Ok(MaterializedConfig {
+        template_id: record.id.clone(),
+        version: record.version,
+        name: record.name.clone(),
+        body,
+        params_redacted: bound.redacted(),
+        used_secret_params: bound.has_secrets(),
+        sink_id: None,
+        sink_version: None,
+        streams: Vec::new(),
+    })
+}
+
+/// The sink half of a trigger: which registered sink template to compose in.
+#[derive(Debug, Clone, Default)]
+pub struct SinkChoice {
+    pub id: Option<String>,
+    /// Defaults to `stable`, like the source side.
+    pub version: VersionSelector,
+}
+
+/// Everything a trigger surface needs to run template `id` at `version`:
+/// dispatches on the record's kind — a `pipeline` materializes alone (and
+/// refuses a sink), a `source-template` requires and composes a sink (whose
+/// version is resolved here too), a `sink-template` is never runnable on its
+/// own. One implementation shared by the CLI, HTTP, MCP, and suites so they
+/// can never disagree about the rules.
+pub async fn materialize_for_run(
+    store: &TemplateStore,
+    id: &str,
+    version: u32,
+    sink: &SinkChoice,
+    supplied: &SuppliedParams,
+    env_overrides: &BTreeMap<String, String>,
+    mode: Materialize,
+) -> CliResult<MaterializedConfig> {
+    let record = fetch_version(store, id, version).await?;
+    match record.kind {
+        TemplateKind::Pipeline => {
+            if let Some(sink_id) = &sink.id {
+                return Err(CliError::Config(format!(
+                    "'{id}' is a complete pipeline template — it takes no sink (got `--sink {sink_id}`)"
+                )));
+            }
+            materialize(store, id, version, supplied, env_overrides, mode).await
+        }
+        TemplateKind::SourceTemplate => {
+            let sink_id = sink.id.as_deref().ok_or_else(|| {
+                CliError::Config(format!(
+                    "'{id}' is a source-template — it runs composed with a sink template: pass \
+                     `--sink <id>` (HTTP: `sink`); `faucet template list --kind sink-template` shows them"
+                ))
+            })?;
+            let sink_version = resolve_version(store, sink_id, sink.version).await?;
+            materialize_pair(
+                store,
+                (id, version),
+                (sink_id, sink_version),
+                supplied,
+                env_overrides,
+                mode,
+            )
+            .await
+        }
+        TemplateKind::SinkTemplate => Err(CliError::Config(format!(
+            "'{id}' is a sink-template and is not runnable on its own — run a source template with \
+             `--sink {id}`"
+        ))),
+    }
+}
+
+/// Compose a registered `source-template` with a registered `sink-template`
+/// and bind params — the trigger path of the hub model. Both sides are pinned
+/// to concrete versions by the caller (`resolve_version` each), so a run
+/// records exactly which builds it composed.
+pub async fn materialize_pair(
+    store: &TemplateStore,
+    (source_id, source_version): (&str, u32),
+    (sink_id, sink_version): (&str, u32),
+    supplied: &SuppliedParams,
+    env_overrides: &BTreeMap<String, String>,
+    mode: Materialize,
+) -> CliResult<MaterializedConfig> {
+    let src_rec = fetch_version(store, source_id, source_version).await?;
+    let sink_rec = fetch_version(store, sink_id, sink_version).await?;
+    if src_rec.kind != TemplateKind::SourceTemplate {
+        return Err(CliError::Config(format!(
+            "'{source_id}' is a {} — the source side of a pairing must be a source-template",
+            src_rec.kind
+        )));
+    }
+    if sink_rec.kind != TemplateKind::SinkTemplate {
+        return Err(CliError::Config(format!(
+            "'{sink_id}' is a {} — `sink` must name a sink-template",
+            sink_rec.kind
+        )));
+    }
+    let source: crate::hub::SourceTemplate =
+        serde_json::from_value(parse_body(&src_rec.body, src_rec.format)?).map_err(|e| {
+            CliError::Internal(format!(
+                "stored source-template '{source_id}' v{source_version}: {e}"
+            ))
+        })?;
+    let sink: crate::hub::SinkTemplate =
+        serde_json::from_value(parse_body(&sink_rec.body, sink_rec.format)?).map_err(|e| {
+            CliError::Internal(format!(
+                "stored sink-template '{sink_id}' v{sink_version}: {e}"
+            ))
+        })?;
+    let composition = crate::hub::compose(&source, &sink)?;
+    let (body, bound) = bind_document_for_run(composition.document, supplied, env_overrides, mode)?;
+    Ok(MaterializedConfig {
+        template_id: src_rec.id.clone(),
+        version: src_rec.version,
+        name: Some(composition.name),
+        body,
+        params_redacted: bound.redacted(),
+        used_secret_params: bound.has_secrets(),
+        sink_id: Some(sink_rec.id.clone()),
+        sink_version: Some(sink_rec.version),
+        streams: composition.streams,
+    })
+}
+
+async fn fetch_version(store: &TemplateStore, id: &str, version: u32) -> CliResult<TemplateRecord> {
+    store
+        .template_get(id, Some(version))
+        .await
+        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .ok_or_else(|| CliError::UnknownPipelineTemplate {
+            id: id.to_string(),
+            version: Some(version),
+        })
+}
+
+/// The shared tail of materialization: (Local only) resolve load-time
+/// directives with the env overlay, bind `${param.*}` strictly, drop the
+/// `params:` block, and re-serialize as JSON.
+fn bind_document_for_run(
+    mut doc: Value,
+    supplied: &SuppliedParams,
+    env_overrides: &BTreeMap<String, String>,
+    mode: Materialize,
+) -> CliResult<(String, params::BoundParams)> {
     if mode == Materialize::Local {
         let overlay: crate::interpolate::EnvOverlay = env_overrides
             .iter()
@@ -549,17 +809,9 @@ pub async fn materialize(
     if let Some(map) = doc.as_object_mut() {
         map.remove(params::PARAMS_KEY);
     }
-
     let body = serde_json::to_string(&doc)
         .map_err(|e| CliError::Internal(format!("re-serializing template body: {e}")))?;
-    Ok(MaterializedConfig {
-        template_id: record.id.clone(),
-        version: record.version,
-        name: record.name.clone(),
-        body,
-        params_redacted: bound.redacted(),
-        used_secret_params: bound.has_secrets(),
-    })
+    Ok((body, bound))
 }
 
 /// Connect a template store from a URL: `memory`, `sqlite:<path>`, or a
@@ -1408,6 +1660,324 @@ pipeline:
         assert_eq!(versions.len(), VERSION_RETAIN);
         assert_eq!(versions[0], (VERSION_RETAIN + 3) as u32, "newest kept");
         assert!(!versions.contains(&1), "oldest pruned");
+    }
+
+    // ── kind-aware registry (source × sink) ─────────────────────────────────
+
+    /// A runnable source template: two CSV exports become two streams.
+    fn source_template(dir: &std::path::Path) -> String {
+        std::fs::write(dir.join("orders.csv"), "id,total\n1,10\n2,20\n").unwrap();
+        std::fs::write(dir.join("customers.csv"), "id,name\n1,alice\n").unwrap();
+        format!(
+            "kind: source-template
+name: acme-exports
+description: Acme — orders and customers exports
+params:
+  data_dir: {{ type: string, default: {} }}
+source:
+  type: csv
+  config:
+    path: \"${{param.data_dir}}/orders.csv\"
+transforms:
+  - {{ type: keys_case, config: {{ mode: snake }} }}
+streams:
+  - name: orders
+    primary_keys: [id]
+    write: [overwrite, upsert]
+  - name: customers
+    source: {{ config: {{ path: \"${{param.data_dir}}/customers.csv\" }} }}
+    primary_keys: [id]
+    write: [overwrite, upsert]
+",
+            dir.display()
+        )
+    }
+
+    /// A local JSON Lines sink template; `overwrite` satisfied by rewriting the file.
+    fn sink_template(dir: &std::path::Path) -> String {
+        format!(
+            "kind: sink-template
+name: local-jsonl
+description: Local JSON Lines files, one per stream
+params:
+  out_dir: {{ type: string, default: {} }}
+sink:
+  type: jsonl
+  config:
+    append: false
+per_stream:
+  path: \"${{param.out_dir}}/${{source}}/${{stream}}.jsonl\"
+write_mode_aliases:
+  overwrite: append
+",
+            dir.display()
+        )
+    }
+
+    #[tokio::test]
+    async fn hub_kinds_register_under_their_name_and_keep_their_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store();
+        let src = register(&s, req_launched(&source_template(dir.path())))
+            .await
+            .unwrap();
+        assert_eq!(src.id, "acme-exports", "a hub template's id is its name");
+        assert_eq!(src.kind, TemplateKind::SourceTemplate);
+        assert_eq!(
+            src.params["data_dir"]
+                .default
+                .as_ref()
+                .map(|v| v.is_string()),
+            Some(true)
+        );
+        // The template's own description is used when the request carries none.
+        let mut no_desc = req(&source_template(dir.path()));
+        no_desc.description = None;
+        let again = register(&s, no_desc).await.unwrap();
+        assert_eq!(again.version, 2);
+        assert_eq!(
+            again.description.as_deref(),
+            Some("test"),
+            "previous description carries forward"
+        );
+
+        let mut fresh = req_launched(&sink_template(dir.path()));
+        fresh.description = None;
+        let sink = register(&s, fresh).await.unwrap();
+        assert_eq!(sink.kind, TemplateKind::SinkTemplate);
+        assert_eq!(
+            sink.description.as_deref(),
+            Some("Local JSON Lines files, one per stream")
+        );
+
+        // An explicit id must agree with `name`.
+        let mut wrong_id = req(&sink_template(dir.path()));
+        wrong_id.id = Some("elsewhere".into());
+        let err = register(&s, wrong_id).await.unwrap_err().to_string();
+        assert!(err.contains("registered under its own `name`"), "{err}");
+
+        // A pipeline cannot take over a source template's id (or vice versa).
+        let mut takeover = req(PARAMETERIZED);
+        takeover.id = Some("acme-exports".into());
+        let err = register(&s, takeover).await.unwrap_err().to_string();
+        assert!(err.contains("is a source-template"), "{err}");
+        assert!(
+            err.contains("cannot be registered under the same id"),
+            "{err}"
+        );
+
+        let listed = list_with_state(&s).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .any(|t| t.kind == TemplateKind::SourceTemplate)
+        );
+        assert!(listed.iter().any(|t| t.kind == TemplateKind::SinkTemplate));
+    }
+
+    #[tokio::test]
+    async fn hub_registration_runs_validation_and_the_publishability_lint() {
+        let s = store();
+        // Structurally broken: a stream referencing an undeclared param.
+        let err = register(
+            &s,
+            req("kind: source-template\nname: bad\nsource: { type: csv, config: { path: \"${param.nope}\" } }\nstreams: [{ name: a }]\n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nope"), "{err}");
+
+        // A literal credential is a lint failure the registry refuses to store.
+        let err = register(
+            &s,
+            req("kind: source-template\nname: leaky\nsource:\n  type: rest\n  config:\n    base_url: https://api.example.com\n    auth: { type: bearer, config: { token: hunter2secretvalue } }\nstreams: [{ name: a }]\n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cannot be registered"), "{err}");
+
+        // A missing description is a nit, not a refusal.
+        register(
+            &s,
+            req("kind: sink-template\nname: terse\nsink: { type: jsonl, config: {} }\nper_stream: { path: \"./${stream}.jsonl\" }\n"),
+        )
+        .await
+        .expect("missing description does not block");
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_hub_kinds_and_for_run_dispatches_on_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store();
+        register(&s, req_launched(&source_template(dir.path())))
+            .await
+            .unwrap();
+        register(&s, req_launched(&sink_template(dir.path())))
+            .await
+            .unwrap();
+        register(&s, req_launched(PARAMETERIZED)).await.unwrap();
+        let none = BTreeMap::new();
+        let supplied = SuppliedParams::new();
+
+        // The plain materialize is pipeline-only and says how to run a hub kind.
+        let err = materialize(&s, "acme-exports", 1, &supplied, &none, Materialize::Local)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--sink <id>"), "{err}");
+        let err = materialize(&s, "local-jsonl", 1, &supplied, &none, Materialize::Local)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not runnable on its own"), "{err}");
+
+        // A pipeline refuses a sink; a source requires one; a sink is never runnable.
+        let with_sink = SinkChoice {
+            id: Some("local-jsonl".into()),
+            version: Default::default(),
+        };
+        let err = materialize_for_run(
+            &s,
+            "tenant-sync",
+            1,
+            &with_sink,
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("takes no sink"), "{err}");
+        let err = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &SinkChoice::default(),
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--kind sink-template"), "{err}");
+        let err = materialize_for_run(
+            &s,
+            "local-jsonl",
+            1,
+            &SinkChoice::default(),
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--sink local-jsonl"), "{err}");
+
+        // `sink` must name a sink template, and the source side a source template.
+        let pipeline_as_sink = SinkChoice {
+            id: Some("tenant-sync".into()),
+            version: Default::default(),
+        };
+        let err = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &pipeline_as_sink,
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`sink` must name a sink-template"), "{err}");
+        let err = materialize_pair(
+            &s,
+            ("tenant-sync", 1),
+            ("local-jsonl", 1),
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("source side of a pairing"), "{err}");
+
+        // The pairing composes: one matrix row per stream, write modes resolved,
+        // both halves' params bound, provenance on both sides.
+        let m = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &with_sink,
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .expect("composes");
+        assert_eq!(m.template_id, "acme-exports");
+        assert_eq!(m.sink_id.as_deref(), Some("local-jsonl"));
+        assert_eq!(m.sink_version, Some(1));
+        assert_eq!(m.name.as_deref(), Some("acme-exports"));
+        let names: Vec<&str> = m.streams.iter().map(|p| p.stream.as_str()).collect();
+        assert_eq!(names, ["orders", "customers"]);
+        let body: Value = serde_json::from_str(&m.body).unwrap();
+        assert_eq!(body["matrix"].as_array().map(Vec::len), Some(2));
+        let row = &body["matrix"][0];
+        assert_eq!(row["id"], json!("orders"));
+        // jsonl has no `WriteSpec`, so the composer records the alias in the plan
+        // rather than writing a `write_mode` the connector would reject.
+        assert!(row["sink"]["config"].get("write_mode").is_none());
+        assert_eq!(m.streams[0].chosen, faucet_core::WriteMode::Append);
+        assert_eq!(
+            m.streams[0].satisfies,
+            Some(faucet_core::WriteMode::Overwrite),
+            "overwrite aliased to append on jsonl"
+        );
+        assert!(
+            row["sink"]["config"]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/acme-exports/orders.jsonl")
+        );
+        assert!(
+            body.get("params").is_none(),
+            "params block dropped after binding"
+        );
+        assert!(
+            m.params_redacted.contains_key("out_dir"),
+            "sink params bound too"
+        );
+        assert!(m.params_redacted.contains_key("data_dir"));
+
+        // An unknown sink version is the same typed error as an unknown template.
+        let pinned = SinkChoice {
+            id: Some("local-jsonl".into()),
+            version: VersionSelector::Pinned(9),
+        };
+        let err = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &pinned,
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CliError::UnknownPipelineTemplate { ref id, version: Some(9) } if id == "local-jsonl"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

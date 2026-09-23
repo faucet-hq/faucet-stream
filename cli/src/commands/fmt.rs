@@ -124,6 +124,7 @@ impl ConfigFormat {
 /// `version`, etc.).
 const KEY_ORDER: &[&str] = &[
     // ── top level ────────────────────────────────────────────────────────────
+    "kind",
     "version",
     "name",
     "vars",

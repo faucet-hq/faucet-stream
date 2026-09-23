@@ -16,6 +16,7 @@ faucet splits that into two pieces:
 ## Declaring parameters
 
 ```yaml
+kind: pipeline          # a complete config — see "Registering a template" for the other kinds
 version: 1
 name: tenant-sync
 
@@ -120,6 +121,34 @@ faucet run tenant-sync.yaml --param tenant_id=acme --param-env API_HOST=eu.examp
 ```
 
 ## Registering a template
+
+The registry stores three **kinds** of document, told apart by a `kind:` line:
+
+| `kind:` | What it is | How it runs |
+|---|---|---|
+| `source-template` | One system: its connector, shared `transforms`, and **streams** with per-stream write preferences ([Template Hub](./template-hub.md)) | Composed with a registered `sink-template`: `faucet template run <source> --sink <sink>` / `POST …/runs {"sink": …}` |
+| `sink-template` | One destination and how a stream is addressed (`per_stream`) | Never on its own — named as the `sink` of a source template's run |
+| `pipeline` | A complete config with `params:` | Alone, as below |
+
+A source or sink template is registered under its own `name` (the hub id), is
+validated as a hub template, and goes through the publishability lint — a
+literal credential or a private hostname is refused, because a shared registry
+is a shared place. A template's kind is fixed for its id: a later register
+under the same id with a different kind is refused. A document without `kind:`
+is still accepted as a pipeline but prints a deprecation notice — add
+`kind: pipeline` to a complete config.
+
+```bash
+faucet template register hub/source-templates/acme-billing.yaml --launch    # id = acme-billing
+faucet template register hub/sink-templates/bigquery.yaml --launch          # id = bigquery
+faucet template list --kind sink-template
+faucet template run acme-billing --sink bigquery \
+  --param api_token="$ACME_TOKEN" --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
+# → composes the two, prints the per-stream plan (bills: overwrite, transactions: upsert[id], …), runs
+```
+
+The rest of this page uses a complete `pipeline` template; everything about
+versions, channels, launching, and triggering applies to all three kinds.
 
 ```bash
 faucet template register tenant-sync.yaml --store sqlite:./faucet-templates.db
@@ -338,6 +367,26 @@ promote, launch, or roll back without a second call:
 
 Pass `?version=newest` to open a `draft` template — it has no `stable` version yet.
 
+#### Suites for a source template
+
+A suite whose `template:` is a source template names the sink it should be
+tested against: `sink:` (a registered id, or a path when `template:` is a path)
+and optionally `sink_select:`. Every case then materializes the **composed**
+pipeline — the same document a trigger builds — and `auto:` cases sweep the
+merged parameter surface, so a sink param the source never declared is still
+covered.
+
+```yaml
+version: 1
+template: acme-billing
+sink: bigquery
+suite:
+  auto: { enum_coverage: true }
+  cases:
+    - name: prod-shape
+      params: { bq_project: analytics, api_token: placeholder }
+```
+
 #### In the console
 
 The web console (`serve-ui`) has a **Templates** view built around exactly this:
@@ -496,9 +545,20 @@ curl -sX POST localhost:8080/v1/templates/tenant-sync/runs \
 #        "template_version":1,"params":{"tenant_id":"acme","api_token":"***",…}}
 ```
 
+```bash
+# A source template names its sink; params are the union of both halves.
+curl -sX POST localhost:8080/v1/templates/acme-billing/runs \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"sink":"bigquery","sink_version":"stable","params":{"api_token":"…","bq_project":"my-project"}}'
+# → 202 {…,"template_id":"acme-billing","template_version":1,"sink_template":"bigquery",
+#        "sink_template_version":1,"streams":[{"stream":"bills","chosen":"overwrite",…},…]}
+curl -s "localhost:8080/v1/templates?kind=source-template" -H "Authorization: Bearer $TOKEN"
+```
+
 A trigger is submitted through the same path as `POST /v1/runs`, so idempotency
 keys, `doctor_first`, queue limits, cluster dispatch, metrics, and the audit log
-all behave identically. The run is labelled `template` and `template_version`, so
+all behave identically. The run is labelled `template` and `template_version`
+(and `sink_template` / `sink_template_version` for a composed run), so
 `GET /v1/runs?…` and your dashboards can group by provenance.
 
 See the [HTTP API reference](../reference/http-api.md) for the full endpoint list.
@@ -516,7 +576,9 @@ faucet mcp --template-store sqlite:./faucet-templates.db --allow-mutations
 ```
 
 Without a store the template tools are not advertised at all, so an agent never
-sees a tool it cannot use.
+sees a tool it cannot use. `run_template` takes the same `sink` / `sink_version`
+pair as the HTTP trigger for a source template, and its `dry_run` output carries
+the per-stream write-mode plan.
 
 ## What is and isn't stored
 

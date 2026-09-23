@@ -130,7 +130,7 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
             .expect("YAML mode always resolves a path above");
         // A hub template handed to `run` directly would fail on `kind:` as an
         // unknown field; say what it is and how to run it instead.
-        if let Some(kind) = crate::hub::detect_kind_in_file(path) {
+        if let Some(kind) = crate::hub::detect_kind_in_file(path).filter(|k| k.is_hub()) {
             return Err(CliError::Config(format!(
                 "{} is a hub {} — compose it: `faucet run --source <source-template> --sink <sink-template>`",
                 path.display(),

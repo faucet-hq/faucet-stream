@@ -433,6 +433,11 @@ pub struct TemplateRecord {
     pub id: String,
     /// Monotonic version, starting at 1. `register` always appends a new one.
     pub version: u32,
+    /// What the body is: a hub `source-template` / `sink-template` (composed
+    /// with a partner at trigger time) or a complete `pipeline`. Records
+    /// written before kinds existed read back as `pipeline`.
+    #[serde(default = "crate::hub::TemplateKind::pipeline")]
+    pub kind: crate::hub::TemplateKind,
     /// The config's own `name:`, if it has one (informational).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -460,6 +465,7 @@ impl TemplateRecord {
         TemplateSummary {
             id: self.id.clone(),
             version: self.version,
+            kind: self.kind,
             name: self.name.clone(),
             description: self.description.clone(),
             params: self.params.clone(),
@@ -485,6 +491,8 @@ pub struct TemplateSummary {
     /// The newest registered version (the build tip). Present for continuity with
     /// the per-version record; `state.stable` is what an unpinned run uses.
     pub version: u32,
+    #[serde(default = "crate::hub::TemplateKind::pipeline")]
+    pub kind: crate::hub::TemplateKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -607,6 +615,7 @@ pub fn previous_version(launches: &[LaunchRecord]) -> Option<u32> {
 #[derive(Debug, Clone)]
 pub struct TemplateDraft {
     pub id: TemplateId,
+    pub kind: crate::hub::TemplateKind,
     pub name: Option<String>,
     pub description: Option<String>,
     pub body: String,
@@ -647,6 +656,7 @@ mod tests {
 
     fn rec(id: &str, version: u32, secs: i64) -> TemplateRecord {
         TemplateRecord {
+            kind: crate::hub::TemplateKind::Pipeline,
             id: id.into(),
             version,
             name: None,
