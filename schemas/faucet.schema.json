@@ -4038,7 +4038,8 @@
                     "number",
                     "string"
                   ],
-                  "format": "double"
+                  "format": "double",
+                  "default": 0.9
                 }
               }
             }
@@ -4083,7 +4084,8 @@
                     "number",
                     "string"
                   ],
-                  "format": "double"
+                  "format": "double",
+                  "default": 0.9
                 },
                 "encoding": {
                   "description": "Body encoding: `json` (default) or `form`\n(`application/x-www-form-urlencoded`, required by RFC-6749 OAuth\ntoken endpoints like Salesforce/Google).",
