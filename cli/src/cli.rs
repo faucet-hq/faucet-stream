@@ -706,6 +706,7 @@ pub enum TemplateKindArg {
     SourceTemplate,
     SinkTemplate,
     Pipeline,
+    Deployment,
 }
 
 impl From<TemplateKindArg> for crate::hub::TemplateKind {
@@ -714,6 +715,7 @@ impl From<TemplateKindArg> for crate::hub::TemplateKind {
             TemplateKindArg::SourceTemplate => Self::SourceTemplate,
             TemplateKindArg::SinkTemplate => Self::SinkTemplate,
             TemplateKindArg::Pipeline => Self::Pipeline,
+            TemplateKindArg::Deployment => Self::Deployment,
         }
     }
 }
@@ -784,6 +786,13 @@ pub struct TemplateRunArgs {
     /// Version of the sink template: a number or a channel. Default `stable`.
     #[arg(long, default_value = "stable", requires = "sink")]
     pub sink_version: String,
+    /// Deployment overlay for the composed run (#679): a registered
+    /// `kind: deployment` id, or a path to a deployment file.
+    #[arg(long, requires = "sink")]
+    pub overlay: Option<String>,
+    /// Version of a registered overlay: a number or a channel. Default `stable`.
+    #[arg(long, default_value = "stable", requires = "overlay")]
+    pub overlay_version: String,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -895,6 +904,11 @@ pub struct HubPairArgs {
     /// official `faucet-hq/name`) resolved under `<hub>/sink-templates/`.
     #[arg(long)]
     pub sink: String,
+    /// Deployment overlay (#679): a `kind: deployment` file, or an id under
+    /// `<hub>/deployments/`, applied over the pairing — `state:`, `dlq:`,
+    /// `notifications:`, `sla:` and other operational blocks.
+    #[arg(long)]
+    pub overlay: Option<String>,
     /// Hub catalog: a directory, `github:owner/repo[@ref][/path]`, or a GitHub
     /// URL. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the
     /// public hub `github:faucet-hq/template-hub` (cached under
@@ -1567,6 +1581,11 @@ pub struct RunArgs {
     /// Template Hub: the `sink-template` (path or hub id) to compose with `--source`.
     #[arg(long, requires = "source")]
     pub sink: Option<String>,
+    /// Deployment overlay (#679): a `kind: deployment` file, or an id under
+    /// `<hub>/deployments/`, applied over the pairing — `state:`, `dlq:`,
+    /// `notifications:`, `sla:` and other operational blocks.
+    #[arg(long, requires = "source")]
+    pub overlay: Option<String>,
     /// Hub catalog for `--source` / `--sink` ids: a directory,
     /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Default:
     /// `$FAUCET_HUB`, else `./hub` when it exists, else the public hub
@@ -1785,6 +1804,11 @@ pub struct ValidateArgs {
     /// Template Hub: the `sink-template` (path or hub id) to compose with `--source`.
     #[arg(long, requires = "source")]
     pub sink: Option<String>,
+    /// Deployment overlay (#679): a `kind: deployment` file, or an id under
+    /// `<hub>/deployments/`, applied over the pairing — `state:`, `dlq:`,
+    /// `notifications:`, `sla:` and other operational blocks.
+    #[arg(long, requires = "source")]
+    pub overlay: Option<String>,
     /// Hub catalog for `--source` / `--sink` ids: a directory,
     /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Default:
     /// `$FAUCET_HUB`, else `./hub` when it exists, else the public hub
@@ -1858,6 +1882,8 @@ pub enum SchemaTarget {
     SourceTemplate,
     /// JSON Schema for a Template Hub `kind: sink-template` document (#571).
     SinkTemplate,
+    /// JSON Schema for a `kind: deployment` overlay (#679).
+    Deployment,
     /// JSON Schema for a `faucet template test` suite file (#648).
     #[cfg(feature = "templates")]
     TemplateTest,

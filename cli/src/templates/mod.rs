@@ -57,10 +57,10 @@ pub mod suite;
 pub mod sync;
 
 pub use store::{
-    LaunchOutcome, Materialize, MaterializedConfig, RegisterRequest, SinkChoice, TemplateStore,
-    launch, list_with_state, materialize, materialize_for_run, materialize_pair, parse_body,
-    promote, register, resolve_store_url, resolve_version, rollback, set_deprecated,
-    template_state,
+    LaunchOutcome, Materialize, MaterializedConfig, OverlayChoice, RegisterRequest, SinkChoice,
+    TemplateStore, launch, list_with_state, materialize, materialize_for_run, materialize_pair,
+    materialize_pair_overlaid, parse_body, promote, register, resolve_store_url, resolve_version,
+    rollback, set_deprecated, template_state,
 };
 
 use crate::error::{CliError, CliResult};

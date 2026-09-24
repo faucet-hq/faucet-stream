@@ -108,7 +108,7 @@
       ]
     },
     "sla": {
-      "description": "Optional data-freshness & volume SLA (#202). Top-level in v1 (not\nper-matrix-row, like `resilience:`). Evaluated after every root\ninvocation by `faucet run`/`schedule`/`serve`/`replicate`; violations\nemit metrics + warnings and never fail the run. Staleness/volume checks\nrequire a `state:` block (enforced at expand time).",
+      "description": "Optional data-freshness & volume SLA (#202). A matrix row's own `sla:`\nreplaces it for that row (#679). Evaluated after every root\ninvocation by `faucet run`/`schedule`/`serve`/`replicate`; violations\nemit metrics + warnings and never fail the run. Staleness/volume checks\nrequire a `state:` block (enforced at expand time).",
       "anyOf": [
         {
           "$ref": "#/$defs/SlaSpec"
@@ -2091,6 +2091,17 @@
             }
           ],
           "default": null
+        },
+        "sla": {
+          "description": "Per-row SLA override (#679). Replaces the top-level `sla:` for this\nrow's invocations; `None` inherits it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlaSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "tags": {
           "description": "Free-form classification tags for this row (#376). Orthogonal to the\nsource's `status:` readiness ladder — `status` gates whether a row is\neligible; `tags` narrow *within* the eligible set at runtime via\n`--tag`. Union-merged with the source template's `tags:` to form the\neffective tag set. Validated at expand time (charset\n`^[a-z0-9][a-z0-9_-]*$`, deduped).",

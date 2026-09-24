@@ -467,6 +467,9 @@ origins:
                 .unwrap();
         assert_eq!(s.stable, Some(4));
         assert_eq!(s.deprecated.get(&2).map(String::as_str), Some("use v3+"));
-        assert!(serde_yaml::from_str::<Sidecar>("stabel: 1").is_err(), "typos still fail");
+        assert!(
+            serde_yaml::from_str::<Sidecar>("stabel: 1").is_err(),
+            "typos still fail"
+        );
     }
 }

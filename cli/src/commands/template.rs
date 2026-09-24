@@ -195,10 +195,13 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
     );
     print_params(&record.summary());
     println!(
-        "\ntrigger it with:\n  faucet template run {} --store {}{}",
-        record.id,
-        args.common.store,
-        required_param_hint(&record.summary())
+        "\n{}",
+        trigger_hint(
+            record.kind,
+            &record.id,
+            &args.common.store,
+            &required_param_hint(&record.summary())
+        )
     );
     Ok(())
 }
@@ -547,6 +550,45 @@ async fn promote(args: TemplatePromoteArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// How to use a just-registered template: only a pipeline or a source
+/// template is triggered directly; a sink or a deployment joins a source's run.
+fn trigger_hint(kind: crate::hub::TemplateKind, id: &str, store: &str, params: &str) -> String {
+    use crate::hub::TemplateKind::*;
+    match kind {
+        Pipeline => format!("trigger it with:\n  faucet template run {id} --store {store}{params}"),
+        SourceTemplate => format!(
+            "trigger it with a sink template:\n  faucet template run {id} --sink <sink-template> --store {store}{params}"
+        ),
+        SinkTemplate => format!(
+            "compose it into a source template's run:\n  faucet template run <source-template> --sink {id} --store {store}{params}"
+        ),
+        Deployment => format!(
+            "apply it to a composed run:\n  faucet template run <source-template> --sink <sink-template> --overlay {id} --store {store}{params}"
+        ),
+    }
+}
+
+/// `--overlay`: an existing file is applied inline; anything else is a
+/// registered deployment id.
+fn overlay_choice(
+    raw: Option<&str>,
+    version: &str,
+) -> CliResult<Option<crate::templates::OverlayChoice>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let path = std::path::Path::new(raw);
+    if path.is_file() {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| CliError::Config(format!("reading overlay {raw}: {e}")))?;
+        let value: serde_json::Value = serde_yaml::from_str(&text)
+            .map_err(|e| CliError::Config(format!("overlay {raw}: invalid YAML: {e}")))?;
+        return Ok(Some(crate::templates::OverlayChoice::Inline(value)));
+    }
+    Ok(Some(crate::templates::OverlayChoice::Registered {
+        id: raw.to_string(),
+        version: VersionSelector::parse(version)?,
+    }))
+}
+
 async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     let store = connect(&args.common).await?;
     let supplied = crate::params::collect_cli_params(&args.param)?;
@@ -556,6 +598,7 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     let sink = crate::templates::SinkChoice {
         id: args.sink.clone(),
         version: VersionSelector::parse(&args.sink_version)?,
+        overlay: overlay_choice(args.overlay.as_deref(), &args.overlay_version)?,
     };
     let materialized = crate::templates::materialize_for_run(
         &store,
@@ -578,6 +621,15 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     if !args.common.json {
         for p in &materialized.streams {
             eprintln!("  {:<32} write_mode: {}", p.stream, p.describe());
+        }
+        if let Some(o) = &materialized.overlay_id {
+            eprintln!(
+                "  overlay '{o}' sets: {}",
+                materialized.overlay_contributes.join(", ")
+            );
+        }
+        for w in &materialized.warnings {
+            eprintln!("warning: {w}");
         }
     }
 
@@ -638,10 +690,23 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
             })?),
             None => None,
         };
+        let overlay = match &file.overlay {
+            Some(p) => overlay_choice(Some(p), "stable")?.filter(|c| {
+                matches!(c, crate::templates::OverlayChoice::Inline(_))
+            }).ok_or_else(|| CliError::Config(format!(
+                "template test: overlay '{p}' is not a readable file — a file-based suite applies an overlay file"
+            )))
+            .map(Some)?,
+            None => None,
+        };
         (
             crate::templates::suite::run(
                 &file,
-                Target::Document { body, sink_body },
+                Target::Document {
+                    body,
+                    sink_body,
+                    overlay,
+                },
                 args.filter.as_deref(),
             )
             .await?,
@@ -670,6 +735,20 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
             )),
             None => None,
         };
+        let overlay = match &file.overlay {
+            Some(oid) => Some(crate::templates::OverlayChoice::Registered {
+                id: oid.clone(),
+                version: VersionSelector::Pinned(
+                    crate::templates::suite::resolve_target_version(
+                        &store,
+                        oid,
+                        file.overlay_select.as_deref(),
+                    )
+                    .await?,
+                ),
+            }),
+            None => None,
+        };
         (
             crate::templates::suite::run(
                 &file,
@@ -678,6 +757,7 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
                     id: &file.template,
                     version,
                     sink,
+                    overlay,
                 },
                 args.filter.as_deref(),
             )
@@ -839,6 +919,8 @@ pipeline:
             version: "stable".into(),
             sink: sink.map(str::to_string),
             sink_version: "stable".into(),
+            overlay: None,
+            overlay_version: "stable".into(),
             param: vec![],
             param_env: vec![],
             dry_run,
@@ -873,6 +955,97 @@ pipeline:
         .unwrap_err()
         .to_string();
         assert!(err.contains("not runnable on its own"), "{err}");
+
+        // #679: an overlay file applies to the composed run; an id that is not
+        // registered is the registry's typed error.
+        let overlay = dir.path().join("ops.yaml");
+        std::fs::write(
+            &overlay,
+            "kind: deployment\nname: ops\nstate: { type: memory }\n",
+        )
+        .unwrap();
+        run_template(TemplateRunArgs {
+            overlay: Some(overlay.display().to_string()),
+            ..run_args(Some("local-jsonl"), true)
+        })
+        .await
+        .expect("dry run with an overlay file");
+        let err = run_template(TemplateRunArgs {
+            overlay: Some("not-registered".into()),
+            ..run_args(Some("local-jsonl"), true)
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not-registered"), "{err}");
+    }
+
+    #[test]
+    fn the_register_hint_matches_the_kind() {
+        use crate::hub::TemplateKind::*;
+        assert!(
+            trigger_hint(Pipeline, "p", "memory", "").contains("faucet template run p --store")
+        );
+        assert!(
+            trigger_hint(SourceTemplate, "s", "memory", "")
+                .contains("run s --sink <sink-template>")
+        );
+        assert!(trigger_hint(SinkTemplate, "k", "memory", "").contains("--sink k"));
+        assert!(
+            trigger_hint(Deployment, "d", "memory", " --param x=…")
+                .ends_with("--overlay d --store memory --param x=…")
+        );
+    }
+
+    #[test]
+    fn an_overlay_flag_is_a_file_or_a_registered_id() {
+        assert!(overlay_choice(None, "stable").unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("o.yaml");
+        std::fs::write(&f, "state: { type: memory }\n").unwrap();
+        assert!(matches!(
+            overlay_choice(Some(f.to_str().unwrap()), "stable").unwrap(),
+            Some(crate::templates::OverlayChoice::Inline(v)) if v["state"]["type"] == "memory"
+        ));
+        assert!(matches!(
+            overlay_choice(Some("ops"), "3").unwrap(),
+            Some(crate::templates::OverlayChoice::Registered { id, version: VersionSelector::Pinned(3) }) if id == "ops"
+        ));
+        let bad = dir.path().join("bad.yaml");
+        std::fs::write(&bad, "state: [unclosed\n").unwrap();
+        assert!(overlay_choice(Some(bad.to_str().unwrap()), "stable").is_err());
+        assert!(overlay_choice(Some("ops"), "latest").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_file_suite_applies_an_overlay_file() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let src = repo.join("hub/source-templates/faucet-hq/example-csv.yaml");
+        let sink = repo.join("hub/sink-templates/faucet-hq/sqlite.yaml");
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ops.yaml");
+        std::fs::write(
+            &overlay,
+            "kind: deployment\nname: ops\nstate: { type: memory }\n",
+        )
+        .unwrap();
+        let suite = dir.path().join("suite.yaml");
+        let body = |ov: &str| {
+            format!(
+                "version: 1\ntemplate: {}\nsink: {}\noverlay: {ov}\nsuite:\n  cases:\n    - name: defaults\n      params: {{}}\n",
+                src.display(),
+                sink.display()
+            )
+        };
+        std::fs::write(&suite, body(&overlay.display().to_string())).unwrap();
+        test_suite(test_args(&suite))
+            .await
+            .expect("suite with an overlay passes");
+        std::fs::write(&suite, body("./does-not-exist.yaml")).unwrap();
+        let err = test_suite(test_args(&suite)).await.unwrap_err().to_string();
+        assert!(err.contains("not a readable file"), "{err}");
     }
 
     const BODY: &str = "\
@@ -936,6 +1109,8 @@ pipeline:
             version: "stable".into(),
             sink: None,
             sink_version: "stable".into(),
+            overlay: None,
+            overlay_version: "stable".into(),
             param: vec!["tag=alpha".into()],
             param_env: vec![],
             dry_run: true,
@@ -960,6 +1135,8 @@ pipeline:
             version: "stable".into(),
             sink: None,
             sink_version: "stable".into(),
+            overlay: None,
+            overlay_version: "stable".into(),
             param: vec!["tag=alpha".into()],
             param_env: vec![],
             dry_run: false,
@@ -1406,6 +1583,50 @@ pipeline:
         args.store = Some(store_url);
         // Resolves `stable` through the registry and runs the case.
         test_suite(args).await.expect("registered suite passes");
+    }
+
+    #[tokio::test]
+    async fn a_registered_suite_resolves_its_overlay_through_the_store() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_url = format!("sqlite:{}", dir.path().join("tpl.db").display());
+        let store = crate::templates::resolve_store_url(&store_url)
+            .await
+            .expect("sqlite store");
+        for body in [
+            std::fs::read_to_string(repo.join("hub/source-templates/faucet-hq/example-csv.yaml"))
+                .unwrap(),
+            std::fs::read_to_string(repo.join("hub/sink-templates/faucet-hq/sqlite.yaml")).unwrap(),
+            "kind: deployment\nname: ops\nstate: { type: memory }\n".to_string(),
+        ] {
+            crate::templates::register(
+                &store,
+                crate::templates::RegisterRequest {
+                    id: None,
+                    body,
+                    format: ConfigFormat::Yaml,
+                    description: None,
+                    tags: Vec::new(),
+                    launch: true,
+                    created_by: None,
+                },
+            )
+            .await
+            .expect("register");
+        }
+        let suite = dir.path().join("suite.yaml");
+        std::fs::write(
+            &suite,
+            "version: 1\ntemplate: faucet-hq/example-csv\nsink: faucet-hq/sqlite\noverlay: ops\noverlay_select: stable\nsuite:\n  cases:\n    - name: defaults\n      params: {}\n",
+        )
+        .expect("write suite");
+        let mut args = test_args(&suite);
+        args.store = Some(store_url);
+        test_suite(args)
+            .await
+            .expect("registered suite with an overlay passes");
     }
 
     /// The dispatcher arm itself — `faucet template test` reaches

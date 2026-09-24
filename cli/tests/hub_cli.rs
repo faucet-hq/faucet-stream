@@ -443,3 +443,79 @@ async fn shipped_example_pairing_runs_twice_against_a_fresh_database() {
         pool.close().await;
     }
 }
+
+/// #679: a deployment overlay supplies the operational blocks neither template
+/// owns. Here it gives the composed run a file state store and a per-stream
+/// SLA, and the SLA history lands in that store — proof the overlay reached
+/// the real run path, not just the printed plan.
+#[cfg(all(feature = "source-csv", feature = "sink-sqlite"))]
+#[tokio::test]
+async fn a_deployment_overlay_reaches_the_composed_run() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let hub = repo.join("hub");
+    let data = hub.join("examples/data");
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let overlay = dir.path().join("ops.yaml");
+    std::fs::write(
+        &overlay,
+        format!(
+            "kind: deployment\nname: ops\nstate: {{ type: file, config: {{ path: \"{}\" }} }}\nstreams:\n  orders: {{ sla: {{ min_rows_per_run: 1 }} }}\n",
+            state.display()
+        ),
+    )
+    .unwrap();
+    let args = |verb: &'static str| {
+        vec![
+            verb.to_string(),
+            "--source".into(),
+            "faucet-hq/example-csv".into(),
+            "--sink".into(),
+            "faucet-hq/sqlite".into(),
+            "--overlay".into(),
+            overlay.display().to_string(),
+            "--hub".into(),
+            hub.display().to_string(),
+            "--no-env-file".into(),
+            "--param".into(),
+            format!("data_dir={}", data.display()),
+            "--param".into(),
+            format!("sqlite_path={}", dir.path().join("o.db").display()),
+        ]
+    };
+    let validate = args("validate");
+    run(&validate.iter().map(String::as_str).collect::<Vec<_>>())
+        .await
+        .expect("validate --overlay");
+    let mut run_args = args("run");
+    run_args.push("--quiet".into());
+    run(&run_args.iter().map(String::as_str).collect::<Vec<_>>())
+        .await
+        .expect("run --overlay");
+    let written: Vec<String> = std::fs::read_dir(&state)
+        .expect("the overlay's state store was used")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        written
+            .iter()
+            .any(|f| f.contains("orders") && f.contains("__sla__")),
+        "per-stream SLA history in the overlay's store: {written:?}"
+    );
+    assert!(
+        !written
+            .iter()
+            .any(|f| f.contains("customers") && f.contains("__sla__")),
+        "only the stream the overlay gave an SLA: {written:?}"
+    );
+
+    // A deployment file handed to `run` as a config says how to apply it.
+    let err = run(&["run", overlay.to_str().unwrap(), "--no-env-file"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("deployment overlay") && err.contains("--overlay"),
+        "{err}"
+    );
+}

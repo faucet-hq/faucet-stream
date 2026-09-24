@@ -33,6 +33,10 @@ pub enum TemplateKind {
     SourceTemplate,
     SinkTemplate,
     Pipeline,
+    /// The operational half of a composed run (#679): state, DLQ,
+    /// notifications, SLA and delivery policy, applied over a source × sink
+    /// composition. Never runnable on its own.
+    Deployment,
 }
 
 impl TemplateKind {
@@ -41,6 +45,7 @@ impl TemplateKind {
             Self::SourceTemplate => "source-template",
             Self::SinkTemplate => "sink-template",
             Self::Pipeline => "pipeline",
+            Self::Deployment => "deployment",
         }
     }
 
@@ -50,6 +55,7 @@ impl TemplateKind {
             "source-template" => Some(Self::SourceTemplate),
             "sink-template" => Some(Self::SinkTemplate),
             "pipeline" => Some(Self::Pipeline),
+            "deployment" => Some(Self::Deployment),
             _ => None,
         }
     }
@@ -589,6 +595,218 @@ pub fn parse_mode(name: &str) -> Option<WriteMode> {
     serde_json::from_value(Value::String(name.to_string())).ok()
 }
 
+/// The keys a deployment overlay may set (#679), besides its own metadata.
+/// Everything here is operational: none of it changes which connectors run or
+/// what the streams produce, so a composed run's shape is fixed by its two
+/// templates and the overlay only decides how it is operated.
+pub const DEPLOYMENT_BLOCKS: &[&str] = &[
+    "state",
+    "dlq",
+    "notifications",
+    "sla",
+    "resilience",
+    "execution",
+    "delivery",
+    "schedule",
+];
+
+/// Per-stream operational overrides in a deployment overlay.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOverlay {
+    /// Replaces the deployment's `sla:` for this stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sla: Option<Value>,
+    /// Replaces the deployment's `dlq:` for this stream; `null` turns it off.
+    #[serde(
+        default,
+        deserialize_with = "present_or_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dlq: Option<Option<Value>>,
+    /// Replaces the deployment's `delivery:` for this stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Value>,
+}
+
+/// Keep an explicit `null` distinct from an absent key: `Some(None)` vs `None`.
+fn present_or_null<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<Value>>, D::Error> {
+    Ok(Some(Option::<Value>::deserialize(d)?))
+}
+
+impl StreamOverlay {
+    fn is_empty(&self) -> bool {
+        self.sla.is_none() && self.dlq.is_none() && self.delivery.is_none()
+    }
+}
+
+/// A `kind: deployment` overlay (#679): the blocks that belong to neither the
+/// source template (published for everyone, so it cannot name *your* state
+/// store) nor the sink template (a destination, not an operations policy),
+/// applied last over a composition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentTemplate {
+    /// Must be `deployment`.
+    pub kind: TemplateKind,
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Parameters the operational blocks reference (a state-store DSN, a
+    /// webhook URL). Merged with the templates' parameters; a name declared on
+    /// both sides must be declared identically.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: ParamsSpec,
+    /// → `pipeline.state` of the composed run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Value>,
+    /// → `pipeline.dlq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq: Option<Value>,
+    /// → top-level `notifications`.
+    #[serde(default, alias = "notify", skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<Value>,
+    /// → top-level `sla`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sla: Option<Value>,
+    /// → top-level `resilience`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resilience: Option<Value>,
+    /// → top-level `execution`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Value>,
+    /// → top-level `delivery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Value>,
+    /// → top-level `schedule` (read by `faucet schedule`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Value>,
+    /// Per-stream overrides, keyed by the source template's stream name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub streams: BTreeMap<String, StreamOverlay>,
+}
+
+impl DeploymentTemplate {
+    /// `owner/name`, or `name` for an unscoped overlay.
+    pub fn id(&self) -> String {
+        hub_id(self.owner.as_deref(), &self.name)
+    }
+
+    /// Parse an untyped document, explaining a refused key in terms of what an
+    /// overlay may set rather than serde's bare "unknown field".
+    pub fn from_value(value: Value) -> CliResult<Self> {
+        if let Some(obj) = value.as_object() {
+            const META: &[&str] = &[
+                "kind",
+                "version",
+                "name",
+                "owner",
+                "description",
+                "tags",
+                "params",
+                "streams",
+                "notify",
+            ];
+            let refused: Vec<&str> = obj
+                .keys()
+                .map(String::as_str)
+                .filter(|k| !META.contains(k) && !DEPLOYMENT_BLOCKS.contains(k))
+                .collect();
+            if !refused.is_empty() {
+                return Err(CliError::Config(format!(
+                    "deployment overlay: `{}` cannot be set here — an overlay decides how a composed run is operated, never which connectors run or what the streams produce. It may set: {} (and per-stream `sla` / `dlq` / `delivery` under `streams:`)",
+                    refused.join("`, `"),
+                    DEPLOYMENT_BLOCKS.join(", ")
+                )));
+            }
+        }
+        let t: Self = serde_json::from_value(value)
+            .map_err(|e| CliError::Config(format!("deployment overlay: {e}")))?;
+        t.validate()?;
+        Ok(t)
+    }
+
+    pub fn validate(&self) -> CliResult<()> {
+        if self.kind != TemplateKind::Deployment {
+            return Err(CliError::Config(format!(
+                "'{}' is a {}, not a deployment",
+                self.name,
+                self.kind.as_str()
+            )));
+        }
+        if self.version != 1 {
+            return Err(CliError::Config(format!(
+                "deployment '{}': unsupported version {} (expected 1)",
+                self.name, self.version
+            )));
+        }
+        check_slug("deployment name", &self.name, true)?;
+        if let Some(o) = &self.owner {
+            check_slug("deployment owner", o, true)?;
+        }
+        crate::params::spec::validate(&self.params)?;
+        for (name, o) in &self.streams {
+            check_slug("deployment stream", name, false)?;
+            if o.is_empty() {
+                return Err(CliError::Config(format!(
+                    "deployment '{}': `streams.{name}` overrides nothing — set `sla`, `dlq`, or `delivery`, or drop the entry",
+                    self.name
+                )));
+            }
+        }
+        let mut refs = Vec::new();
+        for (_, v) in self.blocks() {
+            param_refs(v, &mut refs);
+        }
+        for o in self.streams.values() {
+            for v in [
+                o.sla.as_ref(),
+                o.dlq.as_ref().and_then(Option::as_ref),
+                o.delivery.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                param_refs(v, &mut refs);
+            }
+        }
+        for r in refs {
+            if !self.params.contains_key(&r) {
+                return Err(CliError::Config(format!(
+                    "deployment '{}': `${{param.{r}}}` is referenced but not declared under `params:`",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The top-level operational blocks this overlay sets, by config key.
+    pub fn blocks(&self) -> Vec<(&'static str, &Value)> {
+        [
+            ("state", &self.state),
+            ("dlq", &self.dlq),
+            ("notifications", &self.notifications),
+            ("sla", &self.sla),
+            ("resilience", &self.resilience),
+            ("execution", &self.execution),
+            ("delivery", &self.delivery),
+            ("schedule", &self.schedule),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+        .collect()
+    }
+}
+
 impl SinkTemplate {
     /// The alias table with parsed keys (validated by [`Self::validate`]).
     pub fn aliases(&self) -> Vec<(WriteMode, WriteMode)> {
@@ -854,5 +1072,78 @@ per_stream:
         );
         assert_eq!(WriteChoice::default().candidates(), vec![WriteMode::Append]);
         assert!(serde_yaml::from_str::<WriteChoice>("truncate").is_err());
+    }
+
+    #[test]
+    fn a_deployment_overlay_parses_and_refuses_shape_changing_keys() {
+        let v: Value = serde_yaml::from_str(
+            "kind: deployment\nname: prod\nstate: { type: memory }\nnotify: []\n",
+        )
+        .unwrap();
+        let d = DeploymentTemplate::from_value(v).unwrap();
+        assert_eq!(d.id(), "prod");
+        assert_eq!(
+            d.blocks().iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec!["state", "notifications"]
+        );
+        for bad in [
+            "pipeline: {}",
+            "matrix: []",
+            "source: {}",
+            "sink: {}",
+            "transforms: []",
+        ] {
+            let v: Value =
+                serde_yaml::from_str(&format!("kind: deployment\nname: x\n{bad}\n")).unwrap();
+            let err = DeploymentTemplate::from_value(v).unwrap_err().to_string();
+            assert!(
+                err.contains("cannot be set here") && err.contains("state, dlq"),
+                "{err}"
+            );
+        }
+        let owned: Value =
+            serde_yaml::from_str("kind: deployment\nname: x\nowner: acme\nsla: {}\n").unwrap();
+        assert_eq!(
+            DeploymentTemplate::from_value(owned).unwrap().id(),
+            "acme/x"
+        );
+    }
+
+    #[test]
+    fn deployment_validation_rules() {
+        let parse = |y: &str| {
+            DeploymentTemplate::from_value(serde_yaml::from_str::<Value>(y).unwrap())
+                .map(|_| ())
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(parse("kind: source-template\nname: x\n").contains("not a deployment"));
+        assert!(parse("kind: deployment\nversion: 2\nname: x\n").contains("unsupported version"));
+        assert!(parse("kind: deployment\nname: Bad\n").contains("deployment name"));
+        assert!(parse("kind: deployment\nname: x\nowner: Bad\n").contains("deployment owner"));
+        assert!(
+            parse("kind: deployment\nname: x\nstreams:\n  s: {}\n").contains("overrides nothing")
+        );
+        assert!(
+            parse("kind: deployment\nname: x\nstreams:\n  Bad: { delivery: at_least_once }\n")
+                .contains("deployment stream")
+        );
+        assert!(
+            parse("kind: deployment\nname: x\nstreams:\n  s: { sla: { x: \"${param.p}\" } }\n")
+                .contains("`${param.p}` is referenced but not declared")
+        );
+        assert!(
+            parse("kind: deployment\nname: x\nstate: { url: \"${param.dsn}\" }\n")
+                .contains("param.dsn")
+        );
+        assert!(
+            parse("kind: deployment\nname: x\nstreams:\n  s: { bogus: 1 }\n").contains("bogus")
+        );
+        assert_eq!(
+            TemplateKind::parse("deployment"),
+            Some(TemplateKind::Deployment)
+        );
+        assert_eq!(TemplateKind::Deployment.to_string(), "deployment");
+        assert!(!TemplateKind::Deployment.is_hub());
     }
 }

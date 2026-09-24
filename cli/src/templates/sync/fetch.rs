@@ -185,7 +185,11 @@ pub fn apply_catalog_index(templates: &mut [RemoteTemplate], index: &crate::hub:
             let Some(head) = e.newest_version() else {
                 continue;
             };
-            if let Some(v) = e.versions.iter().find(|v| v.version == head && v.deprecated) {
+            if let Some(v) = e
+                .versions
+                .iter()
+                .find(|v| v.version == head && v.deprecated)
+            {
                 let why = v.reason.clone().unwrap_or_else(|| "no reason given".into());
                 t.retired = Some(format!("catalog v{head} is deprecated: {why}"));
             }
@@ -367,7 +371,11 @@ impl Fetcher for GithubFetcher {
             self.cfg.r#ref
         );
         let resp = self
-            .request(reqwest::Method::GET, &url, "application/vnd.github.raw+json")
+            .request(
+                reqwest::Method::GET,
+                &url,
+                "application/vnd.github.raw+json",
+            )
             .send()
             .await
             .map_err(|e| io_err("github", format!("reading index.json: {e}")))?;
@@ -971,7 +979,10 @@ mod tests {
             ts[0].retired.as_deref(),
             Some("catalog v3 is deprecated: drops invoices")
         );
-        assert!(ts[1].retired.is_none(), "only an older version is deprecated");
+        assert!(
+            ts[1].retired.is_none(),
+            "only an older version is deprecated"
+        );
         assert_eq!(
             ts[2].retired.as_deref(),
             Some("catalog v1 is deprecated: no reason given")
@@ -1000,7 +1011,8 @@ mod tests {
             token: None,
             api_base: server.uri(),
         };
-        let catalog = GithubFetcher::new(&src(vec!["source-templates".into()], "acme/hub")).unwrap();
+        let catalog =
+            GithubFetcher::new(&src(vec!["source-templates".into()], "acme/hub")).unwrap();
         let idx = catalog.catalog_index().await.unwrap().expect("an index");
         assert_eq!(idx.sources[0].id, "acme/erp");
         // A plain `path:` origin is not a catalog: no request is made.

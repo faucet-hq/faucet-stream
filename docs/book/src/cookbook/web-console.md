@@ -110,7 +110,8 @@ the browser.
 When the server is built with the `templates` feature, a **Templates** view browses
 the [template registry](./templates.md) in the `--history` backend. Every row
 carries a **kind** pill — `source` (a system and its streams), `sink` (a
-destination), or `pipeline` (a complete config) — beside its lifecycle status
+destination), `deployment` (the operational blocks — state, DLQ, notifications,
+SLA — applied over a composed run), or `pipeline` (a complete config) — beside its lifecycle status
 (`draft` / `launched` / `deprecated`), which version is live, the build tip, and
 its parameter count. Chips filter by status and by kind (deprecated templates are
 hidden until their chip is toggled on). As soon as the registry holds a source
@@ -119,7 +120,7 @@ one row per source, one column per sink, ✓ where every stream has a write mode
 the sink supports (the tooltip lists the per-stream plan); clicking a cell opens
 the source's page with that sink preselected in its trigger form:
 
-![The Templates view: a Compatibility grid (two source templates × two sink templates, all ✓) above the list of source, sink and pipeline templates, each with a kind pill, its live and newest version, and the status / kind filter chips](../assets/console/templates.png)
+![The Templates view: a Compatibility grid (the example-csv source template × the jsonl and sqlite sink templates, both ✓) above the list of deployment, source, sink and pipeline templates, each with a kind pill, its live and newest version, and the status / kind filter chips](../assets/console/templates.png)
 
 Clicking one opens its **versions page** — the release console for that template:
 
@@ -139,10 +140,13 @@ Clicking one opens its **versions page** — the release console for that templa
 A **source template**'s page adds a **sink template** selector (plus its version
 channel) to the trigger form: the chosen sink's params join the form, tagged
 `sink`, and the run composes the two at submit time — the same source can be
-sent to BigQuery today and Postgres tomorrow from one page. A **sink template**'s
-page has no trigger form; it lists the source templates it can be composed with.
+sent to BigQuery today and Postgres tomorrow from one page. A **deployment**
+selector applies a registered [deployment overlay](./template-hub.md#deployment-overlays)
+to the run; its params join the form tagged `deployment`. A **sink template**'s
+or **deployment**'s page has no trigger form; it lists the source templates it
+can be used with.
 
-![The versions page for the example-csv source template: the trigger form with a sink-template dropdown and sink version beside the source's own params, the sink's param tagged](../assets/console/template-source-detail.png)
+![The versions page for the example-csv source template: the trigger form with a sink-template dropdown, sink version and deployment selector beside the source's own params, the sink's param tagged](../assets/console/template-source-detail.png)
 
 When the server was started with `--templates-sync`, the Templates page also
 shows **Sync from origins**: the configured remote origins (repo or bucket,

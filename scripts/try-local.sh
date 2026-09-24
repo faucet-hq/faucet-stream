@@ -193,6 +193,11 @@ launch_ui() {
           curl -s -o /dev/null -X POST "${base}/v1/templates" \
             -H 'content-type: application/json' -d "$body"
         done
+        # A deployment overlay (#679): the operational blocks a composed run
+        # gets from neither template — here file-backed bookmarks and an SLA.
+        body="$(python3 -c 'import json;print(json.dumps({"config":"kind: deployment\nname: demo-ops\ndescription: File-backed bookmarks and a row-count SLA for composed demo runs\nparams:\n  state_dir: { type: string, default: ./state, description: \"Where bookmarks live\" }\nstate: { type: file, config: { path: \"${param.state_dir}\" } }\nsla: { min_rows_per_run: 1 }\n","launch":True}))')"
+        curl -s -o /dev/null -X POST "${base}/v1/templates" \
+          -H 'content-type: application/json' -d "$body"
       fi
     fi
   else
@@ -921,6 +926,23 @@ if [ "$HAVE_TEMPLATES" -eq 1 ]; then
     step "template run source × sink (composed at run time)" \
       "$FAUCET" template run faucet-hq/example-csv --store "$TPL_STORE" --sink faucet-hq/jsonl \
         --param data_dir="${REPO_ROOT}/hub/examples/data" --param out_dir=./out/hub
+    # A deployment overlay (#679): state + SLA for a composed run, owned by
+    # neither template.
+    cat > 24_demo_ops.yaml <<'YAML'
+kind: deployment
+name: demo-ops
+description: File-backed bookmarks and a row-count SLA for composed demo runs
+params:
+  state_dir: { type: string, default: ./state, description: "Where bookmarks live" }
+state: { type: file, config: { path: "${param.state_dir}" } }
+sla: { min_rows_per_run: 1 }
+YAML
+    step "template register a deployment overlay (demo-ops)" \
+      "$FAUCET" template register 24_demo_ops.yaml --store "$TPL_STORE" --launch
+    step "template run source × sink + deployment overlay" \
+      "$FAUCET" template run faucet-hq/example-csv --store "$TPL_STORE" --sink faucet-hq/jsonl \
+        --overlay demo-ops --param data_dir="${REPO_ROOT}/hub/examples/data" \
+        --param out_dir=./out/hub --param state_dir=./state/demo-ops
   fi
 else
   info "Skipping the template registry (built without the \`templates\` feature)."

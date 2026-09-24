@@ -89,7 +89,16 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
 
     let cfg = if let Some((source, sink)) = hub_pair {
         let hub_dir = crate::hub::resolve_hub(args.hub.as_deref()).await?;
-        let composition = crate::hub::compose_locators(&source, &sink, &hub_dir).await?;
+        let composition = crate::hub::compose_locators_overlaid(
+            &source,
+            &sink,
+            args.overlay.as_deref(),
+            &hub_dir,
+        )
+        .await?;
+        for w in &composition.warnings {
+            eprintln!("warning: {w}");
+        }
         let inputs = crate::config::RunInputs {
             params: crate::params::collect_cli_params(&args.param)?,
             env: crate::params::collect_env_overrides(&args.param_env)?
@@ -130,12 +139,8 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
             .expect("YAML mode always resolves a path above");
         // A hub template handed to `run` directly would fail on `kind:` as an
         // unknown field; say what it is and how to run it instead.
-        if let Some(kind) = crate::hub::detect_kind_in_file(path).filter(|k| k.is_hub()) {
-            return Err(CliError::Config(format!(
-                "{} is a hub {} — compose it: `faucet run --source <source-template> --sink <sink-template>`",
-                path.display(),
-                kind.as_str()
-            )));
+        if let Some(msg) = crate::hub::misplaced_document(path, "run") {
+            return Err(CliError::Config(msg));
         }
         PipelineConfig::from_path_async_with(path, args.profile.as_deref(), &inputs).await?
     };

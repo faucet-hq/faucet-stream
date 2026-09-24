@@ -79,6 +79,7 @@ Flags:
 | `--param <NAME=VALUE>` | Supply a value for a declared [`params:`](config.md#params) entry. Repeatable; coerced to the declared type. A `required` param with no value is an error naming it. |
 | `--param-env <NAME[=VALUE]>` | Override an environment variable for this run's `${env:VAR}` resolution only. Bare `NAME` takes the value from the caller's environment (so a secret stays out of the process arguments). The process environment is not modified. Repeatable. |
 | `--source <id\|path> --sink <id\|path>` | Template Hub: compose a `source-template` with a `sink-template` and run the result instead of loading a config file. Ids resolve under `--hub` / `$FAUCET_HUB` / `./hub`. See [`hub`](#hub). |
+| `--overlay <id\|path>` | With `--source` / `--sink`: apply a `kind: deployment` overlay — state, DLQ, notifications, SLA and other operational blocks — over the composition. A path, or an id under `<hub>/deployments/`. See [Deployment overlays](../cookbook/template-hub.md#deployment-overlays). |
 | `--tui` | Show a live full-screen terminal UI while the pipeline runs: per-invocation source→sink route, records in/out, records/s, errors, DLQ counts, bookmark age, and a scrolling log pane. Press `q` (or `Ctrl-C`) to cancel cooperatively — in-flight invocations stop at their next page boundary and flush their sinks. Requires a binary built with the `cli-tui` feature (`cargo install faucet-cli --features cli-tui`); on a non-TTY stdout (CI, pipes) the flag logs a notice and runs normally. When the config has an `observability.prometheus` block, the `/metrics` endpoint stays up alongside the TUI; OTLP *metrics* export is skipped under `--tui` (traces are unaffected). |
 | `--quiet` | Suppress the inline live progress line. |
 
@@ -663,6 +664,7 @@ faucet template register  tenant-sync.yaml --id tenant-sync --tag dev --descript
 faucet template register  tenant-sync.yaml --launch            # register AND make live
 faucet template register  hub/source-templates/acme/billing.yaml --launch   # kind: source-template → id = its hub id
 faucet template register  hub/sink-templates/faucet-hq/bigquery.yaml --launch         # kind: sink-template
+faucet template register  ops/prod.yaml --launch               # kind: deployment
 faucet template list      --store sqlite:./faucet-templates.db
 faucet template list      --kind sink-template                  # one kind only
 faucet template show      tenant-sync --store sqlite:./faucet-templates.db --version 2
@@ -674,6 +676,8 @@ faucet template run       tenant-sync --store sqlite:./faucet-templates.db \
   --version prod --param tenant_id=acme --param-env API_HOST=eu.example.com
 faucet template run       acme/billing --sink faucet-hq/bigquery --sink-version stable \
   --param api_token="$TOKEN" --param bq_project=my-project    # source × sink, composed at run time
+faucet template run       acme/billing --sink faucet-hq/bigquery --overlay prod \
+  --param state_dsn="$STATE_DSN"                              # + a deployment overlay
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
 faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
@@ -683,10 +687,12 @@ faucet template publish   platform-nightly --store sqlite:./faucet-templates.db 
 ```
 
 Register a template **once**, then trigger runs by id — the register-once /
-trigger-by-id model. The registry holds three kinds of document, told apart by
+trigger-by-id model. The registry holds four kinds of document, told apart by
 their `kind:` line: a **`source-template`** (one system — connector, shared
 transforms, streams with write preferences), a **`sink-template`** (one
-destination), and a complete **`pipeline`**. A source template is run with
+destination), a **`deployment`** (the operational blocks — state, DLQ,
+notifications, SLA — overlaid on a composed run with `--overlay`), and a
+complete **`pipeline`**. A source template is run with
 `--sink <id>` and composes with that registered sink template at run time (the
 [Template Hub](../cookbook/template-hub.md) model); a pipeline runs alone; a sink
 template is never run on its own. A document without `kind:` still registers
@@ -697,9 +703,11 @@ as a pipeline but prints a deprecation notice — add `kind: pipeline`. See the
 |------|---------|
 | `--store <url>` | Registry location: `sqlite:<path>`, a `postgres://…` URL, or `memory`. Same grammar as `catalog.url` and `faucet serve --history` — point `serve` at the same URL to trigger these templates over HTTP/MCP. Env: `FAUCET_TEMPLATE_STORE`. SQL stores need `serve-history-sqlite` / `serve-history-postgres`. |
 | `--id <slug>` | *(register)* Registry id (`^[a-z0-9][a-z0-9_-]*$`). Derived from the config's `name:` when omitted. A source / sink template is always registered under its own `name` — an explicit `--id` must match it. |
-| `--kind <source-template\|sink-template\|pipeline>` | *(list)* Show only templates of one kind. `list` prints a KIND column either way. |
+| `--kind <source-template\|sink-template\|deployment\|pipeline>` | *(list)* Show only templates of one kind. `list` prints a KIND column either way. |
 | `--sink <id>` | *(run)* For a source template: the registered sink template to compose with. Required for a source template; refused for a pipeline. |
 | `--sink-version <n\|channel>` | *(run)* Version of the sink template. Default `stable`. |
+| `--overlay <id\|path>` | *(run)* A deployment overlay for the composed run: a registered `kind: deployment` id, or a path to a deployment file. |
+| `--overlay-version <n\|channel>` | *(run)* Version of a registered overlay. Default `stable`. |
 | `--description <text>` | *(register)* Shown by `list` / `show`. Carried forward from the previous version when omitted. |
 | `--launch` | *(register)* Launch the new version immediately, making it `stable`. Off by default — registering a build must never move existing callers. |
 | `--tag <channel>` | *(register)* Point an assignable channel at the new version; repeatable. *(promote)* The channel to move. One of the closed set: `dev`, `test`, `staging`, `pre-prod`, `canary`, `prod`. The derived channels (`stable`, `previous`, `newest`) cannot be assigned — `stable` moves only via `launch`. |
@@ -766,13 +774,13 @@ before it is ever registered. The exit code is the failed-case count, mirroring
 
 ```bash
 faucet hub list      [--hub ./hub] [--sort name|stars|updated] [--json]
-faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigquery   # per-stream write modes; exit≠0 if incompatible
-faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite --out my-pipeline.yaml
+faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--overlay ops/prod.yaml]  # per-stream write modes; exit≠0 if incompatible
+faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite [--overlay ops/prod.yaml] --out my-pipeline.yaml
 faucet hub matrix    --format table|markdown|json [--out FILE]
 faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint
 faucet run           --source faucet-hq/example-csv --sink faucet-hq/jsonl                   # runs offline
 faucet validate      --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--show-composed]
-faucet schema source-template | sink-template
+faucet schema source-template | sink-template | deployment
 ```
 
 The Template Hub composes a `kind: source-template` (one system, its shaping,
@@ -786,6 +794,7 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 | `--source <id\|path>` / `--sink <id\|path>` | The pairing. A path is used as-is; an id resolves to `<hub>/source-templates/<id>.yaml` / `<hub>/sink-templates/<id>.yaml`, where `id` is `owner/name` (a community template under `source-templates/<owner>/`) or a bare `name` (shorthand for the official `faucet-hq/name`). An optional `@stable` (default) / `@newest` / `@N` selects a catalog version when the hub's `index.json` records history. |
 | `--hub <dir\|github:owner/repo[@ref][/path]\|URL>` | Where ids resolve. A directory, or a GitHub repository laid out like `hub/` (`github:faucet-hq/template-hub`, `github:acme/catalog@v2/hub`, `https://github.com/acme/catalog/tree/main/hub`), fetched through the GitHub contents API and cached under `~/.cache/faucet/hub/` pinned to the ref's commit — one request per run when unchanged, the cached snapshot with a warning when offline (`FAUCET_HUB_OFFLINE=1` skips the network). `GITHUB_TOKEN` is used when set. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the public hub `github:faucet-hq/template-hub`. |
 | `--sort name\|stars\|updated` | *(list)* Order by id, by stars (most starred first), or by the newest version's date. Stars, dates and open issues come from the catalog's `index.json` (`trust`) and are shown as columns; `--json` includes each entry's `trust` block. |
+| `--overlay <id\|path>` | *(compose / check, and `run` / `validate`)* A `kind: deployment` overlay applied over the pairing: a path, or an id under `<hub>/deployments/`. `check` also verifies every stream it names exists; `lint` accepts deployment files and flags literal credentials. |
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
 | `--format table\|markdown\|json` | *(matrix)* Terminal table, the docs page, or `index.json`. |
 | `--json` | Machine-readable output. |

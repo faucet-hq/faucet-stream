@@ -28,6 +28,7 @@
   --brand-ring: rgba(20, 184, 166, 0.35);
 
   --ok: #0e9f6e;
+  --overlay: #7c3aed;
   --fail: #e02424;
   --queued: #c2700b;
   --cancelled: #64748b;
@@ -71,6 +72,7 @@
   --brand-ring: rgba(45, 212, 191, 0.40);
 
   --ok: #34d399;
+  --overlay: #a78bfa;
   --fail: #f87171;
   --queued: #fbbf24;
   --cancelled: #94a3b8;
@@ -104,6 +106,7 @@
     --brand-tint: rgba(45, 212, 191, 0.12);
     --brand-ring: rgba(45, 212, 191, 0.40);
     --ok: #34d399;
+    --overlay: #a78bfa;
     --fail: #f87171;
     --queued: #fbbf24;
     --cancelled: #94a3b8;
@@ -1209,7 +1212,8 @@ select {
 .tpl-kind-source-template { color: var(--running);   border-color: color-mix(in srgb, var(--running) 45%, transparent);   background: color-mix(in srgb, var(--running) 12%, transparent); }
 .tpl-kind-sink-template   { color: var(--queued);    border-color: color-mix(in srgb, var(--queued) 45%, transparent);    background: color-mix(in srgb, var(--queued) 12%, transparent); }
 .tpl-kind-pipeline        { color: var(--ink-dim);   border-color: var(--border-strong);                                    background: var(--surface-2); }
-.tpl-kind-source-template::before, .tpl-kind-sink-template::before, .tpl-kind-pipeline::before { display: none; }
+.tpl-kind-deployment      { color: var(--overlay);   border-color: color-mix(in srgb, var(--overlay) 45%, transparent);   background: color-mix(in srgb, var(--overlay) 12%, transparent); }
+.tpl-kind-source-template::before, .tpl-kind-sink-template::before, .tpl-kind-pipeline::before, .tpl-kind-deployment::before { display: none; }
 .tpl-row-id b { font-weight: 600; font-size: 0.95rem; }
 .tpl-row-desc {
   font-size: 0.8rem;

@@ -247,7 +247,7 @@ pub async fn template_matrix(State(state): State<ServerState>) -> Result<Json<Va
                 })?;
                 sinks.push((path, k));
             }
-            crate::hub::TemplateKind::Pipeline => {}
+            crate::hub::TemplateKind::Pipeline | crate::hub::TemplateKind::Deployment => {}
         }
     }
     sources.sort_by(|a, b| a.1.name.cmp(&b.1.name));
@@ -592,6 +592,14 @@ pub struct TriggerBody {
     /// Version of the sink template (a number or a channel). Default `stable`.
     #[serde(default)]
     pub sink_version: Option<VersionSelector>,
+    /// Deployment overlay for a composed run (#679): a registered
+    /// `kind: deployment` id, or an inline mapping of operational blocks
+    /// (`state`, `dlq`, `notifications`, `sla`, …).
+    #[serde(default)]
+    pub overlay: Option<OverlayRef>,
+    /// Version of a registered overlay. Default `stable`.
+    #[serde(default)]
+    pub overlay_version: Option<VersionSelector>,
     /// Version to run: a number, or a named channel (`"latest"` — the default
     /// when omitted — `"prod"`, `"pre-prod"`, `"dev"`, …).
     #[serde(default)]
@@ -631,6 +639,26 @@ pub struct TriggerBody {
     pub callback: Option<crate::serve::callback::CallbackSpec>,
 }
 
+/// A trigger's `overlay`: a registered deployment id, or an inline document.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum OverlayRef {
+    Id(String),
+    Inline(Value),
+}
+
+impl TriggerBody {
+    fn overlay_choice(&self) -> Option<crate::templates::OverlayChoice> {
+        self.overlay.as_ref().map(|o| match o {
+            OverlayRef::Id(id) => crate::templates::OverlayChoice::Registered {
+                id: id.clone(),
+                version: self.overlay_version.unwrap_or_default(),
+            },
+            OverlayRef::Inline(v) => crate::templates::OverlayChoice::Inline(v.clone()),
+        })
+    }
+}
+
 /// `POST /v1/templates/{id}/runs` success body (202): the ordinary submit
 /// response plus which template version produced it and the (redacted) params
 /// it was bound with.
@@ -648,6 +676,17 @@ pub struct TriggerResponse {
     /// Per-stream write-mode resolution of a composed run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub streams: Vec<crate::hub::compose::StreamPlan>,
+    /// The deployment overlay applied (a registered id, or `inline`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_version: Option<u32>,
+    /// What the overlay set (`pipeline.state`, `matrix.orders.dlq`, …).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overlay_contributes: Vec<String>,
+    /// Warnings about the composed run (e.g. incremental streams with no state).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Bound params with every `secret: true` value replaced by `"***"`.
     pub params: BTreeMap<String, Value>,
     /// Present only when the template is deprecated — the run still started, but
@@ -662,15 +701,18 @@ const LABEL_TEMPLATE: &str = "template";
 const LABEL_TEMPLATE_VERSION: &str = "template_version";
 const LABEL_SINK_TEMPLATE: &str = "sink_template";
 const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
+const LABEL_OVERLAY: &str = "overlay";
+const LABEL_OVERLAY_VERSION: &str = "overlay_version";
 
 /// `POST /v1/templates/{id}/runs` → 202 / 404 / 422 / 429.
 pub async fn trigger_template(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
-    Json(body): Json<TriggerBody>,
+    Json(mut body): Json<TriggerBody>,
 ) -> Result<(StatusCode, Json<TriggerResponse>), ServeError> {
-    let supplied: SuppliedParams = body.params.into_iter().collect();
+    let overlay = body.overlay_choice();
+    let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
     // Resolve through the registry: a channel needs a lookup, and an unpinned
     // request means `stable` — the *launched* version, never "the newest build".
     let s = store(&state);
@@ -710,6 +752,7 @@ pub async fn trigger_template(
     let sink = crate::templates::SinkChoice {
         id: body.sink.clone(),
         version: body.sink_version.unwrap_or_default(),
+        overlay,
     };
     if let Some(sink_id) = &sink.id {
         let sink_state = crate::templates::template_state(&s, sink_id)
@@ -757,6 +800,12 @@ pub async fn trigger_template(
         labels.insert(LABEL_SINK_TEMPLATE.into(), sid.clone());
         labels.insert(LABEL_SINK_TEMPLATE_VERSION.into(), sv.to_string());
     }
+    if let Some(oid) = &materialized.overlay_id {
+        labels.insert(LABEL_OVERLAY.into(), oid.clone());
+        if let Some(ov) = materialized.overlay_version {
+            labels.insert(LABEL_OVERLAY_VERSION.into(), ov.to_string());
+        }
+    }
 
     let req = SubmitRequest {
         config: materialized.body.clone(),
@@ -792,6 +841,10 @@ pub async fn trigger_template(
             sink_template: materialized.sink_id,
             sink_template_version: materialized.sink_version,
             streams: materialized.streams,
+            overlay: materialized.overlay_id,
+            overlay_version: materialized.overlay_version,
+            overlay_contributes: materialized.overlay_contributes,
+            warnings: materialized.warnings,
             params: materialized.params_redacted,
             deprecated: (tstate.status
                 == crate::serve::history::templates::TemplateStatus::Deprecated)
@@ -1112,6 +1165,75 @@ write_mode_aliases:
         assert_eq!(rec.labels[LABEL_SINK_TEMPLATE], "local-jsonl");
         assert_eq!(rec.labels[LABEL_SINK_TEMPLATE_VERSION], "1");
         assert_eq!(rec.name.as_deref(), Some("acme-exports"));
+
+        // #679: a registered deployment overlay and an inline one both apply,
+        // stamp provenance labels, and report what they set.
+        register_body(
+            &state,
+            "kind: deployment\nname: ops\nstate: { type: memory }\n".into(),
+        )
+        .await;
+        let (_, resp) = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("acme-exports".into()),
+            Json(TriggerBody {
+                sink: Some("local-jsonl".into()),
+                overlay: Some(OverlayRef::Id("ops".into())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trigger with a registered overlay");
+        assert_eq!(resp.0.overlay.as_deref(), Some("ops"));
+        assert_eq!(resp.0.overlay_version, Some(1));
+        assert_eq!(resp.0.overlay_contributes, vec!["pipeline.state"]);
+        let rec = state
+            .history()
+            .get(&resp.0.run.run_id)
+            .await
+            .unwrap()
+            .expect("run record");
+        assert_eq!(rec.labels[LABEL_OVERLAY], "ops");
+        assert_eq!(rec.labels[LABEL_OVERLAY_VERSION], "1");
+        let body: TriggerBody = serde_json::from_value(json!({
+            "sink": "local-jsonl",
+            "overlay": { "execution": { "max_concurrent": 1 } }
+        }))
+        .unwrap();
+        let (_, resp) = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("acme-exports".into()),
+            Json(body),
+        )
+        .await
+        .expect("trigger with an inline overlay");
+        assert_eq!(resp.0.overlay.as_deref(), Some("inline"));
+        assert_eq!(resp.0.overlay_contributes, vec!["execution"]);
+        let rec = state
+            .history()
+            .get(&resp.0.run.run_id)
+            .await
+            .unwrap()
+            .expect("run record");
+        assert!(!rec.labels.contains_key(LABEL_OVERLAY_VERSION));
+        // A deployment is part of neither side of the compatibility matrix.
+        let idx = template_matrix(State(state.clone())).await.unwrap().0;
+        assert!(
+            idx["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["name"] != "ops")
+        );
+        assert!(
+            idx["sinks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["name"] != "ops")
+        );
     }
 
     #[tokio::test]

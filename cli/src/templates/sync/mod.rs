@@ -275,9 +275,9 @@ async fn sync_origin_inner(
         Ok(None) => {}
         // Deprecation is advisory for the mirror; an unreadable index is
         // surfaced rather than failing the whole pull.
-        Err(e) => paired
-            .warnings
-            .push(format!("catalog index.json unreadable ({e}); version deprecations not applied")),
+        Err(e) => paired.warnings.push(format!(
+            "catalog index.json unreadable ({e}); version deprecations not applied"
+        )),
     }
     let local = local_snapshot(store, &origin.prefix).await?;
     let plan = plan::plan(origin, &paired.templates, &local);

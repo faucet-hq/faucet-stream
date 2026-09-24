@@ -512,6 +512,30 @@ swap, and the run is labelled `sink_template` / `sink_template_version` beside
 `template` / `template_version`. Registering a document with no `kind:` still
 works as a pipeline but is deprecated: add `kind: pipeline`.
 
+**Deployment overlays.** A `kind: deployment` template carries the operational
+blocks a composed run gets from neither template — `state`, `dlq`,
+`notifications`, `sla`, `resilience`, `execution`, `delivery`, `schedule`, and
+per-stream `sla` / `dlq` / `delivery` under `streams:` (see
+[Deployment overlays](../cookbook/template-hub.md#deployment-overlays)). It is
+registered like any template, never triggered on its own (`422`), and applied
+with `overlay` on a source-template trigger — a registered id (with
+`overlay_version`, default `stable`) or an inline mapping, whose `kind` / `name`
+may be omitted:
+
+```bash
+curl -sX POST http://127.0.0.1:8080/v1/templates/acme%2Fbilling/runs \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"sink":"faucet-hq/bigquery","overlay":"prod","params":{"state_dsn":"…"}}'
+# → 202 {…, "overlay":"prod","overlay_version":2,
+#        "overlay_contributes":["pipeline.state","pipeline.dlq","matrix.bills.sla"], "warnings":[]}
+```
+
+An overlay that would change connectors or streams, names a stream the source
+lacks, or declares a param differently from the templates is a `422`; `overlay`
+on a `pipeline` template is a `422`. The run is labelled `overlay` (and
+`overlay_version` for a registered one), and `warnings` flags incremental
+streams composed with no state store.
+
 **Registering never moves callers.** `POST /v1/templates` appends a version and
 stops there; `POST /v1/templates/{id}/launch` is the one call that moves `stable`
 and therefore every unpinned caller. So a template is `draft` until something is
@@ -543,12 +567,13 @@ target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
 `launches` log — so a client can pin, promote, launch, or roll back without a
 second request. Use `?version=newest` to read a `draft` template.
 
-The trigger body's `params` / `env` / `version` / `sink` / `sink_version` are
-template-specific; every other field (`name`, `labels`, `timeout_secs`,
+The trigger body's `params` / `env` / `version` / `sink` / `sink_version` /
+`overlay` / `overlay_version` are template-specific; every other field (`name`, `labels`, `timeout_secs`,
 `doctor_first`, `idempotency_key`, `clock`, `concurrency`) behaves exactly as in
 `POST /v1/runs`, because the run is submitted through the same path. The run is
 labelled `template` and `template_version` (plus `sink_template` /
-`sink_template_version` for a composed run).
+`sink_template_version` for a composed run, and `overlay` / `overlay_version`
+when an overlay applied).
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing
 `required` param or a type mismatch, naming the param; `429` when the queue is

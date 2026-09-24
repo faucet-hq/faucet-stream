@@ -121,8 +121,8 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resilience: Option<ResilienceSpec>,
 
-    /// Optional data-freshness & volume SLA (#202). Top-level in v1 (not
-    /// per-matrix-row, like `resilience:`). Evaluated after every root
+    /// Optional data-freshness & volume SLA (#202). A matrix row's own `sla:`
+    /// replaces it for that row (#679). Evaluated after every root
     /// invocation by `faucet run`/`schedule`/`serve`/`replicate`; violations
     /// emit metrics + warnings and never fail the run. Staleness/volume checks
     /// require a `state:` block (enforced at expand time).
@@ -607,6 +607,11 @@ pub struct MatrixRow {
     /// Per-row delivery override. `None` inherits the top-level `delivery`.
     #[serde(default)]
     pub delivery: Option<faucet_core::DeliveryMode>,
+
+    /// Per-row SLA override (#679). Replaces the top-level `sla:` for this
+    /// row's invocations; `None` inherits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sla: Option<crate::sla::SlaSpec>,
 
     /// Free-form classification tags for this row (#376). Orthogonal to the
     /// source's `status:` readiness ladder — `status` gates whether a row is

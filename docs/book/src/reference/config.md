@@ -935,6 +935,20 @@ history is persisted next to the pipeline's bookmarks under
 persists within a single `faucet schedule` / `serve` process. Schema:
 `faucet schema sla`.
 
+**Per-row override (#679).** A matrix row may carry its own `sla:`, which
+replaces the top-level block for that row's invocations (the state-store gate
+applies to it the same way). This is also where a
+[deployment overlay](../cookbook/template-hub.md#deployment-overlays)'s
+per-stream `sla` lands.
+
+```yaml
+sla: { min_rows_per_run: 1 }        # every row …
+matrix:
+  - id: invoices
+    sla: { max_staleness_secs: 3600 }   # … except this one
+  - id: customers
+```
+
 ## `reconcile`
 
 Opt-in **completeness reconciliation** (#502): after a successful root run,

@@ -122,12 +122,13 @@ faucet run tenant-sync.yaml --param tenant_id=acme --param-env API_HOST=eu.examp
 
 ## Registering a template
 
-The registry stores three **kinds** of document, told apart by a `kind:` line:
+The registry stores four **kinds** of document, told apart by a `kind:` line:
 
 | `kind:` | What it is | How it runs |
 |---|---|---|
 | `source-template` | One system: its connector, shared `transforms`, and **streams** with per-stream write preferences ([Template Hub](./template-hub.md)) | Composed with a registered `sink-template`: `faucet template run <source> --sink <sink>` / `POST …/runs {"sink": …}` |
 | `sink-template` | One destination and how a stream is addressed (`per_stream`) | Never on its own — named as the `sink` of a source template's run |
+| `deployment` | The operational blocks of a composed run — `state`, `dlq`, `notifications`, `sla`, … ([Deployment overlays](./template-hub.md#deployment-overlays)) | Never on its own — named as the `overlay` of a source template's run |
 | `pipeline` | A complete config with `params:` | Alone, as below |
 
 A source or sink template is registered under its own `name` (the hub id), is
@@ -145,6 +146,8 @@ faucet template list --kind sink-template
 faucet template run acme/billing --sink faucet-hq/bigquery \
   --param api_token="$ACME_TOKEN" --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
 # → composes the two, prints the per-stream plan (bills: overwrite, transactions: upsert[id], …), runs
+faucet template register ops/prod.yaml --launch                               # kind: deployment
+faucet template run acme/billing --sink faucet-hq/bigquery --overlay prod …   # + state / DLQ / SLA
 ```
 
 The rest of this page uses a complete `pipeline` template; everything about
@@ -374,7 +377,9 @@ tested against: `sink:` (a registered id, or a path when `template:` is a path)
 and optionally `sink_select:`. Every case then materializes the **composed**
 pipeline — the same document a trigger builds — and `auto:` cases sweep the
 merged parameter surface, so a sink param the source never declared is still
-covered.
+covered. `overlay:` (and `overlay_select:`) adds a deployment overlay to that
+composition — a registered id, or a path in a file-based suite — and its params
+join the surface too.
 
 ```yaml
 version: 1
@@ -577,8 +582,9 @@ faucet mcp --template-store sqlite:./faucet-templates.db --allow-mutations
 
 Without a store the template tools are not advertised at all, so an agent never
 sees a tool it cannot use. `run_template` takes the same `sink` / `sink_version`
-pair as the HTTP trigger for a source template, and its `dry_run` output carries
-the per-stream write-mode plan.
+pair as the HTTP trigger for a source template (and `overlay` / `overlay_version`
+for a deployment overlay), and its `dry_run` output carries the per-stream
+write-mode plan and what the overlay set.
 
 ## What is and isn't stored
 
