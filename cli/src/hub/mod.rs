@@ -21,6 +21,7 @@ pub mod compose;
 #[cfg(feature = "hub-remote")]
 pub mod remote;
 pub mod spec;
+pub mod trust;
 
 use std::path::{Path, PathBuf};
 
@@ -283,6 +284,42 @@ pub fn parse_sink_file(path: &Path) -> CliResult<SinkTemplate> {
     Ok(t)
 }
 
+/// Community variants of one name, best first by the catalog's trust
+/// signals (#685), each with its summary: `octo/hr (★ 12 · updated …), acme/hr`.
+fn ranked_variants(variants: &[&String], index: Option<&IndexVersions>, subdir: &str) -> String {
+    let entries: Vec<(&str, Option<&IndexEntry>)> = variants
+        .iter()
+        .map(|id| (id.as_str(), index.and_then(|i| i.entry(subdir, id))))
+        .collect();
+    let mut cands: Vec<(trust::Candidate<'_>, String)> = entries
+        .iter()
+        .map(|(id, e)| {
+            let t = e.and_then(|e| e.trust.as_ref());
+            let summary = t.map(|t| t.summary()).unwrap_or_default();
+            (
+                trust::Candidate {
+                    id,
+                    official: e.is_some_and(|e| e.official),
+                    trust: t,
+                },
+                summary,
+            )
+        })
+        .collect();
+    cands.sort_by(|a, b| trust::rank(&a.0, &b.0));
+    cands
+        .iter()
+        .map(|(c, summary)| {
+            if summary.is_empty() {
+                c.id.to_string()
+            } else {
+                format!("{} ({summary})", c.id)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Every hub id under `base`: top-level stems plus `owner/stem` one level down.
 fn known_ids(base: &Path) -> Vec<String> {
     let mut out = Vec::new();
@@ -302,17 +339,30 @@ fn known_ids(base: &Path) -> Vec<String> {
                 for f in sub.flatten() {
                     if let Some(stem) = f.path().file_stem().and_then(|s| s.to_str())
                         && !stem.starts_with('.')
-                        && f.path().is_file()
+                        && is_template_file(&f.path())
                     {
                         out.push(format!("{n}/{stem}"));
                     }
                 }
             }
-        } else if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+        } else if let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+            && is_template_file(&p)
+        {
             out.push(stem.to_string());
         }
     }
     out
+}
+
+/// A template document — not a namespace's `OWNERS` file or a `*.faucet.yaml` sidecar.
+fn is_template_file(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    p.is_file()
+        && matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("yaml" | "yml" | "json")
+        )
+        && !name.contains(".faucet.")
 }
 
 /// A version selector on a hub locator: `id@stable` (the default), `id@newest`,
@@ -388,11 +438,7 @@ pub fn resolve_locator(locator: &str, hub: &Path, subdir: &str) -> CliResult<Pat
             "no hub template '{name}' at the top level or under {}/, but {} published one: {} — pick one with `--{} <owner>/{name}`",
             spec::OFFICIAL_OWNER,
             variants.len(),
-            variants
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
+            ranked_variants(&variants, IndexVersions::load(hub).as_ref(), subdir),
             if subdir == catalog::SOURCE_DIR {
                 "source"
             } else {
@@ -455,6 +501,11 @@ pub struct IndexEntry {
     pub newest: Option<u32>,
     #[serde(default)]
     pub versions: Vec<IndexVersion>,
+    #[serde(default)]
+    pub official: bool,
+    /// Stars, freshness and track record, when the catalog records them (#685).
+    #[serde(default)]
+    pub trust: Option<trust::TrustSignals>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -883,6 +934,51 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_names_list_variants_best_first_with_their_trust() {
+        let d = hub();
+        for owner in ["acme", "octo", "zed"] {
+            let dir = d.path().join(format!("source-templates/{owner}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("hr.yaml"),
+                OWNED_SRC
+                    .replace("name: acme", "name: hr")
+                    .replace("owner: octo", &format!("owner: {owner}")),
+            )
+            .unwrap();
+            // Neither a namespace's OWNERS file nor a sidecar is a template.
+            std::fs::write(dir.join("OWNERS"), "owners: []\n").unwrap();
+            std::fs::write(dir.join("hr.faucet.yaml"), "launch: true\n").unwrap();
+        }
+        let index = serde_json::json!({
+            "sources": [
+                {"id": "acme/hr", "name": "hr", "trust": {"stars": 3, "updated": "2026-09-01"}},
+                {"id": "octo/hr", "name": "hr", "trust": {"stars": 40, "updated": "2026-01-01", "open_issues": 2}},
+                {"id": "zed/hr", "name": "hr"}
+            ],
+            "sinks": []
+        });
+        std::fs::write(d.path().join("index.json"), index.to_string()).unwrap();
+        let err = resolve_locator("hr", d.path(), catalog::SOURCE_DIR)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "3 published one: octo/hr (★ 40 · updated 2026-01-01 · 2 open issues), acme/hr (★ 3 · updated 2026-09-01), zed/hr"
+            ),
+            "{err}"
+        );
+        let known = known_ids(&d.path().join("source-templates"));
+        assert!(
+            known
+                .iter()
+                .all(|k| !k.ends_with("OWNERS") && !k.contains(".faucet")),
+            "{known:?}"
+        );
+        assert!(known.contains(&"octo/hr".to_string()));
+    }
+
+    #[test]
     fn selectors_split_off_the_locator() {
         assert_eq!(split_selector("acme").unwrap(), ("acme", None));
         assert_eq!(
@@ -1019,6 +1115,7 @@ mod tests {
                     commit: "b".into(),
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(
             e.commit_for(HubVersion::Stable).unwrap().unwrap().commit,

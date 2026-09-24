@@ -254,6 +254,37 @@ A version whose body is not the snapshot's is fetched from the catalog at that
 commit and cached, so a pinned run composes the same document every time. A
 local directory hub has no history: selectors are an error there.
 
+### Choosing between variants: stars and trust
+
+When several namespaces publish a template for the same system, the catalog
+records facts that help you choose, in `index.json` under each entry's `trust`:
+
+| Signal | What it is |
+|---|---|
+| `stars` | 👍 reactions on the template's discussion in the catalog (**Discussions → Templates**). An account counts once, must be at least 30 days old, and must not be an owner of the template's own namespace. |
+| `updated` / `stable_since` | when the newest version landed, and when the stable one did |
+| `open_issues` | open catalog issues labelled `template:<id>` |
+| `compatible_sinks` | how many sink templates the source composes with in full |
+| `publisher` | how many templates the namespace publishes, and its GitHub account age |
+
+Stars measure popularity, not correctness, so they are one signal among
+these. They are never used to pick a template for you. The CLI shows the
+signals and orders by them:
+
+```bash
+faucet hub list --sort stars       # most starred first; ★ and last-updated columns
+faucet hub list --sort updated     # most recently changed first
+faucet run --source netsuite --sink bigquery
+# error: no hub template 'netsuite' at the top level or under faucet-hq/, but 2 published one:
+#   octo/netsuite (★ 37 · updated 2026-09-12), acme/netsuite (★ 9 · updated 2026-09-22)
+#   — pick one with `--source <owner>/netsuite`
+```
+
+Variants are ranked official first, then by stars, then by recency. The
+[hub page](https://faucet-hq.github.io/hub) shows the same signals on every
+card and sorts by them. To star a template, 👍 its discussion; to report a
+problem, open an issue with its `template:<id>` label.
+
 ### Mirror the hub into your server
 
 `faucet serve` pulls the catalog into its template registry with a sync file

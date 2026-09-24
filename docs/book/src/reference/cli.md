@@ -765,7 +765,7 @@ before it is ever registered. The exit code is the failed-case count, mirroring
 ## `hub`
 
 ```bash
-faucet hub list      [--hub ./hub] [--json]
+faucet hub list      [--hub ./hub] [--sort name|stars|updated] [--json]
 faucet hub check     --source example-rest-api --sink bigquery   # per-stream write modes; exit≠0 if incompatible
 faucet hub compose   --source example-rest-api --sink sqlite --out my-pipeline.yaml
 faucet hub matrix    --format table|markdown|json [--out FILE]
@@ -785,7 +785,7 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 |------|---------|
 | `--source <id\|path>` / `--sink <id\|path>` | The pairing. A path is used as-is; an id resolves to `<hub>/source-templates/<id>.yaml` / `<hub>/sink-templates/<id>.yaml`, where `id` is `owner/name` (a community template under `source-templates/<owner>/`) or a bare `name` (shorthand for the official `faucet-hq/name`). An optional `@stable` (default) / `@newest` / `@N` selects a catalog version when the hub's `index.json` records history. |
 | `--hub <dir\|github:owner/repo[@ref][/path]\|URL>` | Where ids resolve. A directory, or a GitHub repository laid out like `hub/` (`github:faucet-hq/template-hub`, `github:acme/catalog@v2/hub`, `https://github.com/acme/catalog/tree/main/hub`), fetched through the GitHub contents API and cached under `~/.cache/faucet/hub/` pinned to the ref's commit — one request per run when unchanged, the cached snapshot with a warning when offline (`FAUCET_HUB_OFFLINE=1` skips the network). `GITHUB_TOKEN` is used when set. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the public hub `github:faucet-hq/template-hub`. |
-| `--hub <dir>` | Catalog directory. Default `$FAUCET_HUB`, else `./hub`. |
+| `--sort name\|stars\|updated` | *(list)* Order by id, by stars (most starred first), or by the newest version's date. Stars, dates and open issues come from the catalog's `index.json` (`trust`) and are shown as columns; `--json` includes each entry's `trust` block. |
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
 | `--format table\|markdown\|json` | *(matrix)* Terminal table, the docs page, or `index.json`. |
 | `--json` | Machine-readable output. |
