@@ -1,0 +1,46 @@
+name: Notify site of a release
+
+# Rebuilds faucet-hq.github.io as soon as a release is published, so the
+# site's /changelog (built from these GitHub releases) shows it immediately
+# instead of at the site's next scheduled rebuild.
+#
+# release-plz publishes one GitHub release per crate, so a single release of
+# the project fires this dozens of times. The concurrency group plus the short
+# wait below collapse that burst into one dispatch after the last release.
+#
+# Token: `SITE_DISPATCH_TOKEN` when set, else `RELEASE_PLZ_TOKEN`. It needs
+# `contents: write` on faucet-hq/faucet-hq.github.io (the repository_dispatch
+# endpoint requires it). GITHUB_TOKEN cannot reach another repository.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: notify-site
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: Trigger site rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for the rest of the release burst
+        if: github.event_name == 'release'
+        run: sleep 120
+      - name: Dispatch faucet-release to the site
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN || secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Set SITE_DISPATCH_TOKEN (or RELEASE_PLZ_TOKEN) with contents:write on faucet-hq/faucet-hq.github.io"
+            exit 1
+          fi
+          gh api --method POST repos/faucet-hq/faucet-hq.github.io/dispatches \
+            -f event_type=faucet-release \
+            -f "client_payload[tag]=${{ github.event.release.tag_name || 'manual' }}"
+          echo "Site rebuild requested."
