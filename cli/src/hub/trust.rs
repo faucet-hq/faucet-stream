@@ -2,8 +2,7 @@
 //!
 //! When many publishers ship a template for one system, the catalog's CI
 //! records facts about each entry in `index.json` under `trust`: GitHub-backed
-//! stars (a 👍 on the template's discussion, filtered against young accounts
-//! and the namespace's own owners), when it last changed, how long `stable`
+//! stars (upvotes on the template's discussion, one per account), when it last changed, how long `stable`
 //! has held, open issues, how many sinks it composes with, and the publisher's
 //! track record. This module reads them and orders variants by them.
 
@@ -15,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// older catalog, or one whose trust job has not run yet, carries none.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustSignals {
-    /// Qualifying 👍 reactions on the template's discussion.
+    /// Upvotes on the template's discussion (GitHub allows one per account).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stars: Option<u64>,
     /// Where to star it: the template's discussion.
