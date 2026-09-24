@@ -261,7 +261,7 @@ records facts that help you choose, in `index.json` under each entry's `trust`:
 
 | Signal | What it is |
 |---|---|
-| `stars` | 👍 reactions on the template's discussion in the catalog (**Discussions → Templates**). An account counts once, must be at least 30 days old, and must not be an owner of the template's own namespace. |
+| `stars` | upvotes (↑) on the template's discussion in the catalog (**Discussions → Templates**). GitHub allows one upvote per account. |
 | `updated` / `stable_since` | when the newest version landed, and when the stable one did |
 | `open_issues` | open catalog issues labelled `template:<id>` |
 | `compatible_sinks` | how many sink templates the source composes with in full |
@@ -282,7 +282,7 @@ faucet run --source netsuite --sink bigquery
 
 Variants are ranked official first, then by stars, then by recency. The
 [hub page](https://faucet-hq.github.io/hub) shows the same signals on every
-card and sorts by them. To star a template, 👍 its discussion; to report a
+card and sorts by them. To star a template, upvote its discussion; to report a
 problem, open an issue with its `template:<id>` label.
 
 ### Mirror the hub into your server
