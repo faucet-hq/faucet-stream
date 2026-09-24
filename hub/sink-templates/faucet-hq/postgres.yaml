@@ -3,6 +3,7 @@
 # truncate-load swap, upsert = INSERT … ON CONFLICT on the primary keys).
 kind: sink-template
 name: postgres
+owner: faucet-hq
 description: PostgreSQL — one auto-mapped table per stream, transactional overwrite or ON CONFLICT upsert
 tags: [database]
 params:

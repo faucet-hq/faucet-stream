@@ -3,6 +3,7 @@
 # auto-mapped table per stream.
 kind: sink-template
 name: sqlite
+owner: faucet-hq
 description: Local SQLite database — one auto-mapped table per stream, real overwrite/upsert semantics without infrastructure
 tags: [database, local]
 params:

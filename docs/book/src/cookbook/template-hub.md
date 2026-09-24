@@ -70,7 +70,7 @@ streams:
 | Field | Purpose |
 |---|---|
 | `name` | Short name (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem). With `owner`, the hub id is `owner/name`; the id is the composed pipeline's `name:` — so per-stream state keys are `{id}::{stream}` and bookmarks survive swapping the sink. |
-| `owner` | Publisher namespace — the GitHub user or org login the file lives under (`source-templates/<owner>/`). Absent on the hub's official templates. |
+| `owner` | Publisher namespace — the GitHub user or org login the file lives under (`source-templates/<owner>/`). `faucet-hq` for the hub's official templates. |
 | `params`, `auth` | Same grammar as a pipeline's `params:` / `auth:` blocks. Merged with the sink template's at compose time; a name declared by both with different specs is an error. |
 | `source` | The connector every stream reads through. Shared transforms go in the top-level `transforms`, not here. |
 | `sources` | Additional named connectors for streams that read a second endpoint family (a reports API beside the entity API). A stream picks one with `source.ref`. |
@@ -216,10 +216,12 @@ rate limit.
 A hundred teams will want their own NetSuite template, so a template's hub id
 is **`owner/name`** — the owner being the publisher's GitHub user or org login
 — and the catalog is laid out to match: `source-templates/acme/netsuite.yaml`
-carries `owner: acme` and is addressed as `acme/netsuite`. Top-level files
-with no `owner` are the hub's **official** templates, addressed by name alone.
-`--source netsuite` means the official one; when there is none, the CLI lists
-the community variants instead of guessing.
+carries `owner: acme` and is addressed as `acme/netsuite`. The hub's own,
+maintained templates are simply the **`faucet-hq`** namespace
+(`source-templates/faucet-hq/…`, `owner: faucet-hq`) — owned by the faucet-hq
+org exactly like any other namespace, and marked **official**. A bare name is
+shorthand for it: `--source netsuite` means `faucet-hq/netsuite`; when there is
+none, the CLI lists the community variants instead of guessing.
 
 The full id names the composed pipeline, so state keys are
 `acme/netsuite::invoices` and two publishers' templates never collide in a
@@ -230,8 +232,8 @@ name — a table cannot contain `/` — and `${owner}` is available for paths
 
 Ownership is enforced by the catalog's CI: the first pull request into a
 namespace adds `<owner>/OWNERS` with the author's numeric GitHub id, and every
-later change must come from a listed id. Official templates are
-maintainers-only.
+later change must come from a listed id — `faucet-hq/` included, whose
+OWNERS lists the hub's maintainers. Nothing lives at the top level.
 
 ### Versions: v1, v2, v3 and `stable`
 
@@ -296,21 +298,21 @@ origin at it.
 
 The [template registry](./templates.md) stores source and sink templates as
 first-class kinds — there is no need to compose first. Register each file
-(its id is its `name`), then run any pairing by id; the server composes at
+(its id is its hub id — `faucet-hq/bigquery` for a shipped sink), then run any pairing by id; the server composes at
 trigger time, so a new sink template is immediately usable with every
 registered source template:
 
 ```bash
 faucet template register hub/source-templates/acme-billing.yaml --launch
-faucet template register hub/sink-templates/bigquery.yaml --launch
-faucet template register hub/sink-templates/postgres.yaml --launch
+faucet template register hub/sink-templates/faucet-hq/bigquery.yaml --launch
+faucet template register hub/sink-templates/faucet-hq/postgres.yaml --launch
 faucet template list --kind source-template
-faucet template run acme-billing --sink bigquery --param api_token="$T" --param bq_project=p --param bq_sa_key="$K"
-faucet template run acme-billing --sink postgres --param api_token="$T" --param pg_url="$PG"
+faucet template run acme-billing --sink faucet-hq/bigquery --param api_token="$T" --param bq_project=p --param bq_sa_key="$K"
+faucet template run acme-billing --sink faucet-hq/postgres --param api_token="$T" --param pg_url="$PG"
 ```
 
 Over HTTP the trigger is `POST /v1/templates/acme-billing/runs` with
-`{"sink": "bigquery", "params": {…}}`; the console's template page offers the
+`{"sink": "faucet-hq/bigquery", "params": {…}}`; the console's template page offers the
 registered sink templates in a dropdown. Registration runs the same
 publishability lint as `faucet hub lint`, so a literal credential never lands in
 a shared registry. A sync origin ([hosting templates](./templates.md#hosting-templates-in-a-repo-or-bucket-sync))

@@ -140,9 +140,9 @@ is still accepted as a pipeline but prints a deprecation notice — add
 
 ```bash
 faucet template register hub/source-templates/acme-billing.yaml --launch    # id = acme-billing
-faucet template register hub/sink-templates/bigquery.yaml --launch          # id = bigquery
+faucet template register hub/sink-templates/faucet-hq/bigquery.yaml --launch  # id = faucet-hq/bigquery
 faucet template list --kind sink-template
-faucet template run acme-billing --sink bigquery \
+faucet template run acme-billing --sink faucet-hq/bigquery \
   --param api_token="$ACME_TOKEN" --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
 # → composes the two, prints the per-stream plan (bills: overwrite, transactions: upsert[id], …), runs
 ```

@@ -887,10 +887,12 @@ pub enum HubCommand {
 /// The pairing every hub verb takes.
 #[derive(Debug, Parser)]
 pub struct HubPairArgs {
-    /// Source template: a path, or an id resolved as `<hub>/source-templates/<id>.yaml`.
+    /// Source template: a path, or an id (`owner/name`, or a bare name for the
+    /// official `faucet-hq/name`) resolved under `<hub>/source-templates/`.
     #[arg(long)]
     pub source: String,
-    /// Sink template: a path, or an id resolved as `<hub>/sink-templates/<id>.yaml`.
+    /// Sink template: a path, or an id (`owner/name`, or a bare name for the
+    /// official `faucet-hq/name`) resolved under `<hub>/sink-templates/`.
     #[arg(long)]
     pub sink: String,
     /// Hub catalog: a directory, `github:owner/repo[@ref][/path]`, or a GitHub

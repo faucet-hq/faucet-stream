@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::compose::{StreamIncompatibility, StreamPlan, compose, resolve_mode};
-use super::spec::{SinkTemplate, SourceTemplate};
+use super::spec::{OFFICIAL_OWNER, SinkTemplate, SourceTemplate, hub_id};
 use crate::error::{CliError, CliResult};
 
 pub const SOURCE_DIR: &str = "source-templates";
@@ -35,7 +35,7 @@ fn is_template_file(p: &Path) -> bool {
             .is_some_and(|n| n.starts_with('.'))
 }
 
-/// Template files directly in `dir` (official templates) plus one level of
+/// Template files directly in `dir` (unscoped templates) plus one level of
 /// owner subdirectories (`<dir>/<owner>/<name>.yaml`, #682). Returns
 /// `(path, owner)`.
 fn list_dir(dir: &Path) -> CliResult<Vec<(PathBuf, Option<String>)>> {
@@ -69,6 +69,11 @@ fn list_dir(dir: &Path) -> CliResult<Vec<(PathBuf, Option<String>)>> {
         }
     }
     Ok(out)
+}
+
+/// A bare name also addresses the hub's official namespace (`faucet-hq/<name>`).
+fn official_alias(id: &str) -> Option<String> {
+    (!id.contains('/')).then(|| hub_id(Some(OFFICIAL_OWNER), id))
 }
 
 impl Catalog {
@@ -112,17 +117,17 @@ impl Catalog {
 
     /// Look a source template up by hub id (`owner/name`, or `name`).
     pub fn source(&self, id: &str) -> Option<&SourceTemplate> {
-        self.sources
-            .iter()
-            .find(|(_, t)| t.id() == id)
+        let find = |want: &str| self.sources.iter().find(|(_, t)| t.id() == want);
+        find(id)
+            .or_else(|| official_alias(id).and_then(|a| find(&a)))
             .map(|(_, t)| t)
     }
 
     /// Look a sink template up by hub id (`owner/name`, or `name`).
     pub fn sink(&self, id: &str) -> Option<&SinkTemplate> {
-        self.sinks
-            .iter()
-            .find(|(_, t)| t.id() == id)
+        let find = |want: &str| self.sinks.iter().find(|(_, t)| t.id() == want);
+        find(id)
+            .or_else(|| official_alias(id).and_then(|a| find(&a)))
             .map(|(_, t)| t)
     }
 
@@ -162,7 +167,7 @@ fn check_stem(
 }
 
 /// The `owner:` field must agree with the directory a template lives in (#682):
-/// a file under `<owner>/` carries `owner: <owner>`; a top-level (official)
+/// a file under `<owner>/` carries `owner: <owner>`; a top-level (unscoped)
 /// file carries none. The field is what makes a template self-describing once
 /// it leaves the catalog (registry, sync, remote fetch).
 fn check_owner(p: &Path, declared: Option<&str>, dir: Option<&str>) -> CliResult<()> {
@@ -174,7 +179,7 @@ fn check_owner(p: &Path, declared: Option<&str>, dir: Option<&str>) -> CliResult
             p.display()
         ))),
         (Some(d), None) => Err(CliError::Config(format!(
-            "{}: declares `owner: {d}` but lives at the top level — move it to '{d}/{}' (top-level templates are the hub's official, owner-less set)",
+            "{}: declares `owner: {d}` but lives at the top level — move it to '{d}/{}'",
             p.display(),
             p.file_name().and_then(|n| n.to_str()).unwrap_or_default()
         ))),
@@ -505,7 +510,7 @@ fn index_json_unsorted(
         "sources": cat.sources.iter().map(|(p, s)| json!({
             "id": s.id(),
             "owner": s.owner,
-            "official": s.owner.is_none(),
+            "official": s.is_official(),
             "name": s.name,
             "description": s.description,
             "tags": s.tags,
@@ -526,7 +531,7 @@ fn index_json_unsorted(
         "sinks": cat.sinks.iter().map(|(p, k)| json!({
             "id": k.id(),
             "owner": k.owner,
-            "official": k.owner.is_none(),
+            "official": k.is_official(),
             "name": k.name,
             "description": k.description,
             "tags": k.tags,
@@ -928,6 +933,33 @@ per_stream:
     }
 
     #[test]
+    fn bare_names_alias_the_official_namespace() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("source-templates/faucet-hq")).unwrap();
+        std::fs::create_dir_all(root.join("sink-templates/faucet-hq")).unwrap();
+        std::fs::write(
+            root.join("source-templates/faucet-hq/shop.yaml"),
+            "kind: source-template\nname: shop\nowner: faucet-hq\ndescription: d\nsource: {type: csv, config: {path: ./x.csv}}\nstreams: [{name: t}]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sink-templates/faucet-hq/lake.yaml"),
+            "kind: sink-template\nname: lake\nowner: faucet-hq\ndescription: d\nsink: {type: jsonl, config: {}}\nper_stream: {path: \"./lake/${stream}.jsonl\"}\n",
+        )
+        .unwrap();
+        let cat = Catalog::load(root).unwrap();
+        assert!(cat.source("shop").is_some_and(|s| s.is_official()));
+        assert!(cat.sink("lake").is_some_and(|k| k.is_official()));
+        assert!(cat.sink("faucet-hq/lake").is_some());
+        assert!(cat.source("missing").is_none() && cat.sink("octo/lake").is_none());
+        let idx = index_json(&cat);
+        assert_eq!(idx["sources"][0]["official"], serde_json::json!(true));
+        assert_eq!(idx["sinks"][0]["official"], serde_json::json!(true));
+        assert_eq!(idx["sinks"][0]["id"], serde_json::json!("faucet-hq/lake"));
+    }
+
+    #[test]
     fn owner_directories_load_and_owner_must_match_the_directory() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
@@ -954,7 +986,8 @@ per_stream:
         assert_eq!(ids, ["shop", "octo/shop"]);
         assert!(cat.source("octo/shop").unwrap().owner.as_deref() == Some("octo"));
         let idx = index_json(&cat);
-        assert_eq!(idx["sources"][0]["official"], serde_json::json!(true));
+        assert_eq!(idx["sources"][0]["official"], serde_json::json!(false));
+        assert_eq!(idx["sources"][1]["official"], serde_json::json!(false));
         assert_eq!(idx["sources"][1]["id"], serde_json::json!("octo/shop"));
         assert_eq!(idx["sources"][1]["owner"], serde_json::json!("octo"));
         assert_eq!(idx["matrix"][1]["source"], serde_json::json!("octo/shop"));

@@ -3,6 +3,7 @@
 #   faucet hub check --source example-csv --sink postgres
 kind: source-template
 name: example-csv
+owner: faucet-hq
 description: Example — two CSV exports as two streams (runs offline, no credentials)
 tags: [example, file]
 params:

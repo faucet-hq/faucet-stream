@@ -351,8 +351,8 @@ pub fn split_selector(locator: &str) -> CliResult<(&str, Option<HubVersion>)> {
 
 /// Turn a `--source` / `--sink` value into a file: an existing path is used
 /// as-is; otherwise it is a hub id looked up as `<hub>/<subdir>/<id>.{yaml,yml,json}`
-/// — `owner/name` resolves under `<subdir>/<owner>/`, a bare `name` at the top
-/// level (the hub's official templates).
+/// — `owner/name` resolves under `<subdir>/<owner>/`; a bare `name` resolves
+/// to a top-level file, else to the hub's official `faucet-hq/` namespace.
 pub fn resolve_locator(locator: &str, hub: &Path, subdir: &str) -> CliResult<PathBuf> {
     let as_path = Path::new(locator);
     if as_path.is_file() {
@@ -360,14 +360,18 @@ pub fn resolve_locator(locator: &str, hub: &Path, subdir: &str) -> CliResult<Pat
     }
     let base = hub.join(subdir);
     let (owner, name) = spec::split_hub_id(locator);
-    let dir = match owner {
-        Some(o) => base.join(o),
-        None => base.clone(),
+    // `owner/name` → the owner directory. A bare `name` → a top-level file
+    // (an unscoped template), else the hub's official namespace.
+    let dirs: Vec<PathBuf> = match owner {
+        Some(o) => vec![base.join(o)],
+        None => vec![base.clone(), base.join(spec::OFFICIAL_OWNER)],
     };
-    for ext in ["yaml", "yml", "json"] {
-        let candidate = dir.join(format!("{name}.{ext}"));
-        if candidate.is_file() {
-            return Ok(candidate);
+    for dir in &dirs {
+        for ext in ["yaml", "yml", "json"] {
+            let candidate = dir.join(format!("{name}.{ext}"));
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
     let mut known = known_ids(&base);
@@ -381,7 +385,8 @@ pub fn resolve_locator(locator: &str, hub: &Path, subdir: &str) -> CliResult<Pat
             .filter(|k| k.ends_with(&format!("/{name}")))
             .collect();
         return Err(CliError::Config(format!(
-            "no official hub template '{name}', but {} published one: {} — pick one with `--{} <owner>/{name}`",
+            "no hub template '{name}' at the top level or under {}/, but {} published one: {} — pick one with `--{} <owner>/{name}`",
+            spec::OFFICIAL_OWNER,
             variants.len(),
             variants
                 .iter()
@@ -518,8 +523,10 @@ impl IndexEntry {
 /// fetched from the remote hub the snapshot was taken from (a local directory
 /// hub has no history, so a selector is an error there).
 pub async fn locate(locator: &str, hub: &Path, subdir: &str) -> CliResult<PathBuf> {
-    let (id, sel) = split_selector(locator)?;
-    let head = resolve_locator(id, hub, subdir);
+    let (given, sel) = split_selector(locator)?;
+    let head = resolve_locator(given, hub, subdir);
+    let id = canonical_id(given, head.as_deref().ok(), hub, subdir);
+    let id = id.as_str();
     let index = IndexVersions::load(hub);
     let entry = index.as_ref().and_then(|i| i.entry(subdir, id));
     let target = match (entry, sel) {
@@ -537,6 +544,22 @@ pub async fn locate(locator: &str, hub: &Path, subdir: &str) -> CliResult<PathBu
         return head;
     }
     fetch_version(hub, subdir, id, target, head.ok().as_deref()).await
+}
+
+/// The id a locator names once the official-namespace shorthand is applied: a
+/// bare name that did not resolve to a top-level file is `faucet-hq/<name>`,
+/// which is how the catalog's `index.json` keys it.
+fn canonical_id(given: &str, head: Option<&Path>, hub: &Path, subdir: &str) -> String {
+    let (owner, name) = spec::split_hub_id(given);
+    if owner.is_some() || Path::new(given).is_file() {
+        return given.to_string();
+    }
+    let top_level = head.is_some_and(|p| p.parent() == Some(hub.join(subdir).as_path()));
+    if top_level {
+        given.to_string()
+    } else {
+        spec::hub_id(Some(spec::OFFICIAL_OWNER), name)
+    }
 }
 
 #[cfg(feature = "hub-remote")]
@@ -836,9 +859,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("no official hub template 'hr'") && err.contains("octo/hr"),
+            err.contains("no hub template 'hr'")
+                && err.contains("faucet-hq/")
+                && err.contains("octo/hr"),
             "{err}"
         );
+        // A bare name falls through to the official faucet-hq namespace.
+        std::fs::create_dir_all(d.path().join("source-templates/faucet-hq")).unwrap();
+        std::fs::write(
+            d.path().join("source-templates/faucet-hq/crm.yaml"),
+            OWNED_SRC
+                .replace("name: acme", "name: crm")
+                .replace("owner: octo", "owner: faucet-hq"),
+        )
+        .unwrap();
+        let crm = resolve_locator("crm", d.path(), catalog::SOURCE_DIR).unwrap();
+        assert!(crm.ends_with("source-templates/faucet-hq/crm.yaml"));
+        assert!(load_source("crm", d.path()).await.unwrap().is_official());
         let err = resolve_locator("octo/nope", d.path(), catalog::SOURCE_DIR)
             .unwrap_err()
             .to_string();
@@ -868,6 +905,53 @@ mod tests {
         let f = d.path().join("x@2.yaml");
         std::fs::write(&f, "kind: sink-template\n").unwrap();
         assert_eq!(split_selector(f.to_str().unwrap()).unwrap().1, None);
+    }
+
+    #[tokio::test]
+    async fn locate_keys_the_index_by_the_official_id() {
+        let d = hub();
+        std::fs::create_dir_all(d.path().join("source-templates/faucet-hq")).unwrap();
+        std::fs::write(
+            d.path().join("source-templates/faucet-hq/crm.yaml"),
+            OWNED_SRC
+                .replace("name: acme", "name: crm")
+                .replace("owner: octo", "owner: faucet-hq"),
+        )
+        .unwrap();
+        let index = serde_json::json!({
+            "commit": "head000",
+            "sources": [{"id": "faucet-hq/crm", "name": "crm", "newest": 2, "stable": 2,
+                          "versions": [{"version": 1, "commit": "old000"}, {"version": 2, "commit": "head000"}]}],
+            "sinks": []
+        });
+        std::fs::write(d.path().join("index.json"), index.to_string()).unwrap();
+        // The bare shorthand finds the faucet-hq entry: stable is the snapshot file…
+        assert!(
+            locate("crm", d.path(), catalog::SOURCE_DIR)
+                .await
+                .unwrap()
+                .ends_with("source-templates/faucet-hq/crm.yaml")
+        );
+        // …and an older version is looked up under the full id.
+        let err = locate("crm@1", d.path(), catalog::SOURCE_DIR)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'faucet-hq/crm' v1"), "{err}");
+        // A top-level (unscoped) file keeps its bare id.
+        assert_eq!(
+            canonical_id(
+                "acme",
+                Some(&d.path().join("source-templates/acme.yaml")),
+                d.path(),
+                catalog::SOURCE_DIR
+            ),
+            "acme"
+        );
+        assert_eq!(
+            canonical_id("gone", None, d.path(), catalog::SOURCE_DIR),
+            "faucet-hq/gone"
+        );
     }
 
     #[tokio::test]

@@ -43,7 +43,8 @@ into the docs site:
 
 Real templates go to the public catalog, under your own namespace
 (`source-templates/<your-github-login>/<name>.yaml` with `owner: <login>`; the
-hub id is `<owner>/<name>`). Top-level files are the official set. The rules:
+hub id is `<owner>/<name>`). The templates shipped here are the official
+`faucet-hq/` namespace; a bare name like `jsonl` is shorthand for `faucet-hq/jsonl`. The rules:
 
 1. Copy the closest existing file; keep `name` equal to the file stem
    (`^[a-z0-9][a-z0-9_-]*$`) and `owner` equal to the directory.
