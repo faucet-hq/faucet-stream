@@ -16,7 +16,7 @@ pub fn schema_targets() -> Vec<&'static str> {
         "sink",
         "transform",
         "dlq",
-        "replication",
+        "mirror",
         "backfill",
         "partition",
         "execution",

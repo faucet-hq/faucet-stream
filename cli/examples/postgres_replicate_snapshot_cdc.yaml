@@ -1,5 +1,5 @@
 # Mirror public.orders → public.orders_mirror: bulk snapshot, then CDC.
-# Run with:  faucet replicate cli/examples/postgres_replicate_snapshot_cdc.yaml
+# Run with:  faucet mirror cli/examples/postgres_replicate_snapshot_cdc.yaml
 # Pair write_mode: upsert (+ cdc_unwrap) so the snapshot↔CDC boundary is idempotent.
 version: 1
 name: orders_mirror
@@ -28,7 +28,7 @@ pipeline:
     type: file
     config: { path: ./.faucet-state }
 
-replication:
+mirror:
   mode: snapshot_then_cdc
   continuous: true                       # keep streaming after the snapshot
   snapshot:

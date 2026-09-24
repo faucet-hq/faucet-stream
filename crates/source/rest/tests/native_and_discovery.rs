@@ -336,13 +336,13 @@ async fn odata_discover_stamps_partition_only_for_single_int_key_entities() {
 
     // Int64 key → resolved partition block with the configured knobs.
     let ledger = descs.iter().find(|d| d.name == "LedgerEntries").unwrap();
-    let part = &ledger.config_patch["odata"]["partition"];
+    let part = &ledger.config_patch["odata"]["key_ranges"];
     assert_eq!(part["key"], "RecId");
     assert_eq!(part["workers"], 6);
     assert_eq!(part["count"], 24);
     // String key → left sequential (no partition block), logged not failed.
     let dept = descs.iter().find(|d| d.name == "Departments").unwrap();
-    assert!(dept.config_patch["odata"].get("partition").is_none());
+    assert!(dept.config_patch["odata"].get("key_ranges").is_none());
 }
 
 #[tokio::test]

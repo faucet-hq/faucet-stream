@@ -26,7 +26,7 @@ your database's connection limit.
 
 ## Concurrency
 
-- The REST source can process partitions concurrently (`partition_concurrency`).
+- The REST source can fetch its `requests:` entries concurrently (`request_concurrency`).
 - S3/GCS sources and sinks read/write objects in parallel
   (`buffer_unordered`-style concurrency).
 - The HTTP sink sends per-record requests concurrently under a semaphore.

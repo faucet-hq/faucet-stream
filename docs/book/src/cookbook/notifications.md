@@ -28,7 +28,7 @@ block, nothing changes.
 | `scheduler_stuck` | `faucet schedule` is exiting on consecutive failures | critical |
 
 Events fire from every runtime — `faucet run`, `faucet schedule`,
-`faucet serve`, and `faucet replicate` — because the emit sites live in the
+`faucet serve`, and `faucet mirror` — because the emit sites live in the
 shared executor (plus the scheduler's `scheduler_stuck` signal). They are
 scoped to real, whole-pipeline **root** runs: `--dry-run`, `--limit`, sharded,
 and cancelled runs do not notify.

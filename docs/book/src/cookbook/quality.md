@@ -55,7 +55,7 @@ pipeline:
         type: Incremental
       replication_key: updated_at
       primary_keys: ["id"]
-      partitions: []
+      requests: []
       schema_sample_size: 100
       state_key: users_api:users
 

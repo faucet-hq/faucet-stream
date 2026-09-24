@@ -17,9 +17,9 @@ This is the flagship faucet-stream source: point it at any JSON-over-HTTP API, d
 - **Memory-bounded streaming** — overrides `Source::stream_pages`, so `Pipeline::run` writes each page to the sink as it arrives; peak memory stays `O(page)` regardless of total record count.
 - **Resilient by default** — exponential backoff with jitter (capped at 60 s), `429` `Retry-After` (delta-seconds or HTTP-date) honouring, and a `tolerated_http_errors` allowlist for legitimately-absent resources.
 - **Incremental replication** — bookmark by any record field, persist it across runs with a state store, and resume from the last value.
-- **Concurrent partitions** — fan a single config across many path substitutions (`/orgs/{org_id}/users`) and fetch them concurrently.
+- **Concurrent requests** — fan a single config across many path substitutions (`/orgs/{org_id}/users`) with `requests:` and fetch them concurrently.
 - **Schema inference** — sample records to produce a JSON Schema, or supply your own; Singer/Meltano `primary_keys` / `name` metadata is carried through.
-- **Client built once** — the `reqwest` client is constructed in `new()` and reused for every request and partition.
+- **Client built once** — the `reqwest` client is constructed in `new()` and reused for every request.
 
 ## Installation
 
@@ -371,13 +371,13 @@ source:
       fan_out: true
       objects: "${param.objects}"
       emit: { table_id: "raw_${name_snake}", sink_ref: warehouse }
-      partition:               # split huge entities into concurrent key ranges
+      key_ranges:              # split huge entities into concurrent key ranges (formerly `partition:`)
         objects: [LedgerEntries, Transactions]
         workers: 16            # concurrent range readers (default 4, max 64)
         count: 64              # ranges to tile into (default workers × 4)
 ```
 
-Each `partition.objects` entity whose `$metadata` declares a single **integer**
+Each `key_ranges.objects` entity whose `$metadata` declares a single **integer**
 key is tiled with `faucet_core::shard::plan_pk_shards` (the same primitive the
 SQL sources shard with) and fetched as concurrent `$filter` ranges; entities
 without such a key fall back to sequential paging. Ranges are planned per run —
@@ -582,8 +582,8 @@ the parsed document this path deliberately never materializes.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `partitions` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per partition and concatenates results. Empty = run once with no substitution. |
-| `partition_concurrency` | int / null | `null` | Max partitions fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the partitions' pages **interleave** — partitions are disjoint and the bookmark is a max across them, so only page order changes. |
+| `requests` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per entry and concatenates results. Empty = run once with no substitution. Formerly `partitions` (still accepted, with a deprecation warning). |
+| `request_concurrency` | int / null | `null` | Max `requests` entries fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the entries' pages **interleave** — entries are disjoint and the bookmark is a max across them, so only page order changes. Formerly `partition_concurrency` (still accepted). |
 
 ## Authentication
 
@@ -741,11 +741,11 @@ source:
       config:
         token: ${env:API_TOKEN}
     records_path: $.members[*]
-    partitions:
+    requests:
       - { org_id: acme }
       - { org_id: globex }
       - { org_id: initech }
-    partition_concurrency: 3
+    request_concurrency: 3
 ```
 
 ### Tolerating a `429` and capping retries
@@ -873,8 +873,8 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 
 ## How it works
 
-1. `new()` resolves the auth method and builds the `reqwest` client **once**, reusing it for every request and partition.
-2. For each partition, `{key}` placeholders in `path` are substituted from the context map; with `partition_concurrency > 1`, partitions run concurrently and their pages interleave.
+1. `new()` resolves the auth method and builds the `reqwest` client **once**, reusing it for every request.
+2. For each `requests` entry, `{key}` placeholders in `path` are substituted from the context map; with `request_concurrency > 1`, entries run concurrently and their pages interleave.
 3. Each page request is wrapped in the retry layer: transient failures back off exponentially with jitter (capped at 60 s); `429` honours `Retry-After`.
 4. Records are extracted from the response body via `records_path` (JSONPath); the pagination style decides the next request and when to stop.
 5. In `Incremental` mode, records at or before the bookmark are filtered out and the max replication-key value becomes the new bookmark, carried on the final page.
@@ -912,7 +912,7 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 | Run ends early after a transient `5xx`/`429` mid-pagination | A `tolerated_http_errors` code only short-circuits the **first** request. Mid-stream it errors instead of silently truncating — raise `max_retries` / `retry_backoff` rather than tolerating the code. |
 | `FaucetError::Json` on a non-empty body | The response wasn't valid JSON (HTML error page, gateway response). Empty/`204` bodies are fine; a non-empty non-JSON body fails loudly by design. |
 | Incremental run re-fetches everything | No `state_key` + `state:` block, so the bookmark isn't persisted; or `replication_method` is still `FullTable`. Set both, plus `replication_key`. |
-| Rate-limited despite retries | The API returns `429` without `Retry-After`, or limits are stricter than backoff. Add `request_delay` to space requests, and/or lower `partition_concurrency`. |
+| Rate-limited despite retries | The API returns `429` without `Retry-After`, or limits are stricter than backoff. Add `request_delay` to space requests, and/or lower `request_concurrency`. |
 
 ## See also
 

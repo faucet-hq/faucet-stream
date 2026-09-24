@@ -2912,7 +2912,7 @@ impl faucet_core::Source for RestStream {
                                 if let Some(c) = partition.count {
                                     block.insert("count".into(), serde_json::json!(c));
                                 }
-                                o.insert("partition".into(), Value::Object(block));
+                                o.insert("key_ranges".into(), Value::Object(block));
                             }
                         }
                         None => tracing::warn!(

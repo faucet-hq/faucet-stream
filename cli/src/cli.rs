@@ -113,7 +113,9 @@ pub enum Command {
     Backfill(BackfillArgs),
     /// Bulk-snapshot a database table, then stream CDC from a position captured
     /// before the snapshot (a true mirror with `write_mode: upsert`).
-    /// Long-running when `replication.continuous` is true (Ctrl-C / SIGTERM to stop).
+    /// Long-running when `mirror.continuous` is true (Ctrl-C / SIGTERM to stop).
+    /// `faucet replicate` is the pre-#670 spelling, still accepted.
+    #[command(name = "mirror", alias = "replicate")]
     Replicate(ReplicateArgs),
     /// Connect to a config's source, enumerate the datasets behind it
     /// (tables / collections / indices / prefixes), and emit a ready-to-run
@@ -1515,7 +1517,7 @@ pub struct RunArgs {
     /// Override this run's **connector** concurrency — how many concurrent
     /// connections/fetches the source and sink may use — whatever the config
     /// says. Maps onto whichever knob the connector declares
-    /// (`max_connections` / `partition_concurrency` / `shard_concurrency` /
+    /// (`max_connections` / `request_concurrency` / `partition_concurrency` / `shard_concurrency` /
     /// `concurrency`); a connector with none ignores it. Does not change
     /// matrix parallelism (`execution.max_concurrent`). Must be > 0.
     #[arg(long, value_name = "N")]
@@ -1855,7 +1857,9 @@ pub enum SchemaTarget {
     },
     /// JSON Schema for the DLQ (Dead Letter Queue) specification.
     Dlq,
-    /// JSON Schema for the `replication:` (snapshot→CDC) block.
+    /// JSON Schema for the `mirror:` (snapshot→CDC) block; `replication` is
+    /// the pre-#670 name, still accepted.
+    #[command(name = "mirror", alias = "replication")]
     Replication,
     /// JSON Schema for the `backfill:` (window replay defaults) block.
     Backfill,

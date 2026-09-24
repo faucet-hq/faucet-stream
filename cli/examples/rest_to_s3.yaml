@@ -33,7 +33,7 @@ pipeline:
       replication_method:
         type: FullTable
       primary_keys: []
-      partitions: []
+      requests: []
       schema_sample_size: 0
 
   sink:

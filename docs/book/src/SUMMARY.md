@@ -32,7 +32,7 @@
 - [Moving data reliably]()
   - [Incremental replication & state](./cookbook/state.md)
   - [Upsert / mirror tables](./cookbook/upsert.md)
-  - [Replication (snapshot → CDC)](./cookbook/replication.md)
+  - [Mirror (snapshot → CDC)](./cookbook/replication.md)
   - [Backfill (historical replay)](./cookbook/backfill.md)
   - [Parallel range partitioning](./cookbook/partitioning.md)
   - [Dead-letter queues](./cookbook/dlq.md)

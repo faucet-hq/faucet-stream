@@ -623,7 +623,7 @@ pub struct TriggerBody {
     /// read replicas and one with a small instance, without per-customer
     /// copies of the config or the template author having to pre-declare a
     /// `${param.*}` for it. Mapped onto whichever knob the connector declares
-    /// (`max_connections` / `partition_concurrency` / `shard_concurrency` /
+    /// (`max_connections` / `request_concurrency` / `partition_concurrency` / `shard_concurrency` /
     /// `concurrency`); a connector with none ignores it. Does **not** change
     /// matrix parallelism or the server's own `--max-concurrent` slots, and it
     /// caps only the *client* side — it cannot exceed what the upstream will

@@ -1416,7 +1416,7 @@ components:
         doctor_first: { type: boolean, default: false, description: "Run doctor probes first; 422 with report on failure." }
         idempotency_key: { type: string, nullable: true }
         clock: { type: string, format: date-time, description: "Override the ${now.*} clock (backfills)." }
-        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
+        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
         callback: { $ref: "#/components/schemas/CallbackSpec" }
       example:
         name: orders_to_warehouse
@@ -2197,7 +2197,7 @@ components:
         doctor_first: { type: boolean, default: false }
         idempotency_key: { type: string }
         clock: { type: string, description: "RFC3339 or YYYY-MM-DD override for `${now.*}`." }
-        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
+        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
       example:
         params:
           region: us-east-1

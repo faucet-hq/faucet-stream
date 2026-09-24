@@ -1,4 +1,5 @@
-//! Serde config types for the `replication:` block (`faucet replicate`).
+//! Serde config types for the `mirror:` block (`faucet mirror`; the pre-#670
+//! spellings `replication:` / `faucet replicate` are still accepted).
 //!
 //! The main `pipeline` is the CDC pipeline (its `source` is a CDC connector,
 //! its `sink` the destination). `replication:` adds the one-time bulk-read
@@ -13,7 +14,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Top-level `replication:` block.
+/// Top-level `mirror:` block (alias `replication:`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicationSpec {

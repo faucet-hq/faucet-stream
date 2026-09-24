@@ -37,7 +37,7 @@ JSON-RPC stream.
 | `faucet dev <config> --sample <f>` | Watch + re-run a sample on save with a live diff (`cli-dev`). |
 | `faucet doctor [config]` | Probe every connector (auth/network/permissions) and print a checklist. |
 | `faucet test <specs…>` | Run fixture-based offline pipeline tests from one or more spec files. |
-| `faucet replicate [config]` | Bulk-snapshot a table, then hand off to CDC for a gap-free mirror. |
+| `faucet mirror [config]` | Bulk-snapshot a table, then hand off to CDC for a gap-free mirror. |
 | `faucet schedule [config]` | Run a pipeline on a cron schedule (long-running foreground process). |
 | `faucet serve` | Run a long-running HTTP control plane: submit / poll / cancel pipeline runs over REST. |
 | `faucet completions <shell>` | Print a shell tab-completion script (bash / zsh / fish / powershell / elvish). |
@@ -48,7 +48,7 @@ JSON-RPC stream.
 | `faucet history [config]` | Terminal view of the run history in a config's `catalog:` store. |
 | `faucet run … --output json\|ndjson` | Machine-readable end-of-run summary (per-row + totals) for scripting. |
 
-`[config]` is optional for `run` / `validate` / `preview` / `doctor` / `replicate` / `schedule`: if
+`[config]` is optional for `run` / `validate` / `preview` / `doctor` / `mirror` / `schedule`: if
 omitted, faucet auto-discovers `faucet.yaml` → `.yml` → `.json` in the current directory.
 
 ## `run`
@@ -68,7 +68,7 @@ Flags:
 | Flag | Purpose |
 |------|---------|
 | `--clock <value>` | Override the clock used by `${now.*}` tokens. Accepts an RFC 3339 timestamp (`2026-03-01T00:00:00Z`) or a bare date (`2026-03-01`, treated as midnight UTC). Default: process start time in UTC. Use this for backfills — run the same config with a different date without changing the file. |
-| `--concurrency <n>` | Override this run's **connector** concurrency — how many concurrent connections/fetches the source and sink may use — whatever the config says. Maps onto whichever knob the connector declares (`max_connections` / `partition_concurrency` / `shard_concurrency` / `concurrency`); a connector with none ignores it. Does **not** change matrix parallelism (`execution.max_concurrent`), and it caps only the *client* side — it cannot raise what the upstream will accept. Must be > 0. |
+| `--concurrency <n>` | Override this run's **connector** concurrency — how many concurrent connections/fetches the source and sink may use — whatever the config says. Maps onto whichever knob the connector declares (`max_connections` / `request_concurrency` / `partition_concurrency` / `shard_concurrency` / `concurrency`); a connector with none ignores it. Does **not** change matrix parallelism (`execution.max_concurrent`), and it caps only the *client* side — it cannot raise what the upstream will accept. Must be > 0. |
 | `--profile <name>` | Select a named overlay from the config's `profiles:` block (see [Config composition](config.md#config-composition)). Overrides `FAUCET_PROFILE`. |
 | `--env-file <path>` / `--no-env-file` | Same `.env` handling as `validate` / `preview`. |
 | `--from-env` | Build the pipeline entirely from `FAUCET_*` environment variables; mutually exclusive with a positional config path. |
@@ -276,7 +276,7 @@ opts into the real secrets path.
 ### `plan --diff` — config-change preview (#374)
 
 A `terraform plan`-style diff of the current config against **what last ran**.
-On every successful `faucet run` / `replicate` / `schedule --once`, a redacted
+On every successful `faucet run` / `mirror` / `schedule --once`, a redacted
 snapshot of the *resolved + expanded* config is recorded into the catalog store
 (best-effort — recording never fails a run). `faucet plan --diff` re-expands the
 current config, loads the last snapshot, and renders a per-row semantic diff:
@@ -818,20 +818,22 @@ kind (`run_failure`, `run_success`, `sla_breach`, `circuit_open`,
 `contract_abort`, `dlq_threshold`, `scheduler_stuck`). See the
 [Notifications](../cookbook/notifications.md) cookbook page.
 
-## `replicate`
+## `mirror`
+
+*(Formerly `faucet replicate`, still accepted as an alias.)*
 
 ```bash
-faucet replicate pipeline.yaml                 # bulk snapshot, then stream CDC; Ctrl-C to stop
-faucet replicate                               # auto-discover faucet.yaml in cwd
-faucet replicate pipeline.yaml --env-file prod.env
-faucet replicate pipeline.yaml --no-env-file
-faucet replicate app.yaml --profile prod       # apply a named profile overlay
+faucet mirror pipeline.yaml                 # bulk snapshot, then stream CDC; Ctrl-C to stop
+faucet mirror                               # auto-discover faucet.yaml in cwd
+faucet mirror pipeline.yaml --env-file prod.env
+faucet mirror pipeline.yaml --no-env-file
+faucet mirror app.yaml --profile prod       # apply a named profile overlay
 ```
 
 Bulk-snapshots a database table and then hands off to **change-data-capture from
 a position captured *before* the snapshot**, producing a true mirror (no gap, no
 duplicate rows) when paired with `write_mode: upsert`. The config must contain a
-top-level `replication:` block (see [config reference](config.md#replication));
+top-level `mirror:` block (see [config reference](config.md#mirror));
 `faucet run` ignores that block, exactly as it ignores `schedule:`.
 
 It runs two phases in order:
@@ -1302,7 +1304,7 @@ faucet cleanup --all --yes --in-flight-grace-secs 0   # nothing is running
 ```
 
 The ledger of outputs lives in the config's `catalog:` store — the same one
-`faucet run` / `schedule` / `replicate` record into and `faucet serve --history`
+`faucet run` / `schedule` / `mirror` record into and `faucet serve --history`
 browses — so `--store` can point at a server's store directly.
 
 **`--retention-days` vs `--older-than-days`** — easy to conflate, and they do

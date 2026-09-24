@@ -31,7 +31,7 @@ pipeline:
         type: Incremental
       replication_key: created
       primary_keys: ["id"]
-      partitions: []
+      requests: []
       schema_sample_size: 200
       state_key: stripe:charges
 

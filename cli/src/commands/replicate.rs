@@ -1,4 +1,4 @@
-//! `faucet replicate` — load a config with a `replication:` block, validate it,
+//! `faucet mirror` (alias `faucet replicate`) — load a config with a `mirror:` block, validate it,
 //! and run the two-phase snapshot→CDC orchestration.
 
 use crate::cli::ReplicateArgs;
@@ -21,8 +21,8 @@ pub async fn run(args: ReplicateArgs) -> CliResult<()> {
     let cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
     let spec = cfg.replication.as_ref().ok_or_else(|| {
         CliError::Config(
-            "no `replication:` block in config — use `faucet run` for a one-shot run, or add a \
-             `replication:` block (see `faucet schema replication`)"
+            "no `mirror:` block in config (formerly `replication:`) — use `faucet run` for a one-shot \
+             run, or add a `mirror:` block (see `faucet schema mirror`)"
                 .into(),
         )
     })?;
@@ -181,5 +181,43 @@ replication:
             format!("{err}").contains("durable state"),
             "should reject memory state at compile time: {err}"
         );
+    }
+
+    /// #670: `faucet mirror` is the command, `faucet replicate` its alias, and
+    /// the block parses under both `mirror:` and `replication:`.
+    #[test]
+    fn mirror_is_the_name_and_replicate_the_alias() {
+        use clap::Parser as _;
+        for verb in ["mirror", "replicate"] {
+            let cli = crate::cli::Cli::try_parse_from(["faucet", verb, "x.yaml"]).unwrap();
+            assert!(
+                matches!(cli.command, crate::cli::Command::Replicate(_)),
+                "{verb}"
+            );
+        }
+        for target in ["mirror", "replication"] {
+            let cli = crate::cli::Cli::try_parse_from(["faucet", "schema", target]).unwrap();
+            assert!(
+                matches!(
+                    cli.command,
+                    crate::cli::Command::Schema(crate::cli::SchemaArgs {
+                        target: Some(crate::cli::SchemaTarget::Replication),
+                        ..
+                    })
+                ),
+                "{target}"
+            );
+        }
+        let body = |key: &str| {
+            format!(
+                "version: 1\nname: m\npipeline:\n  source: {{ type: rest, config: {{ base_url: https://a }} }}\n  sink: {{ type: stdout, config: {{}} }}\n{key}:\n  mode: snapshot_then_cdc\n  snapshot:\n    source: {{ type: rest, config: {{ base_url: https://b }} }}\n"
+            )
+        };
+        for key in ["mirror", "replication"] {
+            let cfg = crate::config::parse_with_extension(&body(key), "yaml").unwrap();
+            assert!(cfg.replication.is_some(), "{key}");
+            let out = serde_json::to_value(&cfg).unwrap();
+            assert!(out.get("mirror").is_some() && out.get("replication").is_none());
+        }
     }
 }

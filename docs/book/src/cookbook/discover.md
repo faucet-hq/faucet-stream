@@ -113,6 +113,6 @@ directly — it returns the same `DatasetDescriptor` list.
 
 - [CLI reference](../reference/cli.md#discover) for the full flag table
 - Each connector README's "Dataset discovery" section for per-system details
-- [Replication (snapshot → CDC)](replication.md) and
+- [Mirror (snapshot → CDC)](replication.md) and
   [upsert / mirror tables](upsert.md) — the natural next step after
   discovering a whole database

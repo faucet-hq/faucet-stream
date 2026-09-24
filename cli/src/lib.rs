@@ -73,6 +73,7 @@ pub mod topology;
 pub mod transforms;
 #[cfg(feature = "cli-tui")]
 pub mod tui;
+pub mod vocabulary;
 
 pub use error::{CliError, CliResult};
 

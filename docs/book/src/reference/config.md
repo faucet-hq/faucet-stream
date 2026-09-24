@@ -903,7 +903,7 @@ and on every sink-side write).
 
 Optional top-level block declaring a freshness/volume SLA for the pipeline
 (evaluated after every root invocation by `faucet run` / `schedule` / `serve` /
-`replicate`). Fully opt-in and **never fails a run**: violations emit the
+`mirror`). Fully opt-in and **never fails a run**: violations emit the
 `faucet_pipeline_sla_violations_total{pipeline,row,kind}` counter and a
 structured warning, and `faucet doctor` reports staleness / baseline health.
 See the [SLA monitoring cookbook](../cookbook/sla.md).
@@ -1042,15 +1042,17 @@ per-chunk state keys, and obey `execution.on_error`. A partitioned row cannot be
 referenced by another row's `parent:` or `depends_on:`. Schema: `faucet schema
 partition`. See [Parallel range partitioning](../cookbook/partitioning.md).
 
-## `replication`
+## `mirror`
 
-Present only when you run [`faucet replicate`](cli.md#replicate). It turns the
+*(Formerly `replication:` — still accepted, with a deprecation warning; renamed in #670 so `replication` means only bookmark-based incremental reads.)*
+
+Present only when you run [`faucet mirror`](cli.md#mirror). It turns the
 main `pipeline` (whose `source` is a CDC connector) into a snapshot→CDC mirror by
 adding a one-time bulk-read snapshot source. `faucet run` ignores this block, the
 same way it ignores `schedule:`.
 
 ```yaml
-replication:
+mirror:
   mode: snapshot_then_cdc          # REQUIRED. Only mode in v1.
   continuous: true                 # After the snapshot, keep streaming CDC until SIGTERM. Default true.
   snapshot:                        # REQUIRED. The one-time bulk-read source.
@@ -1089,7 +1091,7 @@ the per-database log-retention caveats.
 
 Optional **defaults** for [`faucet backfill`](cli.md#backfill) — the range
 itself always comes from the command line. `faucet run` ignores this block, the
-same way it ignores `schedule:` / `replication:`. Whenever the block is
+same way it ignores `schedule:` / `mirror:`. Whenever the block is
 present, `faucet validate` also checks that at least one root source references
 a `${backfill.*}` / `${now.*}` scoping token (an unscoped source would replay
 identical data into every window).
@@ -1203,7 +1205,7 @@ Non-object records pass through unchanged.
 
 ## `catalog`
 
-Optional. When present, `faucet run` / `schedule` / `replicate` record every
+Optional. When present, `faucet run` / `schedule` / `mirror` record every
 successful **root** invocation into the [Data Movement Catalog](../cookbook/catalog.md) —
 the persistent, cross-run store of datasets, schema timelines, volume/freshness
 stats, and lineage edges. Recording **never fails a run**. `faucet serve`
@@ -1246,7 +1248,7 @@ ever deletes *recorded* paths, that also means its outputs are never
 automatically deleted — an opt-out of the bookkeeping, not just of the listing.
 
 Recording needs somewhere to record *to*: the `catalog:` block's store for
-`faucet run` / `schedule` / `replicate`, or the `--history` backend under
+`faucet run` / `schedule` / `mirror`, or the `--history` backend under
 `faucet serve`. With neither, tracking is inert and logs one line rather than
 failing the run.
 

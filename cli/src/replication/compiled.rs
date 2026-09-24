@@ -22,7 +22,7 @@ impl CompiledReplication {
         // No matrix fan-out in v1 — replication is a single pipeline.
         if !cfg.matrix.is_empty() {
             return Err(CliError::Config(
-                "replication does not support a `matrix:` — define a single CDC \
+                "mirror does not support a `matrix:` — define a single CDC \
                  pipeline (pipeline.source + pipeline.sink) plus replication.snapshot"
                     .into(),
             ));
@@ -30,14 +30,14 @@ impl CompiledReplication {
         // The main pipeline.source must be a capture-capable CDC source.
         let cdc = cfg.pipeline.source.as_ref().ok_or_else(|| {
             CliError::Config(
-                "replication requires `pipeline.source` to be the CDC source \
+                "mirror requires `pipeline.source` to be the CDC source \
                  (postgres-cdc / mysql-cdc / mongodb-cdc)"
                     .into(),
             )
         })?;
         if !crate::registry::source_supports_exactly_once(&cdc.kind) {
             return Err(CliError::Config(format!(
-                "replication `pipeline.source` must be a CDC source \
+                "mirror `pipeline.source` must be a CDC source \
                  (postgres-cdc / mysql-cdc / mongodb-cdc); got '{}'",
                 cdc.kind
             )));
@@ -46,7 +46,7 @@ impl CompiledReplication {
         let snap = &spec.snapshot.source;
         if crate::registry::source_supports_exactly_once(&snap.kind) {
             return Err(CliError::Config(format!(
-                "replication.snapshot.source must be a non-CDC bulk source \
+                "mirror.snapshot.source must be a non-CDC bulk source \
                  (e.g. postgres / mysql / mongodb); got CDC source '{}'",
                 snap.kind
             )));
@@ -54,20 +54,18 @@ impl CompiledReplication {
         crate::registry::source_schema(&snap.kind)?; // typed UnknownConnector if absent
         // A destination sink is required.
         let sink = cfg.pipeline.sink.as_ref().ok_or_else(|| {
-            CliError::Config("replication requires `pipeline.sink` (the destination)".into())
+            CliError::Config("mirror requires `pipeline.sink` (the destination)".into())
         })?;
         // A durable, shared state backend is required: the orchestrator seeds
         // the CDC bookmark and persists the phase marker, and the executor must
         // read them back. `memory` is per-instance (not shared) and would also
         // lose the phase marker on restart, defeating resumability.
         let state = cfg.pipeline.state.as_ref().ok_or_else(|| {
-            CliError::Config(
-                "replication requires a `state:` store (for the phase + bookmark)".into(),
-            )
+            CliError::Config("mirror requires a `state:` store (for the phase + bookmark)".into())
         })?;
         if state.kind == "memory" {
             return Err(CliError::Config(
-                "replication requires a durable state backend (file / redis / postgres), \
+                "mirror requires a durable state backend (file / redis / postgres), \
                  not `memory` — the snapshot→CDC handoff and resume depend on it"
                     .into(),
             ));
@@ -81,7 +79,7 @@ impl CompiledReplication {
         if write_mode != "upsert" {
             tracing::warn!(
                 write_mode,
-                "replication sink is not in upsert mode — the snapshot↔CDC boundary may \
+                "mirror sink is not in upsert mode — the snapshot↔CDC boundary may \
                  produce duplicate rows; use write_mode: upsert (with a key) for a true mirror"
             );
         }
