@@ -141,6 +141,13 @@ pub fn plan(origin: &Origin, remote: &[RemoteTemplate], local: &[LocalTemplate])
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     for r in remote {
+        if let Some(why) = &r.retired {
+            actions.push(SyncAction::Skipped {
+                name: r.stem.clone(),
+                reason: why.clone(),
+            });
+            continue;
+        }
         let id = format!("{}{}", origin.prefix, r.stem);
         if let Err(e) = TemplateId::parse(&id) {
             actions.push(SyncAction::Skipped {
@@ -269,6 +276,7 @@ mod tests {
             body: body.into(),
             format: ConfigFormat::Yaml,
             sidecar,
+            retired: None,
         }
     }
 
@@ -370,6 +378,7 @@ mod tests {
             launch: true,
             description: Some("d".into()),
             tags: vec!["dev".into()],
+            ..Default::default()
         };
         let follow = origin("", LaunchPolicy::Follow, PrunePolicy::Keep);
         let p = plan(&follow, &[remote("a", BODY_A, Some(side.clone()))], &[]);
@@ -493,6 +502,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_body_the_catalog_retired_is_skipped_with_its_reason() {
+        // #691: never register a version the catalog deprecated.
+        let o = origin("", LaunchPolicy::Always, PrunePolicy::Keep);
+        let mut r = remote("acme/erp", BODY_A, None);
+        r.retired = Some("catalog v3 is deprecated: drops invoices".into());
+        let p = plan(&o, &[r], &[]);
+        assert_eq!(
+            p.actions,
+            vec![SyncAction::Skipped {
+                name: "acme/erp".into(),
+                reason: "catalog v3 is deprecated: drops invoices".into(),
+            }]
+        );
+        assert_eq!(p.mutations(), 0);
     }
 
     #[test]

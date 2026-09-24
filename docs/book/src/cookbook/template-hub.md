@@ -255,6 +255,38 @@ A version whose body is not the snapshot's is fetched from the catalog at that
 commit and cached, so a pinned run composes the same document every time. A
 local directory hub has no history: selectors are an error there.
 
+#### Retiring a version
+
+A version cannot be edited: `@3` must always mean the same bytes, or a pinned
+pipeline changes under its owner. There are three supported moves instead:
+
+- **Fix forward.** Commit the fix; it becomes the next version.
+- **Roll back.** Re-commit an older body. It becomes a new version with the old
+  content, and the sidecar points `stable` at it.
+- **Retire.** Deprecate the bad version in the sidecar, with a reason that
+  names the replacement:
+
+```yaml
+# source-templates/acme/netsuite.faucet.yaml
+stable: 4
+deprecated:
+  2: "drops the invoices stream; use v3+"
+  1: "superseded"
+```
+
+A deprecated version stays resolvable, so nothing already pinned to it breaks.
+It is dropped from everything that *chooses* a version for you:
+
+- `@newest` resolves to the highest version that is **not** deprecated.
+- An explicit pin still runs, and prints
+  `warning: acme/netsuite v2 is deprecated: drops the invoices stream; use v3+ — stable is v4`.
+- The hub website hides deprecated versions behind **Show deprecated versions**.
+- A server mirroring the hub never registers a body the catalog marks deprecated.
+
+The catalog's CI refuses a sidecar that deprecates the `stable` version, or a
+version that does not exist, so the default selector always lands on a live
+version. Un-deprecating is deleting the entry.
+
 ### Choosing between variants: stars and trust
 
 When several namespaces publish a template for the same system, the catalog
@@ -314,6 +346,12 @@ faucet serve --history sqlite:./faucet.db --templates-sync cli/examples/template
 `paths` reads both catalog directories as one origin. A hub's source and sink
 names share the registry's id namespace, so a stem may appear in only one of
 them.
+
+The pull reads the catalog's `index.json` too. When a template's newest body is
+a version the publisher deprecated, the sync skips it (the report names the
+reason) instead of registering a retired version. Catalog sidecar keys
+(`stable`, `deprecated`) are accepted by the sync; they describe catalog
+versions, which the registry numbers separately.
 
 ### Publish a template
 

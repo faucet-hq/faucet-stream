@@ -196,6 +196,15 @@ pub struct Sidecar {
     /// Assignable channels (`dev`, `staging`, …) to point at the pulled version.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Template Hub catalog field (#682): the *catalog* version listings treat
+    /// as stable. Catalog versions come from git history, so the sync reads
+    /// them through the catalog's `index.json`, not from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable: Option<u32>,
+    /// Template Hub catalog field (#691): retired catalog versions and why.
+    /// A body the catalog's `index.json` marks deprecated is not registered.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub deprecated: std::collections::BTreeMap<u32, String>,
 }
 
 impl SyncFile {
@@ -447,5 +456,17 @@ origins:
         let s: Sidecar = serde_yaml::from_str("launch: true\ntags: [dev]").unwrap();
         assert!(s.launch);
         assert_eq!(s.tags, vec!["dev"]);
+    }
+
+    #[test]
+    fn a_template_hub_sidecar_parses() {
+        // #682 / #691: a catalog sidecar used to be rejected as unknown keys,
+        // which made the sync skip the template entirely.
+        let s: Sidecar =
+            serde_yaml::from_str("launch: false\nstable: 4\ndeprecated:\n  2: \"use v3+\"\n")
+                .unwrap();
+        assert_eq!(s.stable, Some(4));
+        assert_eq!(s.deprecated.get(&2).map(String::as_str), Some("use v3+"));
+        assert!(serde_yaml::from_str::<Sidecar>("stabel: 1").is_err(), "typos still fail");
     }
 }

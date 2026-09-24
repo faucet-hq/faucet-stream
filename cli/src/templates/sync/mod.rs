@@ -269,7 +269,16 @@ async fn sync_origin_inner(
 ) -> CliResult<SyncReport> {
     let fetcher = fetch::fetcher_for(&origin.source)?;
     let files = fetcher.list().await?;
-    let paired = fetch::pair_files(files);
+    let mut paired = fetch::pair_files(files);
+    match fetcher.catalog_index().await {
+        Ok(Some(index)) => fetch::apply_catalog_index(&mut paired.templates, &index),
+        Ok(None) => {}
+        // Deprecation is advisory for the mirror; an unreadable index is
+        // surfaced rather than failing the whole pull.
+        Err(e) => paired
+            .warnings
+            .push(format!("catalog index.json unreadable ({e}); version deprecations not applied")),
+    }
     let local = local_snapshot(store, &origin.prefix).await?;
     let plan = plan::plan(origin, &paired.templates, &local);
     tracing::info!(
