@@ -175,6 +175,7 @@ fn build_create_table_sql(
     table: &str,
     columns: &[faucet_core::PlannedColumn],
     json_column: Option<&str>,
+    key: &[String],
 ) -> String {
     let cols = match json_column {
         // JSON mode stores the whole record in one column, so the page's own
@@ -184,7 +185,14 @@ fn build_create_table_sql(
             quote_ident_sqlite("id"),
             quote_ident_sqlite(col)
         ),
-        None => faucet_core::render_columns(columns, quote_ident_sqlite, sqlite_keyword),
+        None => {
+            let defs = faucet_core::render_columns(columns, quote_ident_sqlite, sqlite_keyword);
+            // A keyed write needs a PRIMARY KEY for its ON CONFLICT target (#676).
+            match faucet_core::render_primary_key(key, quote_ident_sqlite) {
+                Some(pk) => format!("{defs}, {pk}"),
+                None => defs,
+            }
+        }
     };
     format!(
         "CREATE TABLE IF NOT EXISTS {} ({cols})",
@@ -277,6 +285,14 @@ fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String {
     }
 }
 
+/// How every write transaction starts. A deferred `BEGIN` takes a read lock and
+/// upgrades on its first write; in WAL mode that upgrade fails at once with
+/// `SQLITE_BUSY` when another connection committed in between, and the busy
+/// timeout is not consulted — so two streams writing one database file failed
+/// at random. `IMMEDIATE` takes the write lock up front, where the busy timeout
+/// does apply.
+const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
+
 /// A sink that writes JSON records to a SQLite table.
 pub struct SqliteSink {
     config: SqliteSinkConfig,
@@ -294,14 +310,7 @@ impl SqliteSink {
             return Ok(());
         }
         if !self.config.create_table {
-            let exists: Option<String> = sqlx::query_scalar(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-            )
-            .bind(&self.config.table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite table probe failed: {e}")))?;
-            if exists.is_none() {
+            if !self.table_exists(&self.config.table_name).await? {
                 return Err(faucet_core::missing_target_error(
                     "sqlite sink",
                     &self.config.table_name,
@@ -315,18 +324,40 @@ impl SqliteSink {
             SqliteColumnMapping::AutoMap => None,
             SqliteColumnMapping::Json { column } => Some(column.as_str()),
         };
-        let columns = match (json_column, faucet_core::plan_columns(records)) {
+        let key: &[String] = if self.config.write.dedups_by_key() {
+            &self.config.write.key
+        } else {
+            &[]
+        };
+        let planned = if key.is_empty() {
+            faucet_core::plan_columns(records)
+        } else {
+            faucet_core::plan_keyed_columns(records, key)
+        };
+        let columns = match (json_column, planned) {
             (Some(_), _) => Vec::new(),
             (None, Some(c)) => c,
             (None, None) => return Ok(()),
         };
-        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column);
+        // An overwrite writes to staging. On a first run (no target) nothing
+        // else creates staging, so it is created here from the page (#676).
+        let sql = build_create_table_sql(&self.effective_table(), &columns, json_column, key);
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite CREATE TABLE failed: {e}")))?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(table)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("SQLite table probe failed: {e}")))?;
+        Ok(exists.is_some())
     }
 
     /// Create a new SQLite sink. Establishes a connection pool.
@@ -436,7 +467,7 @@ impl SqliteSink {
         }
         let mut tx = self
             .pool
-            .begin()
+            .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
         let n = self.insert_json_tx(&mut tx, records, column).await?;
@@ -458,7 +489,7 @@ impl SqliteSink {
 
         let mut tx = self
             .pool
-            .begin()
+            .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
 
@@ -696,7 +727,7 @@ impl SqliteSink {
     async fn apply_plan(&self, plan: &faucet_core::WritePlan) -> Result<usize, FaucetError> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
 
@@ -752,7 +783,7 @@ impl SqliteSink {
 
         let mut tx = self
             .pool
-            .begin()
+            .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
 
@@ -929,9 +960,13 @@ impl faucet_core::Sink for SqliteSink {
 
     /// Create the staging table as an empty clone of the target's shape
     /// (`CREATE TABLE staging AS SELECT * FROM target WHERE 0`), dropping any
-    /// leftover staging table from a previously-crashed run first. The target
-    /// table must already exist (the sink never auto-creates it) — an overwrite
-    /// replaces its rows, not its definition.
+    /// leftover staging table from a previously-crashed run first.
+    ///
+    /// A missing target with `create_table: true` (a first run) has no shape to
+    /// clone: the first write creates staging from the page, and the commit
+    /// renames it into place (#676). Every step reads the database rather than
+    /// sink-instance memory, because the CLI runs begin, the writes and the
+    /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         let staging = quote_ident(&self.staging_table());
         let target = quote_ident(&self.config.table_name);
@@ -939,6 +974,9 @@ impl faucet_core::Sink for SqliteSink {
             .execute(&self.pool)
             .await
             .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: drop stale staging: {e}")))?;
+        if self.config.create_table && !self.table_exists(&self.config.table_name).await? {
+            return Ok(());
+        }
         sqlx::query(&format!(
             "CREATE TABLE {staging} AS SELECT * FROM {target} WHERE 0"
         ))
@@ -959,10 +997,26 @@ impl faucet_core::Sink for SqliteSink {
     /// anywhere rolls the whole swap back and the prior rows survive.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         let staging = quote_ident(&self.staging_table());
+        if !self.table_exists(&self.config.table_name).await? {
+            // First run: staging holds everything; publish it as the target.
+            // A run that wrote nothing has no staging either, and leaves no table.
+            if self.table_exists(&self.staging_table()).await? {
+                sqlx::query(&format!(
+                    "ALTER TABLE {staging} RENAME TO {}",
+                    quote_ident(&self.config.table_name)
+                ))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("sqlite overwrite: publish staging: {e}"))
+                })?;
+            }
+            return Ok(());
+        }
         let target = quote_ident(&self.config.table_name);
         let mut tx = self
             .pool
-            .begin()
+            .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: begin swap: {e}")))?;
         for stmt in [
@@ -982,7 +1036,8 @@ impl faucet_core::Sink for SqliteSink {
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
-    /// behind. Best-effort — the destination was never touched.
+    /// behind. Best-effort — the destination was never touched (on a first run
+    /// it was never created).
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         sqlx::query(&format!(
             "DROP TABLE IF EXISTS {}",
@@ -1146,6 +1201,8 @@ impl faucet_core::Sink for SqliteSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
         if !matches!(
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
@@ -1194,6 +1251,8 @@ impl faucet_core::Sink for SqliteSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
         self.ensure_commit_table().await?;
 
         // For upsert/delete modes, plan the page before opening the transaction
@@ -1213,7 +1272,7 @@ impl faucet_core::Sink for SqliteSink {
 
         let mut tx = self
             .pool
-            .begin()
+            .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
 

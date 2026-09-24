@@ -204,3 +204,32 @@ async fn write_batch_partial_routes_missing_key_per_row() {
         "id=1 must be present with name 'ok'"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
+    // #676: the auto-created table carries PRIMARY KEY (id), so ON CONFLICT
+    // has a target on the first run and a re-run updates in place.
+    let (_container, url) = start_postgres().await;
+    let first = PostgresSink::new(upsert_sink_config(&url)).await.unwrap();
+    first
+        .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})])
+        .await
+        .unwrap();
+    let second = PostgresSink::new(upsert_sink_config(&url)).await.unwrap();
+    second
+        .write_batch(&[
+            json!({"id": 1, "name": "a2"}),
+            json!({"id": 3, "name": "c"}),
+        ])
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM kv ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, "a2".into()), (2, "b".into()), (3, "c".into())]
+    );
+}

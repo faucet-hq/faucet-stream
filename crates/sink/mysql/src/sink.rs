@@ -211,6 +211,7 @@ fn build_create_table_sql(
     table: &str,
     columns: &[faucet_core::PlannedColumn],
     json_column: Option<&str>,
+    key: &[String],
 ) -> String {
     let cols = match json_column {
         // JSON mode stores the whole record in one column, so the page's own
@@ -220,12 +221,36 @@ fn build_create_table_sql(
             quote_ident_mysql("id"),
             quote_ident_mysql(col)
         ),
-        None => faucet_core::render_columns(columns, quote_ident_mysql, mysql_keyword),
+        None => {
+            // A keyed write needs a PRIMARY KEY for ON DUPLICATE KEY UPDATE
+            // (#676), and MySQL cannot index LONGTEXT, so key text columns get
+            // a bounded type.
+            let defs = faucet_core::render_column_defs(columns, quote_ident_mysql, |c| {
+                if key.contains(&c.name) {
+                    mysql_key_keyword(c.base_type)
+                } else {
+                    mysql_keyword(c.base_type)
+                }
+            });
+            match faucet_core::render_primary_key(key, quote_ident_mysql) {
+                Some(pk) => format!("{defs}, {pk}"),
+                None => defs,
+            }
+        }
     };
     format!(
         "CREATE TABLE IF NOT EXISTS {} ({cols})",
         quote_ident_mysql(table)
     )
+}
+
+/// The type for a primary-key column of a created table (#676). 191 characters
+/// keeps even a four-column utf8mb4 key under InnoDB's 3072-byte index limit.
+fn mysql_key_keyword(t: SqlBaseType) -> &'static str {
+    match t {
+        SqlBaseType::Text | SqlBaseType::Json => "VARCHAR(191)",
+        other => mysql_keyword(other),
+    }
 }
 
 /// Map a [`SqlBaseType`] to the MySQL type keyword used when adding/widening a
@@ -357,15 +382,7 @@ impl MysqlSink {
             return Ok(());
         }
         if !self.config.create_table {
-            let exists: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM information_schema.tables \
-                 WHERE table_schema = DATABASE() AND table_name = ?",
-            )
-            .bind(&self.config.table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("MySQL table probe failed: {e}")))?;
-            if exists.is_none() {
+            if !self.table_exists(&self.config.table_name).await? {
                 return Err(faucet_core::missing_target_error(
                     "mysql sink",
                     &self.config.table_name,
@@ -382,18 +399,42 @@ impl MysqlSink {
         // AutoMap needs a page to infer from; a page with nothing inferable
         // leaves the table uncreated so the next page can try, rather than
         // emitting a zero-column CREATE.
-        let columns = match (json_column, faucet_core::plan_columns(records)) {
+        let key: &[String] = if self.config.write.dedups_by_key() {
+            &self.config.write.key
+        } else {
+            &[]
+        };
+        let planned = if key.is_empty() {
+            faucet_core::plan_columns(records)
+        } else {
+            faucet_core::plan_keyed_columns(records, key)
+        };
+        let columns = match (json_column, planned) {
             (Some(_), _) => Vec::new(),
             (None, Some(c)) => c,
             (None, None) => return Ok(()),
         };
-        let sql = build_create_table_sql(&self.config.table_name, &columns, json_column);
+        // An overwrite writes to staging. On a first run (no target) nothing
+        // else creates staging, so it is created here from the page (#676).
+        let sql = build_create_table_sql(&self.effective_table_name(), &columns, json_column, key);
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL CREATE TABLE failed: {e}")))?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = DATABASE() AND table_name = ?",
+        )
+        .bind(table)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| FaucetError::Sink(format!("MySQL table probe failed: {e}")))?;
+        Ok(exists.is_some())
     }
 
     /// Create a new MySQL sink. Establishes a connection pool.
@@ -1124,9 +1165,16 @@ impl faucet_core::Sink for MysqlSink {
 
     /// Create the staging table as an empty structural clone of the target
     /// (`CREATE TABLE staging LIKE target`, which copies columns AND indexes),
-    /// dropping any leftover staging/old tables from a crashed run first. The
-    /// target must already exist — overwrite replaces its rows, not its schema.
+    /// dropping any leftover staging/old tables from a crashed run first.
+    ///
+    /// A missing target with `create_table: true` (a first run) has no shape to
+    /// clone: the first write creates staging from the page, and the commit
+    /// renames it into place (#676). Every step reads the database rather than
+    /// sink-instance memory, because the CLI runs begin, the writes and the
+    /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        let first_run =
+            self.config.create_table && !self.table_exists(&self.config.table_name).await?;
         let staging = quote_ident_mysql(&self.staging_table_name());
         let old = quote_ident_mysql(&self.old_table_name());
         let target = quote_ident_mysql(&self.config.table_name);
@@ -1135,11 +1183,14 @@ impl faucet_core::Sink for MysqlSink {
             .acquire()
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
-        for stmt in [
+        let mut stmts = vec![
             format!("DROP TABLE IF EXISTS {staging}"),
             format!("DROP TABLE IF EXISTS {old}"),
-            format!("CREATE TABLE {staging} LIKE {target}"),
-        ] {
+        ];
+        if !first_run {
+            stmts.push(format!("CREATE TABLE {staging} LIKE {target}"));
+        }
+        for stmt in stmts {
             sqlx::query(&stmt).execute(&mut *conn).await.map_err(|e| {
                 FaucetError::Sink(format!(
                     "mysql overwrite: prepare staging from '{}' (does the table exist?): {e}",
@@ -1164,6 +1215,19 @@ impl faucet_core::Sink for MysqlSink {
             .acquire()
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL pool acquire failed: {e}")))?;
+        if !self.table_exists(&self.config.table_name).await? {
+            // First run: staging holds everything; publish it as the target.
+            // A run that wrote nothing has no staging either, and leaves no table.
+            if self.table_exists(&self.staging_table_name()).await? {
+                sqlx::query(&format!("RENAME TABLE {staging} TO {target}"))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        FaucetError::Sink(format!("mysql overwrite: publish staging: {e}"))
+                    })?;
+            }
+            return Ok(());
+        }
         sqlx::query(&format!(
             "RENAME TABLE {target} TO {old}, {staging} TO {target}"
         ))
@@ -1385,6 +1449,8 @@ impl faucet_core::Sink for MysqlSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
         if !matches!(
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
@@ -1433,6 +1499,8 @@ impl faucet_core::Sink for MysqlSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
         self.ensure_commit_table().await?;
 
         // For upsert/delete modes, plan the page before opening the transaction
@@ -1580,6 +1648,21 @@ mod tests {
 
         let sql = build_modify_column_sql("`t`", "flag", SqlBaseType::Boolean);
         assert_eq!(sql, "ALTER TABLE `t` MODIFY COLUMN `flag` TINYINT(1)");
+    }
+
+    #[test]
+    fn create_table_sql_for_a_keyed_write_bounds_key_text_and_adds_a_primary_key() {
+        let key = vec!["sku".to_string()];
+        let cols = faucet_core::plan_keyed_columns(
+            &[serde_json::json!({ "sku": "a", "note": "long text" })],
+            &key,
+        )
+        .expect("a plan");
+        let sql = build_create_table_sql("t", &cols, None, &key);
+        assert!(sql.contains("`sku` VARCHAR(191)"), "{sql}");
+        assert!(sql.contains("`note` LONGTEXT"), "{sql}");
+        assert!(sql.ends_with(", PRIMARY KEY (`sku`))"), "{sql}");
+        assert_eq!(mysql_key_keyword(SqlBaseType::Integer), "BIGINT");
     }
 
     #[test]

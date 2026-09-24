@@ -310,3 +310,37 @@ async fn write_batch_partial_routes_missing_key_per_row() {
     assert_eq!(count, 1, "only the good row should be written");
     assert_eq!(name, "ok", "id=1 must be present with name 'ok'");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
+    // #676: the auto-created table carries PRIMARY KEY on a text key (typed
+    // VARCHAR(191), since MySQL cannot index LONGTEXT), and the second sink's
+    // unique-index check passes against it.
+    let (_container, url) = start_mysql().await;
+    let first = MysqlSink::new(make_upsert_sink_config(&url, vec!["sku".into()]))
+        .await
+        .unwrap();
+    first
+        .write_batch(&[json!({"sku": "a", "qty": 1}), json!({"sku": "b", "qty": 2})])
+        .await
+        .unwrap();
+    let second = MysqlSink::new(make_upsert_sink_config(&url, vec!["sku".into()]))
+        .await
+        .unwrap();
+    second
+        .write_batch(&[
+            json!({"sku": "a", "qty": 10}),
+            json!({"sku": "c", "qty": 3}),
+        ])
+        .await
+        .unwrap();
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    let rows: Vec<(String, i64)> = sqlx::query_as("SELECT sku, qty FROM t ORDER BY sku")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![("a".into(), 10), ("b".into(), 2), ("c".into(), 3)]
+    );
+}

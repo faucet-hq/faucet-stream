@@ -391,3 +391,55 @@ fn hub_flags_are_mutually_required_and_exclusive_with_a_config_path() {
     );
     assert!(Cli::try_parse_from(["faucet", "validate", "--source", "a", "--sink", "b"]).is_ok());
 }
+
+/// #676: the shipped `faucet-hq/example-csv` × `faucet-hq/sqlite` pairing asks
+/// for `overwrite` on every stream. Against a fresh database file the first
+/// run creates each table, and the second replaces it — the row counts match
+/// the CSVs both times instead of failing on a missing target or doubling.
+#[cfg(all(feature = "source-csv", feature = "sink-sqlite"))]
+#[tokio::test]
+async fn shipped_example_pairing_runs_twice_against_a_fresh_database() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let hub = repo.join("hub");
+    let data = hub.join("examples/data");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("fresh.db");
+    let csv_rows = |name: &str| {
+        std::fs::read_to_string(data.join(name))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .count() as i64
+    };
+    for pass in 1..=2 {
+        run(&[
+            "run",
+            "--source",
+            "faucet-hq/example-csv",
+            "--sink",
+            "faucet-hq/sqlite",
+            "--hub",
+            hub.to_str().unwrap(),
+            "--no-env-file",
+            "--quiet",
+            "--param",
+            &format!("data_dir={}", data.display()),
+            "--param",
+            &format!("sqlite_path={}", db.display()),
+        ])
+        .await
+        .unwrap_or_else(|e| panic!("pass {pass}: {e}"));
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.display()))
+            .await
+            .unwrap();
+        for (table, file) in [("orders", "orders.csv"), ("customers", "customers.csv")] {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(n, csv_rows(file), "pass {pass}: {table}");
+        }
+        pool.close().await;
+    }
+}

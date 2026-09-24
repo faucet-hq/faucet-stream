@@ -324,3 +324,36 @@ async fn write_batch_partial_routes_missing_key_per_row() {
     );
     assert_eq!(name_of(&pool, "dbo.t", 1).await, "ok", "id=1 → name 'ok'");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
+    // #676: auto_columns creates dbo.t with PRIMARY KEY (id) on the first page.
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    let write = || WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["id".to_string()],
+        delete_marker: None,
+    };
+    let first = MssqlSink::new(upsert_sink_cfg(&cfg, write()))
+        .await
+        .expect("sink");
+    first
+        .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})])
+        .await
+        .expect("first write");
+    let second = MssqlSink::new(upsert_sink_cfg(&cfg, write()))
+        .await
+        .expect("sink");
+    second
+        .write_batch(&[
+            json!({"id": 1, "name": "a2"}),
+            json!({"id": 3, "name": "c"}),
+        ])
+        .await
+        .expect("second write");
+    assert_eq!(count(&pool, "dbo.t").await, 3);
+    assert_eq!(name_of(&pool, "dbo.t", 1).await, "a2");
+}

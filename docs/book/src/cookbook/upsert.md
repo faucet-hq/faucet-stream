@@ -33,10 +33,10 @@ Eight sinks support `upsert`/`delete`; every other sink is append-only.
 
 | Sink | Requires | Native primitive |
 |------|----------|------------------|
-| `postgres` | `column_mapping: auto_map` + UNIQUE/PK on `key` | `INSERT … ON CONFLICT … DO UPDATE` |
-| `sqlite` | `column_mapping: auto_map` + UNIQUE/PK on `key` | `INSERT … ON CONFLICT … DO UPDATE` |
-| `mysql` | `column_mapping: auto_map` + a PRIMARY/UNIQUE index whose columns **exactly match** `key` | `INSERT … ON DUPLICATE KEY UPDATE` |
-| `mssql` | `column_mapping: auto_columns` + UNIQUE/PK on `key` | `MERGE` |
+| `postgres` | `column_mapping: auto_map` + UNIQUE/PK on `key` (created for you) | `INSERT … ON CONFLICT … DO UPDATE` |
+| `sqlite` | `column_mapping: auto_map` + UNIQUE/PK on `key` (created for you) | `INSERT … ON CONFLICT … DO UPDATE` |
+| `mysql` | `column_mapping: auto_map` + a PRIMARY/UNIQUE index whose columns **exactly match** `key` (created for you) | `INSERT … ON DUPLICATE KEY UPDATE` |
+| `mssql` | `column_mapping: auto_columns` + UNIQUE/PK on `key` (created for you) | `MERGE` |
 | `mongodb` | — (schemaless) | `replace_one(upsert)` / `delete_one`, `key` → match filter |
 | `elasticsearch` | — (schemaless) | `_bulk` `index` / `delete`, `key` → `_id` |
 | `bigquery` | a defined table schema + `key` columns | in-place `MERGE … USING UNNEST(@payload)` (no staging table) |
@@ -49,6 +49,13 @@ mode cannot upsert because there is no per-column conflict target. They also req
 what the database's `ON CONFLICT` / `ON DUPLICATE KEY` / `MERGE` matches against;
 without it the upsert silently degrades to plain inserts. faucet does not create
 the constraint for you; create it on the destination table first.
+
+**"Created for you":** when the table does not exist and `create_table: true`
+(the default), the SQL sinks create it with `PRIMARY KEY (<key…>)` on the key
+columns, so the very first run upserts correctly. On MySQL and SQL Server, text
+key columns are created as `VARCHAR(191)` / `NVARCHAR(450)`, because neither can
+index an unbounded text type. A table you created yourself must carry that
+constraint already; the sink checks, and does not alter your table.
 
 > **MySQL validates the index match at startup.** MySQL's `ON DUPLICATE KEY
 > UPDATE` resolves against *whichever* unique index a row collides with — not the
@@ -308,10 +315,14 @@ uncancelled**. If the run fails or is cancelled part-way, the staging target is
 discarded and the previous destination is left exactly as it was. There is no
 window where the table is empty because a load died halfway.
 
-**The target must already exist.** Overwrite replaces the destination's *rows*,
-not its definition — the sink never creates the table/collection. Create it once
-up front (with whatever schema, indexes, partitioning you want); each run
-refreshes its contents.
+**A first run creates the target.** With `create_table: true` (the default) a
+destination that does not exist yet is created by the first run: the staging
+table is built from the first page's inferred columns, and the commit renames it
+into place. Until that commit the target does not exist, and a failed first run
+leaves no table behind. From the second run on, overwrite replaces the
+destination's *rows*, not its definition — so indexes, partitioning, or column
+types you add after the first run survive every refresh. With
+`create_table: false`, a missing target is an error.
 
 ### Supported sinks & mechanism
 

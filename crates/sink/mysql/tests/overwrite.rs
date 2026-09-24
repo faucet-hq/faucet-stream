@@ -160,3 +160,60 @@ async fn overwrite_reported_in_supported_write_modes() {
     assert!(sink.supported_write_modes().contains(&WriteMode::Overwrite));
     assert!(sink.is_overwrite());
 }
+
+async fn target_present(url: &str) -> bool {
+    let url = url.to_string();
+    table_exists(&url, "t").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_on_a_fresh_database_creates_then_swaps() {
+    // #676. The CLI runs begin, the writes and the commit on *different* sink
+    // instances, so each step gets its own sink.
+    let (_container, url) = start_mysql().await;
+    let sink = || MysqlSink::new(overwrite_config(&url));
+
+    sink().await.unwrap().begin_overwrite().await.unwrap();
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})])
+        .await
+        .unwrap();
+    assert!(
+        !target_present(&url).await,
+        "a first run stages; the target appears at commit"
+    );
+    sink().await.unwrap().commit_overwrite().await.unwrap();
+    assert_eq!(names_ordered(&url).await, vec!["a", "b"]);
+
+    sink().await.unwrap().begin_overwrite().await.unwrap();
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 3, "name": "c"})])
+        .await
+        .unwrap();
+    assert_eq!(
+        names_ordered(&url).await,
+        vec!["a", "b"],
+        "second run is staged"
+    );
+    sink().await.unwrap().commit_overwrite().await.unwrap();
+    assert_eq!(names_ordered(&url).await, vec!["c"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborted_first_overwrite_leaves_no_table_behind() {
+    let (_container, url) = start_mysql().await;
+    let sink = || MysqlSink::new(overwrite_config(&url));
+    sink().await.unwrap().begin_overwrite().await.unwrap();
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .unwrap();
+    sink().await.unwrap().abort_overwrite().await.unwrap();
+    assert!(!target_present(&url).await);
+}
