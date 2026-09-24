@@ -14,6 +14,9 @@ independently).
 > `cli/CHANGELOG.md`, `faucet-stream/CHANGELOG.md`), maintained automatically
 > by release-plz. This root file preserves the consolidated history up to and
 > including the 1.1.0 release; new entries are **not** added here.
+>
+> Every release since, across all crates, is on the site's
+> [changelog](https://faucet-hq.github.io/changelog/).
 
 ## [Unreleased]
 
