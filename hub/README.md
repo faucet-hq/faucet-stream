@@ -19,12 +19,12 @@ Any source × any sink composes into an ordinary pipeline config at run time:
 
 ```bash
 faucet hub list                                            # what's in the catalog at --hub / $FAUCET_HUB / ./hub
-faucet hub check   --source example-rest-api --sink bigquery   # per-stream write modes
-faucet run         --source example-csv --sink jsonl           # runs offline: ./out/example-csv/*.jsonl
-faucet run         --source example-rest-api --sink bigquery \
+faucet hub check   --source faucet-hq/example-rest-api --sink faucet-hq/bigquery   # per-stream write modes
+faucet run         --source faucet-hq/example-csv --sink faucet-hq/jsonl           # runs offline: ./out/example-csv/*.jsonl
+faucet run         --source faucet-hq/example-rest-api --sink faucet-hq/bigquery \
   --param base_url=https://api.example.com/v1 --param api_token="$API_TOKEN" \
   --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
-faucet hub compose --source example-rest-api --sink postgres --out my-pipeline.yaml   # inspect / register / edit
+faucet hub compose --source faucet-hq/example-rest-api --sink faucet-hq/postgres --out my-pipeline.yaml   # inspect / register / edit
 ```
 
 The composer resolves each stream's write preference against the sink's real
@@ -57,7 +57,7 @@ hub id is `<owner>/<name>`). The templates shipped here are the official
 
 ```bash
 faucet hub lint                                   # publishability lint
-faucet hub check --source <yours> --sink jsonl    # and against bigquery / postgres / sqlite
+faucet hub check --source <your-login>/<name> --sink faucet-hq/jsonl    # and against bigquery / postgres / sqlite
 cargo test -p faucet-cli --test hub_catalog -- --ignored regenerate   # refresh the matrix page + index.json
 cargo test -p faucet-cli --test hub_catalog
 ```

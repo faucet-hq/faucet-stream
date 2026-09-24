@@ -475,19 +475,20 @@ curl -sX POST http://127.0.0.1:8080/v1/templates/tenant-sync/runs \
 #        "template_id":"tenant-sync","template_version":2,
 #        "params":{"tenant_id":"acme","api_token":"***"},"streams":[]}
 
-# Register a source template and a sink template (their ids are their `name:`) …
+# Register a source template and a sink template (ids are `owner/name`) …
 curl -sX POST http://127.0.0.1:8080/v1/templates -H "Authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{"config":"kind: source-template\nname: acme-billing\n…","launch":true}'
+  -H 'content-type: application/json' -d '{"config":"kind: source-template\nname: billing\nowner: acme\n…","launch":true}'
 curl -sX POST http://127.0.0.1:8080/v1/templates -H "Authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{"config":"kind: sink-template\nname: bigquery\n…","launch":true}'
+  -H 'content-type: application/json' -d '{"config":"kind: sink-template\nname: bigquery\nowner: faucet-hq\n…","launch":true}'
 curl -s "http://127.0.0.1:8080/v1/templates?kind=sink-template" -H "Authorization: Bearer $TOKEN"
 
-# … and run the pairing: the trigger names the sink, and binds both halves' params.
-curl -sX POST http://127.0.0.1:8080/v1/templates/acme-billing/runs \
+# … and run the pairing. An id's `/` is percent-encoded in the path (`acme%2Fbilling`);
+# the trigger names the sink, and binds both halves' params.
+curl -sX POST http://127.0.0.1:8080/v1/templates/acme%2Fbilling/runs \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"sink":"bigquery","sink_version":"stable","params":{"api_token":"…","bq_project":"my-project"}}'
-# → 202 {"run_id":"…","template_id":"acme-billing","template_version":1,
-#        "sink_template":"bigquery","sink_template_version":1,
+  -d '{"sink":"faucet-hq/bigquery","sink_version":"stable","params":{"api_token":"…","bq_project":"my-project"}}'
+# → 202 {"run_id":"…","template_id":"acme/billing","template_version":1,
+#        "sink_template":"faucet-hq/bigquery","sink_template_version":1,
 #        "streams":[{"stream":"bills","requested":["overwrite","upsert"],"chosen":"overwrite","key":["id"]}, …],
 #        "params":{"api_token":"***","bq_project":"my-project"}}
 ```

@@ -139,10 +139,10 @@ is still accepted as a pipeline but prints a deprecation notice — add
 `kind: pipeline` to a complete config.
 
 ```bash
-faucet template register hub/source-templates/acme-billing.yaml --launch    # id = acme-billing
+faucet template register hub/source-templates/acme/billing.yaml --launch    # id = acme/billing
 faucet template register hub/sink-templates/faucet-hq/bigquery.yaml --launch  # id = faucet-hq/bigquery
 faucet template list --kind sink-template
-faucet template run acme-billing --sink faucet-hq/bigquery \
+faucet template run acme/billing --sink faucet-hq/bigquery \
   --param api_token="$ACME_TOKEN" --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
 # → composes the two, prints the per-stream plan (bills: overwrite, transactions: upsert[id], …), runs
 ```
@@ -378,8 +378,8 @@ covered.
 
 ```yaml
 version: 1
-template: acme-billing
-sink: bigquery
+template: acme/billing
+sink: faucet-hq/bigquery
 suite:
   auto: { enum_coverage: true }
   cases:
@@ -547,10 +547,10 @@ curl -sX POST localhost:8080/v1/templates/tenant-sync/runs \
 
 ```bash
 # A source template names its sink; params are the union of both halves.
-curl -sX POST localhost:8080/v1/templates/acme-billing/runs \
+curl -sX POST localhost:8080/v1/templates/acme%2Fbilling/runs \
   -H "Authorization: Bearer $TOKEN" \
-  -d '{"sink":"bigquery","sink_version":"stable","params":{"api_token":"…","bq_project":"my-project"}}'
-# → 202 {…,"template_id":"acme-billing","template_version":1,"sink_template":"bigquery",
+  -d '{"sink":"faucet-hq/bigquery","sink_version":"stable","params":{"api_token":"…","bq_project":"my-project"}}'
+# → 202 {…,"template_id":"acme/billing","template_version":1,"sink_template":"faucet-hq/bigquery",
 #        "sink_template_version":1,"streams":[{"stream":"bills","chosen":"overwrite",…},…]}
 curl -s "localhost:8080/v1/templates?kind=source-template" -H "Authorization: Bearer $TOKEN"
 ```
