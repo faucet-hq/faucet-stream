@@ -109,38 +109,136 @@ async fn load_catalog(hub_flag: Option<&str>) -> CliResult<Catalog> {
     Catalog::load(&hub::resolve_hub(hub_flag).await?)
 }
 
-/// `faucet hub list` — every source and sink template in the catalog.
+/// `faucet hub list` — every source and sink template in the catalog, with
+/// the trust signals its `index.json` records (#685).
 async fn list(a: HubListArgs) -> CliResult<()> {
-    let cat = load_catalog(a.hub.as_deref()).await?;
-    if a.json {
-        println!("{}", pretty(&hub::catalog::index_json(&cat))?);
-        return Ok(());
+    let dir = hub::resolve_hub(a.hub.as_deref()).await?;
+    let cat = Catalog::load(&dir)?;
+    let index = hub::IndexVersions::load(&dir);
+    print!(
+        "{}",
+        render_list(&cat, index.as_ref(), a.sort.into(), a.json)?
+    );
+    Ok(())
+}
+
+fn render_list(
+    cat: &Catalog,
+    index: Option<&hub::IndexVersions>,
+    sort: hub::trust::SortBy,
+    json: bool,
+) -> CliResult<String> {
+    use hub::catalog::{SINK_DIR, SOURCE_DIR};
+    use hub::trust::{Candidate, TrustSignals, order};
+    let trust_of = |subdir: &str, id: &str| -> Option<TrustSignals> {
+        index
+            .and_then(|i| i.entry(subdir, id))
+            .and_then(|e| e.trust.clone())
+    };
+    let src_ids: Vec<String> = cat.sources.iter().map(|(_, t)| t.id()).collect();
+    let snk_ids: Vec<String> = cat.sinks.iter().map(|(_, t)| t.id()).collect();
+    let src_trust: Vec<Option<TrustSignals>> =
+        src_ids.iter().map(|id| trust_of(SOURCE_DIR, id)).collect();
+    let snk_trust: Vec<Option<TrustSignals>> =
+        snk_ids.iter().map(|id| trust_of(SINK_DIR, id)).collect();
+    let src_order = order(
+        &src_ids
+            .iter()
+            .zip(&cat.sources)
+            .zip(&src_trust)
+            .map(|((id, (_, t)), tr)| Candidate {
+                id,
+                official: t.is_official(),
+                trust: tr.as_ref(),
+            })
+            .collect::<Vec<_>>(),
+        sort,
+    );
+    let snk_order = order(
+        &snk_ids
+            .iter()
+            .zip(&cat.sinks)
+            .zip(&snk_trust)
+            .map(|((id, (_, t)), tr)| Candidate {
+                id,
+                official: t.is_official(),
+                trust: tr.as_ref(),
+            })
+            .collect::<Vec<_>>(),
+        sort,
+    );
+
+    if json {
+        let mut v = hub::catalog::index_json(cat);
+        for (key, ids, trust, ord) in [
+            ("sources", &src_ids, &src_trust, &src_order),
+            ("sinks", &snk_ids, &snk_trust, &snk_order),
+        ] {
+            let list = v[key].as_array().cloned().unwrap_or_default();
+            let sorted: Vec<serde_json::Value> = ord
+                .iter()
+                .filter_map(|&i| {
+                    let mut e = list.iter().find(|e| e["id"] == ids[i].as_str())?.clone();
+                    if let Some(t) = &trust[i] {
+                        e["trust"] = serde_json::to_value(t).unwrap_or_default();
+                    }
+                    Some(e)
+                })
+                .collect();
+            v[key] = serde_json::Value::Array(sorted);
+        }
+        return Ok(format!("{}\n", pretty(&v)?));
     }
-    println!("source templates ({}):", cat.sources.len());
-    for (_, s) in &cat.sources {
-        println!(
-            "  {:<24} {:<10} {:>3} stream(s)  {}",
-            s.name,
+
+    let stars = |t: &Option<TrustSignals>| {
+        t.as_ref()
+            .and_then(|t| t.stars)
+            .map(|n| format!("★ {n}"))
+            .unwrap_or_default()
+    };
+    let updated = |t: &Option<TrustSignals>| {
+        t.as_ref()
+            .and_then(|t| t.updated.clone())
+            .unwrap_or_default()
+    };
+    let w = src_ids
+        .iter()
+        .chain(&snk_ids)
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .max(12);
+    let mut out = format!("source templates ({}):\n", cat.sources.len());
+    for &i in &src_order {
+        let s = &cat.sources[i].1;
+        out.push_str(&format!(
+            "  {:<w$} {:<10} {:>3} stream(s) {:>7} {:<10}  {}\n",
+            src_ids[i],
             s.source.kind,
             s.streams.len(),
+            stars(&src_trust[i]),
+            updated(&src_trust[i]),
             s.description.as_deref().unwrap_or("")
-        );
+        ));
     }
-    println!("sink templates ({}):", cat.sinks.len());
-    for (_, k) in &cat.sinks {
-        println!(
-            "  {:<24} {:<10} {:<28} {}",
-            k.name,
+    out.push_str(&format!("sink templates ({}):\n", cat.sinks.len()));
+    for &i in &snk_order {
+        let k = &cat.sinks[i].1;
+        out.push_str(&format!(
+            "  {:<w$} {:<10} {:<28} {:>7} {:<10}  {}\n",
+            snk_ids[i],
             k.sink.kind,
             crate::registry::sink_supported_write_modes(&k.sink.kind)
                 .iter()
                 .map(|m| m.as_str())
                 .collect::<Vec<_>>()
                 .join("|"),
+            stars(&snk_trust[i]),
+            updated(&snk_trust[i]),
             k.description.as_deref().unwrap_or("")
-        );
+        ));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// `faucet hub matrix [--format table|markdown|json]` — the source × sink
@@ -340,6 +438,7 @@ mod tests {
                 command: HubCommand::List(HubListArgs {
                     hub: Some(repo_hub()),
                     json,
+                    sort: crate::cli::HubSort::Stars,
                 }),
             })
             .await
@@ -392,6 +491,61 @@ mod tests {
         .expect("one file lints clean");
     }
 
+    #[test]
+    fn list_shows_and_sorts_by_the_index_trust_signals() {
+        let dir = std::path::Path::new(&repo_hub()).to_path_buf();
+        let cat = Catalog::load(&dir).unwrap();
+        let index: hub::IndexVersions = serde_json::from_value(serde_json::json!({
+            "sources": [
+                {"id": "faucet-hq/example-rest-api", "trust": {"stars": 7, "updated": "2026-09-01"}},
+                {"id": "faucet-hq/example-csv", "trust": {"stars": 2, "updated": "2026-09-20"}}
+            ],
+            "sinks": [{"id": "faucet-hq/sqlite", "trust": {"stars": 1}}]
+        }))
+        .unwrap();
+        let by_stars = render_list(&cat, Some(&index), hub::trust::SortBy::Stars, false).unwrap();
+        let rest = by_stars.find("faucet-hq/example-rest-api").unwrap();
+        let csv = by_stars.find("faucet-hq/example-csv").unwrap();
+        assert!(rest < csv, "most starred first:\n{by_stars}");
+        assert!(
+            by_stars.contains("★ 7") && by_stars.contains("2026-09-20"),
+            "{by_stars}"
+        );
+        let sqlite = by_stars.find("faucet-hq/sqlite").unwrap();
+        assert!(
+            sqlite < by_stars.find("faucet-hq/bigquery").unwrap(),
+            "{by_stars}"
+        );
+
+        let by_date = render_list(&cat, Some(&index), hub::trust::SortBy::Updated, false).unwrap();
+        assert!(
+            by_date.find("faucet-hq/example-csv").unwrap()
+                < by_date.find("faucet-hq/example-rest-api").unwrap()
+        );
+
+        let json: serde_json::Value = serde_json::from_str(
+            &render_list(&cat, Some(&index), hub::trust::SortBy::Stars, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["sources"][0]["id"], "faucet-hq/example-rest-api");
+        assert_eq!(json["sources"][0]["trust"]["stars"], 7);
+        assert!(
+            json["sinks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k.get("trust").is_none())
+        );
+
+        // No index: plain listing, alphabetical.
+        let plain = render_list(&cat, None, hub::trust::SortBy::Name, false).unwrap();
+        assert!(!plain.contains('★'));
+        assert!(
+            plain.find("faucet-hq/example-csv").unwrap()
+                < plain.find("faucet-hq/example-rest-api").unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn an_unknown_pairing_and_a_missing_hub_are_errors() {
         let err = run(HubArgs {
@@ -409,6 +563,7 @@ mod tests {
             command: HubCommand::List(HubListArgs {
                 hub: Some("/definitely/not/a/hub".into()),
                 json: false,
+                sort: Default::default(),
             }),
         })
         .await

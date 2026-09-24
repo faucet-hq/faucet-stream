@@ -933,6 +933,30 @@ pub struct HubListArgs {
     pub hub: Option<String>,
     #[arg(long)]
     pub json: bool,
+    /// Order: `name`, `stars` (most starred first), or `updated` (most
+    /// recently changed first). Stars and dates come from the catalog's
+    /// `index.json`; a hub without them sorts those last.
+    #[arg(long, value_enum, default_value_t = HubSort::Name)]
+    pub sort: HubSort,
+}
+
+/// Ordering for `faucet hub list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum HubSort {
+    #[default]
+    Name,
+    Stars,
+    Updated,
+}
+
+impl From<HubSort> for crate::hub::trust::SortBy {
+    fn from(s: HubSort) -> Self {
+        match s {
+            HubSort::Name => Self::Name,
+            HubSort::Stars => Self::Stars,
+            HubSort::Updated => Self::Updated,
+        }
+    }
 }
 
 /// Output format for `faucet hub matrix`.
