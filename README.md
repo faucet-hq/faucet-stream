@@ -155,7 +155,7 @@ for the DAG pattern. The [`hub/`](hub) directory is the **Template Hub** layout:
 ([faucet-hq/template-hub](https://github.com/faucet-hq/template-hub), the default `--hub`, browsable at
 [faucet-hq.github.io/hub](https://faucet-hq.github.io/hub)), from files, or from the template registry
 (`faucet template run <source> --sink <sink>`, `POST /v1/templates/{id}/runs`) —
-`faucet run --source <system> --sink bigquery`, or `--sink jsonl` to validate locally first (see the
+`faucet run --source <owner>/<system> --sink faucet-hq/bigquery`, or `--sink faucet-hq/jsonl` to validate locally first (see the
 [cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html)). The [`cli/examples/`](cli/examples) directory has runnable configs for
 every common source→sink combination.
 

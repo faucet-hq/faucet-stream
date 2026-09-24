@@ -18,11 +18,11 @@ The Template Hub splits them:
 Any source × any sink composes into an ordinary pipeline at run time:
 
 ```bash
-faucet run --source acme-billing --sink bigquery \
+faucet run --source acme/billing --sink faucet-hq/bigquery \
   --param api_token="$ACME_TOKEN" --param bq_project=my-project --param bq_sa_key="$BQ_SA_KEY"
 
-faucet run --source acme-billing --sink jsonl     # the same source, validated locally first
-faucet run --source acme-billing --sink postgres  # real upsert/overwrite semantics
+faucet run --source acme/billing --sink faucet-hq/jsonl     # the same source, validated locally first
+faucet run --source acme/billing --sink faucet-hq/postgres  # real upsert/overwrite semantics
 ```
 
 The engine repository ships the **layout and tooling** under
@@ -40,7 +40,8 @@ catalog the docs are built from, with a copy-paste command per pairing.
 
 ```yaml
 kind: source-template
-name: acme-billing               # hub id, and the composed pipeline's `name:`
+name: billing
+owner: acme                      # hub id acme/billing: the composed pipeline's `name:`
 description: Acme Billing — invoices, payments, and customers
 tags: [finance, billing]
 params:
@@ -137,7 +138,7 @@ only a sink that dedups by key can honour them.
 
 ```yaml
 version: 1
-name: acme-billing                           # the source's name
+name: acme/billing                           # the source's hub id
 params: { …merged… }
 pipeline:
   sources: { default: <source-template.source> }
@@ -159,7 +160,7 @@ capabilities) or through an alias. A stream with no viable mode fails the
 pairing with a per-stream message naming both sides:
 
 ```
-source-template 'acme-billing' cannot compose with sink-template 'plain' — 2 stream(s) have no viable write mode:
+source-template 'acme/billing' cannot compose with sink-template 'plain' — 2 stream(s) have no viable write mode:
   - bills: needs overwrite|upsert; sink 'jsonl' supports only append
   - transactions: needs upsert|append; …
 ```
@@ -198,7 +199,7 @@ It is the default hub, so with no `./hub` checkout and no `--hub`:
 
 ```bash
 faucet hub list                                   # fetches github:faucet-hq/template-hub (cached)
-faucet run --source acme-billing --sink bigquery --param api_token="$T" …
+faucet run --source acme/billing --sink faucet-hq/bigquery --param api_token="$T" …
 ```
 
 A remote hub is any GitHub repository laid out like `hub/`:
@@ -245,9 +246,9 @@ it. The catalog records all of this in its `index.json`, and the CLI honours
 it:
 
 ```bash
-faucet run --source acme/netsuite --sink bigquery …          # stable (the default)
-faucet run --source acme/netsuite@newest --sink bigquery …   # the tip
-faucet run --source acme/netsuite@3 --sink bigquery …        # pinned — always the same body
+faucet run --source acme/netsuite --sink faucet-hq/bigquery …          # stable (the default)
+faucet run --source acme/netsuite@newest --sink faucet-hq/bigquery …   # the tip
+faucet run --source acme/netsuite@3 --sink faucet-hq/bigquery …        # pinned — always the same body
 ```
 
 A version whose body is not the snapshot's is fetched from the catalog at that
@@ -274,7 +275,7 @@ signals and orders by them:
 ```bash
 faucet hub list --sort stars       # most starred first; ★ and last-updated columns
 faucet hub list --sort updated     # most recently changed first
-faucet run --source netsuite --sink bigquery
+faucet run --source netsuite --sink faucet-hq/bigquery
 # error: no hub template 'netsuite' at the top level or under faucet-hq/, but 2 published one:
 #   octo/netsuite (★ 37 · updated 2026-09-12), acme/netsuite (★ 9 · updated 2026-09-22)
 #   — pick one with `--source <owner>/netsuite`
@@ -329,20 +330,20 @@ origin at it.
 
 The [template registry](./templates.md) stores source and sink templates as
 first-class kinds — there is no need to compose first. Register each file
-(its id is its hub id — `faucet-hq/bigquery` for a shipped sink), then run any pairing by id; the server composes at
+(its id is its hub id: `acme/billing`, `faucet-hq/bigquery`), then run any pairing by id; the server composes at
 trigger time, so a new sink template is immediately usable with every
 registered source template:
 
 ```bash
-faucet template register hub/source-templates/acme-billing.yaml --launch
+faucet template register hub/source-templates/acme/billing.yaml --launch
 faucet template register hub/sink-templates/faucet-hq/bigquery.yaml --launch
 faucet template register hub/sink-templates/faucet-hq/postgres.yaml --launch
 faucet template list --kind source-template
-faucet template run acme-billing --sink faucet-hq/bigquery --param api_token="$T" --param bq_project=p --param bq_sa_key="$K"
-faucet template run acme-billing --sink faucet-hq/postgres --param api_token="$T" --param pg_url="$PG"
+faucet template run acme/billing --sink faucet-hq/bigquery --param api_token="$T" --param bq_project=p --param bq_sa_key="$K"
+faucet template run acme/billing --sink faucet-hq/postgres --param api_token="$T" --param pg_url="$PG"
 ```
 
-Over HTTP the trigger is `POST /v1/templates/acme-billing/runs` with
+Over HTTP the trigger is `POST /v1/templates/acme%2Fbilling/runs` with
 `{"sink": "faucet-hq/bigquery", "params": {…}}`; the console's template page offers the
 registered sink templates in a dropdown. Registration runs the same
 publishability lint as `faucet hub lint`, so a literal credential never lands in

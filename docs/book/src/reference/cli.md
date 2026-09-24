@@ -661,7 +661,7 @@ Read-only — it never mutates the store.
 faucet template register  tenant-sync.yaml --store sqlite:./faucet-templates.db
 faucet template register  tenant-sync.yaml --id tenant-sync --tag dev --description "per-tenant events"
 faucet template register  tenant-sync.yaml --launch            # register AND make live
-faucet template register  hub/source-templates/acme-billing.yaml --launch   # kind: source-template → id = its hub id
+faucet template register  hub/source-templates/acme/billing.yaml --launch   # kind: source-template → id = its hub id
 faucet template register  hub/sink-templates/faucet-hq/bigquery.yaml --launch         # kind: sink-template
 faucet template list      --store sqlite:./faucet-templates.db
 faucet template list      --kind sink-template                  # one kind only
@@ -672,7 +672,7 @@ faucet template rollback  tenant-sync                           # re-launch `pre
 faucet template deprecate tenant-sync --reason "superseded"      # retire (`--undo` revives)
 faucet template run       tenant-sync --store sqlite:./faucet-templates.db \
   --version prod --param tenant_id=acme --param-env API_HOST=eu.example.com
-faucet template run       acme-billing --sink faucet-hq/bigquery --sink-version stable \
+faucet template run       acme/billing --sink faucet-hq/bigquery --sink-version stable \
   --param api_token="$TOKEN" --param bq_project=my-project    # source × sink, composed at run time
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
@@ -766,12 +766,12 @@ before it is ever registered. The exit code is the failed-case count, mirroring
 
 ```bash
 faucet hub list      [--hub ./hub] [--sort name|stars|updated] [--json]
-faucet hub check     --source example-rest-api --sink bigquery   # per-stream write modes; exit≠0 if incompatible
-faucet hub compose   --source example-rest-api --sink sqlite --out my-pipeline.yaml
+faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigquery   # per-stream write modes; exit≠0 if incompatible
+faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite --out my-pipeline.yaml
 faucet hub matrix    --format table|markdown|json [--out FILE]
 faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint
-faucet run           --source example-csv --sink jsonl                   # runs offline
-faucet validate      --source example-rest-api --sink bigquery [--show-composed]
+faucet run           --source faucet-hq/example-csv --sink faucet-hq/jsonl                   # runs offline
+faucet validate      --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--show-composed]
 faucet schema source-template | sink-template
 ```
 
