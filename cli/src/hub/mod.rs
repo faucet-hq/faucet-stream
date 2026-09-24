@@ -533,6 +533,15 @@ impl IndexVersions {
 }
 
 impl IndexEntry {
+    /// The highest version this entry records — the body the catalog's files hold.
+    pub fn newest_version(&self) -> Option<u32> {
+        self.versions
+            .iter()
+            .map(|v| v.version)
+            .max()
+            .or(self.newest)
+    }
+
     /// The commit a selector resolves to, when this entry carries history.
     pub fn commit_for(&self, sel: HubVersion) -> CliResult<Option<&IndexVersion>> {
         if self.versions.is_empty() {
@@ -590,8 +599,12 @@ pub async fn locate(locator: &str, hub: &Path, subdir: &str) -> CliResult<PathBu
         (None, None) => None,
     };
     let Some(target) = target else { return head };
+    // The checkout's file is the newest version's body (versions are deduped by
+    // body), whatever commit the index was later regenerated at (#688).
+    let newest = entry.and_then(IndexEntry::newest_version);
     let snapshot_commit = index.as_ref().and_then(|i| i.commit.clone());
-    if snapshot_commit.as_deref() == Some(target.commit.as_str()) {
+    if newest == Some(target.version) || snapshot_commit.as_deref() == Some(target.commit.as_str())
+    {
         return head;
     }
     fetch_version(hub, subdir, id, target, head.ok().as_deref()).await
@@ -1048,6 +1061,43 @@ mod tests {
             canonical_id("gone", None, d.path(), catalog::SOURCE_DIR),
             "faucet-hq/gone"
         );
+    }
+
+    #[tokio::test]
+    async fn the_checkout_file_is_the_newest_version_whatever_commit_the_index_names() {
+        let d = hub();
+        // Regenerated at a later commit than the template's last change (#688).
+        let index = serde_json::json!({
+            "commit": "later000",
+            "sources": [{"id": "acme", "name": "acme", "newest": 2, "stable": 2,
+                          "versions": [{"version": 1, "commit": "old000"}, {"version": 2, "commit": "mid000"}]}],
+            "sinks": []
+        });
+        std::fs::write(d.path().join("index.json"), index.to_string()).unwrap();
+        for loc in ["acme", "acme@stable", "acme@newest", "acme@2"] {
+            assert!(
+                locate(loc, d.path(), catalog::SOURCE_DIR)
+                    .await
+                    .unwrap_or_else(|e| panic!("{loc}: {e}"))
+                    .ends_with("acme.yaml"),
+                "{loc}"
+            );
+        }
+        // An older version still needs its own commit's body.
+        let err = locate("acme@1", d.path(), catalog::SOURCE_DIR)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("old000") || err.contains("hub-remote"),
+            "{err}"
+        );
+        let e = IndexEntry {
+            newest: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(e.newest_version(), Some(7));
+        assert_eq!(IndexEntry::default().newest_version(), None);
     }
 
     #[tokio::test]
