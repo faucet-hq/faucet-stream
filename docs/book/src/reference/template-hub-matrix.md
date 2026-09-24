@@ -4,16 +4,16 @@
 
 2 source templates × 4 sink templates. ✓ = every stream has a write mode the sink supports; ◐ = some streams do; — = none. Each source section below carries the copy-paste command for every compatible sink.
 
-| source \ sink | [bigquery](#sink-bigquery) | [jsonl](#sink-jsonl) | [postgres](#sink-postgres) | [sqlite](#sink-sqlite) |
+| source \ sink | [faucet-hq/bigquery](#sink-faucet-hq-bigquery) | [faucet-hq/jsonl](#sink-faucet-hq-jsonl) | [faucet-hq/postgres](#sink-faucet-hq-postgres) | [faucet-hq/sqlite](#sink-faucet-hq-sqlite) |
 |---|:---:|:---:|:---:|:---:|
-| [example-csv](#example-csv) | ✓ | ✓ | ✓ | ✓ |
-| [example-rest-api](#example-rest-api) | ✓ | ✓ | ✓ | ✓ |
+| [faucet-hq/example-csv](#faucet-hq-example-csv) | ✓ | ✓ | ✓ | ✓ |
+| [faucet-hq/example-rest-api](#faucet-hq-example-rest-api) | ✓ | ✓ | ✓ | ✓ |
 
 ## Sinks
 
-### sink: bigquery
+### sink: faucet-hq/bigquery
 
-<a id="sink-bigquery"></a>Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert
+<a id="sink-faucet-hq-bigquery"></a>Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert
 
 - connector: `bigquery` · write modes: `append`, `upsert`, `delete`, `overwrite`
 - params:
@@ -21,27 +21,27 @@
   - `bq_project` (required) — GCP project id that owns the dataset
   - `bq_sa_key` (required, secret) — Service-account key JSON, inline. Pass it with --param-env from a secret store; copy this template and switch `auth` to application_default to use ADC instead.
 
-### sink: jsonl
+### sink: faucet-hq/jsonl
 
-<a id="sink-jsonl"></a>Local JSON Lines files, one per stream — the local validation destination
+<a id="sink-faucet-hq-jsonl"></a>Local JSON Lines files, one per stream — the local validation destination
 
 - connector: `jsonl` · write modes: `append`
 - satisfies by construction: `overwrite`→`append`
 - params:
   - `out_dir` (default `"./out"`) — Directory to write <source>/<stream>.jsonl under
 
-### sink: postgres
+### sink: faucet-hq/postgres
 
-<a id="sink-postgres"></a>PostgreSQL — one auto-mapped table per stream, transactional overwrite or ON CONFLICT upsert
+<a id="sink-faucet-hq-postgres"></a>PostgreSQL — one auto-mapped table per stream, transactional overwrite or ON CONFLICT upsert
 
 - connector: `postgres` · write modes: `append`, `upsert`, `delete`, `overwrite`
 - params:
   - `pg_schema` (default `"public"`) — Schema every stream's table is created in
   - `pg_url` (required, secret) — postgres://user:pass@host:5432/db connection URL
 
-### sink: sqlite
+### sink: faucet-hq/sqlite
 
-<a id="sink-sqlite"></a>Local SQLite database — one auto-mapped table per stream, real overwrite/upsert semantics without infrastructure
+<a id="sink-faucet-hq-sqlite"></a>Local SQLite database — one auto-mapped table per stream, real overwrite/upsert semantics without infrastructure
 
 - connector: `sqlite` · write modes: `append`, `upsert`, `delete`, `overwrite`
 - params:
@@ -49,9 +49,9 @@
 
 ## Sources
 
-### example-csv
+### faucet-hq/example-csv
 
-<a id="example-csv"></a>Example — two CSV exports as two streams (runs offline, no credentials)
+<a id="faucet-hq-example-csv"></a>Example — two CSV exports as two streams (runs offline, no credentials)
 
 - tags: `example`, `file`
 - connector: `csv` · 2 stream(s)
@@ -63,36 +63,36 @@
 | `orders` | `overwrite` → `upsert` | `id` |
 | `customers` | `overwrite` → `upsert` | `id` |
 
-**→ bigquery**
+**→ faucet-hq/bigquery**
 
 ```bash
-faucet run --source example-csv --sink bigquery \
+faucet run --source faucet-hq/example-csv --sink faucet-hq/bigquery \
   --param bq_project=<bq_project> \
   --param bq_sa_key="$BQ_SA_KEY"
 ```
 
-**→ jsonl** — 2 stream(s) run through an alias: `orders` overwrite→append, `customers` overwrite→append
+**→ faucet-hq/jsonl** — 2 stream(s) run through an alias: `orders` overwrite→append, `customers` overwrite→append
 
 ```bash
-faucet run --source example-csv --sink jsonl
+faucet run --source faucet-hq/example-csv --sink faucet-hq/jsonl
 ```
 
-**→ postgres**
+**→ faucet-hq/postgres**
 
 ```bash
-faucet run --source example-csv --sink postgres \
+faucet run --source faucet-hq/example-csv --sink faucet-hq/postgres \
   --param pg_url="$PG_URL"
 ```
 
-**→ sqlite**
+**→ faucet-hq/sqlite**
 
 ```bash
-faucet run --source example-csv --sink sqlite
+faucet run --source faucet-hq/example-csv --sink faucet-hq/sqlite
 ```
 
-### example-rest-api
+### faucet-hq/example-rest-api
 
-<a id="example-rest-api"></a>Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint
+<a id="faucet-hq-example-rest-api"></a>Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint
 
 - tags: `example`, `rest`
 - connector: `rest` · 2 stream(s)
@@ -105,37 +105,37 @@ faucet run --source example-csv --sink sqlite
 | `accounts` | `overwrite` → `upsert` | `id` |
 | `events` | `upsert` → `append` | `id` |
 
-**→ bigquery**
+**→ faucet-hq/bigquery**
 
 ```bash
-faucet run --source example-rest-api --sink bigquery \
+faucet run --source faucet-hq/example-rest-api --sink faucet-hq/bigquery \
   --param api_token="$API_TOKEN" \
   --param base_url=<base_url> \
   --param bq_project=<bq_project> \
   --param bq_sa_key="$BQ_SA_KEY"
 ```
 
-**→ jsonl** — 1 stream(s) run through an alias: `accounts` overwrite→append
+**→ faucet-hq/jsonl** — 1 stream(s) run through an alias: `accounts` overwrite→append
 
 ```bash
-faucet run --source example-rest-api --sink jsonl \
+faucet run --source faucet-hq/example-rest-api --sink faucet-hq/jsonl \
   --param api_token="$API_TOKEN" \
   --param base_url=<base_url>
 ```
 
-**→ postgres**
+**→ faucet-hq/postgres**
 
 ```bash
-faucet run --source example-rest-api --sink postgres \
+faucet run --source faucet-hq/example-rest-api --sink faucet-hq/postgres \
   --param api_token="$API_TOKEN" \
   --param base_url=<base_url> \
   --param pg_url="$PG_URL"
 ```
 
-**→ sqlite**
+**→ faucet-hq/sqlite**
 
 ```bash
-faucet run --source example-rest-api --sink sqlite \
+faucet run --source faucet-hq/example-rest-api --sink faucet-hq/sqlite \
   --param api_token="$API_TOKEN" \
   --param base_url=<base_url>
 ```

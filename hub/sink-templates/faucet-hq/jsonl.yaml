@@ -5,6 +5,7 @@
 # (declared below). Keyed modes (`upsert`) cannot be satisfied by a file.
 kind: sink-template
 name: jsonl
+owner: faucet-hq
 description: Local JSON Lines files, one per stream — the local validation destination
 tags: [file, local]
 params:

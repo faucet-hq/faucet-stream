@@ -78,7 +78,13 @@ fn default_version() -> u32 {
 /// Slug rule shared by template names and stream names: lowercase, digits,
 /// `-`/`_`, first character alphanumeric. Stream names additionally become
 /// table names, so `-` is rejected there (see [`Stream::validate`]).
-/// The hub id of a template: `owner/name`, or `name` for an official one.
+/// The namespace the hub's maintained templates live under. An unqualified
+/// locator (`--source netsuite`) resolves here when no top-level file matches,
+/// so the official set is addressable by short name while still being owned
+/// by the org like any other namespace (#682).
+pub const OFFICIAL_OWNER: &str = "faucet-hq";
+
+/// The hub id of a template: `owner/name`, or `name` for an unscoped one.
 pub fn hub_id(owner: Option<&str>, name: &str) -> String {
     match owner {
         Some(o) => format!("{o}/{name}"),
@@ -284,9 +290,10 @@ pub struct SourceTemplate {
     /// composed pipeline's `name:`, so per-stream state keys
     /// (`{id}::{stream}`) stay stable no matter which sink is composed in.
     pub name: String,
-    /// Publisher namespace — a GitHub user or org login (#682). Set on every
-    /// community template (`source-templates/<owner>/<name>.yaml`); absent on
-    /// the hub's official templates.
+    /// Publisher namespace — a GitHub user or org login (#682), equal to the
+    /// directory the file lives in (`source-templates/<owner>/<name>.yaml`).
+    /// The hub's maintained set is the `faucet-hq` namespace; a top-level file
+    /// with no owner is an unscoped template (a private hub's shortcut).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,9 +333,14 @@ pub struct SourceTemplate {
 }
 
 impl SourceTemplate {
-    /// `owner/name`, or `name` for an official template.
+    /// `owner/name`, or `name` for an unscoped template.
     pub fn id(&self) -> String {
         hub_id(self.owner.as_deref(), &self.name)
+    }
+
+    /// Maintained by the hub itself (the [`OFFICIAL_OWNER`] namespace).
+    pub fn is_official(&self) -> bool {
+        self.owner.as_deref() == Some(OFFICIAL_OWNER)
     }
 
     pub fn validate(&self) -> CliResult<()> {
@@ -429,8 +441,8 @@ pub struct SinkTemplate {
     pub version: u32,
     /// Hub id.
     pub name: String,
-    /// Publisher namespace — a GitHub user or org login (#682); absent on the
-    /// hub's official templates.
+    /// Publisher namespace — a GitHub user or org login (#682), equal to the
+    /// directory the file lives in; `faucet-hq` for the hub's maintained set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,9 +476,14 @@ pub struct SinkTemplate {
 }
 
 impl SinkTemplate {
-    /// `owner/name`, or `name` for an official template.
+    /// `owner/name`, or `name` for an unscoped template.
     pub fn id(&self) -> String {
         hub_id(self.owner.as_deref(), &self.name)
+    }
+
+    /// Maintained by the hub itself (the [`OFFICIAL_OWNER`] namespace).
+    pub fn is_official(&self) -> bool {
+        self.owner.as_deref() == Some(OFFICIAL_OWNER)
     }
 
     pub fn validate(&self) -> CliResult<()> {

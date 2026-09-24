@@ -3,6 +3,7 @@
 #   faucet validate --source example-rest-api --sink bigquery
 kind: source-template
 name: example-rest-api
+owner: faucet-hq
 description: Example — a bearer-authenticated REST API with cursor pagination and one stream per endpoint
 tags: [example, rest]
 params:

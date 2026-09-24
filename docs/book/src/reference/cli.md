@@ -661,8 +661,8 @@ Read-only — it never mutates the store.
 faucet template register  tenant-sync.yaml --store sqlite:./faucet-templates.db
 faucet template register  tenant-sync.yaml --id tenant-sync --tag dev --description "per-tenant events"
 faucet template register  tenant-sync.yaml --launch            # register AND make live
-faucet template register  hub/source-templates/acme-billing.yaml --launch   # kind: source-template → id = its name
-faucet template register  hub/sink-templates/bigquery.yaml --launch         # kind: sink-template
+faucet template register  hub/source-templates/acme-billing.yaml --launch   # kind: source-template → id = its hub id
+faucet template register  hub/sink-templates/faucet-hq/bigquery.yaml --launch         # kind: sink-template
 faucet template list      --store sqlite:./faucet-templates.db
 faucet template list      --kind sink-template                  # one kind only
 faucet template show      tenant-sync --store sqlite:./faucet-templates.db --version 2
@@ -672,7 +672,7 @@ faucet template rollback  tenant-sync                           # re-launch `pre
 faucet template deprecate tenant-sync --reason "superseded"      # retire (`--undo` revives)
 faucet template run       tenant-sync --store sqlite:./faucet-templates.db \
   --version prod --param tenant_id=acme --param-env API_HOST=eu.example.com
-faucet template run       acme-billing --sink bigquery --sink-version stable \
+faucet template run       acme-billing --sink faucet-hq/bigquery --sink-version stable \
   --param api_token="$TOKEN" --param bq_project=my-project    # source × sink, composed at run time
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
@@ -783,7 +783,7 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 
 | Flag | Purpose |
 |------|---------|
-| `--source <id\|path>` / `--sink <id\|path>` | The pairing. A path is used as-is; an id resolves to `<hub>/source-templates/<id>.yaml` / `<hub>/sink-templates/<id>.yaml`, where `id` is `owner/name` (a community template under `source-templates/<owner>/`) or a bare `name` (an official one). An optional `@stable` (default) / `@newest` / `@N` selects a catalog version when the hub's `index.json` records history. |
+| `--source <id\|path>` / `--sink <id\|path>` | The pairing. A path is used as-is; an id resolves to `<hub>/source-templates/<id>.yaml` / `<hub>/sink-templates/<id>.yaml`, where `id` is `owner/name` (a community template under `source-templates/<owner>/`) or a bare `name` (shorthand for the official `faucet-hq/name`). An optional `@stable` (default) / `@newest` / `@N` selects a catalog version when the hub's `index.json` records history. |
 | `--hub <dir\|github:owner/repo[@ref][/path]\|URL>` | Where ids resolve. A directory, or a GitHub repository laid out like `hub/` (`github:faucet-hq/template-hub`, `github:acme/catalog@v2/hub`, `https://github.com/acme/catalog/tree/main/hub`), fetched through the GitHub contents API and cached under `~/.cache/faucet/hub/` pinned to the ref's commit — one request per run when unchanged, the cached snapshot with a warning when offline (`FAUCET_HUB_OFFLINE=1` skips the network). `GITHUB_TOKEN` is used when set. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the public hub `github:faucet-hq/template-hub`. |
 | `--hub <dir>` | Catalog directory. Default `$FAUCET_HUB`, else `./hub`. |
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |

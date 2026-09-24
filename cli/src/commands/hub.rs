@@ -152,25 +152,35 @@ async fn matrix(a: HubMatrixArgs) -> CliResult<()> {
         MatrixFormat::Markdown => hub::catalog::render_markdown(&cat),
         MatrixFormat::Table => {
             let cells = cat.matrix();
+            let src_w = cat
+                .sources
+                .iter()
+                .map(|(_, t)| t.id().len())
+                .max()
+                .unwrap_or(0)
+                .max(13)
+                + 2;
             let mut s = String::new();
-            s.push_str(&format!("{:<24}", "source \\ sink"));
+            s.push_str(&format!("{:<src_w$}", "source \\ sink"));
             for (_, k) in &cat.sinks {
-                s.push_str(&format!(" {:>12}", k.name));
+                s.push_str(&format!(" {:>w$}", k.id(), w = k.id().len().max(5)));
             }
             s.push('\n');
             for (_, src) in &cat.sources {
-                s.push_str(&format!("{:<24}", src.name));
+                let sid = src.id();
+                s.push_str(&format!("{sid:<src_w$}"));
                 for (_, k) in &cat.sinks {
+                    let kid = k.id();
                     let c = cells
                         .iter()
-                        .find(|c| c.source == src.name && c.sink == k.name)
+                        .find(|c| c.source == sid && c.sink == kid)
                         .expect("cell");
                     let mark = if c.compatible {
                         "✓".to_string()
                     } else {
                         format!("{}/{}", c.streams.len(), src.streams.len())
                     };
-                    s.push_str(&format!(" {mark:>12}"));
+                    s.push_str(&format!(" {mark:>w$}", w = kid.len().max(5)));
                 }
                 s.push('\n');
             }
@@ -296,7 +306,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(&composed)
                 .unwrap()
-                .contains("name: example-csv")
+                .contains("name: faucet-hq/example-csv")
         );
         run(HubArgs {
             command: HubCommand::Compose(HubComposeArgs {
@@ -374,7 +384,7 @@ mod tests {
         run(HubArgs {
             command: HubCommand::Lint(HubLintArgs {
                 hub: Some(repo_hub()),
-                files: vec![PathBuf::from(repo_hub()).join("sink-templates/jsonl.yaml")],
+                files: vec![PathBuf::from(repo_hub()).join("sink-templates/faucet-hq/jsonl.yaml")],
                 json: true,
             }),
         })

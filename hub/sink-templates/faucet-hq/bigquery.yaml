@@ -3,6 +3,7 @@
 # upsert = MERGE on the stream's primary keys, append = streaming insert).
 kind: sink-template
 name: bigquery
+owner: faucet-hq
 description: Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert
 tags: [warehouse, gcp]
 docs: https://faucet-hq.github.io/faucet-stream/reference/connectors.html

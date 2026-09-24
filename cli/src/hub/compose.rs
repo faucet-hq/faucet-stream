@@ -190,7 +190,7 @@ pub fn render_per_stream(v: &Value, stream: &str, source: &str) -> Value {
 }
 
 /// [`render_per_stream`] with the source template's `owner` for `${owner}`
-/// (empty for an official template). `${source}` stays the short name so a
+/// (empty for an unscoped template). `${source}` stays the short name so a
 /// destination table name never receives a `/`.
 pub fn render_per_stream_owned(v: &Value, stream: &str, source: &str, owner: &str) -> Value {
     match v {

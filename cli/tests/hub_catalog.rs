@@ -50,8 +50,24 @@ fn every_template_parses_validates_and_passes_lint() {
         "≥3 sink templates ship, got {}",
         cat.sinks.len()
     );
-    for name in ["bigquery", "jsonl"] {
+    for name in ["faucet-hq/bigquery", "faucet-hq/jsonl"] {
         assert!(cat.sink(name).is_some(), "sink-template '{name}' must ship");
+    }
+    // The maintained set is the faucet-hq namespace, and bare names alias it.
+    assert!(cat.sink("jsonl").is_some_and(|k| k.is_official()));
+    for (p, s) in &cat.sources {
+        assert!(
+            s.is_official(),
+            "{}: shipped templates live under faucet-hq/",
+            p.display()
+        );
+    }
+    for (p, k) in &cat.sinks {
+        assert!(
+            k.is_official(),
+            "{}: shipped templates live under faucet-hq/",
+            p.display()
+        );
     }
     let findings = catalog::lint_catalog(&cat);
     assert!(findings.is_empty(), "lint findings:\n{findings:#?}");
@@ -86,8 +102,18 @@ fn no_template_carries_private_text() {
         "localhost:",
     ];
     for dir in [catalog::SOURCE_DIR, catalog::SINK_DIR] {
+        let mut files = Vec::new();
         for entry in std::fs::read_dir(hub_dir().join(dir)).unwrap() {
             let p = entry.unwrap().path();
+            if p.is_dir() {
+                for inner in std::fs::read_dir(&p).unwrap() {
+                    files.push(inner.unwrap().path());
+                }
+            } else {
+                files.push(p);
+            }
+        }
+        for p in files {
             if !p.is_file() {
                 continue;
             }
@@ -137,8 +163,8 @@ fn every_compatible_pairing_is_a_runnable_pipeline() {
                 .unwrap_or_else(|e| panic!("{} × {}: load: {e}", s.name, k.name));
             assert_eq!(
                 cfg.name.as_deref(),
-                Some(s.name.as_str()),
-                "state keys are `{{source}}::{{stream}}`"
+                Some(s.id().as_str()),
+                "state keys are `{{source id}}::{{stream}}`"
             );
             let nodes = faucet_cli::expand::expand(&cfg)
                 .unwrap_or_else(|e| panic!("{} × {}: expand: {e}", s.name, k.name));
