@@ -3098,7 +3098,7 @@
       ]
     },
     "ReplicationSpec": {
-      "description": "Top-level `replication:` block.",
+      "description": "Top-level `mirror:` block (alias `replication:`).",
       "type": "object",
       "properties": {
         "mode": {
