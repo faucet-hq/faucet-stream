@@ -534,6 +534,7 @@ export async function renderTemplateDetail(container, { id, query }) {
       ${d.description ? `<p class="tpl-desc">${escapeHtml(d.description)}</p>` : ""}
 
       <h2 class="tpl-h2">Versions</h2>
+      <p class="tpl-desc tpl-versions-hint">Click a version to run it below.</p>
       <div id="t-versions" class="tpl-versions"></div>
 
       <h2 class="tpl-h2">${{ "sink-template": "Compose with a source template", deployment: "Apply to a run" }[kindOf(d)] || "Trigger a run"}</h2>
@@ -765,7 +766,8 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       ${withSink ? `<p class="tpl-desc">Every stream of <b class="mono">${escapeHtml(id)}</b> lands in the chosen sink; the write mode per stream is resolved against the sink's capabilities when the run is submitted.</p>` : ""}
       <fieldset class="submit-opts tpl-trigger-opts">
         <label>version
-          <select id="tg-version">${versionOptions(st)}</select>
+          <input type="hidden" id="tg-version" value="${st.stable ?? st.newest}" />
+          <span id="tg-version-show" class="tpl-picked" title="pick a version from the list above"></span>
         </label>
         ${withSink ? `
         <label class="tpl-field-wide">sink template <select id="tg-sink">${sinkOptions}</select></label>
@@ -866,7 +868,11 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   // selects it here, and the row that matches the selection stays marked.
   const rows = [...(host.closest(".page") || document).querySelectorAll(".tpl-version[data-version]")];
   const markPicked = () => {
-    const picked = /^\d+$/.test(versionSel.value) ? Number(versionSel.value) : channelTarget(versionSel.value, st);
+    const picked = Number(versionSel.value);
+    const pills = channelsFor(picked, st)
+      .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
+      .join("");
+    host.querySelector("#tg-version-show").innerHTML = `<b class="mono">v${picked}</b>${pills}`;
     for (const r of rows) r.classList.toggle("tpl-version-picked", Number(r.dataset.version) === picked);
   };
   for (const r of rows) {
@@ -880,7 +886,6 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   }
   markPicked();
   renderParams();
-  versionSel.onchange = () => { markPicked(); renderParams(); };
   if (sinkSel) sinkSel.onchange = () => { refillSinkVersions(); renderParams(); };
   if (sinkVersionSel) sinkVersionSel.onchange = renderParams;
   if (overlaySel) overlaySel.onchange = () => { refillOverlayVersions(); renderParams(); };
