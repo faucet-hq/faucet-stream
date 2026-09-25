@@ -64,11 +64,13 @@ export async function renderTemplates(container) {
         <input id="t-search" type="search" autocomplete="off"
           placeholder="search templates by id or description…" />
         <div class="tpl-status-filter" id="t-status-filter" role="group" aria-label="Filter by status">
+          <span class="tpl-filter-label">status</span>
           <button type="button" class="tpl-chip is-on" data-status="launched">launched</button>
           <button type="button" class="tpl-chip is-on" data-status="draft">draft</button>
           <button type="button" class="tpl-chip" data-status="deprecated">deprecated</button>
         </div>
         <div class="tpl-status-filter" id="t-kind-filter" role="group" aria-label="Filter by kind">
+          <span class="tpl-filter-label">kind</span>
           <button type="button" class="tpl-chip is-on" data-kind="source-template">source</button>
           <button type="button" class="tpl-chip is-on" data-kind="sink-template">sink</button>
           <button type="button" class="tpl-chip is-on" data-kind="deployment">deployment</button>

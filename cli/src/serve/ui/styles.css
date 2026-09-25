@@ -1325,6 +1325,10 @@ select {
 
 /* Status filter chips on the templates list (multi-toggle; launched+draft on by default). */
 .tpl-status-filter { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+/* Status and kind are separate dimensions: a label each, and a divider between. */
+.tpl-status-filter + .tpl-status-filter { border-left: 1px solid var(--border); padding-left: 14px; margin-left: 6px; }
+@media (max-width: 1100px) { .tpl-status-filter + .tpl-status-filter { border-left: 0; padding-left: 0; margin-left: 0; } }
+.tpl-filter-label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); margin-right: 2px; }
 .tpl-chip {
   border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-faint);
   border-radius: 999px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer;
