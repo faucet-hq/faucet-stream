@@ -516,7 +516,12 @@ mod tests {
         let rows = vec![LocalOutputRecord::new(&o)];
         for scope in [SweepScope::All, SweepScope::Output(rows[0].id.clone())] {
             let sel = select(&rows, &scope, &opts());
-            assert_eq!(sel[0].skip, Some(SkipReason::PreExisting), "{}", scope.label());
+            assert_eq!(
+                sel[0].skip,
+                Some(SkipReason::PreExisting),
+                "{}",
+                scope.label()
+            );
         }
     }
 

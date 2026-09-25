@@ -508,7 +508,10 @@ mod tests {
         let mut o = obs("/tmp/theirs.jsonl", "2026-08-01T00:00:00Z");
         o.pre_existing = true;
         o.replaced = true;
-        assert_eq!(LocalOutputRecord::new(&o).state(), LocalOutputState::Replaced);
+        assert_eq!(
+            LocalOutputRecord::new(&o).state(),
+            LocalOutputState::Replaced
+        );
 
         // Appended first (external), truncated by a later run (replaced).
         let mut first = obs("/tmp/theirs.csv", "2026-08-01T00:00:00Z");
@@ -525,7 +528,10 @@ mod tests {
         // `replaced` means nothing for a file faucet created.
         let mut ours = obs("/tmp/ours.jsonl", "2026-08-01T00:00:00Z");
         ours.replaced = true;
-        assert_eq!(LocalOutputRecord::new(&ours).state(), LocalOutputState::Present);
+        assert_eq!(
+            LocalOutputRecord::new(&ours).state(),
+            LocalOutputState::Present
+        );
         assert_eq!(LocalOutputState::Replaced.as_str(), "replaced");
     }
 

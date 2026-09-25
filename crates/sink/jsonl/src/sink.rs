@@ -120,7 +120,8 @@ impl JsonlSink {
             // `create(true)` cannot make a file faucet did not create look like
             // one it did. Idempotent + first-open-wins, so the flush→reopen
             // cycle above never reclassifies it.
-            self.outputs.record_open_probing_with(&self.config.path, truncate);
+            self.outputs
+                .record_open_probing_with(&self.config.path, truncate);
             let file = OpenOptions::new()
                 .create(true)
                 .write(true)

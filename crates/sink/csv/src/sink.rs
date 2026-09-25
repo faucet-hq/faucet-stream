@@ -972,7 +972,8 @@ mod tests {
         // original owner's content, so it stays plain pre-existing.
         for (append, replaced) in [(false, true), (true, false)] {
             let tmp = NamedTempFile::with_suffix(".csv").unwrap();
-            let sink = CsvSink::new(CsvSinkConfig::new(tmp.path().to_str().unwrap()).append(append));
+            let sink =
+                CsvSink::new(CsvSinkConfig::new(tmp.path().to_str().unwrap()).append(append));
             sink.write_batch(&[json!({"id": "1"})]).await.unwrap();
             let outs = sink.local_outputs().await;
             assert!(outs[0].pre_existing);
