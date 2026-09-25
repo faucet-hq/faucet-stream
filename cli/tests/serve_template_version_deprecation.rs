@@ -197,3 +197,66 @@ async fn retire_and_revive(dir: &std::path::Path, history: Option<String>) {
         .unwrap();
     assert!(got.get("deprecated_versions").is_none(), "{got}");
 }
+
+/// A third-party history backend that predates #697 compiles unchanged: the
+/// new trait methods default to "unsupported" and "none", and the provided
+/// `template_state` still assembles.
+#[tokio::test]
+async fn a_backend_without_version_deprecation_gets_safe_defaults() {
+    use faucet_cli::serve::history::{
+        Claim, DeleteOutcome, HistoryError, ListFilter, ListPage, RunHistory, RunRecord,
+    };
+    struct Minimal;
+    #[async_trait::async_trait]
+    impl RunHistory for Minimal {
+        async fn claim_idempotency(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Duration,
+        ) -> Result<Claim, HistoryError> {
+            unreachable!()
+        }
+        async fn upsert(&self, _: &RunRecord) -> Result<(), HistoryError> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> Result<Option<RunRecord>, HistoryError> {
+            unreachable!()
+        }
+        async fn list(&self, _: &ListFilter) -> Result<ListPage, HistoryError> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> Result<DeleteOutcome, HistoryError> {
+            unreachable!()
+        }
+        async fn purge_expired(&self, _: Duration) -> Result<usize, HistoryError> {
+            unreachable!()
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            unreachable!()
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+    }
+    let marker = faucet_cli::serve::history::templates::DeprecationRecord {
+        deprecated_at: chrono::Utc::now(),
+        deprecated_by: None,
+        reason: None,
+    };
+    let err = Minimal
+        .template_set_version_deprecation("x", 1, Some(&marker))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("does not support"), "{err}");
+    assert!(
+        Minimal
+            .template_version_deprecations("x")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let st = Minimal.template_state("x").await.unwrap();
+    assert!(st.deprecated_versions.is_empty() && st.newest.is_none());
+}

@@ -73,22 +73,20 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
 /// Boot a server whose auth is the two-principal RBAC config. Returns the
 /// tempdir (kept alive for the server's lifetime — it holds the auth file).
 async fn spawn_rbac_server(port: u16) -> tempfile::TempDir {
-    spawn_rbac_server_with(port, |_| {}).await
+    spawn_rbac_server_with(port, Default::default()).await
 }
 
 async fn spawn_rbac_server_with(
     port: u16,
-    tweak: impl FnOnce(&mut ServeArgs),
+    mcp: faucet_cli::serve::McpServeSettings,
 ) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let auth_path = dir.path().join("auth.yaml");
     std::fs::write(&auth_path, AUTH_CONFIG).unwrap();
-    let mut args = args_with_auth_config(port, auth_path);
-    tweak(&mut args);
-    let mut config = ServeConfig::from_args(args).unwrap();
+    let mut config = ServeConfig::from_args(args_with_auth_config(port, auth_path)).unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
-        let _ = faucet_cli::serve::run_server(config, Default::default()).await;
+        let _ = faucet_cli::serve::run_server(config, mcp).await;
     });
     let client = reqwest::Client::new();
     // 30s: this polls a server starting up next to the whole
@@ -530,10 +528,13 @@ async fn whoami_reports_each_principals_role_and_permissions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_lists_the_template_lifecycle_tools_to_admins_only() {
     let port = free_port();
-    let _dir = spawn_rbac_server_with(port, |a| {
-        a.mcp = true;
-        a.mcp_allow_mutations = true;
-    })
+    let _dir = spawn_rbac_server_with(
+        port,
+        faucet_cli::serve::McpServeSettings {
+            enabled: true,
+            allow_mutations: true,
+        },
+    )
     .await;
     let client = reqwest::Client::new();
     for (token, admin) in [("operator-tok", false), ("admin-tok", true)] {
