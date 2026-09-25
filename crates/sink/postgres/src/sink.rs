@@ -56,7 +56,7 @@ pub(crate) fn pg_bind_text(value: Option<&Value>, udt: &str) -> Option<String> {
 /// `"schema"."table"`, pinning both discovery and insert to that namespace —
 /// otherwise a table of the same name in another schema pollutes the
 /// AutoMap column set (duplicate / wrong columns).
-fn qualified_table_ref(schema: Option<&str>, table: &str) -> String {
+pub(crate) fn qualified_table_ref(schema: Option<&str>, table: &str) -> String {
     match schema {
         Some(s) => format!("{}.{}", quote_ident(s), quote_ident(table)),
         None => quote_ident(table),
@@ -182,8 +182,8 @@ fn pg_udt_to_json_schema(udt: &str, nullable: bool) -> serde_json::Value {
 
 /// A sink that writes JSON records to a PostgreSQL table.
 pub struct PostgresSink {
-    config: PostgresSinkConfig,
-    pool: PgPool,
+    pub(crate) config: PostgresSinkConfig,
+    pub(crate) pool: PgPool,
     /// Whether the target has been confirmed present (created or probed) for
     /// this sink instance (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
@@ -260,7 +260,7 @@ impl PostgresSink {
         Ok(())
     }
 
-    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+    pub(crate) async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
         let table_ref = qualified_table_ref(self.config.schema.as_deref(), table);
         let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
             .bind(&table_ref)
@@ -340,7 +340,7 @@ impl PostgresSink {
     /// via `to_regclass` (#146 M13). Shared by the INSERT and COPY paths so
     /// both see an identical column set. `::text` casts the `name`-typed
     /// catalog columns so sqlx decodes them as `String`.
-    async fn discover_columns(
+    pub(crate) async fn discover_columns(
         &self,
         conn: &mut sqlx::PgConnection,
         table_ref: &str,
@@ -487,7 +487,7 @@ impl PostgresSink {
     /// `ON CONFLICT (key) DO UPDATE …` tail so it upserts by the key columns
     /// (last-write-wins within the batch is already handled by the planner's
     /// dedup, so a single sub-chunk never double-hits the same conflict target).
-    async fn insert_auto_map_with_conflict(
+    pub(crate) async fn insert_auto_map_with_conflict(
         &self,
         conn: &mut sqlx::PgConnection,
         records: &[Value],
@@ -645,7 +645,7 @@ impl PostgresSink {
     /// Delete rows whose key columns match any of `deletes`, using
     /// `DELETE FROM t WHERE (k1, …) IN ((v1, …), …)` with per-column `::udt`
     /// casts (the key columns' underlying types), chunked at the param cap.
-    async fn delete_by_keys(
+    pub(crate) async fn delete_by_keys(
         &self,
         conn: &mut sqlx::PgConnection,
         deletes: &[faucet_core::KeyTuple],
@@ -855,12 +855,20 @@ impl PostgresSink {
         Ok(res.rows_affected())
     }
 
-    /// Apply a planned upsert/delete batch on one connection.
+    /// Apply a planned upsert/delete batch on one connection. With
+    /// `rollback.journal` set, the before-image of every touched key is
+    /// journaled first, on the same connection, so the caller's transaction
+    /// commits the journal together with the writes (#706).
     async fn apply_plan(
         &self,
         conn: &mut sqlx::PgConnection,
         plan: &faucet_core::WritePlan,
     ) -> Result<usize, FaucetError> {
+        if self.config.write.journals()
+            && let Some(run_id) = self.config.write.rollback_run_id()
+        {
+            self.journal_plan(&mut *conn, plan, run_id).await?;
+        }
         let mut affected = 0usize;
         if !plan.upserts.is_empty() {
             affected += self
@@ -873,8 +881,33 @@ impl PostgresSink {
         Ok(affected)
     }
 
+    /// Apply a plan outside an exactly-once transaction. A journaled write
+    /// opens its own transaction so the journal rows and the data commit
+    /// atomically; an unjournaled one keeps the autocommit statements.
+    async fn apply_plan_standalone(
+        &self,
+        plan: &faucet_core::WritePlan,
+    ) -> Result<usize, FaucetError> {
+        if self.config.write.journals() {
+            let mut tx = self.pool.begin().await.map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL transaction begin failed: {e}"))
+            })?;
+            let n = self.apply_plan(&mut tx, plan).await?;
+            tx.commit().await.map_err(|e| {
+                FaucetError::Sink(format!("PostgreSQL transaction commit failed: {e}"))
+            })?;
+            return Ok(n);
+        }
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
+        self.apply_plan(&mut conn, plan).await
+    }
+
     /// Ensure the commit-token watermark table exists.
-    async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
+    pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {t} ({s} TEXT PRIMARY KEY, {k} TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT now())",
             t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
@@ -1013,6 +1046,11 @@ impl faucet_core::Sink for PostgresSink {
             .begin()
             .await
             .map_err(|e| FaucetError::Sink(format!("postgres overwrite: begin swap: {e}")))?;
+        // `rollback.keep_previous`: snapshot the rows about to be replaced, in
+        // the same transaction, so a rollback can swap them back (#706).
+        if self.config.write.keeps_previous() {
+            self.keep_previous_copy(&mut tx).await?;
+        }
         for stmt in [
             clear,
             format!("INSERT INTO {target} SELECT * FROM {staging}"),
@@ -1049,6 +1087,36 @@ impl faucet_core::Sink for PostgresSink {
 
     fn dedups_by_key(&self) -> bool {
         self.config.write.dedups_by_key()
+    }
+
+    /// Column-mapping mode only: the run-id column, the journaled keys and the
+    /// kept previous table all address real columns (#706).
+    fn supports_rollback(&self) -> bool {
+        self.rollback_supported()
+    }
+
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        self.rollback_run_impl(run_id, opts).await
+    }
+
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.forget_run_impl(run_id).await
+    }
+
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.rewind_commit_token_impl(scope, token).await
+    }
+
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.readback_source_impl()
     }
 
     fn supports_schema_evolution(&self) -> bool {
@@ -1222,11 +1290,7 @@ impl faucet_core::Sink for PostgresSink {
                     self.config.write.write_mode.as_str()
                 )));
             }
-            let mut conn =
-                self.pool.acquire().await.map_err(|e| {
-                    FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}"))
-                })?;
-            return self.apply_plan(&mut conn, &plan).await;
+            return self.apply_plan_standalone(&plan).await;
         }
         // Append and overwrite are insert-shaped; overwrite writes land in the
         // staging table via `effective_table_name`.
@@ -1297,12 +1361,7 @@ impl faucet_core::Sink for PostgresSink {
         }
 
         let plan = faucet_core::plan_writes(records, &self.config.write);
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("PostgreSQL pool acquire failed: {e}")))?;
-        self.apply_plan(&mut conn, &plan).await?;
+        self.apply_plan_standalone(&plan).await?;
 
         let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
         for (idx, msg) in &plan.failed {

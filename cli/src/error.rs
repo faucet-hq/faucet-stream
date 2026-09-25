@@ -490,6 +490,21 @@ pub enum CliError {
     #[error("{failed} backfill unit(s) failed")]
     BackfillFailed { failed: usize },
 
+    /// `faucet verify` found differing keys between the source and the
+    /// destination (#701). The report is printed by the command; `main` maps
+    /// this to an exit code equal to the differing-key count (clamped to 255).
+    #[error("{differences} differing key(s) between source and destination")]
+    VerifyFailed { differences: usize },
+
+    /// `faucet rollback` was refused because a later run changed keys the run
+    /// touched (#706); nothing was changed. `main` maps this to an exit code
+    /// equal to the conflict count (clamped to 255).
+    #[error(
+        "rollback blocked: {conflicts} key(s) were changed by a later run — pass --force to \
+         restore them anyway"
+    )]
+    RollbackBlocked { conflicts: u64 },
+
     /// A `faucet serve` startup or runtime failure (bind, auth gate, etc.).
     #[error("serve error: {0}")]
     Serve(String),

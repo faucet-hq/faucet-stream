@@ -92,7 +92,16 @@ payloads through its transforms / quality / contract / sink, with a dry-run
 toggle. This is the [DLQ replay](./dlq.md) workflow, in the browser (backed by
 `POST /v1/dlq/{inspect,replay,discard}`).
 
-![A run's detail view showing the status summary, invocations table, live log panel, and the dead-letter-queue inspect/replay/discard panel](../assets/console/run-detail.png)
+The invocations table carries each invocation's own **run id** — the value of
+the `_faucet_run_id` column and what a rollback undoes — and a finished run
+made with a `rollback:` block gets a **Roll back…** button (admin-only) that
+opens a panel with an invocation picker, a dry-run toggle, a *force* toggle for
+keys a later run changed, and a config editor for servers that did not store the
+run's config. The result renders inline: what was deleted / restored, any
+conflicts, and whether the bookmark was rewound (backed by
+`POST /v1/runs/{id}/rollback`; see [Undoing a run](./rollback.md)).
+
+![A run's detail view showing the status summary, the Roll back… and Delete actions, the invocations table with a run id column, the log panel, and the dead-letter-queue inspect/replay/discard panel](../assets/console/run-detail.png)
 
 ### Submit
 

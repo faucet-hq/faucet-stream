@@ -72,6 +72,8 @@ pub async fn run(args: ReplicateArgs) -> CliResult<()> {
             resilience,
             sla: cfg.sla.clone(),
             reconcile: cfg.reconcile.clone(),
+            verify: cfg.verify.clone(),
+            rollback: cfg.rollback.clone(),
             #[cfg(feature = "notify")]
             notifier,
             #[cfg(feature = "catalog")]

@@ -4,6 +4,17 @@
   "description": "Top-level pipeline definition.",
   "type": "object",
   "properties": {
+    "kind": {
+      "description": "Document kind. A complete pipeline config may declare `kind: pipeline`\n(the registry's explicit kind for a hand-written pipeline template);\n`source-template` / `sink-template` documents are not pipeline configs\nand are composed with `faucet run --source X --sink Y` instead.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConfigKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "version": {
       "description": "Config-format version. Currently always `1`.",
       "type": "integer",
@@ -129,6 +140,28 @@
         }
       ]
     },
+    "verify": {
+      "description": "Optional content verification (#701): after every successful root run\n(and on demand with `faucet verify`), compare the destination to the\nsource by key ranges and digests, report differing keys, and — with\n`repair: true` — re-sync them through the sink. Differences fail the\nrun unless `fail_on_difference: false`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VerifySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rollback": {
+      "description": "Optional run rollback (#706): stamp a run-id column, journal the\nbefore-image of every key an upsert touches, keep the table an\noverwrite replaces, and record the pre-run bookmark, so\n`faucet rollback --run <id>` can undo the run. Needs a durable `state:`\nblock and a rollback-capable sink (postgres / sqlite / mysql, column\nmapping).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RollbackSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "shard": {
       "description": "Optional source-shard distribution for clustered (Mode B) execution.\nOnly consumed by `faucet serve --cluster`: a run whose source\n[is shardable](faucet_core::Source::is_shardable) is split into\n`shard.count` shards processed concurrently across cluster workers.\nIgnored by `faucet run` and by a non-cluster `serve`, so it is fully\nbackward compatible.",
       "anyOf": [
@@ -234,17 +267,6 @@
           "type": "null"
         }
       ]
-    },
-    "kind": {
-      "description": "Document kind. A complete pipeline config may declare `kind: pipeline`\n(the registry's explicit kind for a hand-written pipeline template);\n`source-template` / `sink-template` documents are not pipeline configs\nand are composed with `faucet run --source X --sink Y` instead.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ConfigKind"
-        },
-        {
-          "type": "null"
-        }
-      ]
     }
   },
   "additionalProperties": false,
@@ -252,6 +274,13 @@
     "pipeline"
   ],
   "$defs": {
+    "ConfigKind": {
+      "description": "The only `kind:` a complete pipeline config may carry.",
+      "type": "string",
+      "enum": [
+        "pipeline"
+      ]
+    },
     "ParamSpec": {
       "description": "One declared parameter.",
       "type": "object",
@@ -2207,6 +2236,91 @@
         }
       ]
     },
+    "SlaSpec": {
+      "description": "Declared service-level agreement for a pipeline: freshness and volume\nexpectations. Violations emit the\n`faucet_pipeline_sla_violations_total{pipeline,row,kind}` counter and a\nstructured warning log; they never fail the run.",
+      "type": "object",
+      "properties": {
+        "max_staleness_secs": {
+          "description": "Maximum seconds since the last *successful* run before the pipeline\ncounts as stale. Evaluated when a run fails (against the previous\nsuccess) and by `faucet doctor`. Requires a `state:` block to persist\nthe last-success timestamp.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "min_rows_per_run": {
+          "description": "Static volume floor: a successful run that writes fewer records than\nthis violates the SLA (catches a source silently returning nothing).\nStateless — works without a `state:` block.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "volume_anomaly": {
+          "description": "Learned-baseline volume anomaly detection over recent successful runs.\nRequires a `state:` block to persist the rolling baseline.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VolumeAnomalySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "VolumeAnomalySpec": {
+      "description": "How a run's record volume is flagged as anomalous against the rolling\nbaseline of recent successful runs.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "Detection method. Default `zscore`.",
+          "$ref": "#/$defs/AnomalyMethod",
+          "default": "zscore"
+        },
+        "sensitivity": {
+          "description": "Detection threshold. For `zscore`: the maximum |x − mean| / std\n(default 3.0). For `iqr`: the Tukey fence multiplier — a volume outside\n[Q1 − k·IQR, Q3 + k·IQR] is anomalous (default 1.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "min_history": {
+          "description": "Minimum successful runs of history before detection starts (cold-start\nguard). Default 5; must be at least 2.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 5
+        },
+        "window": {
+          "description": "Rolling-window size: how many recent successful-run volumes form the\nbaseline. Default 20; must be ≥ `min_history`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 20
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnomalyMethod": {
+      "description": "Volume anomaly detection method.",
+      "oneOf": [
+        {
+          "description": "Flag when |volume − mean| / std exceeds `sensitivity`.",
+          "type": "string",
+          "const": "zscore"
+        },
+        {
+          "description": "Flag when the volume falls outside the Tukey fences\n[Q1 − k·IQR, Q3 + k·IQR] with k = `sensitivity`.",
+          "type": "string",
+          "const": "iqr"
+        }
+      ]
+    },
     "PartitionSpec": {
       "description": "A partitioned range. `kind` selects the variant.",
       "oneOf": [
@@ -2962,91 +3076,6 @@
         }
       ]
     },
-    "SlaSpec": {
-      "description": "Declared service-level agreement for a pipeline: freshness and volume\nexpectations. Violations emit the\n`faucet_pipeline_sla_violations_total{pipeline,row,kind}` counter and a\nstructured warning log; they never fail the run.",
-      "type": "object",
-      "properties": {
-        "max_staleness_secs": {
-          "description": "Maximum seconds since the last *successful* run before the pipeline\ncounts as stale. Evaluated when a run fails (against the previous\nsuccess) and by `faucet doctor`. Requires a `state:` block to persist\nthe last-success timestamp.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "min_rows_per_run": {
-          "description": "Static volume floor: a successful run that writes fewer records than\nthis violates the SLA (catches a source silently returning nothing).\nStateless — works without a `state:` block.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "volume_anomaly": {
-          "description": "Learned-baseline volume anomaly detection over recent successful runs.\nRequires a `state:` block to persist the rolling baseline.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VolumeAnomalySpec"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "VolumeAnomalySpec": {
-      "description": "How a run's record volume is flagged as anomalous against the rolling\nbaseline of recent successful runs.",
-      "type": "object",
-      "properties": {
-        "method": {
-          "description": "Detection method. Default `zscore`.",
-          "$ref": "#/$defs/AnomalyMethod",
-          "default": "zscore"
-        },
-        "sensitivity": {
-          "description": "Detection threshold. For `zscore`: the maximum |x − mean| / std\n(default 3.0). For `iqr`: the Tukey fence multiplier — a volume outside\n[Q1 − k·IQR, Q3 + k·IQR] is anomalous (default 1.5).",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "min_history": {
-          "description": "Minimum successful runs of history before detection starts (cold-start\nguard). Default 5; must be at least 2.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0,
-          "default": 5
-        },
-        "window": {
-          "description": "Rolling-window size: how many recent successful-run volumes form the\nbaseline. Default 20; must be ≥ `min_history`.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0,
-          "default": 20
-        }
-      },
-      "additionalProperties": false
-    },
-    "AnomalyMethod": {
-      "description": "Volume anomaly detection method.",
-      "oneOf": [
-        {
-          "description": "Flag when |volume − mean| / std exceeds `sensitivity`.",
-          "type": "string",
-          "const": "zscore"
-        },
-        {
-          "description": "Flag when the volume falls outside the Tukey fences\n[Q1 − k·IQR, Q3 + k·IQR] with k = `sensitivity`.",
-          "type": "string",
-          "const": "iqr"
-        }
-      ]
-    },
     "ReconcileSpec": {
       "description": "Top-level `reconcile:` block.",
       "type": "object",
@@ -3092,6 +3121,163 @@
       "required": [
         "type"
       ]
+    },
+    "VerifySpec": {
+      "description": "Top-level `verify:` block.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key columns rows are matched on. Defaults to the sink's `key`\n(`write_mode: upsert`); required otherwise. A single integer key\nenables range bisection; any other key compares the whole dataset.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "columns": {
+          "description": "Columns to compare. Default: every column present on either side,\nminus `exclude`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude": {
+          "description": "Columns to ignore — exact names or `prefix*` globs. Default\n`[\"_faucet_*\"]` (the metadata columns a run stamps).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "_faucet_*"
+          ]
+        },
+        "destination": {
+          "description": "How to read the destination back. Default: the sink's own read-back\n(`postgres` / `mysql` / `sqlite` in column mode); required for sinks\nthat cannot describe one (files, queues).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ranges": {
+          "description": "Key ranges in the first digest pass (default 16).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 16
+        },
+        "leaf_rows": {
+          "description": "A differing range at or below this many rows is fetched and diffed row\nby row (default 1000).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 1000
+        },
+        "max_differences": {
+          "description": "Stop reporting (but keep counting) after this many differences\n(default 1000).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 1000
+        },
+        "max_rows_scanned": {
+          "description": "Stop scanning after this many rows have been fetched from either side;\nthe report is then marked `truncated`. Default: no cap.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "normalize": {
+          "description": "How values are canonicalised before comparing.",
+          "$ref": "#/$defs/Normalizer",
+          "default": {
+            "float_tolerance": 0.0,
+            "timestamps": true,
+            "numeric_strings": false
+          }
+        },
+        "after_run": {
+          "description": "After a successful run (`faucet run` / `schedule` / `serve`), verify\nthe destination against the source automatically (default `true`\nwhen the block is present).",
+          "type": "boolean",
+          "default": true
+        },
+        "fail_on_difference": {
+          "description": "Fail the run when the post-run verification finds differences\n(default `true`). With `false` differences are reported and counted\nbut the run stays green.",
+          "type": "boolean",
+          "default": true
+        },
+        "repair": {
+          "description": "Re-sync differing keys through the pipeline's own write path (the\n`--repair` default; `faucet verify --repair` forces it on).",
+          "type": "boolean",
+          "default": false
+        },
+        "allow_delete": {
+          "description": "Let a repair delete destination rows the source no longer has\n(`--allow-delete`). Off by default: a delete is not undoable.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "Normalizer": {
+      "description": "How values are canonicalised before hashing and comparing, so two backends'\nspellings of the same value agree.",
+      "type": "object",
+      "properties": {
+        "float_tolerance": {
+          "description": "Round floats to this absolute tolerance before comparing (`0` = exact).",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "timestamps": {
+          "description": "Parse strings that look like timestamps (RFC 3339, or\n`YYYY-MM-DD HH:MM:SS[.fff]`) and compare them as UTC microseconds.",
+          "type": "boolean",
+          "default": true
+        },
+        "numeric_strings": {
+          "description": "Treat a string holding a number (`\"42\"`, `\"1.5\"`) as that number.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "RollbackSpec": {
+      "description": "Top-level `rollback:` block.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch (default `true` when the block is present).",
+          "type": "boolean",
+          "default": true
+        },
+        "journal": {
+          "description": "Journal the before-image of every key an upsert / delete run touches,\nin the same transaction as the write (default `true`). Required to\nundo an upsert; an append run needs only the run-id column.",
+          "type": "boolean",
+          "default": true
+        },
+        "keep_previous": {
+          "description": "Keep the table an overwrite replaces as `<table>__faucet_prev` so the\noverwrite can be swapped back (default `true`).",
+          "type": "boolean",
+          "default": true
+        },
+        "retain": {
+          "description": "Undoable runs kept per row (default 10). The oldest run's journal rows\nand marker are dropped when a new run completes.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 10
+        }
+      },
+      "additionalProperties": false
     },
     "ShardingSpec": {
       "description": "Source-shard distribution settings for clustered (Mode B) execution.",
@@ -6588,6 +6774,192 @@
         }
       ]
     },
+    "source_rabbitmq__RabbitMqAuth": {
+      "description": "RabbitMQ authentication.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape. The\nhand-written [`std::fmt::Debug`] never prints the password.",
+      "oneOf": [
+        {
+          "description": "No explicit credentials: the userinfo embedded in `url` is used, or the\nAMQP default (`guest`/`guest`, which RabbitMQ only accepts from\nloopback).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "none"
+            }
+          }
+        },
+        {
+          "description": "SASL `PLAIN` username + password. Overrides any userinfo in `url`.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "plain"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "description": "The username.",
+                  "type": "string"
+                },
+                "password": {
+                  "description": "The password.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "SASL `EXTERNAL` — the broker authenticates the TLS client certificate\n(requires `tls.enabled` plus `tls.client_cert_path`/`client_key_path`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "external"
+            }
+          }
+        }
+      ]
+    },
+    "source_rabbitmq__RabbitMqTls": {
+      "description": "TLS (`amqps://`) settings. Server certificates are always verified — there\nis no insecure mode.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Connect over TLS. Also implied by an `amqps://` `url`. Requires the\nconnector's `tls` Cargo feature.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "ca_cert_path": {
+          "description": "PEM file of extra CA certificates to trust (in addition to the\nplatform's native root store) — for brokers with a private CA.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key_path": {
+          "description": "PEM PKCS#8 private key for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rabbitmq__RabbitMqBinding": {
+      "description": "A binding from an exchange to the consumed queue, declared before consuming.",
+      "type": "object",
+      "properties": {
+        "exchange": {
+          "description": "Exchange to bind the queue to. Must not be the default exchange (`\"\"`).",
+          "type": "string"
+        },
+        "routing_key": {
+          "description": "Binding key (a pattern for `topic` exchanges). Defaults to `\"\"`.",
+          "type": "string",
+          "default": ""
+        },
+        "exchange_kind": {
+          "description": "When set, the exchange is declared (durable) with this type before\nbinding; otherwise it must already exist.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rabbitmq__RabbitMqExchangeKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rabbitmq__RabbitMqExchangeKind": {
+      "description": "An AMQP exchange type, used when a connector declares an exchange.",
+      "oneOf": [
+        {
+          "description": "Route on an exact routing-key match.",
+          "type": "string",
+          "const": "direct"
+        },
+        {
+          "description": "Broadcast to every bound queue, ignoring the routing key.",
+          "type": "string",
+          "const": "fanout"
+        },
+        {
+          "description": "Route on a dotted routing-key pattern (`*` one word, `#` zero or more).",
+          "type": "string",
+          "const": "topic"
+        },
+        {
+          "description": "Route on message header values.",
+          "type": "string",
+          "const": "headers"
+        }
+      ]
+    },
+    "source_rabbitmq__AckMode": {
+      "description": "When deliveries are acknowledged to the broker.",
+      "oneOf": [
+        {
+          "description": "At-least-once: a page's deliveries are acknowledged only after the\npipeline has written **and flushed** that page to the sink. A crash or\nfailed write before that leaves them unacknowledged, and the broker\nredelivers them — duplicates are possible, loss is not.",
+          "type": "string",
+          "const": "on_sink_confirm"
+        },
+        {
+          "description": "At-most-once: the broker considers a message delivered as soon as it is\nsent (`no_ack`). Fastest, but a crash loses in-flight messages.",
+          "type": "string",
+          "const": "auto"
+        }
+      ]
+    },
+    "source_rabbitmq__RabbitMqValueFormat": {
+      "description": "How a message body maps to and from a JSON record.",
+      "oneOf": [
+        {
+          "description": "The body is a JSON document. The source fails (or skips, per\n`on_decode_error`) a body that is not valid JSON; the sink serializes\neach record as JSON.",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "The body is UTF-8 text, emitted as a JSON string. The sink requires\nstring records.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "The body is opaque bytes, emitted as a standard base64 JSON string. The\nsink requires base64 string records.",
+          "type": "string",
+          "const": "bytes"
+        }
+      ]
+    },
+    "source_rabbitmq__OnDecodeError": {
+      "description": "What to do with a message whose body does not decode under `value_format`.",
+      "oneOf": [
+        {
+          "description": "Fail the run. The message stays unacknowledged and is redelivered.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Reject the message without requeue — it is dropped, or routed to the\nqueue's dead-letter exchange when one is configured — and continue.",
+          "type": "string",
+          "const": "skip"
+        }
+      ]
+    },
     "source_sftp__HostKeyPolicy": {
       "description": "How the server's host key is verified during the SSH handshake.\n\nDefaults to [`AcceptNew`](Self::AcceptNew). The insecure, verification-off\nmode is a distinct explicit variant so it can never be selected by\naccident.",
       "oneOf": [
@@ -9303,6 +9675,37 @@
         }
       }
     },
+    "sink_bigquery__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_bigquery__OverwriteScope": {
       "description": "Scope for a **scoped/windowed overwrite** (#518): with `write_mode:\noverwrite`, replace only the destination rows matching this scope instead of\ntruncating the whole table. The sink-side sibling of scoped cleanup (#478).\n\nv1 supports a half-open date/number **window** on a single column.",
       "oneOf": [
@@ -9721,6 +10124,37 @@
         }
       }
     },
+    "sink_postgres__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_postgres__PostgresWriteMethod": {
       "description": "How rows are shipped to PostgreSQL in append mode.",
       "oneOf": [
@@ -9986,6 +10420,37 @@
         }
       }
     },
+    "sink_mysql__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_mssql__MssqlTls": {
       "description": "TLS configuration for an MSSQL connection.\n\nMatches the YAML shape `tls: { type: <mode>, ca_cert_path: <path> }`.",
       "type": "object",
@@ -10122,6 +10587,37 @@
           }
         }
       }
+    },
+    "sink_mssql__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
     },
     "sink_mssql__MssqlStagingConfig": {
       "description": "Staged-load configuration for the MSSQL sink (#528). `COPY INTO` reads Azure\nBlob / ADLS Gen2 only, so `location` must be `az://…` and `format: csv`.",
@@ -10303,6 +10799,37 @@
           }
         }
       }
+    },
+    "sink_sqlite__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
     },
     "sink_duckdb__DuckdbColumnMapping": {
       "description": "How to map JSON records to table columns.",
@@ -10565,6 +11092,135 @@
               }
             }
           }
+        }
+      ]
+    },
+    "sink_rabbitmq__RabbitMqAuth": {
+      "description": "RabbitMQ authentication.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape. The\nhand-written [`std::fmt::Debug`] never prints the password.",
+      "oneOf": [
+        {
+          "description": "No explicit credentials: the userinfo embedded in `url` is used, or the\nAMQP default (`guest`/`guest`, which RabbitMQ only accepts from\nloopback).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "none"
+            }
+          }
+        },
+        {
+          "description": "SASL `PLAIN` username + password. Overrides any userinfo in `url`.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "plain"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "username": {
+                  "description": "The username.",
+                  "type": "string"
+                },
+                "password": {
+                  "description": "The password.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "SASL `EXTERNAL` — the broker authenticates the TLS client certificate\n(requires `tls.enabled` plus `tls.client_cert_path`/`client_key_path`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "external"
+            }
+          }
+        }
+      ]
+    },
+    "sink_rabbitmq__RabbitMqTls": {
+      "description": "TLS (`amqps://`) settings. Server certificates are always verified — there\nis no insecure mode.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Connect over TLS. Also implied by an `amqps://` `url`. Requires the\nconnector's `tls` Cargo feature.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "ca_cert_path": {
+          "description": "PEM file of extra CA certificates to trust (in addition to the\nplatform's native root store) — for brokers with a private CA.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key_path": {
+          "description": "PEM PKCS#8 private key for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_rabbitmq__RabbitMqExchangeKind": {
+      "description": "An AMQP exchange type, used when a connector declares an exchange.",
+      "oneOf": [
+        {
+          "description": "Route on an exact routing-key match.",
+          "type": "string",
+          "const": "direct"
+        },
+        {
+          "description": "Broadcast to every bound queue, ignoring the routing key.",
+          "type": "string",
+          "const": "fanout"
+        },
+        {
+          "description": "Route on a dotted routing-key pattern (`*` one word, `#` zero or more).",
+          "type": "string",
+          "const": "topic"
+        },
+        {
+          "description": "Route on message header values.",
+          "type": "string",
+          "const": "headers"
+        }
+      ]
+    },
+    "sink_rabbitmq__RabbitMqValueFormat": {
+      "description": "How a message body maps to and from a JSON record.",
+      "oneOf": [
+        {
+          "description": "The body is a JSON document. The source fails (or skips, per\n`on_decode_error`) a body that is not valid JSON; the sink serializes\neach record as JSON.",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "The body is UTF-8 text, emitted as a JSON string. The sink requires\nstring records.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "The body is opaque bytes, emitted as a standard base64 JSON string. The\nsink requires base64 string records.",
+          "type": "string",
+          "const": "bytes"
         }
       ]
     },
@@ -10858,6 +11514,37 @@
         }
       }
     },
+    "sink_mongodb__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_redis__RedisSinkType": {
       "description": "The type of Redis data structure to write to.",
       "oneOf": [
@@ -11075,6 +11762,37 @@
           }
         }
       }
+    },
+    "sink_elasticsearch__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
     },
     "sink_kafka__KafkaSinkTopic": {
       "description": "Where each message's destination topic comes from.",
@@ -11832,6 +12550,37 @@
           }
         }
       }
+    },
+    "sink_spanner__RollbackWriteSpec": {
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        },
+        "keep_previous": {
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
     },
     "sink_http__AuthSpec": {
       "description": "A connector's `auth:` field: **either** an inline auth definition `A`\n(the `{ type, config }` shape), **or** a `{ ref: <name> }` reference to a\nshared provider defined in the top-level `auth:` catalog.\n\n`ref` is mutually exclusive with inline fields — supplying both is a\ndeserialization error.",
@@ -13106,6 +13855,13 @@
             "config": {
               "anyOf": [
                 {
+                  "x-faucet-aliases": [
+                    "partitions",
+                    "partition_concurrency"
+                  ],
+                  "title": "RestStreamConfig",
+                  "description": "Configuration for a RestStream.\n\n`#[serde(default)]` at the container level: every field falls back to its\nvalue from the [`Default`] impl below when omitted. Without it, **22 fields\nwere required** — a config had to spell out `max_retries`, `retry_backoff`,\n`tolerated_http_errors`, `primary_keys`, `partitions`,\n`schema_sample_size` and more before it would deserialize at all. That is\nwhy the shipped examples are so verbose, and several of them still omitted\none field and could not run; nothing caught it because `faucet validate`\ndid not deserialize connector configs until #609.\n\n`base_url` stays required — in serde *and* in the generated JSON Schema, so\n`faucet init` still marks it `# REQUIRED`. Everything else defaults to the\nvalue in the [`Default`] impl below.",
+                  "type": "object",
                   "properties": {
                     "base_url": {
                       "description": "Base URL of the API, e.g. `https://api.example.com/v2`. Required. Joined\nwith [`path`](Self::path); any trailing slash is handled either way.",
@@ -13481,14 +14237,7 @@
                         }
                       ]
                     }
-                  },
-                  "title": "RestStreamConfig",
-                  "description": "Configuration for a RestStream.\n\n`#[serde(default)]` at the container level: every field falls back to its\nvalue from the [`Default`] impl below when omitted. Without it, **22 fields\nwere required** — a config had to spell out `max_retries`, `retry_backoff`,\n`tolerated_http_errors`, `primary_keys`, `partitions`,\n`schema_sample_size` and more before it would deserialize at all. That is\nwhy the shipped examples are so verbose, and several of them still omitted\none field and could not run; nothing caught it because `faucet validate`\ndid not deserialize connector configs until #609.\n\n`base_url` stays required — in serde *and* in the generated JSON Schema, so\n`faucet init` still marks it `# REQUIRED`. Everything else defaults to the\nvalue in the [`Default`] impl below.",
-                  "type": "object",
-                  "x-faucet-aliases": [
-                    "partitions",
-                    "partition_concurrency"
-                  ]
+                  }
                 },
                 true
               ]
@@ -14676,6 +15425,222 @@
                   },
                   "title": "NatsSourceConfig",
                   "description": "Configuration for [`NatsSource`](crate::NatsSource).\n\nThe [`NatsConnectionConfig`] surface (`servers` / `auth` / `tls` / `name`)\nis flattened in, so a config looks like:\n\n```yaml\nservers: [\"nats://127.0.0.1:4222\"]\nsubject: \"events.>\"\nidle_timeout_secs: 5\nbatch_size: 500\n```",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "rabbitmq",
+          "properties": {
+            "type": {
+              "const": "rabbitmq"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "url": {
+                      "description": "Full AMQP URI, e.g. `amqp://user:pass@rabbit:5672/%2f` (the vhost is\nURL-encoded; `%2f` is `/`). `amqps://` selects TLS. Mutually exclusive\nwith `host`/`port`/`vhost`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "host": {
+                      "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "port": {
+                      "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint16",
+                      "minimum": 0,
+                      "maximum": 65535
+                    },
+                    "vhost": {
+                      "description": "Virtual host. Defaults to `/`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "auth": {
+                      "description": "Authentication. Defaults to [`RabbitMqAuth::None`].",
+                      "$ref": "#/$defs/source_rabbitmq__RabbitMqAuth",
+                      "default": {
+                        "type": "none"
+                      }
+                    },
+                    "tls": {
+                      "description": "TLS settings. Disabled by default.",
+                      "$ref": "#/$defs/source_rabbitmq__RabbitMqTls",
+                      "default": {
+                        "enabled": false
+                      }
+                    },
+                    "connection_name": {
+                      "description": "Client connection name shown in the RabbitMQ management UI.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "heartbeat_secs": {
+                      "description": "Requested heartbeat interval in seconds (`0` disables heartbeats).\nUnset uses the broker's proposal.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint16",
+                      "minimum": 0,
+                      "maximum": 65535
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Upper bound, in seconds, on establishing the connection (TCP + AMQP\nhandshake, including any retries). Defaults to 30.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_retries": {
+                      "description": "Extra TCP connect attempts (exponential backoff) before giving up.\nDefaults to 0 — an unreachable broker fails immediately.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 0
+                    },
+                    "queue": {
+                      "description": "Queue to consume from.",
+                      "type": "string"
+                    },
+                    "declare_queue": {
+                      "description": "Declare the queue before consuming (idempotent when it already exists\nwith the same properties). Defaults to `true`. Set `false` to consume\na queue managed elsewhere (it must exist).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "queue_durable": {
+                      "description": "Whether a declared queue is durable (survives a broker restart).\nDefaults to `true`. Must match an existing queue's durability.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "bindings": {
+                      "description": "Exchange → queue bindings to declare before consuming.",
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/source_rabbitmq__RabbitMqBinding"
+                      }
+                    },
+                    "prefetch": {
+                      "description": "Consumer QoS window: the most unacknowledged deliveries the broker\nsends ahead. `0` is unlimited. Defaults to `batch_size` (capped at\n65535; unlimited when `batch_size` is 0 or larger than 65535). Under\n`ack_mode: on_sink_confirm` it must be `0` or ≥ `batch_size`, or the\nbroker would stop delivering before a page could fill.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint16",
+                      "minimum": 0,
+                      "maximum": 65535
+                    },
+                    "ack_mode": {
+                      "description": "When deliveries are acknowledged. Defaults to `on_sink_confirm`.",
+                      "$ref": "#/$defs/source_rabbitmq__AckMode",
+                      "default": "on_sink_confirm"
+                    },
+                    "value_format": {
+                      "description": "How message bodies decode into records. Defaults to `json`.",
+                      "$ref": "#/$defs/source_rabbitmq__RabbitMqValueFormat",
+                      "default": "json"
+                    },
+                    "on_decode_error": {
+                      "description": "What to do with a body that fails to decode. Defaults to `fail`.",
+                      "$ref": "#/$defs/source_rabbitmq__OnDecodeError",
+                      "default": "fail"
+                    },
+                    "include_metadata": {
+                      "description": "Wrap each record as `{ \"data\": <body>, \"exchange\", \"routing_key\",\n\"delivery_tag\", \"redelivered\", \"headers\", … }` instead of emitting the\ndecoded body alone. Defaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "consumer_tag": {
+                      "description": "Consumer tag. Defaults to a broker-generated one.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_messages": {
+                      "description": "Stop after this many messages. At least one of `max_messages` /\n`idle_timeout_secs` must be set so a run terminates.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "idle_timeout_secs": {
+                      "description": "Stop after this many seconds with no new message. At least one of\n`max_messages` / `idle_timeout_secs` must be set so a run terminates.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "batch_size": {
+                      "description": "Messages per emitted page (and per acknowledgement under\n`on_sink_confirm`). Defaults to [`DEFAULT_BATCH_SIZE`]. `0` drains the\nwhole run window into one page.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    }
+                  },
+                  "title": "RabbitMqSourceConfig",
+                  "description": "Configuration for [`RabbitMqSource`](crate::RabbitMqSource).\n\nThe [`RabbitMqConnectionConfig`] surface (`url` / `host` / `port` / `vhost`\n/ `auth` / `tls` / …) is flattened in:\n\n```yaml\nurl: \"amqp://guest:guest@127.0.0.1:5672/%2f\"\nqueue: orders\nidle_timeout_secs: 5\nbatch_size: 500\n```",
                   "type": "object"
                 },
                 true
@@ -17664,222 +18629,6 @@
             "type"
           ],
           "additionalProperties": false
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "config": {
-              "anyOf": [
-                {
-                  "description": "Configuration for [`RabbitMqSource`](crate::RabbitMqSource).\n\nThe [`RabbitMqConnectionConfig`] surface (`url` / `host` / `port` / `vhost`\n/ `auth` / `tls` / …) is flattened in:\n\n```yaml\nurl: \"amqp://guest:guest@127.0.0.1:5672/%2f\"\nqueue: orders\nidle_timeout_secs: 5\nbatch_size: 500\n```",
-                  "properties": {
-                    "ack_mode": {
-                      "$ref": "#/$defs/source_rabbitmq__AckMode",
-                      "default": "on_sink_confirm",
-                      "description": "When deliveries are acknowledged. Defaults to `on_sink_confirm`."
-                    },
-                    "auth": {
-                      "$ref": "#/$defs/source_rabbitmq__RabbitMqAuth",
-                      "default": {
-                        "type": "none"
-                      },
-                      "description": "Authentication. Defaults to [`RabbitMqAuth::None`]."
-                    },
-                    "batch_size": {
-                      "default": 1000,
-                      "description": "Messages per emitted page (and per acknowledgement under\n`on_sink_confirm`). Defaults to [`DEFAULT_BATCH_SIZE`]. `0` drains the\nwhole run window into one page.",
-                      "format": "uint",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "bindings": {
-                      "description": "Exchange → queue bindings to declare before consuming.",
-                      "items": {
-                        "$ref": "#/$defs/source_rabbitmq__RabbitMqBinding"
-                      },
-                      "type": "array"
-                    },
-                    "connect_retries": {
-                      "default": 0,
-                      "description": "Extra TCP connect attempts (exponential backoff) before giving up.\nDefaults to 0 — an unreachable broker fails immediately.",
-                      "format": "uint32",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "connect_timeout_secs": {
-                      "default": 30,
-                      "description": "Upper bound, in seconds, on establishing the connection (TCP + AMQP\nhandshake, including any retries). Defaults to 30.",
-                      "format": "uint64",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "connection_name": {
-                      "description": "Client connection name shown in the RabbitMQ management UI.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "consumer_tag": {
-                      "description": "Consumer tag. Defaults to a broker-generated one.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "declare_queue": {
-                      "default": true,
-                      "description": "Declare the queue before consuming (idempotent when it already exists\nwith the same properties). Defaults to `true`. Set `false` to consume\na queue managed elsewhere (it must exist).",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ]
-                    },
-                    "heartbeat_secs": {
-                      "description": "Requested heartbeat interval in seconds (`0` disables heartbeats).\nUnset uses the broker's proposal.",
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
-                    },
-                    "host": {
-                      "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "idle_timeout_secs": {
-                      "description": "Stop after this many seconds with no new message. At least one of\n`max_messages` / `idle_timeout_secs` must be set so a run terminates.",
-                      "format": "uint64",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
-                    },
-                    "include_metadata": {
-                      "default": false,
-                      "description": "Wrap each record as `{ \"data\": <body>, \"exchange\", \"routing_key\",\n\"delivery_tag\", \"redelivered\", \"headers\", … }` instead of emitting the\ndecoded body alone. Defaults to `false`.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ]
-                    },
-                    "max_messages": {
-                      "description": "Stop after this many messages. At least one of `max_messages` /\n`idle_timeout_secs` must be set so a run terminates.",
-                      "format": "uint",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
-                    },
-                    "on_decode_error": {
-                      "$ref": "#/$defs/source_rabbitmq__OnDecodeError",
-                      "default": "fail",
-                      "description": "What to do with a body that fails to decode. Defaults to `fail`."
-                    },
-                    "port": {
-                      "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
-                    },
-                    "prefetch": {
-                      "description": "Consumer QoS window: the most unacknowledged deliveries the broker\nsends ahead. `0` is unlimited. Defaults to `batch_size` (capped at\n65535; unlimited when `batch_size` is 0 or larger than 65535). Under\n`ack_mode: on_sink_confirm` it must be `0` or ≥ `batch_size`, or the\nbroker would stop delivering before a page could fill.",
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
-                    },
-                    "queue": {
-                      "description": "Queue to consume from.",
-                      "type": "string"
-                    },
-                    "queue_durable": {
-                      "default": true,
-                      "description": "Whether a declared queue is durable (survives a broker restart).\nDefaults to `true`. Must match an existing queue's durability.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ]
-                    },
-                    "tls": {
-                      "$ref": "#/$defs/source_rabbitmq__RabbitMqTls",
-                      "default": {
-                        "enabled": false
-                      },
-                      "description": "TLS settings. Disabled by default."
-                    },
-                    "url": {
-                      "description": "Full AMQP URI, e.g. `amqp://user:pass@rabbit:5672/%2f` (the vhost is\nURL-encoded; `%2f` is `/`). `amqps://` selects TLS. Mutually exclusive\nwith `host`/`port`/`vhost`.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "value_format": {
-                      "$ref": "#/$defs/source_rabbitmq__RabbitMqValueFormat",
-                      "default": "json",
-                      "description": "How message bodies decode into records. Defaults to `json`."
-                    },
-                    "vhost": {
-                      "description": "Virtual host. Defaults to `/`.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    }
-                  },
-                  "title": "RabbitMqSourceConfig",
-                  "type": "object"
-                },
-                true
-              ]
-            },
-            "inherit_transforms": {
-              "type": "boolean"
-            },
-            "transforms": {
-              "type": [
-                "array",
-                "null"
-              ]
-            },
-            "type": {
-              "const": "rabbitmq"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "rabbitmq",
-          "type": "object"
         }
       ]
     },
@@ -17947,6 +18696,17 @@
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_bigquery__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_bigquery__RollbackWriteSpec"
                         },
                         {
                           "type": "null"
@@ -18205,6 +18965,17 @@
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_postgres__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_postgres__RollbackWriteSpec"
                         },
                         {
                           "type": "null"
@@ -18501,6 +19272,17 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_mysql__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
                   "title": "MysqlSinkConfig",
@@ -18638,6 +19420,17 @@
                         }
                       ]
                     },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_mssql__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
                     "staging": {
                       "description": "Staged bulk load (#528): stage each page to Azure Blob / ADLS and have\nSQL Server / Synapse pull it with `COPY INTO` instead of parameterized\n`INSERT`s. Absent ⇒ the ordinary insert path. Requires the crate's\n`staging` feature at build time to execute.",
                       "anyOf": [
@@ -18732,6 +19525,17 @@
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_sqlite__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_sqlite__RollbackWriteSpec"
                         },
                         {
                           "type": "null"
@@ -19006,6 +19810,191 @@
                   },
                   "title": "NatsSinkConfig",
                   "description": "Configuration for [`NatsSink`](crate::NatsSink).\n\nThe [`NatsConnectionConfig`] surface (`servers` / `auth` / `tls` / `name`)\nis flattened in.",
+                  "type": "object"
+                },
+                true
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "rabbitmq",
+          "properties": {
+            "type": {
+              "const": "rabbitmq"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "url": {
+                      "description": "Full AMQP URI, e.g. `amqp://user:pass@rabbit:5672/%2f` (the vhost is\nURL-encoded; `%2f` is `/`). `amqps://` selects TLS. Mutually exclusive\nwith `host`/`port`/`vhost`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "host": {
+                      "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "port": {
+                      "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint16",
+                      "minimum": 0,
+                      "maximum": 65535
+                    },
+                    "vhost": {
+                      "description": "Virtual host. Defaults to `/`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "auth": {
+                      "description": "Authentication. Defaults to [`RabbitMqAuth::None`].",
+                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqAuth",
+                      "default": {
+                        "type": "none"
+                      }
+                    },
+                    "tls": {
+                      "description": "TLS settings. Disabled by default.",
+                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqTls",
+                      "default": {
+                        "enabled": false
+                      }
+                    },
+                    "connection_name": {
+                      "description": "Client connection name shown in the RabbitMQ management UI.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "heartbeat_secs": {
+                      "description": "Requested heartbeat interval in seconds (`0` disables heartbeats).\nUnset uses the broker's proposal.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint16",
+                      "minimum": 0,
+                      "maximum": 65535
+                    },
+                    "connect_timeout_secs": {
+                      "description": "Upper bound, in seconds, on establishing the connection (TCP + AMQP\nhandshake, including any retries). Defaults to 30.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 30
+                    },
+                    "connect_retries": {
+                      "description": "Extra TCP connect attempts (exponential backoff) before giving up.\nDefaults to 0 — an unreachable broker fails immediately.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 0
+                    },
+                    "exchange": {
+                      "description": "Exchange to publish to. Defaults to `\"\"`, the default exchange, which\nroutes each message to the queue named by its routing key.",
+                      "type": "string",
+                      "default": ""
+                    },
+                    "exchange_kind": {
+                      "description": "When set, `exchange` is declared (durable) with this type before the\nfirst publish; otherwise it must already exist. Not allowed with the\ndefault exchange.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_rabbitmq__RabbitMqExchangeKind"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "routing_key": {
+                      "description": "Static routing key for every message.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "routing_key_field": {
+                      "description": "Top-level record field whose value (string, number or bool) is the\nrouting key.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "routing_key_jsonpath": {
+                      "description": "JSONPath (e.g. `$.meta.route`) whose first match is the routing key.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "value_format": {
+                      "description": "How records encode into message bodies. Defaults to `json`.",
+                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqValueFormat",
+                      "default": "json"
+                    },
+                    "persistent": {
+                      "description": "Publish with delivery mode 2 (persisted to disk on durable queues).\nDefaults to `true`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "mandatory": {
+                      "description": "Publish with the `mandatory` flag: a message no queue is bound to\nreceive is returned by the broker and surfaces as a per-row error\n(DLQ-routable) instead of being silently dropped. Requires `confirm`.\nDefaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "confirm": {
+                      "description": "Enable publisher confirms: every batch waits for the broker to\nacknowledge each message before the write returns. Defaults to `true`\n(the reliable setting — without it a broker-side failure is invisible).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "batch_size": {
+                      "description": "Messages published before waiting on their confirms. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` publishes the whole batch handed over by\nthe pipeline at once.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    }
+                  },
+                  "title": "RabbitMqSinkConfig",
+                  "description": "Configuration for [`RabbitMqSink`](crate::RabbitMqSink).\n\nExactly one of `routing_key` (static), `routing_key_field` (top-level\nrecord field) or `routing_key_jsonpath` (JSONPath into the record) selects\neach message's routing key. With the default exchange (`\"\"`) the routing\nkey is the destination queue name.\n\n```yaml\nurl: \"amqp://guest:guest@127.0.0.1:5672/%2f\"\nexchange: events\nexchange_kind: topic\nrouting_key_field: event_type\n```",
                   "type": "object"
                 },
                 true
@@ -19371,6 +20360,17 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_mongodb__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
                   "title": "MongoSinkConfig",
@@ -19565,6 +20565,17 @@
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_elasticsearch__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_elasticsearch__RollbackWriteSpec"
                         },
                         {
                           "type": "null"
@@ -20058,6 +21069,17 @@
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_spanner__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "rollback": {
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_spanner__RollbackWriteSpec"
                         },
                         {
                           "type": "null"
@@ -21084,513 +22106,6 @@
             "type"
           ],
           "additionalProperties": false
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "config": {
-              "anyOf": [
-                {
-                  "description": "Configuration for [`RabbitMqSink`](crate::RabbitMqSink).\n\nExactly one of `routing_key` (static), `routing_key_field` (top-level\nrecord field) or `routing_key_jsonpath` (JSONPath into the record) selects\neach message's routing key. With the default exchange (`\"\"`) the routing\nkey is the destination queue name.\n\n```yaml\nurl: \"amqp://guest:guest@127.0.0.1:5672/%2f\"\nexchange: events\nexchange_kind: topic\nrouting_key_field: event_type\n```",
-                  "properties": {
-                    "auth": {
-                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqAuth",
-                      "default": {
-                        "type": "none"
-                      },
-                      "description": "Authentication. Defaults to [`RabbitMqAuth::None`]."
-                    },
-                    "batch_size": {
-                      "default": 1000,
-                      "description": "Messages published before waiting on their confirms. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` publishes the whole batch handed over by\nthe pipeline at once.",
-                      "format": "uint",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "confirm": {
-                      "default": true,
-                      "description": "Enable publisher confirms: every batch waits for the broker to\nacknowledge each message before the write returns. Defaults to `true`\n(the reliable setting — without it a broker-side failure is invisible).",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ]
-                    },
-                    "connect_retries": {
-                      "default": 0,
-                      "description": "Extra TCP connect attempts (exponential backoff) before giving up.\nDefaults to 0 — an unreachable broker fails immediately.",
-                      "format": "uint32",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "connect_timeout_secs": {
-                      "default": 30,
-                      "description": "Upper bound, in seconds, on establishing the connection (TCP + AMQP\nhandshake, including any retries). Defaults to 30.",
-                      "format": "uint64",
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "string"
-                      ]
-                    },
-                    "connection_name": {
-                      "description": "Client connection name shown in the RabbitMQ management UI.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "exchange": {
-                      "default": "",
-                      "description": "Exchange to publish to. Defaults to `\"\"`, the default exchange, which\nroutes each message to the queue named by its routing key.",
-                      "type": "string"
-                    },
-                    "exchange_kind": {
-                      "anyOf": [
-                        {
-                          "$ref": "#/$defs/sink_rabbitmq__RabbitMqExchangeKind"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "When set, `exchange` is declared (durable) with this type before the\nfirst publish; otherwise it must already exist. Not allowed with the\ndefault exchange."
-                    },
-                    "heartbeat_secs": {
-                      "description": "Requested heartbeat interval in seconds (`0` disables heartbeats).\nUnset uses the broker's proposal.",
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
-                    },
-                    "host": {
-                      "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "mandatory": {
-                      "default": false,
-                      "description": "Publish with the `mandatory` flag: a message no queue is bound to\nreceive is returned by the broker and surfaces as a per-row error\n(DLQ-routable) instead of being silently dropped. Requires `confirm`.\nDefaults to `false`.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ]
-                    },
-                    "persistent": {
-                      "default": true,
-                      "description": "Publish with delivery mode 2 (persisted to disk on durable queues).\nDefaults to `true`.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ]
-                    },
-                    "port": {
-                      "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
-                      "format": "uint16",
-                      "maximum": 65535,
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ]
-                    },
-                    "routing_key": {
-                      "description": "Static routing key for every message.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "routing_key_field": {
-                      "description": "Top-level record field whose value (string, number or bool) is the\nrouting key.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "routing_key_jsonpath": {
-                      "description": "JSONPath (e.g. `$.meta.route`) whose first match is the routing key.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "tls": {
-                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqTls",
-                      "default": {
-                        "enabled": false
-                      },
-                      "description": "TLS settings. Disabled by default."
-                    },
-                    "url": {
-                      "description": "Full AMQP URI, e.g. `amqp://user:pass@rabbit:5672/%2f` (the vhost is\nURL-encoded; `%2f` is `/`). `amqps://` selects TLS. Mutually exclusive\nwith `host`/`port`/`vhost`.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "value_format": {
-                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqValueFormat",
-                      "default": "json",
-                      "description": "How records encode into message bodies. Defaults to `json`."
-                    },
-                    "vhost": {
-                      "description": "Virtual host. Defaults to `/`.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    }
-                  },
-                  "title": "RabbitMqSinkConfig",
-                  "type": "object"
-                },
-                true
-              ]
-            },
-            "type": {
-              "const": "rabbitmq"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "rabbitmq",
-          "type": "object"
-        }
-      ]
-    },
-    "ConfigKind": {
-      "description": "The only `kind:` a complete pipeline config may carry.",
-      "type": "string",
-      "enum": [
-        "pipeline"
-      ]
-    },
-    "sink_rabbitmq__RabbitMqAuth": {
-      "description": "RabbitMQ authentication.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape. The\nhand-written [`std::fmt::Debug`] never prints the password.",
-      "oneOf": [
-        {
-          "description": "No explicit credentials: the userinfo embedded in `url` is used, or the\nAMQP default (`guest`/`guest`, which RabbitMQ only accepts from\nloopback).",
-          "properties": {
-            "type": {
-              "const": "none",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        {
-          "description": "SASL `PLAIN` username + password. Overrides any userinfo in `url`.",
-          "properties": {
-            "config": {
-              "properties": {
-                "password": {
-                  "description": "The password.",
-                  "type": "string"
-                },
-                "username": {
-                  "description": "The username.",
-                  "type": "string"
-                }
-              },
-              "type": "object"
-            },
-            "type": {
-              "const": "plain",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        {
-          "description": "SASL `EXTERNAL` — the broker authenticates the TLS client certificate\n(requires `tls.enabled` plus `tls.client_cert_path`/`client_key_path`).",
-          "properties": {
-            "type": {
-              "const": "external",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
-      ]
-    },
-    "sink_rabbitmq__RabbitMqExchangeKind": {
-      "description": "An AMQP exchange type, used when a connector declares an exchange.",
-      "oneOf": [
-        {
-          "const": "direct",
-          "description": "Route on an exact routing-key match.",
-          "type": "string"
-        },
-        {
-          "const": "fanout",
-          "description": "Broadcast to every bound queue, ignoring the routing key.",
-          "type": "string"
-        },
-        {
-          "const": "topic",
-          "description": "Route on a dotted routing-key pattern (`*` one word, `#` zero or more).",
-          "type": "string"
-        },
-        {
-          "const": "headers",
-          "description": "Route on message header values.",
-          "type": "string"
-        }
-      ]
-    },
-    "sink_rabbitmq__RabbitMqTls": {
-      "additionalProperties": true,
-      "description": "TLS (`amqps://`) settings. Server certificates are always verified — there\nis no insecure mode.",
-      "properties": {
-        "ca_cert_path": {
-          "description": "PEM file of extra CA certificates to trust (in addition to the\nplatform's native root store) — for brokers with a private CA.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_cert_path": {
-          "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_key_path": {
-          "description": "PEM PKCS#8 private key for `client_cert_path`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "enabled": {
-          "default": false,
-          "description": "Connect over TLS. Also implied by an `amqps://` `url`. Requires the\nconnector's `tls` Cargo feature.",
-          "type": [
-            "boolean",
-            "string"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "sink_rabbitmq__RabbitMqValueFormat": {
-      "description": "How a message body maps to and from a JSON record.",
-      "oneOf": [
-        {
-          "const": "json",
-          "description": "The body is a JSON document. The source fails (or skips, per\n`on_decode_error`) a body that is not valid JSON; the sink serializes\neach record as JSON.",
-          "type": "string"
-        },
-        {
-          "const": "string",
-          "description": "The body is UTF-8 text, emitted as a JSON string. The sink requires\nstring records.",
-          "type": "string"
-        },
-        {
-          "const": "bytes",
-          "description": "The body is opaque bytes, emitted as a standard base64 JSON string. The\nsink requires base64 string records.",
-          "type": "string"
-        }
-      ]
-    },
-    "source_rabbitmq__AckMode": {
-      "description": "When deliveries are acknowledged to the broker.",
-      "oneOf": [
-        {
-          "const": "on_sink_confirm",
-          "description": "At-least-once: a page's deliveries are acknowledged only after the\npipeline has written **and flushed** that page to the sink. A crash or\nfailed write before that leaves them unacknowledged, and the broker\nredelivers them — duplicates are possible, loss is not.",
-          "type": "string"
-        },
-        {
-          "const": "auto",
-          "description": "At-most-once: the broker considers a message delivered as soon as it is\nsent (`no_ack`). Fastest, but a crash loses in-flight messages.",
-          "type": "string"
-        }
-      ]
-    },
-    "source_rabbitmq__OnDecodeError": {
-      "description": "What to do with a message whose body does not decode under `value_format`.",
-      "oneOf": [
-        {
-          "const": "fail",
-          "description": "Fail the run. The message stays unacknowledged and is redelivered.",
-          "type": "string"
-        },
-        {
-          "const": "skip",
-          "description": "Reject the message without requeue — it is dropped, or routed to the\nqueue's dead-letter exchange when one is configured — and continue.",
-          "type": "string"
-        }
-      ]
-    },
-    "source_rabbitmq__RabbitMqAuth": {
-      "description": "RabbitMQ authentication.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape. The\nhand-written [`std::fmt::Debug`] never prints the password.",
-      "oneOf": [
-        {
-          "description": "No explicit credentials: the userinfo embedded in `url` is used, or the\nAMQP default (`guest`/`guest`, which RabbitMQ only accepts from\nloopback).",
-          "properties": {
-            "type": {
-              "const": "none",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        {
-          "description": "SASL `PLAIN` username + password. Overrides any userinfo in `url`.",
-          "properties": {
-            "config": {
-              "properties": {
-                "password": {
-                  "description": "The password.",
-                  "type": "string"
-                },
-                "username": {
-                  "description": "The username.",
-                  "type": "string"
-                }
-              },
-              "type": "object"
-            },
-            "type": {
-              "const": "plain",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        {
-          "description": "SASL `EXTERNAL` — the broker authenticates the TLS client certificate\n(requires `tls.enabled` plus `tls.client_cert_path`/`client_key_path`).",
-          "properties": {
-            "type": {
-              "const": "external",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
-      ]
-    },
-    "source_rabbitmq__RabbitMqBinding": {
-      "additionalProperties": true,
-      "description": "A binding from an exchange to the consumed queue, declared before consuming.",
-      "properties": {
-        "exchange": {
-          "description": "Exchange to bind the queue to. Must not be the default exchange (`\"\"`).",
-          "type": "string"
-        },
-        "exchange_kind": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/source_rabbitmq__RabbitMqExchangeKind"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "When set, the exchange is declared (durable) with this type before\nbinding; otherwise it must already exist."
-        },
-        "routing_key": {
-          "default": "",
-          "description": "Binding key (a pattern for `topic` exchanges). Defaults to `\"\"`.",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "source_rabbitmq__RabbitMqExchangeKind": {
-      "description": "An AMQP exchange type, used when a connector declares an exchange.",
-      "oneOf": [
-        {
-          "const": "direct",
-          "description": "Route on an exact routing-key match.",
-          "type": "string"
-        },
-        {
-          "const": "fanout",
-          "description": "Broadcast to every bound queue, ignoring the routing key.",
-          "type": "string"
-        },
-        {
-          "const": "topic",
-          "description": "Route on a dotted routing-key pattern (`*` one word, `#` zero or more).",
-          "type": "string"
-        },
-        {
-          "const": "headers",
-          "description": "Route on message header values.",
-          "type": "string"
-        }
-      ]
-    },
-    "source_rabbitmq__RabbitMqTls": {
-      "additionalProperties": true,
-      "description": "TLS (`amqps://`) settings. Server certificates are always verified — there\nis no insecure mode.",
-      "properties": {
-        "ca_cert_path": {
-          "description": "PEM file of extra CA certificates to trust (in addition to the\nplatform's native root store) — for brokers with a private CA.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_cert_path": {
-          "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "client_key_path": {
-          "description": "PEM PKCS#8 private key for `client_cert_path`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "enabled": {
-          "default": false,
-          "description": "Connect over TLS. Also implied by an `amqps://` `url`. Requires the\nconnector's `tls` Cargo feature.",
-          "type": [
-            "boolean",
-            "string"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "source_rabbitmq__RabbitMqValueFormat": {
-      "description": "How a message body maps to and from a JSON record.",
-      "oneOf": [
-        {
-          "const": "json",
-          "description": "The body is a JSON document. The source fails (or skips, per\n`on_decode_error`) a body that is not valid JSON; the sink serializes\neach record as JSON.",
-          "type": "string"
-        },
-        {
-          "const": "string",
-          "description": "The body is UTF-8 text, emitted as a JSON string. The sink requires\nstring records.",
-          "type": "string"
-        },
-        {
-          "const": "bytes",
-          "description": "The body is opaque bytes, emitted as a standard base64 JSON string. The\nsink requires base64 string records.",
-          "type": "string"
         }
       ]
     }

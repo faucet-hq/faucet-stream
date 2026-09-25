@@ -973,6 +973,59 @@ fails when `rows_written < authoritative × (1 − tolerance_pct/100)`. Compares
 rows **written** to the destination, so it is most meaningful for straight
 loads / full-refreshes. Schema: `faucet schema` (the `reconcile` block).
 
+## `verify`
+
+Opt-in **content verification** (#701): after every successful root run,
+compare the destination to the source **by key** — key ranges by digest
+(server-side where both backends share an algorithm, so matching ranges ship
+no rows), differing ranges bisected down to the keys — and fail the run on a
+mismatch. `faucet verify` runs the same comparison on demand.
+
+```yaml
+verify:
+  key: [id]                 # default: the sink's upsert key (required otherwise)
+  columns: [name, amount]   # default: every column on either side
+  exclude: ["_faucet_*"]    # names or `prefix*` globs (default)
+  destination:              # default: the sink's own read-back (SQL sinks)
+    type: postgres
+    config: { connection_url: ${secret:PG_URL}, query: "SELECT * FROM orders" }
+  ranges: 16                # first-pass key ranges
+  leaf_rows: 1000           # bisect a differing range down to this many rows
+  max_differences: 1000     # report cap (the count keeps going)
+  max_rows_scanned: 5000000 # stop (truncated report) after this many rows
+  normalize: { float_tolerance: 0.0, timestamps: true, numeric_strings: false }
+  after_run: true           # verify after every successful root run
+  fail_on_difference: true  # a mismatch fails the run
+  repair: false             # re-sync differing keys through the sink first
+  allow_delete: false       # let a repair delete destination-only rows
+```
+
+The source side runs through the row's transforms and masking, so a
+deterministic mask matches on both sides. See the
+[verification cookbook](../cookbook/verify.md). Schema: `faucet schema verify`.
+
+## `rollback`
+
+Opt-in **undoable runs** (#706): stamp the `_faucet_run_id` column, journal
+the before-image of every key an upsert/delete run touches (in the write's own
+transaction), keep the table an overwrite replaces as `<table>__faucet_prev`,
+and record the pre-run bookmark, so `faucet rollback --run <id>` can undo the
+run and rewind the sync.
+
+```yaml
+rollback:
+  enabled: true
+  journal: true         # before-images for upsert / delete runs
+  keep_previous: true   # keep the replaced table of an overwrite
+  retain: 10            # undoable runs kept per row
+```
+
+Requires a durable `state:` block (not `memory`) and a rollback-capable sink
+(`postgres` / `sqlite` / `mysql` in column mode); refused at load time
+otherwise, or when `metadata_columns.enabled` is `false`. `faucet run` prints
+each row's run id. See the [rollback cookbook](../cookbook/rollback.md).
+Schema: `faucet schema rollback`.
+
 ## `notifications`
 
 *(requires the `notify` build feature)*

@@ -257,6 +257,7 @@ async fn copy_with_upsert_or_delete_is_rejected_at_config_load() {
             write_mode: mode,
             key: vec!["id".into()],
             delete_marker: None,
+            rollback: None,
         };
         let Err(err) = PostgresSink::new(cfg).await else {
             panic!("copy + {mode:?} must be rejected");

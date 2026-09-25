@@ -162,9 +162,30 @@ pub struct WriteSpec {
     /// upsert rows before writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_marker: Option<DeleteMarker>,
+    /// Runtime rollback settings (#706): the run id to journal under, the
+    /// run-id column, and whether to journal before-images / keep a replaced
+    /// table. Injected per invocation by the CLI when a config has a
+    /// top-level `rollback:` block — not meant to be written by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<crate::rollback::RollbackWriteSpec>,
 }
 
 impl WriteSpec {
+    /// The run id this invocation writes under, when rollback is on.
+    pub fn rollback_run_id(&self) -> Option<&str> {
+        self.rollback.as_ref().map(|r| r.run_id.as_str())
+    }
+
+    /// Whether upserts/deletes must journal before-images (#706).
+    pub fn journals(&self) -> bool {
+        self.rollback.as_ref().is_some_and(|r| r.journal)
+    }
+
+    /// Whether an overwrite keeps the replaced table (#706).
+    pub fn keeps_previous(&self) -> bool {
+        self.rollback.as_ref().is_some_and(|r| r.keep_previous)
+    }
+
     /// Validate internal consistency at config-load time.
     pub fn validate(&self) -> Result<(), FaucetError> {
         if matches!(self.write_mode, WriteMode::Upsert | WriteMode::Delete) && self.key.is_empty() {
@@ -268,6 +289,12 @@ pub fn plan_writes(page: &[Value], spec: &WriteSpec) -> WritePlan {
     plan
 }
 
+/// The key tuple of a record in `key` order, or `None` when a key column is
+/// missing or null — the same rule [`plan_writes`] applies.
+pub fn record_key(rec: &Value, key: &[String]) -> Option<KeyTuple> {
+    extract_key(rec, key).ok()
+}
+
 /// Pull the key columns out of a record in `key` order. Missing key or null
 /// key value is an error.
 fn extract_key(rec: &Value, key: &[String]) -> Result<KeyTuple, String> {
@@ -347,6 +374,7 @@ mod tests {
             write_mode: WriteMode::Upsert,
             key: keys.iter().map(|s| s.to_string()).collect(),
             delete_marker: None,
+            rollback: None,
         }
     }
 
@@ -407,6 +435,7 @@ mod tests {
                 field: "__op".into(),
                 values: vec!["d".into()],
             }),
+            rollback: None,
         };
         let plan = plan_writes(
             &[
@@ -438,6 +467,7 @@ mod tests {
                 field: "__op".into(),
                 values: vec!["d".into()],
             }),
+            rollback: None,
         };
         let plan = plan_writes(
             &[json!({"id": 1, "__op": "u"}), json!({"id": 1, "__op": "d"})],
@@ -453,6 +483,7 @@ mod tests {
             write_mode: WriteMode::Delete,
             key: vec!["id".into()],
             delete_marker: None,
+            rollback: None,
         };
         let plan = plan_writes(&[json!({"id": 1}), json!({"id": 2})], &spec);
         assert!(plan.upserts.is_empty());
@@ -482,6 +513,7 @@ mod tests {
             write_mode: WriteMode::Upsert,
             key: vec![],
             delete_marker: None,
+            rollback: None,
         };
         assert!(spec.validate().is_err());
     }
@@ -498,12 +530,14 @@ mod tests {
             write_mode: WriteMode::Upsert,
             key: vec!["id".into()],
             delete_marker: None,
+            rollback: None,
         };
         assert!(upsert.dedups_by_key());
         let delete = WriteSpec {
             write_mode: WriteMode::Delete,
             key: vec!["id".into()],
             delete_marker: None,
+            rollback: None,
         };
         assert!(delete.dedups_by_key());
         // An (invalid) keyless upsert never claims keyed dedup.
@@ -511,6 +545,7 @@ mod tests {
             write_mode: WriteMode::Upsert,
             key: vec![],
             delete_marker: None,
+            rollback: None,
         };
         assert!(!keyless.dedups_by_key());
     }
@@ -525,6 +560,7 @@ mod tests {
                 field: "__op".into(),
                 values: vec!["d".into()],
             }),
+            rollback: None,
         };
         let plan = plan_writes(
             &[
@@ -673,6 +709,7 @@ mod tests {
             write_mode: WriteMode::Delete,
             key: vec!["id".into()],
             delete_marker: None,
+            rollback: None,
         };
         let plan = plan_writes(&[json!({"id": 1}), json!({"id": 1})], &spec);
         assert_eq!(plan.deletes.len(), 1);

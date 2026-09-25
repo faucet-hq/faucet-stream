@@ -14,14 +14,14 @@ use sqlx::{MySqlConnection, MySqlPool, Row};
 const SCOPE_COL_WIDTH: usize = 255;
 
 /// Fit a pipeline scope into [`SCOPE_COL_WIDTH`].
-fn scope_key(scope: &str) -> String {
+pub(crate) fn scope_key(scope: &str) -> String {
     faucet_core::idempotency::scope_key(scope, SCOPE_COL_WIDTH)
 }
 
 /// A sink that writes JSON records to a MySQL table.
 pub struct MysqlSink {
-    config: MysqlSinkConfig,
-    pool: MySqlPool,
+    pub(crate) config: MysqlSinkConfig,
+    pub(crate) pool: MySqlPool,
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
@@ -31,7 +31,7 @@ pub struct MysqlSink {
 ///
 /// Wraps the name in backticks and escapes any embedded backticks by doubling
 /// them, per MySQL convention.
-fn quote_ident_mysql(name: &str) -> String {
+pub(crate) fn quote_ident_mysql(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
@@ -178,7 +178,7 @@ fn validate_cleanup_columns(
 /// Shared by the delete-by-key and scoped-cleanup paths so the two never drift:
 /// a key bound as a JSON string (`"7"` instead of `7`) would silently match
 /// nothing and turn a delete into a no-op.
-fn bind_value<'q>(
+pub(crate) fn bind_value<'q>(
     q: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
     v: &Value,
 ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
@@ -425,7 +425,7 @@ impl MysqlSink {
         Ok(())
     }
 
-    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+    pub(crate) async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
         let exists: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM information_schema.tables \
              WHERE table_schema = DATABASE() AND table_name = ?",
@@ -488,7 +488,7 @@ impl MysqlSink {
     }
 
     /// The table the current-target-old is renamed to during the atomic swap.
-    fn old_table_name(&self) -> String {
+    pub(crate) fn old_table_name(&self) -> String {
         format!(
             "{}{}",
             self.config.table_name,
@@ -638,7 +638,7 @@ impl MysqlSink {
     /// or UNIQUE key (last-write-wins within the batch is handled by the
     /// planner's dedup, so a single sub-chunk never double-hits the same
     /// conflict target).
-    async fn insert_auto_map_with_conflict(
+    pub(crate) async fn insert_auto_map_with_conflict(
         &self,
         conn: &mut MySqlConnection,
         records: &[Value],
@@ -797,7 +797,7 @@ impl MysqlSink {
     /// Delete rows whose key columns match any of `deletes`, using
     /// `DELETE FROM t WHERE (k1, …) IN ((?, …), …)`, chunked at MySQL's
     /// 65535-placeholder limit. Runs inside the caller's transaction.
-    async fn delete_by_keys(
+    pub(crate) async fn delete_by_keys(
         &self,
         conn: &mut MySqlConnection,
         deletes: &[faucet_core::KeyTuple],
@@ -852,6 +852,12 @@ impl MysqlSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("MySQL transaction begin failed: {e}")))?;
 
+        // `rollback.journal`: before-images commit with the writes (#706).
+        if self.config.write.journals()
+            && let Some(run_id) = self.config.write.rollback_run_id()
+        {
+            self.journal_plan(&mut tx, plan, run_id).await?;
+        }
         let mut affected = 0usize;
         if !plan.upserts.is_empty() {
             affected += self
@@ -1068,7 +1074,7 @@ impl MysqlSink {
     /// resume bookmark (`{20-digit seq}#{bookmark-json}`) and easily exceeds the
     /// old `VARCHAR(32)`, which truncated/rejected every bookmark-bearing page
     /// and broke exactly-once delivery (audit #321 C3).
-    async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
+    pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {t} ({s} VARCHAR({w}) PRIMARY KEY, {k} TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
             t = quote_ident_mysql(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
@@ -1228,6 +1234,25 @@ impl faucet_core::Sink for MysqlSink {
             }
             return Ok(());
         }
+        // `rollback.keep_previous`: the replaced table is kept as
+        // `<table>__faucet_prev` (the rename is already the atomic unit, so
+        // no copy is needed) instead of being dropped (#706).
+        if self.config.write.keeps_previous() {
+            let prev = quote_ident_mysql(&self.previous_table_name());
+            sqlx::query(&format!("DROP TABLE IF EXISTS {prev}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("mysql overwrite: drop older previous: {e}"))
+                })?;
+            sqlx::query(&format!(
+                "RENAME TABLE {target} TO {prev}, {staging} TO {target}"
+            ))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("mysql overwrite swap (RENAME) failed: {e}")))?;
+            return Ok(());
+        }
         sqlx::query(&format!(
             "RENAME TABLE {target} TO {old}, {staging} TO {target}"
         ))
@@ -1265,6 +1290,36 @@ impl faucet_core::Sink for MysqlSink {
 
     fn dedups_by_key(&self) -> bool {
         self.config.write.dedups_by_key()
+    }
+
+    /// Column-mapping mode only: the run-id column, the journaled keys and the
+    /// kept previous table all address real columns (#706).
+    fn supports_rollback(&self) -> bool {
+        self.rollback_supported()
+    }
+
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        self.rollback_run_impl(run_id, opts).await
+    }
+
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.forget_run_impl(run_id).await
+    }
+
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.rewind_commit_token_impl(scope, token).await
+    }
+
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.readback_source_impl()
     }
 
     fn supports_schema_evolution(&self) -> bool {
@@ -1530,6 +1585,11 @@ impl faucet_core::Sink for MysqlSink {
         // tx (no nested tx — the helpers run on this transaction's connection).
         let written = match &plan {
             Some(plan) => {
+                if self.config.write.journals()
+                    && let Some(run_id) = self.config.write.rollback_run_id()
+                {
+                    self.journal_plan(&mut tx, plan, run_id).await?;
+                }
                 let mut affected = 0usize;
                 if !plan.upserts.is_empty() {
                     affected += self

@@ -29,6 +29,10 @@ pub struct ReplicationOptions {
     pub sla: Option<crate::sla::SlaSpec>,
     /// Optional completeness reconciliation (#502), evaluated after each phase's runs.
     pub reconcile: Option<crate::reconcile::ReconcileSpec>,
+    /// Post-run content verification (#701), forwarded to every phase.
+    pub verify: Option<crate::verify::VerifySpec>,
+    /// Run rollback settings (#706), forwarded to every phase.
+    pub rollback: Option<crate::rollback::RollbackSpec>,
     /// Optional notifier (#280), shared across both phases' runs.
     #[cfg(feature = "notify")]
     pub notifier: Option<std::sync::Arc<crate::notify::Notifier>>,
@@ -103,6 +107,8 @@ fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> Ex
         resilience: opts.resilience.clone(),
         sla: opts.sla.clone(),
         reconcile: opts.reconcile.clone(),
+        verify: opts.verify.clone(),
+        rollback: opts.rollback.clone(),
         #[cfg(feature = "lineage")]
         lineage: None,
         #[cfg(feature = "lineage")]
@@ -439,6 +445,7 @@ pipeline:
             invocations: vec![crate::executor::InvocationOutcome {
                 row_id: "snapshot".into(),
                 parent_record_key: None,
+                run_id: None,
                 records_written: 0,
                 error: Some("connection refused".into()),
                 error_kind: None,
@@ -463,6 +470,7 @@ pipeline:
             invocations: vec![crate::executor::InvocationOutcome {
                 row_id: "cdc".into(),
                 parent_record_key: None,
+                run_id: None,
                 records_written: 0,
                 error: None,
                 error_kind: None,

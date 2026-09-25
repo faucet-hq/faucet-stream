@@ -55,6 +55,7 @@ async fn fresh_sink() -> (ContainerAsync<Postgres>, String, PostgresSink) {
             field: "__op".to_string(),
             values: vec!["d".to_string()],
         }),
+        rollback: None,
     };
     let sink = PostgresSink::new(cfg).await.expect("sink");
     (container, url, sink)

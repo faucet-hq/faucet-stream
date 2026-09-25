@@ -608,6 +608,62 @@ fail again go to a *fresh* DLQ, never back to the source.
 See the [Dead-letter queues](../cookbook/dlq.md) cookbook page for the envelope
 shape and the inspect → fix → replay → discard workflow.
 
+## `verify`
+
+Prove a destination matches its source **by content** (#701): compare key
+ranges by digest, bisect to the differing keys, report them, and optionally
+repair exactly those keys through the row's sink.
+
+```bash
+faucet verify pipeline.yaml                          # exit code = differing keys
+faucet verify pipeline.yaml --json
+faucet verify pipeline.yaml --repair --allow-delete  # re-sync, deleting destination-only rows
+faucet verify pipeline.yaml --row orders --max-differences 50
+```
+
+| Flag | Effect |
+|------|--------|
+| `--row <id>` | Which root row to verify. Default: the first root. |
+| `--repair` | Re-sync missing / changed keys through the sink (`write_mode: upsert`). |
+| `--allow-delete` | With `--repair`, also delete rows only the destination has. |
+| `--dry-run` | With `--repair`, plan without writing. |
+| `--max-differences <n>` | Report at most this many differences (the count keeps going). |
+| `--json` | Emit the machine-readable report. |
+| `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
+
+Rows are matched on the sink's `key` or `verify.key`; a keyless table is
+refused. The `verify:` block (see [config](./config.md#verify)) also runs the
+comparison after every successful run. Cookbook: [Content
+verification](../cookbook/verify.md).
+
+## `rollback`
+
+Undo a run (#706): delete the rows it appended, restore the journaled
+before-images of the keys it upserted, or swap back the table it overwrote —
+then rewind the row's bookmark so the next run re-reads what was undone.
+
+```bash
+faucet rollback pipeline.yaml --list                 # undoable runs, newest first
+faucet rollback pipeline.yaml --run <id> --dry-run
+faucet rollback pipeline.yaml --run <id>
+faucet rollback pipeline.yaml --run <id> --force     # restore keys a later run changed
+```
+
+| Flag | Effect |
+|------|--------|
+| `--run <id>` | The run to undo — the id `faucet run` prints per row (the value of `_faucet_run_id`). Required unless `--list`. |
+| `--row <id>` | The row the run wrote. Default: search every root row's state. |
+| `--list` | List the undoable runs instead. |
+| `--dry-run` | Show what would change without changing anything. |
+| `--force` | Restore keys a later run changed since (otherwise they are conflicts that block the rollback). |
+| `--json` | Emit a machine-readable report. |
+| `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
+
+A blocked rollback (conflicts without `--force`) exits with the conflict count
+and changes nothing. Runs are undoable only when made with a `rollback:` block
+(see [config](./config.md#rollback)). Cookbook: [Undoing a
+run](../cookbook/rollback.md).
+
 ## `contract`
 
 ```bash

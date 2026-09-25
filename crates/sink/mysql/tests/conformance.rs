@@ -67,6 +67,7 @@ async fn fresh_sink() -> (
             field: "__op".to_string(),
             values: vec!["d".to_string()],
         }),
+        rollback: None,
     };
     let sink = MysqlSink::new(cfg).await.expect("sink");
     (container, permit, url, sink)

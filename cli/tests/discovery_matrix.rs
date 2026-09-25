@@ -28,6 +28,8 @@ fn opts() -> ExecuteOptions {
         resilience: None,
         sla: None,
         reconcile: None,
+        verify: None,
+        rollback: None,
         #[cfg(feature = "lineage")]
         lineage: None,
         #[cfg(feature = "lineage")]

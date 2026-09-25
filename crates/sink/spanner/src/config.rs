@@ -196,6 +196,7 @@ mod tests {
             write_mode: WriteMode::Upsert,
             key: vec![],
             delete_marker: None,
+            rollback: None,
         };
         assert!(config.validate().is_err());
     }

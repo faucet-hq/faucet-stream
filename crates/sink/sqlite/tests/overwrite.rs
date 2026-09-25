@@ -86,6 +86,7 @@ fn overwrite_config(url: &str, mapping: SqliteColumnMapping) -> SqliteSinkConfig
             write_mode: WriteMode::Overwrite,
             key: vec![],
             delete_marker: None,
+            rollback: None,
         },
     }
 }

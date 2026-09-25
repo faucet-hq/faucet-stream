@@ -784,6 +784,7 @@ fn build_summary(
         .map(|(node_id, records)| InvocationOutcome {
             row_id: node_id.clone(),
             parent_record_key: None,
+            run_id: None,
             records_written: *records,
             error: None,
             error_kind: None,
@@ -796,6 +797,7 @@ fn build_summary(
         invocations.push(InvocationOutcome {
             row_id: (*node_id).to_string(),
             parent_record_key: None,
+            run_id: None,
             records_written: 0,
             error: Some((*error).to_string()),
             error_kind: kind.map(|k| match k {

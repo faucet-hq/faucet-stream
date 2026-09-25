@@ -73,6 +73,7 @@ fn overwrite_cfg(cfg: &MssqlConnectionConfig) -> MssqlSinkConfig {
         write_mode: WriteMode::Overwrite,
         key: vec![],
         delete_marker: None,
+        rollback: None,
     };
     s
 }

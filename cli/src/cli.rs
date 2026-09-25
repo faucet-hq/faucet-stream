@@ -158,6 +158,14 @@ pub enum Command {
     /// Inspect, replay, or discard dead-letter-queue envelopes written by a
     /// pipeline's `dlq:` sink.
     Dlq(DlqArgs),
+    /// Prove a destination matches its source by content: compare key ranges
+    /// by digest, bisect to the differing keys, report them — and with
+    /// `--repair`, re-sync exactly those keys. Exit code = differing keys.
+    Verify(VerifyArgs),
+    /// Undo a run: delete the rows it appended, restore the before-images of
+    /// the keys it upserted, or swap back the table it overwrote — and rewind
+    /// the bookmark so the next run re-reads what was undone.
+    Rollback(RollbackArgs),
     /// Template Hub: compose a `source-template` with a `sink-template`, check
     /// a pairing, list a catalog, render its compatibility matrix, or lint
     /// templates for publication.
@@ -1117,6 +1125,81 @@ pub struct DlqReplayArgs {
     pub profile: Option<String>,
 }
 
+/// `faucet verify` arguments.
+#[derive(Debug, Parser)]
+pub struct VerifyArgs {
+    /// Path to the pipeline config whose source and sink to compare. If
+    /// omitted, auto-discover `faucet.yaml` / `.yml` / `.json` in cwd.
+    pub config: Option<PathBuf>,
+    /// Which root row to verify. Defaults to the first root.
+    #[arg(long)]
+    pub row: Option<String>,
+    /// Re-sync the differing keys through the row's sink (`write_mode:
+    /// upsert`). Rows only the destination has are left alone unless
+    /// `--allow-delete`.
+    #[arg(long)]
+    pub repair: bool,
+    /// With `--repair`, also delete destination rows the source no longer has.
+    #[arg(long, requires = "repair")]
+    pub allow_delete: bool,
+    /// With `--repair`, plan the repair without writing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Report at most this many differences (the count keeps going).
+    #[arg(long)]
+    pub max_differences: Option<usize>,
+    /// Emit the machine-readable report instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file for `${env:VAR}` interpolation in the config.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Select a named overlay from the config's `profiles:` block.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
+}
+
+/// `faucet rollback` arguments.
+#[derive(Debug, Parser)]
+pub struct RollbackArgs {
+    /// Path to the pipeline config the run was made with. If omitted,
+    /// auto-discover `faucet.yaml` / `.yml` / `.json` in cwd.
+    pub config: Option<PathBuf>,
+    /// The run to undo — the id `faucet run` prints per row (and the value of
+    /// the `_faucet_run_id` column). Required unless `--list`.
+    #[arg(long, required_unless_present = "list")]
+    pub run: Option<String>,
+    /// The row the run wrote. Defaults to searching every root row's state
+    /// for the run.
+    #[arg(long)]
+    pub row: Option<String>,
+    /// List the undoable runs instead of undoing one.
+    #[arg(long, conflicts_with_all = ["dry_run", "force"])]
+    pub list: bool,
+    /// Show what would change without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Restore keys a later run changed since (they are otherwise conflicts
+    /// that block the whole rollback).
+    #[arg(long)]
+    pub force: bool,
+    /// Emit a machine-readable JSON report instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file for `${env:VAR}` interpolation in the config.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Select a named overlay from the config's `profiles:` block.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
+}
+
 /// `faucet dlq discard <location>` arguments.
 #[derive(Debug, Parser)]
 pub struct DlqDiscardArgs {
@@ -1891,6 +1974,10 @@ pub enum SchemaTarget {
     },
     /// JSON Schema for the DLQ (Dead Letter Queue) specification.
     Dlq,
+    /// JSON Schema for the top-level `verify:` (content verification) block.
+    Verify,
+    /// JSON Schema for the top-level `rollback:` (undoable runs) block.
+    Rollback,
     /// JSON Schema for the `mirror:` (snapshot→CDC) block; `replication` is
     /// the pre-#670 name, still accepted.
     #[command(name = "mirror", alias = "replication")]

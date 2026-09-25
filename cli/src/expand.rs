@@ -172,6 +172,17 @@ pub struct DeferredRef {
     pub token: String,
 }
 
+/// The metadata-columns policy a node runs with: the config's own, plus the
+/// `run_id` column when a `rollback:` block needs it (#706).
+fn effective_metadata_columns(cfg: &PipelineConfig) -> Option<faucet_core::MetadataColumnsSpec> {
+    match cfg.rollback.as_ref().filter(|r| r.enabled) {
+        Some(_) => Some(crate::rollback::ensure_run_id_column(
+            cfg.metadata_columns.as_ref(),
+        )),
+        None => cfg.metadata_columns.clone(),
+    }
+}
+
 /// In-memory lookup of source / sink templates, built once per `expand()` call.
 /// Combines named entries from `pipeline.sources` / `pipeline.sinks` with the
 /// legacy singular `pipeline.source` / `pipeline.sink` (registered as `default`).
@@ -962,6 +973,50 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             }
         }
 
+        // Rollback gate (#706): an undoable run needs a durable state store
+        // (the pre-run marker and bookmark live there), a sink that can undo
+        // its own writes, and the run-id column the metadata decorator stamps.
+        if let Some(rb) = cfg.rollback.as_ref().filter(|r| r.enabled) {
+            rb.validate()
+                .map_err(|e| CliError::Config(format!("rollback: {e}")))?;
+            match state.as_ref() {
+                None => {
+                    return Err(CliError::Config(format!(
+                        "row '{row_id}': rollback: needs a `state:` block — the pre-run marker \
+                         (bookmark + watermark before the run) is kept there so the next run \
+                         re-reads what a rollback undid"
+                    )));
+                }
+                Some(s) if s.kind == "memory" => {
+                    return Err(CliError::Config(format!(
+                        "row '{row_id}': rollback: the `memory` state store resets on process \
+                         exit, so a run could never be undone later — use `file`, `redis`, or \
+                         `postgres`"
+                    )));
+                }
+                Some(_) => {}
+            }
+            if !crate::rollback::sink_supports_rollback(&merged_sink.kind) {
+                return Err(CliError::Config(format!(
+                    "row '{row_id}': rollback: sink '{}' cannot undo a run (supported: {})",
+                    merged_sink.kind,
+                    crate::rollback::ROLLBACK_SINK_KINDS.join(", ")
+                )));
+            }
+            if cfg.metadata_columns.as_ref().is_some_and(|m| !m.enabled) {
+                return Err(CliError::Config(format!(
+                    "row '{row_id}': rollback: needs the `run_id` metadata column, but \
+                     `metadata_columns.enabled` is false"
+                )));
+            }
+        }
+        // Verify gate (#701): validate once per row; the key / destination are
+        // resolved at verify time against the built sink.
+        if let Some(v) = cfg.verify.as_ref() {
+            v.validate()
+                .map_err(|e| CliError::Config(format!("verify: {e}")))?;
+        }
+
         // write_mode × sink validation (load-time): reject an unsupported mode
         // for the sink kind, and upsert/delete without a key, before any run.
         // Runs for every row; append rows pass trivially.
@@ -1397,7 +1452,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             deferred_refs: deferred,
             source_override: None,
             cleanup_scope,
-            metadata_columns: cfg.metadata_columns.clone(),
+            metadata_columns: effective_metadata_columns(cfg),
             #[cfg(feature = "catalog")]
             local_outputs: cfg.local_outputs.clone(),
         };

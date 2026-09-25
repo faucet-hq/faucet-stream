@@ -466,6 +466,8 @@ async fn execute_shard(
         // carried for uniformity with the whole-run path below.
         sla: cfg.sla.clone(),
         reconcile: cfg.reconcile.clone(),
+        verify: cfg.verify.clone(),
+        rollback: cfg.rollback.clone(),
         #[cfg(feature = "lineage")]
         lineage,
         #[cfg(feature = "lineage")]
@@ -1292,6 +1294,8 @@ async fn execute_run(
         resilience,
         sla: cfg.sla.clone(),
         reconcile: cfg.reconcile.clone(),
+        verify: cfg.verify.clone(),
+        rollback: cfg.rollback.clone(),
         #[cfg(feature = "lineage")]
         lineage,
         #[cfg(feature = "lineage")]
@@ -1494,6 +1498,7 @@ mod tests {
             invocations: vec![crate::executor::InvocationOutcome {
                 row_id: "r".into(),
                 parent_record_key: None,
+                run_id: None,
                 records_written: 3,
                 error: None,
                 error_kind: None,
@@ -1513,6 +1518,7 @@ mod tests {
             invocations: vec![crate::executor::InvocationOutcome {
                 row_id: "r".into(),
                 parent_record_key: None,
+                run_id: None,
                 records_written: 0,
                 error: Some("boom".into()),
                 error_kind: None,

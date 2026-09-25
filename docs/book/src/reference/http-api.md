@@ -73,6 +73,8 @@ someone does.
 | `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs` | ✓ | ✓ | ✓ |
 | `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
 | `POST /v1/backfill` | — | ✓ | ✓ |
+| `POST /v1/verify` | — | ✓ | ✓ |
+| `POST /v1/runs/{id}/rollback` | — | — | ✓ |
 | `GET /v1/schemas`, `/v1/schemas/{kind}/{name}` | ✓ | ✓ | ✓ |
 | `POST /v1/doctor` | — | ✓ | ✓ |
 | `POST /v1/dlq/inspect` | ✓ | ✓ | ✓ |
@@ -642,6 +644,43 @@ already-submitted units replay their existing run, the rest submit (a full
 queue marks the remainder `not_submitted`; re-POST to continue). A config
 carrying `shard: {count}` makes each unit a sharded run tracked via shard
 progress. Requires `RunWrite` (operator); audited as `backfill.submit`.
+
+### `POST /v1/verify`
+
+Compare one root row's destination to its source by content (#701) — see the
+[verification cookbook](../cookbook/verify.md) for the digest + bisection
+model.
+
+```json
+{ "config": "version: 1\n…", "config_format": "yaml", "row": "orders",
+  "repair": false, "allow_delete": false, "dry_run": false, "max_differences": 1000 }
+```
+
+`200` with the report: `strategy` (`range` / `full`), `ranges_compared`,
+`ranges_differing`, `server_digests`, `rows_fetched_source` /
+`rows_fetched_dest`, `differences: [{key, kind, columns?}]`, `truncated`, and
+`repaired_upserts` / `repaired_deletes` when a repair ran. A mismatch is a
+result, not an error. Requires `RunWrite` (operator); audited as `verify`.
+
+### `POST /v1/runs/{id}/rollback`
+
+Undo one invocation of a finished run (#706) — see the [rollback
+cookbook](../cookbook/rollback.md).
+
+```json
+{ "invocation_id": "019…", "row": "orders", "config": "version: 1\n…",
+  "config_format": "yaml", "dry_run": false, "force": false }
+```
+
+- **`invocation_id`** — one of the run's `invocations[].run_id`; optional when
+  the run has exactly one invocation.
+- **`config`** — the config the run was made with; optional when the server
+  stored it (cluster mode), `422` otherwise.
+
+`200` with the report: `applied`, `blocked`, `mode`, `deleted`, `restored`,
+`conflicts`, `bookmark_rewound`, `token_rewound`, `note`. `blocked: true`
+means a later run changed the keys and nothing was touched — pass `force`. `409` while the run is still running. Admin-only (`Rollback`
+permission); audited as `run.rollback`.
 
 ## Completion callbacks
 

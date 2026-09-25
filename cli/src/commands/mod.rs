@@ -34,6 +34,7 @@ pub mod notify;
 pub mod plan;
 pub mod preview;
 pub mod replicate;
+pub mod rollback;
 pub mod run;
 #[cfg(feature = "schedule")]
 pub mod schedule;
@@ -45,6 +46,7 @@ pub mod serve;
 pub mod template;
 pub mod test;
 pub mod validate;
+pub mod verify;
 
 use crate::error::CliError;
 

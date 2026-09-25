@@ -4,7 +4,7 @@
 use crate::serve::error::ServeError;
 use crate::serve::history::{DeleteOutcome, ListFilter, RunRecord, RunStatus};
 use crate::serve::rbac::AuthContext;
-use crate::serve::runner::{self, SubmitRequest, SubmitResponse};
+use crate::serve::runner::{self, ConfigFormatWire, SubmitRequest, SubmitResponse};
 use crate::serve::state::ServerState;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
@@ -251,6 +251,152 @@ pub async fn list_runs(
         runs,
         next_cursor: page.next_cursor,
     }))
+}
+
+/// `POST /v1/runs/{id}/rollback` request body (#706).
+#[derive(Debug, Deserialize, Default)]
+pub struct RollbackRequest {
+    /// The invocation to undo — one of the run's `invocations[].run_id`.
+    /// Optional when the run has exactly one invocation.
+    #[serde(default)]
+    pub invocation_id: Option<String>,
+    /// The row that invocation wrote (default: search every root's state).
+    #[serde(default)]
+    pub row: Option<String>,
+    /// The pipeline config the run was made with. Optional when the server
+    /// stored the run's config (cluster mode); required otherwise.
+    #[serde(default)]
+    pub config: Option<String>,
+    #[serde(default)]
+    pub config_format: ConfigFormatWire,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `POST /v1/runs/{id}/rollback` → 200 with the
+/// [`RollbackReport`](crate::rollback::RollbackReport) (`applied: false` +
+/// `conflicts > 0` means the rollback was refused because a later run changed
+/// the keys — pass `force`). Admin-only; audited as `run.rollback`.
+pub async fn rollback_run(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(id): Path<String>,
+    body: Option<Json<RollbackRequest>>,
+) -> Result<Json<crate::rollback::RollbackReport>, ServeError> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let rec = state
+        .history()
+        .get(&id)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .ok_or(ServeError::NotFound)?;
+    if !rec.status.is_terminal() {
+        return Err(ServeError::Conflict(format!(
+            "run {id} is {} — a run can only be rolled back once it has finished",
+            rec.status.as_str()
+        )));
+    }
+    // Which invocation: the caller's pick, else the only one.
+    let known: Vec<String> = rec
+        .invocations
+        .iter()
+        .filter_map(|i| i.run_id.clone())
+        .collect();
+    let invocation_id = match req.invocation_id {
+        Some(inv) => {
+            if !known.is_empty() && !known.contains(&inv) {
+                return Err(ServeError::BadConfig(format!(
+                    "invocation_id {inv} is not one of run {id}'s invocations ({})",
+                    known.join(", ")
+                )));
+            }
+            inv
+        }
+        None if known.len() == 1 => known[0].clone(),
+        None if known.is_empty() => {
+            return Err(ServeError::Unprocessable {
+                message: format!(
+                    "run {id} recorded no invocation ids (it predates rollback support, or \
+                     no pipeline ran); pass `invocation_id` explicitly"
+                ),
+                details: None,
+            });
+        }
+        None => {
+            return Err(ServeError::BadConfig(format!(
+                "run {id} has {} invocations — pass `invocation_id` (one of: {})",
+                known.len(),
+                known.join(", ")
+            )));
+        }
+    };
+    // Which config: the caller's, else the stored one (cluster mode).
+    let (config, format) = match (req.config, rec.config_body.as_deref()) {
+        (Some(c), _) => (c, req.config_format.into()),
+        (None, Some(stored)) => (stored.to_string(), rec.config_format.unwrap_or_default()),
+        (None, None) => {
+            return Err(ServeError::Unprocessable {
+                message: format!(
+                    "run {id}'s config is not stored on this server; pass `config` (the \
+                     pipeline config the run was made with) in the request body"
+                ),
+                details: None,
+            });
+        }
+    };
+    let loaded =
+        crate::serve::load::load_submission(&config, format, state.default_base().as_ref()).await?;
+    let auth = crate::auth_catalog::build_auth_catalog(loaded.cfg.auth.as_ref())
+        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+    let pipeline_name = loaded
+        .cfg
+        .name
+        .clone()
+        .or(rec.name.clone())
+        .unwrap_or_else(|| "pipeline".to_string());
+    let (node, store, marker) = crate::rollback::locate(
+        &loaded.nodes,
+        &pipeline_name,
+        &invocation_id,
+        req.row.as_deref(),
+    )
+    .await
+    .map_err(cli_to_serve)?;
+    let report = crate::rollback::rollback_node(
+        &node,
+        store,
+        marker,
+        &crate::rollback::RollbackInputs {
+            run_id: invocation_id,
+            row: req.row,
+            dry_run: req.dry_run,
+            force: req.force,
+            pipeline_name,
+            auth,
+        },
+    )
+    .await
+    .map_err(cli_to_serve)?;
+    let result = if req.dry_run {
+        "dry_run"
+    } else if report.outcome.applied {
+        "ok"
+    } else {
+        "blocked"
+    };
+    crate::serve::audit::write(&state, &actor, "run.rollback", Some(id), None, result).await;
+    Ok(Json(report))
+}
+
+/// Map a CLI-layer error to an HTTP-facing one: a bad config / missing run is
+/// a client error (400); anything else is internal (500).
+fn cli_to_serve(e: crate::error::CliError) -> ServeError {
+    match e {
+        crate::error::CliError::Config(m) => ServeError::BadConfig(m),
+        other => ServeError::Internal(other.to_string()),
+    }
 }
 
 #[cfg(test)]

@@ -167,6 +167,7 @@ mod tests {
             invocations: vec![InvocationRecord {
                 row_id: "us".into(),
                 parent_record_key: None,
+                run_id: None,
                 records_written: rows as usize,
                 duration_ms: 0,
                 error: None,

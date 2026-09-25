@@ -27,6 +27,7 @@ pub mod contract;
 pub mod create_table;
 #[cfg(feature = "transform-cross-join")]
 pub mod cross_join;
+pub mod diff;
 pub mod discover;
 pub mod dlq;
 pub mod drift;
@@ -50,6 +51,7 @@ pub mod redact;
 pub mod replication;
 pub mod resilience;
 pub mod retry;
+pub mod rollback;
 pub mod schema;
 pub mod shard;
 pub mod stage;
@@ -92,6 +94,10 @@ pub use create_table::{
 };
 #[cfg(feature = "transform-cross-join")]
 pub use cross_join::{CompiledCrossJoin, CrossJoinSpec, OnEmpty as CrossJoinOnEmpty};
+pub use diff::{
+    ContentDigest, Difference, DifferenceKind, DigestAccumulator, KeyRange, Normalizer,
+    ServerDigest, VerifyReport, diff_rows, plan_ranges, row_hash,
+};
 pub use discover::{DatasetDescriptor, columns_to_schema, nullable_type, sql_type_to_json_schema};
 pub use dlq::{
     DlqConfig, DlqReason, DlqStats, EnvelopeError, OnBatchError, UnwrappedEnvelope, build_envelope,
@@ -149,6 +155,10 @@ pub use resilience::{
     execute_with_policy, execute_with_policy_metered,
 };
 pub use retry::execute_with_retry;
+pub use rollback::{
+    DEFAULT_RUN_ID_COLUMN, PREVIOUS_TABLE_SUFFIX, RUN_JOURNAL_TABLE, RollbackMode, RollbackOptions,
+    RollbackOutcome, RollbackWriteSpec,
+};
 pub use shard::ShardSpec;
 #[cfg(feature = "transform-cdc-unwrap")]
 pub use stage::CdcUnwrapSpec;

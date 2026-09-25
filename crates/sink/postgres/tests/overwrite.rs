@@ -69,6 +69,7 @@ fn overwrite_config(url: &str) -> PostgresSinkConfig {
         write_mode: WriteMode::Overwrite,
         key: vec![],
         delete_marker: None,
+        rollback: None,
     };
     config
 }

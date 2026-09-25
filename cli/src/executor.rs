@@ -128,6 +128,16 @@ pub struct ExecuteOptions {
     /// beyond tolerance. `None` disables the pass. Same root/real-run scoping as
     /// the SLA pass (skipped for dry-run / `--limit` / shard / cancelled runs).
     pub reconcile: Option<crate::reconcile::ReconcileSpec>,
+    /// Optional content verification (#701): after every successful **root**
+    /// invocation (`verify.after_run`), compare the destination to the source
+    /// by content; differences fail the run unless `fail_on_difference:
+    /// false`, and `repair: true` re-syncs them first. Same root/real-run
+    /// scoping as reconcile.
+    pub verify: Option<crate::verify::VerifySpec>,
+    /// Optional run rollback (#706): when set, every real **root** invocation
+    /// writes a pre-run marker into its state store and hands the sink its
+    /// journaling settings, so `faucet rollback --run <id>` can undo it.
+    pub rollback: Option<crate::rollback::RollbackSpec>,
     /// Shared OpenLineage emitter, built once from the `lineage:` block. `None`
     /// disables lineage (and adds zero overhead). Gated on the `lineage` feature.
     #[cfg(feature = "lineage")]
@@ -218,6 +228,10 @@ pub struct InvocationOutcome {
     /// `None` for root invocations; for children, the value at `parent_key` in
     /// the parent record (rendered to a string).
     pub parent_record_key: Option<String>,
+    /// This invocation's own run id — the value the `run_id` metadata column
+    /// carries and the id `faucet rollback --run` takes (#706). `None` for
+    /// synthetic outcomes where no pipeline ran.
+    pub run_id: Option<String>,
     pub records_written: usize,
     pub error: Option<String>,
     /// Typed kind of `error`, set wherever the failure is still a typed
@@ -264,6 +278,7 @@ pub struct InvocationMetrics {
 /// records — the pipeline-level counters `run_unit` folds into an
 /// [`InvocationMetrics`] (which then adds the connector kinds + wall-clock).
 struct PipelineStats {
+    run_id: String,
     records_written: usize,
     records_read: Option<u64>,
     dlq_count: u64,
@@ -321,6 +336,16 @@ fn concurrency_permits(configured: Option<usize>) -> usize {
 
 /// Execute every node in `nodes`. `nodes` must be in BFS order (roots first
 /// then children) — that's what [`crate::expand::expand`] returns.
+/// [`run_expanded`] as a boxed future — for callers that run the executor
+/// from *inside* an invocation (the `verify` repair pass, #701), where the
+/// recursive `async fn` type would otherwise be a cycle.
+pub fn run_expanded_boxed(
+    nodes: Vec<ExpandedNode>,
+    opts: ExecuteOptions,
+) -> futures::future::BoxFuture<'static, CliResult<RunSummary>> {
+    Box::pin(run_expanded(nodes, opts))
+}
+
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
     let on_error = opts
         .execution
@@ -788,6 +813,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                     InvocationOutcome {
                         row_id,
                         parent_record_key,
+                        run_id: None,
                         records_written: 0,
                         error: Some(format!("pipeline invocation task panicked: {e}")),
                         // A panicked task never produced a typed error.
@@ -1026,6 +1052,22 @@ fn resolved_sink_destination(unit: &Unit, opts: &ExecuteOptions) -> CliResult<Va
     if !ctx.is_empty() {
         resolve_inplace(&mut sink_cfg, &ctx)?;
     }
+    // Rollback (#706): the group's lifecycle sink (begin/commit/abort) is a
+    // different instance from the writers, and it is the commit that keeps
+    // the replaced table — so it needs the `keep_previous` setting too. The
+    // run id is irrelevant to the copy (the run-id column comes from the
+    // metadata decorator on the writers).
+    if let Some(spec) = opts.rollback.as_ref().filter(|r| r.enabled)
+        && matches!(unit.node.role, NodeRole::Root)
+        && !opts.dry_run
+        && opts.limit.is_none()
+        && opts.shard.is_none()
+        && unit.node.state.is_some()
+        && crate::rollback::sink_supports_rollback(&unit.node.sink.kind)
+    {
+        let column = crate::rollback::run_id_column(unit.node.metadata_columns.as_ref());
+        crate::rollback::inject_write_spec(&mut sink_cfg, spec, "", &column);
+    }
     Ok(sink_cfg)
 }
 
@@ -1119,7 +1161,7 @@ async fn run_unit(
     }
     let needs_capture = capture.is_some();
     let started = std::time::Instant::now();
-    let result = run_one_invocation(
+    let result = boxed_run_one_invocation(
         &unit.node,
         unit.parent_record.as_deref(),
         unit.product_ctx.as_ref(),
@@ -1166,6 +1208,7 @@ async fn run_unit(
             InvocationOutcome {
                 row_id,
                 parent_record_key,
+                run_id: Some(stats.run_id.clone()),
                 records_written: stats.records_written,
                 error: None,
                 error_kind: None,
@@ -1180,12 +1223,50 @@ async fn run_unit(
         Err(e) => InvocationOutcome {
             row_id,
             parent_record_key,
+            run_id: None,
             records_written: 0,
             error: Some(e.to_string()),
             error_kind: Some(classify_error(&e)),
             metrics: Some(base_metrics()),
         },
     }
+}
+
+/// [`run_one_invocation`] behind a heap allocation, built in its own
+/// never-inlined frame.
+///
+/// One invocation's future is enormous in a debug build — every optional pass
+/// (masking, quality, contract, drift, verify, lineage, catalog) is a state
+/// machine inlined into it. Awaiting it directly puts that whole size into
+/// the *caller's* stack frame (the compiler reserves the temporary even on
+/// branches that never run), which overflowed the 2 MiB test-thread stack
+/// under `--all-features`. Constructing it here and returning a `BoxFuture`
+/// keeps the caller's frame at pointer size; only this frame pays the
+/// transient cost. `run_unit` and every other caller go through this.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_run_one_invocation<'a>(
+    node: &'a ExpandedNode,
+    parent_record: Option<&'a Value>,
+    product_ctx: Option<&'a HashMap<String, Value>>,
+    state_key: &'a str,
+    capture: Option<Arc<Projection>>,
+    opts: &'a ExecuteOptions,
+    cancel: CancellationToken,
+    suppress_overwrite: bool,
+    overwrite_grouped: bool,
+) -> futures::future::BoxFuture<'a, CliResult<(Vec<Value>, PipelineStats)>> {
+    Box::pin(run_one_invocation(
+        node,
+        parent_record,
+        product_ctx,
+        state_key,
+        capture,
+        opts,
+        cancel,
+        suppress_overwrite,
+        overwrite_grouped,
+    ))
 }
 
 /// Run a discovery row (#501): build its source, drain it, project `select`,
@@ -1267,6 +1348,7 @@ async fn run_discovery(
             InvocationOutcome {
                 row_id: node.id.clone(),
                 parent_record_key: None,
+                run_id: None,
                 records_written: 0,
                 error: None,
                 error_kind: None,
@@ -1276,6 +1358,7 @@ async fn run_discovery(
         Err(e) => InvocationOutcome {
             row_id: node.id.clone(),
             parent_record_key: None,
+            run_id: None,
             records_written: 0,
             error: Some(e.to_string()),
             error_kind: Some(classify_error(&e)),
@@ -1683,6 +1766,21 @@ async fn run_one_invocation(
     reject_unresolved_backfill_tokens(&source_cfg, "source")?;
     reject_unresolved_backfill_tokens(&sink_cfg, "sink")?;
 
+    // Rollback (#706): a real root run of an undo-capable sink is journaled.
+    // The sink gets its per-run settings through its flattened `WriteSpec`;
+    // the pre-run marker is written once the state store is built below.
+    let rollback_active = opts.rollback.as_ref().is_some_and(|r| r.enabled)
+        && matches!(node.role, NodeRole::Root)
+        && !opts.dry_run
+        && opts.limit.is_none()
+        && opts.shard.is_none()
+        && node.state.is_some()
+        && crate::rollback::sink_supports_rollback(&node.sink.kind);
+    let run_id_column = crate::rollback::run_id_column(node.metadata_columns.as_ref());
+    if rollback_active && let Some(spec) = &opts.rollback {
+        crate::rollback::inject_write_spec(&mut sink_cfg, spec, &run_id, &run_id_column);
+    }
+
     // Scoped-cleanup claim (#478). Resolved through the *same* token passes as
     // the connector configs — the scope is typically `${parent.id}` on a child
     // row, so it has to see the parent record exactly like the source URL does.
@@ -1905,6 +2003,32 @@ async fn run_one_invocation(
         Some(shard) => format!("{state_key}::{}", shard.id),
         None => state_key.to_owned(),
     };
+    // Rollback (#706): record what the bookmark and watermark were before this
+    // run writes, so undoing it can rewind them. Never fails the run — a run
+    // whose marker could not be written is simply not undoable.
+    if rollback_active
+        && let (Some(spec), Some(store)) = (&opts.rollback, &state)
+        && sink.supports_rollback()
+    {
+        let marker = crate::rollback::marker_for(
+            &run_id,
+            &pipeline_name,
+            node,
+            &effective_state_key,
+            opts.clock,
+            sink.dataset_uri(),
+            run_id_column.clone(),
+        );
+        if let Err(e) =
+            crate::rollback::prepare_boxed(store.as_ref(), sink.as_ref(), marker, spec.retain).await
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %e,
+                "rollback marker could not be written; this run will not be undoable"
+            );
+        }
+    }
     let source: Box<dyn Source> = if state.is_some() && source.state_key().is_some() {
         Box::new(StateKeyOverride {
             inner: source,
@@ -2056,6 +2180,86 @@ async fn run_one_invocation(
             match crate::reconcile::run(spec, &opts.auth, written).await {
                 Ok(()) => result,
                 Err(e) => Err(e),
+            }
+        }
+        _ => result,
+    };
+
+    // ── Content verification (#701) ──────────────────────────────────────────
+    // On a successful root run, compare the destination to the source by
+    // content (digests + bisection) and — with `repair` — re-sync differing
+    // keys. Differences fail the run unless `fail_on_difference: false`. Same
+    // scoping as reconcile; a repair runs its own nested invocation.
+    let result = match (&result, &opts.verify) {
+        (Ok(_), Some(spec))
+            if spec.after_run
+                && matches!(node.role, NodeRole::Root)
+                && !opts.dry_run
+                && opts.limit.is_none()
+                && opts.shard.is_none()
+                && !cancel.is_cancelled() =>
+        {
+            let inputs = crate::verify::VerifyInputs {
+                row: Some(node.id.clone()),
+                repair: spec.repair,
+                allow_delete: spec.allow_delete,
+                dry_run: false,
+                pipeline_name: pipeline_name.clone(),
+                execution: opts.execution.clone(),
+                auth: opts.auth.clone(),
+                clock: opts.clock,
+            };
+            // Behind a never-inlined boxing helper: the verifier's state
+            // machine is large, and inlining it here overflowed the 2 MiB
+            // test-thread stack under `--all-features` (see
+            // `boxed_run_one_invocation`).
+            match crate::verify::verify_node_boxed(node, spec, &inputs).await {
+                Ok(outcome) if outcome.report.equal() => result,
+                // A repair that re-synced every reported difference healed the
+                // drift: the run is green, and the drift is logged.
+                Ok(outcome) if outcome.report.healed() => {
+                    tracing::warn!(
+                        row = %node.id,
+                        differences = outcome.differing_keys(),
+                        repaired_upserts = outcome.report.repaired_upserts.unwrap_or(0),
+                        repaired_deletes = outcome.report.repaired_deletes.unwrap_or(0),
+                        "content verification found drift and repaired it"
+                    );
+                    result
+                }
+                Ok(outcome) => {
+                    let (missing, extra, changed, dup) = outcome.report.tally();
+                    let msg = format!(
+                        "content verification found {} differing key(s) between {} and {} \
+                         ({missing} missing in destination, {extra} extra in destination, \
+                         {changed} changed, {dup} duplicated{}{})",
+                        outcome.differing_keys(),
+                        outcome.source,
+                        outcome.destination,
+                        match (
+                            outcome.report.repaired_upserts,
+                            outcome.report.repaired_deletes
+                        ) {
+                            (Some(u), Some(d)) =>
+                                format!("; repaired: {u} upsert(s), {d} delete(s)"),
+                            _ => String::new(),
+                        },
+                        if outcome.report.truncated {
+                            "; report truncated"
+                        } else {
+                            ""
+                        },
+                    );
+                    if spec.fail_on_difference {
+                        Err(FaucetError::Sink(msg))
+                    } else {
+                        tracing::warn!(row = %node.id, "{msg}");
+                        result
+                    }
+                }
+                Err(e) => Err(FaucetError::Sink(format!(
+                    "content verification failed: {e}"
+                ))),
             }
         }
         _ => result,
@@ -2353,6 +2557,7 @@ async fn run_one_invocation(
     #[cfg(not(feature = "lineage"))]
     let records_read: Option<u64> = None;
     let stats = PipelineStats {
+        run_id: run_id.clone(),
         records_written: result.records_written,
         records_read,
         dlq_count: result
@@ -2731,6 +2936,12 @@ impl Sink for CapturingSink {
     }
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         self.inner.last_committed_token(scope).await
+    }
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
     }
     async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.current_schema().await
@@ -3162,6 +3373,8 @@ mod tests {
             resilience: None,
             sla: None,
             reconcile: None,
+            verify: None,
+            rollback: None,
             shard: None,
             replication: None,
             backfill: None,
@@ -3202,6 +3415,8 @@ mod tests {
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -3243,6 +3458,8 @@ mod tests {
             resilience: None,
             sla: None,
             reconcile: None,
+            verify: None,
+            rollback: None,
             #[cfg(feature = "lineage")]
             lineage: None,
             #[cfg(feature = "lineage")]
@@ -3399,6 +3616,68 @@ mod tests {
             vs,
             vec!["OLD".to_string()],
             "destination must be unchanged: {vs:?}"
+        );
+    }
+
+    /// The invocation future must stay small enough to be *constructed* on a
+    /// 2 MiB thread stack (the CI test threads), whatever passes are compiled
+    /// in. A debug build reserves the full size of an awaited future in the
+    /// awaiting frame, so an unboxed post-run pass silently pushes every
+    /// caller of `run_expanded` toward a stack overflow (#725).
+    #[test]
+    fn invocation_future_size_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        let output = dir.path().join("out.jsonl");
+        std::fs::write(&input, "name\nalice\n").unwrap();
+        let cfg = cfg_csv_to_jsonl(&input, &output);
+        let nodes = expand(&cfg).unwrap();
+        let o = opts("size");
+        let fut = run_one_invocation(
+            &nodes[0],
+            None,
+            None,
+            "size::row",
+            None,
+            &o,
+            CancellationToken::new(),
+            false,
+            false,
+        );
+        let size = std::mem::size_of_val(&fut);
+        drop(fut);
+        eprintln!("run_one_invocation future: {size} bytes");
+        assert!(
+            size < 1_200_000,
+            "run_one_invocation future is {size} bytes; box the newest pass (see boxed_run_one_invocation)"
+        );
+        let unit = Unit {
+            node: nodes[0].clone(),
+            parent_record: None,
+            state_key: "size::row".into(),
+            parent_record_key: None,
+            product_ctx: None,
+        };
+        let captured: CapturedRecords = Default::default();
+        let discovered: DiscoveredDims = Default::default();
+        let collected: CollectedDims = Default::default();
+        let run_unit_fut = run_unit(
+            &unit,
+            None,
+            &captured,
+            &discovered,
+            &collected,
+            &o,
+            CancellationToken::new(),
+            false,
+            false,
+        );
+        let unit_size = std::mem::size_of_val(&run_unit_fut);
+        drop(run_unit_fut);
+        eprintln!("run_unit future: {unit_size} bytes");
+        assert!(
+            unit_size < 65_536,
+            "run_unit future is {unit_size} bytes; the invocation must stay boxed"
         );
     }
 
@@ -3680,6 +3959,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -3745,6 +4026,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -3975,6 +4258,8 @@ execution:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4065,6 +4350,8 @@ pipeline:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4129,6 +4416,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4202,6 +4491,8 @@ execution:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4276,6 +4567,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4549,6 +4842,8 @@ matrix:
             resilience: None,
             sla: None,
             reconcile: None,
+            verify: None,
+            rollback: None,
             #[cfg(feature = "lineage")]
             lineage: None,
             #[cfg(feature = "lineage")]
@@ -5242,6 +5537,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]

@@ -36,6 +36,7 @@ fn upsert_config(uri: &str, delete_marker: Option<DeleteMarker>) -> MongoSinkCon
         write_mode: WriteMode::Upsert,
         key: vec!["_id".to_string()],
         delete_marker,
+        rollback: None,
     };
     config
 }

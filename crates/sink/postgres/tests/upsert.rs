@@ -63,6 +63,7 @@ fn upsert_sink_config(url: &str) -> PostgresSinkConfig {
         write_mode: WriteMode::Upsert,
         key: vec!["id".into()],
         delete_marker: None,
+        rollback: None,
     };
     config
 }
@@ -116,6 +117,7 @@ async fn upsert_with_delete_marker_removes_the_row() {
             field: "__op".into(),
             values: vec!["d".into()],
         }),
+        rollback: None,
     };
     let sink = PostgresSink::new(config).await.expect("sink new");
 

@@ -22,6 +22,8 @@ pub fn schema_targets() -> Vec<&'static str> {
         "execution",
         "resilience",
         "sla",
+        "verify",
+        "rollback",
     ];
     #[cfg(feature = "quality")]
     targets.push("quality");
@@ -94,6 +96,16 @@ pub fn pipeline_blocks() -> Vec<PipelineBlock> {
         block(
             "sla",
             "Freshness and volume expectations checked after every run",
+            "top",
+        ),
+        block(
+            "verify",
+            "Compare the destination to the source by content after every run; repair differences",
+            "top",
+        ),
+        block(
+            "rollback",
+            "Make every run undoable with `faucet rollback` (journal, kept previous table, run-id column)",
             "top",
         ),
     ];
@@ -191,6 +203,8 @@ pub fn block_schema(name: &str) -> Option<serde_json::Value> {
         "delivery" => to_schema_value(faucet_core::schema_for!(faucet_core::DeliveryMode)),
         "resilience" => to_schema_value(faucet_core::schema_for!(crate::config::ResilienceSpec)),
         "sla" => to_schema_value(faucet_core::schema_for!(crate::sla::SlaSpec)),
+        "verify" => to_schema_value(faucet_core::schema_for!(crate::verify::VerifySpec)),
+        "rollback" => to_schema_value(faucet_core::schema_for!(crate::rollback::RollbackSpec)),
         "schema" => to_schema_value(faucet_core::schema_for!(faucet_core::SchemaDriftSpec)),
         #[cfg(feature = "quality")]
         "quality" => to_schema_value(faucet_core::schema_for!(faucet_core::QualitySpec)),
@@ -227,6 +241,8 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         SchemaTarget::Sink { name } => sink_schema(&name)?,
         SchemaTarget::Transform { name } => transform_schema(&name)?,
         SchemaTarget::Dlq => block_schema("dlq").expect("dlq is always compiled"),
+        SchemaTarget::Verify => block_schema("verify").expect("verify is always compiled"),
+        SchemaTarget::Rollback => block_schema("rollback").expect("rollback is always compiled"),
         SchemaTarget::Replication => {
             let s = faucet_core::schema_for!(crate::replication::spec::ReplicationSpec);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))

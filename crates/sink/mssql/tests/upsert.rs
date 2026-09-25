@@ -109,6 +109,7 @@ async fn upsert_second_write_updates_existing_row() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
     );
     let sink = MssqlSink::new(scfg).await.expect("sink");
@@ -149,6 +150,7 @@ async fn upsert_with_delete_marker_removes_row() {
                 field: "__op".to_string(),
                 values: vec!["d".to_string()],
             }),
+            rollback: None,
         },
     );
     let sink = MssqlSink::new(scfg).await.expect("sink");
@@ -188,6 +190,7 @@ async fn upsert_same_key_twice_in_one_batch_last_write_wins() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
     );
     let sink = MssqlSink::new(scfg).await.expect("sink");
@@ -240,6 +243,7 @@ async fn new_rejects_upsert_without_key() {
         write_mode: WriteMode::Upsert,
         key: vec![], // missing key → rejected before any connection attempt
         delete_marker: None,
+        rollback: None,
     };
 
     let err = MssqlSink::new(config)
@@ -262,6 +266,7 @@ async fn new_rejects_upsert_with_json_column_mapping() {
         write_mode: WriteMode::Upsert,
         key: vec!["id".to_string()],
         delete_marker: None,
+        rollback: None,
     };
 
     let err = MssqlSink::new(config)
@@ -297,6 +302,7 @@ async fn write_batch_partial_routes_missing_key_per_row() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
     );
     let sink = MssqlSink::new(scfg).await.expect("sink");
@@ -336,6 +342,7 @@ async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
         write_mode: WriteMode::Upsert,
         key: vec!["id".to_string()],
         delete_marker: None,
+        rollback: None,
     };
     let first = MssqlSink::new(upsert_sink_cfg(&cfg, write()))
         .await

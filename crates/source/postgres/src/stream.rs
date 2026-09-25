@@ -479,12 +479,86 @@ impl faucet_core::Source for PostgresSource {
             parse_pk_shard(shard, "postgres")?;
         Ok(())
     }
+
+    /// Server-side content digest of one key range (#701): `count(*)`, the sum
+    /// of a 60-bit prefix of each row's `md5` over its compared columns, and
+    /// the key bounds — all inside Postgres, so a matching range ships nothing.
+    /// Algorithm [`DIGEST_ALGORITHM`]; comparable only with the same algorithm.
+    async fn range_digest(
+        &self,
+        range: &faucet_core::diff::KeyRange,
+        key: &str,
+        columns: &[String],
+    ) -> Result<Option<faucet_core::diff::ServerDigest>, FaucetError> {
+        let bounds = PkShardBounds::from_spec(&range.to_shard(key))
+            .ok_or_else(|| FaucetError::Source("postgres: invalid digest range".into()))?;
+        let inner = bounds.wrap(&self.config.query, quote_ident);
+        let sql = digest_query(&inner, key, columns);
+        let row = bind_params(sqlx::query(&sql), &self.config.params, &[])?
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Source(format!("postgres: range digest failed: {e}")))?;
+        let rows: i64 = row
+            .try_get("rows")
+            .map_err(|e| FaucetError::Source(format!("postgres: digest decode: {e}")))?;
+        let digest: String = row
+            .try_get("digest")
+            .map_err(|e| FaucetError::Source(format!("postgres: digest decode: {e}")))?;
+        let key_min: Option<i64> = row
+            .try_get("key_min")
+            .map_err(|e| FaucetError::Source(format!("postgres: digest decode: {e}")))?;
+        let key_max: Option<i64> = row
+            .try_get("key_max")
+            .map_err(|e| FaucetError::Source(format!("postgres: digest decode: {e}")))?;
+        Ok(Some(faucet_core::diff::ServerDigest {
+            algorithm: DIGEST_ALGORITHM.to_string(),
+            rows: rows.max(0) as u64,
+            digest,
+            key_min,
+            key_max,
+        }))
+    }
+}
+
+/// The server-side digest algorithm id. Two sides compare only when both
+/// report it: each backend hashes its *own* text rendering of a row.
+pub const DIGEST_ALGORITHM: &str = "postgres:md5-60-sum:v1";
+
+/// The digest statement over an already range-wrapped `inner` query: one row
+/// with `rows`, `digest` (the exact decimal sum, as text — it exceeds a
+/// bigint), `key_min` and `key_max`. Every compared column is rendered as text
+/// with a control-character sentinel for NULL (so NULL ≠ empty string) and
+/// joined with `chr(31)`; the key column leads.
+pub fn digest_query(inner: &str, key: &str, columns: &[String]) -> String {
+    let mut cols: Vec<&str> = vec![key];
+    cols.extend(columns.iter().map(String::as_str).filter(|c| *c != key));
+    let rendered: Vec<String> = cols
+        .iter()
+        .map(|c| format!("coalesce({}::text, chr(1) || 'null')", quote_ident(c)))
+        .collect();
+    format!(
+        "SELECT count(*)::bigint AS rows,          coalesce(sum(('x' || left(md5(concat_ws(chr(31), {cols})), 15))::bit(60)::bigint), 0)::text AS digest,          min({k})::bigint AS key_min, max({k})::bigint AS key_max          FROM ({inner}) AS _faucet_digest",
+        cols = rendered.join(", "),
+        k = quote_ident(key),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use faucet_core::shard::plan_pk_shards;
+
+    #[test]
+    fn digest_query_leads_with_the_key_and_marks_nulls() {
+        let sql = digest_query("SELECT * FROM t", "id", &["v".into(), "id".into()]);
+        assert!(sql.starts_with("SELECT count(*)::bigint AS rows"), "{sql}");
+        assert!(
+            sql.contains("concat_ws(chr(31), coalesce(\"id\"::text, chr(1) || 'null'), coalesce(\"v\"::text, chr(1) || 'null'))"),
+            "key first, deduplicated: {sql}"
+        );
+        assert!(sql.contains("min(\"id\")::bigint AS key_min"));
+        assert!(sql.ends_with("FROM (SELECT * FROM t) AS _faucet_digest"));
+    }
 
     /// The shard-bounds type moved to `faucet_core::shard` (#262) so the
     /// PK-range logic is shared across the SQL sources; alias it so the

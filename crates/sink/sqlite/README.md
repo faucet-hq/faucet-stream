@@ -425,3 +425,19 @@ needed; a missing target is created by the first run
 (staged from the first page, then renamed into place at commit — a failed first
 run leaves no table) when `create_table: true`. Works in both `auto_map` and JSON
 column modes.
+
+## Rollback (`faucet rollback`, #706)
+
+With a top-level `rollback:` block in the pipeline config, every run of this
+sink (column mapping only) is **undoable**: the run-id column
+(`_faucet_run_id`, via `metadata_columns`) is stamped, the before-image of
+every key an upsert / delete touches is journaled into `_faucet_run_journal`
+**in the same transaction** as the write, and an overwrite keeps the replaced
+table as `<table>__faucet_prev` (a copy inside the swap transaction). `faucet rollback --run <id>` then
+deletes the run's appended rows, restores the journaled before-images, or
+swaps the previous table back — refusing (unless `--force`) when a later run
+changed the same keys — and rewinds the row's bookmark and exactly-once
+watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
+`rewind_commit_token`, `readback_source` (the `sqlite` source config
+`faucet verify` reads the destination back with). See the [rollback
+cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).

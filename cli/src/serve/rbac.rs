@@ -58,6 +58,10 @@ pub enum Permission {
     /// a `viewer` must never be able to delete data. Guarded further in the
     /// console — "clean all" needs an explicit confirm.
     LocalOutputManage,
+    /// Undo a run (`POST /v1/runs/{id}/rollback`, #706) — admin-only: it
+    /// rewrites destination rows and rewinds a bookmark, a release-grade
+    /// decision rather than an operator's.
+    Rollback,
     /// Read the audit log (`GET /v1/audit`) — admin-only.
     AuditRead,
     /// Hot-reload the server's `--default-config` (`POST /v1/reload`) — admin-only.
@@ -69,7 +73,7 @@ pub enum Permission {
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 15] = [
+    pub const ALL: [Permission; 16] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -82,6 +86,7 @@ impl Permission {
         Permission::TemplateAdmin,
         Permission::LocalOutputRead,
         Permission::LocalOutputManage,
+        Permission::Rollback,
         Permission::AuditRead,
         Permission::Reload,
         Permission::Identity,
@@ -352,6 +357,10 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::GET, "/v1/schemas/{kind}/{name}") => Some(SchemaRead),
         (&Method::POST, "/v1/doctor") => Some(Doctor),
         (&Method::POST, "/v1/backfill") => Some(RunWrite),
+        // Content verification (#701): a repair writes through the sink, so
+        // the whole endpoint is `RunWrite` (operator+).
+        (&Method::POST, "/v1/verify") => Some(RunWrite),
+        (&Method::POST, "/v1/runs/{id}/rollback") => Some(Rollback),
         (&Method::POST, "/v1/dlq/inspect") => Some(DlqRead),
         (&Method::POST, "/v1/dlq/replay") => Some(DlqManage),
         (&Method::POST, "/v1/dlq/discard") => Some(DlqManage),
@@ -413,6 +422,8 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::GET, "/v1/schemas/{kind}/{name}") => "schema.get",
         (&Method::POST, "/v1/doctor") => "doctor",
         (&Method::POST, "/v1/backfill") => "backfill.submit",
+        (&Method::POST, "/v1/verify") => "verify",
+        (&Method::POST, "/v1/runs/{id}/rollback") => "run.rollback",
         (&Method::POST, "/v1/dlq/inspect") => "dlq.inspect",
         (&Method::POST, "/v1/dlq/replay") => "dlq.replay",
         (&Method::POST, "/v1/dlq/discard") => "dlq.discard",
@@ -589,6 +600,8 @@ mod tests {
                 "/v1/local-outputs/{id}/preview",
                 LocalOutputRead,
             ),
+            (Method::POST, "/v1/verify", RunWrite),
+            (Method::POST, "/v1/runs/{id}/rollback", Rollback),
             (Method::POST, "/v1/templates", TemplateAdmin),
             (Method::GET, "/v1/templates", TemplateRead),
             (Method::GET, "/v1/templates/{id}", TemplateRead),

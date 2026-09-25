@@ -616,6 +616,7 @@ where
         write_mode: WriteMode::Upsert,
         key: vec!["id".to_string()],
         delete_marker: None,
+        rollback: None,
     };
     let plan = plan_writes(
         &[

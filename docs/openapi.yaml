@@ -100,6 +100,46 @@ paths:
         "202": { description: Cancellation requested. }
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+  /v1/runs/{id}/rollback:
+    post:
+      summary: Undo a finished run (#706)
+      description: >
+        Asks the run's sink to undo one invocation — delete the rows it
+        appended (by run id), restore the journaled before-images of the keys
+        it upserted, or swap back the kept previous table it overwrote — then
+        rewinds the row's bookmark (and exactly-once watermark) so the next run
+        re-reads what was undone. The config the run was made with is taken
+        from the stored run record (cluster mode) or from `config` in the
+        body. A key a later run changed since is a conflict: the response then
+        carries `applied: false` and `conflicts > 0`, and nothing was changed
+        (pass `force` to restore anyway). Requires the `Rollback` permission
+        (admin); audited as `run.rollback`.
+      operationId: rollbackRun
+      security: [{ bearerAuth: [] }]
+      parameters: [ { $ref: "#/components/parameters/RunId" } ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                invocation_id: { type: string, description: "One of the run's `invocations[].run_id`; optional when the run has exactly one invocation." }
+                row: { type: string, description: "The row that invocation wrote (default: search every root's state)." }
+                config: { type: string, description: "The pipeline config the run was made with; required unless the server stored it." }
+                config_format: { type: string, enum: [yaml, json], default: yaml }
+                dry_run: { type: boolean, default: false }
+                force: { type: boolean, default: false }
+      responses:
+        "200":
+          description: The rollback report (`applied`, `deleted`, `restored`, `conflicts`, `bookmark_rewound`, `token_rewound`).
+          content: { application/json: { schema: { $ref: "#/components/schemas/RollbackReport" } } }
+        "400": { description: Bad config, unknown invocation, or no undoable run with that id }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the `Rollback` permission }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The run has not finished yet }
+        "422": { description: The run's config is not stored and none was supplied, or it recorded no invocation ids }
   /v1/runs/{id}/logs:
     get:
       summary: Stream a run's logs (SSE), or read persisted logs
@@ -290,6 +330,43 @@ paths:
           description: One or more probes failed; report in body
           content: { application/json: { schema: { type: object } } }
         "403": { description: Principal's role lacks the required permission }
+  /v1/verify:
+    post:
+      summary: Verify a destination matches its source by content (#701)
+      description: >
+        Compares one root row's destination to its source by key: key ranges
+        are compared by digest (server-side when both backends share an
+        algorithm, so matching ranges ship no rows), disagreeing ranges are
+        bisected down to `leaf_rows`, and only those are fetched and diffed
+        per key. With `repair` the differing keys are re-synced through the
+        row's sink (`write_mode: upsert`; deletes only with `allow_delete`).
+        A mismatch is a result, not an error: the 200 body lists the
+        differences. Requires `RunWrite` (operator); audited as `verify`.
+      operationId: verify
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config: { type: string }
+                config_format: { type: string, enum: [yaml, json], default: yaml }
+                row: { type: string }
+                repair: { type: boolean, default: false }
+                allow_delete: { type: boolean, default: false }
+                dry_run: { type: boolean, default: false }
+                max_differences: { type: integer }
+      responses:
+        "200":
+          description: The verification outcome (`strategy`, `ranges_compared`, `differences[]`, `repaired_upserts`, …)
+          content: { application/json: { schema: { type: object } } }
+        "400": { description: Bad config, no key to match on, or a destination that cannot be read back }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "422": { description: Config failed validation / expansion }
   /v1/backfill:
     post:
       summary: Submit a windowed backfill as tracked runs (one per window unit)
@@ -1572,11 +1649,29 @@ components:
         run_id: run_01HZY8K3QK7
         status: pending
         submitted_at: '2026-01-01T00:00:00Z'
+    RollbackReport:
+      type: object
+      properties:
+        run_id: { type: string, description: "The invocation that was undone." }
+        row: { type: string }
+        sink_kind: { type: string }
+        dataset: { type: string }
+        mode: { type: string, enum: [append, upsert, overwrite] }
+        dry_run: { type: boolean }
+        deleted: { type: integer }
+        restored: { type: integer }
+        conflicts: { type: integer, description: "Keys a later run changed since; without `force` these block the rollback." }
+        applied: { type: boolean }
+        blocked: { type: boolean, description: "Refused because a later run changed the keys and `force` was not set (a dry run reports whether it would be)." }
+        note: { type: string, nullable: true }
+        bookmark_rewound: { type: boolean }
+        token_rewound: { type: boolean }
     InvocationRecord:
       type: object
       properties:
         row_id: { type: string }
         parent_record_key: { type: string, nullable: true }
+        run_id: { type: string, nullable: true, description: "The invocation's own run id — what `POST /v1/runs/{id}/rollback` undoes (#706)." }
         records_written: { type: integer }
         duration_ms: { type: integer, description: "Wall-clock duration of this invocation in milliseconds (#645)." }
         error: { type: string, nullable: true }

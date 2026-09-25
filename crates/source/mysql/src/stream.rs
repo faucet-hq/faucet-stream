@@ -483,11 +483,85 @@ impl faucet_core::Source for MysqlSource {
         *self.applied_shard.lock().expect("shard mutex poisoned") = parse_pk_shard(shard, "mysql")?;
         Ok(())
     }
+
+    /// Server-side content digest of one key range (#701): `count(*)`, the
+    /// exact sum of a 60-bit prefix of each row's `MD5` over its compared
+    /// columns, and the key bounds — inside MySQL, so a matching range ships
+    /// nothing. Algorithm [`DIGEST_ALGORITHM`].
+    async fn range_digest(
+        &self,
+        range: &faucet_core::diff::KeyRange,
+        key: &str,
+        columns: &[String],
+    ) -> Result<Option<faucet_core::diff::ServerDigest>, FaucetError> {
+        let bounds = PkShardBounds::from_spec(&range.to_shard(key))
+            .ok_or_else(|| FaucetError::Source("mysql: invalid digest range".into()))?;
+        let inner = bounds.wrap(&self.config.query, quote_ident_mysql);
+        let sql = digest_query(&inner, key, columns);
+        let row = sqlx::query(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Source(format!("mysql: range digest failed: {e}")))?;
+        let rows: i64 = row
+            .try_get("rows")
+            .map_err(|e| FaucetError::Source(format!("mysql: digest decode: {e}")))?;
+        let digest: String = row
+            .try_get("digest")
+            .map_err(|e| FaucetError::Source(format!("mysql: digest decode: {e}")))?;
+        let key_min: Option<i64> = row
+            .try_get("key_min")
+            .map_err(|e| FaucetError::Source(format!("mysql: digest decode: {e}")))?;
+        let key_max: Option<i64> = row
+            .try_get("key_max")
+            .map_err(|e| FaucetError::Source(format!("mysql: digest decode: {e}")))?;
+        Ok(Some(faucet_core::diff::ServerDigest {
+            algorithm: DIGEST_ALGORITHM.to_string(),
+            rows: rows.max(0) as u64,
+            digest,
+            key_min,
+            key_max,
+        }))
+    }
+}
+
+/// The server-side digest algorithm id (see the postgres source for the
+/// comparability rule).
+pub const DIGEST_ALGORITHM: &str = "mysql:md5-60-sum:v1";
+
+/// The digest statement over an already range-wrapped `inner` query. `CONV`
+/// turns the 15-hex-char prefix into a decimal string; `CAST … AS UNSIGNED`
+/// makes `SUM` exact (DECIMAL) rather than a lossy double; the result is
+/// cast to CHAR so it decodes as text whatever its magnitude.
+pub fn digest_query(inner: &str, key: &str, columns: &[String]) -> String {
+    let mut cols: Vec<&str> = vec![key];
+    cols.extend(columns.iter().map(String::as_str).filter(|c| *c != key));
+    let rendered: Vec<String> = cols
+        .iter()
+        .map(|c| {
+            format!(
+                "COALESCE(CAST({} AS CHAR), CONCAT(CHAR(1), 'null'))",
+                quote_ident_mysql(c)
+            )
+        })
+        .collect();
+    format!(
+        "SELECT CAST(COUNT(*) AS SIGNED) AS `rows`,          CAST(COALESCE(SUM(CAST(CONV(LEFT(MD5(CONCAT_WS(CHAR(31), {cols})), 15), 16, 10) AS UNSIGNED)), 0) AS CHAR) AS digest,          CAST(MIN({k}) AS SIGNED) AS key_min, CAST(MAX({k}) AS SIGNED) AS key_max          FROM ({inner}) AS _faucet_digest",
+        cols = rendered.join(", "),
+        k = quote_ident_mysql(key),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_query_leads_with_the_key_and_marks_nulls() {
+        let sql = digest_query("SELECT * FROM t", "id", &["v".into()]);
+        assert!(sql.contains("CONCAT_WS(CHAR(31), COALESCE(CAST(`id` AS CHAR), CONCAT(CHAR(1), 'null')), COALESCE(CAST(`v` AS CHAR), CONCAT(CHAR(1), 'null')))"), "{sql}");
+        assert!(sql.contains("CAST(MIN(`id`) AS SIGNED) AS key_min"));
+        assert!(sql.ends_with("FROM (SELECT * FROM t) AS _faucet_digest"));
+    }
     use faucet_core::shard::plan_pk_shards;
 
     #[tokio::test]

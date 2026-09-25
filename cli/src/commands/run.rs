@@ -153,7 +153,9 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
         PipelineConfig::from_path_async_with(path, args.profile.as_deref(), &inputs).await?
     };
 
-    execute(cfg, args, resolved_config_path).await
+    // Boxed so `run`'s (and `run_command`'s) future stays small; see
+    // `commands::template::tests::command_futures_stay_small`.
+    Box::pin(execute(cfg, args, resolved_config_path)).await
 }
 
 /// Execute an already-loaded config: install observability, build the auth
@@ -323,6 +325,8 @@ pub(crate) async fn execute(
             resilience,
             sla: cfg.sla.clone(),
             reconcile: cfg.reconcile.clone(),
+            verify: cfg.verify.clone(),
+            rollback: cfg.rollback.clone(),
             #[cfg(feature = "lineage")]
             lineage,
             #[cfg(feature = "lineage")]
@@ -448,6 +452,17 @@ pub(crate) async fn execute(
                 total_written,
                 if total_written == 1 { "" } else { "s" }
             );
+            // Undoable runs (#706): print each invocation's run id so the
+            // operator can `faucet rollback --run <id>` without digging it
+            // out of the destination's `_faucet_run_id` column.
+            if cfg.rollback.as_ref().is_some_and(|r| r.enabled) {
+                eprintln!("  run ids (undo with `faucet rollback --run <id>`):");
+                for i in summary.invocations.iter().filter(|i| i.error.is_none()) {
+                    if let Some(id) = &i.run_id {
+                        eprintln!("    {:<30} {id}", i.row_id);
+                    }
+                }
+            }
             // Per-row timing breakdown (slowest first) — the wall-clock each
             // matrix row's work took. Only for multi-row runs, where the
             // scheduling tail matters; a single invocation adds no signal.
@@ -531,6 +546,9 @@ pub(crate) struct RunRowSummary {
     pub row_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_key: Option<String>,
+    /// The invocation's run id — what `faucet rollback --run` undoes (#706).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub source: String,
     pub sink: String,
     pub status: &'static str,
@@ -575,6 +593,7 @@ pub(crate) fn summary_rows(summary: &RunSummary) -> Vec<RunRowSummary> {
             RunRowSummary {
                 row_id: o.row_id.clone(),
                 parent_key: o.parent_record_key.clone(),
+                run_id: o.run_id.clone(),
                 source: m.source_kind,
                 sink: m.sink_kind,
                 status: if o.error.is_some() { "failed" } else { "ok" },
@@ -681,12 +700,62 @@ fn finish_topology_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `faucet run` invocation's future is awaited on the caller's stack —
+    /// a 2 MiB test thread in CI. Keep it well under that whatever passes are
+    /// compiled in (#725: an inlined post-run pass overflowed it).
+    #[test]
+    fn execute_future_size_is_bounded() {
+        let cfg = crate::config::PipelineConfig::from_text(
+            "version: 1\nname: p\npipeline:\n  source: {type: csv, config: {path: in.csv}}\n  sink: {type: jsonl, config: {path: out.jsonl}}\n",
+            std::path::Path::new("p.yaml"),
+        )
+        .unwrap();
+        let fut = execute(cfg.clone(), RunArgs::default(), None);
+        let size = std::mem::size_of_val(&fut);
+        drop(fut);
+        eprintln!("commands::run::execute future: {size} bytes");
+        let nodes = crate::expand::expand(&cfg).unwrap();
+        let opts = crate::executor::ExecuteOptions {
+            pipeline_name: "p".into(),
+            run_id: None,
+            execution: None,
+            concurrency: None,
+            dry_run: true,
+            limit: None,
+            state_path_override: None,
+            shard: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+            cancel: None,
+            resilience: None,
+            sla: None,
+            reconcile: None,
+            verify: None,
+            rollback: None,
+            #[cfg(feature = "lineage")]
+            lineage: None,
+            #[cfg(feature = "lineage")]
+            lineage_cfg: None,
+            #[cfg(feature = "notify")]
+            notifier: None,
+            #[cfg(feature = "catalog")]
+            catalog: None,
+        };
+        let fut = crate::executor::run_expanded(nodes, opts);
+        let exp = std::mem::size_of_val(&fut);
+        drop(fut);
+        eprintln!("run_expanded future: {exp} bytes");
+        assert!(size < 1_000_000, "execute future is {size} bytes");
+        assert!(exp < 1_000_000, "run_expanded future is {exp} bytes");
+    }
     use crate::executor::{InvocationMetrics, InvocationOutcome};
 
     fn outcome(id: &str, written: usize, err: Option<&str>) -> InvocationOutcome {
         InvocationOutcome {
             row_id: id.into(),
             parent_record_key: None,
+            run_id: None,
             records_written: written,
             error: err.map(|s| s.to_string()),
             error_kind: None,

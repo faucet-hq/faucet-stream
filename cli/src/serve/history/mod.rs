@@ -79,6 +79,10 @@ impl RunStatus {
 pub struct InvocationRecord {
     pub row_id: String,
     pub parent_record_key: Option<String>,
+    /// The invocation's own run id — what `POST /v1/runs/{id}/rollback` undoes
+    /// (#706). Defaulted so records written before it existed still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub records_written: usize,
     /// Wall-clock duration of this invocation, in milliseconds (#645). Lives in
     /// the JSON `body`, so a defaulted field is backward-compatible with records
@@ -93,6 +97,7 @@ impl From<&InvocationOutcome> for InvocationRecord {
         Self {
             row_id: o.row_id.clone(),
             parent_record_key: o.parent_record_key.clone(),
+            run_id: o.run_id.clone(),
             records_written: o.records_written,
             duration_ms: o.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
             error: o.error.clone(),
@@ -1231,6 +1236,7 @@ mod tests {
         let o = InvocationOutcome {
             row_id: "contact".into(),
             parent_record_key: None,
+            run_id: None,
             records_written: 483,
             error: None,
             error_kind: None,

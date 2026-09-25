@@ -71,6 +71,7 @@ fn sink_config(url: &str, key: &[&str]) -> SqliteSinkConfig {
         write_mode: WriteMode::Upsert,
         key: key.iter().map(|s| s.to_string()).collect(),
         delete_marker: None,
+        rollback: None,
     };
     config
 }

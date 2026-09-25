@@ -37,6 +37,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         invocations: vec![InvocationRecord {
             row_id: row_id.into(),
             parent_record_key: None,
+            run_id: None,
             records_written: 10,
             duration_ms: 0,
             error: None,

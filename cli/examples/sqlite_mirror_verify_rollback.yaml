@@ -1,0 +1,49 @@
+# SQLite → SQLite mirror that verifies itself and can be undone (#701 / #706).
+#
+#   faucet run      cli/examples/sqlite_mirror_verify_rollback.yaml   # prints the run id
+#   faucet verify   cli/examples/sqlite_mirror_verify_rollback.yaml   # exit code = differing keys
+#   faucet verify   cli/examples/sqlite_mirror_verify_rollback.yaml --repair --allow-delete
+#   faucet rollback cli/examples/sqlite_mirror_verify_rollback.yaml --list
+#   faucet rollback cli/examples/sqlite_mirror_verify_rollback.yaml --run <id> --dry-run
+#   faucet rollback cli/examples/sqlite_mirror_verify_rollback.yaml --run <id>
+#
+# `verify:` compares the destination to the source by content after every run
+# (key ranges by digest, bisected down to the differing keys) and fails the run
+# on a mismatch. `rollback:` makes every run undoable: the run-id column is
+# stamped, before-images are journaled in the upsert transaction, and the
+# bookmark is recorded before the run so undoing it rewinds the sync.
+version: 1
+name: orders_mirror
+
+pipeline:
+  source:
+    type: sqlite
+    config:
+      database_url: sqlite:./app.db
+      query: "SELECT id, customer, amount, updated_at FROM orders"
+
+  sink:
+    type: sqlite
+    config:
+      database_url: sqlite:./mirror.db
+      table_name: orders
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]
+
+  # Rollback needs a durable state store: the pre-run bookmark lives here.
+  state:
+    type: file
+    config: { path: ./.faucet-state }
+
+verify:
+  # key: [id]              # defaults to the sink's upsert key
+  exclude: ["_faucet_*"]   # metadata columns never match the source (default)
+  leaf_rows: 1000          # bisect differing ranges down to this many rows
+  fail_on_difference: true # a drifted destination fails the run
+  repair: false            # set true to re-sync differing keys automatically
+
+rollback:
+  journal: true            # before-images for upsert/delete runs
+  keep_previous: true      # keep the replaced table of an overwrite run
+  retain: 10               # undoable runs kept per row
