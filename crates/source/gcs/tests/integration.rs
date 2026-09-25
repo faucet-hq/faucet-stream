@@ -349,7 +349,12 @@ async fn shards_partition_the_listing() {
     for shard in &shards {
         let source = GcsSource::new(config.clone()).await.unwrap();
         source.apply_shard(shard).await.unwrap();
-        seen.extend(stream_all(&source).await.iter().map(|r| r["id"].as_i64().unwrap()));
+        seen.extend(
+            stream_all(&source)
+                .await
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap()),
+        );
     }
     seen.sort();
     assert_eq!(seen, (0..8).collect::<Vec<i64>>());
@@ -371,7 +376,10 @@ async fn missing_object_key_is_a_typed_error() {
         )
         .await
         .unwrap();
-        let err = source.fetch_with_context(&HashMap::new()).await.unwrap_err();
+        let err = source
+            .fetch_with_context(&HashMap::new())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("nope/missing.jsonl"), "{err}");
     }
 }
@@ -410,7 +418,14 @@ async fn csv_objects_decode_through_the_shared_format_layer() {
     let Some((host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
-    seed_object(&host, &bucket, "csv/a.csv", "id,name\n1,ann\n2,bo\n", "text/csv").await;
+    seed_object(
+        &host,
+        &bucket,
+        "csv/a.csv",
+        "id,name\n1,ann\n2,bo\n",
+        "text/csv",
+    )
+    .await;
     let source = GcsSource::new(
         GcsSourceConfig::new(&bucket)
             .prefix("csv/")
@@ -449,7 +464,14 @@ async fn parquet_reads_by_row_group_and_whole_object() {
         return;
     };
     let rows: Vec<_> = (0..5).map(|i| serde_json::json!({"id": i})).collect();
-    seed_bytes(&host, &bucket, "pq/a.parquet", parquet_bytes(&rows, 2), "application/vnd.apache.parquet").await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "pq/a.parquet",
+        parquet_bytes(&rows, 2),
+        "application/vnd.apache.parquet",
+    )
+    .await;
 
     for verify_checksum in [false, true] {
         let source = GcsSource::new(
@@ -468,8 +490,19 @@ async fn parquet_reads_by_row_group_and_whole_object() {
             .iter()
             .map(|r| r["id"].as_i64().unwrap())
             .collect();
-        assert_eq!(ids, (0..5).collect::<Vec<i64>>(), "verify_checksum={verify_checksum}");
-        assert_eq!(source.fetch_with_context(&HashMap::new()).await.unwrap().len(), 5);
+        assert_eq!(
+            ids,
+            (0..5).collect::<Vec<i64>>(),
+            "verify_checksum={verify_checksum}"
+        );
+        assert_eq!(
+            source
+                .fetch_with_context(&HashMap::new())
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
 
         assert!(source.supports_columnar());
         use futures::StreamExt;
@@ -492,8 +525,22 @@ async fn parquet_schema_mismatch_across_objects_is_an_error() {
     };
     let a = parquet_bytes(&[serde_json::json!({"id": 1})], 10);
     let b = parquet_bytes(&[serde_json::json!({"name": "x"})], 10);
-    seed_bytes(&host, &bucket, "mix/a.parquet", a, "application/vnd.apache.parquet").await;
-    seed_bytes(&host, &bucket, "mix/b.parquet", b, "application/vnd.apache.parquet").await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "mix/a.parquet",
+        a,
+        "application/vnd.apache.parquet",
+    )
+    .await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "mix/b.parquet",
+        b,
+        "application/vnd.apache.parquet",
+    )
+    .await;
     let source = GcsSource::new(
         GcsSourceConfig::new(&bucket)
             .prefix("mix/")
@@ -528,4 +575,3 @@ async fn parquet_schema_mismatch_across_objects_is_an_error() {
     let mut non_parquet = jsonl.stream_batches(&ctx, 0);
     assert!(non_parquet.next().await.unwrap().is_err());
 }
-

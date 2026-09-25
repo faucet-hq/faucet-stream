@@ -106,7 +106,9 @@ pub async fn build_storage_control(
     storage_host: Option<&str>,
 ) -> Result<StorageControl, FaucetError> {
     if let Some(host) = storage_host.filter(|h| json_control::is_plaintext_endpoint(h)) {
-        return Ok(StorageControl::from_stub(json_control::JsonApiControl::new(host)));
+        return Ok(StorageControl::from_stub(
+            json_control::JsonApiControl::new(host),
+        ));
     }
     let credentials = build_credentials(creds).await?;
     let mut builder = StorageControl::builder().with_credentials(credentials);

@@ -10,7 +10,9 @@
 use google_cloud_gax::error::Error;
 use google_cloud_gax::options::RequestOptions;
 use google_cloud_gax::response::Response;
-use google_cloud_storage::model::{GetObjectRequest, ListObjectsRequest, ListObjectsResponse, Object};
+use google_cloud_storage::model::{
+    GetObjectRequest, ListObjectsRequest, ListObjectsResponse, Object,
+};
 use serde::Deserialize;
 
 const BUCKET_PREFIX: &str = "projects/_/buckets/";
@@ -83,7 +85,9 @@ impl google_cloud_storage::stub::StorageControl for JsonApiControl {
         _options: RequestOptions,
     ) -> google_cloud_gax::Result<Response<ListObjectsResponse>> {
         let page: JsonListPage = self.get_json(&self.list_url(&req)?).await?;
-        Ok(Response::from(page.into_response(bucket_from_parent(&req.parent)?)))
+        Ok(Response::from(
+            page.into_response(bucket_from_parent(&req.parent)?),
+        ))
     }
 
     async fn get_object(
@@ -92,7 +96,9 @@ impl google_cloud_storage::stub::StorageControl for JsonApiControl {
         _options: RequestOptions,
     ) -> google_cloud_gax::Result<Response<Object>> {
         let object: JsonObject = self.get_json(&self.get_url(&req)?).await?;
-        Ok(Response::from(object.into_model(bucket_from_parent(&req.bucket)?)))
+        Ok(Response::from(
+            object.into_model(bucket_from_parent(&req.bucket)?),
+        ))
     }
 }
 
@@ -209,8 +215,16 @@ mod tests {
 
     #[test]
     fn bucket_is_parsed_from_the_resource_path() {
-        assert_eq!(bucket_from_parent("projects/_/buckets/data").unwrap(), "data");
-        for bad in ["", "projects/_/buckets/", "buckets/data", "projects/_/buckets/a/b"] {
+        assert_eq!(
+            bucket_from_parent("projects/_/buckets/data").unwrap(),
+            "data"
+        );
+        for bad in [
+            "",
+            "projects/_/buckets/",
+            "buckets/data",
+            "projects/_/buckets/a/b",
+        ] {
             let err = bucket_from_parent(bad).unwrap_err();
             assert!(err.is_binding(), "{bad}: {err}");
         }
@@ -236,7 +250,8 @@ mod tests {
     fn url_joins_endpoint_bucket_and_query() {
         let l = JsonApiControl::new("http://h:1/");
         assert_eq!(
-            l.list_url(&req("projects/_/buckets/my bucket").set_prefix("p/")).unwrap(),
+            l.list_url(&req("projects/_/buckets/my bucket").set_prefix("p/"))
+                .unwrap(),
             "http://h:1/storage/v1/b/my%20bucket/o?prefix=p%2F"
         );
         assert_eq!(
@@ -314,9 +329,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let control = crate::build_storage_control(&crate::GcsCredentials::Anonymous, Some(&server.uri()))
-            .await
-            .unwrap();
+        let control =
+            crate::build_storage_control(&crate::GcsCredentials::Anonymous, Some(&server.uri()))
+                .await
+                .unwrap();
         let mut items = control
             .list_objects()
             .set_parent("projects/_/buckets/bkt")
@@ -365,7 +381,10 @@ mod tests {
         let r = GetObjectRequest::new()
             .set_bucket("projects/_/buckets/b")
             .set_object("dir/a b.parquet");
-        assert_eq!(c.get_url(&r).unwrap(), "http://h:1/storage/v1/b/b/o/dir%2Fa%20b.parquet");
+        assert_eq!(
+            c.get_url(&r).unwrap(),
+            "http://h:1/storage/v1/b/b/o/dir%2Fa%20b.parquet"
+        );
         let missing = GetObjectRequest::new().set_bucket("projects/_/buckets/b");
         assert!(c.get_url(&missing).unwrap_err().is_binding());
         let bad = GetObjectRequest::new().set_bucket("b").set_object("x");
@@ -385,9 +404,10 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let control = crate::build_storage_control(&crate::GcsCredentials::Anonymous, Some(&server.uri()))
-            .await
-            .unwrap();
+        let control =
+            crate::build_storage_control(&crate::GcsCredentials::Anonymous, Some(&server.uri()))
+                .await
+                .unwrap();
         let obj = control
             .get_object()
             .set_bucket("projects/_/buckets/bkt")

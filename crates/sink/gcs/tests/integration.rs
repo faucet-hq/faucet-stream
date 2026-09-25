@@ -256,7 +256,10 @@ async fn sink_compresses_objects_by_extension() {
     sink.flush().await.unwrap();
     let names = object_names(&host, &bucket, "gz/").await;
     assert_eq!(names.len(), 1);
-    assert_eq!(&download(&host, &bucket, &names[0]).await[..2], &[0x1f, 0x8b]);
+    assert_eq!(
+        &download(&host, &bucket, &names[0]).await[..2],
+        &[0x1f, 0x8b]
+    );
 }
 
 #[cfg(feature = "arrow")]
@@ -280,7 +283,11 @@ async fn sink_writes_parquet_on_the_row_and_columnar_paths() {
     assert_eq!(sink.write_batch_columnar(&batch).await.unwrap(), 3);
 
     let names = object_names(&host, &bucket, "pq/").await;
-    assert_eq!(names.len(), 4, "two row-path and two columnar objects: {names:?}");
+    assert_eq!(
+        names.len(),
+        4,
+        "two row-path and two columnar objects: {names:?}"
+    );
     for name in names {
         let body = download(&host, &bucket, &name).await;
         assert_eq!(&body[..4], b"PAR1");
