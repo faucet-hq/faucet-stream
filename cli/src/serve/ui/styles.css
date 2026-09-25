@@ -1281,7 +1281,8 @@ select {
 .tpl-cell a { display: inline-block; padding: 4px 12px; border-radius: 999px; }
 .tpl-cell-ok a { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
 .tpl-cell-ok a:hover { background: color-mix(in srgb, var(--ok) 22%, transparent); text-decoration: none; }
-.tpl-cell-partial a { color: var(--queued); background: color-mix(in srgb, var(--queued) 14%, transparent); }
+.tpl-cell-partial a, .tpl-cell-partial > span { color: var(--queued); background: color-mix(in srgb, var(--queued) 14%, transparent); }
+.tpl-cell-partial > span { display: inline-block; padding: 4px 12px; border-radius: 999px; cursor: help; }
 .tpl-cell-bad { color: var(--fail); }
 .tpl-cell-none { color: var(--ink-faint); }
 .tpl-desc { color: var(--ink-dim); font-size: 0.88rem; margin: 12px 0 0; }

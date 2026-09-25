@@ -289,8 +289,12 @@ function renderMatrix(idx) {
     if (c.compatible) {
       return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(idOf(s))} into ${escapeHtml(idOf(k))}">✓</a></td>`;
     }
+    // A partial pairing is shown but not linked: composition refuses a pairing
+    // with any stream the sink cannot write, so the run form could only fail.
+    // The tooltip names the streams that do and do not fit.
     const ok = (c.streams || []).length;
-    return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(plan)}">${ok ? `<a href="${href}">${ok}/${total}</a>` : "✗"}</td>`;
+    const why = `${plan}\n\nNot runnable: every stream needs a write mode this sink supports.`;
+    return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(why)}">${ok ? `<span>${ok}/${total}</span>` : "✗"}</td>`;
   };
   const row = (s, ks) => {
     const n = (s.streams || []).length;
