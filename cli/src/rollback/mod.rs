@@ -173,12 +173,15 @@ pub struct RollbackReport {
     pub bookmark_rewound: bool,
     /// The exactly-once watermark was reset to its pre-run token.
     pub token_rewound: bool,
+    /// The rollback was refused because a later run changed the keys and
+    /// `force` was not set (a dry run reports whether it *would* be).
+    pub blocked: bool,
 }
 
 impl RollbackReport {
     /// Whether the rollback was refused because a later run changed the keys.
     pub fn blocked(&self) -> bool {
-        !self.outcome.applied && self.outcome.conflicts > 0
+        self.blocked
     }
 }
 
@@ -229,6 +232,7 @@ pub async fn rollback_node(
         dataset: marker.sink_uri.clone(),
         mode: marker.mode,
         dry_run: inputs.dry_run,
+        blocked: outcome.conflicts > 0 && !inputs.force,
         outcome,
         bookmark_rewound: false,
         token_rewound: false,
@@ -452,6 +456,7 @@ mod tests {
             outcome: RollbackOutcome::blocked(2),
             bookmark_rewound: false,
             token_rewound: false,
+            blocked: true,
         };
         assert!(base.blocked());
         let ok = RollbackReport {
@@ -459,6 +464,7 @@ mod tests {
                 applied: true,
                 ..Default::default()
             },
+            blocked: false,
             ..base
         };
         assert!(!ok.blocked());

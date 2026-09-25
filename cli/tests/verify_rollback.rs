@@ -661,3 +661,115 @@ rollback: {{}}
     );
     let _ = RollbackSpec::default();
 }
+
+// ───────────────────────── command layer ─────────────────────────
+
+/// The `faucet verify` / `faucet rollback` entry points over a config file:
+/// exit-code mapping (`VerifyFailed` / `RollbackBlocked`), `--json`, `--list`,
+/// and the "no undoable run" refusal.
+#[tokio::test]
+async fn verify_and_rollback_commands_over_a_config_file() {
+    use faucet_cli::cli::{RollbackArgs, VerifyArgs};
+    use faucet_cli::error::CliError;
+
+    let d = fresh().await;
+    let path = d._dir.path().join("mirror.yaml");
+    std::fs::write(
+        &path,
+        config_yaml(&d.src, &d.dst, &d.state, "upsert", "rollback: {}"),
+    )
+    .unwrap();
+    let cfg = load(&std::fs::read_to_string(&path).unwrap());
+    let summary = run(&cfg).await;
+    let run_id = summary.invocations[0].run_id.clone().unwrap();
+
+    let verify_args = |json: bool, repair: bool| VerifyArgs {
+        config: Some(path.clone()),
+        row: None,
+        repair,
+        allow_delete: repair,
+        dry_run: false,
+        max_differences: Some(10),
+        json,
+        env_file: None,
+        no_env_file: true,
+        profile: None,
+    };
+    // Equal → Ok.
+    faucet_cli::commands::verify::run(verify_args(false, false))
+        .await
+        .unwrap();
+    // Drift → VerifyFailed with the differing-key count (human and --json).
+    exec(&d.dst, "UPDATE dst SET name = 'TWO' WHERE id = 2").await;
+    for json in [false, true] {
+        let err = faucet_cli::commands::verify::run(verify_args(json, false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CliError::VerifyFailed { differences: 1 }),
+            "{err}"
+        );
+    }
+    // A repair heals it, but the command still reports what it found.
+    let err = faucet_cli::commands::verify::run(verify_args(false, true))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CliError::VerifyFailed { differences: 1 }),
+        "{err}"
+    );
+    faucet_cli::commands::verify::run(verify_args(false, false))
+        .await
+        .unwrap();
+
+    let rollback_args = |run: Option<String>, list: bool, dry_run: bool, json: bool| RollbackArgs {
+        config: Some(path.clone()),
+        run,
+        row: None,
+        list,
+        dry_run,
+        force: false,
+        json,
+        env_file: None,
+        no_env_file: true,
+        profile: None,
+    };
+    faucet_cli::commands::rollback::run(rollback_args(None, true, false, false))
+        .await
+        .unwrap();
+    faucet_cli::commands::rollback::run(rollback_args(None, true, false, true))
+        .await
+        .unwrap();
+    // The repair re-upserted key 2 under another run id → the first run's
+    // rollback is blocked, and the command maps that to `RollbackBlocked`.
+    let err = faucet_cli::commands::rollback::run(rollback_args(
+        Some(run_id.clone()),
+        false,
+        false,
+        true,
+    ))
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, CliError::RollbackBlocked { conflicts: 1 }),
+        "{err}"
+    );
+    // A dry run of a forced rollback is fine and changes nothing.
+    let mut forced = rollback_args(Some(run_id.clone()), false, true, false);
+    forced.force = true;
+    faucet_cli::commands::rollback::run(forced).await.unwrap();
+    assert_eq!(rows(&d.dst).await.len(), 4);
+    let mut forced = rollback_args(Some(run_id.clone()), false, false, false);
+    forced.force = true;
+    faucet_cli::commands::rollback::run(forced).await.unwrap();
+    assert!(rows(&d.dst).await.is_empty(), "the run created every key");
+    // Gone: undoing it again is a config error naming --list.
+    let err = faucet_cli::commands::rollback::run(rollback_args(Some(run_id), false, false, false))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no undoable run"), "{err}");
+    let err = faucet_cli::commands::rollback::run(rollback_args(None, false, false, false))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--run"), "{err}");
+}

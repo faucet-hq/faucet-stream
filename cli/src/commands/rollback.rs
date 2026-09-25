@@ -192,6 +192,7 @@ mod tests {
             dataset: "sqlite:///x#t".into(),
             mode,
             dry_run,
+            blocked: !outcome.applied && outcome.conflicts > 0,
             outcome,
             bookmark_rewound: true,
             token_rewound: false,

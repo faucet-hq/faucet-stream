@@ -1662,6 +1662,7 @@ components:
         restored: { type: integer }
         conflicts: { type: integer, description: "Keys a later run changed since; without `force` these block the rollback." }
         applied: { type: boolean }
+        blocked: { type: boolean, description: "Refused because a later run changed the keys and `force` was not set (a dry run reports whether it would be)." }
         note: { type: string, nullable: true }
         bookmark_rewound: { type: boolean }
         token_rewound: { type: boolean }

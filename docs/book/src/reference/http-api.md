@@ -677,10 +677,9 @@ cookbook](../cookbook/rollback.md).
 - **`config`** — the config the run was made with; optional when the server
   stored it (cluster mode), `422` otherwise.
 
-`200` with the report: `applied`, `mode`, `deleted`, `restored`, `conflicts`,
-`bookmark_rewound`, `token_rewound`, `note`. `applied: false` with
-`conflicts > 0` means a later run changed the keys and nothing was touched —
-pass `force`. `409` while the run is still running. Admin-only (`Rollback`
+`200` with the report: `applied`, `blocked`, `mode`, `deleted`, `restored`,
+`conflicts`, `bookmark_rewound`, `token_rewound`, `note`. `blocked: true`
+means a later run changed the keys and nothing was touched — pass `force`. `409` while the run is still running. Admin-only (`Rollback`
 permission); audited as `run.rollback`.
 
 ## Completion callbacks
