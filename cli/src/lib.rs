@@ -51,8 +51,8 @@ pub mod obs;
 pub mod params;
 pub mod partition;
 pub mod pipeline_test;
-#[cfg(feature = "cli-progress")]
 pub mod profiling;
+#[cfg(feature = "cli-progress")]
 pub mod progress;
 pub mod reconcile;
 pub mod registry;
