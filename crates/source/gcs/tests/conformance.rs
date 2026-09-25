@@ -2,13 +2,9 @@
 //!
 //! Check 1 (config-schema validity) is pure and offline and always runs.
 //!
-//! Check 2 (bounded-memory streaming) is `#[ignore]`d for the same reason the
-//! rest of this crate's integration suite is: `fake-gcs-server` only speaks the
-//! REST API, but the GCS source reads via the gRPC storage client, so the
-//! emulator cannot actually serve `stream_pages` reads. The check is wired
-//! against a real GCS-compatible gRPC backend and matches the existing
-//! `integration.rs` emulator setup; run it with `cargo test -- --ignored`
-//! against a live backend.
+//! Checks 2, 9 and 12 run against `fake-gcs-server`: a plaintext storage host
+//! lists over the JSON API (see `faucet-common-gcs`), so the emulator serves
+//! the full list + read path. They skip when Docker is unavailable.
 
 #![cfg(not(target_os = "windows"))]
 
@@ -29,11 +25,8 @@ fn conformance_config_schema_valid() {
 }
 
 // ── Check 10: connector_name is non-empty (offline, lazy build) ──────────────
-/// Building the gRPC storage clients with `Anonymous` creds + an endpoint
+/// Building the storage clients with `Anonymous` creds + an endpoint
 /// override performs no I/O, so this runs unconditionally (no emulator needed).
-/// Check 9 (`batch_size = 0` single page) is intentionally *not* added: like the
-/// bounded-memory check it would need the gRPC read path, which `fake-gcs-server`
-/// cannot serve.
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_connector_name_nonempty() {
     let config = GcsSourceConfig::new("does-not-exist")
@@ -43,7 +36,7 @@ async fn conformance_connector_name_nonempty() {
     faucet_conformance::assert_connector_name_nonempty(&source);
 }
 
-// ── Check 2: bounded-memory streaming (live gRPC backend, ignored) ──────────
+// ── Check 2: bounded-memory streaming (emulator) ────────────────────────────
 
 /// Spawn `fake-gcs-server` and return `(host_url, bucket_name)`.
 /// Returns `None` when Docker is unavailable so tests skip cleanly.
@@ -111,7 +104,6 @@ fn jsonl_body(n: i64) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires a real GCS-compatible gRPC backend; fake-gcs-server only speaks REST. Run with `cargo test -- --ignored` against a live backend."]
 async fn conformance_bounded_memory() {
     let Some((host, bucket)) = spawn_fake_gcs().await else {
         return;
@@ -133,18 +125,26 @@ async fn conformance_bounded_memory() {
     let source = GcsSource::new(config).await.unwrap();
 
     faucet_conformance::assert_bounded_memory(&source, 250, 5_000).await;
+
+    // Check 9: the same seeded object read with `batch_size = 0` is one page.
+    let zero = GcsSource::new(
+        GcsSourceConfig::new(&bucket)
+            .prefix("data/")
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host)
+            .with_batch_size(0),
+    )
+    .await
+    .unwrap();
+    faucet_conformance::assert_batch_size_zero_single_page(&zero).await;
 }
 
-// ── Check 12: discovery round-trips (live gRPC backend, ignored) ─────────────
+// ── Check 12: discovery round-trips (emulator) ───────────────────────────────
 
 /// Every dataset `discover()` reports must be genuinely selectable: take its
 /// config_patch (a `{"prefix": …}` override) and rebuild the source pointed at
-/// that prefix, then read it. `#[ignore]`d for the same reason as the
-/// bounded-memory check — `discover()` and the read path both use the gRPC
-/// storage client, which `fake-gcs-server` (REST-only) cannot serve. Run with
-/// `cargo test -- --ignored` against a real GCS-compatible gRPC backend.
+/// that prefix, then read it.
 #[tokio::test]
-#[ignore = "requires a real GCS-compatible gRPC backend; fake-gcs-server only speaks REST. Run with `cargo test -- --ignored` against a live backend."]
 async fn conformance_discover_roundtrips() {
     let Some((host, bucket)) = spawn_fake_gcs().await else {
         return;
@@ -194,15 +194,14 @@ async fn conformance_discover_roundtrips() {
 
 /// Point the source at an unreachable GCS storage host (`http://127.0.0.1:1`,
 /// which refuses connections immediately) with anonymous credentials. `new()`
-/// stays lazy — building the gRPC storage clients with `Anonymous` creds + an
+/// stays lazy — building the storage clients with `Anonymous` creds + an
 /// endpoint override does not perform I/O (see `faucet-common-gcs` tests) — so
 /// no container is needed. The first list/get RPC fails with a typed
 /// `FaucetError` on both the `fetch_all` and `stream_pages` paths, never a
 /// panic.
 ///
-/// Unlike Check 2 (which is `#[ignore]`d because the REST emulator cannot serve
-/// the gRPC read path), Check 6 only needs the *failure* path, which an
-/// unreachable host reproduces deterministically — so it runs unconditionally.
+/// Check 6 only needs the *failure* path, which an unreachable host reproduces
+/// deterministically — so it needs no container.
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_errors_not_panics() {
     let config = GcsSourceConfig::new("does-not-exist")
