@@ -108,6 +108,7 @@ async fn upsert_item_errors_route_per_row_not_outer_err() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
         ..ElasticsearchSinkConfig::new(server.uri(), "idx")
     };
@@ -161,6 +162,7 @@ async fn upsert_delete_mixed_per_row_attribution() {
                 field: "__op".to_string(),
                 values: vec!["d".to_string()],
             }),
+            rollback: None,
         },
         ..ElasticsearchSinkConfig::new(server.uri(), "idx")
     };
@@ -205,6 +207,7 @@ async fn upsert_dedup_failure_fails_all_origin_indices() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
         ..ElasticsearchSinkConfig::new(server.uri(), "idx")
     };
@@ -245,6 +248,7 @@ async fn upsert_missing_key_failed_others_ok() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
         ..ElasticsearchSinkConfig::new(server.uri(), "idx")
     };
@@ -282,6 +286,7 @@ async fn upsert_http_failure_bubbles_outer_err() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
         ..ElasticsearchSinkConfig::new(server.uri(), "idx")
     };

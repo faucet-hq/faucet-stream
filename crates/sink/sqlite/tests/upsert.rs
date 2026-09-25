@@ -70,6 +70,7 @@ fn upsert_config(url: &str) -> SqliteSinkConfig {
             write_mode: WriteMode::Upsert,
             key: vec!["id".to_string()],
             delete_marker: None,
+            rollback: None,
         },
     }
 }
@@ -127,6 +128,7 @@ async fn delete_marker_removes_row() {
                 field: "__op".to_string(),
                 values: vec!["d".to_string()],
             }),
+            rollback: None,
         },
     };
     let sink = SqliteSink::new(config).await.unwrap();
@@ -227,6 +229,7 @@ async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
             write_mode: WriteMode::Upsert,
             key: vec!["id".into()],
             delete_marker: None,
+            rollback: None,
         },
     };
     let first = SqliteSink::new(cfg()).await.unwrap();
@@ -263,6 +266,7 @@ async fn dlq_and_exactly_once_paths_create_a_fresh_keyed_table() {
                 write_mode: WriteMode::Upsert,
                 key: vec!["id".into()],
                 delete_marker: None,
+                rollback: None,
             },
         })
         .await

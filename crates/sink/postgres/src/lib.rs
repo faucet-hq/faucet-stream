@@ -11,6 +11,7 @@
 
 pub mod config;
 mod copy;
+mod rollback;
 pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};

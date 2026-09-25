@@ -118,6 +118,8 @@ struct ReloadedBundle {
     resilience: Option<faucet_core::ResiliencePolicy>,
     sla: Option<crate::sla::SlaSpec>,
     reconcile: Option<crate::reconcile::ReconcileSpec>,
+    verify: Option<crate::verify::VerifySpec>,
+    rollback: Option<crate::rollback::RollbackSpec>,
     cron: String,
     timezone: String,
 }
@@ -145,6 +147,8 @@ async fn reload_bundle(path: &std::path::Path, profile: Option<&str>) -> CliResu
         resilience,
         sla: cfg.sla.clone(),
         reconcile: cfg.reconcile.clone(),
+        verify: cfg.verify.clone(),
+        rollback: cfg.rollback.clone(),
         cron,
         timezone,
     })
@@ -221,6 +225,8 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
             &resilience,
             &cfg.sla,
             &cfg.reconcile,
+            &cfg.verify,
+            &cfg.rollback,
             #[cfg(feature = "lineage")]
             &lineage,
             #[cfg(feature = "lineage")]
@@ -244,6 +250,8 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
         resilience,
         cfg.sla.clone(),
         cfg.reconcile.clone(),
+        cfg.verify.clone(),
+        cfg.rollback.clone(),
         path,
         args.profile,
         #[cfg(feature = "lineage")]
@@ -269,6 +277,8 @@ fn make_opts(
     resilience: &Option<faucet_core::ResiliencePolicy>,
     sla: &Option<crate::sla::SlaSpec>,
     reconcile: &Option<crate::reconcile::ReconcileSpec>,
+    verify: &Option<crate::verify::VerifySpec>,
+    rollback: &Option<crate::rollback::RollbackSpec>,
     #[cfg(feature = "lineage")] lineage: &Option<std::sync::Arc<faucet_lineage::LineageEmitter>>,
     #[cfg(feature = "lineage")] lineage_cfg: &Option<faucet_lineage::LineageConfig>,
     #[cfg(feature = "notify")] notifier: &Option<std::sync::Arc<crate::notify::Notifier>>,
@@ -289,6 +299,8 @@ fn make_opts(
         resilience: resilience.clone(),
         sla: sla.clone(),
         reconcile: reconcile.clone(),
+        verify: verify.clone(),
+        rollback: rollback.clone(),
         #[cfg(feature = "lineage")]
         lineage: lineage.clone(),
         #[cfg(feature = "lineage")]
@@ -400,6 +412,8 @@ async fn run_once(
     resilience: &Option<faucet_core::ResiliencePolicy>,
     sla: &Option<crate::sla::SlaSpec>,
     reconcile: &Option<crate::reconcile::ReconcileSpec>,
+    verify: &Option<crate::verify::VerifySpec>,
+    rollback: &Option<crate::rollback::RollbackSpec>,
     #[cfg(feature = "lineage")] lineage: &Option<std::sync::Arc<faucet_lineage::LineageEmitter>>,
     #[cfg(feature = "lineage")] lineage_cfg: &Option<faucet_lineage::LineageConfig>,
     #[cfg(feature = "notify")] notifier: &Option<std::sync::Arc<crate::notify::Notifier>>,
@@ -415,6 +429,8 @@ async fn run_once(
         resilience,
         sla,
         reconcile,
+        verify,
+        rollback,
         #[cfg(feature = "lineage")]
         lineage,
         #[cfg(feature = "lineage")]
@@ -468,6 +484,8 @@ async fn run_loop(
     mut resilience: Option<faucet_core::ResiliencePolicy>,
     mut sla: Option<crate::sla::SlaSpec>,
     mut reconcile: Option<crate::reconcile::ReconcileSpec>,
+    mut verify: Option<crate::verify::VerifySpec>,
+    mut rollback: Option<crate::rollback::RollbackSpec>,
     path: std::path::PathBuf,
     profile: Option<String>,
     #[cfg(feature = "lineage")] lineage: Option<std::sync::Arc<faucet_lineage::LineageEmitter>>,
@@ -544,6 +562,8 @@ async fn run_loop(
                         &resilience,
                         &sla,
                         &reconcile,
+                        &verify,
+                        &rollback,
                         #[cfg(feature = "lineage")]
                         &lineage,
                         #[cfg(feature = "lineage")]
@@ -694,7 +714,9 @@ async fn run_loop(
                                 compiled.clock_at(sched_for),
                                 &resilience,
                                 &sla,
-                        &reconcile,
+                                &reconcile,
+                                &verify,
+                                &rollback,
                                 #[cfg(feature = "lineage")]
                                 &lineage,
                                 #[cfg(feature = "lineage")]
@@ -729,6 +751,8 @@ async fn run_loop(
                         resilience = b.resilience;
                         sla = b.sla;
                         reconcile = b.reconcile;
+                        verify = b.verify;
+                        rollback = b.rollback;
                         cron = b.cron;
                         timezone = b.timezone;
                         breaker_cooldown = resilience
@@ -838,6 +862,7 @@ mod tests {
             invocations.push(crate::executor::InvocationOutcome {
                 row_id: format!("r{i}"),
                 parent_record_key: None,
+                run_id: None,
                 records_written: if i < failures { 0 } else { 3 },
                 error: if i < failures {
                     Some("boom".into())
@@ -901,6 +926,7 @@ mod tests {
         vec![crate::executor::InvocationOutcome {
             row_id: "r0".into(),
             parent_record_key: None,
+            run_id: None,
             records_written: 0,
             error: Some(msg.into()),
             error_kind: kind,
@@ -1048,6 +1074,8 @@ mod tests {
             &None,
             &None,
             &None,
+            &None,
+            &None,
             #[cfg(feature = "lineage")]
             &None,
             #[cfg(feature = "lineage")]
@@ -1083,6 +1111,8 @@ mod tests {
             &None,
             &auth,
             clock,
+            &None,
+            &None,
             &None,
             &None,
             &None,

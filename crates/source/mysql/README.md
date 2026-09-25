@@ -383,3 +383,15 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 ## Observability
 
 Metrics emitted by this source are labelled `connector="mysql"`.
+
+## Range digests (`faucet verify`, #701)
+
+The source implements `Source::range_digest`: `faucet verify` asks it for a
+**server-side content digest** of one integer-key range — `count(*)`, the
+exact sum of a 60-bit prefix of each row's `MD5` over the compared columns
+(NULL rendered distinctly from an empty string), and the key bounds —
+computed by one aggregate query over the range-wrapped `query`. Algorithm id
+`mysql:md5-60-sum:v1`; two digests compare only when both sides report the same id, so a
+pair of these sources verifies without shipping any rows for the ranges that
+match (other pairings stream and hash client-side). See the [verification
+cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html).

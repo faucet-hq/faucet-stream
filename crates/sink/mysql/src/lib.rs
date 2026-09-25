@@ -8,6 +8,7 @@
 //! column or dynamic column mapping.
 
 pub mod config;
+mod rollback;
 pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};

@@ -291,12 +291,12 @@ fn on_conflict_clause(key: &[String], all_cols: &[String]) -> String {
 /// timeout is not consulted — so two streams writing one database file failed
 /// at random. `IMMEDIATE` takes the write lock up front, where the busy timeout
 /// does apply.
-const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
+pub(crate) const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
 
 /// A sink that writes JSON records to a SQLite table.
 pub struct SqliteSink {
-    config: SqliteSinkConfig,
-    pool: SqlitePool,
+    pub(crate) config: SqliteSinkConfig,
+    pub(crate) pool: SqlitePool,
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
@@ -350,7 +350,7 @@ impl SqliteSink {
         Ok(())
     }
 
-    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+    pub(crate) async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
         let exists: Option<String> =
             sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
                 .bind(table)
@@ -516,7 +516,7 @@ impl SqliteSink {
     /// `ON CONFLICT(key) DO UPDATE …` tail so it upserts by the key columns
     /// (last-write-wins within the batch is handled by the planner's dedup,
     /// so a single sub-chunk never double-hits the same conflict target).
-    async fn insert_auto_map_with_conflict_tx(
+    pub(crate) async fn insert_auto_map_with_conflict_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         records: &[Value],
@@ -676,7 +676,7 @@ impl SqliteSink {
     /// Delete rows whose key columns match any of `deletes`, using
     /// `DELETE FROM t WHERE (k1, …) IN ((?, …), …)`, chunked at
     /// SQLite's bind-variable cap. Runs inside the caller's transaction.
-    async fn delete_by_keys(
+    pub(crate) async fn delete_by_keys(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         deletes: &[faucet_core::KeyTuple],
@@ -731,6 +731,12 @@ impl SqliteSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("SQLite transaction begin failed: {e}")))?;
 
+        // `rollback.journal`: before-images commit with the writes (#706).
+        if self.config.write.journals()
+            && let Some(run_id) = self.config.write.rollback_run_id()
+        {
+            self.journal_plan(&mut tx, plan, run_id).await?;
+        }
         let mut affected = 0usize;
         if !plan.upserts.is_empty() {
             affected += self
@@ -859,7 +865,7 @@ impl SqliteSink {
     }
 
     /// Ensure the commit-token watermark table exists.
-    async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
+    pub(crate) async fn ensure_commit_table(&self) -> Result<(), FaucetError> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {t} ({s} TEXT PRIMARY KEY, {k} TEXT NOT NULL, updated_at TEXT DEFAULT (datetime('now')))",
             t = quote_ident(faucet_core::idempotency::COMMIT_TOKEN_TABLE),
@@ -954,6 +960,36 @@ impl faucet_core::Sink for SqliteSink {
         self.config.write.dedups_by_key()
     }
 
+    /// Column-mapping mode only: the run-id column, the journaled keys and the
+    /// kept previous table all address real columns (#706).
+    fn supports_rollback(&self) -> bool {
+        self.rollback_supported()
+    }
+
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &faucet_core::rollback::RollbackOptions,
+    ) -> Result<faucet_core::rollback::RollbackOutcome, FaucetError> {
+        self.rollback_run_impl(run_id, opts).await
+    }
+
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.forget_run_impl(run_id).await
+    }
+
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        self.rewind_commit_token_impl(scope, token).await
+    }
+
+    fn readback_source(&self) -> Option<(String, Value)> {
+        self.readback_source_impl()
+    }
+
     fn is_overwrite(&self) -> bool {
         self.config.write.is_overwrite()
     }
@@ -1019,6 +1055,11 @@ impl faucet_core::Sink for SqliteSink {
             .begin_with(BEGIN_WRITE)
             .await
             .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: begin swap: {e}")))?;
+        // `rollback.keep_previous`: snapshot the rows about to be replaced, in
+        // the same transaction, so a rollback can swap them back (#706).
+        if self.config.write.keeps_previous() {
+            self.keep_previous_copy(&mut tx).await?;
+        }
         for stmt in [
             format!("DELETE FROM {target}"),
             format!("INSERT INTO {target} SELECT * FROM {staging}"),
@@ -1284,6 +1325,11 @@ impl faucet_core::Sink for SqliteSink {
         // we reuse `apply_plan`'s helpers directly on this transaction).
         let written = match &plan {
             Some(plan) => {
+                if self.config.write.journals()
+                    && let Some(run_id) = self.config.write.rollback_run_id()
+                {
+                    self.journal_plan(&mut tx, plan, run_id).await?;
+                }
                 let mut affected = 0usize;
                 if !plan.upserts.is_empty() {
                     affected += self

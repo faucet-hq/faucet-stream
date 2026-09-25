@@ -36,6 +36,8 @@
   - [Backfill (historical replay)](./cookbook/backfill.md)
   - [Parallel range partitioning](./cookbook/partitioning.md)
   - [Dead-letter queues](./cookbook/dlq.md)
+  - [Content verification (`faucet verify`)](./cookbook/verify.md)
+  - [Undoing a run (`faucet rollback`)](./cookbook/rollback.md)
   - [Resilience (retry / circuit breaker / poison-pill)](./cookbook/resilience.md)
   - [File formats](./cookbook/file-formats.md)
   - [Compression](./cookbook/compression.md)

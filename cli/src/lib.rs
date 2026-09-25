@@ -57,6 +57,7 @@ pub mod reconcile;
 pub mod registry;
 pub mod registry_index;
 pub mod replication;
+pub mod rollback;
 pub mod scaffold;
 #[cfg(feature = "schedule")]
 pub mod schedule;
@@ -73,6 +74,7 @@ pub mod topology;
 pub mod transforms;
 #[cfg(feature = "cli-tui")]
 pub mod tui;
+pub mod verify;
 pub mod vocabulary;
 
 pub use error::{CliError, CliResult};
@@ -177,6 +179,14 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
             Err(CliError::DoctorFailed { failed }) => ExitCode::from(failed.min(255) as u8),
             Err(CliError::TestsFailed { failed }) => ExitCode::from(failed.min(255) as u8),
             Err(CliError::BackfillFailed { failed }) => ExitCode::from(failed.min(255) as u8),
+            // `verify` printed its report; the exit code is the differing-key
+            // count. A blocked `rollback` exits with the conflict count.
+            Err(CliError::VerifyFailed { differences }) => {
+                ExitCode::from(differences.clamp(1, 255) as u8)
+            }
+            Err(CliError::RollbackBlocked { conflicts }) => {
+                ExitCode::from(conflicts.clamp(1, 255) as u8)
+            }
             Err(err) => {
                 commands::report(&err);
                 ExitCode::from(1)
@@ -213,6 +223,8 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         Command::Doctor(args) => commands::doctor::run(args).await,
         Command::Test(args) => commands::test::run(args).await,
         Command::Dlq(args) => commands::dlq::run(args).await,
+        Command::Verify(args) => commands::verify::run(args).await,
+        Command::Rollback(args) => commands::rollback::run(args).await,
         Command::Hub(args) => commands::hub::run(args).await,
         #[cfg(feature = "contract")]
         Command::Contract(args) => commands::contract::run(args).await,
@@ -344,6 +356,8 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
             resilience,
             sla: cfg.sla.clone(),
             reconcile: cfg.reconcile.clone(),
+            verify: cfg.verify.clone(),
+            rollback: cfg.rollback.clone(),
             #[cfg(feature = "lineage")]
             lineage: None,
             #[cfg(feature = "lineage")]

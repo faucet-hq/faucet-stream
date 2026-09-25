@@ -37,6 +37,21 @@ function templateLink(rec) {
   return `<a href="#/templates/${encodeURIComponent(l.template)}">${escapeHtml(l.template)}</a>${ver}`;
 }
 
+/** Render a rollback report: what changed (or would), and why it was blocked. */
+function renderRollback(el, r) {
+  const verb = r.dry_run ? "would " : "";
+  const lines = [];
+  if (r.mode === "append") lines.push(`${verb}delete <b>${fmtInt(r.deleted)}</b> appended row(s)`);
+  if (r.mode === "upsert") lines.push(`${verb}delete <b>${fmtInt(r.deleted)}</b> created key(s), ${verb}restore <b>${fmtInt(r.restored)}</b> before-image(s)`);
+  if (r.mode === "overwrite") lines.push(`${verb}swap back the kept previous table (<b>${fmtInt(r.restored)}</b> row(s))`);
+  if (r.conflicts > 0) lines.push(`<b>${fmtInt(r.conflicts)}</b> key(s) were changed by a later run${r.applied ? " (restored anyway: force)" : ""}`);
+  if (r.note) lines.push(escapeHtml(r.note));
+  if (r.applied && !r.dry_run) lines.push(`bookmark ${r.bookmark_rewound ? "rewound" : "unchanged"}; exactly-once watermark ${r.token_rewound ? "rewound" : "not applicable"}`);
+  const status = r.dry_run ? "dry-run" : r.applied ? "rolled back" : "blocked";
+  const cls = r.dry_run ? "pill-queued" : r.applied ? "pill-completed" : "pill-failed";
+  el.innerHTML = `<div class="rollback-result"><span class="pill ${cls}">${status}</span> run <span class="mono">${escapeHtml(r.run_id)}</span> on <b>${escapeHtml(r.row)}</b> (${escapeHtml(r.sink_kind)} ${escapeHtml(r.dataset)}, ${escapeHtml(r.mode)})<ul>${lines.map((l) => `<li>${l}</li>`).join("")}</ul></div>`;
+}
+
 // Location-driven DLQ panel: inspect / replay / discard envelopes at a
 // server-local path. The DLQ is not run-scoped, so the location is entered
 // explicitly. inspect → DlqRead (viewer); replay/discard → DlqManage (operator).
@@ -125,10 +140,34 @@ export async function renderDetail(container, { id }) {
         <button class="btn-ghost" id="back">← Runs</button>
         <div class="detail-actions">
           <button class="btn-warn" id="cancel" data-perm="run_write" hidden>Cancel</button>
+          <button class="btn-warn" id="rollback-toggle" data-perm="rollback" hidden>Roll back…</button>
           <button class="btn-danger" id="delete" data-perm="run_write" hidden>Delete</button>
         </div>
       </div>
       <div id="detail-head"></div>
+      <section class="dlq-panel rollback-panel" id="rollback-panel" data-perm="rollback" hidden>
+        <h2>Roll back this run</h2>
+        <p class="dlq-hint">
+          Undo what one invocation wrote — delete the rows it appended, restore the
+          before-images of the keys it upserted, or swap back the table it overwrote —
+          and rewind the row's bookmark so the next run re-reads it. The run must have
+          been made with a <code>rollback:</code> block. A key a later run changed since
+          is a conflict and blocks the rollback unless <em>force</em> is set.
+        </p>
+        <div class="dlq-row">
+          <label class="dlq-check">invocation
+            <select id="rollback-invocation"></select>
+          </label>
+          <label class="dlq-check"><input type="checkbox" id="rollback-dryrun" checked /> dry-run</label>
+          <label class="dlq-check"><input type="checkbox" id="rollback-force" /> force (restore keys a later run changed)</label>
+          <button class="btn-danger" id="rollback-go">Roll back</button>
+        </div>
+        <details class="dlq-replay" id="rollback-config-details">
+          <summary>Config (only needed when the server did not store this run's config)</summary>
+          <textarea id="rollback-config" rows="6" placeholder="paste the pipeline config (YAML) the run was made with"></textarea>
+        </details>
+        <div id="rollback-result"></div>
+      </section>
       <h2>Invocations</h2>
       <div id="invocations"></div>
       <h2>Logs</h2>
@@ -195,6 +234,20 @@ export async function renderDetail(container, { id }) {
     const live = !TERMINAL.includes(rec.status);
     container.querySelector("#cancel").hidden = !(rec.status === "running" || rec.status === "queued");
     container.querySelector("#delete").hidden = !TERMINAL.includes(rec.status);
+    // Roll back (#706): only a finished run with at least one invocation id can
+    // be undone. The toggle keeps its own hidden state once revealed.
+    const undoable = TERMINAL.includes(rec.status) && (rec.invocations || []).some((i) => i.run_id);
+    const toggle = container.querySelector("#rollback-toggle");
+    if (undoable && toggle.hidden && !toggle.dataset.shown) toggle.hidden = false;
+    toggle.dataset.shown = "1";
+    if (!undoable) { toggle.hidden = true; container.querySelector("#rollback-panel").hidden = true; }
+    const sel = container.querySelector("#rollback-invocation");
+    const wanted = (rec.invocations || []).filter((i) => i.run_id);
+    if (sel.options.length !== wanted.length) {
+      sel.innerHTML = wanted
+        .map((i) => `<option value="${escapeHtml(i.run_id)}">${escapeHtml(i.row_id)} — ${escapeHtml(i.run_id)}</option>`)
+        .join("");
+    }
     if (live) {
       clearTimeout(pollTimer);
       pollTimer = setTimeout(load, 3000);
@@ -249,7 +302,7 @@ export async function renderDetail(container, { id }) {
       .sort((a, b) => (b.duration_ms || 0) - (a.duration_ms || 0));
     const maxMs = Math.max(1, ...invs.map((i) => i.duration_ms || 0));
     inv.innerHTML =
-      `<table class="tbl"><thead><tr><th title="the matrix row this invocation ran">matrix row</th><th>parent key</th><th>records</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
+      `<table class="tbl"><thead><tr><th title="the matrix row this invocation ran">matrix row</th><th>parent key</th><th title="the invocation's own run id — what faucet rollback --run undoes">run id</th><th>records</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
       invs
         .map((i) => {
           const ms = i.duration_ms || 0;
@@ -267,7 +320,7 @@ export async function renderDetail(container, { id }) {
           const bar =
             `<div style="height:9px;width:100%;max-width:180px;border-radius:4px;background:rgba(120,120,120,0.14);` +
             `box-shadow:inset 0 1px 1px rgba(0,0,0,0.12);margin-top:5px">${fill}</div>`;
-          return `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td>${fmtInt(i.records_written ?? 0)}</td><td><div style="white-space:nowrap">${fmtMs(ms)}</div>${bar}</td><td>${escapeHtml(i.error || "")}</td></tr>`;
+          return `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td class="mono">${escapeHtml(i.run_id || "—")}</td><td>${fmtInt(i.records_written ?? 0)}</td><td><div style="white-space:nowrap">${fmtMs(ms)}</div>${bar}</td><td>${escapeHtml(i.error || "")}</td></tr>`;
         })
         .join("") +
       `</tbody></table>`;
@@ -280,6 +333,30 @@ export async function renderDetail(container, { id }) {
   container.querySelector("#delete").onclick = async () => {
     try { await api(`/v1/runs/${encodeURIComponent(id)}`, { method: "DELETE" }); navigate("#/runs"); }
     catch (e) { toast(e.message, "error"); }
+  };
+  container.querySelector("#rollback-toggle").onclick = () => {
+    const panel = container.querySelector("#rollback-panel");
+    panel.hidden = !panel.hidden;
+  };
+  container.querySelector("#rollback-go").onclick = async () => {
+    const resultEl = container.querySelector("#rollback-result");
+    const body = {
+      invocation_id: container.querySelector("#rollback-invocation").value || undefined,
+      dry_run: container.querySelector("#rollback-dryrun").checked,
+      force: container.querySelector("#rollback-force").checked,
+    };
+    const cfg = container.querySelector("#rollback-config").value.trim();
+    if (cfg) body.config = cfg;
+    resultEl.textContent = "rolling back…";
+    try {
+      const r = await api(`/v1/runs/${encodeURIComponent(id)}/rollback`, { method: "POST", body });
+      renderRollback(resultEl, r);
+      // A 422 for a missing config is surfaced below; on success reveal the
+      // config editor only when it was needed.
+    } catch (e) {
+      resultEl.innerHTML = `<div class="error-box">${escapeHtml(e.message)}</div>`;
+      if (e.status === 422) container.querySelector("#rollback-config-details").open = true;
+    }
   };
 
   logCtrl = streamLogs(id, {

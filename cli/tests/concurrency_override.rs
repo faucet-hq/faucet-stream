@@ -31,6 +31,8 @@ fn opts(name: &str, concurrency: Option<usize>) -> ExecuteOptions {
         resilience: None,
         sla: None,
         reconcile: None,
+        verify: None,
+        rollback: None,
         #[cfg(feature = "lineage")]
         lineage: None,
         #[cfg(feature = "lineage")]

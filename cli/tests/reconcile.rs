@@ -42,6 +42,8 @@ fn opts_with_reconcile(reconcile: Option<ReconcileSpec>) -> ExecuteOptions {
         resilience: None,
         sla: None,
         reconcile,
+        verify: None,
+        rollback: None,
         #[cfg(feature = "lineage")]
         lineage: None,
         #[cfg(feature = "lineage")]

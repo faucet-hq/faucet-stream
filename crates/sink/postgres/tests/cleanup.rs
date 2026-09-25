@@ -88,6 +88,7 @@ fn sink_config(url: &str) -> PostgresSinkConfig {
         write_mode: WriteMode::Upsert,
         key: vec!["id".to_string()],
         delete_marker: None,
+        rollback: None,
     };
     config
 }

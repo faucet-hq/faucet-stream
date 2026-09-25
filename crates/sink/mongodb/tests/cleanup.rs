@@ -37,6 +37,7 @@ fn config(uri: &str, key: Vec<String>) -> MongoSinkConfig {
         write_mode: WriteMode::Upsert,
         key,
         delete_marker: None,
+        rollback: None,
     };
     config
 }

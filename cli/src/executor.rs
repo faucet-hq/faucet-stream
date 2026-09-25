@@ -128,6 +128,16 @@ pub struct ExecuteOptions {
     /// beyond tolerance. `None` disables the pass. Same root/real-run scoping as
     /// the SLA pass (skipped for dry-run / `--limit` / shard / cancelled runs).
     pub reconcile: Option<crate::reconcile::ReconcileSpec>,
+    /// Optional content verification (#701): after every successful **root**
+    /// invocation (`verify.after_run`), compare the destination to the source
+    /// by content; differences fail the run unless `fail_on_difference:
+    /// false`, and `repair: true` re-syncs them first. Same root/real-run
+    /// scoping as reconcile.
+    pub verify: Option<crate::verify::VerifySpec>,
+    /// Optional run rollback (#706): when set, every real **root** invocation
+    /// writes a pre-run marker into its state store and hands the sink its
+    /// journaling settings, so `faucet rollback --run <id>` can undo it.
+    pub rollback: Option<crate::rollback::RollbackSpec>,
     /// Shared OpenLineage emitter, built once from the `lineage:` block. `None`
     /// disables lineage (and adds zero overhead). Gated on the `lineage` feature.
     #[cfg(feature = "lineage")]
@@ -218,6 +228,10 @@ pub struct InvocationOutcome {
     /// `None` for root invocations; for children, the value at `parent_key` in
     /// the parent record (rendered to a string).
     pub parent_record_key: Option<String>,
+    /// This invocation's own run id — the value the `run_id` metadata column
+    /// carries and the id `faucet rollback --run` takes (#706). `None` for
+    /// synthetic outcomes where no pipeline ran.
+    pub run_id: Option<String>,
     pub records_written: usize,
     pub error: Option<String>,
     /// Typed kind of `error`, set wherever the failure is still a typed
@@ -264,6 +278,7 @@ pub struct InvocationMetrics {
 /// records — the pipeline-level counters `run_unit` folds into an
 /// [`InvocationMetrics`] (which then adds the connector kinds + wall-clock).
 struct PipelineStats {
+    run_id: String,
     records_written: usize,
     records_read: Option<u64>,
     dlq_count: u64,
@@ -321,6 +336,16 @@ fn concurrency_permits(configured: Option<usize>) -> usize {
 
 /// Execute every node in `nodes`. `nodes` must be in BFS order (roots first
 /// then children) — that's what [`crate::expand::expand`] returns.
+/// [`run_expanded`] as a boxed future — for callers that run the executor
+/// from *inside* an invocation (the `verify` repair pass, #701), where the
+/// recursive `async fn` type would otherwise be a cycle.
+pub fn run_expanded_boxed(
+    nodes: Vec<ExpandedNode>,
+    opts: ExecuteOptions,
+) -> futures::future::BoxFuture<'static, CliResult<RunSummary>> {
+    Box::pin(run_expanded(nodes, opts))
+}
+
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
     let on_error = opts
         .execution
@@ -788,6 +813,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                     InvocationOutcome {
                         row_id,
                         parent_record_key,
+                        run_id: None,
                         records_written: 0,
                         error: Some(format!("pipeline invocation task panicked: {e}")),
                         // A panicked task never produced a typed error.
@@ -1026,6 +1052,22 @@ fn resolved_sink_destination(unit: &Unit, opts: &ExecuteOptions) -> CliResult<Va
     if !ctx.is_empty() {
         resolve_inplace(&mut sink_cfg, &ctx)?;
     }
+    // Rollback (#706): the group's lifecycle sink (begin/commit/abort) is a
+    // different instance from the writers, and it is the commit that keeps
+    // the replaced table — so it needs the `keep_previous` setting too. The
+    // run id is irrelevant to the copy (the run-id column comes from the
+    // metadata decorator on the writers).
+    if let Some(spec) = opts.rollback.as_ref().filter(|r| r.enabled)
+        && matches!(unit.node.role, NodeRole::Root)
+        && !opts.dry_run
+        && opts.limit.is_none()
+        && opts.shard.is_none()
+        && unit.node.state.is_some()
+        && crate::rollback::sink_supports_rollback(&unit.node.sink.kind)
+    {
+        let column = crate::rollback::run_id_column(unit.node.metadata_columns.as_ref());
+        crate::rollback::inject_write_spec(&mut sink_cfg, spec, "", &column);
+    }
     Ok(sink_cfg)
 }
 
@@ -1166,6 +1208,7 @@ async fn run_unit(
             InvocationOutcome {
                 row_id,
                 parent_record_key,
+                run_id: Some(stats.run_id.clone()),
                 records_written: stats.records_written,
                 error: None,
                 error_kind: None,
@@ -1180,6 +1223,7 @@ async fn run_unit(
         Err(e) => InvocationOutcome {
             row_id,
             parent_record_key,
+            run_id: None,
             records_written: 0,
             error: Some(e.to_string()),
             error_kind: Some(classify_error(&e)),
@@ -1267,6 +1311,7 @@ async fn run_discovery(
             InvocationOutcome {
                 row_id: node.id.clone(),
                 parent_record_key: None,
+                run_id: None,
                 records_written: 0,
                 error: None,
                 error_kind: None,
@@ -1276,6 +1321,7 @@ async fn run_discovery(
         Err(e) => InvocationOutcome {
             row_id: node.id.clone(),
             parent_record_key: None,
+            run_id: None,
             records_written: 0,
             error: Some(e.to_string()),
             error_kind: Some(classify_error(&e)),
@@ -1683,6 +1729,21 @@ async fn run_one_invocation(
     reject_unresolved_backfill_tokens(&source_cfg, "source")?;
     reject_unresolved_backfill_tokens(&sink_cfg, "sink")?;
 
+    // Rollback (#706): a real root run of an undo-capable sink is journaled.
+    // The sink gets its per-run settings through its flattened `WriteSpec`;
+    // the pre-run marker is written once the state store is built below.
+    let rollback_active = opts.rollback.as_ref().is_some_and(|r| r.enabled)
+        && matches!(node.role, NodeRole::Root)
+        && !opts.dry_run
+        && opts.limit.is_none()
+        && opts.shard.is_none()
+        && node.state.is_some()
+        && crate::rollback::sink_supports_rollback(&node.sink.kind);
+    let run_id_column = crate::rollback::run_id_column(node.metadata_columns.as_ref());
+    if rollback_active && let Some(spec) = &opts.rollback {
+        crate::rollback::inject_write_spec(&mut sink_cfg, spec, &run_id, &run_id_column);
+    }
+
     // Scoped-cleanup claim (#478). Resolved through the *same* token passes as
     // the connector configs — the scope is typically `${parent.id}` on a child
     // row, so it has to see the parent record exactly like the source URL does.
@@ -1905,6 +1966,32 @@ async fn run_one_invocation(
         Some(shard) => format!("{state_key}::{}", shard.id),
         None => state_key.to_owned(),
     };
+    // Rollback (#706): record what the bookmark and watermark were before this
+    // run writes, so undoing it can rewind them. Never fails the run — a run
+    // whose marker could not be written is simply not undoable.
+    if rollback_active
+        && let (Some(spec), Some(store)) = (&opts.rollback, &state)
+        && sink.supports_rollback()
+    {
+        let marker = crate::rollback::marker_for(
+            &run_id,
+            &pipeline_name,
+            node,
+            &effective_state_key,
+            opts.clock,
+            sink.dataset_uri(),
+            run_id_column.clone(),
+        );
+        if let Err(e) =
+            crate::rollback::prepare(store.as_ref(), sink.as_ref(), marker, spec.retain).await
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %e,
+                "rollback marker could not be written; this run will not be undoable"
+            );
+        }
+    }
     let source: Box<dyn Source> = if state.is_some() && source.state_key().is_some() {
         Box::new(StateKeyOverride {
             inner: source,
@@ -2056,6 +2143,82 @@ async fn run_one_invocation(
             match crate::reconcile::run(spec, &opts.auth, written).await {
                 Ok(()) => result,
                 Err(e) => Err(e),
+            }
+        }
+        _ => result,
+    };
+
+    // ── Content verification (#701) ──────────────────────────────────────────
+    // On a successful root run, compare the destination to the source by
+    // content (digests + bisection) and — with `repair` — re-sync differing
+    // keys. Differences fail the run unless `fail_on_difference: false`. Same
+    // scoping as reconcile; a repair runs its own nested invocation.
+    let result = match (&result, &opts.verify) {
+        (Ok(_), Some(spec))
+            if spec.after_run
+                && matches!(node.role, NodeRole::Root)
+                && !opts.dry_run
+                && opts.limit.is_none()
+                && opts.shard.is_none()
+                && !cancel.is_cancelled() =>
+        {
+            let inputs = crate::verify::VerifyInputs {
+                row: Some(node.id.clone()),
+                repair: spec.repair,
+                allow_delete: spec.allow_delete,
+                dry_run: false,
+                pipeline_name: pipeline_name.clone(),
+                execution: opts.execution.clone(),
+                auth: opts.auth.clone(),
+                clock: opts.clock,
+            };
+            match crate::verify::verify_node(node, spec, &inputs).await {
+                Ok(outcome) if outcome.report.equal() => result,
+                // A repair that re-synced every reported difference healed the
+                // drift: the run is green, and the drift is logged.
+                Ok(outcome) if outcome.report.healed() => {
+                    tracing::warn!(
+                        row = %node.id,
+                        differences = outcome.differing_keys(),
+                        repaired_upserts = outcome.report.repaired_upserts.unwrap_or(0),
+                        repaired_deletes = outcome.report.repaired_deletes.unwrap_or(0),
+                        "content verification found drift and repaired it"
+                    );
+                    result
+                }
+                Ok(outcome) => {
+                    let (missing, extra, changed, dup) = outcome.report.tally();
+                    let msg = format!(
+                        "content verification found {} differing key(s) between {} and {} \
+                         ({missing} missing in destination, {extra} extra in destination, \
+                         {changed} changed, {dup} duplicated{}{})",
+                        outcome.differing_keys(),
+                        outcome.source,
+                        outcome.destination,
+                        match (
+                            outcome.report.repaired_upserts,
+                            outcome.report.repaired_deletes
+                        ) {
+                            (Some(u), Some(d)) =>
+                                format!("; repaired: {u} upsert(s), {d} delete(s)"),
+                            _ => String::new(),
+                        },
+                        if outcome.report.truncated {
+                            "; report truncated"
+                        } else {
+                            ""
+                        },
+                    );
+                    if spec.fail_on_difference {
+                        Err(FaucetError::Sink(msg))
+                    } else {
+                        tracing::warn!(row = %node.id, "{msg}");
+                        result
+                    }
+                }
+                Err(e) => Err(FaucetError::Sink(format!(
+                    "content verification failed: {e}"
+                ))),
             }
         }
         _ => result,
@@ -2353,6 +2516,7 @@ async fn run_one_invocation(
     #[cfg(not(feature = "lineage"))]
     let records_read: Option<u64> = None;
     let stats = PipelineStats {
+        run_id: run_id.clone(),
         records_written: result.records_written,
         records_read,
         dlq_count: result
@@ -2731,6 +2895,12 @@ impl Sink for CapturingSink {
     }
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
         self.inner.last_committed_token(scope).await
+    }
+    fn supports_rollback(&self) -> bool {
+        self.inner.supports_rollback()
+    }
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        self.inner.forget_run(run_id).await
     }
     async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.current_schema().await
@@ -3162,6 +3332,8 @@ mod tests {
             resilience: None,
             sla: None,
             reconcile: None,
+            verify: None,
+            rollback: None,
             shard: None,
             replication: None,
             backfill: None,
@@ -3202,6 +3374,8 @@ mod tests {
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -3243,6 +3417,8 @@ mod tests {
             resilience: None,
             sla: None,
             reconcile: None,
+            verify: None,
+            rollback: None,
             #[cfg(feature = "lineage")]
             lineage: None,
             #[cfg(feature = "lineage")]
@@ -3680,6 +3856,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -3745,6 +3923,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -3975,6 +4155,8 @@ execution:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4065,6 +4247,8 @@ pipeline:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4129,6 +4313,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4202,6 +4388,8 @@ execution:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4276,6 +4464,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]
@@ -4549,6 +4739,8 @@ matrix:
             resilience: None,
             sla: None,
             reconcile: None,
+            verify: None,
+            rollback: None,
             #[cfg(feature = "lineage")]
             lineage: None,
             #[cfg(feature = "lineage")]
@@ -5242,6 +5434,8 @@ matrix:
                 resilience: None,
                 sla: None,
                 reconcile: None,
+                verify: None,
+                rollback: None,
                 #[cfg(feature = "lineage")]
                 lineage: None,
                 #[cfg(feature = "lineage")]

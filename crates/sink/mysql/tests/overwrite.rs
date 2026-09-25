@@ -81,6 +81,7 @@ fn overwrite_config(url: &str) -> MysqlSinkConfig {
         write_mode: WriteMode::Overwrite,
         key: vec![],
         delete_marker: None,
+        rollback: None,
     };
     config
 }

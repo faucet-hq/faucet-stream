@@ -218,6 +218,8 @@ async fn dry_run_skips_sla_evaluation() {
             resilience: None,
             sla: cfg.sla.clone(),
             reconcile: cfg.reconcile.clone(),
+            verify: cfg.verify.clone(),
+            rollback: cfg.rollback.clone(),
             #[cfg(feature = "lineage")]
             lineage: None,
             #[cfg(feature = "lineage")]

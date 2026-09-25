@@ -323,6 +323,8 @@ pub(crate) async fn execute(
             resilience,
             sla: cfg.sla.clone(),
             reconcile: cfg.reconcile.clone(),
+            verify: cfg.verify.clone(),
+            rollback: cfg.rollback.clone(),
             #[cfg(feature = "lineage")]
             lineage,
             #[cfg(feature = "lineage")]
@@ -448,6 +450,17 @@ pub(crate) async fn execute(
                 total_written,
                 if total_written == 1 { "" } else { "s" }
             );
+            // Undoable runs (#706): print each invocation's run id so the
+            // operator can `faucet rollback --run <id>` without digging it
+            // out of the destination's `_faucet_run_id` column.
+            if cfg.rollback.as_ref().is_some_and(|r| r.enabled) {
+                eprintln!("  run ids (undo with `faucet rollback --run <id>`):");
+                for i in summary.invocations.iter().filter(|i| i.error.is_none()) {
+                    if let Some(id) = &i.run_id {
+                        eprintln!("    {:<30} {id}", i.row_id);
+                    }
+                }
+            }
             // Per-row timing breakdown (slowest first) — the wall-clock each
             // matrix row's work took. Only for multi-row runs, where the
             // scheduling tail matters; a single invocation adds no signal.
@@ -531,6 +544,9 @@ pub(crate) struct RunRowSummary {
     pub row_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_key: Option<String>,
+    /// The invocation's run id — what `faucet rollback --run` undoes (#706).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub source: String,
     pub sink: String,
     pub status: &'static str,
@@ -575,6 +591,7 @@ pub(crate) fn summary_rows(summary: &RunSummary) -> Vec<RunRowSummary> {
             RunRowSummary {
                 row_id: o.row_id.clone(),
                 parent_key: o.parent_record_key.clone(),
+                run_id: o.run_id.clone(),
                 source: m.source_kind,
                 sink: m.sink_kind,
                 status: if o.error.is_some() { "failed" } else { "ok" },
@@ -687,6 +704,7 @@ mod tests {
         InvocationOutcome {
             row_id: id.into(),
             parent_record_key: None,
+            run_id: None,
             records_written: written,
             error: err.map(|s| s.to_string()),
             error_kind: None,

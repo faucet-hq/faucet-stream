@@ -136,6 +136,23 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconcile: Option<crate::reconcile::ReconcileSpec>,
 
+    /// Optional content verification (#701): after every successful root run
+    /// (and on demand with `faucet verify`), compare the destination to the
+    /// source by key ranges and digests, report differing keys, and — with
+    /// `repair: true` — re-sync them through the sink. Differences fail the
+    /// run unless `fail_on_difference: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::verify::VerifySpec>,
+
+    /// Optional run rollback (#706): stamp a run-id column, journal the
+    /// before-image of every key an upsert touches, keep the table an
+    /// overwrite replaces, and record the pre-run bookmark, so
+    /// `faucet rollback --run <id>` can undo the run. Needs a durable `state:`
+    /// block and a rollback-capable sink (postgres / sqlite / mysql, column
+    /// mapping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<crate::rollback::RollbackSpec>,
+
     /// Optional source-shard distribution for clustered (Mode B) execution.
     /// Only consumed by `faucet serve --cluster`: a run whose source
     /// [is shardable](faucet_core::Source::is_shardable) is split into

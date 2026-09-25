@@ -302,6 +302,22 @@ pub trait Source: Send + Sync {
         Ok(())
     }
 
+    /// Compute a [`ServerDigest`](crate::diff::ServerDigest) of the rows in
+    /// `range` **inside the backend**, so a matching range ships no rows
+    /// (#701). `columns` are the compared columns; `key` the integer key the
+    /// range is over. Default `Ok(None)`: not supported, the verifier streams
+    /// the range instead. Two digests compare only when both sides report the
+    /// same `algorithm`.
+    async fn range_digest(
+        &self,
+        range: &crate::diff::KeyRange,
+        key: &str,
+        columns: &[String],
+    ) -> Result<Option<crate::diff::ServerDigest>, FaucetError> {
+        let _ = (range, key, columns);
+        Ok(None)
+    }
+
     /// Whether this source can enumerate the datasets behind its connection
     /// via [`discover`](Self::discover). Default: `false`. Sources backed by
     /// an introspectable catalog (database `information_schema`, MongoDB
@@ -739,6 +755,64 @@ pub trait Sink: Send + Sync {
         )))
     }
 
+    /// Whether this sink can undo a run it wrote (#706) through
+    /// [`rollback_run`](Self::rollback_run). Default `false`.
+    fn supports_rollback(&self) -> bool {
+        false
+    }
+
+    /// Undo everything `run_id` wrote to this destination, per
+    /// `opts.mode`: delete the run's rows (append), restore journaled
+    /// before-images (upsert / delete), or swap the kept previous table back
+    /// (overwrite). Must be all-or-nothing per destination where the backend
+    /// allows it, and must leave the destination untouched when `opts.dry_run`
+    /// is set or when conflicts block it (see
+    /// [`RollbackOutcome`](crate::rollback::RollbackOutcome)).
+    ///
+    /// Default: a typed "unsupported" error.
+    async fn rollback_run(
+        &self,
+        run_id: &str,
+        opts: &crate::rollback::RollbackOptions,
+    ) -> Result<crate::rollback::RollbackOutcome, FaucetError> {
+        let _ = (run_id, opts);
+        Err(FaucetError::Sink(format!(
+            "sink '{}' does not support rollback",
+            self.connector_name()
+        )))
+    }
+
+    /// Drop whatever this sink kept to make `run_id` undoable (journal rows, a
+    /// previous table) once the run is past the retention window. Default:
+    /// no-op.
+    async fn forget_run(&self, run_id: &str) -> Result<(), FaucetError> {
+        let _ = run_id;
+        Ok(())
+    }
+
+    /// Rewind the exactly-once watermark for `scope` to `token` (`None` clears
+    /// it), so a rolled-back run's pages are not skipped on the next run.
+    /// Default: a typed "unsupported" error.
+    async fn rewind_commit_token(
+        &self,
+        scope: &str,
+        token: Option<&str>,
+    ) -> Result<(), FaucetError> {
+        let _ = (scope, token);
+        Err(FaucetError::Sink(format!(
+            "sink '{}' does not support rewinding its commit token",
+            self.connector_name()
+        )))
+    }
+
+    /// A source `(kind, config)` that reads this destination back — what
+    /// `faucet verify` (#701) compares the pipeline's source against. Default
+    /// `None`: the user names the destination reader in `verify.destination`.
+    /// The config must not need a credential the sink config lacks.
+    fn readback_source(&self) -> Option<(String, Value)> {
+        None
+    }
+
     /// Discard the staging target after a failed or cancelled overwrite run.
     ///
     /// Called (best-effort) when an overwrite run does not reach
@@ -977,6 +1051,33 @@ mod tests {
                 .contains("does not support native byte loading"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn default_rollback_and_readback_hooks() {
+        let sink = MockSink::new();
+        assert!(!sink.supports_rollback());
+        let opts = crate::rollback::RollbackOptions {
+            run_id_column: "_faucet_run_id".into(),
+            mode: crate::rollback::RollbackMode::Append,
+            force: false,
+            dry_run: false,
+        };
+        let err = sink.rollback_run("r1", &opts).await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not support rollback"),
+            "{err}"
+        );
+        assert!(sink.forget_run("r1").await.is_ok());
+        let err = sink.rewind_commit_token("s", None).await.unwrap_err();
+        assert!(err.to_string().contains("commit token"), "{err}");
+        assert!(sink.readback_source().is_none());
+        let source = MockSource { records: vec![] };
+        let digest = source
+            .range_digest(&crate::diff::KeyRange::ALL, "id", &["v".into()])
+            .await
+            .unwrap();
+        assert!(digest.is_none(), "not supported by default");
     }
 
     #[tokio::test]

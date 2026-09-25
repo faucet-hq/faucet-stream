@@ -33,6 +33,7 @@ fn overwrite_config(uri: &str) -> MongoSinkConfig {
         write_mode: WriteMode::Overwrite,
         key: vec![],
         delete_marker: None,
+        rollback: None,
     };
     config
 }
