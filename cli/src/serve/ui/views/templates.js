@@ -38,7 +38,7 @@ function kindPill(kind) {
     deployment: "deployment overlay — state, DLQ, notifications and SLA applied over a composed run",
     pipeline: "complete pipeline config",
   }[k];
-  return `<span class="pill tpl-kind tpl-kind-${escapeHtml(k)}" title="${escapeHtml(title)}">${KIND_LABEL[k]}</span>`;
+  return `<span class="pill tpl-kind tpl-kind-${escapeHtml(k)}" title="${escapeHtml(title)}"><span class="pill-label">${KIND_LABEL[k]}</span></span>`;
 }
 
 function statusPill(status) {
