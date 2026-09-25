@@ -728,12 +728,19 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       # Cover unit + integration tests, and keep the integration-only share
-      # separately (#695): run the integration test binaries (each crate's
-      # `tests/` targets) first, report, set their profiles aside, run the unit
-      # tests (lib + bin targets), report, then merge both for the combined
-      # report. Every test still runs exactly once. The integration tests boot
-      # Docker testcontainers whose image pulls intermittently flake, so each
-      # half is retried like the `test` job does.
+      # separately (#695). One build, two phases:
+      #   1. integration — compiles every library once, plus each crate's
+      #      `tests/` binaries, runs them, writes integration.lcov;
+      #   2. teardown — deletes what only phase 1 needed (the integration test
+      #      binaries, their profiles, every testcontainer image/volume), which
+      #      is what ran the runner out of disk when phase 2 started compiling;
+      #   3. unit — reuses the compiled libraries and builds only each crate's
+      #      `cfg(test)` harness, runs it, writes unit.lcov.
+      # lcov.info is the two reports concatenated: codecov and
+      # scripts/patch-coverage.py both treat a line as covered when any record
+      # of it is, so no merged profile (and no kept integration binary) is
+      # needed. The integration tests boot Docker testcontainers whose image
+      # pulls intermittently flake, so each phase is retried like `test` is.
       - name: Collect coverage (integration, then unit)
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         env:
@@ -753,16 +760,25 @@ jobs:
           rm -f target/*.profraw
           eval "$(cargo llvm-cov show-env --sh)"
           retry cargo test --workspace --all-features --test '*'
-          cargo llvm-cov report --lcov --output-path integration.lcov --ignore-filename-regex "$IGNORE_RE"
-          mkdir -p target/profraw-integration
-          mv target/*.profraw target/profraw-integration/
-          retry cargo test --workspace --all-features --lib --bins
-          cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
-          mv target/profraw-integration/*.profraw target/
           # The staged-load execution shims need a live warehouse that can reach
           # a live bucket, so they are excluded here, in codecov.yml, and in
           # scripts/patch-coverage.py (all three kept in sync).
-          cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$IGNORE_RE"
+          cargo llvm-cov report --lcov --output-path integration.lcov --ignore-filename-regex "$IGNORE_RE"
+
+          echo "::group::teardown before the unit phase"
+          df -h /
+          cargo test --workspace --all-features --test '*' --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
+            | while read -r exe; do rm -f "$exe" "${exe}.d"; done
+          rm -f target/*.profraw
+          docker ps -aq | xargs -r docker rm -f >/dev/null
+          docker system prune -af --volumes >/dev/null
+          df -h /
+          echo "::endgroup::"
+
+          retry cargo test --workspace --all-features --lib --bins
+          cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
+          cat integration.lcov unit.lcov > lcov.info
       - name: Test the coverage gate scripts
         if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         run: python3 -m unittest discover -s scripts -p 'test_*.py'

@@ -39,8 +39,10 @@ crate's `tests/` directory — and enforces two gates on the lines a PR changes:
 | Patch coverage | `scripts/patch-coverage.py` | changed lines hit by **any** test | 95% |
 | Integration coverage (#695) | `scripts/integration-coverage.py` | changed **I/O** lines hit by an **integration** test | 60%, and every changed I/O file ≥ 1 line |
 
-The job runs the integration binaries first and reports them on their own, then
-the unit tests, then merges both — every test still runs once. The unit-only and
+The job builds once and runs the integration binaries first, reporting them on
+their own; it then deletes what only that phase needed (the integration test
+binaries and every testcontainer image) so the runner keeps its disk, runs the
+unit tests, and concatenates the two reports — every test still runs once. The unit-only and
 integration-only halves are uploaded to Codecov under the `unit` and
 `integration` flags. Both gates print the uncovered lines when they fail; the
 integration gate also writes a per-file table to the job summary.
@@ -97,10 +99,10 @@ cargo llvm-cov clean --workspace && rm -f target/*.profraw
 eval "$(cargo llvm-cov show-env --sh)"
 cargo test -p <crate> --all-features --test '*'
 cargo llvm-cov report --lcov --output-path integration.lcov
-mkdir -p target/i && mv target/*.profraw target/i/
+rm -f target/*.profraw
 cargo test -p <crate> --all-features --lib --bins
 cargo llvm-cov report --lcov --output-path unit.lcov
-mv target/i/*.profraw target/ && cargo llvm-cov report --lcov --output-path lcov.info
+cat integration.lcov unit.lcov > lcov.info
 python3 scripts/patch-coverage.py --lcov lcov.info --base origin/main --min 95
 python3 scripts/integration-coverage.py --lcov integration.lcov --unit-lcov unit.lcov --base origin/main
 ```
