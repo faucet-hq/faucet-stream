@@ -335,9 +335,9 @@ function renderMatrix(idx) {
   };
 
   const facets = [
-    ["srcOwner", "Owner", values(sources, "owner"), (v) => `@${v}`],
+    ["srcOwner", "Owner", values(sources, "owner"), (v) => v],
     ["srcType", "Type", values(sources, "source_type"), (v) => v],
-    ["sinkOwner", "Owner", values(sinks, "owner"), (v) => `@${v}`],
+    ["sinkOwner", "Owner", values(sinks, "owner"), (v) => v],
     ["sinkType", "Type", values(sinks, "sink_type"), (v) => v],
   ];
   const menus = [];
