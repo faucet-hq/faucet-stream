@@ -344,7 +344,9 @@ async fn never_deletes_a_file_faucet_did_not_create() {
     let listed = list_outputs(&base, &client, "").await;
     let row = find(&listed, "theirs.jsonl").expect("still tracked, so a user can see why");
     assert_eq!(row["pre_existing"], true);
-    assert_eq!(row["state"], "external");
+    // The run truncated it (`append: false`), so its contents are faucet's and
+    // previewable — but the file is still someone else's, so never deletable.
+    assert_eq!(row["state"], "replaced");
     let id = row["id"].as_str().unwrap().to_string();
 
     // Explicit single-output delete → refused, with the reason.
