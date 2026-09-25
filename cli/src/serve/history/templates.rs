@@ -541,13 +541,22 @@ pub struct LaunchRecord {
 
 /// Why and when a template was retired. Stored only while deprecated; clearing it
 /// is the `--undo`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeprecationRecord {
     pub deprecated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// One retired version (#697). The version keeps running when pinned, but is
+/// skipped by `newest`, refused by `launch`, and warned about on every trigger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VersionDeprecation {
+    pub version: u32,
+    #[serde(flatten)]
+    pub record: DeprecationRecord,
 }
 
 /// Everything a surface needs to describe a template's release state, read in one
@@ -564,7 +573,7 @@ pub struct TemplateState {
     pub stable: Option<u32>,
     /// The version launched before the current one; the rollback target.
     pub previous: Option<u32>,
-    /// Highest version number, launched or not.
+    /// Highest version number that is not deprecated, launched or not.
     pub newest: Option<u32>,
     /// Assignable channel pointers (`{channel: version}`), excluding the derived
     /// ones.
@@ -572,6 +581,9 @@ pub struct TemplateState {
     /// Present only when `status` is `deprecated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecation: Option<DeprecationRecord>,
+    /// Individually retired versions, newest first (#697).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deprecated_versions: Vec<VersionDeprecation>,
 }
 
 impl TemplateState {
@@ -582,17 +594,29 @@ impl TemplateState {
         launches: &[LaunchRecord],
         tags: BTreeMap<String, u32>,
         deprecation: Option<DeprecationRecord>,
+        mut deprecated_versions: Vec<VersionDeprecation>,
     ) -> Self {
         let stable = stable_version(launches);
+        deprecated_versions.retain(|d| versions.contains(&d.version));
+        deprecated_versions.sort_by_key(|d| std::cmp::Reverse(d.version));
+        let retired = |v: &u32| deprecated_versions.iter().any(|d| d.version == *v);
         Self {
             status: TemplateStatus::derive(stable.is_some(), deprecation.is_some()),
-            newest: versions.first().copied(),
+            newest: versions.iter().copied().find(|v| !retired(v)),
             stable,
             previous: previous_version(launches),
             versions,
             tags,
             deprecation,
+            deprecated_versions,
         }
+    }
+
+    /// The deprecation marker of `version`, if it is individually retired.
+    pub fn version_deprecation(&self, version: u32) -> Option<&VersionDeprecation> {
+        self.deprecated_versions
+            .iter()
+            .find(|d| d.version == version)
     }
 
     /// Resolve a derived channel against this state.

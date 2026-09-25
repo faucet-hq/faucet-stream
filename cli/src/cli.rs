@@ -687,6 +687,10 @@ pub struct TemplateDeprecateArgs {
     /// Revive a deprecated template instead of retiring it.
     #[arg(long)]
     pub undo: bool,
+    /// Retire (or with `--undo`, revive) only this version — a number or a
+    /// channel name — instead of the whole template.
+    #[arg(long)]
+    pub version: Option<String>,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -912,11 +916,21 @@ pub struct HubPairArgs {
     #[arg(long)]
     pub overlay: Option<String>,
     /// Hub catalog: a directory, `github:owner/repo[@ref][/path]`, or a GitHub
-    /// URL. Default: `$FAUCET_HUB`, else `./hub` when it exists, else the
-    /// public hub `github:faucet-hq/template-hub` (cached under
-    /// `~/.cache/faucet/hub`).
-    #[arg(long, env = "FAUCET_HUB")]
-    pub hub: Option<String>,
+    /// URL. Repeat it (or separate with commas) to search several hubs in
+    /// order — a bare id resolves in the first that has it. Default:
+    /// `$FAUCET_HUB`, else `./hub` when it exists, else the public hub
+    /// `github:faucet-hq/template-hub` (cached under `~/.cache/faucet/hub`).
+    #[arg(long, env = "FAUCET_HUB", value_delimiter = ',')]
+    pub hub: Vec<String>,
+    /// Hub for `--source` only (e.g. a private catalog); overrides `--hub` for it.
+    #[arg(long)]
+    pub source_hub: Option<String>,
+    /// Hub for `--sink` only; overrides `--hub` for it.
+    #[arg(long)]
+    pub sink_hub: Option<String>,
+    /// Hub for `--overlay` only; overrides `--hub` for it.
+    #[arg(long)]
+    pub overlay_hub: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -1589,11 +1603,21 @@ pub struct RunArgs {
     #[arg(long, requires = "source")]
     pub overlay: Option<String>,
     /// Hub catalog for `--source` / `--sink` ids: a directory,
-    /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Default:
+    /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Repeat it (or
+    /// separate with commas) to search several hubs in order. Default:
     /// `$FAUCET_HUB`, else `./hub` when it exists, else the public hub
     /// `github:faucet-hq/template-hub`.
-    #[arg(long, env = "FAUCET_HUB")]
-    pub hub: Option<String>,
+    #[arg(long, env = "FAUCET_HUB", value_delimiter = ',')]
+    pub hub: Vec<String>,
+    /// Hub for `--source` only (e.g. a private catalog); overrides `--hub` for it.
+    #[arg(long)]
+    pub source_hub: Option<String>,
+    /// Hub for `--sink` only; overrides `--hub` for it.
+    #[arg(long)]
+    pub sink_hub: Option<String>,
+    /// Hub for `--overlay` only; overrides `--hub` for it.
+    #[arg(long)]
+    pub overlay_hub: Option<String>,
 }
 
 /// Format for `faucet run`'s end-of-run summary.
@@ -1812,11 +1836,21 @@ pub struct ValidateArgs {
     #[arg(long, requires = "source")]
     pub overlay: Option<String>,
     /// Hub catalog for `--source` / `--sink` ids: a directory,
-    /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Default:
+    /// `github:owner/repo[@ref][/path]`, or a GitHub URL. Repeat it (or
+    /// separate with commas) to search several hubs in order. Default:
     /// `$FAUCET_HUB`, else `./hub` when it exists, else the public hub
     /// `github:faucet-hq/template-hub`.
-    #[arg(long, env = "FAUCET_HUB")]
-    pub hub: Option<String>,
+    #[arg(long, env = "FAUCET_HUB", value_delimiter = ',')]
+    pub hub: Vec<String>,
+    /// Hub for `--source` only (e.g. a private catalog); overrides `--hub` for it.
+    #[arg(long)]
+    pub source_hub: Option<String>,
+    /// Hub for `--sink` only; overrides `--hub` for it.
+    #[arg(long)]
+    pub sink_hub: Option<String>,
+    /// Hub for `--overlay` only; overrides `--hub` for it.
+    #[arg(long)]
+    pub overlay_hub: Option<String>,
 }
 
 /// `faucet schema` arguments.

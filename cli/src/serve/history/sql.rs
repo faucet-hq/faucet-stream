@@ -187,6 +187,14 @@ pub const DDL: &[&str] = &[
         deprecated_at TEXT NOT NULL,\
         deprecated_by TEXT,\
         reason TEXT)",
+    // Per-version deprecation markers (#697).
+    "CREATE TABLE IF NOT EXISTS faucet_template_version_deprecations (\
+        id TEXT NOT NULL,\
+        version TEXT NOT NULL,\
+        deprecated_at TEXT NOT NULL,\
+        deprecated_by TEXT,\
+        reason TEXT,\
+        PRIMARY KEY (id, version))",
     // Local sink output ledger (#587): one row per concrete local file a sink
     // opened. This is the provenance the retention GC deletes from — it may only
     // remove files listed here, never a glob or a directory — so the table is
@@ -406,6 +414,15 @@ pub struct Stmts {
     pub template_select_deprecation: String,
     /// Clear the deprecation marker. Param: id.
     pub template_delete_deprecation: String,
+    /// Upsert one version's deprecation marker. Params: id, version,
+    /// deprecated_at, deprecated_by, reason.
+    pub template_upsert_version_deprecation: String,
+    /// Every version deprecation of a template. Param: id.
+    pub template_select_version_deprecations: String,
+    /// Clear one version's deprecation marker. Params: id, version.
+    pub template_delete_version_deprecation: String,
+    /// Clear every version deprecation of a template. Param: id.
+    pub template_delete_version_deprecations_all: String,
     /// The dialect these statements were built for. Needed by the one query that
     /// cannot be a fixed string: the local-output listing pushes its filter and
     /// `LIMIT` into SQL (#587), so the placeholder style has to be known at call
@@ -770,6 +787,19 @@ impl Stmts {
                 .into(),
             template_delete_deprecation: "DELETE FROM faucet_template_deprecations WHERE id=$1"
                 .into(),
+            template_upsert_version_deprecation: "INSERT INTO faucet_template_version_deprecations \
+                (id, version, deprecated_at, deprecated_by, reason) VALUES ($1,$2,$3,$4,$5) \
+                ON CONFLICT (id, version) DO UPDATE SET deprecated_at=excluded.deprecated_at, \
+                deprecated_by=excluded.deprecated_by, reason=excluded.reason"
+                .into(),
+            template_select_version_deprecations: "SELECT version, deprecated_at, deprecated_by, reason \
+                FROM faucet_template_version_deprecations WHERE id=$1 \
+                ORDER BY CAST(version AS BIGINT) DESC"
+                .into(),
+            template_delete_version_deprecation:
+                "DELETE FROM faucet_template_version_deprecations WHERE id=$1 AND version=$2".into(),
+            template_delete_version_deprecations_all:
+                "DELETE FROM faucet_template_version_deprecations WHERE id=$1".into(),
             dialect: Dialect::Postgres,
         }
     }
@@ -1056,6 +1086,19 @@ impl Stmts {
                 .into(),
             template_delete_deprecation: "DELETE FROM faucet_template_deprecations WHERE id=?"
                 .into(),
+            template_upsert_version_deprecation: "INSERT INTO faucet_template_version_deprecations \
+                (id, version, deprecated_at, deprecated_by, reason) VALUES (?,?,?,?,?) \
+                ON CONFLICT (id, version) DO UPDATE SET deprecated_at=excluded.deprecated_at, \
+                deprecated_by=excluded.deprecated_by, reason=excluded.reason"
+                .into(),
+            template_select_version_deprecations: "SELECT version, deprecated_at, deprecated_by, reason \
+                FROM faucet_template_version_deprecations WHERE id=? \
+                ORDER BY CAST(version AS BIGINT) DESC"
+                .into(),
+            template_delete_version_deprecation:
+                "DELETE FROM faucet_template_version_deprecations WHERE id=? AND version=?".into(),
+            template_delete_version_deprecations_all:
+                "DELETE FROM faucet_template_version_deprecations WHERE id=?".into(),
             dialect: Dialect::Sqlite,
         }
     }
@@ -3088,6 +3131,12 @@ macro_rules! impl_sql_history {
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?;
+                        sqlx::query(&self.stmts.template_delete_version_deprecation)
+                            .bind(id)
+                            .bind(v.to_string())
+                            .execute(&self.pool)
+                            .await
+                            .map_err(backend)?;
                         sqlx::query(&self.stmts.template_delete_version)
                             .bind(id)
                             .bind(v.to_string())
@@ -3099,6 +3148,7 @@ macro_rules! impl_sql_history {
                             &self.stmts.template_delete_tags_all,
                             &self.stmts.template_delete_launches_all,
                             &self.stmts.template_delete_deprecation,
+                            &self.stmts.template_delete_version_deprecations_all,
                         ] {
                             sqlx::query(stmt)
                                 .bind(id)
@@ -3305,6 +3355,72 @@ macro_rules! impl_sql_history {
                     }
                 }
                 Ok(())
+            }
+
+            async fn template_set_version_deprecation(
+                &self,
+                id: &str,
+                version: u32,
+                record: Option<&$crate::serve::history::templates::DeprecationRecord>,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                match record {
+                    Some(r) => {
+                        sqlx::query(&self.stmts.template_upsert_version_deprecation)
+                            .bind(id)
+                            .bind(version.to_string())
+                            .bind(sql::fmt_ts(r.deprecated_at))
+                            .bind(r.deprecated_by.as_deref())
+                            .bind(r.reason.as_deref())
+                            .execute(&self.pool)
+                            .await
+                            .map_err(backend)?;
+                    }
+                    None => {
+                        sqlx::query(&self.stmts.template_delete_version_deprecation)
+                            .bind(id)
+                            .bind(version.to_string())
+                            .execute(&self.pool)
+                            .await
+                            .map_err(backend)?;
+                    }
+                }
+                Ok(())
+            }
+
+            async fn template_version_deprecations(
+                &self,
+                id: &str,
+            ) -> Result<
+                Vec<$crate::serve::history::templates::VersionDeprecation>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::{sql, templates};
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let rows = sqlx::query(&self.stmts.template_select_version_deprecations)
+                    .bind(id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let version: String = row.try_get("version").map_err(backend)?;
+                    let Ok(version) = version.parse::<u32>() else {
+                        continue;
+                    };
+                    let at: String = row.try_get("deprecated_at").map_err(backend)?;
+                    out.push(templates::VersionDeprecation {
+                        version,
+                        record: templates::DeprecationRecord {
+                            deprecated_at: sql::parse_ts(&at),
+                            deprecated_by: row.try_get("deprecated_by").map_err(backend)?,
+                            reason: row.try_get("reason").map_err(backend)?,
+                        },
+                    });
+                }
+                Ok(out)
             }
 
             async fn template_deprecation(

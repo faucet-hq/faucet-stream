@@ -41,11 +41,12 @@ pub enum Permission {
     /// Read the pipeline template registry (`GET /v1/templates*`, #444) —
     /// read-only. Also required to *resolve* a template when triggering a run.
     TemplateRead,
-    /// Register or delete a pipeline template (`POST`/`DELETE /v1/templates*`,
-    /// #444). Granted from `operator` up: a principal that can already submit an
-    /// arbitrary config to `POST /v1/runs` gains no new capability by storing one
-    /// under a name.
-    TemplateWrite,
+    /// Manage the pipeline template registry's lifecycle (#444, #698): register
+    /// templates and versions, launch, roll back, deprecate, assign channels,
+    /// delete, sync and publish. Admin-only: a launch changes what every
+    /// unpinned caller runs, so it is a release decision, not an operator's.
+    /// Triggering a registered template is `RunWrite`.
+    TemplateAdmin,
     /// Read the local sink output ledger (`GET /v1/local-outputs`, #587) —
     /// read-only, granted to every role from `viewer` up. It lists paths and
     /// sizes of the server's own output files, which anyone who can already read
@@ -61,6 +62,30 @@ pub enum Permission {
     AuditRead,
     /// Hot-reload the server's `--default-config` (`POST /v1/reload`) — admin-only.
     Reload,
+    /// Read the caller's own principal, role and permissions (`GET /v1/whoami`,
+    /// #698) — every role, so a client can shape itself to what it may do.
+    Identity,
+}
+
+impl Permission {
+    /// Every permission, in declaration order.
+    pub const ALL: [Permission; 15] = [
+        Permission::RunRead,
+        Permission::RunWrite,
+        Permission::SchemaRead,
+        Permission::Doctor,
+        Permission::TriggerFire,
+        Permission::DlqRead,
+        Permission::DlqManage,
+        Permission::CatalogRead,
+        Permission::TemplateRead,
+        Permission::TemplateAdmin,
+        Permission::LocalOutputRead,
+        Permission::LocalOutputManage,
+        Permission::AuditRead,
+        Permission::Reload,
+        Permission::Identity,
+    ];
 }
 
 /// A named role. Roles are a fixed, built-in ladder — `viewer` ⊂ `operator` ⊂
@@ -71,10 +96,10 @@ pub enum Permission {
 pub enum Role {
     /// Read-only: runs + logs + schemas.
     Viewer,
-    /// Everything a viewer can do, plus submit/cancel/delete runs, doctor, and
-    /// firing triggers.
+    /// Everything a viewer can do, plus submit/cancel/delete runs (including
+    /// triggering registered templates), doctor, and firing triggers.
     Operator,
-    /// Full access, including reading the audit log.
+    /// Full access, including the template lifecycle and the audit log.
     Admin,
 }
 
@@ -86,7 +111,13 @@ impl Role {
             Role::Viewer => {
                 matches!(
                     perm,
-                    RunRead | SchemaRead | DlqRead | CatalogRead | TemplateRead | LocalOutputRead
+                    RunRead
+                        | SchemaRead
+                        | DlqRead
+                        | CatalogRead
+                        | TemplateRead
+                        | LocalOutputRead
+                        | Identity
                 )
             }
             Role::Operator => {
@@ -101,13 +132,21 @@ impl Role {
                         | Doctor
                         | TriggerFire
                         | DlqManage
-                        | TemplateWrite
                         | LocalOutputRead
                         | LocalOutputManage
+                        | Identity
                 )
             }
             Role::Admin => true,
         }
+    }
+
+    /// Every permission this role grants, in declaration order.
+    pub fn permissions(self) -> Vec<Permission> {
+        Permission::ALL
+            .into_iter()
+            .filter(|p| self.grants(*p))
+            .collect()
     }
 
     pub fn as_str(self) -> &'static str {
@@ -338,19 +377,21 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         // Pipeline templates (#444). Triggering maps to `RunWrite` — it starts a
         // run, which is the privileged half; `operator` holds both scopes, so a
         // single check suffices and a `viewer` can browse but never trigger.
-        (&Method::POST, "/v1/templates") => Some(TemplateWrite),
+        (&Method::POST, "/v1/templates") => Some(TemplateAdmin),
         (&Method::GET, "/v1/templates") => Some(TemplateRead),
         (&Method::GET, "/v1/templates/matrix") => Some(TemplateRead),
         (&Method::GET, "/v1/templates/{id}") => Some(TemplateRead),
-        (&Method::DELETE, "/v1/templates/{id}") => Some(TemplateWrite),
+        (&Method::DELETE, "/v1/templates/{id}") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/runs") => Some(RunWrite),
-        (&Method::POST, "/v1/templates/{id}/tags") => Some(TemplateWrite),
-        (&Method::POST, "/v1/templates/{id}/launch") => Some(TemplateWrite),
-        (&Method::POST, "/v1/templates/{id}/rollback") => Some(TemplateWrite),
-        (&Method::POST, "/v1/templates/{id}/deprecate") => Some(TemplateWrite),
-        (&Method::POST, "/v1/templates/sync") => Some(TemplateWrite),
-        (&Method::POST, "/v1/templates/{id}/publish") => Some(TemplateWrite),
+        (&Method::POST, "/v1/templates/{id}/tags") => Some(TemplateAdmin),
+        (&Method::POST, "/v1/templates/{id}/launch") => Some(TemplateAdmin),
+        (&Method::POST, "/v1/templates/{id}/rollback") => Some(TemplateAdmin),
+        (&Method::POST, "/v1/templates/{id}/deprecate") => Some(TemplateAdmin),
+        (&Method::POST, "/v1/templates/{id}/versions/{version}/deprecate") => Some(TemplateAdmin),
+        (&Method::POST, "/v1/templates/sync") => Some(TemplateAdmin),
+        (&Method::POST, "/v1/templates/{id}/publish") => Some(TemplateAdmin),
         (&Method::POST, "/v1/reload") => Some(Reload),
+        (&Method::GET, "/v1/whoami") => Some(Identity),
         // MCP endpoint (#420): baseline access needs only a read scope (Viewer+);
         // the mutating `run_pipeline` tool is separately gated on RunWrite inside
         // the handler.
@@ -393,9 +434,13 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/templates/{id}/launch") => "template.launch",
         (&Method::POST, "/v1/templates/{id}/rollback") => "template.rollback",
         (&Method::POST, "/v1/templates/{id}/deprecate") => "template.deprecate",
+        (&Method::POST, "/v1/templates/{id}/versions/{version}/deprecate") => {
+            "template.version_deprecate"
+        }
         (&Method::POST, "/v1/templates/sync") => "template.sync",
         (&Method::POST, "/v1/templates/{id}/publish") => "template.publish",
         (&Method::POST, "/v1/reload") => "config.reload",
+        (&Method::GET, "/v1/whoami") => "whoami",
         (&Method::POST, "/mcp") => "mcp",
         _ => "unknown",
     }
@@ -425,14 +470,15 @@ mod tests {
         assert!(!Role::Viewer.grants(Doctor));
         assert!(!Role::Viewer.grants(DlqManage));
         assert!(!Role::Viewer.grants(AuditRead));
-        assert!(!Role::Viewer.grants(TemplateWrite));
-        // Operator: reads + writes + doctor + triggers + dlq management, but not audit.
+        assert!(!Role::Viewer.grants(TemplateAdmin));
+        // Operator: reads + writes + doctor + triggers + dlq management, but not
+        // audit and not the template lifecycle (#698).
         assert!(Role::Operator.grants(RunWrite));
         assert!(Role::Operator.grants(Doctor));
         assert!(Role::Operator.grants(TriggerFire));
         assert!(Role::Operator.grants(DlqRead));
         assert!(Role::Operator.grants(DlqManage));
-        assert!(Role::Operator.grants(TemplateWrite));
+        assert!(!Role::Operator.grants(TemplateAdmin));
         assert!(!Role::Operator.grants(AuditRead));
         // Admin: everything.
         for p in [
@@ -445,7 +491,7 @@ mod tests {
             DlqManage,
             AuditRead,
             TemplateRead,
-            TemplateWrite,
+            TemplateAdmin,
         ] {
             assert!(Role::Admin.grants(p));
         }
@@ -543,16 +589,24 @@ mod tests {
                 "/v1/local-outputs/{id}/preview",
                 LocalOutputRead,
             ),
-            (Method::POST, "/v1/templates", TemplateWrite),
+            (Method::POST, "/v1/templates", TemplateAdmin),
             (Method::GET, "/v1/templates", TemplateRead),
             (Method::GET, "/v1/templates/{id}", TemplateRead),
-            (Method::DELETE, "/v1/templates/{id}", TemplateWrite),
+            (Method::DELETE, "/v1/templates/{id}", TemplateAdmin),
             (Method::POST, "/v1/templates/{id}/runs", RunWrite),
-            (Method::POST, "/v1/templates/{id}/tags", TemplateWrite),
-            (Method::POST, "/v1/templates/{id}/launch", TemplateWrite),
-            (Method::POST, "/v1/templates/{id}/rollback", TemplateWrite),
-            (Method::POST, "/v1/templates/{id}/deprecate", TemplateWrite),
+            (Method::POST, "/v1/templates/{id}/tags", TemplateAdmin),
+            (Method::POST, "/v1/templates/{id}/launch", TemplateAdmin),
+            (Method::POST, "/v1/templates/{id}/rollback", TemplateAdmin),
+            (Method::POST, "/v1/templates/{id}/deprecate", TemplateAdmin),
+            (
+                Method::POST,
+                "/v1/templates/{id}/versions/{version}/deprecate",
+                TemplateAdmin,
+            ),
+            (Method::POST, "/v1/templates/sync", TemplateAdmin),
+            (Method::POST, "/v1/templates/{id}/publish", TemplateAdmin),
             (Method::POST, "/v1/reload", Reload),
+            (Method::GET, "/v1/whoami", Identity),
         ] {
             assert_eq!(required_permission(&m, path), Some(want), "{m} {path}");
         }
@@ -603,6 +657,35 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Permission::AuditRead).unwrap(),
             "\"audit_read\""
+        );
+    }
+
+    #[test]
+    fn template_lifecycle_is_admin_only_and_triggering_is_operator() {
+        use Permission::*;
+        for role in [Role::Viewer, Role::Operator] {
+            assert!(!role.grants(TemplateAdmin), "{role:?}");
+        }
+        assert!(Role::Admin.grants(TemplateAdmin));
+        assert!(!Role::Viewer.grants(RunWrite));
+        assert!(Role::Operator.grants(RunWrite));
+        assert!(Role::Operator.grants(TemplateRead));
+    }
+
+    #[test]
+    fn every_role_can_read_its_own_identity_and_lists_exactly_what_it_grants() {
+        for role in [Role::Viewer, Role::Operator, Role::Admin] {
+            assert!(role.grants(Permission::Identity), "{role:?}");
+            let listed = role.permissions();
+            for p in Permission::ALL {
+                assert_eq!(listed.contains(&p), role.grants(p), "{role:?} {p:?}");
+            }
+        }
+        assert_eq!(Role::Admin.permissions().len(), Permission::ALL.len());
+        assert!(
+            !Role::Viewer
+                .permissions()
+                .contains(&Permission::TemplateAdmin)
         );
     }
 

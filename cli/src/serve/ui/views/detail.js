@@ -124,8 +124,8 @@ export async function renderDetail(container, { id }) {
       <div class="page-head">
         <button class="btn-ghost" id="back">← Runs</button>
         <div class="detail-actions">
-          <button class="btn-warn" id="cancel" hidden>Cancel</button>
-          <button class="btn-danger" id="delete" hidden>Delete</button>
+          <button class="btn-warn" id="cancel" data-perm="run_write" hidden>Cancel</button>
+          <button class="btn-danger" id="delete" data-perm="run_write" hidden>Delete</button>
         </div>
       </div>
       <div id="detail-head"></div>
@@ -150,11 +150,11 @@ export async function renderDetail(container, { id }) {
             <option value="contract">contract</option>
           </select>
           <button class="btn-ghost" id="dlq-inspect">Inspect</button>
-          <button class="btn-warn" id="dlq-discard">Discard</button>
-          <label class="dlq-check"><input type="checkbox" id="dlq-delete" /> delete (no archive)</label>
+          <button class="btn-warn" id="dlq-discard" data-perm="dlq_manage">Discard</button>
+          <label class="dlq-check" data-perm="dlq_manage"><input type="checkbox" id="dlq-delete" /> delete (no archive)</label>
         </div>
         <div id="dlq-result"></div>
-        <details class="dlq-replay">
+        <details class="dlq-replay" data-perm="dlq_manage">
           <summary>Replay through a config</summary>
           <textarea id="dlq-config" rows="6" placeholder="paste the pipeline config (YAML) whose sink/transforms/quality/contract to replay through"></textarea>
           <div class="dlq-row">

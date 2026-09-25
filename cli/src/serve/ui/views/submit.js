@@ -2,6 +2,7 @@ import { api, toast } from "../api.js";
 import { renderSchemaForm } from "../schema-form.js";
 import { escapeHtml } from "../utils.js";
 import { navigate } from "../router.js";
+import { can } from "../access.js";
 
 // Optional blocks, grouped the way people think about them. Blocks this build
 // did not compile (the server omits them from /v1/schemas) are skipped.
@@ -28,6 +29,7 @@ export async function renderSubmit(container) {
           <button id="mode-editor" class="btn-ghost">Editor</button>
         </div>
       </div>
+      ${can("run_write") ? "" : `<div class="tpl-notice">Your role is read-only: you can build and inspect a config here, but submitting a run needs an operator or admin token.</div>`}
       <div id="guided" class="submit-mode"></div>
       <div id="editor" class="submit-mode" hidden>
         <textarea id="cfg" class="code" spellcheck="false" placeholder="version: 1
@@ -45,8 +47,8 @@ pipeline:
         <label>idempotency key <input id="o-idem" /></label>
       </fieldset>
       <div class="submit-actions">
-        <button id="btn-check" class="btn-ghost">Check (doctor)</button>
-        <button id="btn-run" class="btn-primary">Run</button>
+        <button id="btn-check" class="btn-ghost" data-perm="doctor">Check (doctor)</button>
+        <button id="btn-run" class="btn-primary" data-perm="run_write">Run</button>
       </div>
       <pre id="submit-out" class="submit-out" hidden></pre>
     </div>`;

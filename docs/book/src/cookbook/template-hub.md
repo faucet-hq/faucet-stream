@@ -273,6 +273,31 @@ falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
 sent when set — needed for a private catalog, and it lifts the anonymous API
 rate limit.
 
+### A private source with the public sinks
+
+Keep internal source templates in your own repository and still use the
+maintained sink templates, without copying them:
+
+```bash
+faucet run --source acme/netsuite --source-hub github:acme/private-hub \
+           --sink faucet-hq/postgres --param …
+# The sink resolves in the default public hub; only the source is private.
+```
+
+Each side takes its own hub (`--source-hub`, `--sink-hub`, `--overlay-hub`), or
+repeat `--hub` to search several hubs in order: a bare id resolves in the first
+hub that has it, and an id found nowhere names every hub searched. One locator
+can also name its hub inline, `github:acme/private-hub:acme/netsuite`. When the
+two repositories belong to different owners, give each its own token with
+`FAUCET_GITHUB_TOKEN_<OWNER>` (for `acme-corp/…`, `FAUCET_GITHUB_TOKEN_ACME_CORP`);
+it takes precedence over the global token for that owner's repositories.
+`faucet hub compose` writes a header recording where each side came from:
+
+```yaml
+# source: acme/netsuite from github:acme/private-hub@main
+# sink: faucet-hq/postgres from github:faucet-hq/template-hub@main
+```
+
 ### Namespaces: `owner/name`
 
 A hundred teams will want their own NetSuite template, so a template's hub id

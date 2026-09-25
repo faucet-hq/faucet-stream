@@ -158,6 +158,43 @@ async fn ui_is_public_but_api_is_gated() {
         .await
         .unwrap();
     assert_eq!(r.status(), 401);
+
+    // `--auth-token` is one implicit admin.
+    let me: serde_json::Value = client
+        .get(format!("{base}/v1/whoami"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (me["principal"].as_str(), me["role"].as_str()),
+        (Some("token"), Some("admin"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn whoami_without_auth_is_an_anonymous_admin() {
+    let port = free_port();
+    let (base, client) = boot(args(port)).await;
+    let me: serde_json::Value = client
+        .get(format!("{base}/v1/whoami"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["principal"], "anonymous");
+    assert_eq!(me["role"], "admin");
+    assert!(
+        me["permissions"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("template_admin"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

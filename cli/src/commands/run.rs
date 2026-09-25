@@ -88,14 +88,22 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
     };
 
     let cfg = if let Some((source, sink)) = hub_pair {
-        let hub_dir = crate::hub::resolve_hub(args.hub.as_deref()).await?;
-        let composition = crate::hub::compose_locators_overlaid(
-            &source,
-            &sink,
-            args.overlay.as_deref(),
-            &hub_dir,
+        let sides = crate::hub::resolve_sides(
+            &args.hub,
+            args.source_hub.as_deref(),
+            args.sink_hub.as_deref(),
+            args.overlay_hub.as_deref(),
         )
         .await?;
+        let composition =
+            crate::hub::compose_across(&source, &sink, args.overlay.as_deref(), &sides).await?;
+        tracing::info!(
+            source = %composition.source,
+            source_hub = composition.source_hub.as_deref().unwrap_or("(file)"),
+            sink = %composition.sink,
+            sink_hub = composition.sink_hub.as_deref().unwrap_or("(file)"),
+            "hub: composed pairing"
+        );
         for w in &composition.warnings {
             eprintln!("warning: {w}");
         }

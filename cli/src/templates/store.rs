@@ -411,11 +411,13 @@ fn unresolved_channel(id: &str, channel: VersionChannel, state: &TemplateState) 
                 None => "nothing has been launched yet".to_string(),
             }
         )),
-        // `newest` is unreachable here (a template with versions always has one),
-        // so this arm only guards a future channel gaining derived status.
-        VersionChannel::Newest => {
-            CliError::Config(format!("template '{id}' has no versions registered"))
-        }
+        // With versions registered, `newest` is unset only when every one of them
+        // is deprecated (#697).
+        VersionChannel::Newest => CliError::Config(format!(
+            "every version of template '{id}' is deprecated, so `newest` has nothing to \
+             resolve to. Revive one (`faucet template deprecate {id} --version <n> --undo`) \
+             or pin a version number"
+        )),
         assigned => CliError::Config(format!(
             "template '{id}' has no `{assigned}` version. Channels currently set: {}. Promote one \
              with `faucet template promote {id} --tag {assigned} --version <n>`",
@@ -534,6 +536,13 @@ pub async fn launch(
              `faucet template deprecate {id} --undo`, then launch"
         )));
     }
+    if before.version_deprecation(version).is_some() {
+        return Err(CliError::Config(format!(
+            "v{version} of template '{id}' is deprecated, so it cannot be launched. Revive it \
+             first (`faucet template deprecate {id} --version {version} --undo`), or launch \
+             another version"
+        )));
+    }
     let seq = store
         .template_launch(id, version, launched_by)
         .await
@@ -593,6 +602,49 @@ pub async fn set_deprecated(
         .await
         .map_err(|e| CliError::Internal(format!("template deprecation write: {e}")))?;
     Ok(TemplateStatus::derive(state.stable.is_some(), deprecated))
+}
+
+/// Retire (`true`) or revive (`false`) one version (#697). A retired version
+/// keeps running when pinned, or when `stable` or a channel points at it, but
+/// `newest` skips it, `launch` refuses it, and every trigger warns.
+pub async fn set_version_deprecated(
+    store: &TemplateStore,
+    id: &str,
+    version: u32,
+    reason: Option<String>,
+    by: Option<&str>,
+    deprecated: bool,
+) -> CliResult<()> {
+    require_version(store, id, version).await?;
+    let record = deprecated.then(|| DeprecationRecord {
+        deprecated_at: chrono::Utc::now(),
+        deprecated_by: by.map(str::to_string),
+        reason,
+    });
+    store
+        .template_set_version_deprecation(id, version, record.as_ref())
+        .await
+        .map_err(|e| CliError::Internal(format!("template version deprecation write: {e}")))
+}
+
+/// The warning a run of `version` carries, if the template or that version is
+/// deprecated. Template-level first: it is the broader statement.
+pub fn deprecation_warning(state: &TemplateState, version: u32) -> Option<String> {
+    if state.status == TemplateStatus::Deprecated {
+        return Some(
+            state
+                .deprecation
+                .as_ref()
+                .and_then(|d| d.reason.clone())
+                .unwrap_or_else(|| "this template is deprecated".to_string()),
+        );
+    }
+    state
+        .version_deprecation(version)
+        .map(|d| match &d.record.reason {
+            Some(r) => format!("v{version} is deprecated: {r}"),
+            None => format!("v{version} is deprecated"),
+        })
 }
 
 /// Where the materialized config is going — which decides whether load-time

@@ -16,3 +16,4 @@ pub mod runs;
 pub mod schemas;
 #[cfg(feature = "templates")]
 pub mod templates;
+pub mod whoami;

@@ -869,6 +869,77 @@ mod templates {
     }
 
     #[tokio::test]
+    async fn a_version_deprecation_round_trips_skips_newest_and_cascades_on_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-version-deprecate.db").await;
+        for _ in 0..3 {
+            s.template_register(&draft("orders", None)).await.unwrap();
+        }
+        s.template_launch("orders", 2, None).await.unwrap();
+        let marker = DeprecationRecord {
+            deprecated_at: Utc::now(),
+            deprecated_by: Some("admin".into()),
+            reason: Some("bad build".into()),
+        };
+        s.template_set_version_deprecation("orders", 3, Some(&marker))
+            .await
+            .unwrap();
+        s.template_set_version_deprecation("orders", 2, Some(&marker))
+            .await
+            .unwrap();
+
+        let st = s.template_state("orders").await.unwrap();
+        assert_eq!(
+            st.deprecated_versions
+                .iter()
+                .map(|d| d.version)
+                .collect::<Vec<_>>(),
+            vec![3, 2],
+            "newest first"
+        );
+        assert_eq!(
+            st.deprecated_versions[0].record.reason.as_deref(),
+            Some("bad build")
+        );
+        assert_eq!(st.newest, Some(1), "`newest` skips retired versions");
+        assert_eq!(st.stable, Some(2), "a retired live version keeps serving");
+        assert_eq!(
+            st.status,
+            TemplateStatus::Launched,
+            "the template itself is not retired"
+        );
+
+        s.template_set_version_deprecation("orders", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.template_version_deprecations("orders")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        s.template_delete("orders", Some(3)).await.unwrap();
+        assert!(
+            s.template_version_deprecations("orders")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        s.template_set_version_deprecation("orders", 1, Some(&marker))
+            .await
+            .unwrap();
+        s.template_delete("orders", None).await.unwrap();
+        assert!(
+            s.template_version_deprecations("orders")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn deleting_a_version_cascades_to_channels_and_launch_entries() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir, "tpl-cascade.db").await;

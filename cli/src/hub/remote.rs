@@ -72,6 +72,36 @@ fn net_err(what: &str, e: impl std::fmt::Display) -> CliError {
     CliError::Config(format!("hub github: {what}: {e}"))
 }
 
+/// The environment variable holding a token for one owner's repos (#696):
+/// `FAUCET_GITHUB_TOKEN_<OWNER>`, the owner upper-cased with `-` and `.` as `_`.
+pub fn owner_token_var(repo: &str) -> String {
+    let owner = repo.split('/').next().unwrap_or(repo);
+    let owner: String = owner
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("FAUCET_GITHUB_TOKEN_{owner}")
+}
+
+/// The token for `repo`: its owner's own variable first, so a private hub in
+/// one org and the public hub can be read in one invocation, then the global
+/// `FAUCET_GITHUB_TOKEN` / `GITHUB_TOKEN`.
+pub fn github_token(repo: &str) -> Option<String> {
+    [
+        owner_token_var(repo),
+        "FAUCET_GITHUB_TOKEN".into(),
+        "GITHUB_TOKEN".into(),
+    ]
+    .into_iter()
+    .find_map(|var| std::env::var(var).ok().filter(|t| !t.trim().is_empty()))
+}
+
 impl GithubHub {
     /// `api_base` is `https://api.github.com` in production and a mock server
     /// in tests. A `GITHUB_TOKEN` in the environment is used when present, so a
@@ -86,10 +116,7 @@ impl GithubHub {
             .user_agent(concat!("faucet-stream/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| net_err("building HTTP client", e))?;
-        let token = std::env::var("FAUCET_GITHUB_TOKEN")
-            .or_else(|_| std::env::var("GITHUB_TOKEN"))
-            .ok()
-            .filter(|t| !t.trim().is_empty());
+        let token = github_token(repo);
         Ok(Self {
             client,
             api_base: api_base.trim_end_matches('/').to_string(),
@@ -692,6 +719,30 @@ mod tests {
                 .to_string()
                 .contains("unexpected commit id")
         );
+    }
+
+    #[test]
+    fn an_owners_own_token_wins_over_the_global_one() {
+        assert_eq!(
+            owner_token_var("acme-corp/hub"),
+            "FAUCET_GITHUB_TOKEN_ACME_CORP"
+        );
+        assert_eq!(owner_token_var("My.Org/x"), "FAUCET_GITHUB_TOKEN_MY_ORG");
+        // A unique owner, so no other test's environment can interfere.
+        let var = owner_token_var("zz-owner-696/hub");
+        // SAFETY: the variable name is unique to this test.
+        unsafe { std::env::set_var(&var, "owner-tok") };
+        assert_eq!(
+            github_token("zz-owner-696/hub").as_deref(),
+            Some("owner-tok")
+        );
+        unsafe { std::env::set_var(&var, "  ") };
+        assert_ne!(
+            github_token("zz-owner-696/hub").as_deref(),
+            Some("  "),
+            "blank is unset"
+        );
+        unsafe { std::env::remove_var(&var) };
     }
 
     #[tokio::test]

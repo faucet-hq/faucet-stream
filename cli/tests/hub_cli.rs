@@ -544,3 +544,142 @@ fn a_deployment_overlay_reaches_the_composed_run() {
         );
     });
 }
+
+/// #696: a private source hub + a public sink hub, in one composition.
+#[tokio::test]
+async fn a_source_and_a_sink_compose_across_two_hubs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (private, _out) = fixture(dir.path());
+    // Split the fixture: the sink templates move to their own "public" hub.
+    let public = dir.path().join("public-hub");
+    std::fs::create_dir_all(&public).unwrap();
+    std::fs::rename(
+        Path::new(&private).join("sink-templates"),
+        public.join("sink-templates"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(Path::new(&private).join("sink-templates")).unwrap();
+    std::fs::create_dir_all(public.join("source-templates")).unwrap();
+    let public = public.to_string_lossy().into_owned();
+    let composed = dir.path().join("composed.yaml");
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+
+    // Per-side hub flags.
+    run(&[
+        "hub",
+        "compose",
+        "--source",
+        "shop",
+        "--source-hub",
+        &private,
+        "--sink",
+        "files",
+        "--hub",
+        &public,
+        "--out",
+        composed.to_str().unwrap(),
+    ])
+    .await
+    .expect("compose across hubs");
+    let text = read(&composed);
+    assert!(
+        text.contains(&format!("# source: shop from {private}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("# sink: files from {public}")),
+        "{text}"
+    );
+
+    // An ordered list: each side resolves in the first hub that has it.
+    let both = format!("{private},{public}");
+    run(&[
+        "hub", "check", "--source", "shop", "--sink", "files", "--hub", &both,
+    ])
+    .await
+    .expect("an ordered hub list");
+    run(&[
+        "validate",
+        "--source",
+        "shop",
+        "--sink",
+        "files",
+        "--hub",
+        &private,
+        "--hub",
+        &public,
+        "--no-env-file",
+        "--no-secrets",
+    ])
+    .await
+    .expect("validate across hubs");
+
+    // A hub-qualified locator reaches a hub that is not in the list.
+    run(&[
+        "hub",
+        "compose",
+        "--source",
+        "shop",
+        "--hub",
+        &private,
+        "--sink",
+        &format!("{public}:files"),
+        "--json",
+    ])
+    .await
+    .expect("a qualified sink locator");
+
+    // An id in both hubs resolves to the first one listed.
+    std::fs::write(
+        Path::new(&private).join("sink-templates/files.yaml"),
+        "kind: sink-template\nname: files\ndescription: Private files\nsink:\n  type: jsonl\n  config: {append: false}\nper_stream:\n  path: \"./private-copy/${stream}.jsonl\"\nwrite_mode_aliases:\n  overwrite: append\n",
+    )
+    .unwrap();
+    run(&[
+        "hub",
+        "compose",
+        "--source",
+        "shop",
+        "--sink",
+        "files",
+        "--hub",
+        &both,
+        "--out",
+        composed.to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    assert!(
+        read(&composed).contains("private-copy"),
+        "the first hub wins"
+    );
+
+    // Unknown everywhere: the error names every hub searched.
+    let err = run(&[
+        "hub", "check", "--source", "shop", "--sink", "nope", "--hub", &both,
+    ])
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("in any of the 2 hubs searched"), "{err}");
+    assert!(err.contains(&private) && err.contains(&public), "{err}");
+}
+
+/// #696: an owner's own token wins over the global one, so a private hub and
+/// the public hub can be read in one invocation.
+#[cfg(feature = "hub-remote")]
+#[test]
+fn a_per_owner_github_token_takes_precedence() {
+    use faucet_cli::hub::remote::{github_token, owner_token_var};
+    let var = owner_token_var("zz-hub-cli-696/private-hub");
+    assert_eq!(var, "FAUCET_GITHUB_TOKEN_ZZ_HUB_CLI_696");
+    // SAFETY: the variable name is unique to this test.
+    unsafe { std::env::set_var(&var, "owner-token") };
+    assert_eq!(
+        github_token("zz-hub-cli-696/private-hub").as_deref(),
+        Some("owner-token")
+    );
+    let loc = faucet_cli::hub::HubLocation::parse("github:zz-hub-cli-696/private-hub").unwrap();
+    assert!(faucet_cli::hub::remote::GithubHub::new(&loc, "http://127.0.0.1:1").is_ok());
+    unsafe { std::env::remove_var(&var) };
+}

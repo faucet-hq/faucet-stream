@@ -2,7 +2,9 @@
 
 use crate::error::{CliError, CliResult};
 use crate::serve::config::ServeConfig;
-use crate::serve::handlers::{audit, backfill, dlq, doctor, health, logs, reload, runs, schemas};
+use crate::serve::handlers::{
+    audit, backfill, dlq, doctor, health, logs, reload, runs, schemas, whoami,
+};
 use crate::serve::history::RunHistory;
 use crate::serve::state::ServerState;
 use crate::serve::{auth, metrics};
@@ -46,7 +48,8 @@ pub fn build_router(
         .route("/v1/dlq/replay", post(dlq::replay))
         .route("/v1/dlq/discard", post(dlq::discard))
         .route("/v1/audit", get(audit::list_audit))
-        .route("/v1/reload", post(reload::reload));
+        .route("/v1/reload", post(reload::reload))
+        .route("/v1/whoami", get(whoami::whoami));
     #[cfg(feature = "triggers")]
     {
         api = api.route(
@@ -106,6 +109,10 @@ pub fn build_router(
             .route(
                 "/v1/templates/{id}/deprecate",
                 post(templates::deprecate_template),
+            )
+            .route(
+                "/v1/templates/{id}/versions/{version}/deprecate",
+                post(templates::deprecate_version),
             );
         // Template hosting + sync (RFC 0006 / #589). Static `/sync` is matched
         // ahead of the `{id}` parameter by the router, so a template can never

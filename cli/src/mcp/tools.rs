@@ -116,7 +116,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                 "required": ["id"]
             }),
         });
-        if ctx.allow_mutations {
+        if ctx.allow_mutations && ctx.allow_template_admin {
             defs.push(ToolDef {
                 name: "register_template",
                 description: "Register a template document as a new version: `kind: source-template` (a system + its streams), `kind: sink-template` (a destination), or `kind: pipeline` (a complete config). Params are declared with `params:`. MUTATING — gated behind --allow-mutations.",
@@ -166,6 +166,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                     "required": ["id"]
                 }),
             });
+        }
+        if ctx.allow_mutations {
             defs.push(ToolDef {
                 name: "run_template",
                 description: "Run a registered template with the given params: a source-template composed with `sink` (a registered sink-template), or a complete `pipeline` template. MUTATING — gated behind --allow-mutations. Pass dry_run:true to materialize + validate only.",
@@ -229,6 +231,8 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         "register_template" => {
             if !ctx.allow_mutations {
                 Err(MUTATION_GATE.to_string())
+            } else if !ctx.allow_template_admin {
+                Err(TEMPLATE_ADMIN_GATE.to_string())
             } else {
                 register_template(ctx, args).await
             }
@@ -237,6 +241,8 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         "launch_template" => {
             if !ctx.allow_mutations {
                 Err(MUTATION_GATE.to_string())
+            } else if !ctx.allow_template_admin {
+                Err(TEMPLATE_ADMIN_GATE.to_string())
             } else {
                 launch_template(ctx, args).await
             }
@@ -245,6 +251,8 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         "rollback_template" => {
             if !ctx.allow_mutations {
                 Err(MUTATION_GATE.to_string())
+            } else if !ctx.allow_template_admin {
+                Err(TEMPLATE_ADMIN_GATE.to_string())
             } else {
                 rollback_template(ctx, args).await
             }
@@ -253,6 +261,8 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         "deprecate_template" => {
             if !ctx.allow_mutations {
                 Err(MUTATION_GATE.to_string())
+            } else if !ctx.allow_template_admin {
+                Err(TEMPLATE_ADMIN_GATE.to_string())
             } else {
                 deprecate_template(ctx, args).await
             }
@@ -511,6 +521,10 @@ fn pretty(v: &Value) -> String {
 const MUTATION_GATE: &str =
     "this tool is disabled; start the MCP server with --allow-mutations to enable mutating tools";
 
+/// Refusal text for the template-lifecycle tools when the caller is not an admin.
+const TEMPLATE_ADMIN_GATE: &str = "managing templates (register, launch, roll back, deprecate) \
+     is admin-only; an operator can run registered templates with run_template";
+
 /// Refusal text for the config-executing tools when the caller lacks the scope.
 /// Phrased for the HTTP transport, which is the only place the gate closes.
 const CONFIG_EXEC_GATE: &str = "this tool acts on a config you supply — it resolves \
@@ -691,6 +705,12 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
     let store = template_store(ctx)?;
     let id = str_arg(args, "id")?;
     let version = resolved_version_arg(store, id, args).await?;
+    let deprecated = crate::templates::deprecation_warning(
+        &crate::templates::template_state(store, id)
+            .await
+            .map_err(|e| e.to_string())?,
+        version,
+    );
     let dry_run = args
         .get("dry_run")
         .and_then(Value::as_bool)
@@ -762,6 +782,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             "params": materialized.params_redacted,
             "rows": rows,
             "dry_run": true,
+            "deprecated": deprecated,
         })));
     }
 
@@ -784,6 +805,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         "ok": summary.invocations.len() - failed,
         "failed": failed,
         "records_written": total,
+        "deprecated": deprecated,
     });
     if failed > 0 {
         return Err(format!(
@@ -1249,6 +1271,33 @@ mod tests {
                         .as_str()
                         .unwrap()
                         .contains("--allow-mutations")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_operator_runs_templates_but_the_lifecycle_tools_are_admin_only() {
+            let operator = tpl_ctx(true).with_template_admin(false);
+            let names: Vec<&str> = tool_defs(&operator).iter().map(|t| t.name).collect();
+            assert!(names.contains(&"run_template"), "{names:?}");
+            for t in [
+                "register_template",
+                "launch_template",
+                "rollback_template",
+                "deprecate_template",
+            ] {
+                assert!(
+                    !names.contains(&t),
+                    "{t} must be hidden from an operator: {names:?}"
+                );
+                let out = call_tool(&operator, t, &json!({"id":"x","config":"y"})).await;
+                assert_eq!(out["isError"], true, "{t}");
+                assert!(
+                    out["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("admin-only"),
+                    "{t}"
                 );
             }
         }

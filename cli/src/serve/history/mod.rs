@@ -982,6 +982,29 @@ pub trait RunHistory: Send + Sync {
         Ok(None)
     }
 
+    /// Set (`Some`) or clear (`None`) one version's deprecation marker (#697).
+    /// Default: unsupported.
+    async fn template_set_version_deprecation(
+        &self,
+        id: &str,
+        version: u32,
+        record: Option<&templates::DeprecationRecord>,
+    ) -> Result<(), HistoryError> {
+        let _ = (id, version, record);
+        Err(HistoryError::Backend(
+            "this run-history backend does not support deprecating a template version".into(),
+        ))
+    }
+
+    /// Every individually deprecated version of the template. Default: none.
+    async fn template_version_deprecations(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::VersionDeprecation>, HistoryError> {
+        let _ = id;
+        Ok(Vec::new())
+    }
+
     /// The template's full release state: versions, launch-derived `stable` /
     /// `previous` / `newest`, channel pointers, and the derived status.
     ///
@@ -994,6 +1017,7 @@ pub trait RunHistory: Send + Sync {
             &self.template_launches(id).await?,
             self.template_tags(id).await?,
             self.template_deprecation(id).await?,
+            self.template_version_deprecations(id).await?,
         ))
     }
 

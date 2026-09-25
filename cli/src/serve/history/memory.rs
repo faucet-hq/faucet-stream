@@ -63,6 +63,9 @@ pub struct MemoryHistory {
     template_launches: Mutex<std::collections::HashMap<String, Vec<templates::LaunchRecord>>>,
     /// Deprecation markers — the only *stored* part of the lifecycle status.
     template_deprecations: Mutex<std::collections::HashMap<String, templates::DeprecationRecord>>,
+    /// Per-version deprecation markers (#697): `{id: {version: record}}`.
+    template_version_deprecations:
+        Mutex<std::collections::HashMap<String, BTreeMap<u32, templates::DeprecationRecord>>>,
     /// Persistent run logs (#529): run_id → lines (append order == seq order).
     run_logs: Mutex<std::collections::HashMap<String, Vec<RunLogLine>>>,
     /// Local sink output ledger (#587): output id → row. The provenance the
@@ -84,6 +87,7 @@ impl MemoryHistory {
             template_tags: Mutex::new(std::collections::HashMap::new()),
             template_launches: Mutex::new(std::collections::HashMap::new()),
             template_deprecations: Mutex::new(std::collections::HashMap::new()),
+            template_version_deprecations: Mutex::new(std::collections::HashMap::new()),
             run_logs: Mutex::new(std::collections::HashMap::new()),
             local_outputs: Mutex::new(BTreeMap::new()),
             idem_retention,
@@ -659,10 +663,14 @@ impl RunHistory for MemoryHistory {
             .template_launches
             .lock()
             .map_err(|_| HistoryError::Backend("template launch lock poisoned".into()))?;
+        let mut retired = self.template_version_deprecations.lock().map_err(|_| {
+            HistoryError::Backend("template version deprecation lock poisoned".into())
+        })?;
         match version {
             None => {
                 tags.remove(id);
                 launches.remove(id);
+                retired.remove(id);
                 self.template_deprecations
                     .lock()
                     .map_err(|_| {
@@ -676,6 +684,12 @@ impl RunHistory for MemoryHistory {
                     return Ok(0);
                 };
                 let removed = versions.remove(&v).is_some() as usize;
+                if let Some(r) = retired.get_mut(id) {
+                    r.remove(&v);
+                    if r.is_empty() {
+                        retired.remove(id);
+                    }
+                }
                 if versions.is_empty() {
                     store.remove(id);
                     tags.remove(id);
@@ -799,6 +813,55 @@ impl RunHistory for MemoryHistory {
             }
         }
         Ok(())
+    }
+
+    async fn template_set_version_deprecation(
+        &self,
+        id: &str,
+        version: u32,
+        record: Option<&templates::DeprecationRecord>,
+    ) -> Result<(), HistoryError> {
+        let mut retired = self.template_version_deprecations.lock().map_err(|_| {
+            HistoryError::Backend("template version deprecation lock poisoned".into())
+        })?;
+        match record {
+            Some(r) => {
+                retired
+                    .entry(id.to_string())
+                    .or_default()
+                    .insert(version, r.clone());
+            }
+            None => {
+                if let Some(m) = retired.get_mut(id) {
+                    m.remove(&version);
+                    if m.is_empty() {
+                        retired.remove(id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn template_version_deprecations(
+        &self,
+        id: &str,
+    ) -> Result<Vec<templates::VersionDeprecation>, HistoryError> {
+        let retired = self.template_version_deprecations.lock().map_err(|_| {
+            HistoryError::Backend("template version deprecation lock poisoned".into())
+        })?;
+        Ok(retired
+            .get(id)
+            .map(|m| {
+                m.iter()
+                    .rev()
+                    .map(|(v, r)| templates::VersionDeprecation {
+                        version: *v,
+                        record: r.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn template_deprecation(
@@ -1297,5 +1360,70 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(h.get("old").await.unwrap().is_none());
         assert!(h.get("live").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_version_deprecation_round_trips_skips_newest_and_cascades() {
+        use crate::serve::history::templates::{DeprecationRecord, TemplateDraft, TemplateId};
+        let h = MemoryHistory::new(std::time::Duration::from_secs(3600));
+        for _ in 0..3 {
+            h.template_register(&TemplateDraft {
+                id: TemplateId::parse("orders").unwrap(),
+                name: Some("orders".into()),
+                description: None,
+                body: "version: 1\nname: orders\n".into(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                params: Default::default(),
+                created_by: None,
+                kind: crate::hub::TemplateKind::Pipeline,
+            })
+            .await
+            .unwrap();
+        }
+        let marker = DeprecationRecord {
+            deprecated_at: Utc::now(),
+            deprecated_by: None,
+            reason: Some("bad build".into()),
+        };
+        h.template_set_version_deprecation("orders", 3, Some(&marker))
+            .await
+            .unwrap();
+        h.template_set_version_deprecation("orders", 1, Some(&marker))
+            .await
+            .unwrap();
+        let st = h.template_state("orders").await.unwrap();
+        assert_eq!(st.newest, Some(2));
+        assert_eq!(
+            st.deprecated_versions
+                .iter()
+                .map(|d| d.version)
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert!(st.version_deprecation(3).is_some() && st.version_deprecation(2).is_none());
+
+        h.template_set_version_deprecation("orders", 1, None)
+            .await
+            .unwrap();
+        h.template_delete("orders", Some(3)).await.unwrap();
+        assert!(
+            h.template_version_deprecations("orders")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        h.template_set_version_deprecation("orders", 2, Some(&marker))
+            .await
+            .unwrap();
+        h.template_set_version_deprecation("nope", 1, None)
+            .await
+            .unwrap();
+        h.template_delete("orders", None).await.unwrap();
+        assert!(
+            h.template_version_deprecations("orders")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

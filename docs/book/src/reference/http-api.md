@@ -28,8 +28,8 @@ built-in roles form a ladder:
 | Role | Permitted |
 |------|-----------|
 | `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/templates*`, `GET /v1/local-outputs` |
-| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, `POST /v1/doctor`, firing triggers, registering / deleting / triggering pipeline templates, and deleting local sink outputs |
-| `admin` | everything, including `GET /v1/audit` |
+| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, `POST /v1/doctor`, firing triggers, and deleting local sink outputs |
+| `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish) and `GET /v1/audit` |
 
 ```yaml
 # auth.yaml
@@ -82,9 +82,12 @@ someone does.
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
 | `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
-| `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | ✓ | ✓ |
-| `POST /v1/templates/{id}/{runs,tags,launch,rollback,deprecate}` | — | ✓ | ✓ |
-| `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | ✓ | ✓ |
+| `POST /v1/templates/{id}/runs` (trigger) | — | ✓ | ✓ |
+| `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | — | ✓ |
+| `POST /v1/templates/{id}/{tags,launch,rollback,deprecate}` | — | — | ✓ |
+| `POST /v1/templates/{id}/versions/{version}/deprecate` | — | — | ✓ |
+| `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | — | ✓ |
+| `GET /v1/whoami` | ✓ | ✓ | ✓ |
 | `POST /mcp` | ✓ | ✓ | ✓ |
 | `GET /v1/audit` | — | — | ✓ |
 | `POST /v1/reload` | — | — | ✓ |
@@ -105,9 +108,23 @@ A request whose role lacks the route's required permission gets `403 forbidden`
 `--auth-token` / `--no-auth`. Every token is registered for log redaction at
 startup.
 
+**Managing templates is admin-only.** Registering, launching, rolling back,
+deprecating (a template or one version), assigning channels, deleting, syncing
+and publishing templates need `admin`; `operator` triggers registered templates
+(`POST /v1/templates/{id}/runs`) but no longer changes them. **Migration:** an
+`--auth-config` file whose `operator` principals managed templates needs those
+principals promoted to `role: admin`. The MCP `register_template` /
+`launch_template` / `rollback_template` / `deprecate_template` tools follow the
+same rule.
+
+**Who am I.** `GET /v1/whoami` returns the caller's `principal`, `role` and
+`permissions` to any authenticated caller (`--no-auth` and `--auth-token`
+report an admin). The web console uses it to hide controls the role cannot use;
+each route still enforces its own permission.
+
 **Audit log.** Every mutating action (`run.submit` / `run.cancel` / `run.delete` /
 `template.register` / `template.delete` / `template.run` / `template.promote` /
-`local_output.delete` / `local_output.cleanup`)
+`template.version_deprecate` / `local_output.delete` / `local_output.cleanup`)
 and every denied attempt is recorded with principal, role, action, run id,
 config fingerprint (submit), source IP, timestamp, and result. Admins read it via
 `GET /v1/audit`. Records persist in the run-history backend (`faucet_serve_audit`
@@ -133,17 +150,19 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `GET` | `/v1/local-outputs` | `200` | List tracked local sink output files with age + state (`dataset_id`, `pipeline`, `include_expired`, `limit`) — viewer / `LocalOutputRead` |
 | `DELETE` | `/v1/local-outputs/{id}` | `200` | Delete one recorded output file now (operator / `LocalOutputManage`); `404` for an unknown id |
 | `POST` | `/v1/local-outputs/cleanup` | `200` | Bulk clean: `older_than_days` \| `expired` \| `dataset_id` \| `run_id` \| `all`, plus `dry_run` (operator / `LocalOutputManage`) |
-| `POST` | `/v1/templates` | `201` | Register a pipeline template (operator / `TemplateWrite`) — requires the `templates` build feature |
+| `POST` | `/v1/templates` | `201` | Register a pipeline template (admin / `TemplateAdmin`) — requires the `templates` build feature |
 | `GET` | `/v1/templates` | `200` | List templates — newest version each, plus release state (viewer / `TemplateRead`) |
 | `GET` | `/v1/templates/{id}` | `200` | One template version + its whole release state. `?version=stable` (default), another channel, or `?version=N` |
-| `DELETE` | `/v1/templates/{id}` | `204` | Delete one version (`?version=<channel\|N>`) or all (operator / `TemplateWrite`) |
+| `DELETE` | `/v1/templates/{id}` | `204` | Delete one version (`?version=<channel\|N>`) or all (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/runs` | `202` | Trigger a run from a template with `params` / `env` (operator / `RunWrite`) |
-| `POST` | `/v1/templates/{id}/tags` | `200` | Point an assignable channel (`prod`, `dev`, …) at a version (operator / `TemplateWrite`) |
-| `POST` | `/v1/templates/{id}/launch` | `200` | Make a version live — moves `stable` and so unpinned callers (operator / `TemplateWrite`) |
-| `POST` | `/v1/templates/{id}/rollback` | `200` | Re-launch `previous` (operator / `TemplateWrite`) |
-| `POST` | `/v1/templates/{id}/deprecate` | `200` | Retire a template, or revive it with `{"undo":true}` (operator / `TemplateWrite`) |
-| `POST` | `/v1/templates/sync` | `200` | Pull the `--templates-sync` origins into the registry — `{origin?, dry_run?}`; one report per origin, appends only (operator / `TemplateWrite`; requires the `templates-sync` feature; `422` when the server has no origins) |
-| `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (operator / `TemplateWrite`; `templates-sync`) |
+| `POST` | `/v1/templates/{id}/tags` | `200` | Point an assignable channel (`prod`, `dev`, …) at a version (admin / `TemplateAdmin`) |
+| `POST` | `/v1/templates/{id}/launch` | `200` | Make a version live — moves `stable` and so unpinned callers (admin / `TemplateAdmin`) |
+| `POST` | `/v1/templates/{id}/rollback` | `200` | Re-launch `previous` (admin / `TemplateAdmin`) |
+| `POST` | `/v1/templates/{id}/deprecate` | `200` | Retire a template, or revive it with `{"undo":true}` (admin / `TemplateAdmin`) |
+| `POST` | `/v1/templates/{id}/versions/{version}/deprecate` | `200` | Retire one version (`{"reason":"…"}`), or revive it with `{"undo":true}`. It still runs when pinned, with a `deprecated` warning; `newest` skips it and `launch` refuses it (admin / `TemplateAdmin`) |
+| `POST` | `/v1/templates/sync` | `200` | Pull the `--templates-sync` origins into the registry — `{origin?, dry_run?}`; one report per origin, appends only (admin / `TemplateAdmin`; requires the `templates-sync` feature; `422` when the server has no origins) |
+| `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (admin / `TemplateAdmin`; `templates-sync`) |
+| `GET` | `/v1/whoami` | `200` | The caller's `principal`, `role` and `permissions` (every role / `Identity`) |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |

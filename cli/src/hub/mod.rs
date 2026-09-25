@@ -192,7 +192,176 @@ pub fn hub_location(flag: Option<&str>) -> CliResult<HubLocation> {
 /// Resolve the hub to a local directory, fetching (or reusing the cached
 /// snapshot of) a remote one.
 pub async fn resolve_hub(flag: Option<&str>) -> CliResult<PathBuf> {
-    match hub_location(flag)? {
+    resolve_location(hub_location(flag)?).await
+}
+
+/// One hub in an ordered search list (#696): where it is, and its local
+/// snapshot directory.
+#[derive(Debug, Clone)]
+pub struct ResolvedHub {
+    pub location: HubLocation,
+    pub dir: PathBuf,
+}
+
+/// The hubs to search, in order: each `--hub` value (commas separate several,
+/// so `FAUCET_HUB` can list more than one), else the single default. The same
+/// hub given twice is searched once.
+pub fn hub_locations(flags: &[String]) -> CliResult<Vec<HubLocation>> {
+    let given: Vec<&str> = flags
+        .iter()
+        .flat_map(|f| f.split(','))
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect();
+    if given.is_empty() {
+        return Ok(vec![hub_location(None)?]);
+    }
+    let mut out: Vec<HubLocation> = Vec::new();
+    for g in given {
+        let loc = HubLocation::parse(g)?;
+        if !out.iter().any(|o| o.cache_key() == loc.cache_key()) {
+            out.push(loc);
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve every hub in `flags` to a local snapshot, in order.
+pub async fn resolve_hubs(flags: &[String]) -> CliResult<Vec<ResolvedHub>> {
+    let mut out = Vec::new();
+    for location in hub_locations(flags)? {
+        let dir = resolve_location(location.clone()).await?;
+        out.push(ResolvedHub { location, dir });
+    }
+    Ok(out)
+}
+
+/// The hubs each side of a composition is looked up in (#696).
+#[derive(Debug, Clone)]
+pub struct HubSides {
+    pub source: Vec<ResolvedHub>,
+    pub sink: Vec<ResolvedHub>,
+    pub overlay: Vec<ResolvedHub>,
+}
+
+/// A side's own `--source-hub` / `--sink-hub` / `--overlay-hub` wins;
+/// otherwise it searches the `--hub` list. The shared list is resolved only
+/// when some side needs it, so a run that names both sides' hubs never
+/// touches the default hub.
+pub async fn resolve_sides(
+    hubs: &[String],
+    source_hub: Option<&str>,
+    sink_hub: Option<&str>,
+    overlay_hub: Option<&str>,
+) -> CliResult<HubSides> {
+    let shared = if [source_hub, sink_hub, overlay_hub]
+        .iter()
+        .any(Option::is_none)
+    {
+        resolve_hubs(hubs).await?
+    } else {
+        Vec::new()
+    };
+    async fn side(flag: Option<&str>, shared: &[ResolvedHub]) -> CliResult<Vec<ResolvedHub>> {
+        match flag {
+            Some(f) => resolve_hubs(&[f.to_string()]).await,
+            None => Ok(shared.to_vec()),
+        }
+    }
+    Ok(HubSides {
+        source: side(source_hub, &shared).await?,
+        sink: side(sink_hub, &shared).await?,
+        overlay: side(overlay_hub, &shared).await?,
+    })
+}
+
+/// Split a hub-qualified locator, `<hub>:<id>` (#696): `<hub>` is a GitHub
+/// hub spec (`github:owner/repo[@ref][/path]` or a github.com URL) or an
+/// existing directory. Anything else — a plain id, a file path — is `None`.
+pub fn split_qualified(locator: &str) -> Option<(HubLocation, &str)> {
+    if Path::new(locator).is_file() {
+        return None;
+    }
+    let (hub, id) = locator.rsplit_once(':')?;
+    if id.is_empty() {
+        return None;
+    }
+    let remote = hub.starts_with("github:") || hub.starts_with("https://github.com/");
+    if !remote && !Path::new(hub).is_dir() {
+        return None;
+    }
+    HubLocation::parse(hub).ok().map(|loc| (loc, id))
+}
+
+/// Find `locator` in `hubs`, in order, returning the file and the hub it came
+/// from. A qualified locator goes straight to its own hub; a path is used as
+/// is. When no hub has it, the error names every hub searched.
+pub async fn locate_in(
+    locator: &str,
+    hubs: &[ResolvedHub],
+    subdir: &str,
+) -> CliResult<(PathBuf, Option<String>)> {
+    if let Some((loc, id)) = split_qualified(locator) {
+        let dir = resolve_location(loc.clone()).await?;
+        return Ok((locate(id, &dir, subdir).await?, Some(loc.describe())));
+    }
+    if Path::new(locator).is_file() {
+        return Ok((PathBuf::from(locator), None));
+    }
+    let mut misses = Vec::new();
+    for h in hubs {
+        let found = if subdir == DEPLOYMENT_DIR {
+            resolve_locator(locator, &h.dir, subdir)
+        } else {
+            locate(locator, &h.dir, subdir).await
+        };
+        match found {
+            Ok(p) => return Ok((p, Some(h.location.describe()))),
+            Err(e) => misses.push((h.location.describe(), e.to_string())),
+        }
+    }
+    match misses.len() {
+        0 => Err(CliError::Config(format!(
+            "no hub to look up '{locator}' in"
+        ))),
+        1 => Err(CliError::Config(misses.remove(0).1)),
+        n => Err(CliError::Config(format!(
+            "no hub template '{locator}' in any of the {n} hubs searched:\n{}",
+            misses
+                .iter()
+                .map(|(hub, why)| format!("  - {hub}: {why}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))),
+    }
+}
+
+/// Compose a pairing whose sides may come from different hubs (#696),
+/// recording where each came from.
+pub async fn compose_across(
+    source: &str,
+    sink: &str,
+    overlay: Option<&str>,
+    sides: &HubSides,
+) -> CliResult<Composition> {
+    let (source_file, source_hub) = locate_in(source, &sides.source, catalog::SOURCE_DIR).await?;
+    let (sink_file, sink_hub) = locate_in(sink, &sides.sink, catalog::SINK_DIR).await?;
+    let s = parse_source_file(&source_file)?;
+    let k = parse_sink_file(&sink_file)?;
+    let mut c = compose(&s, &k)?;
+    c.source_hub = source_hub;
+    c.sink_hub = sink_hub;
+    if let Some(o) = overlay {
+        let (file, hub) = locate_in(o, &sides.overlay, DEPLOYMENT_DIR).await?;
+        c = c.apply_overlay(&parse_deployment_file(&file)?)?;
+        c.overlay_hub = hub;
+    }
+    Ok(c)
+}
+
+/// Resolve one hub location to a local directory.
+pub async fn resolve_location(location: HubLocation) -> CliResult<PathBuf> {
+    match location {
         HubLocation::Dir(p) => Ok(p),
         #[cfg(feature = "hub-remote")]
         loc @ HubLocation::Github { .. } => {
@@ -845,6 +1014,57 @@ mod tests {
         std::fs::write(d.path().join("source-templates/acme.yaml"), SRC).unwrap();
         std::fs::write(d.path().join("sink-templates/files.yml"), SINK).unwrap();
         d
+    }
+
+    #[test]
+    fn hub_lists_split_on_commas_keep_order_and_drop_repeats() {
+        let locs = hub_locations(&[
+            "github:acme/private, github:faucet-hq/template-hub".into(),
+            "github:acme/private".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            locs.iter().map(HubLocation::describe).collect::<Vec<_>>(),
+            vec![
+                "github:acme/private@main",
+                "github:faucet-hq/template-hub@main"
+            ]
+        );
+        assert_eq!(
+            hub_locations(&[]).unwrap().len(),
+            1,
+            "the default when none is given"
+        );
+        assert!(hub_locations(&["github:".into()]).is_err());
+    }
+
+    #[test]
+    fn qualified_locators_split_only_on_a_real_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display().to_string();
+        let (loc, id) = split_qualified("github:acme/private-hub:acme/netsuite@3").unwrap();
+        assert_eq!(
+            (loc.describe().as_str(), id),
+            ("github:acme/private-hub@main", "acme/netsuite@3")
+        );
+        let qualified = format!("{d}:files");
+        let (loc, id) = split_qualified(&qualified).unwrap();
+        assert_eq!((loc, id), (HubLocation::Dir(dir.path().into()), "files"));
+        for plain in [
+            "acme/netsuite",
+            "github:acme/hub",
+            "nowhere:files",
+            "https://x.y/a:b",
+            "github:acme/hub:",
+        ] {
+            assert!(split_qualified(plain).is_none(), "{plain}");
+        }
+        let file = dir.path().join("a:b.yaml");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            split_qualified(file.to_str().unwrap()).is_none(),
+            "a file path is never split"
+        );
     }
 
     #[test]

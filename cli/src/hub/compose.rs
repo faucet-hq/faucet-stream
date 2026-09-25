@@ -74,16 +74,35 @@ pub struct Composition {
     /// Whether any stream reads incrementally ([`has_incremental_stream`]).
     #[serde(skip)]
     pub incremental: bool,
+    /// Which hub each side came from, when composed from hubs (#696).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_hub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink_hub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_hub: Option<String>,
     /// The composed `PipelineConfig` document (JSON value; serialize as YAML
     /// for humans).
     pub document: Value,
 }
 
 impl Composition {
-    /// The document as YAML text (what `faucet hub compose` prints).
+    /// The document as YAML text (what `faucet hub compose` prints), headed by
+    /// a comment naming the hub each side came from.
     pub fn to_yaml(&self) -> CliResult<String> {
-        serde_yaml::to_string(&self.document)
-            .map_err(|e| CliError::Internal(format!("hub compose: rendering YAML: {e}")))
+        let body = serde_yaml::to_string(&self.document)
+            .map_err(|e| CliError::Internal(format!("hub compose: rendering YAML: {e}")))?;
+        let mut head = String::new();
+        for (what, id, hub) in [
+            ("source", Some(&self.source), &self.source_hub),
+            ("sink", Some(&self.sink), &self.sink_hub),
+            ("overlay", self.overlay.as_ref(), &self.overlay_hub),
+        ] {
+            if let (Some(id), Some(hub)) = (id, hub) {
+                head.push_str(&format!("# {what}: {id} from {hub}\n"));
+            }
+        }
+        Ok(head + &body)
     }
 }
 
@@ -478,6 +497,9 @@ pub fn compose_with(
         overlay_contributes: Vec::new(),
         warnings,
         incremental,
+        source_hub: None,
+        sink_hub: None,
+        overlay_hub: None,
         document: Value::Object(doc),
     })
 }

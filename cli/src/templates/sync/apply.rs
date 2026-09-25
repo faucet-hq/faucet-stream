@@ -36,6 +36,8 @@ pub struct ApplyOutcome {
     pub launched: Vec<Registered>,
     pub revived: Vec<String>,
     pub deprecated: Vec<String>,
+    /// Versions retired because the catalog deprecated them (#697).
+    pub deprecated_versions: Vec<Registered>,
     pub unchanged: usize,
     pub orphaned: Vec<String>,
     pub skipped: Vec<(String, String)>,
@@ -45,7 +47,11 @@ pub struct ApplyOutcome {
 impl ApplyOutcome {
     /// Registry mutations performed.
     pub fn mutations(&self) -> usize {
-        self.registered.len() + self.launched.len() + self.revived.len() + self.deprecated.len()
+        self.registered.len()
+            + self.launched.len()
+            + self.revived.len()
+            + self.deprecated.len()
+            + self.deprecated_versions.len()
     }
 }
 
@@ -109,6 +115,26 @@ async fn run_action(
             .await?;
             out.deprecated.push(id);
         }
+        SyncAction::DeprecateVersion {
+            id,
+            version,
+            reason,
+        } => {
+            crate::templates::set_version_deprecated(
+                store,
+                &id,
+                version,
+                Some(reason),
+                Some(actor),
+                true,
+            )
+            .await?;
+            out.deprecated_versions.push(Registered {
+                id,
+                version,
+                launched: false,
+            });
+        }
         SyncAction::Unchanged { .. } => out.unchanged += 1,
         SyncAction::Orphaned { id } => out.orphaned.push(id),
         SyncAction::Skipped { name, reason } => out.skipped.push((name, reason)),
@@ -123,7 +149,8 @@ fn action_id(a: &SyncAction) -> String {
         | SyncAction::Revive { id }
         | SyncAction::Unchanged { id, .. }
         | SyncAction::Orphaned { id }
-        | SyncAction::Deprecate { id } => id.clone(),
+        | SyncAction::Deprecate { id }
+        | SyncAction::DeprecateVersion { id, .. } => id.clone(),
         SyncAction::Skipped { name, .. } => name.clone(),
     }
 }
@@ -248,6 +275,31 @@ mod tests {
         assert_eq!(out.revived, vec!["b"]);
         let b = crate::templates::template_state(&s, "b").await.unwrap();
         assert_eq!(b.status, TemplateStatus::Launched);
+
+        // #697: a catalog-retired version is retired here, attributed to sync.
+        let out = apply(
+            &s,
+            SyncPlan {
+                origin: "o".into(),
+                actions: vec![SyncAction::DeprecateVersion {
+                    id: "b".into(),
+                    version: 1,
+                    reason: "catalog v2 is deprecated: broken".into(),
+                }],
+            },
+            "sync:o",
+        )
+        .await;
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert_eq!(out.deprecated_versions[0].version, 1);
+        assert_eq!(out.mutations(), 1);
+        let b = crate::templates::template_state(&s, "b").await.unwrap();
+        let d = b.version_deprecation(1).expect("v1 retired");
+        assert_eq!(d.record.deprecated_by.as_deref(), Some("sync:o"));
+        assert_eq!(
+            d.record.reason.as_deref(),
+            Some("catalog v2 is deprecated: broken")
+        );
     }
 
     /// One broken template must not stop the others: the failure is recorded

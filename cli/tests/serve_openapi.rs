@@ -34,6 +34,7 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     ("POST", "/v1/dlq/discard"),
     ("GET", "/v1/audit"),
     ("POST", "/v1/reload"),
+    ("GET", "/v1/whoami"),
     ("GET", "/healthz"),
     ("GET", "/readyz"),
     ("GET", "/metrics"),
@@ -76,6 +77,7 @@ const ROUTES_TEMPLATES: &[(&str, &str)] = &[
     ("POST", "/v1/templates/{id}/launch"),
     ("POST", "/v1/templates/{id}/rollback"),
     ("POST", "/v1/templates/{id}/deprecate"),
+    ("POST", "/v1/templates/{id}/versions/{version}/deprecate"),
 ];
 
 #[cfg(feature = "templates-sync")]

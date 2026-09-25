@@ -24,16 +24,27 @@ fn pretty<T: serde::Serialize>(v: &T) -> CliResult<String> {
         .map_err(|e| CliError::Internal(format!("hub: rendering JSON: {e}")))
 }
 
+/// The hubs each side of a `compose` / `check` pairing is looked up in.
+async fn pair_sides(p: &crate::cli::HubPairArgs) -> CliResult<hub::HubSides> {
+    hub::resolve_sides(
+        &p.hub,
+        p.source_hub.as_deref(),
+        p.sink_hub.as_deref(),
+        p.overlay_hub.as_deref(),
+    )
+    .await
+}
+
 /// `faucet hub compose --source X --sink Y [--out F] [--json]` — print (or
 /// write) the composed pipeline config. The output is an ordinary config:
 /// `faucet validate` / `run` / `template register` all take it.
 async fn compose(a: HubComposeArgs) -> CliResult<()> {
-    let hub_dir = hub::resolve_hub(a.pair.hub.as_deref()).await?;
-    let c = hub::compose_locators_overlaid(
+    let sides = pair_sides(&a.pair).await?;
+    let c = hub::compose_across(
         &a.pair.source,
         &a.pair.sink,
         a.pair.overlay.as_deref(),
-        &hub_dir,
+        &sides,
     )
     .await?;
     for w in &c.warnings {
@@ -65,16 +76,25 @@ async fn compose(a: HubComposeArgs) -> CliResult<()> {
 /// resolution for one pairing; exits non-zero when any stream is
 /// incompatible.
 async fn check(a: HubCheckArgs) -> CliResult<()> {
-    let hub_dir = hub::resolve_hub(a.pair.hub.as_deref()).await?;
-    let s = hub::load_source(&a.pair.source, &hub_dir).await?;
-    let k = hub::load_sink(&a.pair.sink, &hub_dir).await?;
+    let sides = pair_sides(&a.pair).await?;
+    let (source_file, _) =
+        hub::locate_in(&a.pair.source, &sides.source, hub::catalog::SOURCE_DIR).await?;
+    let (sink_file, _) = hub::locate_in(&a.pair.sink, &sides.sink, hub::catalog::SINK_DIR).await?;
+    let s = hub::parse_source_file(&source_file)?;
+    let k = hub::parse_sink_file(&sink_file)?;
     let cell = hub::catalog::cell(&s, &k);
     // An overlay is checked against the pairing it would be applied to: a
     // stream it names must exist, and its params must not clash.
     let overlaid = match (&a.pair.overlay, cell.compatible) {
-        (Some(o), true) => {
-            Some(hub::compose(&s, &k)?.apply_overlay(&hub::load_deployment(o, &hub_dir)?)?)
-        }
+        (Some(_), true) => Some(
+            hub::compose_across(
+                &a.pair.source,
+                &a.pair.sink,
+                a.pair.overlay.as_deref(),
+                &sides,
+            )
+            .await?,
+        ),
         _ => None,
     };
     if a.json {
@@ -433,7 +453,10 @@ mod tests {
             source: source.into(),
             sink: sink.into(),
             overlay: None,
-            hub: Some(repo_hub()),
+            hub: vec![repo_hub()],
+            source_hub: None,
+            sink_hub: None,
+            overlay_hub: None,
         }
     }
 

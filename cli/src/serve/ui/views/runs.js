@@ -17,7 +17,7 @@ export async function renderRuns(container) {
     <div class="page">
       <div class="page-head">
         <h1>Runs</h1>
-        <button class="btn-primary" id="r-submit">+ Submit run</button>
+        <button class="btn-primary" id="r-submit" data-perm="run_write">+ Submit run</button>
       </div>
       <div class="filters">
         <details class="dd" id="f-status-dd">

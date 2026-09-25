@@ -414,6 +414,30 @@ impl RunHistory for FallbackHistory {
             f => f.template_set_deprecation(id, record)
         )
     }
+    async fn template_set_version_deprecation(
+        &self,
+        id: &str,
+        version: u32,
+        record: Option<&crate::serve::history::templates::DeprecationRecord>,
+    ) -> Result<(), HistoryError> {
+        via!(
+            self,
+            p => p.template_set_version_deprecation(id, version, record),
+            f => f.template_set_version_deprecation(id, version, record)
+        )
+    }
+
+    async fn template_version_deprecations(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::serve::history::templates::VersionDeprecation>, HistoryError> {
+        via!(
+            self,
+            p => p.template_version_deprecations(id),
+            f => f.template_version_deprecations(id)
+        )
+    }
+
     async fn template_deprecation(
         &self,
         id: &str,

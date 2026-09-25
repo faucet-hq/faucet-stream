@@ -214,6 +214,33 @@ faucet template deprecate tenant-sync --reason "superseded by tenant-sync-v2"
 faucet template deprecate tenant-sync --undo         # revive it
 ```
 
+#### Retiring one version
+
+A single bad build can be retired without deleting it, which would erase its
+history and break anything pinned to it:
+
+```bash
+faucet template deprecate tenant-sync --version 5 --reason "drops the invoices stream"
+faucet template deprecate tenant-sync --version 5 --undo      # revive it
+```
+
+A retired version:
+
+- **still runs** when pinned (`--version 5`), or when `stable` or a channel
+  points at it, and every such trigger carries a `deprecated` warning
+  (`"v5 is deprecated: drops the invoices stream"`);
+- is **skipped by `newest`**, which resolves to the highest version that is
+  not retired (when every version is retired, `newest` says so instead);
+- **cannot be launched**. Revive it first, or launch another version.
+
+Deprecating the live version does not move `stable`; roll back separately.
+Deleting a version clears its marker. Over HTTP it is
+`POST /v1/templates/{id}/versions/{version}/deprecate` with
+`{"reason":"…"}` or `{"undo":true}`, and `GET /v1/templates/{id}` lists
+`deprecated_versions`. A [sync](#hosting-templates-in-a-repo-or-bucket-sync)
+from a Template Hub catalog retires a version here when the catalog deprecates
+the body it holds.
+
 #### Channels
 
 On top of the numbers sit **named channels**: pointers at one numeric version.
@@ -397,9 +424,12 @@ suite:
 The web console (`serve-ui`) has a **Templates** view built around exactly this:
 a list showing each template's status, live version, and build tip, and a
 per-template **versions page** with one row per version, the channels currently
-pointing at it, an assign-channel dropdown, and Launch / Config / Delete —
-plus Roll back, Deprecate, and a typed trigger form generated from the template's
-`params:`.
+pointing at it, an assign-channel dropdown, and Launch / Config / Deprecate /
+Delete (a retired row shows a `deprecated` pill and cannot be launched) —
+plus Roll back, Deprecate for the whole template, and a typed trigger form
+generated from the template's `params:`. The controls follow the signed-in
+role: a viewer sees no buttons that change anything, an operator can run
+templates but not manage them.
 
 #### Wire shapes and cleanup
 
@@ -533,7 +563,7 @@ faucet serve --history sqlite:./faucet-templates.db --auth-token "$TOKEN"
 ```
 
 ```bash
-# Register (operator+ / TemplateWrite)
+# Register (admin / TemplateAdmin)
 curl -sX POST localhost:8080/v1/templates \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"id":"tenant-sync","config":"'"$(sed 's/"/\\"/g;:a;N;$!ba;s/\n/\\n/g' tenant-sync.yaml)"'"}'
@@ -643,7 +673,7 @@ faucet template publish platform-nightly --store sqlite:./faucet.db --config syn
 
 Over HTTP the same two verbs are `POST /v1/templates/sync` (`{origin?, dry_run?}`)
 and `POST /v1/templates/{id}/publish` (`{origin, version?}`), both
-`TemplateWrite` and audited as `template.sync` / `template.publish`; the console's
+`TemplateAdmin` (admin) and audited as `template.sync` / `template.publish`; the console's
 Templates page grows a **Sync from origins** panel when the server has any.
 
 **Layout at an origin.** The template id is the file **stem**, with the origin's

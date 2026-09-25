@@ -851,7 +851,7 @@ paths:
         `${vault:…}` stay unresolved and are resolved at trigger time on the
         instance that runs the pipeline. Validation runs against a
         placeholder binding, so no secret is read and no connector is built.
-        Requires the `TemplateWrite` permission (operator) and the `templates`
+        Requires the `TemplateAdmin` permission (admin) and the `templates`
         Cargo feature.
       operationId: registerTemplate
       security: [{ bearerAuth: [] }]
@@ -970,7 +970,7 @@ paths:
       description: >
         Removes one version (`version` given) or every version of the template.
         Runs already produced by it are untouched. Requires the
-        `TemplateWrite` permission (operator).
+        `TemplateAdmin` permission (admin).
       operationId: deleteTemplate
       security: [{ bearerAuth: [] }]
       parameters:
@@ -993,7 +993,7 @@ paths:
         a concrete version, so the pointer never silently follows future
         registrations. The derived channels (`stable`, `previous`, `newest`) cannot
         be assigned (`422`) — `stable` moves only via `launch`. Requires the
-        `TemplateWrite` permission (operator) and the `templates` Cargo feature.
+        `TemplateAdmin` permission (admin) and the `templates` Cargo feature.
       operationId: promoteTemplate
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1037,7 +1037,7 @@ paths:
         (`{"version":"pre-prod"}`). Re-launching the already-live version is a
         no-op (`already_launched: true`), keeping `previous` a real rollback
         target. A deprecated template refuses to launch — revive it first.
-        Requires the `TemplateWrite` permission (operator) and the `templates`
+        Requires the `TemplateAdmin` permission (admin) and the `templates`
         Cargo feature.
       operationId: launchTemplate
       security: [{ bearerAuth: [] }]
@@ -1071,7 +1071,7 @@ paths:
         Implemented as a normal launch, so the launch log keeps the full audit
         trail and `previous` becomes the version you just rolled off. A template
         with fewer than two launches has nothing to roll back to (`422`). Requires
-        the `TemplateWrite` permission (operator) and the `templates` Cargo
+        the `TemplateAdmin` permission (admin) and the `templates` Cargo
         feature.
       operationId: rollbackTemplate
       security: [{ bearerAuth: [] }]
@@ -1095,7 +1095,7 @@ paths:
         keeps serving callers who pin or ride `stable` — retiring must not
         hard-break them — but every trigger response carries a `deprecated` field
         and listings mark it. `DELETE` is the hard stop. Pass `undo: true` to
-        revive. Requires the `TemplateWrite` permission (operator) and the
+        revive. Requires the `TemplateAdmin` permission (admin) and the
         `templates` Cargo feature.
       operationId: deprecateTemplate
       security: [{ bearerAuth: [] }]
@@ -1124,6 +1124,45 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "404": { $ref: "#/components/responses/Error" }
+  /v1/templates/{id}/versions/{version}/deprecate:
+    post:
+      summary: Retire (or revive) one version of a pipeline template
+      description: >
+        A retired version keeps running when pinned, or when `stable` or a
+        channel points at it, and every trigger of it carries a `deprecated`
+        field. `newest` skips it and `launch` refuses it. Pass `undo: true` to
+        revive. `version` is a number or a channel name. Requires the
+        `TemplateAdmin` permission (admin) and the `templates` Cargo feature.
+      operationId: deprecateTemplateVersion
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string }, description: "A version number or a channel name." }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, description: "Why it is being retired; surfaced on every trigger of it." }
+                undo: { type: boolean, default: false, description: "Revive instead of retire." }
+      responses:
+        "200":
+          description: The version's state after the change.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, version, deprecated]
+                properties:
+                  id: { type: string }
+                  version: { type: integer }
+                  deprecated: { type: boolean }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
   /v1/templates/sync:
     post:
       summary: Pull pipeline templates from the configured remote origins
@@ -1138,7 +1177,7 @@ paths:
         register is attributed to the calling principal. `dry_run: true`
         returns the plan without applying it. One unreadable origin does not
         stop the others; it is listed under `origin_errors`. Requires the
-        `TemplateWrite` permission (operator) and the `templates-sync` Cargo
+        `TemplateAdmin` permission (admin) and the `templates-sync` Cargo
         feature; `422` when the server has no origins configured.
       operationId: syncTemplates
       security: [{ bearerAuth: [] }]
@@ -1184,7 +1223,7 @@ paths:
         runs on its own — an operator-driven step, audited as
         `template.publish`. The id must carry the origin's `prefix`
         (otherwise the next pull would re-register it under a different id).
-        Requires `TemplateWrite` and the `templates-sync` Cargo feature.
+        Requires `TemplateAdmin` (admin) and the `templates-sync` Cargo feature.
       operationId: publishTemplate
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1312,6 +1351,32 @@ paths:
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the Reload permission }
         "422": { description: New config invalid; previous config kept }
+  /v1/whoami:
+    get:
+      summary: The caller's principal, role and permissions
+      description: >
+        Every role may call it. The web console uses it to hide controls the
+        caller cannot use; each route still enforces its own permission.
+        `--no-auth` and `--auth-token` report an implicit admin.
+      operationId: whoami
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The resolved identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [principal, role, permissions]
+                properties:
+                  principal: { type: string }
+                  role: { type: string, enum: [viewer, operator, admin] }
+                  permissions:
+                    type: array
+                    items:
+                      type: string
+                      enum: [run_read, run_write, schema_read, doctor, trigger_fire, dlq_read, dlq_manage, catalog_read, template_read, template_admin, local_output_read, local_output_manage, audit_read, reload, identity]
+        "401": { description: Missing or invalid bearer token }
   /healthz:
     get:
       summary: Liveness probe (unauthenticated)
@@ -2035,7 +2100,7 @@ components:
           items: { type: integer }
         stable: { type: integer, nullable: true, description: "The launched version — what `stable` and an unpinned request resolve to. Null while the template is a draft." }
         previous: { type: integer, nullable: true, description: "The version launched before the current one; the rollback target." }
-        newest: { type: integer, nullable: true, description: "Highest version number, launched or not." }
+        newest: { type: integer, nullable: true, description: "Highest version number that is not deprecated, launched or not. Null when every version is deprecated." }
         tags:
           type: object
           description: "Assignable channel pointers ({channel: version}), excluding the derived `stable` / `previous` / `newest`."
@@ -2043,6 +2108,16 @@ components:
         deprecation:
           allOf: [{ $ref: "#/components/schemas/DeprecationRecord" }]
           description: "Present only when `status` is `deprecated`."
+        deprecated_versions:
+          type: array
+          description: "Individually retired versions, newest first. Omitted when there are none."
+          items:
+            allOf:
+              - { $ref: "#/components/schemas/DeprecationRecord" }
+              - type: object
+                required: [version]
+                properties:
+                  version: { type: integer }
       example:
         status: draft
         versions:

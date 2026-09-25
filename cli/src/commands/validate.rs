@@ -24,10 +24,15 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
     // binding unless `--param` is given, exactly like a file. A single
     // `report` await at the end keeps the future small (see `run`).
     let cfg = if let (Some(source), Some(sink)) = (&args.source, &args.sink) {
-        let hub_dir = crate::hub::resolve_hub(args.hub.as_deref()).await?;
+        let sides = crate::hub::resolve_sides(
+            &args.hub,
+            args.source_hub.as_deref(),
+            args.sink_hub.as_deref(),
+            args.overlay_hub.as_deref(),
+        )
+        .await?;
         let composition =
-            crate::hub::compose_locators_overlaid(source, sink, args.overlay.as_deref(), &hub_dir)
-                .await?;
+            crate::hub::compose_across(source, sink, args.overlay.as_deref(), &sides).await?;
         if args.show_composed {
             print!("{}", composition.to_yaml()?);
             return Ok(());
@@ -52,6 +57,15 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
                 composition.sink_kind,
                 composition.streams.len()
             );
+            for (what, hub) in [
+                ("source", &composition.source_hub),
+                ("sink", &composition.sink_hub),
+                ("overlay", &composition.overlay_hub),
+            ] {
+                if let Some(hub) = hub {
+                    println!("  {what} from {hub}");
+                }
+            }
             for p in &composition.streams {
                 println!("  {:<32} write_mode: {}", p.stream, p.describe());
             }

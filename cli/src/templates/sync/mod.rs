@@ -117,6 +117,11 @@ impl SyncReport {
                 SyncAction::Unchanged { id, version } => format!("  unchanged  {id} (v{version})"),
                 SyncAction::Orphaned { id } => format!("  orphaned   {id} (gone upstream; kept)"),
                 SyncAction::Deprecate { id } => format!("  deprecate  {id} (gone upstream)"),
+                SyncAction::DeprecateVersion {
+                    id,
+                    version,
+                    reason,
+                } => format!("  deprecate  {id} v{version} ({reason})"),
                 SyncAction::Skipped { name, reason } => format!("  skipped    {name}: {reason}"),
             };
             s.push_str(&line);
@@ -202,7 +207,10 @@ pub async fn local_snapshot(store: &TemplateStore, prefix: &str) -> CliResult<Ve
             Some(st) => st,
             None => crate::templates::template_state(store, &s.id).await?,
         };
-        let newest_hash = match state.newest {
+        // Sync reasons about the newest *registered* body, so a version this
+        // registry retired still counts as the one the origin last delivered.
+        let newest = state.versions.first().copied();
+        let newest_hash = match newest {
             Some(v) => match store.template_get(&s.id, Some(v)).await {
                 Ok(Some(rec)) => plan::body_hash(&rec.body).ok(),
                 Ok(None) => None,
@@ -213,9 +221,10 @@ pub async fn local_snapshot(store: &TemplateStore, prefix: &str) -> CliResult<Ve
             None => None,
         };
         out.push(LocalTemplate {
+            newest_deprecated: newest.is_some_and(|v| state.version_deprecation(v).is_some()),
             id: s.id,
             status: state.status,
-            newest: state.newest,
+            newest,
             newest_hash,
             stable: state.stable,
         });
@@ -1009,6 +1018,11 @@ mod tests {
                 },
                 SyncAction::Orphaned { id: "e".into() },
                 SyncAction::Deprecate { id: "f".into() },
+                SyncAction::DeprecateVersion {
+                    id: "h".into(),
+                    version: 4,
+                    reason: "catalog v4 is deprecated: broken".into(),
+                },
                 SyncAction::Skipped {
                     name: "g".into(),
                     reason: "why".into(),
@@ -1029,6 +1043,7 @@ mod tests {
             "launch     b v3",
             "revive     c",
             "unchanged  d (v1)",
+            "deprecate  h v4 (catalog v4 is deprecated: broken)",
             "orphaned   e",
             "deprecate  f",
             "skipped    g: why",

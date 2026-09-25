@@ -29,10 +29,13 @@ use crate::serve::load::ConfigFormat;
 pub struct LocalTemplate {
     pub id: String,
     pub status: TemplateStatus,
-    /// Highest registered version.
+    /// Highest registered version, deprecated or not.
     pub newest: Option<u32>,
     /// [`body_hash`] of the newest version's body.
     pub newest_hash: Option<String>,
+    /// Whether that newest version is individually deprecated (#697).
+    #[serde(default)]
+    pub newest_deprecated: bool,
     /// The launched version, if any.
     pub stable: Option<u32>,
 }
@@ -70,6 +73,13 @@ pub enum SyncAction {
     Orphaned { id: String },
     /// Gone upstream; `prune: deprecate` marks it retired (never deleted).
     Deprecate { id: String },
+    /// The catalog deprecated the version this body is, and it is already
+    /// registered here as `version`: retire that version too (#697).
+    DeprecateVersion {
+        id: String,
+        version: u32,
+        reason: String,
+    },
     /// A remote file the plan could not act on (bad id, unparseable body, bad
     /// sidecar tag). Reported, never fatal — one broken file must not block
     /// the rest of the origin.
@@ -85,6 +95,7 @@ impl SyncAction {
                 | Self::Launch { .. }
                 | Self::Revive { .. }
                 | Self::Deprecate { .. }
+                | Self::DeprecateVersion { .. }
         )
     }
 }
@@ -142,10 +153,26 @@ pub fn plan(origin: &Origin, remote: &[RemoteTemplate], local: &[LocalTemplate])
 
     for r in remote {
         if let Some(why) = &r.retired {
-            actions.push(SyncAction::Skipped {
-                name: r.stem.clone(),
-                reason: why.clone(),
+            // A body the catalog retired is never registered. When it already is
+            // (as the newest version here), the retirement follows it. Either way
+            // the template is still upstream, so it is never an orphan.
+            let id = format!("{}{}", origin.prefix, r.stem);
+            seen.insert(id.clone());
+            let registered = local_by_id.get(id.as_str()).and_then(|l| {
+                let same = l.newest_hash.is_some() && body_hash(&r.body).ok() == l.newest_hash;
+                (same && !l.newest_deprecated).then_some(l.newest).flatten()
             });
+            match registered {
+                Some(version) => actions.push(SyncAction::DeprecateVersion {
+                    id,
+                    version,
+                    reason: why.clone(),
+                }),
+                None => actions.push(SyncAction::Skipped {
+                    name: r.stem.clone(),
+                    reason: why.clone(),
+                }),
+            }
             continue;
         }
         let id = format!("{}{}", origin.prefix, r.stem);
@@ -292,6 +319,7 @@ mod tests {
             status,
             newest: Some(newest),
             newest_hash: Some(body_hash(body).unwrap()),
+            newest_deprecated: false,
             stable,
         }
     }
@@ -305,7 +333,8 @@ mod tests {
                 | SyncAction::Revive { id }
                 | SyncAction::Unchanged { id, .. }
                 | SyncAction::Orphaned { id }
-                | SyncAction::Deprecate { id } => id.clone(),
+                | SyncAction::Deprecate { id }
+                | SyncAction::DeprecateVersion { id, .. } => id.clone(),
                 SyncAction::Skipped { name, .. } => format!("skipped:{name}"),
             })
             .collect()
@@ -519,6 +548,57 @@ mod tests {
             }]
         );
         assert_eq!(p.mutations(), 0);
+    }
+
+    #[test]
+    fn a_retired_body_already_registered_retires_that_version() {
+        // #697: the catalog deprecated the version this registry already holds
+        // as its newest, so the retirement follows it here.
+        let o = origin("", LaunchPolicy::Always, PrunePolicy::Keep);
+        let mut r = remote("acme/erp", BODY_A, None);
+        r.retired = Some("catalog v3 is deprecated: drops invoices".into());
+        let l = local("acme/erp", TemplateStatus::Launched, 5, BODY_A, Some(5));
+        let p = plan(&o, std::slice::from_ref(&r), std::slice::from_ref(&l));
+        assert_eq!(
+            p.actions,
+            vec![SyncAction::DeprecateVersion {
+                id: "acme/erp".into(),
+                version: 5,
+                reason: "catalog v3 is deprecated: drops invoices".into(),
+            }]
+        );
+        assert_eq!(p.mutations(), 1);
+
+        // Under `prune: deprecate` the template is still upstream, so it is not
+        // retired as a whole.
+        let prune = origin("", LaunchPolicy::Always, PrunePolicy::Deprecate);
+        assert_eq!(
+            plan(&prune, std::slice::from_ref(&r), std::slice::from_ref(&l))
+                .actions
+                .len(),
+            1
+        );
+
+        // Already retired here, or a different body: just skipped.
+        let done = LocalTemplate {
+            newest_deprecated: true,
+            ..l.clone()
+        };
+        assert!(matches!(
+            plan(&o, std::slice::from_ref(&r), &[done]).actions[0],
+            SyncAction::Skipped { .. }
+        ));
+        let other = local(
+            "acme/erp",
+            TemplateStatus::Launched,
+            5,
+            "version: 1\nname: other\n",
+            Some(5),
+        );
+        assert!(matches!(
+            plan(&o, &[r], &[other]).actions[0],
+            SyncAction::Skipped { .. }
+        ));
     }
 
     #[test]
