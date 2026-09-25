@@ -21,6 +21,9 @@ pub struct SchemasResponse {
     pub sinks: Vec<SchemaItem>,
     pub transforms: Vec<SchemaItem>,
     pub state: Vec<String>,
+    /// Config blocks a submitted pipeline can add beside its source, sink, and
+    /// transforms; fetch each one's schema from `/v1/schemas/block/{name}`.
+    pub blocks: Vec<crate::commands::schema::PipelineBlock>,
 }
 
 fn items(pairs: Vec<(&'static str, &'static str)>) -> Vec<SchemaItem> {
@@ -43,10 +46,12 @@ pub async fn list_schemas(State(_state): State<ServerState>) -> Json<SchemasResp
             .into_iter()
             .map(String::from)
             .collect(),
+        blocks: crate::commands::schema::pipeline_blocks(),
     })
 }
 
-/// `GET /v1/schemas/{kind}/{name}` → the JSON Schema for one connector/transform.
+/// `GET /v1/schemas/{kind}/{name}` → the JSON Schema for one connector,
+/// transform, or pipeline block (`kind` = `source` | `sink` | `transform` | `block`).
 /// Unknown kind or name → 404.
 pub async fn get_schema(
     State(_state): State<ServerState>,
@@ -56,6 +61,11 @@ pub async fn get_schema(
         "source" => crate::registry::source_schema(&name),
         "sink" => crate::registry::sink_schema(&name),
         "transform" => crate::transforms::transform_schema(&name),
+        "block" => {
+            return crate::commands::schema::block_schema(&name)
+                .map(Json)
+                .ok_or(ServeError::NotFound);
+        }
         _ => return Err(ServeError::NotFound),
     }
     .map_err(|_| ServeError::NotFound)?;

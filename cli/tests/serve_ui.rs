@@ -173,6 +173,31 @@ async fn schemas_catalog_and_one_schema() {
     assert_eq!(r.status(), 200);
     let body: serde_json::Value = r.json().await.unwrap();
     assert!(body["sources"].is_array() && body["sinks"].is_array());
+    let blocks: Vec<&str> = body["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    for name in ["state", "dlq", "delivery", "resilience", "sla", "schema"] {
+        assert!(blocks.contains(&name), "missing block {name}: {blocks:?}");
+    }
+
+    for name in &blocks {
+        let r = client
+            .get(format!("{base}/v1/schemas/block/{name}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "block {name}");
+        assert!(r.json::<serde_json::Value>().await.unwrap().is_object());
+    }
+    let r = client
+        .get(format!("{base}/v1/schemas/block/nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
 
     let r = client
         .get(format!("{base}/v1/schemas/source/rest"))

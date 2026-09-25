@@ -607,13 +607,16 @@
       "type": "object",
       "properties": {
         "sink": {
+          "description": "The sink failed and quarantined records are written to.",
           "$ref": "#/$defs/ConnectorSpec"
         },
         "on_batch_error": {
+          "description": "What to do when the sink rejects a whole page rather than individual records.",
           "$ref": "#/$defs/OnBatchErrorSpec",
           "default": "propagate"
         },
         "max_failures_per_page": {
+          "description": "Fail the run once one page sends more records than this to the DLQ\n(write failures and quarantines both count). Unset means no limit.",
           "type": [
             "integer",
             "null"
@@ -623,6 +626,7 @@
           "default": null
         },
         "max_failures_total": {
+          "description": "Fail the run once more records than this have gone to the DLQ in total\n(write failures and quarantines both count). Unset means no limit.",
           "type": [
             "integer",
             "null"
@@ -632,6 +636,7 @@
           "default": null
         },
         "include_original_payload": {
+          "description": "Include each failed record's original payload in its DLQ envelope.",
           "type": "boolean",
           "default": true
         }
@@ -642,11 +647,18 @@
       ]
     },
     "OnBatchErrorSpec": {
-      "description": "Mirrors `faucet_core::OnBatchError` but with `JsonSchema` derived and\n`Deserialize` accepting the YAML/JSON shape. Converted to the core\ntype during `executor::build_dlq_config`.",
-      "type": "string",
-      "enum": [
-        "propagate",
-        "dlq_all"
+      "description": "What to do when the sink rejects a whole page rather than individual records.",
+      "oneOf": [
+        {
+          "description": "Fail the run (the default).",
+          "type": "string",
+          "const": "propagate"
+        },
+        {
+          "description": "Send every record of the failed page to the DLQ and continue. Use only\nwith sinks where a failed write lands nothing, or retried rows duplicate.",
+          "type": "string",
+          "const": "dlq_all"
+        }
       ]
     },
     "QualitySpec": {

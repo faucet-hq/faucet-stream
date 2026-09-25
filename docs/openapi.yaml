@@ -164,13 +164,22 @@ paths:
                   sinks: { type: array, items: { type: object, properties: { name: { type: string }, description: { type: string } } } }
                   transforms: { type: array, items: { type: object, properties: { name: { type: string }, description: { type: string } } } }
                   state: { type: array, items: { type: string } }
+                  blocks:
+                    type: array
+                    description: Config blocks a submitted pipeline can add; fetch each schema from /v1/schemas/block/{name}
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        description: { type: string }
+                        placement: { type: string, enum: [pipeline, top], description: "Whether the block lives under `pipeline:` or at the top level" }
         "401": { description: Missing or invalid bearer token }
   /v1/schemas/{kind}/{name}:
     get:
-      summary: Get the JSON Schema for one connector or transform
+      summary: Get the JSON Schema for one connector, transform, or pipeline block
       security: [{ bearerAuth: [] }]
       parameters:
-        - { name: kind, in: path, required: true, schema: { type: string, enum: [source, sink, transform] } }
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [source, sink, transform, block] } }
         - { name: name, in: path, required: true, schema: { type: string } }
       responses:
         "200":

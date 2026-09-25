@@ -984,14 +984,15 @@ impl OtelSpec {
     }
 }
 
-/// Mirrors `faucet_core::OnBatchError` but with `JsonSchema` derived and
-/// `Deserialize` accepting the YAML/JSON shape. Converted to the core
-/// type during `executor::build_dlq_config`.
+/// What to do when the sink rejects a whole page rather than individual records.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OnBatchErrorSpec {
+    /// Fail the run (the default).
     #[default]
     Propagate,
+    /// Send every record of the failed page to the DLQ and continue. Use only
+    /// with sinks where a failed write lands nothing, or retried rows duplicate.
     DlqAll,
 }
 
@@ -999,13 +1000,20 @@ pub enum OnBatchErrorSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DlqSpec {
+    /// The sink failed and quarantined records are written to.
     pub sink: ConnectorSpec,
+    /// What to do when the sink rejects a whole page rather than individual records.
     #[serde(default)]
     pub on_batch_error: OnBatchErrorSpec,
+    /// Fail the run once one page sends more records than this to the DLQ
+    /// (write failures and quarantines both count). Unset means no limit.
     #[serde(default)]
     pub max_failures_per_page: Option<usize>,
+    /// Fail the run once more records than this have gone to the DLQ in total
+    /// (write failures and quarantines both count). Unset means no limit.
     #[serde(default)]
     pub max_failures_total: Option<usize>,
+    /// Include each failed record's original payload in its DLQ envelope.
     #[serde(default = "default_true")]
     pub include_original_payload: bool,
 }
