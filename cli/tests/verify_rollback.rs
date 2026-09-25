@@ -773,3 +773,204 @@ async fn verify_and_rollback_commands_over_a_config_file() {
         .unwrap_err();
     assert!(err.to_string().contains("--run"), "{err}");
 }
+
+// ───────────────────────── verify options ─────────────────────────
+
+fn spec(yaml: &str) -> VerifySpec {
+    serde_yaml::from_str(yaml).unwrap()
+}
+
+fn inputs() -> VerifyInputs {
+    VerifyInputs {
+        row: None,
+        repair: false,
+        allow_delete: false,
+        dry_run: false,
+        pipeline_name: "mirror".into(),
+        execution: None,
+        auth: Default::default(),
+        clock: chrono::Utc::now().fixed_offset(),
+    }
+}
+
+/// `columns`, an explicit `destination`, a composite key (full mode),
+/// `max_differences` truncation and the `max_rows_scanned` budget.
+#[tokio::test]
+async fn verify_honours_columns_destination_key_and_limits() {
+    let d = fresh().await;
+    let cfg = load(&config_yaml(&d.src, &d.dst, &d.state, "upsert", ""));
+    assert!(!run(&cfg).await.had_failures());
+
+    let only_name = faucet_cli::verify::verify(&cfg, &spec("columns: [name]"), inputs())
+        .await
+        .unwrap();
+    assert!(only_name.report.equal(), "{only_name:?}");
+
+    let dest = format!(
+        "destination:\n  type: sqlite\n  config:\n    database_url: \"{}\"\n    query: \"SELECT id, name FROM dst\"\n",
+        d.dst
+    );
+    let explicit = faucet_cli::verify::verify(&cfg, &spec(&dest), inputs())
+        .await
+        .unwrap();
+    assert!(explicit.report.equal(), "{explicit:?}");
+
+    let composite = faucet_cli::verify::verify(&cfg, &spec("key: [id, name]"), inputs())
+        .await
+        .unwrap();
+    assert_eq!(composite.strategy, "full");
+    assert!(composite.report.equal());
+
+    exec(&d.dst, "UPDATE dst SET name = upper(name)").await;
+    let capped = faucet_cli::verify::verify(&cfg, &spec("max_differences: 1"), inputs())
+        .await
+        .unwrap();
+    assert_eq!(capped.report.differences.len(), 1);
+    assert!(capped.report.truncated, "{capped:?}");
+
+    let budget = faucet_cli::verify::verify(
+        &cfg,
+        &spec("max_rows_scanned: 1\nranges: 4\nleaf_rows: 1"),
+        inputs(),
+    )
+    .await
+    .unwrap();
+    assert!(budget.report.truncated, "{budget:?}");
+}
+
+/// Masking is applied to the source side, so a deterministic mask matches
+/// what the pipeline wrote instead of being reported as drift.
+#[tokio::test]
+async fn verify_masks_the_source_side_like_the_pipeline_did() {
+    let d = fresh().await;
+    let yaml = config_yaml(&d.src, &d.dst, &d.state, "upsert", "").replace(
+        "  state:\n",
+        "  masking:\n    rules:\n      - name: hide\n        match: { fields: [name] }\n        action: { type: redact, mask: \"x\" }\n  state:\n",
+    );
+    let cfg = load(&yaml);
+    assert!(!run(&cfg).await.had_failures());
+    assert_eq!(
+        count(&d.dst, "SELECT count(*) FROM dst WHERE name = 'x'").await,
+        4,
+        "the pipeline wrote masked names"
+    );
+    let out = faucet_cli::verify::verify(&cfg, &VerifySpec::default(), inputs())
+        .await
+        .unwrap();
+    assert!(out.report.equal(), "{out:?}");
+}
+
+/// A file sink cannot describe its own read-back (`verify.destination` is
+/// required), a csv destination compares in full mode, and a repair through a
+/// sink without keyed writes is refused.
+#[tokio::test]
+async fn verify_file_sinks_need_a_destination_and_cannot_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    let out = dir.path().join("out.csv");
+    std::fs::write(&input, "id,name\n1,one\n2,two\n").unwrap();
+    let csv_yaml = format!(
+        r#"
+version: 1
+name: files
+pipeline:
+  source: {{ type: csv, config: {{ path: "{}" }} }}
+  sink: {{ type: csv, config: {{ path: "{}" }} }}
+"#,
+        input.display(),
+        out.display()
+    );
+    let cfg = load(&csv_yaml);
+    assert!(!run(&cfg).await.had_failures());
+
+    let err = faucet_cli::verify::verify(&cfg, &spec("key: [id]"), inputs())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot describe how to read"),
+        "{err}"
+    );
+
+    let with_dest = format!(
+        "key: [id]\ndestination:\n  type: csv\n  config:\n    path: \"{}\"\n",
+        out.display()
+    );
+    let ok = faucet_cli::verify::verify(&cfg, &spec(&with_dest), inputs())
+        .await
+        .unwrap();
+    assert_eq!(ok.strategy, "full");
+    assert!(ok.report.equal(), "{ok:?}");
+
+    std::fs::write(&input, "id,name\n1,one\n2,deux\n").unwrap();
+    let err = faucet_cli::verify::verify(
+        &cfg,
+        &spec(&with_dest),
+        VerifyInputs {
+            repair: true,
+            ..inputs()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("does not support keyed writes"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn rollback_locate_errors_name_the_row_and_the_missing_state() {
+    let d = fresh().await;
+    let with_state = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "upsert",
+        "rollback: {}",
+    ));
+    let err = faucet_cli::rollback::rollback(
+        &with_state,
+        RollbackInputs {
+            run_id: "x".into(),
+            row: Some("nope".into()),
+            dry_run: false,
+            force: false,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("not a root row"), "{err}");
+
+    let no_state = load(&format!(
+        r#"
+version: 1
+name: mirror
+pipeline:
+  source: {{ type: sqlite, config: {{ database_url: "{}", query: "SELECT id, name FROM src" }} }}
+  sink: {{ type: sqlite, config: {{ database_url: "{}", table_name: dst, column_mapping: auto_map }} }}
+"#,
+        d.src, d.dst
+    ));
+    assert!(
+        faucet_cli::rollback::list(&no_state, "mirror", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let err = faucet_cli::rollback::rollback(
+        &no_state,
+        RollbackInputs {
+            run_id: "x".into(),
+            row: None,
+            dry_run: false,
+            force: false,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("no undoable run 'x'"), "{err}");
+}

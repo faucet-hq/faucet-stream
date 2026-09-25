@@ -1059,6 +1059,81 @@ mod tests {
     }
 
     #[test]
+    fn range_width_display_and_number_canonical_forms() {
+        let inverted = KeyRange {
+            lo: Some(5),
+            hi: Some(5),
+        };
+        assert_eq!(inverted.width(), Some(0));
+        assert_eq!(format!("{inverted}"), "[5, 5)");
+        assert_eq!(format!("{}", KeyRange::ALL), "all");
+        let norm = Normalizer::default();
+        assert_eq!(
+            norm.canonical(Some(&json!(u64::MAX))),
+            format!("n{}", u64::MAX)
+        );
+        assert_eq!(norm.canonical(Some(&json!(-3))), "n-3");
+        assert_eq!(norm.canonical(Some(&json!(2.0))), "n2");
+    }
+
+    #[test]
+    fn timestamps_parse_every_supported_spelling_or_none() {
+        assert!(parse_timestamp_micros("2026-01-01T00:00:00Z").is_some());
+        assert!(parse_timestamp_micros("2026-01-01 00:00:00.5").is_some());
+        assert!(parse_timestamp_micros("2026-01-01 00:00:00+02:00").is_some());
+        assert!(parse_timestamp_micros("2026-01-01").is_some());
+        assert_eq!(parse_timestamp_micros("2026-13-99"), None);
+        assert_eq!(parse_timestamp_micros("not a date"), None);
+        assert_eq!(parse_timestamp_micros("20260101"), None);
+    }
+
+    #[test]
+    fn bounds_union_needs_both_ends() {
+        let a = ContentDigest {
+            key_min: Some(1),
+            ..Default::default()
+        };
+        let b = ContentDigest::default();
+        assert_eq!(a.bounds_union(&b), None, "no max anywhere");
+        let sd = ServerDigest {
+            algorithm: "x".into(),
+            rows: 0,
+            digest: "0".into(),
+            key_min: None,
+            key_max: Some(9),
+        };
+        assert_eq!(sd.bounds_union(&sd), None, "no min anywhere");
+        let other = ServerDigest {
+            key_min: Some(2),
+            ..sd.clone()
+        };
+        assert_eq!(sd.bounds_union(&other), Some((2, 9)));
+    }
+
+    #[test]
+    fn duplicate_destination_keys_are_reported_once_on_that_side() {
+        let source = vec![json!({"id": 1, "v": "a"})];
+        let dest = vec![json!({"id": 1, "v": "a"}), json!({"id": 1, "v": "b"})];
+        let d = diff_rows(
+            &source,
+            &dest,
+            &["id".into()],
+            None,
+            &[],
+            &Normalizer::default(),
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(
+            d[0].kind,
+            DifferenceKind::Duplicate {
+                side: Side::Destination,
+                count: 2
+            }
+        );
+        assert!(!d[0].needs_upsert() && !d[0].needs_delete());
+    }
+
+    #[test]
     fn report_healed_only_when_every_difference_was_repaired() {
         let mut r = VerifyReport::default();
         assert!(!r.healed(), "nothing to heal");

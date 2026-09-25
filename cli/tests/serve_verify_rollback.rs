@@ -341,6 +341,57 @@ async fn verify_and_rollback_endpoints_with_rbac() {
         1
     );
 
+    // A run that recorded no invocation ids (it failed at load) cannot be
+    // rolled back → 422; a matrix run with several invocations needs
+    // `invocation_id` → 400.
+    let broken = config_yaml(&src, &dst, &state, "rollback: {}\nverify:\n  ranges: 0");
+    let failed: Value = client
+        .post(format!("{base}/v1/runs"))
+        .bearer_auth("op-tok")
+        .json(&json!({ "config": broken }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    if let Some(fid) = failed["run_id"].as_str() {
+        let rec = wait_terminal(&client, &base, fid).await;
+        assert_eq!(rec["status"], "failed", "{rec}");
+        let r = client
+            .post(format!("{base}/v1/runs/{fid}/rollback"))
+            .bearer_auth("admin-tok")
+            .json(&json!({ "config": cfg }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 422, "{}", r.text().await.unwrap());
+    }
+    let two_rows = format!(
+        "{cfg}matrix:\n  - id: a\n  - id: b\n    source:\n      config: {{ query: \"SELECT id, name FROM src WHERE id = 1\" }}\n"
+    );
+    let multi: Value = client
+        .post(format!("{base}/v1/runs"))
+        .bearer_auth("op-tok")
+        .json(&json!({ "config": two_rows }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mid = multi["run_id"].as_str().expect("submitted").to_string();
+    let rec = wait_terminal(&client, &base, &mid).await;
+    assert_eq!(rec["invocations"].as_array().unwrap().len(), 2, "{rec}");
+    let r = client
+        .post(format!("{base}/v1/runs/{mid}/rollback"))
+        .bearer_auth("admin-tok")
+        .json(&json!({ "config": two_rows, "dry_run": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "{}", r.text().await.unwrap());
+
     // The audit log saw both actions.
     let audit: Value = client
         .get(format!("{base}/v1/audit"))
