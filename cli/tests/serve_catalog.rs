@@ -261,6 +261,55 @@ async fn catalog_endpoints_accumulate_runs_and_enforce_rbac() {
     assert_eq!(rooted["edges"].as_array().unwrap().len(), 1);
 }
 
+/// The in-memory backend keeps column profiles per dataset (#708): a replay
+/// of the same `(dataset, recorded_at)` is a no-op, the list is pruned to
+/// `PROFILE_RETAIN`, and the history reads back newest first, bounded.
+#[tokio::test]
+async fn memory_backend_records_and_prunes_column_profiles() {
+    use faucet_cli::serve::history::RunHistory;
+    use faucet_cli::serve::history::catalog::{CatalogProfileRecord, PROFILE_RETAIN};
+    use faucet_cli::serve::history::memory::MemoryHistory;
+    let store = MemoryHistory::new(Duration::from_secs(60));
+    let base = chrono::Utc::now() - chrono::Duration::hours(24);
+    let record = |i: i64| CatalogProfileRecord {
+        run_id: format!("run-{i}"),
+        pipeline: "p".into(),
+        row: "r".into(),
+        recorded_at: base + chrono::Duration::seconds(i),
+        profile: faucet_core::RunProfile {
+            rows: i as u64,
+            ..Default::default()
+        },
+        drift: Vec::new(),
+        baseline_runs: 0,
+    };
+    for i in 0..(PROFILE_RETAIN as i64 + 3) {
+        store
+            .catalog_record_profile("ds", &record(i))
+            .await
+            .unwrap();
+    }
+    store
+        .catalog_record_profile("ds", &record(PROFILE_RETAIN as i64 + 2))
+        .await
+        .unwrap();
+    let all = store.catalog_profile_history("ds", 1000).await.unwrap();
+    assert_eq!(all.len(), PROFILE_RETAIN);
+    assert_eq!(all[0].run_id, format!("run-{}", PROFILE_RETAIN + 2));
+    assert_eq!(all.last().unwrap().run_id, "run-3");
+    assert_eq!(
+        store.catalog_profile_history("ds", 2).await.unwrap().len(),
+        2
+    );
+    assert!(
+        store
+            .catalog_profile_history("other", 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// A `profiling:` pipeline records each run's column profile on its sink
 /// dataset (#708): the detail carries the latest profile + drift and the recent
 /// history, and the source dataset carries none.
