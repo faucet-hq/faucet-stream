@@ -696,7 +696,10 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         no_env_file: true,
         ..Default::default()
     };
-    crate::commands::run::execute(cfg, run_args, None).await
+    // Boxed: `execute` is a large future, and every command that awaits it by
+    // value would otherwise carry the whole state machine in its own frame
+    // (a debug-build `#[tokio::test]` overflowed its 2 MiB stack that way).
+    Box::pin(crate::commands::run::execute(cfg, run_args, None)).await
 }
 
 /// `faucet template test` — run a suite across a template's parameter space
@@ -882,6 +885,46 @@ pipeline:
             env_file: None,
             no_env_file: true,
             json,
+        }
+    }
+
+    /// A command's future is held by value in its caller's state machine and,
+    /// in a debug build, staged on the stack once per `.await`. Keep the
+    /// command entry points small so a test that awaits several of them (or
+    /// `run_command`'s match over every command) stays far under the 2 MiB
+    /// test-thread stack — the executor's large future is boxed behind them.
+    #[test]
+    fn command_futures_stay_small() {
+        let args = TemplateRunArgs {
+            id: "x".into(),
+            version: "stable".into(),
+            sink: None,
+            sink_version: "stable".into(),
+            overlay: None,
+            overlay_version: "stable".into(),
+            param: vec![],
+            param_env: vec![],
+            dry_run: true,
+            limit: None,
+            common: common("memory", false),
+        };
+        let f = run_template(args);
+        let run_template_size = std::mem::size_of_val(&f);
+        drop(f);
+        use clap::Parser;
+        let cli = crate::cli::Cli::parse_from(["faucet", "list"]);
+        let f = crate::run_command(cli);
+        let run_command_size = std::mem::size_of_val(&f);
+        drop(f);
+        let f = crate::commands::run::run(crate::cli::RunArgs::default());
+        let run_size = std::mem::size_of_val(&f);
+        drop(f);
+        for (name, size) in [
+            ("template run", run_template_size),
+            ("run_command", run_command_size),
+            ("run", run_size),
+        ] {
+            assert!(size < 32 * 1024, "{name} future is {size} bytes");
         }
     }
 

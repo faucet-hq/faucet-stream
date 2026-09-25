@@ -104,6 +104,18 @@ pub async fn verify(
     verify_node(&node, spec, &inputs).await
 }
 
+/// [`verify_node`] behind a heap allocation, built in its own never-inlined
+/// frame — what the executor awaits from inside `run_one_invocation`, so the
+/// verifier's (large) state machine never lands in that future's frame.
+#[inline(never)]
+pub fn verify_node_boxed<'a>(
+    node: &'a ExpandedNode,
+    spec: &'a VerifySpec,
+    inputs: &'a VerifyInputs,
+) -> futures::future::BoxFuture<'a, CliResult<VerifyOutcome>> {
+    Box::pin(verify_node(node, spec, inputs))
+}
+
 /// Verify an already-expanded root node. Shared by the command and the
 /// executor's post-run pass.
 pub async fn verify_node(

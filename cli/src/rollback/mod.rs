@@ -99,6 +99,18 @@ pub fn inject_write_spec(sink_cfg: &mut Value, spec: &RollbackSpec, run_id: &str
     }
 }
 
+/// [`prepare`] behind a heap allocation, built in its own never-inlined
+/// frame (see the executor's `boxed_run_one_invocation`).
+#[inline(never)]
+pub fn prepare_boxed<'a>(
+    store: &'a dyn StateStore,
+    sink: &'a dyn Sink,
+    marker: RunMarker,
+    retain: usize,
+) -> futures::future::BoxFuture<'a, CliResult<()>> {
+    Box::pin(prepare(store, sink, marker, retain))
+}
+
 /// Write the pre-run marker for `marker.run_id` and prune the retained set.
 /// Reads the bookmark before the run (and the exactly-once token, when the
 /// row is exactly-once) off the live store / sink. Pruned runs lose their

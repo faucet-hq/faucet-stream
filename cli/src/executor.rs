@@ -1161,7 +1161,7 @@ async fn run_unit(
     }
     let needs_capture = capture.is_some();
     let started = std::time::Instant::now();
-    let result = run_one_invocation(
+    let result = boxed_run_one_invocation(
         &unit.node,
         unit.parent_record.as_deref(),
         unit.product_ctx.as_ref(),
@@ -1230,6 +1230,43 @@ async fn run_unit(
             metrics: Some(base_metrics()),
         },
     }
+}
+
+/// [`run_one_invocation`] behind a heap allocation, built in its own
+/// never-inlined frame.
+///
+/// One invocation's future is enormous in a debug build — every optional pass
+/// (masking, quality, contract, drift, verify, lineage, catalog) is a state
+/// machine inlined into it. Awaiting it directly puts that whole size into
+/// the *caller's* stack frame (the compiler reserves the temporary even on
+/// branches that never run), which overflowed the 2 MiB test-thread stack
+/// under `--all-features`. Constructing it here and returning a `BoxFuture`
+/// keeps the caller's frame at pointer size; only this frame pays the
+/// transient cost. `run_unit` and every other caller go through this.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_run_one_invocation<'a>(
+    node: &'a ExpandedNode,
+    parent_record: Option<&'a Value>,
+    product_ctx: Option<&'a HashMap<String, Value>>,
+    state_key: &'a str,
+    capture: Option<Arc<Projection>>,
+    opts: &'a ExecuteOptions,
+    cancel: CancellationToken,
+    suppress_overwrite: bool,
+    overwrite_grouped: bool,
+) -> futures::future::BoxFuture<'a, CliResult<(Vec<Value>, PipelineStats)>> {
+    Box::pin(run_one_invocation(
+        node,
+        parent_record,
+        product_ctx,
+        state_key,
+        capture,
+        opts,
+        cancel,
+        suppress_overwrite,
+        overwrite_grouped,
+    ))
 }
 
 /// Run a discovery row (#501): build its source, drain it, project `select`,
@@ -1983,7 +2020,7 @@ async fn run_one_invocation(
             run_id_column.clone(),
         );
         if let Err(e) =
-            crate::rollback::prepare(store.as_ref(), sink.as_ref(), marker, spec.retain).await
+            crate::rollback::prepare_boxed(store.as_ref(), sink.as_ref(), marker, spec.retain).await
         {
             tracing::warn!(
                 run_id = %run_id,
@@ -2172,7 +2209,11 @@ async fn run_one_invocation(
                 auth: opts.auth.clone(),
                 clock: opts.clock,
             };
-            match crate::verify::verify_node(node, spec, &inputs).await {
+            // Behind a never-inlined boxing helper: the verifier's state
+            // machine is large, and inlining it here overflowed the 2 MiB
+            // test-thread stack under `--all-features` (see
+            // `boxed_run_one_invocation`).
+            match crate::verify::verify_node_boxed(node, spec, &inputs).await {
                 Ok(outcome) if outcome.report.equal() => result,
                 // A repair that re-synced every reported difference healed the
                 // drift: the run is green, and the drift is logged.
@@ -3575,6 +3616,68 @@ mod tests {
             vs,
             vec!["OLD".to_string()],
             "destination must be unchanged: {vs:?}"
+        );
+    }
+
+    /// The invocation future must stay small enough to be *constructed* on a
+    /// 2 MiB thread stack (the CI test threads), whatever passes are compiled
+    /// in. A debug build reserves the full size of an awaited future in the
+    /// awaiting frame, so an unboxed post-run pass silently pushes every
+    /// caller of `run_expanded` toward a stack overflow (#725).
+    #[test]
+    fn invocation_future_size_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        let output = dir.path().join("out.jsonl");
+        std::fs::write(&input, "name\nalice\n").unwrap();
+        let cfg = cfg_csv_to_jsonl(&input, &output);
+        let nodes = expand(&cfg).unwrap();
+        let o = opts("size");
+        let fut = run_one_invocation(
+            &nodes[0],
+            None,
+            None,
+            "size::row",
+            None,
+            &o,
+            CancellationToken::new(),
+            false,
+            false,
+        );
+        let size = std::mem::size_of_val(&fut);
+        drop(fut);
+        eprintln!("run_one_invocation future: {size} bytes");
+        assert!(
+            size < 1_200_000,
+            "run_one_invocation future is {size} bytes; box the newest pass (see boxed_run_one_invocation)"
+        );
+        let unit = Unit {
+            node: nodes[0].clone(),
+            parent_record: None,
+            state_key: "size::row".into(),
+            parent_record_key: None,
+            product_ctx: None,
+        };
+        let captured: CapturedRecords = Default::default();
+        let discovered: DiscoveredDims = Default::default();
+        let collected: CollectedDims = Default::default();
+        let run_unit_fut = run_unit(
+            &unit,
+            None,
+            &captured,
+            &discovered,
+            &collected,
+            &o,
+            CancellationToken::new(),
+            false,
+            false,
+        );
+        let unit_size = std::mem::size_of_val(&run_unit_fut);
+        drop(run_unit_fut);
+        eprintln!("run_unit future: {unit_size} bytes");
+        assert!(
+            unit_size < 65_536,
+            "run_unit future is {unit_size} bytes; the invocation must stay boxed"
         );
     }
 
