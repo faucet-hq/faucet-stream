@@ -664,3 +664,22 @@ async fn a_source_and_a_sink_compose_across_two_hubs() {
     assert!(err.contains("in any of the 2 hubs searched"), "{err}");
     assert!(err.contains(&private) && err.contains(&public), "{err}");
 }
+
+/// #696: an owner's own token wins over the global one, so a private hub and
+/// the public hub can be read in one invocation.
+#[cfg(feature = "hub-remote")]
+#[test]
+fn a_per_owner_github_token_takes_precedence() {
+    use faucet_cli::hub::remote::{github_token, owner_token_var};
+    let var = owner_token_var("zz-hub-cli-696/private-hub");
+    assert_eq!(var, "FAUCET_GITHUB_TOKEN_ZZ_HUB_CLI_696");
+    // SAFETY: the variable name is unique to this test.
+    unsafe { std::env::set_var(&var, "owner-token") };
+    assert_eq!(
+        github_token("zz-hub-cli-696/private-hub").as_deref(),
+        Some("owner-token")
+    );
+    let loc = faucet_cli::hub::HubLocation::parse("github:zz-hub-cli-696/private-hub").unwrap();
+    assert!(faucet_cli::hub::remote::GithubHub::new(&loc, "http://127.0.0.1:1").is_ok());
+    unsafe { std::env::remove_var(&var) };
+}

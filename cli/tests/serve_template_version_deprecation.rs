@@ -89,21 +89,31 @@ async fn start(port: u16, history: Option<String>) -> (reqwest::Client, String) 
 fn pipeline(dir: &std::path::Path, n: u32) -> String {
     std::fs::write(dir.join("in.csv"), "id\n1\n").unwrap();
     format!(
-        "kind: pipeline\nversion: 1\nname: orders\ndescription: build {n}\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+        "kind: pipeline\nversion: 1\nname: orders\nvars: {{ build: {n} }}\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
         dir.join("in.csv").display(),
         dir.join(format!("out{n}.jsonl")).display()
     )
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_retired_version_warns_is_skipped_by_newest_and_cannot_launch() {
+async fn a_retired_version_warns_is_skipped_by_newest_and_cannot_launch_on_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let history = format!("sqlite:{}", dir.path().join("h.db").display());
-    let (client, base) = start(free_port(), Some(history)).await;
+    retire_and_revive(dir.path(), Some(history)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_version_warns_is_skipped_by_newest_and_cannot_launch_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    retire_and_revive(dir.path(), None).await;
+}
+
+async fn retire_and_revive(dir: &std::path::Path, history: Option<String>) {
+    let (client, base) = start(free_port(), history).await;
     for n in 1..=2 {
         let r = client
             .post(format!("{base}/v1/templates"))
-            .json(&json!({ "config": pipeline(dir.path(), n), "launch": n == 1 }))
+            .json(&json!({ "config": pipeline(dir, n), "launch": n == 1 }))
             .send()
             .await
             .unwrap();
@@ -127,7 +137,10 @@ async fn a_retired_version_warns_is_skipped_by_newest_and_cannot_launch() {
         .unwrap();
     assert_eq!(got["newest"], 1, "`newest` skips the retired v2: {got}");
     assert_eq!(got["deprecated_versions"][0]["version"], 2, "{got}");
-    assert_eq!(got["deprecated_versions"][0]["reason"], "bad build", "{got}");
+    assert_eq!(
+        got["deprecated_versions"][0]["reason"], "bad build",
+        "{got}"
+    );
 
     let run: Value = client
         .post(format!("{base}/v1/templates/orders/runs"))
@@ -146,7 +159,11 @@ async fn a_retired_version_warns_is_skipped_by_newest_and_cannot_launch() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 422, "a retired version cannot be launched");
+    assert_eq!(
+        r.status().as_u16(),
+        422,
+        "a retired version cannot be launched"
+    );
 
     let r = deprecate("2", json!({ "undo": true })).await;
     assert_eq!(r.status().as_u16(), 200);

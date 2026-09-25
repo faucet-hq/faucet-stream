@@ -73,10 +73,19 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
 /// Boot a server whose auth is the two-principal RBAC config. Returns the
 /// tempdir (kept alive for the server's lifetime — it holds the auth file).
 async fn spawn_rbac_server(port: u16) -> tempfile::TempDir {
+    spawn_rbac_server_with(port, |_| {}).await
+}
+
+async fn spawn_rbac_server_with(
+    port: u16,
+    tweak: impl FnOnce(&mut ServeArgs),
+) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let auth_path = dir.path().join("auth.yaml");
     std::fs::write(&auth_path, AUTH_CONFIG).unwrap();
-    let mut config = ServeConfig::from_args(args_with_auth_config(port, auth_path)).unwrap();
+    let mut args = args_with_auth_config(port, auth_path);
+    tweak(&mut args);
+    let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
         let _ = faucet_cli::serve::run_server(config, Default::default()).await;
@@ -513,6 +522,47 @@ async fn whoami_reports_each_principals_role_and_permissions() {
         .await
         .unwrap();
     assert_eq!(r.status(), 401);
+}
+
+/// #698 over `/mcp`: the template-lifecycle tools are listed for an admin
+/// only; an operator still gets `run_template`.
+#[cfg(all(feature = "templates", feature = "mcp"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_lists_the_template_lifecycle_tools_to_admins_only() {
+    let port = free_port();
+    let _dir = spawn_rbac_server_with(port, |a| {
+        a.mcp = true;
+        a.mcp_allow_mutations = true;
+    })
+    .await;
+    let client = reqwest::Client::new();
+    for (token, admin) in [("operator-tok", false), ("admin-tok", true)] {
+        let r: serde_json::Value = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let names: Vec<&str> = r["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{r}"))
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"run_template"), "{token}: {names:?}");
+        for t in [
+            "register_template",
+            "launch_template",
+            "rollback_template",
+            "deprecate_template",
+        ] {
+            assert_eq!(names.contains(&t), admin, "{token}: {t} in {names:?}");
+        }
+    }
 }
 
 #[test]

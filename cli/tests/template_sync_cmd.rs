@@ -278,3 +278,113 @@ async fn sync_fails_when_an_origin_is_unreadable_or_a_template_does_not_apply() 
 async fn schema_templates_sync_prints_the_sync_file_schema() {
     run(&["schema", "templates-sync"]).await.expect("schema");
 }
+
+/// #697: a catalog origin (`paths:`) that later deprecates the version this
+/// registry already holds retires that version here too, and the template is
+/// not mistaken for one that left the catalog.
+#[tokio::test]
+async fn a_version_the_catalog_deprecates_is_retired_in_the_registry() {
+    let gh = MockServer::start().await;
+    let mount = |deprecated: bool| {
+        let gh = &gh;
+        async move {
+            gh.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/hub/contents/source-templates"))
+                .and(query_param("ref", "main"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                    "name": "erp.yaml", "type": "file", "sha": "abc",
+                    "url": format!("{}/repos/acme/hub/contents/source-templates/erp.yaml?ref=main", gh.uri()),
+                }])))
+                .mount(gh)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/hub/contents/source-templates/erp.yaml"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(BODY))
+                .mount(gh)
+                .await;
+            let version = if deprecated {
+                json!({"version": 1, "commit": "a", "deprecated": true, "reason": "drops invoices"})
+            } else {
+                json!({"version": 1, "commit": "a"})
+            };
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/hub/contents/index.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    json!({"commit": "a", "sources": [{"id": "erp", "versions": [version]}], "sinks": []})
+                        .to_string(),
+                ))
+                .mount(gh)
+                .await;
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = format!("sqlite:{}", dir.path().join("t.db").display());
+    let sync = dir.path().join("sync.yaml");
+    std::fs::write(
+        &sync,
+        format!(
+            "version: 1\norigins:\n  - name: hub\n    prefix: plat-\n    launch: always\n    prune: deprecate\n    source:\n      type: github\n      config: {{ repo: acme/hub, paths: [source-templates], api_base: \"{}\" }}\n",
+            gh.uri()
+        ),
+    )
+    .unwrap();
+    let sync = sync.to_string_lossy().into_owned();
+    let args: Vec<String> = [
+        "template",
+        "sync",
+        "--store",
+        &store,
+        "--config",
+        &sync,
+        "--no-env-file",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let pull = || {
+        let args = args.clone();
+        async move {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            run(&argv).await
+        }
+    };
+    let registry = faucet_cli::templates::resolve_store_url(&store)
+        .await
+        .unwrap();
+
+    mount(false).await;
+    pull().await.expect("first pull registers v1");
+    let st = faucet_cli::templates::template_state(&registry, "plat-erp")
+        .await
+        .unwrap();
+    assert_eq!((st.stable, st.deprecated_versions.len()), (Some(1), 0));
+
+    mount(true).await;
+    pull().await.expect("the catalog now deprecates v1");
+    let st = faucet_cli::templates::template_state(&registry, "plat-erp")
+        .await
+        .unwrap();
+    let d = st.version_deprecation(1).expect("v1 retired here too");
+    assert_eq!(
+        d.record.reason.as_deref(),
+        Some("catalog v1 is deprecated: drops invoices")
+    );
+    assert_eq!(d.record.deprecated_by.as_deref(), Some("sync:hub"));
+    assert_eq!(
+        st.status,
+        faucet_cli::serve::history::templates::TemplateStatus::Launched,
+        "still in the catalog, so not retired as a whole"
+    );
+
+    // Pulling again changes nothing.
+    pull().await.expect("idempotent");
+    assert_eq!(
+        faucet_cli::templates::template_state(&registry, "plat-erp")
+            .await
+            .unwrap()
+            .deprecated_versions
+            .len(),
+        1
+    );
+}
