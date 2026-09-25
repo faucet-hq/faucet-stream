@@ -1235,8 +1235,18 @@ select {
 .tpl-matrix { margin-bottom: 18px; }
 .tpl-matrix-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 .tpl-matrix-head .tpl-h2 { margin: 6px 0 8px; }
-.tpl-matrix-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-.tpl-matrix-table { margin: 0; min-width: 100%; }
+/* The grid scrolls inside its own box both ways, with the sink header row and
+   the source column pinned, so a large catalog stays readable and the list
+   below it stays in reach. */
+.tpl-matrix-scroll { overflow: auto; max-height: 460px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.tpl-matrix-table { margin: 0; min-width: 100%; width: max-content; table-layout: auto; border-collapse: separate; border-spacing: 0; }
+.tpl-matrix-table th, .tpl-matrix-table td { width: auto; }
+.tpl-matrix-table td { padding: 7px 10px; vertical-align: middle; }
+.tpl-matrix-table thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); min-width: 92px; max-width: 128px; padding: 9px 10px; border-bottom: 1px solid var(--border); }
+.tpl-matrix-table thead th a, .tpl-matrix-table thead th .tpl-matrix-kind { display: block; overflow: hidden; text-overflow: ellipsis; }
+.tpl-matrix-table tbody th { position: sticky; left: 0; z-index: 1; background: var(--surface); max-width: 230px; min-width: 190px; padding: 7px 12px; border-right: 1px solid var(--border); overflow: hidden; text-overflow: ellipsis; }
+.tpl-matrix-table thead th.tpl-matrix-corner { left: 0; z-index: 3; text-align: left; border-right: 1px solid var(--border); }
+.tpl-matrix-table tbody tr:hover th { background: var(--surface-2); }
 .tpl-matrix-table th, .tpl-matrix-table td { text-align: center; white-space: nowrap; }
 .tpl-matrix-table thead th { vertical-align: bottom; }
 .tpl-matrix-table tbody th { text-align: left; font-weight: 600; text-transform: none; letter-spacing: 0; font-size: 0.9rem; }

@@ -261,11 +261,10 @@ function renderMatrix(idx) {
   const sinks = idx.sinks || [];
   const cells = new Map((idx.matrix || []).map((c) => [`${c.source}\u0000${c.sink}`, c]));
   const idOf = (t) => t.id || t.name;
-  const ownerTag = (t) => (t.owner ? `<span class="tpl-matrix-kind">@${escapeHtml(t.owner)}</span>` : "");
   const el = document.createElement("section");
   el.className = "tpl-matrix";
   const head = sinks
-    .map((k) => `<th title="${escapeHtml(k.description || "")}"><a href="#/templates/${encodeURIComponent(idOf(k))}" class="mono">${escapeHtml(k.name)}</a>${ownerTag(k)}<span class="tpl-matrix-kind">${escapeHtml(k.sink_type || "")}</span></th>`)
+    .map((k) => `<th title="${escapeHtml(idOf(k))}${k.description ? ` — ${escapeHtml(k.description)}` : ""}"><a href="#/templates/${encodeURIComponent(idOf(k))}" class="mono">${escapeHtml(k.name)}</a><span class="tpl-matrix-kind">${k.owner ? `@${escapeHtml(k.owner)} · ` : ""}${escapeHtml(k.sink_type || "")}</span></th>`)
     .join("");
   const rows = sources
     .map((s) => {
@@ -286,7 +285,8 @@ function renderMatrix(idx) {
           return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(plan)}">${ok ? `<a href="${href}">${ok}/${total}</a>` : "✗"}</td>`;
         })
         .join("");
-      return `<tr><th scope="row"><a href="#/templates/${encodeURIComponent(idOf(s))}" class="mono">${escapeHtml(s.name)}</a>${ownerTag(s)}<span class="tpl-matrix-kind">${escapeHtml(s.source_type || "")} · ${(s.streams || []).length} stream${(s.streams || []).length === 1 ? "" : "s"}</span></th>${tds}</tr>`;
+      const n = (s.streams || []).length;
+      return `<tr><th scope="row" title="${escapeHtml(idOf(s))}"><a href="#/templates/${encodeURIComponent(idOf(s))}" class="mono">${escapeHtml(s.name)}</a><span class="tpl-matrix-kind">${s.owner ? `@${escapeHtml(s.owner)} · ` : ""}${escapeHtml(s.source_type || "")} · ${n} stream${n === 1 ? "" : "s"}</span></th>${tds}</tr>`;
     })
     .join("");
   el.innerHTML = `
