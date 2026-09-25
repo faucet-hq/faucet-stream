@@ -51,8 +51,9 @@ pub async fn handle(
     // The server's run-history backend doubles as the pipeline-template registry
     // (#444), so an agent on `/mcp` sees the same templates the `/v1/templates`
     // endpoints and `faucet template` do.
-    let ctx =
-        crate::mcp::McpContext::new(auth, can_mutate).with_config_execution(can_execute_config);
+    let ctx = crate::mcp::McpContext::new(auth, can_mutate)
+        .with_config_execution(can_execute_config)
+        .with_template_admin(actor.role.grants(Permission::TemplateAdmin));
     #[cfg(feature = "templates")]
     let ctx = ctx.with_templates(state.history());
     let response = crate::mcp::handle_message(&ctx, &body).await;

@@ -15,7 +15,7 @@
       </a>
       <nav class="nav">
         <button id="nav-runs">Runs</button>
-        <button id="nav-submit">Submit</button>
+        <button id="nav-submit" data-perm="run_write">Submit</button>
         <button id="nav-templates">Templates</button>
         <button id="nav-schemas">Schemas</button>
         <button id="nav-datasets">Datasets</button>
@@ -24,6 +24,7 @@
       <div class="spacer"></div>
       <select id="tz-select" class="tz-select" title="Display timezone — how all times are shown"></select>
       <button id="theme-toggle" class="icon-btn" title="Toggle theme">◐</button>
+      <span id="whoami" class="whoami" hidden></span>
       <button id="token-btn" class="icon-btn" title="Access token">🔑</button>
     </header>
     <main id="view" class="view"><div class="empty">loading…</div></main>

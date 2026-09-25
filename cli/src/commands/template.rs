@@ -377,6 +377,12 @@ async fn show(args: TemplateShowArgs) -> CliResult<()> {
         if state.newest == Some(*v) {
             marks.push("newest".into());
         }
+        if let Some(d) = state.version_deprecation(*v) {
+            marks.push(match &d.record.reason {
+                Some(r) => format!("DEPRECATED ({r})"),
+                None => "DEPRECATED".into(),
+            });
+        }
         marks.extend(
             state
                 .tags
@@ -512,6 +518,37 @@ async fn rollback(args: TemplateRollbackArgs) -> CliResult<()> {
 
 async fn deprecate(args: TemplateDeprecateArgs) -> CliResult<()> {
     let store = connect(&args.common).await?;
+    if let Some(raw) = &args.version {
+        let version =
+            crate::templates::resolve_version(&store, &args.id, VersionSelector::parse(raw)?)
+                .await?;
+        crate::templates::set_version_deprecated(
+            &store,
+            &args.id,
+            version,
+            args.reason.clone(),
+            None,
+            !args.undo,
+        )
+        .await?;
+        if args.common.json {
+            println!(
+                "{}",
+                to_pretty(&serde_json::json!({
+                    "id": args.id, "version": version, "deprecated": !args.undo,
+                }))?
+            );
+        } else if args.undo {
+            println!("v{version} of '{}' is live again", args.id);
+        } else {
+            println!(
+                "v{version} of '{}' is deprecated\n  pinned runs and channels pointing at it keep \
+                 working but warn; `newest` skips it and `launch` refuses it",
+                args.id
+            );
+        }
+        return Ok(());
+    }
     let status =
         crate::templates::set_deprecated(&store, &args.id, args.reason.clone(), None, !args.undo)
             .await?;
@@ -595,6 +632,10 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
     let env = crate::params::collect_env_overrides(&args.param_env)?;
     let selector = VersionSelector::parse(&args.version)?;
     let want = crate::templates::resolve_version(&store, &args.id, selector).await?;
+    let state = crate::templates::template_state(&store, &args.id).await?;
+    if let Some(warning) = crate::templates::deprecation_warning(&state, want) {
+        eprintln!("warning: '{}' — {warning}", args.id);
+    }
     let sink = crate::templates::SinkChoice {
         id: args.sink.clone(),
         version: VersionSelector::parse(&args.sink_version)?,
@@ -1204,6 +1245,7 @@ pipeline:
             id: "cli-tpl".into(),
             reason: Some("superseded".into()),
             undo: false,
+            version: None,
             common: common(&store, false),
         })
         .await
@@ -1212,10 +1254,48 @@ pipeline:
             id: "cli-tpl".into(),
             reason: None,
             undo: true,
+            version: None,
             common: common(&store, true),
         })
         .await
         .expect("undeprecate");
+
+        // One version: retired, refused by launch, then revived (#697).
+        deprecate(TemplateDeprecateArgs {
+            id: "cli-tpl".into(),
+            reason: Some("bad build".into()),
+            undo: false,
+            version: Some("1".into()),
+            common: common(&store, false),
+        })
+        .await
+        .expect("deprecate v1");
+        let err = launch(TemplateLaunchArgs {
+            id: "cli-tpl".into(),
+            version: "1".into(),
+            common: common(&store, false),
+        })
+        .await
+        .expect_err("a deprecated version cannot be launched");
+        assert!(err.to_string().contains("deprecated"), "{err}");
+        deprecate(TemplateDeprecateArgs {
+            id: "cli-tpl".into(),
+            reason: None,
+            undo: true,
+            version: Some("1".into()),
+            common: common(&store, true),
+        })
+        .await
+        .expect("revive v1");
+        deprecate(TemplateDeprecateArgs {
+            id: "cli-tpl".into(),
+            reason: None,
+            undo: true,
+            version: Some("1".into()),
+            common: common(&store, false),
+        })
+        .await
+        .expect("reviving a live version is a no-op");
 
         // Delete a single version, then the whole template.
         delete(TemplateDeleteArgs {

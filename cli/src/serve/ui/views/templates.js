@@ -54,8 +54,8 @@ export async function renderTemplates(container) {
       <div class="page-head">
         <h1>Templates</h1>
         <button class="btn-ghost" id="t-refresh">↻</button>
-        <button class="btn-ghost" id="t-sync" hidden title="Pull templates from the configured remote origins">Sync from origins</button>
-        <button class="btn-primary" id="t-new">Register a template</button>
+        <button class="btn-ghost" id="t-sync" data-perm="template_admin" hidden title="Pull templates from the configured remote origins">Sync from origins</button>
+        <button class="btn-primary" id="t-new" data-perm="template_admin">Register a template</button>
       </div>
       <div id="t-register" hidden></div>
       <div id="t-sync-panel" hidden></div>
@@ -604,7 +604,10 @@ export async function renderTemplateDetail(container, { id, query }) {
   }
 
   const reload = () => renderTemplateDetail(container, { id, query });
-  const st = { status: d.status, versions: d.versions, stable: d.stable, previous: d.previous, newest: d.newest, tags: d.tags || {}, deprecation: d.deprecation };
+  const st = { status: d.status, versions: d.versions, stable: d.stable, previous: d.previous, newest: d.newest, tags: d.tags || {}, deprecation: d.deprecation, deprecated_versions: d.deprecated_versions || [] };
+  // A pipeline or source template runs from this page; the sink/deployment
+  // panels in the same slot are read-only information, visible to everyone.
+  const runnable = !["sink-template", "deployment"].includes(kindOf(d));
 
   container.innerHTML = `
     <div class="page">
@@ -614,10 +617,10 @@ export async function renderTemplateDetail(container, { id, query }) {
         ${kindPill(kindOf(d))}
         ${statusPill(st.status)}
         <div class="detail-actions">
-          <button class="btn-primary" id="t-newver" title="register a new version of this template">+ New version</button>
-          <button class="btn-ghost" id="t-rollback" ${st.previous == null ? "disabled" : ""}
+          <button class="btn-primary" id="t-newver" data-perm="template_admin" title="register a new version of this template">+ New version</button>
+          <button class="btn-ghost" id="t-rollback" data-perm="template_admin" ${st.previous == null ? "disabled" : ""}
             title="${st.previous == null ? "no earlier launch to roll back to" : `re-launch v${st.previous}`}">Roll back</button>
-          <button class="${st.status === "deprecated" ? "btn-ghost" : "btn-warn"}" id="t-deprecate">${st.status === "deprecated" ? "Revive" : "Deprecate"}</button>
+          <button class="${st.status === "deprecated" ? "btn-ghost" : "btn-warn"}" id="t-deprecate" data-perm="template_admin">${st.status === "deprecated" ? "Revive" : "Deprecate"}</button>
         </div>
       </div>
 
@@ -638,11 +641,13 @@ export async function renderTemplateDetail(container, { id, query }) {
       ${d.description ? `<p class="tpl-desc">${escapeHtml(d.description)}</p>` : ""}
 
       <h2 class="tpl-h2">Versions</h2>
-      <p class="tpl-desc tpl-versions-hint">Click a version to run it below.</p>
+      <p class="tpl-desc tpl-versions-hint"${runnable ? ' data-perm="run_write"' : ""}>Click a version to run it below.</p>
       <div id="t-versions" class="tpl-versions"></div>
 
-      <h2 class="tpl-h2">${{ "sink-template": "Compose with a source template", deployment: "Apply to a run" }[kindOf(d)] || "Trigger a run"}</h2>
-      <div id="t-trigger"></div>
+      <div${runnable ? ' data-perm="run_write"' : ""}>
+        <h2 class="tpl-h2">${{ "sink-template": "Compose with a source template", deployment: "Apply to a run" }[kindOf(d)] || "Trigger a run"}</h2>
+        <div id="t-trigger"></div>
+      </div>
 
       <h2 class="tpl-h2">Launch history</h2>
       <div id="t-launches"></div>
@@ -719,24 +724,32 @@ function renderVersions(host, id, st, d, reload) {
     return;
   }
   for (const v of st.versions) {
+    const retired = (st.deprecated_versions || []).find((x) => x.version === v);
     const row = document.createElement("div");
-    row.className = "tpl-version" + (st.stable === v ? " tpl-version-live" : "");
+    row.className = "tpl-version" + (st.stable === v ? " tpl-version-live" : "") + (retired ? " tpl-version-retired" : "");
     row.dataset.version = String(v);
-    const pills = channelsFor(v, st)
-      .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
-      .join("");
+    const pills =
+      (retired
+        ? `<span class="pill pill-cancelled" title="${escapeHtml(retired.reason ? `deprecated: ${retired.reason}` : "deprecated")}">deprecated</span>`
+        : "") +
+      channelsFor(v, st)
+        .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
+        .join("");
+    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : `make v${v} live for unpinned runs`;
     row.innerHTML = `
       <span class="tpl-vnum mono">v${v}</span>
       <span class="tpl-vchannels">${pills || `<span class="run-meta">no channel</span>`}</span>
-      <select class="tpl-assign" title="point a channel at v${v}">
+      <select class="tpl-assign" data-perm="template_admin" title="point a channel at v${v}">
         <option value="">assign channel</option>
         ${ASSIGNABLE.map((c) => `<option value="${c}">${c}</option>`).join("")}
       </select>
-      <button class="btn-ghost tpl-launch" ${st.stable === v ? "disabled" : ""}
-        title="${st.stable === v ? "already live" : `make v${v} live for unpinned runs`}">Launch</button>
+      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired ? "disabled" : ""}
+        title="${launchTitle}">Launch</button>
       <button class="btn-ghost tpl-view">Config</button>
       <button class="btn-ghost tpl-view-clean" title="comments stripped, canonical YAML">Clean</button>
-      <button class="btn-danger tpl-del">Delete</button>
+      <button class="${retired ? "btn-ghost" : "btn-warn"} tpl-vdeprecate" data-perm="template_admin"
+        title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
+      <button class="btn-danger tpl-del" data-perm="template_admin">Delete</button>
       <pre class="tpl-body" hidden></pre>`;
 
     row.querySelector(".tpl-assign").onchange = async (ev) => {
@@ -747,6 +760,20 @@ function renderVersions(host, id, st, d, reload) {
         toast(`${tag} → v${v}`);
         reload();
       } catch (e) { toast(e.message, "error"); ev.target.value = ""; }
+    };
+
+    row.querySelector(".tpl-vdeprecate").onclick = async () => {
+      const body = { undo: !!retired };
+      if (!retired) {
+        const reason = prompt(`Why is v${v} being retired? (optional)`);
+        if (reason === null) return;
+        if (reason.trim()) body.reason = reason.trim();
+      }
+      try {
+        await api(`/v1/templates/${encodeURIComponent(id)}/versions/${v}/deprecate`, { method: "POST", body });
+        toast(retired ? `v${v} is live again` : `v${v} is deprecated`);
+        reload();
+      } catch (e) { toast(e.message, "error"); }
     };
 
     row.querySelector(".tpl-launch").onclick = async () => {
@@ -1097,7 +1124,10 @@ function versionOptions(state) {
   );
   return [
     ...channels.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)} (v${channelTarget(c, state)})</option>`),
-    ...(state.versions || []).map((v) => `<option value="${v}">v${v} (pinned)</option>`),
+    ...(state.versions || []).map((v) => {
+      const retired = (state.deprecated_versions || []).some((x) => x.version === v);
+      return `<option value="${v}">v${v} (pinned${retired ? ", deprecated" : ""})</option>`;
+    }),
   ].join("");
 }
 

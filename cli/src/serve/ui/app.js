@@ -9,6 +9,7 @@ import { renderTemplates, renderTemplateDetail } from "./views/templates.js";
 import { renderDatasets, renderDatasetDetail } from "./views/datasets.js";
 import { renderLineage } from "./views/lineage.js";
 import { route } from "./router.js";
+import { loadAccess } from "./access.js";
 
 // --- theme ---
 const THEME_KEY = "faucet.theme";
@@ -91,6 +92,7 @@ async function main() {
   registerRoutes();
   // If the server requires auth and we have no valid token, prompt first.
   if (!(await authOk())) openTokenModal();
+  await loadAccess();
   startRouter(document.getElementById("view"));
 }
 main();

@@ -153,3 +153,59 @@ async fn postgres_backend_full_lifecycle() {
         RunStatus::Failed
     );
 }
+
+/// #697 on the Postgres dialect: a version deprecation round-trips, `newest`
+/// skips it, and deleting the version clears it.
+#[tokio::test]
+async fn postgres_version_deprecation_round_trips() {
+    use faucet_cli::serve::history::templates::{DeprecationRecord, TemplateDraft, TemplateId};
+    use faucet_cli::serve::load::ConfigFormat;
+    let Ok(url) = std::env::var("FAUCET_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_version_deprecation_round_trips: FAUCET_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let h = PostgresHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        "pg-test".into(),
+    )
+    .await
+    .expect("connect postgres history");
+    let id = format!("pgv{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    for _ in 0..2 {
+        h.template_register(&TemplateDraft {
+            id: TemplateId::parse(&id).unwrap(),
+            name: Some(id.clone()),
+            description: None,
+            body: format!("version: 1\nname: {id}\n"),
+            format: ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+            kind: faucet_cli::hub::TemplateKind::Pipeline,
+        })
+        .await
+        .unwrap();
+    }
+    let marker = DeprecationRecord {
+        deprecated_at: Utc::now(),
+        deprecated_by: Some("admin".into()),
+        reason: Some("bad build".into()),
+    };
+    h.template_set_version_deprecation(&id, 2, Some(&marker))
+        .await
+        .unwrap();
+    let st = h.template_state(&id).await.unwrap();
+    assert_eq!(st.newest, Some(1));
+    assert_eq!(st.deprecated_versions.len(), 1);
+    let stored = &st.deprecated_versions[0].record;
+    assert_eq!(stored.reason.as_deref(), Some("bad build"));
+    assert_eq!(stored.deprecated_by.as_deref(), Some("admin"));
+    h.template_delete(&id, None).await.unwrap();
+    assert!(
+        h.template_version_deprecations(&id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

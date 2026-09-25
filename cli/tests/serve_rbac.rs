@@ -16,14 +16,18 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Two principals: `admin-tok` → admin, `viewer-tok` → viewer.
+/// Three principals: `admin-tok` → admin, `viewer-tok` → viewer,
+/// `operator-tok` → operator.
 const AUTH_CONFIG: &str = "principals:\n\
     \x20 - name: alice\n\
     \x20   token: admin-tok\n\
     \x20   role: admin\n\
     \x20 - name: bob\n\
     \x20   token: viewer-tok\n\
-    \x20   role: viewer\n";
+    \x20   role: viewer\n\
+    \x20 - name: carol\n\
+    \x20   token: operator-tok\n\
+    \x20   role: operator\n";
 
 fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArgs {
     ServeArgs {
@@ -299,6 +303,7 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::POST, "/v1/dlq/discard"),
         (Method::GET, "/v1/audit"),
         (Method::POST, "/v1/reload"),
+        (Method::GET, "/v1/whoami"),
         (Method::POST, "/mcp"),
     ];
     #[cfg(feature = "triggers")]
@@ -327,6 +332,15 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::POST, "/v1/templates/{id}/launch"),
         (Method::POST, "/v1/templates/{id}/rollback"),
         (Method::POST, "/v1/templates/{id}/deprecate"),
+        (
+            Method::POST,
+            "/v1/templates/{id}/versions/{version}/deprecate",
+        ),
+    ]);
+    #[cfg(feature = "templates-sync")]
+    v.extend([
+        (Method::POST, "/v1/templates/sync"),
+        (Method::POST, "/v1/templates/{id}/publish"),
     ]);
     v
 }
@@ -426,6 +440,79 @@ fn an_operator_token_is_denied_the_audit_log_and_reload() {
     assert!(!Role::Operator.grants(Permission::Reload));
     assert!(Role::Admin.grants(Permission::AuditRead));
     assert!(Role::Admin.grants(Permission::Reload));
+}
+
+/// #698: an operator runs registered templates but never changes what they
+/// are — every template lifecycle write is admin-only.
+#[cfg(feature = "templates")]
+#[test]
+fn an_operator_triggers_templates_but_cannot_manage_them() {
+    use axum::http::Method;
+    use faucet_cli::serve::rbac::{Role, required_permission};
+    let allowed =
+        |m: &Method, p: &str| required_permission(m, p).is_some_and(|x| Role::Operator.grants(x));
+    assert!(allowed(&Method::POST, "/v1/templates/{id}/runs"));
+    assert!(allowed(&Method::GET, "/v1/templates/{id}"));
+    for path in [
+        "/v1/templates",
+        "/v1/templates/{id}/tags",
+        "/v1/templates/{id}/launch",
+        "/v1/templates/{id}/rollback",
+        "/v1/templates/{id}/deprecate",
+        "/v1/templates/{id}/versions/{version}/deprecate",
+        "/v1/templates/sync",
+        "/v1/templates/{id}/publish",
+    ] {
+        assert!(
+            !allowed(&Method::POST, path),
+            "operator reached POST {path}"
+        );
+    }
+    assert!(!allowed(&Method::DELETE, "/v1/templates/{id}"));
+}
+
+/// `GET /v1/whoami` reports each principal's own role and permissions.
+#[tokio::test(flavor = "multi_thread")]
+async fn whoami_reports_each_principals_role_and_permissions() {
+    let port = free_port();
+    let _dir = spawn_rbac_server(port).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    for (token, principal, role, can_run, can_manage) in [
+        ("viewer-tok", "bob", "viewer", false, false),
+        ("operator-tok", "carol", "operator", true, false),
+        ("admin-tok", "alice", "admin", true, true),
+    ] {
+        let r = client
+            .get(format!("{base}/v1/whoami"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{role}");
+        let me: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(me["principal"], principal);
+        assert_eq!(me["role"], role);
+        let perms: Vec<&str> = me["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(perms.contains(&"identity"), "{role}: {perms:?}");
+        assert_eq!(perms.contains(&"run_write"), can_run, "{role}: {perms:?}");
+        assert_eq!(
+            perms.contains(&"template_admin"),
+            can_manage,
+            "{role}: {perms:?}"
+        );
+    }
+    let r = client
+        .get(format!("{base}/v1/whoami"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
 }
 
 #[test]

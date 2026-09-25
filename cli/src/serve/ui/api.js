@@ -11,6 +11,10 @@ export const token = {
 const unauthorizedHandlers = new Set();
 export const onUnauthorized = (fn) => unauthorizedHandlers.add(fn);
 
+// Listeners notified when a request gets a 403 (the caller's role may have changed).
+const forbiddenHandlers = new Set();
+export const onForbidden = (fn) => forbiddenHandlers.add(fn);
+
 export class ApiError extends Error {
   constructor(status, code, message, details, retryAfter) {
     super(message || code || `HTTP ${status}`);
@@ -40,6 +44,7 @@ export async function api(path, { method = "GET", body, headers } = {}) {
   if (resp.status === 204) return null;
   const text = await resp.text();
   const json = text ? safeJson(text) : null;
+  if (resp.status === 403 && path !== "/v1/whoami") forbiddenHandlers.forEach((fn) => fn());
   if (!resp.ok) {
     const e = json && json.error ? json.error : {};
     const retryAfter = Number(resp.headers.get("retry-after")) || undefined;

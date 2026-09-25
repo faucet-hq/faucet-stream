@@ -1318,9 +1318,11 @@ select {
 .tpl-register textarea { min-height: 220px; }
 
 .tpl-versions { display: flex; flex-direction: column; gap: 6px; }
+/* Flex, not grid: a control hidden for the caller's role (#698) must leave no
+   empty track behind, and the fixed widths below keep rows aligned. */
 .tpl-version {
-  display: grid;
-  grid-template-columns: 52px 1fr auto auto auto auto auto;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
@@ -1332,17 +1334,21 @@ select {
 .tpl-version[data-version] { cursor: pointer; }
 .tpl-versions-hint { margin: -4px 0 8px; font-size: 0.8rem; }
 .tpl-version-picked { box-shadow: 0 0 0 2px var(--brand-ring); background: color-mix(in srgb, var(--brand-tint) 55%, var(--surface)); }
-.tpl-vnum { font-weight: 700; font-size: 0.9rem; }
-.tpl-vchannels { display: flex; flex-wrap: wrap; gap: 5px; }
+.tpl-vnum { font-weight: 700; font-size: 0.9rem; flex: 0 0 42px; }
+.tpl-vchannels { display: flex; flex-wrap: wrap; gap: 5px; flex: 1 1 auto; min-width: 0; }
+.tpl-version .tpl-vdeprecate { min-width: 96px; }
+.tpl-version .tpl-launch { min-width: 76px; }
 .tpl-assign { max-width: 160px; }
-.tpl-version .btn-ghost, .tpl-version .btn-danger { padding: 5px 11px; font-size: 0.8rem; }
+.tpl-version .btn-ghost, .tpl-version .btn-danger, .tpl-version .btn-warn { padding: 5px 11px; font-size: 0.8rem; }
+.tpl-version-retired { background: color-mix(in srgb, var(--surface-sunken) 60%, var(--surface)); }
+.tpl-version-retired .tpl-vnum { color: var(--ink-dim); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--ink-faint) 70%, transparent); }
 .tpl-launch-wrap { overflow-x: auto; }
 .tpl-launch-tbl th:nth-child(1), .tpl-launch-tbl td:nth-child(1) { width: 4rem; }
 .tpl-launch-tbl th:nth-child(2), .tpl-launch-tbl td:nth-child(2) { width: 6rem; }
 .tpl-launch-tbl th:nth-child(3), .tpl-launch-tbl td:nth-child(3) { width: 14rem; }
 .tpl-launch-when { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tpl-body {
-  grid-column: 1 / -1;
+  flex: 1 1 100%;
   margin: 6px 0 0;
   max-height: 340px;
   overflow: auto;
@@ -1674,3 +1680,10 @@ select {
    never enabled with its defaults. */
 .sf-optional-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 34px; font-size: 0.8rem; color: var(--ink-dim); cursor: pointer; }
 .sf-optional .sf-object { margin-top: 6px; }
+
+/* Signed-in identity (#698): principal + role next to the token button. */
+.whoami { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; font-size: 0.78rem; color: var(--ink-dim); white-space: nowrap; }
+.whoami-name { font-family: var(--font-mono); color: var(--ink); max-width: 14ch; overflow: hidden; text-overflow: ellipsis; }
+.whoami-role { padding: 1px 7px; border-radius: 999px; font-size: 0.68rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; background: var(--brand-tint); color: var(--brand); }
+.whoami[data-role="viewer"] .whoami-role { background: color-mix(in srgb, var(--ink-faint) 16%, transparent); color: var(--ink-dim); }
+@media (max-width: 720px) { .whoami-name { display: none; } }

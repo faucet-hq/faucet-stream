@@ -49,6 +49,15 @@ is stored in browser `localStorage` and sent as `Authorization: Bearer <token>`
 on every subsequent `/v1` request. A key-icon button in the top bar lets you
 update or clear it at any time.
 
+The console then asks `GET /v1/whoami` who the token belongs to, shows the
+principal and role beside the key icon, and hides what that role cannot do. A
+**viewer** (shown as *read-only*) sees no Submit, Run, Cancel, Delete, Launch or
+Deprecate controls; an **operator** can submit and trigger runs but not
+register, launch, roll back, deprecate, assign channels to, sync or delete
+templates, which is **admin** work. Hiding a control is only a convenience: the
+server refuses the action either way, and if a token loses a role mid-session
+the next refused call makes the console re-read it and redraw.
+
 > **Security:** the bearer token is as sensitive as the API itself — anyone who
 > obtains it can submit arbitrary pipeline configs with the server's identity
 > (see the [security model](./serve.md#️-security-model--read-before-exposing)).
@@ -301,7 +310,8 @@ The `serve-ui` feature ships three new bearer-gated endpoints that the console
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/schemas` | Catalog of all compiled sources, sinks, transforms, and state-store kinds. |
-| `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector or transform (`kind` ∈ `source`/`sink`/`transform`). Returns 404 for unknown kind or name. |
+| `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector, transform, or pipeline block (`kind` ∈ `source`/`sink`/`transform`/`block`). Returns 404 for unknown kind or name. |
+| `GET` | `/v1/whoami` | The caller's principal, role and permissions; the console uses it to hide controls the role cannot use. |
 | `POST` | `/v1/doctor` | Validate and probe a submitted config without running it. Returns 200 (all probes pass) or 422 (any probe fails) with a probe report. Request body: `{ "config": "<yaml-or-json>", "config_format": "yaml" }`. |
 
 With the `catalog` feature the console also drives the local-output endpoints —

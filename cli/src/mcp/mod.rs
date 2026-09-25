@@ -41,6 +41,13 @@ pub struct McpContext {
     /// the schema-read scope the route's baseline uses (#456 C4). The stdio
     /// transport runs as the local user and sets this `true`.
     pub allow_config_execution: bool,
+    /// Whether the template-lifecycle tools (`register_template`,
+    /// `launch_template`, `rollback_template`, `deprecate_template`) are exposed
+    /// and callable, on top of `allow_mutations`. The HTTP transport passes the
+    /// caller's `TemplateAdmin` decision (admin-only, #698); `run_template` needs
+    /// only `allow_mutations`. The stdio transport runs as the local user and
+    /// sets this `true`.
+    pub allow_template_admin: bool,
     /// The pipeline template registry (#444), when one is wired: `faucet serve
     /// --mcp` passes its own `--history` backend; `faucet mcp` needs
     /// `--template-store`. Absent = the template tools are not advertised at all,
@@ -58,6 +65,7 @@ impl McpContext {
             auth,
             allow_mutations,
             allow_config_execution: true,
+            allow_template_admin: true,
             #[cfg(feature = "templates")]
             templates: None,
         }
@@ -67,6 +75,13 @@ impl McpContext {
     /// transport passes the caller's RBAC decision here.
     pub fn with_config_execution(mut self, allow: bool) -> Self {
         self.allow_config_execution = allow;
+        self
+    }
+
+    /// Set whether the template-lifecycle tools are available. The HTTP
+    /// transport passes the caller's RBAC decision here.
+    pub fn with_template_admin(mut self, allow: bool) -> Self {
+        self.allow_template_admin = allow;
         self
     }
 

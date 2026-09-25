@@ -2,7 +2,7 @@
 //! API (#444).
 //!
 //! Thin adapters over [`crate::templates`]: deserialize, call, map to a status
-//! code. Registration/read/delete need the `TemplateWrite` / `TemplateRead`
+//! code. Registration/read/delete need the `TemplateAdmin` / `TemplateRead`
 //! permissions; triggering a run needs **both** `TemplateRead` (to resolve the
 //! template) and `RunWrite` (to start a run), and then flows through the very
 //! same [`crate::serve::runner::submit`] as `POST /v1/runs` — so idempotency
@@ -572,6 +572,55 @@ pub async fn deprecate_template(
     ))
 }
 
+/// `POST /v1/templates/{id}/versions/{version}/deprecate` → 200 / 404 / 422.
+///
+/// Retires (or, with `undo`, revives) one version (#697). It keeps running when
+/// pinned or when `stable` or a channel points at it, but `newest` skips it,
+/// `launch` refuses it, and every trigger of it carries a `deprecated` warning.
+pub async fn deprecate_version(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path((id, version)): Path<(String, String)>,
+    Json(body): Json<DeprecateBody>,
+) -> Result<Json<serde_json::Value>, ServeError> {
+    let s = store(&state);
+    let selector = VersionSelector::parse(&version).map_err(map_err)?;
+    let version = crate::templates::resolve_version(&s, &id, selector)
+        .await
+        .map_err(map_err)?;
+    crate::templates::set_version_deprecated(
+        &s,
+        &id,
+        version,
+        body.reason.clone(),
+        Some(&actor.principal),
+        !body.undo,
+    )
+    .await
+    .map_err(map_err)?;
+    tracing::info!(
+        principal = %actor.principal,
+        template = %id,
+        version,
+        deprecated = !body.undo,
+        "pipeline template version deprecation changed"
+    );
+    crate::serve::audit::write(
+        &state,
+        &actor,
+        "template.version_deprecate",
+        None,
+        None,
+        "ok",
+    )
+    .await;
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "version": version,
+        "deprecated": !body.undo,
+    })))
+}
+
 // ── POST /v1/templates/{id}/runs ────────────────────────────────────────────
 
 /// `POST /v1/templates/{id}/runs` request body. Everything after `params`/`env`
@@ -725,15 +774,12 @@ pub async fn trigger_template(
     let tstate = crate::templates::template_state(&s, &id)
         .await
         .map_err(map_err)?;
-    if tstate.status == crate::serve::history::templates::TemplateStatus::Deprecated {
+    let deprecated = crate::templates::deprecation_warning(&tstate, want);
+    if let Some(reason) = &deprecated {
         tracing::warn!(
             template = %id,
             version = want,
-            reason = tstate
-                .deprecation
-                .as_ref()
-                .and_then(|d| d.reason.as_deref())
-                .unwrap_or("(none given)"),
+            reason = %reason,
             "triggering a DEPRECATED pipeline template"
         );
     }
@@ -846,15 +892,7 @@ pub async fn trigger_template(
             overlay_contributes: materialized.overlay_contributes,
             warnings: materialized.warnings,
             params: materialized.params_redacted,
-            deprecated: (tstate.status
-                == crate::serve::history::templates::TemplateStatus::Deprecated)
-                .then(|| {
-                    tstate
-                        .deprecation
-                        .as_ref()
-                        .and_then(|d| d.reason.clone())
-                        .unwrap_or_else(|| "this template is deprecated".to_string())
-                }),
+            deprecated,
         }),
     ))
 }
@@ -1528,6 +1566,104 @@ write_mode_aliases:
     }
 
     #[tokio::test]
+    async fn a_deprecated_version_warns_skips_newest_and_cannot_be_launched() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        register_demo(&state, &dir.path().join("v1.jsonl")).await; // v1 live
+        register_demo_opts(&state, &dir.path().join("v2.jsonl"), false).await; // v2 build
+
+        let body = deprecate_version(
+            State(state.clone()),
+            Extension(actor()),
+            Path(("tpl-demo".into(), "newest".into())),
+            Json(DeprecateBody {
+                reason: Some("bad build".into()),
+                undo: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            (body["version"].as_u64(), body["deprecated"].as_bool()),
+            (Some(2), Some(true))
+        );
+
+        let st = crate::templates::template_state(&store(&state), "tpl-demo")
+            .await
+            .unwrap();
+        assert_eq!(st.newest, Some(1), "`newest` skips the retired v2");
+        assert_eq!(
+            st.status,
+            crate::serve::history::templates::TemplateStatus::Launched
+        );
+
+        // A pinned run of it still starts, and says why it should not.
+        let resp = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(TriggerBody {
+                version: Some(VersionSelector::Pinned(2)),
+                params: [("tag".to_string(), json!("x"))].into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("a pinned deprecated version still runs")
+        .1
+        .0;
+        assert_eq!(
+            resp.deprecated.as_deref(),
+            Some("v2 is deprecated: bad build")
+        );
+
+        let err = launch_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(LaunchBody {
+                version: Some(VersionSelector::Pinned(2)),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Unprocessable { .. }), "{err:?}");
+
+        // Revive it; an unknown version or selector is a clear error.
+        let revived = deprecate_version(
+            State(state.clone()),
+            Extension(actor()),
+            Path(("tpl-demo".into(), "2".into())),
+            Json(DeprecateBody {
+                reason: None,
+                undo: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(revived["deprecated"], false);
+        let st = crate::templates::template_state(&store(&state), "tpl-demo")
+            .await
+            .unwrap();
+        assert_eq!(st.newest, Some(2));
+        for bad in ["9", "latest"] {
+            assert!(
+                deprecate_version(
+                    State(state.clone()),
+                    Extension(actor()),
+                    Path(("tpl-demo".into(), bad.into())),
+                    Json(DeprecateBody::default()),
+                )
+                .await
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn promote_moves_a_channel_without_touching_what_is_live() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state();
@@ -1927,7 +2063,7 @@ fn require_sync(
 
 /// `POST /v1/templates/sync` → 200 with one report per origin. Registers,
 /// launches, and deprecations are attributed to the calling principal.
-/// Requires `TemplateWrite`; audited as `template.sync`.
+/// Requires `TemplateAdmin`; audited as `template.sync`.
 #[cfg(feature = "templates-sync")]
 pub async fn sync_templates(
     State(state): State<ServerState>,
@@ -1988,7 +2124,7 @@ pub struct PublishBody {
 }
 
 /// `POST /v1/templates/{id}/publish` → 200 with where the file landed.
-/// Requires `TemplateWrite`; audited as `template.publish`.
+/// Requires `TemplateAdmin`; audited as `template.publish`.
 #[cfg(feature = "templates-sync")]
 pub async fn publish_template(
     State(state): State<ServerState>,
