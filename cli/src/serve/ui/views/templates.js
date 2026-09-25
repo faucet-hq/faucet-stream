@@ -73,12 +73,13 @@ export async function renderTemplates(container) {
           <span class="tpl-filter-label">kind</span>
           <button type="button" class="tpl-chip is-on" data-kind="source-template">source</button>
           <button type="button" class="tpl-chip is-on" data-kind="sink-template">sink</button>
-          <button type="button" class="tpl-chip is-on" data-kind="deployment">deployment</button>
-          <button type="button" class="tpl-chip is-on" data-kind="pipeline">pipeline</button>
+          <button type="button" class="tpl-chip" data-kind="deployment">deployment</button>
+          <button type="button" class="tpl-chip" data-kind="pipeline">pipeline</button>
         </div>
       </div>
       <div class="tpl-list-head" id="t-list-head" hidden>
         <span>status</span>
+        <span>kind</span>
         <button type="button" class="tpl-sort" data-sort="name">name<span class="tpl-sort-caret"></span></button>
         <button type="button" class="tpl-sort tpl-col-r" data-sort="updated">last updated<span class="tpl-sort-caret"></span></button>
         <span class="tpl-col-r">live</span>
@@ -125,8 +126,9 @@ export async function renderTemplates(container) {
     };
   });
 
-  // Kind filter — all three kinds on by default.
-  const kindFilter = new Set(KINDS);
+  // Kind filter — source and sink templates on by default; deployments and
+  // pipelines are one chip away.
+  const kindFilter = new Set(["source-template", "sink-template"]);
   container.querySelectorAll("#t-kind-filter .tpl-chip").forEach((chip) => {
     chip.onclick = () => {
       const k = chip.dataset.kind;
@@ -310,14 +312,15 @@ function listRow(t) {
   const live = st.stable == null ? "—" : `v${st.stable}`;
   el.innerHTML = `
     ${statusPill(st.status || "draft")}
+    <span class="tpl-row-kind">${kindPill(kindOf(t))}</span>
     <span class="tpl-row-id">
-      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b>${kindPill(kindOf(t))}</span>
+      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b></span>
       ${t.description ? `<span class="tpl-row-desc">${escapeHtml(t.description)}</span>` : ""}
     </span>
-    <span class="run-meta" title="last registered / updated">${fmtTime(t.created_at)}</span>
-    <span class="run-meta" title="live version — what an unpinned run uses">${live}</span>
-    <span class="run-meta" title="newest registered build">v${st.newest ?? t.version}</span>
-    <span class="run-meta" title="declared params">${params}</span>`;
+    <span class="run-meta" data-l="updated" title="last registered / updated">${fmtTime(t.created_at)}</span>
+    <span class="run-meta" data-l="live" title="live version — what an unpinned run uses">${live}</span>
+    <span class="run-meta" data-l="newest" title="newest registered build">v${st.newest ?? t.version}</span>
+    <span class="run-meta" data-l="params" title="declared params">${params}</span>`;
   return el;
 }
 

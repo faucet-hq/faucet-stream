@@ -1155,7 +1155,7 @@ select {
 /* Borderless rows with a bottom separator so Templates reads as the same table
    as Runs/Datasets (its columns are fixed-width, so they already align). */
 .tpl-row {
-  grid-template-columns: 120px 1fr 205px 56px 64px 60px;
+  grid-template-columns: 120px 104px 1fr 205px 56px 64px 60px;
   background: transparent;
   border: none;
   border-bottom: 1px solid var(--border);
@@ -1167,7 +1167,7 @@ select {
 .tpl-row .run-meta { white-space: nowrap; } /* keep the timestamp (incl. AM/PM) on one line */
 .tpl-list-head {
   display: grid;
-  grid-template-columns: 120px 1fr 205px 56px 64px 60px;
+  grid-template-columns: 120px 104px 1fr 205px 56px 64px 60px;
   align-items: center;
   gap: 14px;
   position: sticky;
@@ -1205,6 +1205,7 @@ select {
 .tpl-list-head .tpl-sort.tpl-col-r { justify-content: flex-end; }
 .tpl-sort-caret { font-size: 0.9em; }
 .tpl-list-head .tpl-sort:not(.is-active) .tpl-sort-caret { opacity: 0.4; }
+.tpl-row-kind { display: flex; align-items: center; }
 .tpl-row-id { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .tpl-row-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 /* Template kind pills — hue per kind so a mixed list scans at a glance. */
@@ -1381,7 +1382,11 @@ select {
   /* The fixed column header can't line up once rows stack — hide it and let the
      rows collapse to status + name with the meta wrapping below. */
   .tpl-list-head { display: none; }
-  .tpl-row { grid-template-columns: auto 1fr; row-gap: 4px; }
+  /* Narrow: pills on top, the name full width, then the numbers on one labelled line. */
+  .tpl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .tpl-row .tpl-row-id { flex: 1 1 100%; }
+  .tpl-row .run-meta { font-size: 0.78rem; }
+  .tpl-row .run-meta[data-l]::before { content: attr(data-l) " "; color: var(--ink-faint); }
   .tpl-row .run-meta { text-align: left; }
 }
 
