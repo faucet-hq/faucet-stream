@@ -761,34 +761,60 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   const sinkOptions = sinks
     .map((s) => `<option value="${escapeHtml(s.id)}" title="${escapeHtml(s.description || "")}">${escapeHtml(s.id)}</option>`)
     .join("");
+  // One section per template the run composes: the source (pinned from the
+  // version list above), the sink and the deployment (each picked here, with
+  // its own version), then the run name. Each section lists the parameters its
+  // own template declares.
+  const segment = (key, title, head, hint) => `
+    <section class="tpl-seg" data-seg="${key}">
+      <header class="tpl-seg-head"><h3>${title}</h3>${hint ? `<span class="tpl-seg-hint">${hint}</span>` : ""}</header>
+      <div class="tpl-seg-fields">${head}</div>
+      <div class="tpl-params" data-params="${key}"></div>
+    </section>`;
   host.innerHTML = `
     <div class="tpl-trigger">
       ${withSink ? `<p class="tpl-desc">Every stream of <b class="mono">${escapeHtml(id)}</b> lands in the chosen sink; the write mode per stream is resolved against the sink's capabilities when the run is submitted.</p>` : ""}
-      <fieldset class="submit-opts tpl-trigger-opts">
-        <label>version
-          <input type="hidden" id="tg-version" value="${st.stable ?? st.newest}" />
-          <span id="tg-version-show" class="tpl-picked" title="pick a version from the list above"></span>
-        </label>
-        ${withSink ? `
-        <label class="tpl-field-wide">sink template <select id="tg-sink">${sinkOptions}</select></label>
-        <label>sink version
-          <select id="tg-sink-version"></select>
-        </label>
-        <label class="tpl-field-wide" title="state, DLQ, notifications and SLA for this run">deployment
-          <select id="tg-overlay">
-            <option value="">none</option>
-            ${overlays.map((o) => `<option value="${escapeHtml(o.id)}" title="${escapeHtml(o.description || "")}">${escapeHtml(o.id)}</option>`).join("")}
-          </select>
-        </label>
-        <label>deployment version <select id="tg-overlay-version" disabled><option value="">—</option></select></label>` : ""}
-        <label>run name <input id="tg-name" placeholder="optional" /></label>
-      </fieldset>
-      <div id="tg-params" class="tpl-params"></div>
+      ${segment(
+        "source",
+        withSink ? "Source" : "Template",
+        `<label class="tpl-field-wide">template <span class="tpl-picked"><b class="mono">${escapeHtml(id)}</b></span></label>
+         <label>version
+           <input type="hidden" id="tg-version" value="${st.stable ?? st.newest}" />
+           <span id="tg-version-show" class="tpl-picked"></span>
+         </label>`,
+        "pick the version in the list above",
+      )}
+      ${withSink ? segment(
+        "sink",
+        "Sink",
+        `<label class="tpl-field-wide">template <select id="tg-sink">${sinkOptions}</select></label>
+         <label>version <select id="tg-sink-version"></select></label>`,
+      ) : ""}
+      ${withSink ? segment(
+        "overlay",
+        "Deployment",
+        `<label class="tpl-field-wide">template
+           <select id="tg-overlay">
+             <option value="">none</option>
+             ${overlays.map((o) => `<option value="${escapeHtml(o.id)}" title="${escapeHtml(o.description || "")}">${escapeHtml(o.id)}</option>`).join("")}
+           </select>
+         </label>
+         <label>version <select id="tg-overlay-version" disabled><option value="">—</option></select></label>`,
+        "state, DLQ, notifications and SLA for this run",
+      ) : ""}
+      <section class="tpl-seg">
+        <header class="tpl-seg-head"><h3>Run</h3></header>
+        <div class="tpl-seg-fields"><label class="tpl-field-wide">run name <input id="tg-name" placeholder="optional" /></label></div>
+      </section>
       <div class="submit-actions"><button id="tg-go" class="btn-primary">Run</button></div>
       <pre id="tg-out" class="submit-out" hidden></pre>
     </div>`;
 
-  const paramHost = host.querySelector("#tg-params");
+  const paramHosts = {
+    source: host.querySelector('[data-params="source"]'),
+    sink: host.querySelector('[data-params="sink"]'),
+    overlay: host.querySelector('[data-params="overlay"]'),
+  };
   const sinkSel = host.querySelector("#tg-sink");
   const overlaySel = host.querySelector("#tg-overlay");
   if (sinkSel && preselectSink && sinks.some((s) => s.id === preselectSink)) sinkSel.value = preselectSink;
@@ -806,10 +832,6 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     fillVersions(overlayVersionSel, overlaySel.value ? overlays.find((o) => o.id === overlaySel.value) : null);
   if (sinkSel) refillSinkVersions();
   if (overlaySel) refillOverlayVersions();
-  // The params the trigger binds: the selected version's own, plus (for a
-  // source template) the selected sink version's — the same merge the server
-  // performs. Each version can declare a different set, so both are fetched
-  // for the version actually chosen, not the one the page loaded.
   const versionSel = host.querySelector("#tg-version");
   const sinkVersionSel = host.querySelector("#tg-sink-version");
   const recordCache = new Map();
@@ -826,46 +848,52 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     }
     return recordCache.get(key);
   };
+  // Every param the run binds, by name — the same merge the server performs.
+  // A name two templates share is one value, shown in the first section that
+  // declares it.
   let params = ownParams;
   let renderSeq = 0;
+  const allInputs = () => host.querySelectorAll("[data-params] [data-name]");
   const renderParams = async () => {
     const seq = ++renderSeq;
     const typed = {};
-    for (const el of paramHost.querySelectorAll("[data-name]")) if (el.value !== "") typed[el.dataset.name] = el.value;
-    let next;
+    for (const el of allInputs()) if (el.value !== "") typed[el.dataset.name] = el.value;
+    const sections = [];
     try {
-      next = { ...(await paramsOf(id, versionSel.value)) };
-      if (sinkSel) {
-        const sinkParams = await paramsOf(sinkSel.value, sinkVersionSel.value);
-        for (const [n, spec] of Object.entries(sinkParams)) next[n] = { ...spec, fromSink: sinkSel.value };
-      }
-      if (overlaySel && overlaySel.value) {
-        const overlayParams = await paramsOf(overlaySel.value, overlayVersionSel.value);
-        for (const [n, spec] of Object.entries(overlayParams)) next[n] = { ...spec, fromOverlay: overlaySel.value };
+      sections.push(["source", await paramsOf(id, versionSel.value)]);
+      if (sinkSel) sections.push(["sink", await paramsOf(sinkSel.value, sinkVersionSel.value)]);
+      if (overlaySel) {
+        sections.push(["overlay", overlaySel.value ? await paramsOf(overlaySel.value, overlayVersionSel.value) : null]);
       }
     } catch (e) {
       if (seq !== renderSeq) return;
-      paramHost.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      paramHosts.source.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
       return;
     }
     if (seq !== renderSeq) return;
-    params = next;
-    // Computed params are derived from other params, not supplied — exclude them
-    // from the trigger form (supplying one is rejected server-side, #573).
-    const names = Object.keys(params).filter((n) => params[n].computed == null);
-    paramHost.innerHTML = "";
-    if (!names.length) {
-      paramHost.innerHTML = `<p class="tpl-desc">${withSink ? "Neither template declares parameters." : "This template declares no parameters."}</p>`;
-    }
-    for (const name of names) {
-      const field = paramField(name, params[name] || {});
-      const input = field.querySelector("[data-name]");
-      if (input && typed[name] !== undefined) input.value = typed[name];
-      paramHost.appendChild(field);
+    params = {};
+    for (const [key, declared] of sections) {
+      const target = paramHosts[key];
+      target.innerHTML = "";
+      if (declared === null) continue;
+      // Computed params are derived from other params, not supplied — exclude
+      // them from the trigger form (supplying one is rejected server-side, #573).
+      const names = Object.keys(declared).filter((n) => declared[n].computed == null && !(n in params));
+      for (const n of names) params[n] = declared[n];
+      if (!names.length) {
+        target.innerHTML = `<p class="tpl-desc">No parameters.</p>`;
+        continue;
+      }
+      for (const name of names) {
+        const field = paramField(name, declared[name] || {});
+        const input = field.querySelector("[data-name]");
+        if (input && typed[name] !== undefined) input.value = typed[name];
+        target.appendChild(field);
+      }
     }
   };
-  // The version rows above the form pick the version to run: clicking one
-  // selects it here, and the row that matches the selection stays marked.
+  // The version rows above the form pick the source version to run: clicking
+  // one selects it here, and the row that matches the selection stays marked.
   const rows = [...(host.closest(".page") || document).querySelectorAll(".tpl-version[data-version]")];
   const markPicked = () => {
     const picked = Number(versionSel.value);
@@ -894,7 +922,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   const out = host.querySelector("#tg-out");
   host.querySelector("#tg-go").onclick = async () => {
     const supplied = {};
-    for (const el of paramHost.querySelectorAll("[data-name]")) {
+    for (const el of allInputs()) {
       const raw = el.value;
       if (raw === "") continue; // omitted → the template's default (or a typed error)
       supplied[el.dataset.name] = coerce(raw, (params[el.dataset.name] || {}).type);

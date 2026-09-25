@@ -1328,11 +1328,27 @@ select {
 .submit-opts.tpl-trigger-opts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 18px; align-items: end; margin: 0; padding: 0; border: 0; background: none; }
 .tpl-trigger-opts label { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0; font-size: 0.82rem; font-weight: 600; color: var(--ink); }
 .tpl-trigger-opts label.tpl-field-wide { grid-column: span 2; }
-.tpl-picked { display: flex; align-items: center; gap: 6px; box-sizing: border-box; height: 33px; padding: 0 10px; border: 1px dashed var(--border); border-radius: var(--r); font-weight: 400; color: var(--ink); }
+.tpl-picked { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; box-sizing: border-box; min-height: 33px; padding: 4px 10px; border: 1px dashed var(--border); border-radius: var(--r); font-weight: 400; color: var(--ink); }
 .tpl-picked b { font-weight: 700; margin-right: 2px; }
 .tpl-trigger-opts select, .tpl-trigger-opts input:not([type="checkbox"]) { width: 100%; min-width: 0; font-weight: 400; }
 @media (max-width: 900px) { .submit-opts.tpl-trigger-opts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 520px) { .submit-opts.tpl-trigger-opts { grid-template-columns: minmax(0, 1fr); } .tpl-trigger-opts label.tpl-field-wide { grid-column: auto; } }
+/* Trigger form: one section per composed template (source / sink /
+   deployment), each with its own picker row and parameters, then the run. */
+.tpl-seg { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--r); }
+.tpl-seg-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.tpl-seg-head h3 { margin: 0; font-size: 0.74rem; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-dim); }
+.tpl-seg-hint { font-size: 0.78rem; color: var(--ink-faint); }
+.tpl-seg-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 18px; align-items: start; }
+.tpl-seg-fields label { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0; font-size: 0.82rem; font-weight: 600; color: var(--ink); }
+.tpl-seg-fields label.tpl-field-wide { grid-column: span 2; }
+.tpl-seg-fields select, .tpl-seg-fields input:not([type="checkbox"]) { width: 100%; min-width: 0; font-weight: 400; }
+.tpl-seg .tpl-params:empty { display: none; }
+.tpl-seg .tpl-params > .tpl-desc { margin: 0; font-size: 0.8rem; color: var(--ink-faint); }
+@media (max-width: 700px) {
+  .tpl-seg-fields { grid-template-columns: minmax(0, 1fr); }
+  .tpl-seg-fields label.tpl-field-wide { grid-column: auto; }
+}
 .tpl-params { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px 18px; }
 .tpl-param { display: flex; flex-direction: column; gap: 5px; }
 .tpl-param-name { font-size: 0.82rem; font-weight: 600; color: var(--ink); }
