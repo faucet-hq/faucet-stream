@@ -761,7 +761,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     }
   }
   const sinkOptions = sinks
-    .map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)}${s.description ? ` — ${escapeHtml(s.description)}` : ""}</option>`)
+    .map((s) => `<option value="${escapeHtml(s.id)}" title="${escapeHtml(s.description || "")}">${escapeHtml(s.id)}</option>`)
     .join("");
   host.innerHTML = `
     <div class="tpl-trigger">
@@ -784,7 +784,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
         <label class="tpl-field-wide" title="state, DLQ, notifications and SLA for this run">deployment
           <select id="tg-overlay">
             <option value="">none</option>
-            ${overlays.map((o) => `<option value="${escapeHtml(o.id)}">${escapeHtml(o.id)}${o.description ? ` — ${escapeHtml(o.description)}` : ""}</option>`).join("")}
+            ${overlays.map((o) => `<option value="${escapeHtml(o.id)}" title="${escapeHtml(o.description || "")}">${escapeHtml(o.id)}</option>`).join("")}
           </select>
         </label>` : ""}
         <label>run name <input id="tg-name" placeholder="optional" /></label>
