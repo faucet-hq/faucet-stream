@@ -32,7 +32,9 @@ fn is_template_file(p: &Path) -> bool {
         && !p
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.'))
+            // Dotfiles, and `<name>.faucet.yaml` sidecars (stable / deprecated
+            // versions, #682 / #691), are not templates.
+            .is_some_and(|n| n.starts_with('.') || n.contains(".faucet."))
 }
 
 /// Template files directly in `dir` (unscoped templates) plus one level of
@@ -1101,6 +1103,14 @@ per_stream:
             err.contains("`owner: someone` but the file lives under 'octo/'"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn sidecars_beside_templates_are_not_loaded_as_templates() {
+        assert!(!is_template_file(Path::new("sink-templates/acme/x.faucet.yaml")));
+        assert!(!is_template_file(Path::new("sink-templates/acme/.hidden.yaml")));
+        assert!(is_template_file(Path::new("sink-templates/acme/x.yaml")));
+        assert!(!is_template_file(Path::new("sink-templates/acme/OWNERS")));
     }
 
     #[test]
