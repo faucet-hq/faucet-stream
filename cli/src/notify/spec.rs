@@ -66,6 +66,9 @@ pub enum EventKind {
     /// The cron scheduler appears stuck (no heartbeat / consecutive-failure
     /// exit). Emitted by `faucet schedule`.
     SchedulerStuck,
+    /// A column's learned profile drifted from its baseline (#708), under
+    /// `profiling.on_drift: notify` or `fail`. One event per finding.
+    ProfileDrift,
 }
 
 impl EventKind {
@@ -79,6 +82,7 @@ impl EventKind {
             EventKind::ContractAbort => "contract_abort",
             EventKind::DlqThreshold => "dlq_threshold",
             EventKind::SchedulerStuck => "scheduler_stuck",
+            EventKind::ProfileDrift => "profile_drift",
         }
     }
 }

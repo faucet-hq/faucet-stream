@@ -156,6 +156,7 @@ const KEY_ORDER: &[&str] = &[
     "delivery",
     "resilience",
     "sla",
+    "profiling",
     "reconcile",
     "verify",
     "rollback",

@@ -267,6 +267,17 @@
           "type": "null"
         }
       ]
+    },
+    "profiling": {
+      "description": "Optional learned column profiles with drift detection (#708). Every\nroot invocation profiles the records it wrote (null rate, distinct\ncount, numeric / string summaries, type mix, top values) into a\nbounded-memory sketch, compares it against a rolling baseline of\nearlier runs kept in the `state:` store, and warns / notifies / fails\non a statistically significant change per `on_drift`. A matrix row's\nown `profiling:` replaces it for that row. Requires a `state:` block.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProfilingSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -2179,6 +2190,17 @@
           "items": {
             "type": "string"
           }
+        },
+        "profiling": {
+          "description": "Per-row profiling override (#708). Replaces the top-level `profiling:`\nfor this row's invocations; `None` inherits it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfilingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -2307,15 +2329,15 @@
       "additionalProperties": false
     },
     "AnomalyMethod": {
-      "description": "Volume anomaly detection method.",
+      "description": "How an observation is flagged as anomalous against the rolling baseline.",
       "oneOf": [
         {
-          "description": "Flag when |volume − mean| / std exceeds `sensitivity`.",
+          "description": "Flag when |x − mean| / std exceeds the sensitivity.",
           "type": "string",
           "const": "zscore"
         },
         {
-          "description": "Flag when the volume falls outside the Tukey fences\n[Q1 − k·IQR, Q3 + k·IQR] with k = `sensitivity`.",
+          "description": "Flag when x falls outside the Tukey fences [Q1 − k·IQR, Q3 + k·IQR]\nwith k = the sensitivity.",
           "type": "string",
           "const": "iqr"
         }
@@ -3857,6 +3879,11 @@
           "description": "The cron scheduler appears stuck (no heartbeat / consecutive-failure\nexit). Emitted by `faucet schedule`.",
           "type": "string",
           "const": "scheduler_stuck"
+        },
+        {
+          "description": "A column's learned profile drifted from its baseline (#708), under\n`profiling.on_drift: notify` or `fail`. One event per finding.",
+          "type": "string",
+          "const": "profile_drift"
         }
       ]
     },
@@ -22106,6 +22133,115 @@
             "type"
           ],
           "additionalProperties": false
+        }
+      ]
+    },
+    "ProfilingSpec": {
+      "description": "Learned column profiles with drift detection. Every run profiles the\nrecords it wrote (null rate, distinct count, min / max / mean, string\nlength, type mix, top values) into a bounded-memory sketch, compares the\nresult against a rolling baseline of earlier successful runs, and reports\nstatistically significant changes per column — no thresholds to write.",
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "Top-level columns to profile. Empty (the default) profiles every\ncolumn the run writes, up to `max_columns`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude": {
+          "description": "Columns to leave out, exact names or `prefix*` globs. Defaults to\n`[\"_faucet_*\"]` so the run-metadata columns are never profiled.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "_faucet_*"
+          ]
+        },
+        "max_columns": {
+          "description": "Maximum columns profiled per run (default 200). Columns beyond the cap\nare skipped and the profile is marked truncated.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 200
+        },
+        "top_values": {
+          "description": "How many most-frequent values to keep per categorical column (default\n10). `0` disables top values entirely.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 10
+        },
+        "categorical_max_distinct": {
+          "description": "A column whose estimated distinct count exceeds this is treated as\nhigh-cardinality: only null / type / length metrics are kept for it and\nno values are published (default 100).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 100
+        },
+        "window": {
+          "description": "Rolling-window size: how many recent successful-run profiles form the\nbaseline (default 20; must be ≥ `min_history`).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 20
+        },
+        "min_history": {
+          "description": "Minimum baseline runs before drift detection starts (default 5; at\nleast 2).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 5
+        },
+        "method": {
+          "description": "How a numeric metric (null rate, distinct count, mean, …) is compared\nagainst its baseline series. Default `zscore`.",
+          "$ref": "#/$defs/AnomalyMethod",
+          "default": "zscore"
+        },
+        "sensitivity": {
+          "description": "Detection threshold for numeric metrics. `zscore`: max |x − mean| / std\n(default 3.0). `iqr`: Tukey fence multiplier (default 1.5).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "new_value_min_share": {
+          "description": "A categorical value never seen in the baseline is reported once its\nshare of the run's values reaches this fraction (default 0.05).",
+          "type": "number",
+          "format": "double",
+          "default": 0.05
+        },
+        "psi_threshold": {
+          "description": "Population stability index above which a categorical column's value\ndistribution counts as drifted (default 0.2; the conventional\n\"significant shift\" threshold).",
+          "type": "number",
+          "format": "double",
+          "default": 0.2
+        },
+        "on_drift": {
+          "description": "What a detected drift does to the run. Default `warn`.",
+          "$ref": "#/$defs/OnProfileDrift",
+          "default": "warn"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OnProfileDrift": {
+      "description": "The action taken when a column's profile drifts from its baseline.",
+      "oneOf": [
+        {
+          "description": "Log a warning and count `faucet_profile_drift_total`; the run succeeds.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "As `warn`, plus a `profile_drift` notification event per finding.",
+          "type": "string",
+          "const": "notify"
+        },
+        {
+          "description": "As `notify`, and the run is reported as failed (the data is already\nwritten; the failure marks the run so operators look).",
+          "type": "string",
+          "const": "fail"
         }
       ]
     }

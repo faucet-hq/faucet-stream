@@ -86,10 +86,19 @@ fn synth_event(kind: &str, pipeline: &str) -> CliResult<NotifyEvent> {
         }
         "dlq_threshold" => NotifyEvent::dlq_threshold(pipeline, "", 1_000_000).with_run(run()),
         "scheduler_stuck" => NotifyEvent::scheduler_stuck(pipeline, "synthetic scheduler-stuck"),
+        "profile_drift" => NotifyEvent::profile_drift(
+            pipeline,
+            "",
+            "amount",
+            "null_rate",
+            "synthetic profile drift: null_rate 0.4 vs baseline mean 0",
+        )
+        .with_run(run()),
         other => {
             return Err(CliError::Config(format!(
                 "unknown --event `{other}` (expected one of: run_failure, run_success, \
-                 sla_breach, circuit_open, contract_abort, dlq_threshold, scheduler_stuck)"
+                 sla_breach, circuit_open, contract_abort, dlq_threshold, scheduler_stuck, \
+                 profile_drift)"
             )));
         }
     })
@@ -110,6 +119,10 @@ mod tests {
             synth_event("scheduler_stuck", "p").unwrap().kind,
             EventKind::SchedulerStuck
         );
+        let drift = synth_event("profile_drift", "p").unwrap();
+        assert_eq!(drift.kind, EventKind::ProfileDrift);
+        assert_eq!(drift.details["column"], "amount");
+        assert!(drift.title.contains("amount.null_rate"), "{}", drift.title);
         // DLQ synthetic count clears any reasonable threshold.
         assert_eq!(
             synth_event("dlq_threshold", "p")
@@ -137,6 +150,7 @@ mod tests {
             "circuit_open",
             "contract_abort",
             "dlq_threshold",
+            "profile_drift",
         ] {
             let e = synth_event(kind, "p").unwrap();
             let run = e

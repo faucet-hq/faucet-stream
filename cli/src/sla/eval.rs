@@ -2,7 +2,7 @@
 //! volume anomaly detection (z-score / Tukey IQR fences). No I/O — the
 //! orchestration in `sla::evaluate_post_run` owns state loading/persisting.
 
-use super::spec::{AnomalyMethod, SlaSpec, VolumeAnomalySpec};
+use super::spec::{SlaSpec, VolumeAnomalySpec};
 use super::state::SlaState;
 use std::fmt;
 
@@ -90,81 +90,17 @@ pub fn evaluate_failure(spec: &SlaSpec, prior: &SlaState, now_unix: i64) -> Vec<
 
 /// Run the configured detector; `Some(detail)` when `rows` is anomalous
 /// against `baseline`. Callers guarantee `baseline.len() >= min_history >= 2`.
+/// The math is the shared [`faucet_core::anomaly`] module (column profiling
+/// uses the same tests, #708); this adapts the integer volume series.
 pub fn detect_anomaly(baseline: &[u64], rows: u64, va: &VolumeAnomalySpec) -> Option<String> {
-    let sensitivity = va.effective_sensitivity();
-    match va.method {
-        AnomalyMethod::Zscore => zscore_anomaly(baseline, rows, sensitivity),
-        AnomalyMethod::Iqr => iqr_anomaly(baseline, rows, sensitivity),
-    }
-}
-
-fn zscore_anomaly(baseline: &[u64], rows: u64, sensitivity: f64) -> Option<String> {
-    let n = baseline.len() as f64;
-    let mean = baseline.iter().map(|&v| v as f64).sum::<f64>() / n;
-    let var = baseline
-        .iter()
-        .map(|&v| {
-            let d = v as f64 - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / n;
-    let std = var.sqrt();
-    let x = rows as f64;
-    if std == 0.0 {
-        // Constant baseline: any deviation is a regime change.
-        if x != mean {
-            return Some(format!(
-                "deviates from a constant baseline of {mean:.0} records/run"
-            ));
-        }
-        return None;
-    }
-    let z = (x - mean).abs() / std;
-    if z > sensitivity {
-        return Some(format!(
-            "|z| {z:.2} exceeds {sensitivity} (baseline mean {mean:.1}, std {std:.1}, n {})",
-            baseline.len()
-        ));
-    }
-    None
-}
-
-fn iqr_anomaly(baseline: &[u64], rows: u64, sensitivity: f64) -> Option<String> {
-    let mut sorted = baseline.to_vec();
-    sorted.sort_unstable();
-    let q1 = quantile(&sorted, 0.25);
-    let q3 = quantile(&sorted, 0.75);
-    let iqr = q3 - q1;
-    let lower = q1 - sensitivity * iqr;
-    let upper = q3 + sensitivity * iqr;
-    let x = rows as f64;
-    if x < lower || x > upper {
-        return Some(format!(
-            "outside [{lower:.1}, {upper:.1}] (q1 {q1:.1}, q3 {q3:.1}, fence {sensitivity}×IQR, n {})",
-            baseline.len()
-        ));
-    }
-    None
-}
-
-/// Linear-interpolation quantile (R type-7) over an ascending slice.
-/// Callers guarantee `sorted` is non-empty.
-fn quantile(sorted: &[u64], q: f64) -> f64 {
-    let n = sorted.len();
-    if n == 1 {
-        return sorted[0] as f64;
-    }
-    let pos = q * (n - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    let frac = pos - lo as f64;
-    sorted[lo] as f64 + (sorted[hi] as f64 - sorted[lo] as f64) * frac
+    let series: Vec<f64> = baseline.iter().map(|&v| v as f64).collect();
+    faucet_core::anomaly::detect(va.method, &series, rows as f64, va.effective_sensitivity())
+        .map(|detail| format!("{detail} records/run"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::spec::{DEFAULT_MIN_HISTORY, DEFAULT_WINDOW};
+    use super::super::spec::{AnomalyMethod, DEFAULT_MIN_HISTORY, DEFAULT_WINDOW};
     use super::*;
 
     fn spec(
@@ -265,6 +201,9 @@ mod tests {
     #[test]
     fn quantile_interpolates() {
         let sorted = [10, 20, 30, 40];
+        let quantile = |s: &[u64], q: f64| {
+            faucet_core::anomaly::quantile(&s.iter().map(|&v| v as f64).collect::<Vec<_>>(), q)
+        };
         assert_eq!(quantile(&sorted, 0.0), 10.0);
         assert_eq!(quantile(&sorted, 1.0), 40.0);
         assert_eq!(quantile(&sorted, 0.5), 25.0);

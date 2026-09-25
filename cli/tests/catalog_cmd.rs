@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 fn config_yaml(dir: &Path) -> String {
     format!(
-        "version: 1\nname: catalog-cmd\ncatalog:\n  url: \"sqlite:{dir}/cat.db\"\n  sample_records: 10\npipeline:\n  source: {{ type: csv, config: {{ path: \"{dir}/in.csv\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{dir}/out.jsonl\" }} }}\n",
+        "version: 1\nname: catalog-cmd\ncatalog:\n  url: \"sqlite:{dir}/cat.db\"\n  sample_records: 10\nprofiling: {{ min_history: 2 }}\npipeline:\n  source: {{ type: csv, config: {{ path: \"{dir}/in.csv\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{dir}/out.jsonl\" }} }}\n  state: {{ type: file, config: {{ path: \"{dir}/state\" }} }}\n",
         dir = dir.display()
     )
 }
@@ -113,6 +113,46 @@ async fn catalog_command_datasets_show_lineage_roundtrip() {
         })
         .await
         .expect("show");
+    }
+
+    // show — the sink dataset carries the column profile section (#708), in
+    // both renderings; the store agrees.
+    let handle = faucet_cli::catalog::connect_from_spec(&faucet_cli::catalog::CatalogSpec {
+        url: format!("sqlite:{}/cat.db", dir.path().display()),
+        sample_records: 10,
+    })
+    .await
+    .unwrap();
+    let sink_id = handle
+        .store
+        .catalog_list_datasets(&CatalogListFilter {
+            kind: Some("jsonl".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .datasets[0]
+        .id
+        .clone();
+    let detail = handle
+        .store
+        .catalog_get_dataset(&sink_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let profile = detail.profile.expect("profile on the sink dataset");
+    assert_eq!(profile.history.len(), 2);
+    assert!(profile.latest.profile.columns.contains_key("email"));
+    for json in [false, true] {
+        catalog_cmd::run(CatalogArgs {
+            command: CatalogCommand::Show(CatalogShowArgs {
+                id: sink_id.clone(),
+                common: common(Some(config.clone()), json),
+            }),
+        })
+        .await
+        .expect("show sink");
     }
 
     // show — unknown id is a clear config error, not a panic.

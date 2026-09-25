@@ -1,0 +1,61 @@
+# CSV → JSONL with learned column profiles + drift detection (#708).
+#
+# Every run profiles the records it writes — per column: null rate, type mix,
+# distinct estimate, numeric / string summaries, top values — into a bounded
+# sketch, compares it with a rolling baseline of earlier runs kept in the
+# `state:` store, and reports a statistically significant change per column.
+# No thresholds to write: after `min_history` runs the baseline is the norm.
+#
+#   faucet run cli/examples/csv_to_jsonl_with_profiling.yaml      # repeat a few times
+#   faucet profiling show cli/examples/csv_to_jsonl_with_profiling.yaml
+#   faucet profiling reset cli/examples/csv_to_jsonl_with_profiling.yaml --column amount
+#   faucet doctor cli/examples/csv_to_jsonl_with_profiling.yaml   # baseline depth
+#
+# Needs a `state:` block (the baseline lives there). Profiling runs after
+# transforms and masking, so a masked column is profiled masked.
+version: 1
+name: csv_to_jsonl_with_profiling
+
+pipeline:
+  source:
+    type: csv
+    config:
+      path: ./data/input.csv
+
+  sink:
+    type: jsonl
+    config:
+      path: ./out/records.jsonl
+
+  state:
+    type: file
+    config:
+      path: ./state
+
+  transforms:
+    # CSV values are strings; profile `amount` as a number (an empty cell
+    # becomes null, which the null-rate metric then tracks).
+    - type: cast
+      config:
+        fields: { amount: float }
+        on_error: "null"
+
+profiling:
+  # Columns to profile (default: every column) and `prefix*` globs to skip
+  # (default: the `_faucet_*` metadata columns).
+  # columns: [amount, region]
+  exclude: ["_faucet_*"]
+  # Runs of baseline before drift detection starts, and the rolling window.
+  min_history: 5
+  window: 20
+  # Numeric-metric test: zscore (sensitivity 3.0) | iqr (fence 1.5).
+  method: zscore
+  # A previously unseen value or type is reported at this share of the run.
+  new_value_min_share: 0.05
+  # Population-stability-index threshold for a shifted value distribution.
+  psi_threshold: 0.2
+  # Columns with more distinct values than this publish no example values.
+  categorical_max_distinct: 100
+  # warn (log + metric) | notify (+ a `profile_drift` notification) | fail
+  # (+ the run is reported failed; the data is already written).
+  on_drift: warn

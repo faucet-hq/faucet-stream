@@ -232,6 +232,28 @@ impl NotifyEvent {
         .with("sla_kind", Value::String(sla_kind.to_string()))
     }
 
+    /// A column-profile drift finding (#708): `column` / `metric` name the
+    /// statistic, `message` is the detector's detail line.
+    pub fn profile_drift(
+        pipeline: impl Into<String>,
+        row: impl Into<String>,
+        column: &str,
+        metric: &str,
+        message: impl Into<String>,
+    ) -> Self {
+        let p = pipeline.into();
+        Self::base(
+            EventKind::ProfileDrift,
+            Severity::Warning,
+            p.clone(),
+            row,
+            format!("Profile drift on `{p}`: {column}.{metric}"),
+            message,
+        )
+        .with("column", Value::String(column.to_string()))
+        .with("metric", Value::String(metric.to_string()))
+    }
+
     pub fn circuit_open(
         pipeline: impl Into<String>,
         row: impl Into<String>,

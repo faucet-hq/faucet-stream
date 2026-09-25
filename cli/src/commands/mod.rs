@@ -33,6 +33,7 @@ pub mod new;
 pub mod notify;
 pub mod plan;
 pub mod preview;
+pub mod profiling;
 pub mod replicate;
 pub mod rollback;
 pub mod run;

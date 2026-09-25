@@ -14,6 +14,7 @@
 //! - [`schema::infer_schema`] — JSON Schema inference from record samples
 
 pub mod adaptive;
+pub mod anomaly;
 pub mod auth;
 pub mod check;
 pub mod cleanup;
@@ -45,6 +46,7 @@ pub mod native;
 pub mod object_rollover;
 pub mod observability;
 pub mod pipeline;
+pub mod profiling;
 #[cfg(feature = "quality")]
 pub mod quality;
 pub mod redact;
@@ -77,6 +79,7 @@ pub mod compression;
 pub use adaptive::{
     AdaptiveBatchConfig, AdjustDirection, AdjustReason, Adjustment, AimdController, Observation,
 };
+pub use anomaly::AnomalyMethod;
 pub use auth::{
     AuthProvider, AuthReference, AuthSpec, Credential, CredentialPlacement, RequestAuth,
     SharedAuthProvider,
@@ -144,6 +147,10 @@ pub use observability::{
 pub use pipeline::{
     DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, Pipeline, PipelineResult, StreamPage, run_stream,
     validate_batch_size,
+};
+pub use profiling::{
+    ColumnProfile, DriftMetric, OnProfileDrift, ProfileDrift, Profiler, ProfilingSink,
+    ProfilingSpec, RunProfile, detect_drift,
 };
 pub use replication::{
     BindFormat, BindTarget, ReplicationBind, ReplicationMethod, format_bookmark, format_instant,

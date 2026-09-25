@@ -22,6 +22,7 @@ pub fn schema_targets() -> Vec<&'static str> {
         "execution",
         "resilience",
         "sla",
+        "profiling",
         "verify",
         "rollback",
     ];
@@ -96,6 +97,11 @@ pub fn pipeline_blocks() -> Vec<PipelineBlock> {
         block(
             "sla",
             "Freshness and volume expectations checked after every run",
+            "top",
+        ),
+        block(
+            "profiling",
+            "Learn each column's profile per run and flag statistically significant drift — no thresholds",
             "top",
         ),
         block(
@@ -203,6 +209,7 @@ pub fn block_schema(name: &str) -> Option<serde_json::Value> {
         "delivery" => to_schema_value(faucet_core::schema_for!(faucet_core::DeliveryMode)),
         "resilience" => to_schema_value(faucet_core::schema_for!(crate::config::ResilienceSpec)),
         "sla" => to_schema_value(faucet_core::schema_for!(crate::sla::SlaSpec)),
+        "profiling" => to_schema_value(faucet_core::schema_for!(faucet_core::ProfilingSpec)),
         "verify" => to_schema_value(faucet_core::schema_for!(crate::verify::VerifySpec)),
         "rollback" => to_schema_value(faucet_core::schema_for!(crate::rollback::RollbackSpec)),
         "schema" => to_schema_value(faucet_core::schema_for!(faucet_core::SchemaDriftSpec)),
@@ -269,6 +276,10 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         }
         SchemaTarget::Sla => {
             let s = faucet_core::schema_for!(crate::sla::SlaSpec);
+            serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
+        SchemaTarget::Profiling => {
+            let s = faucet_core::schema_for!(faucet_core::ProfilingSpec);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
         }
         #[cfg(feature = "quality")]
@@ -498,6 +509,23 @@ mod tests {
         })
         .await;
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn schema_profiling_target_ok() {
+        let r = super::run(SchemaArgs {
+            target: Some(SchemaTarget::Profiling),
+            list: false,
+        })
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+        let s = serde_json::to_string(&super::block_schema("profiling").unwrap()).unwrap();
+        assert!(s.contains("on_drift") && s.contains("min_history"), "{s}");
+        assert!(
+            super::pipeline_blocks()
+                .iter()
+                .any(|b| b.name == "profiling")
+        );
     }
 
     #[test]

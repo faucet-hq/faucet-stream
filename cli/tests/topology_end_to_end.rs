@@ -461,6 +461,110 @@ pipeline:
     assert_eq!(summary.invocations[0].row_id, "w");
 }
 
+/// A `profiling:` block applies per sink node in topology mode (#708): the
+/// baseline is keyed `{pipeline}::{node}`, a drifted run is flagged, and
+/// `on_drift: fail` marks that node failed in the summary.
+#[tokio::test]
+async fn profiling_applies_per_sink_node() {
+    use faucet_core::StateStore;
+    let dir = TempDir::new().unwrap();
+    let csv = dir.path().join("orders.csv");
+    let out = dir.path().join("o.jsonl");
+    let state = dir.path().join("state");
+    let config = |on_drift: &str| {
+        parse(&format!(
+            r#"version: 1
+name: topo_prof
+profiling: {{ min_history: 2, window: 5, on_drift: {on_drift} }}
+pipeline:
+  sources:
+    o: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    out: {{ type: jsonl, config: {{ path: {out}, append: false }} }}
+  state: {{ type: file, config: {{ path: {state} }} }}
+  nodes:
+    s: {{ kind: source, ref: o }}
+    w: {{ kind: sink, ref: out }}
+  edges:
+    - {{ from: s, to: w }}
+"#,
+            csv = csv.display(),
+            out = out.display(),
+            state = state.display()
+        ))
+    };
+    async fn run(cfg: PipelineConfig) -> faucet_cli::executor::RunSummary {
+        let auth = build_auth_catalog(None).unwrap();
+        faucet_cli::topology::run_topology(
+            &cfg,
+            &auth,
+            faucet_cli::topology::TopologyRunOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+    for _ in 0..2 {
+        write(
+            &csv,
+            "order_id,country_code,amount\n1,US,10\n2,US,5\n3,IN,7\n4,DE,3\n",
+        );
+        let summary = run(config("warn")).await;
+        assert!(!summary.had_failures(), "{summary:?}");
+    }
+    let store = faucet_core::FileStateStore::new(&state);
+    let key = faucet_cli::profiling::profiling_state_key("topo_prof::w");
+    let history = faucet_cli::profiling::ProfileHistory::from_value(
+        store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("baseline keyed by sink node"),
+    );
+    assert_eq!(history.runs.len(), 2);
+    assert!(
+        history
+            .latest()
+            .unwrap()
+            .profile
+            .columns
+            .contains_key("country_code")
+    );
+
+    // Every country changes: `country_code` drifts; under `fail` the node fails.
+    write(
+        &csv,
+        "order_id,country_code,amount\n1,BR,10\n2,BR,5\n3,BR,7\n4,BR,3\n",
+    );
+    let summary = run(config("fail")).await;
+    assert!(summary.had_failures(), "{summary:?}");
+    let err = summary.invocations[0].error.clone().unwrap();
+    assert!(
+        err.contains("Profile drift") && err.contains("country_code"),
+        "{err}"
+    );
+    assert_eq!(summary.invocations[0].row_id, "w");
+    let history =
+        faucet_cli::profiling::ProfileHistory::from_value(store.get(&key).await.unwrap().unwrap());
+    assert_eq!(history.runs.len(), 3);
+    assert!(!history.latest().unwrap().drift.is_empty());
+
+    // A preview never touches the baseline.
+    let auth = build_auth_catalog(None).unwrap();
+    faucet_cli::topology::run_topology(
+        &config("warn"),
+        &auth,
+        faucet_cli::topology::TopologyRunOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let history =
+        faucet_cli::profiling::ProfileHistory::from_value(store.get(&key).await.unwrap().unwrap());
+    assert_eq!(history.runs.len(), 3);
+}
+
 #[tokio::test]
 async fn rejects_missing_default_template() {
     // A source node with no `ref` defaults to the `default` template; with only

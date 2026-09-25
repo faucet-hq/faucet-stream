@@ -166,6 +166,9 @@ pub enum Command {
     /// the keys it upserted, or swap back the table it overwrote — and rewind
     /// the bookmark so the next run re-reads what was undone.
     Rollback(RollbackArgs),
+    /// Inspect or re-baseline the learned column profiles a config's
+    /// `profiling:` block keeps in its state store.
+    Profiling(ProfilingArgs),
     /// Template Hub: compose a `source-template` with a `sink-template`, check
     /// a pairing, list a catalog, render its compatibility matrix, or lint
     /// templates for publication.
@@ -1200,6 +1203,68 @@ pub struct RollbackArgs {
     pub profile: Option<String>,
 }
 
+/// `faucet profiling` arguments.
+#[derive(Debug, Parser)]
+pub struct ProfilingArgs {
+    #[command(subcommand)]
+    pub command: ProfilingCommand,
+}
+
+/// `faucet profiling` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ProfilingCommand {
+    /// Print the latest column profile and drift findings per root row, plus
+    /// the baseline depth.
+    Show(ProfilingShowArgs),
+    /// Re-baseline: forget the stored profile history (or one column's) so
+    /// the next `min_history` runs learn the new normal — for a planned
+    /// migration or a legitimate step change.
+    Reset(ProfilingResetArgs),
+}
+
+/// Shared config-loading flags for `faucet profiling`.
+#[derive(Debug, Parser)]
+pub struct ProfilingConfigArgs {
+    /// Path to the pipeline config. If omitted, auto-discover `faucet.yaml` /
+    /// `.yml` / `.json` in cwd.
+    pub config: Option<PathBuf>,
+    /// Only this root row (default: every root row).
+    #[arg(long)]
+    pub row: Option<String>,
+    /// Emit machine-readable JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file for `${env:VAR}` interpolation in the config.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Select a named overlay from the config's `profiles:` block.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
+}
+
+/// `faucet profiling show` arguments.
+#[derive(Debug, Parser)]
+pub struct ProfilingShowArgs {
+    #[command(flatten)]
+    pub common: ProfilingConfigArgs,
+    /// Print every column's full profile, not just the summary line per column.
+    #[arg(long)]
+    pub full: bool,
+}
+
+/// `faucet profiling reset` arguments.
+#[derive(Debug, Parser)]
+pub struct ProfilingResetArgs {
+    #[command(flatten)]
+    pub common: ProfilingConfigArgs,
+    /// Re-baseline only this column, keeping the rest of the history.
+    #[arg(long)]
+    pub column: Option<String>,
+}
+
 /// `faucet dlq discard <location>` arguments.
 #[derive(Debug, Parser)]
 pub struct DlqDiscardArgs {
@@ -1992,6 +2057,9 @@ pub enum SchemaTarget {
     Resilience,
     /// JSON Schema for the top-level `sla:` (freshness/volume SLA) block.
     Sla,
+    /// JSON Schema for the top-level `profiling:` (learned column profiles +
+    /// drift detection) block.
+    Profiling,
     /// JSON Schema for the `quality:` block.
     #[cfg(feature = "quality")]
     Quality,

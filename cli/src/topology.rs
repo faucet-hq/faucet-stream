@@ -332,6 +332,11 @@ fn record_identity(
 /// Per-node identities, keyed by node id. Only source and sink nodes appear.
 pub type NodeIdentities = std::collections::HashMap<String, NodeIdentity>;
 
+/// Per-sink-node column profilers (#708), keyed by node id — present for every
+/// real (non-preview) sink node when the config has a `profiling:` block.
+pub type TopologyProfilers =
+    std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<faucet_core::Profiler>>>;
+
 /// [`build_topology_with`] that also reports each source/sink node's identity.
 pub async fn build_topology_meta(
     cfg: &PipelineConfig,
@@ -339,8 +344,21 @@ pub async fn build_topology_meta(
     opts: &TopologyRunOptions,
 ) -> CliResult<(Topology, NodeIdentities)> {
     let mut ids = NodeIdentities::new();
-    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids)).await?;
+    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids), None).await?;
     Ok((topo, ids))
+}
+
+/// [`build_topology_meta`] that also hands back each sink node's column
+/// profiler (#708), so the post-run pass can evaluate drift per sink node.
+pub async fn build_topology_full(
+    cfg: &PipelineConfig,
+    auth: &AuthCatalog,
+    opts: &TopologyRunOptions,
+) -> CliResult<(Topology, NodeIdentities, TopologyProfilers)> {
+    let mut ids = NodeIdentities::new();
+    let mut profilers = TopologyProfilers::new();
+    let topo = build_topology_inner(cfg, auth, opts, Some(&mut ids), Some(&mut profilers)).await?;
+    Ok((topo, ids, profilers))
 }
 
 /// Build a [`faucet_core::Topology`], honouring the run options.
@@ -359,7 +377,7 @@ pub async fn build_topology_with(
     auth: &AuthCatalog,
     opts: &TopologyRunOptions,
 ) -> CliResult<Topology> {
-    build_topology_inner(cfg, auth, opts, None).await
+    build_topology_inner(cfg, auth, opts, None, None).await
 }
 
 async fn build_topology_inner(
@@ -367,6 +385,7 @@ async fn build_topology_inner(
     auth: &AuthCatalog,
     opts: &TopologyRunOptions,
     mut identities: Option<&mut NodeIdentities>,
+    mut profilers: Option<&mut TopologyProfilers>,
 ) -> CliResult<Topology> {
     // Cheap graph checks first, so a wiring typo never costs a connector build.
     validate_topology_spec(cfg)?;
@@ -435,6 +454,19 @@ async fn build_topology_inner(
                 let sink = match opts.limit {
                     Some(n) => Box::new(crate::executor::LimitedSink::wrap(sink, n)) as Box<_>,
                     None => sink,
+                };
+                // Column profiling (#708): a real run's sink node profiles what
+                // it writes, exactly as a matrix invocation does. Previews are
+                // not profiled (their volumes are synthetic).
+                let sink = match (cfg.profiling.as_ref(), profilers.as_mut()) {
+                    (Some(spec), Some(map)) if !opts.is_preview() => {
+                        let profiler = std::sync::Arc::new(std::sync::Mutex::new(
+                            faucet_core::Profiler::new(spec.clone()),
+                        ));
+                        map.insert((*id).clone(), std::sync::Arc::clone(&profiler));
+                        Box::new(faucet_core::ProfilingSink::new(sink, profiler)) as Box<_>
+                    }
+                    _ => sink,
                 };
                 NodeKind::Sink(sink)
             }
@@ -649,7 +681,7 @@ pub async fn run_topology(
         );
     }
 
-    let (topo, identities) = build_topology_meta(cfg, auth, &run).await?;
+    let (topo, identities, profilers) = build_topology_full(cfg, auth, &run).await?;
 
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| "unnamed".to_string());
     let run_id = uuid::Uuid::now_v7().to_string();
@@ -725,7 +757,7 @@ pub async fn run_topology(
     // matrix invocation — it owns a state key, a bookmark, and a record count —
     // so the SLA and notification passes key off it, reusing the same standalone
     // functions the executor calls rather than a parallel implementation.
-    if !run.is_preview() && !cancelled {
+    let profile_failures = if !run.is_preview() && !cancelled {
         post_run_observability(
             cfg,
             PostRun {
@@ -733,6 +765,7 @@ pub async fn run_topology(
                 reported: &reported,
                 state_store: state_store.as_ref(),
                 identities: &identities,
+                profilers: &profilers,
                 reaching: &reaching_sources(cfg),
                 clock: run.clock(),
                 run_id: &run_id,
@@ -740,10 +773,12 @@ pub async fn run_topology(
                 lineage: lineage.as_ref(),
             },
         )
-        .await;
-    }
+        .await
+    } else {
+        Vec::new()
+    };
 
-    let failures: Vec<(&str, &str, Option<faucet_core::topology::NodeErrorKind>)> = reported
+    let mut failures: Vec<(&str, &str, Option<faucet_core::topology::NodeErrorKind>)> = reported
         .nodes
         .iter()
         .filter_map(|n| {
@@ -752,6 +787,11 @@ pub async fn run_topology(
                 .map(|e| (n.node_id.as_str(), e, n.error_kind))
         })
         .collect();
+    // A `profiling.on_drift: fail` finding marks its sink node failed (#708),
+    // like the matrix executor does for an invocation.
+    for (node_id, message) in &profile_failures {
+        failures.push((node_id.as_str(), message.as_str(), None));
+    }
     Ok(build_summary(&reported.result.per_sink, &failures))
 }
 
@@ -794,20 +834,28 @@ fn build_summary(
     invocations.sort_by(|a, b| a.row_id.cmp(&b.row_id));
 
     for (node_id, error, kind) in failures {
+        // Classification comes from the typed kind only — never from the text.
+        // `NodeErrorKind` is non-exhaustive: an unmapped future class is still
+        // a failure, just not one with its own handling; a post-run verdict
+        // (profile drift, #708) carries no node kind and stays unclassified.
+        let error_kind = kind.map(|k| match k {
+            faucet_core::topology::NodeErrorKind::CircuitOpen => InvocationErrorKind::CircuitOpen,
+            _ => InvocationErrorKind::Other,
+        });
+        // A node that wrote its records and was then failed by a post-run pass
+        // is one outcome, not a success row plus a failure row.
+        if let Some(existing) = invocations.iter_mut().find(|i| i.row_id == *node_id) {
+            existing.error = Some((*error).to_string());
+            existing.error_kind = error_kind;
+            continue;
+        }
         invocations.push(InvocationOutcome {
             row_id: (*node_id).to_string(),
             parent_record_key: None,
             run_id: None,
             records_written: 0,
             error: Some((*error).to_string()),
-            error_kind: kind.map(|k| match k {
-                faucet_core::topology::NodeErrorKind::CircuitOpen => {
-                    InvocationErrorKind::CircuitOpen
-                }
-                // `NodeErrorKind` is non-exhaustive: an unmapped future class is
-                // still a failure, just not one with its own handling.
-                _ => InvocationErrorKind::Other,
-            }),
+            error_kind,
             metrics: None,
         });
     }
@@ -924,6 +972,7 @@ struct PostRun<'a> {
     reported: &'a faucet_core::topology::TopologyRun,
     state_store: Option<&'a std::sync::Arc<dyn faucet_core::StateStore>>,
     identities: &'a NodeIdentities,
+    profilers: &'a TopologyProfilers,
     reaching: &'a std::collections::HashMap<String, Vec<String>>,
     clock: DateTime<FixedOffset>,
     run_id: &'a str,
@@ -931,12 +980,15 @@ struct PostRun<'a> {
     lineage: Option<&'a std::sync::Arc<faucet_lineage::LineageEmitter>>,
 }
 
-async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) {
+/// Returns the `(sink node id, message)` of every node a
+/// `profiling.on_drift: fail` finding turned into a failure (#708).
+async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(String, String)> {
     let PostRun {
         pipeline_name,
         reported,
         state_store,
         identities,
+        profilers,
         reaching,
         clock,
         run_id,
@@ -967,6 +1019,7 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) {
         }
     };
     let now = chrono::Utc::now().timestamp();
+    let mut profile_failures = Vec::new();
 
     for node in reported.nodes.iter().filter(|n| n.kind == "sink") {
         let row = node.node_id.as_str();
@@ -999,12 +1052,38 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) {
             None => Vec::new(),
         };
 
+        // ── Column profiling (#708) ──────────────────────────────────────────
+        // Same pass as the matrix executor's: finish the node's profile, compare
+        // it with the baseline under `{pipeline}::{node}`, and apply `on_drift`.
+        let profile_outcome = match (cfg.profiling.as_ref(), profilers.get(row), &node.error) {
+            (Some(spec), Some(p), None) => {
+                let profile = p.lock().map(|g| g.finish()).unwrap_or_default();
+                let outcome = crate::profiling::evaluate_post_run(
+                    spec,
+                    state_store,
+                    &format!("{pipeline_name}::{row}"),
+                    pipeline_name,
+                    row,
+                    run_id,
+                    profile,
+                    chrono::Utc::now(),
+                )
+                .await;
+                if outcome.fails_run(spec) {
+                    profile_failures.push((row.to_string(), outcome.error().to_string()));
+                }
+                Some(outcome)
+            }
+            _ => None,
+        };
+        let node_failed_by_profile = profile_failures.iter().any(|(id, _)| id == row);
+
         // ── Notifications (#280) ─────────────────────────────────────────────
         #[cfg(feature = "notify")]
         if let Some(notifier) = &notifier {
             use crate::notify::NotifyEvent;
-            match &node.error {
-                None => {
+            match (&node.error, node_failed_by_profile) {
+                (None, false) => {
                     notifier
                         .emit(NotifyEvent::run_success(
                             pipeline_name,
@@ -1013,7 +1092,22 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) {
                         ))
                         .await;
                 }
-                Some(msg) => {
+                (None, true) => {
+                    let msg = profile_failures
+                        .iter()
+                        .find(|(id, _)| id == row)
+                        .map(|(_, m)| m.clone())
+                        .unwrap_or_default();
+                    notifier
+                        .emit(NotifyEvent::run_failure(
+                            pipeline_name,
+                            row,
+                            "profile_drift",
+                            msg,
+                        ))
+                        .await;
+                }
+                (Some(msg), _) => {
                     notifier
                         .emit(NotifyEvent::run_failure(pipeline_name, row, "sink", msg))
                         .await;
@@ -1029,9 +1123,26 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) {
                     ))
                     .await;
             }
+            if let (Some(o), Some(spec)) = (&profile_outcome, cfg.profiling.as_ref())
+                && spec.on_drift != faucet_core::OnProfileDrift::Warn
+            {
+                for d in &o.drift {
+                    notifier
+                        .emit(NotifyEvent::profile_drift(
+                            pipeline_name,
+                            row,
+                            &d.column,
+                            d.metric.as_str(),
+                            d.to_string(),
+                        ))
+                        .await;
+                }
+            }
         }
         #[cfg(not(feature = "notify"))]
-        let _ = &violations;
+        let _ = (&violations, node_failed_by_profile);
+        #[cfg(not(feature = "catalog"))]
+        let _ = &profile_outcome;
 
         // ── OpenLineage terminal event (#459) ────────────────────────────────
         #[cfg(feature = "lineage")]
@@ -1114,8 +1225,23 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) {
                 };
                 crate::catalog::record(handle, &update).await;
             }
+            if let Some(o) = &profile_outcome {
+                use crate::serve::history::catalog::{CatalogProfileRecord, dataset_id};
+                let uri = canonicalize_uri(&sink_id.dataset_uri, &sink_id.config, clock);
+                let record = CatalogProfileRecord {
+                    run_id: run_id.to_string(),
+                    pipeline: pipeline_name.to_string(),
+                    row: row.to_string(),
+                    recorded_at: chrono::Utc::now(),
+                    profile: o.profile.clone(),
+                    drift: o.drift.clone(),
+                    baseline_runs: o.baseline_runs,
+                };
+                crate::catalog::record_profile(handle, &dataset_id(&uri), &record).await;
+            }
         }
     }
+    profile_failures
 }
 
 #[cfg(test)]

@@ -105,6 +105,27 @@ pub async fn record(handle: &CatalogHandle, update: &CatalogUpdate) {
     }
 }
 
+/// Persist one run's column profile for a dataset (#708). Best-effort, same
+/// never-fails-the-run contract as [`record`].
+pub async fn record_profile(
+    handle: &CatalogHandle,
+    dataset_id: &str,
+    record: &crate::serve::history::catalog::CatalogProfileRecord,
+) {
+    if let Err(e) = handle
+        .store
+        .catalog_record_profile(dataset_id, record)
+        .await
+    {
+        tracing::warn!(
+            pipeline = %record.pipeline,
+            row = %record.row,
+            error = %e,
+            "catalog profile write failed — run unaffected"
+        );
+    }
+}
+
 /// Persist the latest resolved+expanded config snapshot for `faucet plan --diff`
 /// (#374). Best-effort, same never-fails-the-run contract as [`record`].
 pub async fn record_config_snapshot(handle: &CatalogHandle, snapshot: &ConfigSnapshot) {

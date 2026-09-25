@@ -322,7 +322,9 @@ it automatically). Viewer-readable under RBAC; requires a build with the
   ordered `(last_seen DESC, id DESC)`; `q` is a case-insensitive URI substring.
 - `GET /v1/catalog/datasets/{id}` — the dataset plus its deduplicated schema
   timeline (each version with a `diff` vs the previous), recent per-run volume
-  points, and upstream/downstream lineage edges. `404` for an unknown id.
+  points, upstream/downstream lineage edges, and — once a `profiling:`
+  pipeline has written it — `profile` (the latest run's per-column statistics
+  + drift findings, and the recent history). `404` for an unknown id.
 - `GET /v1/catalog/lineage?root=&depth=` — the source→sink edge graph; with
   `root` (a dataset id), a BFS slice bounded by `depth` hops.
 
@@ -535,7 +537,7 @@ works as a pipeline but is deprecated: add `kind: pipeline`.
 
 **Deployment overlays.** A `kind: deployment` template carries the operational
 blocks a composed run gets from neither template — `state`, `dlq`,
-`notifications`, `sla`, `resilience`, `execution`, `delivery`, `schedule`, and
+`notifications`, `sla`, `profiling`, `resilience`, `execution`, `delivery`, `schedule`, and
 per-stream `sla` / `dlq` / `delivery` under `streams:` (see
 [Deployment overlays](../cookbook/template-hub.md#deployment-overlays)). It is
 registered like any template, never triggered on its own (`422`), and applied

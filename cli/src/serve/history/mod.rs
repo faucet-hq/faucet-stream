@@ -777,6 +777,28 @@ pub trait RunHistory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Append one run's column profile for `dataset_id` (#708), keeping the
+    /// newest [`catalog::PROFILE_RETAIN`]. Default: no-op.
+    async fn catalog_record_profile(
+        &self,
+        dataset_id: &str,
+        record: &catalog::CatalogProfileRecord,
+    ) -> Result<(), HistoryError> {
+        let _ = (dataset_id, record);
+        Ok(())
+    }
+
+    /// The most recent column profiles of a dataset, newest first, at most
+    /// `limit`. Default: empty.
+    async fn catalog_profile_history(
+        &self,
+        dataset_id: &str,
+        limit: usize,
+    ) -> Result<Vec<catalog::CatalogProfileRecord>, HistoryError> {
+        let _ = (dataset_id, limit);
+        Ok(Vec::new())
+    }
+
     /// Record the latest resolved+expanded config snapshot for a pipeline
     /// (#374). Latest-wins per pipeline (upsert). Best-effort at the call site —
     /// recording never fails a run. Default: no-op.

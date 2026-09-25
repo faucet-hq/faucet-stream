@@ -900,6 +900,7 @@ pub(crate) async fn run_doctor_first(
         &auth,
         &ctx,
         loaded.cfg.sla.as_ref(),
+        loaded.cfg.profiling.as_ref(),
         &pipeline_name,
     )
     .await;

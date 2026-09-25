@@ -15,6 +15,10 @@ run, the catalog accumulates **across** runs:
 - **Lineage edges** — which dataset feeds which, with per-edge column lineage
   whenever the transform chain is expressible (the same derivation the
   [OpenLineage emitter](./lineage.md) uses).
+- **Column profiles** — for a pipeline with a [`profiling:`](./profiling.md)
+  block, each run's learned per-column statistics (null rate, distinct
+  estimate, numeric / string summaries, top values) and drift findings,
+  recorded on the sink dataset.
 - **Provenance** — every catalog row is linked to the run that produced it
   (the serve run id under `faucet serve`, the invocation run id otherwise).
 
@@ -95,12 +99,13 @@ Three read-only endpoints (viewer-readable under RBAC):
 | Endpoint | Returns |
 |---|---|
 | `GET /v1/catalog/datasets` | Paginated dataset list (`kind`, `q`, `limit`, `cursor` filters) |
-| `GET /v1/catalog/datasets/{id}` | Current schema, schema timeline (with diffs), recent volume points, upstream/downstream edges |
+| `GET /v1/catalog/datasets/{id}` | Current schema, schema timeline (with diffs), recent volume points, upstream/downstream edges, column profiles (`profile.latest` + `profile.history`) |
 | `GET /v1/catalog/lineage` | The edge graph (`root` + `depth` for a bounded slice) |
 
 The embedded [web console](./web-console.md) adds a **Datasets** browser
-(filterable list → per-dataset detail with the schema timeline and volume
-bars) and a **Lineage** graph view (layered SVG; click a node for its detail).
+(filterable list → per-dataset detail with the schema timeline, volume bars,
+and the column-profile table with null-rate sparklines and drift markers) and
+a **Lineage** graph view (layered SVG; click a node for its detail).
 
 ## Dataset identity & cardinality
 
@@ -122,6 +127,17 @@ same samplers the lineage emitter uses, capped by `sample_records`. The
 timeline dedupes by a content hash, so re-running an unchanged pipeline never
 grows it; a real change appends one version whose `diff` is computed with the
 same engine as [schema-drift handling](./schema-drift.md).
+
+## Column profiles
+
+A pipeline with a [`profiling:`](./profiling.md) block records every run's
+column profile on the **sink** dataset it wrote — the latest profile with its
+drift findings plus the newest 100 runs (the detail read returns 30). `faucet
+catalog show <id>` prints a `profile:` section and the console renders the
+per-column table. The catalog copy is for browsing: the drift detector reads
+its baseline from the pipeline's `state:` store, so `faucet profiling reset`
+re-baselines there and the catalog history stays as a record of what each run
+looked like.
 
 ## Relationship to lineage emission
 

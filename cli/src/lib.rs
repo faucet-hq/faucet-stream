@@ -52,6 +52,7 @@ pub mod params;
 pub mod partition;
 pub mod pipeline_test;
 #[cfg(feature = "cli-progress")]
+pub mod profiling;
 pub mod progress;
 pub mod reconcile;
 pub mod registry;
@@ -225,6 +226,7 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         Command::Dlq(args) => commands::dlq::run(args).await,
         Command::Verify(args) => commands::verify::run(args).await,
         Command::Rollback(args) => commands::rollback::run(args).await,
+        Command::Profiling(args) => commands::profiling::run(args).await,
         Command::Hub(args) => commands::hub::run(args).await,
         #[cfg(feature = "contract")]
         Command::Contract(args) => commands::contract::run(args).await,

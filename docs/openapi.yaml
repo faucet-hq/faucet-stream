@@ -562,9 +562,12 @@ paths:
       summary: Get one dataset's catalog detail
       description: >
         Current schema, the deduplicated schema timeline (with per-version
-        diffs), recent per-run volume points, and the dataset's upstream /
-        downstream lineage edges. Requires the `CatalogRead` permission
-        (viewer). Requires the `catalog` Cargo feature.
+        diffs), recent per-run volume points, the dataset's upstream /
+        downstream lineage edges, and — once a `profiling:` pipeline has
+        written it — the learned column profiles (`profile`: the latest run's
+        per-column statistics + drift findings and the recent history).
+        Requires the `CatalogRead` permission (viewer). Requires the `catalog`
+        Cargo feature.
       operationId: getCatalogDataset
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1988,6 +1991,109 @@ components:
             downstream:
               type: array
               items: { $ref: "#/components/schemas/CatalogLineageEdge" }
+            profile:
+              $ref: "#/components/schemas/CatalogProfile"
+    CatalogProfile:
+      type: object
+      description: >
+        Learned column profiles (#708) recorded on a sink dataset: the latest
+        run's profile + drift and the recent history (newest first, at most 30).
+        The detector's baseline lives in the pipeline's state store; this is
+        the browsable copy.
+      required: [latest, history]
+      properties:
+        latest: { $ref: "#/components/schemas/CatalogProfileRecord" }
+        history:
+          type: array
+          items: { $ref: "#/components/schemas/CatalogProfileRecord" }
+    CatalogProfileRecord:
+      type: object
+      required: [run_id, pipeline, row, recorded_at, profile]
+      properties:
+        run_id: { type: string }
+        pipeline: { type: string }
+        row: { type: string }
+        recorded_at: { type: string, format: date-time }
+        profile: { $ref: "#/components/schemas/RunProfile" }
+        drift:
+          type: array
+          description: Findings against the baseline (absent when none).
+          items: { $ref: "#/components/schemas/ProfileDrift" }
+        baseline_runs:
+          type: integer
+          description: Runs in the baseline this profile was compared against.
+    RunProfile:
+      type: object
+      required: [rows, columns]
+      properties:
+        rows: { type: integer, description: Records the run wrote. }
+        columns:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/ColumnProfile" }
+        skipped_columns:
+          type: integer
+          description: Columns seen beyond `profiling.max_columns` (absent when 0).
+    ColumnProfile:
+      type: object
+      required: [rows, present, nulls, null_rate, types, distinct]
+      properties:
+        rows: { type: integer }
+        present: { type: integer, description: Records in which the column was present. }
+        nulls: { type: integer, description: Records where the column was absent or null. }
+        null_rate: { type: number }
+        types:
+          type: object
+          description: Values per JSON type.
+          properties:
+            "null": { type: integer }
+            boolean: { type: integer }
+            integer: { type: integer }
+            number: { type: integer }
+            string: { type: integer }
+            object: { type: integer }
+            array: { type: integer }
+        distinct: { type: integer, description: HyperLogLog estimate of distinct non-null values. }
+        numeric:
+          type: object
+          properties:
+            count: { type: integer }
+            min: { type: number }
+            max: { type: number }
+            mean: { type: number }
+            stddev: { type: number }
+            p50: { type: number }
+            p95: { type: number }
+        string:
+          type: object
+          properties:
+            count: { type: integer }
+            len_min: { type: integer }
+            len_max: { type: integer }
+            len_mean: { type: number }
+        top_values:
+          type: array
+          description: Most frequent values, count descending; absent for high-cardinality columns.
+          items:
+            type: object
+            required: [value, count, share]
+            properties:
+              value: { type: string }
+              count: { type: integer }
+              error: { type: integer, description: Possible over-count (absent when 0). }
+              share: { type: number }
+        high_cardinality: { type: boolean }
+    ProfileDrift:
+      type: object
+      required: [column, metric, observed, detail]
+      properties:
+        column: { type: string }
+        metric:
+          type: string
+          enum: [null_rate, distinct, mean, min, max, string_length, type_mix, new_value, vanished_value, psi]
+        observed: { type: number }
+        baseline: { type: number, description: The baseline mean for a numeric metric. }
+        value: { type: string, description: The value or type name for `type_mix` / `new_value` / `vanished_value`. }
+        detail: { type: string }
     ParamSpec:
       type: object
       description: One entry of a config's `params:` block — the trigger-time override surface.

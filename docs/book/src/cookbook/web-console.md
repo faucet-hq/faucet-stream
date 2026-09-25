@@ -188,7 +188,12 @@ When the server is built with the `catalog` feature, two more views browse the
 - **Datasets** — a filterable list (kind / URI search) of every dataset the
   server's pipelines have touched. Clicking a dataset opens its detail:
   freshness and run counters, per-run volume bars, the deduplicated schema
-  timeline with per-version diff badges, and its upstream/downstream edges.
+  timeline with per-version diff badges, its upstream/downstream edges, and —
+  for a dataset written by a [`profiling:`](./profiling.md) pipeline — a
+  **Column profiles** table: per column the type mix, null rate with a
+  sparkline over the recorded runs (drift runs marked), distinct estimate,
+  numeric / string summary, and top values, with the latest run's drift
+  findings listed above it.
 
   ![The Datasets view listing every dataset touched, each with a kind badge, URI, source/sink role, and run/row counts](../assets/console/datasets.png)
 

@@ -42,6 +42,9 @@ struct CatalogState {
     edges: std::collections::HashMap<(String, String), CatalogLineageEdge>,
     /// pipeline name → latest config snapshot (#374). Latest-wins.
     config_snapshots: std::collections::HashMap<String, super::catalog::ConfigSnapshot>,
+    /// dataset id → column profiles, oldest first, capped at `PROFILE_RETAIN`
+    /// (#708).
+    profiles: std::collections::HashMap<String, Vec<super::catalog::CatalogProfileRecord>>,
 }
 
 pub struct MemoryHistory {
@@ -441,13 +444,58 @@ impl RunHistory for MemoryHistory {
         });
         let (downstream, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|e| e.src_id == id);
         let upstream = rest.into_iter().filter(|e| e.dst_id == id).collect();
+        let profile = catalog::profile_view(
+            cat.profiles
+                .get(id)
+                .map(|v| v.iter().rev().cloned().collect())
+                .unwrap_or_default(),
+        );
         Ok(Some(CatalogDatasetDetail {
             dataset,
             schema_timeline,
             stats,
             upstream,
             downstream,
+            profile,
         }))
+    }
+
+    async fn catalog_record_profile(
+        &self,
+        dataset_id: &str,
+        record: &catalog::CatalogProfileRecord,
+    ) -> Result<(), HistoryError> {
+        let mut cat = self
+            .catalog
+            .lock()
+            .map_err(|_| HistoryError::Backend("catalog lock poisoned".into()))?;
+        let list = cat.profiles.entry(dataset_id.to_string()).or_default();
+        // The SQL backends key on (dataset, recorded_at); mirror that dedup.
+        if list.iter().any(|r| r.recorded_at == record.recorded_at) {
+            return Ok(());
+        }
+        list.push(record.clone());
+        if list.len() > catalog::PROFILE_RETAIN {
+            let drop_n = list.len() - catalog::PROFILE_RETAIN;
+            list.drain(..drop_n);
+        }
+        Ok(())
+    }
+
+    async fn catalog_profile_history(
+        &self,
+        dataset_id: &str,
+        limit: usize,
+    ) -> Result<Vec<catalog::CatalogProfileRecord>, HistoryError> {
+        let cat = self
+            .catalog
+            .lock()
+            .map_err(|_| HistoryError::Backend("catalog lock poisoned".into()))?;
+        Ok(cat
+            .profiles
+            .get(dataset_id)
+            .map(|v| v.iter().rev().take(limit).cloned().collect())
+            .unwrap_or_default())
     }
 
     async fn catalog_lineage(
