@@ -674,7 +674,11 @@ jobs:
           # Excluding them is internal, reversible, and honest about what is
           # unguarded. Restore the moment upstream yanks 1.2.0 or `deltalake`
           # moves to the `buoyant_kernel` 0.28 line that pairs with it.
-          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta
+          #
+          # The RabbitMQ crates (#561) are new and have no published baseline
+          # yet — cargo-semver-checks can only compare against a crates.io
+          # release. Drop them from this list once release-plz publishes 1.0.0.
+          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq
           # No `package:` — check the whole workspace. Gating only `faucet-core`
           # left 89 crates unguarded, so a genuine removal or signature change in
           # a connector could publish in a minor and break dependents silently
