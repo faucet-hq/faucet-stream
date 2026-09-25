@@ -423,5 +423,6 @@ Full-refresh: each run atomically **replaces** the whole table. Writes are
 staged into a `CREATE TABLE … LIKE` clone (`{table}__faucet_ovw`) and published
 with an atomic `RENAME TABLE` swap (MySQL auto-commits DDL, so a rename — not a
 transaction — is what makes the swap atomic) only after the run succeeds, so a
-mid-run failure leaves the previous rows intact. No `key` is needed; the target
-table must already exist.
+mid-run failure leaves the previous rows intact. No `key` is needed; a missing target is created by the
+first run (staged from the first page, then renamed into place at commit — a
+failed first run leaves no table) when `create_table: true`.

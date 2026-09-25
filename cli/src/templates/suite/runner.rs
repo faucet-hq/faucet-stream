@@ -61,6 +61,8 @@ pub enum Target<'a> {
         id: &'a str,
         version: u32,
         sink: Option<(&'a str, u32)>,
+        /// The deployment overlay applied over the composition (#679).
+        overlay: Option<crate::templates::OverlayChoice>,
     },
     /// A config file on disk — lets a template be tested **before** it is
     /// registered, which is when these failures are cheapest to fix.
@@ -69,6 +71,9 @@ pub enum Target<'a> {
     Document {
         body: String,
         sink_body: Option<String>,
+        /// The deployment overlay applied over the composition (#679); a
+        /// file-based suite reads it from disk, so it is always inline here.
+        overlay: Option<crate::templates::OverlayChoice>,
     },
 }
 
@@ -155,7 +160,11 @@ fn parse_template_text(text: &str, what: &str) -> CliResult<Value> {
 /// exactly what a trigger does, so a suite tests the real thing.
 async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
     match target {
-        Target::Document { body, sink_body } => {
+        Target::Document {
+            body,
+            sink_body,
+            overlay,
+        } => {
             let doc = parse_template_text(body, "template")?;
             match crate::hub::detect_kind(&doc) {
                 Some(crate::hub::TemplateKind::SourceTemplate) => {
@@ -175,7 +184,21 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                             .map_err(|e| {
                                 CliError::Config(format!("template test: sink-template: {e}"))
                             })?;
-                    Ok(crate::hub::compose(&source, &sink)?.document)
+                    let c = crate::hub::compose(&source, &sink)?;
+                    Ok(match overlay {
+                        Some(crate::templates::OverlayChoice::Inline(v)) => {
+                            c.apply_overlay(&crate::hub::DeploymentTemplate::from_value(
+                                v.clone(),
+                            )?)?
+                            .document
+                        }
+                        Some(crate::templates::OverlayChoice::Registered { id, .. }) => {
+                            return Err(CliError::Config(format!(
+                                "template test: a file-based suite applies an overlay file, not the registered '{id}'"
+                            )));
+                        }
+                        None => c.document,
+                    })
                 }
                 Some(crate::hub::TemplateKind::SinkTemplate) => Err(CliError::Config(
                     "template test: a sink-template has no streams to test on its own — point \
@@ -190,6 +213,7 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
             id,
             version,
             sink,
+            overlay,
         } => {
             let rec = store
                 .template_get(id, Some(*version))
@@ -227,10 +251,21 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                     .map_err(|e| {
                         CliError::Internal(format!("stored sink-template '{sink_id}': {e}"))
                     })?;
-                    Ok(crate::hub::compose(&source, &sink_t)?.document)
+                    let c = crate::hub::compose(&source, &sink_t)?;
+                    Ok(match overlay {
+                        Some(choice) => {
+                            let (t, _, _) =
+                                crate::templates::store::resolve_overlay(store, choice).await?;
+                            c.apply_overlay(&t)?.document
+                        }
+                        None => c.document,
+                    })
                 }
                 crate::hub::TemplateKind::SinkTemplate => Err(CliError::Config(format!(
                     "template test: '{id}' is a sink-template and has no streams to test on its own"
+                ))),
+                crate::hub::TemplateKind::Deployment => Err(CliError::Config(format!(
+                    "template test: '{id}' is a deployment overlay — name it under `overlay:` of a source template's suite"
                 ))),
             }
         }
@@ -370,6 +405,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
             id,
             version,
             sink,
+            overlay,
         } => {
             let choice = crate::templates::SinkChoice {
                 id: sink.map(|(s, _)| s.to_string()),
@@ -377,6 +413,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
                     Some((_, v)) => crate::serve::history::templates::VersionSelector::Pinned(*v),
                     None => Default::default(),
                 },
+                overlay: overlay.clone(),
             };
             Ok(crate::templates::materialize_for_run(
                 store,
@@ -469,6 +506,7 @@ pipeline:
         Target::Document {
             body: template(),
             sink_body: None,
+            overlay: None,
         }
     }
 
@@ -711,6 +749,7 @@ suite:
 "
             .into(),
             sink_body: None,
+            overlay: None,
         };
         assert!(run(&file, target, None).await.is_err());
     }
@@ -766,6 +805,7 @@ suite:
                 id: "suite-fixture",
                 version,
                 sink: None,
+                overlay: None,
             },
             None,
         )
@@ -810,6 +850,7 @@ suite:
                 id: "nope",
                 version: 1,
                 sink: None,
+                overlay: None,
             },
             None,
         )
@@ -853,6 +894,7 @@ suite:
             Target::Document {
                 body: source.clone(),
                 sink_body: Some(sink.clone()),
+                overlay: None,
             },
             None,
         )
@@ -866,6 +908,7 @@ suite:
             Target::Document {
                 body: source,
                 sink_body: None,
+                overlay: None,
             },
             None,
         )
@@ -880,6 +923,7 @@ suite:
             Target::Document {
                 body: sink,
                 sink_body: None,
+                overlay: None,
             },
             None,
         )
@@ -887,6 +931,117 @@ suite:
         .expect_err("sink alone")
         .to_string();
         assert!(err.contains("no streams"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn suites_apply_a_deployment_overlay_to_the_composition() {
+        // #679: the overlay's params join the swept surface, and its blocks
+        // land on every case's document.
+        let dir = tempfile::tempdir().unwrap();
+        let (source, sink) = hub_pair(dir.path());
+        let overlay = serde_json::json!({
+            "kind": "deployment", "name": "ops",
+            "params": { "state_dir": { "type": "string", "required": true } },
+            "state": { "type": "file", "config": { "path": "${param.state_dir}" } }
+        });
+        let file = suite_from(
+            r#"
+version: 1
+template: acme-exports
+suite:
+  cases:
+    - name: with-state
+      params: { region: eu, out_dir: ./out, state_dir: ./state }
+    - name: missing-overlay-param
+      params: { region: eu, out_dir: ./out }
+      expect: { error: "state_dir" }
+"#,
+        );
+        let out = run(
+            &file,
+            Target::Document {
+                body: source.clone(),
+                sink_body: Some(sink.clone()),
+                overlay: Some(crate::templates::OverlayChoice::Inline(overlay)),
+            },
+            None,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out.passed(), 2, "{:?}", out.cases);
+
+        // A file-based suite cannot reach a registry.
+        let err = run(
+            &file,
+            Target::Document {
+                body: source.clone(),
+                sink_body: Some(sink.clone()),
+                overlay: Some(crate::templates::OverlayChoice::Registered {
+                    id: "ops".into(),
+                    version: Default::default(),
+                }),
+            },
+            None,
+        )
+        .await
+        .expect_err("registered overlay in a file suite")
+        .to_string();
+        assert!(err.contains("applies an overlay file"), "{err}");
+
+        // Registered: source, sink and overlay all come from the store.
+        let store = crate::templates::resolve_store_url("memory").await.unwrap();
+        for body in [
+            source,
+            sink,
+            "kind: deployment\nname: ops\nstate: { type: memory }\n".to_string(),
+        ] {
+            crate::templates::register(
+                &store,
+                crate::templates::RegisterRequest {
+                    id: None,
+                    body,
+                    format: crate::serve::load::ConfigFormat::Yaml,
+                    description: None,
+                    tags: Vec::new(),
+                    launch: true,
+                    created_by: None,
+                },
+            )
+            .await
+            .expect("register");
+        }
+        let file = suite_from(
+            "version: 1\ntemplate: acme-exports\nsink: local-jsonl\noverlay: ops\nsuite:\n  cases:\n    - name: eu\n      params: { region: eu, out_dir: ./out }\n",
+        );
+        assert_eq!(file.overlay.as_deref(), Some("ops"));
+        let registered = || Target::Registered {
+            store: &store,
+            id: "acme-exports",
+            version: 1,
+            sink: Some(("local-jsonl", 1)),
+            overlay: Some(crate::templates::OverlayChoice::Registered {
+                id: "ops".into(),
+                version: Default::default(),
+            }),
+        };
+        let out = run(&file, registered(), None).await.expect("runs");
+        assert_eq!(out.failed(), 0, "{:?}", out.cases);
+        // A deployment is not a suite target of its own.
+        let err = run(
+            &file,
+            Target::Registered {
+                store: &store,
+                id: "ops",
+                version: 1,
+                sink: None,
+                overlay: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("deployment as a target")
+        .to_string();
+        assert!(err.contains("deployment overlay"), "{err}");
     }
 
     #[tokio::test]
@@ -929,6 +1084,7 @@ suite:
                 id: "acme-exports",
                 version: 1,
                 sink: Some(("local-jsonl", 1)),
+                overlay: None,
             },
             None,
         )
@@ -945,6 +1101,7 @@ suite:
                 id: "acme-exports",
                 version: 1,
                 sink: None,
+                overlay: None,
             },
             None,
         )
@@ -960,6 +1117,7 @@ suite:
                 id: "local-jsonl",
                 version: 1,
                 sink: None,
+                overlay: None,
             },
             None,
         )

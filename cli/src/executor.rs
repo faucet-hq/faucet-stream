@@ -2133,7 +2133,7 @@ async fn run_one_invocation(
         && !cancel.is_cancelled();
 
     #[cfg_attr(not(feature = "notify"), allow(unused_variables))]
-    let sla_violations = if let Some(spec) = &opts.sla
+    let sla_violations = if let Some(spec) = node.sla.as_ref().or(opts.sla.as_ref())
         && is_notifiable_root
     {
         let outcome = match &result {
@@ -2866,6 +2866,7 @@ mod tests {
                 transforms: Vec::new(),
                 state: None,
                 dlq: None,
+                sla: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -4415,6 +4416,7 @@ matrix:
                 transforms: Vec::new(),
                 state: None,
                 dlq: None,
+                sla: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -4499,6 +4501,7 @@ matrix:
             transforms: Vec::new(),
             state: None,
             dlq: None,
+            sla: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]
@@ -4826,6 +4829,7 @@ matrix:
             transforms: Vec::new(),
             state,
             dlq: None,
+            sla: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]
@@ -5053,6 +5057,7 @@ matrix:
             transforms: Vec::new(),
             state: None,
             dlq: None,
+            sla: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]

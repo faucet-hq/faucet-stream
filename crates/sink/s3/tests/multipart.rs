@@ -22,7 +22,10 @@ use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::minio::MinIO;
 
-const MINIO_IMAGE_NAME: &str = "quay.io/minio/minio";
+/// Chainguard's maintained MinIO build: the upstream images stopped being
+/// pullable (#694). Same server binary and CLI.
+const MINIO_IMAGE_NAME: &str = "cgr.dev/chainguard/minio";
+const MINIO_IMAGE_TAG: &str = "latest";
 const ACCESS_KEY: &str = "minioadmin";
 const SECRET_KEY: &str = "minioadmin";
 const REGION: &str = "us-east-1";
@@ -35,6 +38,8 @@ const RECORDS: usize = 12_000;
 async fn start_minio() -> (ContainerAsync<MinIO>, String) {
     let container: ContainerAsync<MinIO> = MinIO::default()
         .with_name(MINIO_IMAGE_NAME)
+        .with_tag(MINIO_IMAGE_TAG)
+        .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
         .start()
         .await
         .expect("minio container start");

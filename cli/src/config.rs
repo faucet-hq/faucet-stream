@@ -121,8 +121,8 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resilience: Option<ResilienceSpec>,
 
-    /// Optional data-freshness & volume SLA (#202). Top-level in v1 (not
-    /// per-matrix-row, like `resilience:`). Evaluated after every root
+    /// Optional data-freshness & volume SLA (#202). A matrix row's own `sla:`
+    /// replaces it for that row (#679). Evaluated after every root
     /// invocation by `faucet run`/`schedule`/`serve`/`replicate`; violations
     /// emit metrics + warnings and never fail the run. Staleness/volume checks
     /// require a `state:` block (enforced at expand time).
@@ -145,9 +145,15 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<ShardingSpec>,
 
-    /// Optional snapshot→CDC replication block. Consumed only by
-    /// `faucet replicate`; ignored by `faucet run` (like `schedule:`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `mirror:` — the snapshot→CDC handoff block. Consumed only by
+    /// `faucet mirror`; ignored by `faucet run` (like `schedule:`). The
+    /// pre-#670 spelling `replication:` is still accepted.
+    #[serde(
+        default,
+        rename = "mirror",
+        alias = "replication",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub replication: Option<crate::replication::spec::ReplicationSpec>,
 
     /// Optional backfill defaults (window/concurrency/timezone, #282).
@@ -607,6 +613,11 @@ pub struct MatrixRow {
     /// Per-row delivery override. `None` inherits the top-level `delivery`.
     #[serde(default)]
     pub delivery: Option<faucet_core::DeliveryMode>,
+
+    /// Per-row SLA override (#679). Replaces the top-level `sla:` for this
+    /// row's invocations; `None` inherits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sla: Option<crate::sla::SlaSpec>,
 
     /// Free-form classification tags for this row (#376). Orthogonal to the
     /// source's `status:` readiness ladder — `status` gates whether a row is
@@ -1416,6 +1427,15 @@ impl PipelineConfig {
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
+        // Deprecated spellings are visible only in the raw document (#670).
+        let raw: Option<serde_json::Value> = match ext.as_deref() {
+            Some("yaml" | "yml") => serde_yaml::from_str(text).ok(),
+            Some("json") => serde_json::from_str(text).ok(),
+            _ => None,
+        };
+        if let Some(raw) = &raw {
+            crate::vocabulary::warn_deprecated(raw);
+        }
         let cfg: PipelineConfig = match ext.as_deref() {
             Some("yaml" | "yml") => {
                 serde_yaml::from_str(text).map_err(|e| CliError::ParseConfig {
@@ -1445,6 +1465,7 @@ impl PipelineConfig {
     /// `interpolate` on the source text) before building the `Value`.
     pub fn from_value(value: serde_json::Value) -> CliResult<Self> {
         let synthetic = Path::new("<submitted>");
+        crate::vocabulary::warn_deprecated(&value);
         let cfg: PipelineConfig =
             serde_json::from_value(value).map_err(|e| CliError::ParseConfig {
                 path: synthetic.to_path_buf(),

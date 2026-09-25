@@ -108,7 +108,7 @@
       ]
     },
     "sla": {
-      "description": "Optional data-freshness & volume SLA (#202). Top-level in v1 (not\nper-matrix-row, like `resilience:`). Evaluated after every root\ninvocation by `faucet run`/`schedule`/`serve`/`replicate`; violations\nemit metrics + warnings and never fail the run. Staleness/volume checks\nrequire a `state:` block (enforced at expand time).",
+      "description": "Optional data-freshness & volume SLA (#202). A matrix row's own `sla:`\nreplaces it for that row (#679). Evaluated after every root\ninvocation by `faucet run`/`schedule`/`serve`/`replicate`; violations\nemit metrics + warnings and never fail the run. Staleness/volume checks\nrequire a `state:` block (enforced at expand time).",
       "anyOf": [
         {
           "$ref": "#/$defs/SlaSpec"
@@ -140,8 +140,8 @@
         }
       ]
     },
-    "replication": {
-      "description": "Optional snapshot→CDC replication block. Consumed only by\n`faucet replicate`; ignored by `faucet run` (like `schedule:`).",
+    "mirror": {
+      "description": "`mirror:` — the snapshot→CDC handoff block. Consumed only by\n`faucet mirror`; ignored by `faucet run` (like `schedule:`). The\npre-#670 spelling `replication:` is still accepted.",
       "anyOf": [
         {
           "$ref": "#/$defs/ReplicationSpec"
@@ -2092,6 +2092,17 @@
           ],
           "default": null
         },
+        "sla": {
+          "description": "Per-row SLA override (#679). Replaces the top-level `sla:` for this\nrow's invocations; `None` inherits it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlaSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tags": {
           "description": "Free-form classification tags for this row (#376). Orthogonal to the\nsource's `status:` readiness ladder — `status` gates whether a row is\neligible; `tags` narrow *within* the eligible set at runtime via\n`--tag`. Union-merged with the source template's `tags:` to form the\neffective tag set. Validated at expand time (charset\n`^[a-z0-9][a-z0-9_-]*$`, deduped).",
           "type": "array",
@@ -3087,7 +3098,7 @@
       ]
     },
     "ReplicationSpec": {
-      "description": "Top-level `replication:` block.",
+      "description": "Top-level `mirror:` block (alias `replication:`).",
       "type": "object",
       "properties": {
         "mode": {
@@ -4647,8 +4658,8 @@
             }
           ]
         },
-        "partition": {
-          "description": "Key-range partitioned extraction: split large entities into contiguous\nprimary-key ranges fetched concurrently, instead of one sequential\n`@odata.nextLink` page walk. See [`PartitionSpec`].",
+        "key_ranges": {
+          "description": "`key_ranges:` — split large entities into contiguous primary-key\nranges fetched concurrently, instead of one sequential\n`@odata.nextLink` page walk. See [`PartitionSpec`]. The pre-#670\nspelling `partition:` is still accepted.",
           "anyOf": [
             {
               "$ref": "#/$defs/source_rest__PartitionSpec"
@@ -4659,7 +4670,10 @@
           ]
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "partition"
+      ]
     },
     "source_rest__ODataVersion": {
       "description": "OData protocol version, which selects the paging-link key.",
@@ -13269,8 +13283,8 @@
                       "minimum": 0,
                       "default": 100
                     },
-                    "partitions": {
-                      "description": "Each entry is a context map whose values are substituted into `path`\nplaceholders. The stream is executed once per partition and results are\nconcatenated.  Empty means run once with no substitution.",
+                    "requests": {
+                      "description": "`requests:` — one entry per request: a context map whose values are\nsubstituted into `path` placeholders. The stream is executed once per\nentry and results are concatenated. Empty means run once with no\nsubstitution. The pre-#670 spelling `partitions:` is still accepted.",
                       "type": "array",
                       "items": {
                         "type": "object",
@@ -13278,8 +13292,8 @@
                       },
                       "default": []
                     },
-                    "partition_concurrency": {
-                      "description": "Maximum number of partitions to fetch concurrently.\n`None` (and `0`/`1`) means sequential processing — the default.\n\nHonoured on **both** read paths since #624: the buffering `fetch_all`\nand the `stream_pages` path the pipeline actually drives, where it used\nto be silently ignored. Above 1, partition pages **interleave**: the\nstreams are polled together, so a page from partition 3 can arrive\nbefore partition 1 has finished. Partitions are disjoint and the\npersisted bookmark is a max across all of them, so this changes\nthroughput rather than the resume position — but a downstream that\nassumed partition-at-a-time page order no longer gets it.",
+                    "request_concurrency": {
+                      "description": "`request_concurrency:` — maximum number of `requests` entries fetched\nconcurrently (`partition_concurrency:` is still accepted).\n`None` (and `0`/`1`) means sequential processing — the default.\n\nHonoured on **both** read paths since #624: the buffering `fetch_all`\nand the `stream_pages` path the pipeline actually drives, where it used\nto be silently ignored. Above 1, partition pages **interleave**: the\nstreams are polled together, so a page from partition 3 can arrive\nbefore partition 1 has finished. Partitions are disjoint and the\npersisted bookmark is a max across all of them, so this changes\nthroughput rather than the resume position — but a downstream that\nassumed partition-at-a-time page order no longer gets it.",
                       "type": [
                         "integer",
                         "null",
@@ -13458,7 +13472,11 @@
                   },
                   "title": "RestStreamConfig",
                   "description": "Configuration for a RestStream.\n\n`#[serde(default)]` at the container level: every field falls back to its\nvalue from the [`Default`] impl below when omitted. Without it, **22 fields\nwere required** — a config had to spell out `max_retries`, `retry_backoff`,\n`tolerated_http_errors`, `primary_keys`, `partitions`,\n`schema_sample_size` and more before it would deserialize at all. That is\nwhy the shipped examples are so verbose, and several of them still omitted\none field and could not run; nothing caught it because `faucet validate`\ndid not deserialize connector configs until #609.\n\n`base_url` stays required — in serde *and* in the generated JSON Schema, so\n`faucet init` still marks it `# REQUIRED`. Everything else defaults to the\nvalue in the [`Default`] impl below.",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-aliases": [
+                    "partitions",
+                    "partition_concurrency"
+                  ]
                 },
                 true
               ]

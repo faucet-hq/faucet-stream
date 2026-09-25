@@ -32,7 +32,10 @@ use testcontainers_modules::minio::MinIO;
 
 /// See the note in `streaming.rs`: MinIO's Docker Hub repository was withdrawn,
 /// so the identical pinned release is pulled from Quay.
-const MINIO_IMAGE_NAME: &str = "quay.io/minio/minio";
+/// Chainguard's maintained MinIO build: the upstream images stopped being
+/// pullable (#694). Same server binary and CLI.
+const MINIO_IMAGE_NAME: &str = "cgr.dev/chainguard/minio";
+const MINIO_IMAGE_TAG: &str = "latest";
 const ACCESS_KEY: &str = "minioadmin";
 const SECRET_KEY: &str = "minioadmin";
 const REGION: &str = "us-east-1";
@@ -41,6 +44,8 @@ const BUCKET: &str = "faucet-parquet-tests";
 async fn start_minio() -> (ContainerAsync<MinIO>, String) {
     let container: ContainerAsync<MinIO> = MinIO::default()
         .with_name(MINIO_IMAGE_NAME)
+        .with_tag(MINIO_IMAGE_TAG)
+        .with_mapped_port(0, testcontainers::core::IntoContainerPort::tcp(9000))
         .start()
         .await
         .expect("minio container start");

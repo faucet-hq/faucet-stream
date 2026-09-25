@@ -454,7 +454,9 @@ Full-refresh: each run atomically **replaces** the whole table. Writes are
 staged into a `LIKE` clone (`{table}__faucet_ovw`) and swapped in one
 transaction (`TRUNCATE` + `INSERT … SELECT` + `DROP`) only after the run
 succeeds, so a mid-run failure leaves the previous rows intact. No `key` is
-needed; the target table must already exist. See the
+needed; a missing target is created by the first run
+(staged from the first page, then renamed into place at commit — a failed first
+run leaves no table) when `create_table: true`. See the
 [Overwrite cookbook](../../../docs/book/src/cookbook/upsert.md).
 
 **Scoped / windowed overwrite (#518):** add a `scope: { window: { column, from, to } }`

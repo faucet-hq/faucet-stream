@@ -25,7 +25,9 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
     // `report` await at the end keeps the future small (see `run`).
     let cfg = if let (Some(source), Some(sink)) = (&args.source, &args.sink) {
         let hub_dir = crate::hub::resolve_hub(args.hub.as_deref()).await?;
-        let composition = crate::hub::compose_locators(source, sink, &hub_dir).await?;
+        let composition =
+            crate::hub::compose_locators_overlaid(source, sink, args.overlay.as_deref(), &hub_dir)
+                .await?;
         if args.show_composed {
             print!("{}", composition.to_yaml()?);
             return Ok(());
@@ -53,6 +55,15 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
             for p in &composition.streams {
                 println!("  {:<32} write_mode: {}", p.stream, p.describe());
             }
+            if let Some(o) = &composition.overlay {
+                println!(
+                    "  overlay '{o}' sets: {}",
+                    composition.overlay_contributes.join(", ")
+                );
+            }
+            for w in &composition.warnings {
+                println!("  warning: {w}");
+            }
         }
         cfg
     } else {
@@ -62,12 +73,8 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
                 crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?
             }
         };
-        if let Some(kind) = crate::hub::detect_kind_in_file(&path).filter(|k| k.is_hub()) {
-            return Err(CliError::Config(format!(
-                "{} is a hub {} — validate a pairing: `faucet validate --source <source-template> --sink <sink-template>`",
-                path.display(),
-                kind.as_str()
-            )));
+        if let Some(msg) = crate::hub::misplaced_document(&path, "validate") {
+            return Err(CliError::Config(msg));
         }
 
         if args.show_composed {

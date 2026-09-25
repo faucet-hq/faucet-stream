@@ -64,7 +64,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `database_url` | string | — *(required)* | SQLite database URL. A file path (`/tmp/app.db`), a `sqlite:` URL, or `sqlite::memory:` for an in-memory database. The file (and parent dirs) is created if missing. |
-| `table_name` | string | — *(required)* | Target table name. Must already exist with the appropriate columns. |
+| `table_name` | string | — *(required)* | Target table name. Created from the first page when missing and `create_table: true`. |
 | `column_mapping` | `SqliteColumnMapping` | `{ json: { column: "data" } }` | How JSON records map to columns — see [Column mapping](#column-mapping). |
 
 ### Batching & pooling
@@ -421,5 +421,7 @@ Full-refresh: each run atomically **replaces** the whole table. Writes are
 staged into a `SELECT … WHERE 0` clone (`{table}__faucet_ovw`) and swapped in
 one transaction (`DELETE` + `INSERT … SELECT` + `DROP`) only after the run
 succeeds, so a mid-run failure leaves the previous rows intact. No `key` is
-needed; the target table must already exist. Works in both `auto_map` and JSON
+needed; a missing target is created by the first run
+(staged from the first page, then renamed into place at commit — a failed first
+run leaves no table) when `create_table: true`. Works in both `auto_map` and JSON
 column modes.

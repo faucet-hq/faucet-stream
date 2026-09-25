@@ -101,6 +101,56 @@ where
         .join(", ")
 }
 
+/// Plan the columns for a table whose writes dedup on `key` (#676).
+///
+/// Like [`plan_columns`], plus: every key column is planned even when the
+/// first page never carries it (typed TEXT, the type that holds anything), and
+/// key columns are marked non-nullable. A created table can then carry a
+/// primary key on `key` — which is what gives an upsert's `ON CONFLICT` /
+/// `MERGE` a target on the very first run.
+pub fn plan_keyed_columns(page: &[Value], key: &[String]) -> Option<Vec<PlannedColumn>> {
+    let mut columns = plan_columns(page)?;
+    for k in key {
+        match columns.iter_mut().find(|c| &c.name == k) {
+            Some(c) => c.nullable = false,
+            None => columns.push(PlannedColumn {
+                name: k.clone(),
+                base_type: SqlBaseType::Text,
+                nullable: false,
+            }),
+        }
+    }
+    Some(columns)
+}
+
+/// Render a column list where the type keyword may depend on the column, not
+/// just its base type — for dialects that cannot index an unbounded type and so
+/// need a bounded one for key columns (MySQL `TEXT`, SQL Server `NVARCHAR(MAX)`).
+pub fn render_column_defs<Q, T>(columns: &[PlannedColumn], quote: Q, ty: T) -> String
+where
+    Q: Fn(&str) -> String,
+    T: Fn(&PlannedColumn) -> &'static str,
+{
+    columns
+        .iter()
+        .map(|c| format!("{} {}", quote(&c.name), ty(c)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `PRIMARY KEY (<key…>)` for a created table, or `None` for an empty key.
+pub fn render_primary_key<Q>(key: &[String], quote: Q) -> Option<String>
+where
+    Q: Fn(&str) -> String,
+{
+    (!key.is_empty()).then(|| {
+        format!(
+            "PRIMARY KEY ({})",
+            key.iter().map(|k| quote(k)).collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
 /// The uniform error a sink raises when its target is missing and
 /// `create_table: false` (#580).
 ///
@@ -254,5 +304,57 @@ mod tests {
             |_| "TEXT",
         );
         assert_eq!(sql, "\"we\"\"ird\" TEXT");
+    }
+
+    #[test]
+    fn keyed_plan_marks_key_columns_required_and_adds_missing_ones() {
+        let page = vec![json!({ "id": 1, "name": "a" })];
+        let cols = plan_keyed_columns(&page, &["id".into(), "tenant".into()]).expect("a plan");
+        let id = cols.iter().find(|c| c.name == "id").unwrap();
+        assert!(!id.nullable);
+        assert_eq!(id.base_type, SqlBaseType::Integer);
+        let tenant = cols.iter().find(|c| c.name == "tenant").unwrap();
+        assert!(!tenant.nullable);
+        assert_eq!(tenant.base_type, SqlBaseType::Text);
+        assert!(cols.iter().find(|c| c.name == "name").unwrap().nullable);
+    }
+
+    #[test]
+    fn keyed_plan_is_none_for_an_empty_page() {
+        assert!(plan_keyed_columns(&[], &["id".into()]).is_none());
+    }
+
+    #[test]
+    fn column_defs_can_type_by_column() {
+        let cols = vec![
+            PlannedColumn {
+                name: "id".into(),
+                base_type: SqlBaseType::Text,
+                nullable: false,
+            },
+            PlannedColumn {
+                name: "note".into(),
+                base_type: SqlBaseType::Text,
+                nullable: true,
+            },
+        ];
+        let sql = render_column_defs(
+            &cols,
+            |n| format!("`{n}`"),
+            |c| {
+                if c.nullable { "TEXT" } else { "VARCHAR(255)" }
+            },
+        );
+        assert_eq!(sql, "`id` VARCHAR(255), `note` TEXT");
+    }
+
+    #[test]
+    fn primary_key_renders_every_key_column_in_order() {
+        let q = |n: &str| format!("\"{n}\"");
+        assert_eq!(
+            render_primary_key(&["a".into(), "b".into()], q).as_deref(),
+            Some("PRIMARY KEY (\"a\", \"b\")")
+        );
+        assert!(render_primary_key(&[], q).is_none());
     }
 }

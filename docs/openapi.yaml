@@ -873,7 +873,7 @@ paths:
         - name: kind
           in: query
           required: false
-          schema: { type: string, enum: [source-template, sink-template, pipeline] }
+          schema: { type: string, enum: [source-template, sink-template, deployment, pipeline] }
           description: Return only templates of this kind.
       responses:
         "200":
@@ -1416,7 +1416,7 @@ components:
         doctor_first: { type: boolean, default: false, description: "Run doctor probes first; 422 with report on failure." }
         idempotency_key: { type: string, nullable: true }
         clock: { type: string, format: date-time, description: "Override the ${now.*} clock (backfills)." }
-        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
+        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
         callback: { $ref: "#/components/schemas/CallbackSpec" }
       example:
         name: orders_to_warehouse
@@ -1843,9 +1843,9 @@ components:
         id: { type: string, description: "Registry id (slug)." }
         kind:
           type: string
-          enum: [source-template, sink-template, pipeline]
+          enum: [source-template, sink-template, deployment, pipeline]
           default: pipeline
-          description: "What the document is. A source template runs composed with a sink template; a sink template is composed into a source template's run; a pipeline runs alone."
+          description: "What the document is. A source template runs composed with a sink template; a sink template is composed into a source template's run; a deployment overlays state / DLQ / notifications / SLA onto such a run; a pipeline runs alone."
         version: { type: integer, description: "The newest registered version (the build tip). `state.stable` is what an unpinned run uses." }
         name: { type: string, nullable: true, description: "The config's own `name:`." }
         description: { type: string, nullable: true }
@@ -2173,6 +2173,15 @@ components:
         sink_version:
           description: "Version of the sink template: `stable` (default), another channel, or an exact number."
           $ref: "#/components/schemas/VersionSelector"
+        overlay:
+          description: "Deployment overlay for a composed run (#679): a registered `kind: deployment` id, or an inline mapping of operational blocks (`state`, `dlq`, `notifications`, `sla`, `resilience`, `execution`, `delivery`, `schedule`, and per-stream `streams`). An inline overlay may omit `kind` and `name`. Refused for a `pipeline` template; anything that would change connectors or streams is a `422`."
+          nullable: true
+          oneOf:
+            - { type: string }
+            - { type: object, additionalProperties: true }
+        overlay_version:
+          description: "Version of a registered overlay: `stable` (default), another channel, or an exact number."
+          $ref: "#/components/schemas/VersionSelector"
         env:
           type: object
           description: "Values that win over the server's environment for `${env:VAR}` during this materialization only."
@@ -2188,7 +2197,7 @@ components:
         doctor_first: { type: boolean, default: false }
         idempotency_key: { type: string }
         clock: { type: string, description: "RFC3339 or YYYY-MM-DD override for `${now.*}`." }
-        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
+        concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
       example:
         params:
           region: us-east-1
@@ -2198,6 +2207,7 @@ components:
         version: stable
         sink: bigquery
         sink_version: stable
+        overlay: prod-ops
         idempotency_key: 2026-01-01-orders
     TriggerTemplateResponse:
       type: object
@@ -2210,6 +2220,16 @@ components:
         template_version: { type: integer }
         sink_template: { type: string, nullable: true, description: "The sink template composed in (source-template runs only)." }
         sink_template_version: { type: integer, nullable: true }
+        overlay: { type: string, nullable: true, description: "The deployment overlay applied: a registered id, or `inline`." }
+        overlay_version: { type: integer, nullable: true, description: "Version of a registered overlay (absent for an inline one)." }
+        overlay_contributes:
+          type: array
+          items: { type: string }
+          description: "What the overlay set, as config paths (`pipeline.state`, `matrix.orders.dlq`, …)."
+        warnings:
+          type: array
+          items: { type: string }
+          description: "Warnings about the composed run — e.g. incremental streams with no state store."
         streams:
           type: array
           description: "Per-stream write-mode plan of a composed run (empty for a `pipeline` template)."
@@ -2240,6 +2260,9 @@ components:
         template_version: 3
         sink_template: bigquery
         sink_template_version: 1
+        overlay: prod-ops
+        overlay_version: 2
+        overlay_contributes: [pipeline.state, pipeline.dlq]
         streams:
           - { stream: orders, requested: [overwrite, upsert], chosen: overwrite, key: [id] }
         params:

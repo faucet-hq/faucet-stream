@@ -270,7 +270,7 @@ pub async fn probe_roots(
         let auth = auth.clone();
         let ctx = ctx.clone();
         let sem = sem.clone();
-        let sla = sla.map(|s| {
+        let sla = node.sla.as_ref().or(sla).map(|s| {
             (
                 s.clone(),
                 crate::executor::build_state_key(pipeline_name, &node.id, None),

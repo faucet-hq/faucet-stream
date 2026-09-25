@@ -147,25 +147,7 @@ impl MssqlSink {
             return Ok(());
         }
         if !self.config.create_table {
-            let mut conn = self.checkout().await?;
-            let rows = conn
-                .simple_query(
-                    format!(
-                        "SELECT OBJECT_ID(N'{}', N'U')",
-                        self.config.table.replace('\'', "''")
-                    )
-                    .as_str(),
-                )
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?
-                .into_first_result()
-                .await
-                .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?;
-            let found = rows
-                .first()
-                .and_then(|r| r.try_get::<i32, _>(0).ok().flatten())
-                .is_some();
-            if !found {
+            if !self.table_exists(&self.config.table).await? {
                 return Err(faucet_core::missing_target_error(
                     "mssql sink",
                     &self.config.table,
@@ -176,26 +158,55 @@ impl MssqlSink {
         }
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
-        let Some(columns) = faucet_core::plan_columns(records) else {
+        let key: &[String] = if self.config.write.dedups_by_key() {
+            &self.config.write.key
+        } else {
+            &[]
+        };
+        let planned = if key.is_empty() {
+            faucet_core::plan_columns(records)
+        } else {
+            faucet_core::plan_keyed_columns(records, key)
+        };
+        let Some(columns) = planned else {
             return Ok(());
         };
-        let mut rendered: Vec<String> = Vec::with_capacity(columns.len());
-        for c in &columns {
-            rendered.push(format!(
-                "{} {}",
-                quote_ident_mssql(&c.name)?,
-                mssql_keyword(c.base_type)
-            ));
-        }
-        let sql = format!(
-            "IF OBJECT_ID(N'{}', N'U') IS NULL CREATE TABLE {} ({})",
-            self.config.table.replace('\'', "''"),
-            self.table_quoted,
-            rendered.join(", ")
-        );
+        // An overwrite writes to staging. On a first run (no target) nothing
+        // else creates staging, so it is created here from the page (#676).
+        let sql = if self.config.write.is_overwrite() {
+            build_create_table_sql(
+                &self.staging_literal(),
+                &self.staging_table_quoted,
+                &columns,
+                key,
+            )?
+        } else {
+            build_create_table_sql(&self.config.table, &self.table_quoted, &columns, key)?
+        };
         self.run_ddl(&sql, "create_table").await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn table_exists(&self, table_literal: &str) -> Result<bool, FaucetError> {
+        let mut conn = self.checkout().await?;
+        let rows = conn
+            .simple_query(
+                format!(
+                    "SELECT OBJECT_ID(N'{}', N'U')",
+                    table_literal.replace('\'', "''")
+                )
+                .as_str(),
+            )
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?
+            .into_first_result()
+            .await
+            .map_err(|e| FaucetError::Sink(format!("MSSQL table probe failed: {e}")))?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.try_get::<i32, _>(0).ok().flatten())
+            .is_some())
     }
 
     /// Run one DDL statement, mapping both the send and the result-drain
@@ -251,7 +262,14 @@ impl MssqlSink {
 
     async fn discover_columns(&self) -> Result<Vec<String>, FaucetError> {
         let mut conn = self.checkout().await?;
-        let table: &str = &self.config.table;
+        // The relation the writes target: staging during an overwrite (a clone
+        // of the target, or — on a first run — the only table there is, #676).
+        let effective = if self.config.write.is_overwrite() {
+            self.staging_literal()
+        } else {
+            self.config.table.clone()
+        };
+        let table: &str = &effective;
         let rows = conn
             .query(
                 "SELECT c.name AS name FROM sys.columns c \
@@ -802,6 +820,61 @@ async fn control(conn: &mut MssqlPooledConnection<'_>, stmt: &str) -> Result<(),
 /// column during schema evolution (issue #194). Integers widen to `BIGINT` and
 /// floats to `FLOAT` so a later, wider value never overflows a narrower column;
 /// text/json land in `NVARCHAR(MAX)`.
+/// `IF OBJECT_ID(...) IS NULL CREATE TABLE` for an `auto_columns` target
+/// (#580). NVARCHAR(MAX) cannot be indexed, so key columns get a bounded type,
+/// and a keyed write gets a PRIMARY KEY so MERGE has a target on a first run
+/// (#676).
+fn build_create_table_sql(
+    table_literal: &str,
+    table_quoted: &str,
+    columns: &[faucet_core::PlannedColumn],
+    key: &[String],
+) -> Result<String, FaucetError> {
+    let mut rendered: Vec<String> = Vec::with_capacity(columns.len() + 1);
+    for c in columns {
+        let ty = if key.contains(&c.name) {
+            mssql_key_keyword(c.base_type)
+        } else {
+            mssql_keyword(c.base_type)
+        };
+        rendered.push(format!("{} {ty}", quote_ident_mssql(&c.name)?));
+    }
+    if !key.is_empty() {
+        let cols = key
+            .iter()
+            .map(|k| quote_ident_mssql(k))
+            .collect::<Result<Vec<_>, _>>()?;
+        rendered.push(format!("PRIMARY KEY ({})", cols.join(", ")));
+    }
+    Ok(format!(
+        "IF OBJECT_ID(N'{}', N'U') IS NULL CREATE TABLE {table_quoted} ({})",
+        table_literal.replace('\'', "''"),
+        rendered.join(", ")
+    ))
+}
+
+/// `sp_rename` of a staging table onto the target's name. `sp_rename` takes the
+/// object's (possibly schema-qualified) current name but only the bare new
+/// name — a qualified one would become part of the name itself.
+fn sp_rename_sql(from_literal: &str, to_table: &str) -> String {
+    let bare = to_table.rsplit('.').next().unwrap_or(to_table);
+    format!(
+        "EXEC sp_rename N'{}', N'{}'",
+        from_literal.replace('\'', "''"),
+        bare.replace('\'', "''")
+    )
+}
+
+/// The type for a primary-key column of a created table (#676): SQL Server
+/// cannot index `NVARCHAR(MAX)`, and 450 characters is its 900-byte key limit.
+fn mssql_key_keyword(t: faucet_core::SqlBaseType) -> &'static str {
+    use faucet_core::SqlBaseType::*;
+    match t {
+        Text | Json => "NVARCHAR(450)",
+        other => mssql_keyword(other),
+    }
+}
+
 fn mssql_keyword(t: faucet_core::SqlBaseType) -> &'static str {
     use faucet_core::SqlBaseType::*;
     match t {
@@ -1103,6 +1176,8 @@ impl Sink for MssqlSink {
         if records.is_empty() {
             return Ok(Vec::new());
         }
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
 
         // Upsert/delete: apply the good rows (upserts + deletes) and route only
         // the rows whose key could not be extracted (missing / null key) to the
@@ -1218,9 +1293,16 @@ impl Sink for MssqlSink {
 
     /// Create the staging table as an empty structural clone of the target
     /// (`SELECT * INTO staging FROM target WHERE 1=0`), dropping any leftover
-    /// staging from a crashed run first. The target must already exist — the
-    /// `SELECT INTO` errors clearly if it does not.
+    /// staging from a crashed run first. With `create_table: false` a missing
+    /// target makes the `SELECT INTO` error clearly.
+    ///
+    /// A missing target with `create_table: true` (a first run) has no shape to
+    /// clone: the first write creates staging from the page, and the commit
+    /// renames it into place (#676). Every step reads the database rather than
+    /// sink-instance memory, because the CLI runs begin, the writes and the
+    /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        let first_run = self.config.create_table && !self.table_exists(&self.config.table).await?;
         let staging = &self.staging_table_quoted;
         let target = &self.table_quoted;
         let staging_lit = self.staging_literal().replace('\'', "''");
@@ -1230,6 +1312,9 @@ impl Sink for MssqlSink {
             &format!("IF OBJECT_ID(N'{staging_lit}', N'U') IS NOT NULL DROP TABLE {staging}"),
         )
         .await?;
+        if first_run {
+            return Ok(());
+        }
         control(
             &mut conn,
             &format!("SELECT * INTO {staging} FROM {target} WHERE 1 = 0"),
@@ -1251,6 +1336,20 @@ impl Sink for MssqlSink {
     /// transactional, so a failure rolls the whole swap back and the prior rows
     /// survive.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+        if !self.table_exists(&self.config.table).await? {
+            // First run: staging holds everything; publish it as the target.
+            // A run that wrote nothing has no staging either, and leaves no table.
+            if self.table_exists(&self.staging_literal()).await? {
+                let mut conn = self.checkout().await?;
+                control(
+                    &mut conn,
+                    &sp_rename_sql(&self.staging_literal(), &self.config.table),
+                )
+                .await
+                .map_err(|e| FaucetError::Sink(format!("mssql overwrite: publish staging: {e}")))?;
+            }
+            return Ok(());
+        }
         // Explicit non-IDENTITY column list, discovered from the real target.
         let cols = self.insertable_columns().await?;
         let col_list = cols
@@ -1280,7 +1379,8 @@ impl Sink for MssqlSink {
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
-    /// behind. Best-effort — the destination was never touched.
+    /// behind. Best-effort — the destination was never touched (on a first run
+    /// it was never created).
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         let staging = &self.staging_table_quoted;
         let staging_lit = self.staging_literal().replace('\'', "''");
@@ -1406,6 +1506,8 @@ impl Sink for MssqlSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
         // For upsert/delete modes, plan the page before opening the transaction
         // so a key-extraction failure aborts without leaving an open tx.
         let plan = if matches!(
@@ -1554,6 +1656,47 @@ mod tests {
 
     // dataset_uri test is skipped: MssqlSink::new() requires a live pool
     // (connects to SQL Server in new()), and no offline constructor exists.
+
+    #[test]
+    fn create_table_sql_for_a_keyed_write_bounds_key_text_and_adds_a_primary_key() {
+        let key = vec!["sku".to_string()];
+        let cols = faucet_core::plan_keyed_columns(
+            &[serde_json::json!({ "sku": "a", "note": "n", "qty": 1 })],
+            &key,
+        )
+        .expect("a plan");
+        let sql = build_create_table_sql("o'rders", "[orders]", &cols, &key).unwrap();
+        assert!(
+            sql.starts_with("IF OBJECT_ID(N'o''rders', N'U') IS NULL CREATE TABLE [orders] ("),
+            "{sql}"
+        );
+        assert!(sql.contains("[sku] NVARCHAR(450)"), "{sql}");
+        assert!(sql.contains("[note] NVARCHAR(MAX)"), "{sql}");
+        assert!(sql.ends_with(", PRIMARY KEY ([sku]))"), "{sql}");
+        assert_eq!(
+            mssql_key_keyword(faucet_core::SqlBaseType::Integer),
+            mssql_keyword(faucet_core::SqlBaseType::Integer)
+        );
+    }
+
+    #[test]
+    fn sp_rename_takes_the_bare_new_name() {
+        assert_eq!(
+            sp_rename_sql("dbo.t__faucet_ovw", "dbo.t"),
+            "EXEC sp_rename N'dbo.t__faucet_ovw', N't'"
+        );
+        assert_eq!(
+            sp_rename_sql("o'k__x", "o'k"),
+            "EXEC sp_rename N'o''k__x', N'o''k'"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_without_a_key_has_no_primary_key() {
+        let cols = faucet_core::plan_columns(&[serde_json::json!({ "a": 1 })]).unwrap();
+        let sql = build_create_table_sql("t", "[t]", &cols, &[]).unwrap();
+        assert!(!sql.contains("PRIMARY KEY"), "{sql}");
+    }
 
     #[test]
     fn quote_table_handles_schema_qualified() {

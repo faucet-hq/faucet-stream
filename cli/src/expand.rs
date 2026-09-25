@@ -54,6 +54,8 @@ pub struct ExpandedNode {
     pub state: Option<StateStoreSpec>,
     /// Resolved DLQ spec for this row, or `None` if no DLQ applies.
     pub dlq: Option<crate::config::DlqSpec>,
+    /// This row's SLA override (#679), or `None` to use the top-level `sla:`.
+    pub sla: Option<crate::sla::SlaSpec>,
     /// Pipeline-level quality spec, shared by every node. `quality:` has no
     /// matrix-row override in v1, so this is `cfg.pipeline.quality` verbatim.
     #[cfg(feature = "quality")]
@@ -328,6 +330,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             state: None,
             dlq: None,
             delivery: None,
+            sla: None,
             tags: Vec::new(),
             partition: None,
             discover: None,
@@ -725,6 +728,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 transforms: Vec::new(),
                 state: None,
                 dlq: None,
+                sla: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -932,7 +936,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         // require a `state:` block when staleness / volume-anomaly checks need
         // persisted history. `min_rows_per_run` alone is stateless and passes
         // without one.
-        if let Some(ref sla) = cfg.sla {
+        if let Some(sla) = row.sla.as_ref().or(cfg.sla.as_ref()) {
             sla.validate()
                 .map_err(|e| CliError::Config(format!("sla: {e}")))?;
             if sla.needs_state() {
@@ -1376,6 +1380,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             transforms,
             state,
             dlq,
+            sla: row.sla.clone(),
             delivery,
             delivery_guarantee,
             #[cfg(feature = "quality")]
@@ -1756,6 +1761,36 @@ mod tests {
 
     fn cfg(yaml: &str) -> PipelineConfig {
         parse_with_extension(yaml, "yaml").unwrap()
+    }
+
+    /// #679: a matrix row's `sla:` replaces the top-level one for that row —
+    /// it rides on the node, and the load-time state gate applies to it.
+    #[test]
+    fn a_row_sla_overrides_the_top_level_one() {
+        let yaml = |state: &str| {
+            format!(
+                r#"
+version: 1
+name: p
+sla: {{ min_rows_per_run: 5 }}
+pipeline:
+  source: {{ type: csv, config: {{ path: in.csv }} }}
+  sink: {{ type: stdout, config: {{}} }}
+{state}
+matrix:
+  - id: a
+    sla: {{ max_staleness_secs: 60 }}
+  - id: b
+"#
+            )
+        };
+        let nodes = expand(&cfg(&yaml("  state: { type: memory }"))).expect("expands");
+        let a = nodes.iter().find(|n| n.id == "a").unwrap();
+        let b = nodes.iter().find(|n| n.id == "b").unwrap();
+        assert_eq!(a.sla.as_ref().and_then(|s| s.max_staleness_secs), Some(60));
+        assert!(b.sla.is_none(), "b inherits the top-level sla at run time");
+        let err = expand(&cfg(&yaml(""))).unwrap_err().to_string();
+        assert!(err.contains("row 'a'") && err.contains("state:"), "{err}");
     }
 
     /// Bare `${name}` tokens are connector placeholders only when the config

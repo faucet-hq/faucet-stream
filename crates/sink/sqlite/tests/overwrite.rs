@@ -198,12 +198,12 @@ async fn overwrite_works_in_json_column_mode() {
 
 #[tokio::test]
 async fn overwrite_begin_errors_when_target_missing() {
-    // Overwrite never auto-creates the target — begin must fail clearly if it
-    // does not exist, rather than silently creating an empty staging clone.
+    // With `create_table: false` overwrite never creates the target — begin
+    // must fail clearly rather than silently creating an empty staging clone.
     let (_dir, url) = fresh_db("CREATE TABLE unrelated (id INTEGER)").await;
-    let sink = SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap))
-        .await
-        .unwrap();
+    let mut cfg = overwrite_config(&url, SqliteColumnMapping::AutoMap);
+    cfg.create_table = false;
+    let sink = SqliteSink::new(cfg).await.unwrap();
     let err = sink.begin_overwrite().await.unwrap_err();
     assert!(
         err.to_string().contains("staging"),
@@ -219,4 +219,70 @@ async fn overwrite_reported_in_supported_write_modes() {
         .unwrap();
     assert!(sink.supported_write_modes().contains(&WriteMode::Overwrite));
     assert!(sink.is_overwrite());
+}
+
+#[tokio::test]
+async fn overwrite_on_a_fresh_database_creates_then_swaps() {
+    // #676. The CLI runs begin, the writes and the commit on *different* sink
+    // instances, so each step here gets its own sink: nothing may ride on
+    // instance memory.
+    let (_dir, url) = fresh_db("CREATE TABLE unrelated (id INTEGER)").await;
+    let sink = || SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap));
+
+    sink().await.unwrap().begin_overwrite().await.unwrap();
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})])
+        .await
+        .unwrap();
+    assert!(
+        !table_exists(&url, "users").await,
+        "a first run stages too: the target appears only at commit"
+    );
+    sink().await.unwrap().commit_overwrite().await.unwrap();
+    assert_eq!(names(&url, "users").await, vec!["a", "b"]);
+    assert!(!table_exists(&url, "users__faucet_ovw").await);
+
+    sink().await.unwrap().begin_overwrite().await.unwrap();
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 3, "name": "c"})])
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&url, "users").await,
+        vec!["a", "b"],
+        "second run is staged"
+    );
+    sink().await.unwrap().commit_overwrite().await.unwrap();
+    assert_eq!(names(&url, "users").await, vec!["c"]);
+}
+
+#[tokio::test]
+async fn aborted_first_overwrite_leaves_no_table_behind() {
+    let (_dir, url) = fresh_db("CREATE TABLE unrelated (id INTEGER)").await;
+    let sink = || SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap));
+    sink().await.unwrap().begin_overwrite().await.unwrap();
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .unwrap();
+    sink().await.unwrap().abort_overwrite().await.unwrap();
+    assert!(!table_exists(&url, "users").await);
+    assert!(!table_exists(&url, "users__faucet_ovw").await);
+}
+
+#[tokio::test]
+async fn first_overwrite_that_writes_nothing_creates_no_table() {
+    let (_dir, url) = fresh_db("CREATE TABLE unrelated (id INTEGER)").await;
+    let sink = SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap))
+        .await
+        .unwrap();
+    sink.begin_overwrite().await.unwrap();
+    sink.commit_overwrite().await.unwrap();
+    assert!(!table_exists(&url, "users").await);
 }

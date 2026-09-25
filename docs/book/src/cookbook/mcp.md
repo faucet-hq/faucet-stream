@@ -78,7 +78,7 @@ even on a mutation-enabled server.
 | `list_templates` | no | Registered [pipeline templates](./templates.md) and the typed params each takes. |
 | `get_template` | no | One template: declared params, stored config body, and its release state (status, `stable` / `previous` / `newest`, channel pointers, launch log). |
 | `register_template` | **yes** | Register a template document as a new version — `kind: source-template`, `kind: sink-template`, or `kind: pipeline`. Inert by default — pass `launch: true` to make it live. |
-| `run_template` | **yes** | Run a template with given `params` / `env`, at a version or named channel (default `stable` — the launched version). A source template also takes `sink` (a registered sink template) + `sink_version`. `dry_run: true` materializes + validates only and reports the per-stream write-mode plan. |
+| `run_template` | **yes** | Run a template with given `params` / `env`, at a version or named channel (default `stable` — the launched version). A source template also takes `sink` (a registered sink template) + `sink_version`, and optionally `overlay` (a registered deployment id or an inline mapping) + `overlay_version`. `dry_run: true` materializes + validates only and reports the per-stream write-mode plan. |
 
 The four template tools appear **only when a registry is wired** — `faucet serve
 --mcp` uses its own `--history` backend; `faucet mcp` needs

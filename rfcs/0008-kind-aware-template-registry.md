@@ -223,12 +223,14 @@ run time.
 
 ## Unresolved questions
 
-- A **deployment overlay** for composed runs — a `state:` store, `dlq:`, and
-  `notify:` block that belongs to neither the source nor the sink but to the
-  deployment. Today a composed pipeline has no state block beyond what the
-  templates carry, so incremental streams do not bookmark across runs unless
-  the templates declare state. The overlay is the next piece of this model
-  (#679).
+- ~~A **deployment overlay** for composed runs~~ — resolved by #679: a fourth
+  kind, `kind: deployment`, holds only operational blocks (`state`, `dlq`,
+  `notifications`, `sla`, `resilience`, `execution`, `delivery`, `schedule`,
+  plus per-stream `sla` / `dlq` / `delivery`). It is registered like any
+  template or passed inline, applied last by `Composition::apply_overlay`, and
+  can never change connectors or streams (those keys are refused). Every
+  trigger surface takes it (`--overlay`, HTTP / MCP `overlay`, a suite's
+  `overlay:`, the console's deployment selector).
 - Whether a sink template should be able to declare which write modes it
   guarantees (beyond the registry's connector capabilities) for a hosted
   catalog to display without composing.

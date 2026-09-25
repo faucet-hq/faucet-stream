@@ -172,17 +172,78 @@ so a composed pipeline inherits every guarantee a hand-written one has.
 `faucet hub matrix` renders the whole catalog: `--format table` for the
 terminal, `markdown` for the docs page, `json` for `hub/index.json`.
 
+## Deployment overlays
+
+A composed run still needs the blocks that belong to **neither** template: a
+state store for incremental bookmarks, a DLQ, notifications, an SLA. A source
+template is published for everyone, so it cannot name *your* state store; a
+sink template describes a destination, not an operations policy. Those blocks
+live in a third document, a `kind: deployment` overlay, applied last:
+
+```yaml
+# ops/prod.yaml
+kind: deployment
+name: prod
+description: Production state, DLQ and paging for composed runs
+params:
+  state_dsn: { type: string, required: true, secret: true }
+state: { type: postgres, config: { connection_url: "${param.state_dsn}" } }
+dlq:   { sink: { type: jsonl, config: { path: /var/faucet/dlq/${now.date}.jsonl } } }
+notify:
+  - { name: oncall, on: [run_failure, sla_breach], channel: { type: pagerduty, config: { routing_key: "${env:PD_KEY}" } } }
+sla: { max_staleness_secs: 86400 }
+streams:
+  invoices: { sla: { min_rows_per_run: 1 } }   # per-stream override
+  scratch:  { dlq: null }                       # no DLQ for this one
+```
+
+```bash
+faucet run      --source acme/billing --sink faucet-hq/bigquery --overlay ops/prod.yaml --param state_dsn=…
+faucet validate --source acme/billing --sink faucet-hq/bigquery --overlay ops/prod.yaml
+```
+
+An overlay may set only operational blocks — `state`, `dlq`,
+`notifications` (alias `notify`), `sla`, `resilience`, `execution`,
+`delivery`, `schedule` — and per-stream `sla` / `dlq` / `delivery` under
+`streams:`. Anything that would change which connectors run or what the streams
+produce (`pipeline`, `matrix`, `source`, `sink`, `transforms`) is refused with a
+message saying so, so the shape of a run is always fixed by its two templates.
+`state` and `dlq` land under `pipeline.`, the rest at the top level, and an
+overlay's value replaces whatever the composition carried. Its `params:` merge
+with the templates' (a name declared on both sides must be declared
+identically). The run keeps the source's `name`, so its state keys are the
+same with or without an overlay, and across sink swaps.
+
+`faucet validate` and `faucet hub check --overlay` print what the overlay set
+(`pipeline.state, notifications, matrix.invoices.sla`, …). Two warnings are
+worth knowing:
+
+- a source with **incremental** streams composed with **no** `state:` re-reads
+  everything each run, and the plan says so, naming the overlay as the fix;
+- an overlay whose state store is `memory` loses those bookmarks when the
+  process exits.
+
+An overlay passed as `--overlay` is a file, or an id under `<hub>/deployments/`.
+In the [template registry](./templates.md) it is a registered template like any
+other (`faucet template register ops/prod.yaml`), picked per trigger:
+`faucet template run acme/billing --sink bigquery --overlay prod`, HTTP
+`{"sink": "bigquery", "overlay": "prod"}` (or an inline mapping), MCP
+`run_template {overlay}`, a suite's `overlay:`, or the console's **deployment**
+selector. `faucet hub lint` checks an overlay for literal credentials — a
+password in a connection URL included — since the values it holds are usually
+secrets.
+
 ## Commands
 
 ```bash
 faucet hub list      [--hub DIR] [--json]
-faucet hub check     --source X --sink Y [--json]          # per-stream write modes; exit≠0 if incompatible
-faucet hub compose   --source X --sink Y [--out FILE|--json]
+faucet hub check     --source X --sink Y [--overlay O] [--json]  # per-stream write modes; exit≠0 if incompatible
+faucet hub compose   --source X --sink Y [--overlay O] [--out FILE|--json]
 faucet hub matrix    [--format table|markdown|json] [--out FILE]
 faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint
-faucet run           --source X --sink Y [--param k=v] …    # compose + run
-faucet validate      --source X --sink Y [--show-composed]  # compose + validate offline
-faucet schema source-template | sink-template
+faucet run           --source X --sink Y [--overlay O] [--param k=v] …  # compose + run
+faucet validate      --source X --sink Y [--overlay O] [--show-composed]  # compose + validate offline
+faucet schema source-template | sink-template | deployment
 ```
 
 `--source` / `--sink` take a **path** or a **hub id**, resolved as
@@ -255,6 +316,38 @@ A version whose body is not the snapshot's is fetched from the catalog at that
 commit and cached, so a pinned run composes the same document every time. A
 local directory hub has no history: selectors are an error there.
 
+#### Retiring a version
+
+A version cannot be edited: `@3` must always mean the same bytes, or a pinned
+pipeline changes under its owner. There are three supported moves instead:
+
+- **Fix forward.** Commit the fix; it becomes the next version.
+- **Roll back.** Re-commit an older body. It becomes a new version with the old
+  content, and the sidecar points `stable` at it.
+- **Retire.** Deprecate the bad version in the sidecar, with a reason that
+  names the replacement:
+
+```yaml
+# source-templates/acme/netsuite.faucet.yaml
+stable: 4
+deprecated:
+  2: "drops the invoices stream; use v3+"
+  1: "superseded"
+```
+
+A deprecated version stays resolvable, so nothing already pinned to it breaks.
+It is dropped from everything that *chooses* a version for you:
+
+- `@newest` resolves to the highest version that is **not** deprecated.
+- An explicit pin still runs, and prints
+  `warning: acme/netsuite v2 is deprecated: drops the invoices stream; use v3+ — stable is v4`.
+- The hub website hides deprecated versions behind **Show deprecated versions**.
+- A server mirroring the hub never registers a body the catalog marks deprecated.
+
+The catalog's CI refuses a sidecar that deprecates the `stable` version, or a
+version that does not exist, so the default selector always lands on a live
+version. Un-deprecating is deleting the entry.
+
 ### Choosing between variants: stars and trust
 
 When several namespaces publish a template for the same system, the catalog
@@ -314,6 +407,12 @@ faucet serve --history sqlite:./faucet.db --templates-sync cli/examples/template
 `paths` reads both catalog directories as one origin. A hub's source and sink
 names share the registry's id namespace, so a stem may appear in only one of
 them.
+
+The pull reads the catalog's `index.json` too. When a template's newest body is
+a version the publisher deprecated, the sync skips it (the report names the
+reason) instead of registering a retired version. Catalog sidecar keys
+(`stable`, `deprecated`) are accepted by the sync; they describe catalog
+versions, which the registry numbers separately.
 
 ### Publish a template
 

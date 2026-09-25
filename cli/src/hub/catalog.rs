@@ -32,7 +32,9 @@ fn is_template_file(p: &Path) -> bool {
         && !p
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.'))
+            // Dotfiles, and `<name>.faucet.yaml` sidecars (stable / deprecated
+            // versions, #682 / #691), are not templates.
+            .is_some_and(|n| n.starts_with('.') || n.contains(".faucet."))
 }
 
 /// Template files directly in `dir` (unscoped templates) plus one level of
@@ -387,6 +389,61 @@ pub fn lint_sink(t: &SinkTemplate) -> Vec<String> {
     walk_markers("per_stream", &v["per_stream"], &mut f);
     lint_params(&t.params, &mut f);
     f
+}
+
+/// Lint a deployment overlay (#679). An overlay names private infrastructure by
+/// design (your state store, your webhook), so only credentials are checked:
+/// they must arrive as `${param.*}` / `${env:}` / `${secret:}`, never as
+/// literals — including a password embedded in a connection URL.
+pub fn lint_deployment(t: &crate::hub::DeploymentTemplate) -> Vec<String> {
+    let mut f = Vec::new();
+    if t.description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        f.push("missing `description`".into());
+    }
+    let v = serde_json::to_value(t).unwrap_or(Value::Null);
+    for key in crate::hub::spec::DEPLOYMENT_BLOCKS
+        .iter()
+        .chain(["streams"].iter())
+    {
+        walk_secrets(key, &v[*key], &mut f);
+        walk_url_passwords(key, &v[*key], &mut f);
+    }
+    lint_params(&t.params, &mut f);
+    f
+}
+
+/// `scheme://user:password@host` with a literal password.
+fn walk_url_passwords(path: &str, v: &Value, findings: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            if let Some((_, rest)) = s.split_once("://")
+                && let Some((userinfo, _)) = rest.split_once('@')
+                && let Some((_, pass)) = userinfo.split_once(':')
+                && !pass.is_empty()
+                && !pass.contains("${")
+            {
+                findings.push(format!(
+                    "`{path}` embeds a literal password in a URL — use `${{param.NAME}}` / `${{env:NAME}}` / `${{secret:NAME}}`"
+                ));
+            }
+        }
+        Value::Object(o) => {
+            for (k, x) in o {
+                walk_url_passwords(&format!("{path}.{k}"), x, findings);
+            }
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                walk_url_passwords(&format!("{path}[{i}]"), x, findings);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn lint_params(params: &crate::params::ParamsSpec, f: &mut Vec<String>) {
@@ -1049,6 +1106,18 @@ per_stream:
     }
 
     #[test]
+    fn sidecars_beside_templates_are_not_loaded_as_templates() {
+        assert!(!is_template_file(Path::new(
+            "sink-templates/acme/x.faucet.yaml"
+        )));
+        assert!(!is_template_file(Path::new(
+            "sink-templates/acme/.hidden.yaml"
+        )));
+        assert!(is_template_file(Path::new("sink-templates/acme/x.yaml")));
+        assert!(!is_template_file(Path::new("sink-templates/acme/OWNERS")));
+    }
+
+    #[test]
     fn load_rejects_stem_mismatch_duplicates_and_empty_dirs() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
@@ -1139,5 +1208,49 @@ per_stream:
         );
         s.source.config["auth"]["config"]["password"] = json!("x");
         assert!(lint_source(&s).is_empty(), "{:?}", lint_source(&s));
+    }
+
+    #[test]
+    fn a_deployment_lint_flags_literal_credentials_only() {
+        let d = |y: &str| {
+            crate::hub::DeploymentTemplate::from_value(serde_yaml::from_str(y).unwrap()).unwrap()
+        };
+        let ok = d(r#"
+kind: deployment
+name: prod
+description: Production operations
+params: { dsn: { type: string, secret: true } }
+state: { type: postgres, config: { url: "${param.dsn}" } }
+notifications: [{ name: ops, channel: { type: webhook, config: { url: "https://hooks.internal.example/x" } } }]
+"#);
+        assert!(
+            lint_deployment(&ok).is_empty(),
+            "{:?}",
+            lint_deployment(&ok)
+        );
+        let bad = d(r#"
+kind: deployment
+name: prod
+params: { password: { type: string } }
+state: { type: postgres, config: { url: "postgres://app:hunter2@db:5432/x" } }
+dlq: { sink: { type: http, config: { token: "abc123" } } }
+streams: { s: { dlq: { sink: { type: http, config: { url: "https://u:p@h/x" } } } } }
+"#);
+        let f = lint_deployment(&bad);
+        assert!(
+            f.iter().any(|x| x.contains("missing `description`")),
+            "{f:?}"
+        );
+        assert!(
+            f.iter()
+                .any(|x| x.contains("state.config.url") && x.contains("literal password")),
+            "{f:?}"
+        );
+        assert!(
+            f.iter().any(|x| x.contains("dlq.sink.config.token")),
+            "{f:?}"
+        );
+        assert!(f.iter().any(|x| x.contains("streams.s.dlq")), "{f:?}");
+        assert!(f.iter().any(|x| x.contains("param `password`")), "{f:?}");
     }
 }

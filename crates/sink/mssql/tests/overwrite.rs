@@ -153,3 +153,105 @@ async fn overwrite_advertised_in_capabilities() {
     assert!(sink.supported_write_modes().contains(&WriteMode::Overwrite));
     assert!(sink.is_overwrite());
 }
+
+async fn target_present(pool: &MssqlPool) -> bool {
+    let mut conn = pool.get().await.expect("checkout");
+    let rows = conn
+        .query("SELECT OBJECT_ID(N'dbo.t', N'U')", &[])
+        .await
+        .expect("query")
+        .into_first_result()
+        .await
+        .expect("result");
+    rows.first()
+        .and_then(|r| r.try_get::<i32, _>(0).ok().flatten())
+        .is_some()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_on_a_fresh_database_creates_then_swaps() {
+    // #676. The CLI runs begin, the writes and the commit on *different* sink
+    // instances, so each step gets its own sink.
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    let sink = || MssqlSink::new(overwrite_cfg(&cfg));
+
+    sink()
+        .await
+        .unwrap()
+        .begin_overwrite()
+        .await
+        .expect("begin");
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})])
+        .await
+        .expect("w1");
+    assert!(
+        !target_present(&pool).await,
+        "a first run stages; the target appears at commit"
+    );
+    sink()
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .expect("commit");
+    assert_eq!(names(&pool, "dbo.t").await, vec!["a", "b"]);
+
+    sink()
+        .await
+        .unwrap()
+        .begin_overwrite()
+        .await
+        .expect("begin");
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 3, "name": "c"})])
+        .await
+        .expect("w2");
+    assert_eq!(
+        names(&pool, "dbo.t").await,
+        vec!["a", "b"],
+        "second run is staged"
+    );
+    sink()
+        .await
+        .unwrap()
+        .commit_overwrite()
+        .await
+        .expect("commit");
+    assert_eq!(names(&pool, "dbo.t").await, vec!["c"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborted_first_overwrite_leaves_no_table_behind() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    let sink = || MssqlSink::new(overwrite_cfg(&cfg));
+    sink()
+        .await
+        .unwrap()
+        .begin_overwrite()
+        .await
+        .expect("begin");
+    sink()
+        .await
+        .unwrap()
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("w1");
+    sink()
+        .await
+        .unwrap()
+        .abort_overwrite()
+        .await
+        .expect("abort");
+    assert!(!target_present(&pool).await);
+}

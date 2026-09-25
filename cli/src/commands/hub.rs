@@ -29,7 +29,16 @@ fn pretty<T: serde::Serialize>(v: &T) -> CliResult<String> {
 /// `faucet validate` / `run` / `template register` all take it.
 async fn compose(a: HubComposeArgs) -> CliResult<()> {
     let hub_dir = hub::resolve_hub(a.pair.hub.as_deref()).await?;
-    let c = hub::compose_locators(&a.pair.source, &a.pair.sink, &hub_dir).await?;
+    let c = hub::compose_locators_overlaid(
+        &a.pair.source,
+        &a.pair.sink,
+        a.pair.overlay.as_deref(),
+        &hub_dir,
+    )
+    .await?;
+    for w in &c.warnings {
+        eprintln!("warning: {w}");
+    }
     if a.json {
         println!("{}", pretty(&c)?);
         return Ok(());
@@ -60,8 +69,26 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
     let s = hub::load_source(&a.pair.source, &hub_dir).await?;
     let k = hub::load_sink(&a.pair.sink, &hub_dir).await?;
     let cell = hub::catalog::cell(&s, &k);
+    // An overlay is checked against the pairing it would be applied to: a
+    // stream it names must exist, and its params must not clash.
+    let overlaid = match (&a.pair.overlay, cell.compatible) {
+        (Some(o), true) => {
+            Some(hub::compose(&s, &k)?.apply_overlay(&hub::load_deployment(o, &hub_dir)?)?)
+        }
+        _ => None,
+    };
     if a.json {
-        println!("{}", pretty(&cell)?);
+        let mut v = serde_json::to_value(&cell)
+            .map_err(|e| CliError::Internal(format!("hub: rendering JSON: {e}")))?;
+        if let (Some(c), Some(obj)) = (&overlaid, v.as_object_mut()) {
+            obj.insert("overlay".into(), serde_json::json!(c.overlay));
+            obj.insert(
+                "overlay_contributes".into(),
+                serde_json::json!(c.overlay_contributes),
+            );
+            obj.insert("warnings".into(), serde_json::json!(c.warnings));
+        }
+        println!("{}", pretty(&v)?);
     } else {
         println!(
             "{} × {} ({}): {}",
@@ -89,8 +116,22 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
         for i in &cell.incompatible {
             println!("  ✗ {:<32} {}", i.stream, i.reason);
         }
+        if let Some(c) = &overlaid {
+            println!(
+                "  overlay '{}' sets: {}",
+                c.overlay.as_deref().unwrap_or_default(),
+                c.overlay_contributes.join(", ")
+            );
+            for w in &c.warnings {
+                println!("  warning: {w}");
+            }
+        }
         if cell.compatible {
-            println!("\n{}", hub::catalog::run_command(&s, &k));
+            let mut cmd = hub::catalog::run_command(&s, &k);
+            if let Some(o) = &a.pair.overlay {
+                cmd.push_str(&format!(" --overlay {o}"));
+            }
+            println!("\n{cmd}");
         }
     }
     if cell.compatible {
@@ -328,9 +369,16 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
                         findings.push((f.display().to_string(), r));
                     }
                 }
+                Some(hub::TemplateKind::Deployment) => {
+                    let t = hub::parse_deployment_file(f)?;
+                    let r = hub::catalog::lint_deployment(&t);
+                    if !r.is_empty() {
+                        findings.push((f.display().to_string(), r));
+                    }
+                }
                 Some(hub::TemplateKind::Pipeline) | None => {
                     return Err(CliError::Config(format!(
-                        "{}: not a hub template (no `kind: source-template` / `sink-template`)",
+                        "{}: not a hub template (no `kind: source-template` / `sink-template` / `deployment`)",
                         f.display()
                     )));
                 }
@@ -384,8 +432,96 @@ mod tests {
         HubPairArgs {
             source: source.into(),
             sink: sink.into(),
+            overlay: None,
             hub: Some(repo_hub()),
         }
+    }
+
+    #[tokio::test]
+    async fn compose_check_and_lint_take_a_deployment_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ops.yaml");
+        std::fs::write(
+            &overlay,
+            "kind: deployment\nname: ops\ndescription: ops\nstate: { type: memory }\n",
+        )
+        .unwrap();
+        let with = |source: &str, sink: &str| HubPairArgs {
+            overlay: Some(overlay.display().to_string()),
+            ..pair(source, sink)
+        };
+        let composed = dir.path().join("composed.yaml");
+        run(HubArgs {
+            command: HubCommand::Compose(HubComposeArgs {
+                pair: with("example-csv", "sqlite"),
+                out: Some(composed.clone()),
+                json: false,
+            }),
+        })
+        .await
+        .expect("compose with an overlay");
+        assert!(
+            std::fs::read_to_string(&composed)
+                .unwrap()
+                .contains("type: memory")
+        );
+        for json in [false, true] {
+            run(HubArgs {
+                command: HubCommand::Check(HubCheckArgs {
+                    pair: with("example-csv", "sqlite"),
+                    json,
+                }),
+            })
+            .await
+            .expect("check with an overlay");
+        }
+        // An overlay that names a stream the source lacks fails the check.
+        let bad = dir.path().join("bad.yaml");
+        std::fs::write(
+            &bad,
+            "kind: deployment\nname: bad\nstreams:\n  nope: { delivery: at_least_once }\n",
+        )
+        .unwrap();
+        let err = run(HubArgs {
+            command: HubCommand::Check(HubCheckArgs {
+                pair: HubPairArgs {
+                    overlay: Some(bad.display().to_string()),
+                    ..pair("example-csv", "sqlite")
+                },
+                json: false,
+            }),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names no stream"), "{err}");
+        // `hub lint` accepts a deployment file and flags a literal credential.
+        let leaky = dir.path().join("leaky.yaml");
+        std::fs::write(
+            &leaky,
+            "kind: deployment\nname: leaky\nstate: { type: postgres, config: { url: \"postgres://u:pw@h/db\" } }\n",
+        )
+        .unwrap();
+        let err = run(HubArgs {
+            command: HubCommand::Lint(HubLintArgs {
+                files: vec![leaky],
+                hub: None,
+                json: false,
+            }),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!err.is_empty());
+        run(HubArgs {
+            command: HubCommand::Lint(HubLintArgs {
+                files: vec![overlay.clone()],
+                hub: None,
+                json: false,
+            }),
+        })
+        .await
+        .expect("a clean overlay lints clean");
     }
 
     #[tokio::test]

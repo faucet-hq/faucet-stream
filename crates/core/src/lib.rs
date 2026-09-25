@@ -86,7 +86,10 @@ pub use columnar::{
     ColumnarPage, infer_arrow_schema, record_batch_to_values, values_to_record_batch,
     values_to_record_batch_inferred,
 };
-pub use create_table::{PlannedColumn, missing_target_error, plan_columns, render_columns};
+pub use create_table::{
+    PlannedColumn, missing_target_error, plan_columns, plan_keyed_columns, render_column_defs,
+    render_columns, render_primary_key,
+};
 #[cfg(feature = "transform-cross-join")]
 pub use cross_join::{CompiledCrossJoin, CrossJoinSpec, OnEmpty as CrossJoinOnEmpty};
 pub use discover::{DatasetDescriptor, columns_to_schema, nullable_type, sql_type_to_json_schema};

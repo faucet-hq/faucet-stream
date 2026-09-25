@@ -177,6 +177,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "params": { "type": "object", "description": "Values for the template's declared params." },
                         "sink": { "type": "string", "description": "For a source-template: the registered sink-template to compose in (required for a source template; a `pipeline` template takes none)." },
                         "sink_version": { "description": "Version of the sink template: a number or a channel. Default \"stable\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                        "overlay": { "description": "Deployment overlay for a composed run: a registered `kind: deployment` id, or an inline mapping of operational blocks (state, dlq, notifications, sla, resilience, execution, delivery, schedule, streams).", "oneOf": [{ "type": "string" }, { "type": "object" }] },
+                        "overlay_version": { "description": "Version of a registered overlay: a number or a channel. Default \"stable\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
                         "env": { "type": "object", "description": "Per-run overrides for ${env:VAR} resolution." },
                         "dry_run": { "type": "boolean", "description": "If true, materialize + validate only; do not write to any sink." }
                     },
@@ -714,6 +716,18 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             None | Some(Value::Null) => Default::default(),
             Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string())?,
         },
+        overlay: match args.get("overlay") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(crate::templates::OverlayChoice::Registered {
+                id: id.clone(),
+                version: match args.get("overlay_version") {
+                    None | Some(Value::Null) => Default::default(),
+                    Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string())?,
+                },
+            }),
+            Some(v @ Value::Object(_)) => Some(crate::templates::OverlayChoice::Inline(v.clone())),
+            Some(_) => return Err("`overlay` must be a deployment id or a mapping".into()),
+        },
     };
     let materialized = crate::templates::materialize_for_run(
         store,
@@ -741,6 +755,10 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             "sink_template": materialized.sink_id,
             "sink_template_version": materialized.sink_version,
             "streams": materialized.streams,
+            "overlay": materialized.overlay_id,
+            "overlay_version": materialized.overlay_version,
+            "overlay_contributes": materialized.overlay_contributes,
+            "warnings": materialized.warnings,
             "params": materialized.params_redacted,
             "rows": rows,
             "dry_run": true,
@@ -759,6 +777,8 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         "template_version": materialized.version,
         "sink_template": materialized.sink_id,
         "sink_template_version": materialized.sink_version,
+        "overlay": materialized.overlay_id,
+        "overlay_version": materialized.overlay_version,
         "params": materialized.params_redacted,
         "invocations": summary.invocations.len(),
         "ok": summary.invocations.len() - failed,
@@ -1148,6 +1168,42 @@ mod tests {
             )
             .await;
             assert_eq!(out["isError"], true);
+
+            // #679: an inline overlay is applied and reported in the dry run; a
+            // registered one resolves by id; a malformed one is a tool error.
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "acme-exports", "sink": "local-jsonl", "dry_run": true,
+                        "overlay": {"execution": {"max_concurrent": 1}}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["overlay"], json!("inline"));
+            assert_eq!(doc["overlay_contributes"], json!(["execution"]));
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "acme-exports", "sink": "local-jsonl", "dry_run": true,
+                        "overlay": "nope", "overlay_version": "stable"}),
+            )
+            .await;
+            assert_eq!(out["isError"], true, "an unknown registered overlay");
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "acme-exports", "sink": "local-jsonl", "dry_run": true, "overlay": 3}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
+            assert!(
+                out["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("deployment id or a mapping")
+            );
         }
 
         #[tokio::test]

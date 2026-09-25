@@ -21,7 +21,7 @@ use faucet_core::WriteMode;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use super::spec::{DEFAULT_SOURCE, SinkTemplate, SourceTemplate, Stream};
+use super::spec::{DEFAULT_SOURCE, DeploymentTemplate, SinkTemplate, SourceTemplate, Stream};
 use crate::error::{CliError, CliResult};
 
 /// The write mode resolved for one stream against one sink.
@@ -61,6 +61,19 @@ pub struct Composition {
     pub sink: String,
     pub sink_kind: String,
     pub streams: Vec<StreamPlan>,
+    /// The deployment overlay applied over the pairing (#679), by id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<String>,
+    /// What the overlay set, as config paths (`pipeline.state`,
+    /// `matrix.orders.dlq`) — the plan output shows it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overlay_contributes: Vec<String>,
+    /// Operator-facing warnings about the composed run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// Whether any stream reads incrementally ([`has_incremental_stream`]).
+    #[serde(skip)]
+    pub incremental: bool,
     /// The composed `PipelineConfig` document (JSON value; serialize as YAML
     /// for humans).
     pub document: Value,
@@ -445,14 +458,145 @@ pub fn compose_with(
     doc.insert("pipeline".into(), Value::Object(pipeline));
     doc.insert("matrix".into(), Value::Array(rows));
 
+    let incremental = has_incremental_stream(source);
+    let warnings = if incremental {
+        vec![format!(
+            "'{}' has incremental streams but the composed run has no `state:` block, so they re-read everything each run — apply a deployment overlay (`kind: deployment`) that sets `state:`",
+            source.id()
+        )]
+    } else {
+        Vec::new()
+    };
+
     Ok(Composition {
         name: source.id(),
         source: source.id(),
         sink: sink.id(),
         sink_kind: sink.sink.kind.clone(),
         streams: plans,
+        overlay: None,
+        overlay_contributes: Vec::new(),
+        warnings,
+        incremental,
         document: Value::Object(doc),
     })
+}
+
+/// Whether any stream reads incrementally (`replication_method: Incremental`
+/// in the shared source config or a stream override) — such a stream only
+/// bookmarks across runs when the run has a state store.
+pub fn has_incremental_stream(source: &SourceTemplate) -> bool {
+    fn incremental(v: &Value) -> bool {
+        match v.get("replication_method") {
+            Some(Value::String(s)) => s.eq_ignore_ascii_case("incremental"),
+            Some(Value::Object(o)) => o
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.eq_ignore_ascii_case("incremental")),
+            _ => false,
+        }
+    }
+    incremental(&source.source.config)
+        || source.sources.values().any(|s| incremental(&s.config))
+        || source.streams.iter().any(|s| incremental(&s.source.config))
+}
+
+impl Composition {
+    /// Apply a deployment overlay (#679) last: its operational blocks replace
+    /// whatever the composition carried, and its per-stream overrides land on
+    /// the matching matrix rows. Connector selection and stream shape are out
+    /// of its reach by construction ([`DeploymentTemplate::from_value`]).
+    pub fn apply_overlay(mut self, overlay: &DeploymentTemplate) -> CliResult<Self> {
+        overlay.validate()?;
+        let doc = self
+            .document
+            .as_object_mut()
+            .ok_or_else(|| CliError::Internal("hub compose: document is not an object".into()))?;
+
+        let theirs: BTreeMap<String, crate::params::ParamSpec> = match doc.get("params") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(internal)?,
+            None => BTreeMap::new(),
+        };
+        let params = merge_named(
+            "param",
+            &theirs,
+            &overlay.params,
+            &format!("{} × {}", self.source, self.sink),
+            &overlay.id(),
+        )?;
+        if !params.is_empty() {
+            doc.insert(
+                "params".into(),
+                serde_json::to_value(&params).map_err(internal)?,
+            );
+        }
+
+        let mut contributes = Vec::new();
+        for (key, value) in overlay.blocks() {
+            match key {
+                "state" | "dlq" => {
+                    let pipeline = doc
+                        .get_mut("pipeline")
+                        .and_then(Value::as_object_mut)
+                        .ok_or_else(|| {
+                            CliError::Internal("hub compose: document has no pipeline".into())
+                        })?;
+                    pipeline.insert(key.into(), value.clone());
+                    contributes.push(format!("pipeline.{key}"));
+                }
+                _ => {
+                    doc.insert(key.into(), value.clone());
+                    contributes.push(key.to_string());
+                }
+            }
+        }
+
+        let known: Vec<String> = self.streams.iter().map(|p| p.stream.clone()).collect();
+        let rows = doc
+            .get_mut("matrix")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| CliError::Internal("hub compose: document has no matrix".into()))?;
+        for (stream, o) in &overlay.streams {
+            let row = rows
+                .iter_mut()
+                .find(|r| r.get("id").and_then(Value::as_str) == Some(stream.as_str()))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    CliError::Config(format!(
+                        "deployment '{}': `streams.{stream}` names no stream of '{}' (streams: {})",
+                        overlay.id(),
+                        self.source,
+                        known.join(", ")
+                    ))
+                })?;
+            let dlq = o.dlq.as_ref().map(|v| v.clone().unwrap_or(Value::Null));
+            for (key, value) in [
+                ("sla", o.sla.clone()),
+                ("dlq", dlq),
+                ("delivery", o.delivery.clone()),
+            ] {
+                if let Some(v) = value {
+                    row.insert(key.into(), v);
+                    contributes.push(format!("matrix.{stream}.{key}"));
+                }
+            }
+        }
+
+        if let Some(state) = &overlay.state {
+            self.warnings.retain(|w| !w.contains("no `state:` block"));
+            let memory = state.get("type").and_then(Value::as_str) == Some("memory");
+            if memory && self.incremental {
+                self.warnings.push(format!(
+                    "deployment '{}' uses a `memory` state store: bookmarks for '{}''s incremental streams reset when the process exits — use `file`, `redis`, or `postgres` for runs that must resume",
+                    overlay.id(),
+                    self.source
+                ));
+            }
+        }
+        self.overlay = Some(overlay.id());
+        self.overlay_contributes = contributes;
+        Ok(self)
+    }
 }
 
 fn internal(e: serde_json::Error) -> CliError {
@@ -792,5 +936,148 @@ per_stream:
             render_per_stream(&v, "bills", "ramp"),
             json!({"a": "bills-ramp", "b": ["bills", 3], "c": true})
         );
+    }
+
+    fn overlay(yaml: &str) -> DeploymentTemplate {
+        DeploymentTemplate::from_value(serde_yaml::from_str(yaml).unwrap()).unwrap()
+    }
+
+    fn jsonl_pair() -> Composition {
+        let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        compose_with(&src(), &k, ALL).unwrap()
+    }
+
+    #[test]
+    fn an_overlay_places_operational_blocks_and_per_stream_overrides() {
+        let o = overlay(
+            r#"
+kind: deployment
+name: prod
+params:
+  state_dir: { type: string, default: ./state }
+state: { type: file, config: { path: "${param.state_dir}" } }
+dlq: { sink: { type: jsonl, config: { path: ./dlq.jsonl } } }
+notify: [{ name: ops, channel: { type: webhook, config: { url: https://hooks.example/x } } }]
+sla: { max_staleness_secs: 3600 }
+delivery: at_least_once
+execution: { max_concurrent: 2 }
+streams:
+  bills: { sla: { min_rows_per_run: 1 }, dlq: null }
+"#,
+        );
+        let c = jsonl_pair().apply_overlay(&o).unwrap();
+        let d = &c.document;
+        assert_eq!(d["pipeline"]["state"]["type"], json!("file"));
+        assert_eq!(d["pipeline"]["dlq"]["sink"]["type"], json!("jsonl"));
+        assert_eq!(
+            d["notifications"][0]["name"],
+            json!("ops"),
+            "`notify` is an alias"
+        );
+        assert_eq!(d["sla"]["max_staleness_secs"], json!(3600));
+        assert_eq!(d["delivery"], json!("at_least_once"));
+        assert_eq!(d["execution"]["max_concurrent"], json!(2));
+        assert!(
+            d["params"]["state_dir"].is_object(),
+            "overlay params merge in"
+        );
+        assert!(d["params"]["token"].is_object(), "template params survive");
+        let bills = d["matrix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "bills")
+            .unwrap();
+        assert_eq!(bills["sla"]["min_rows_per_run"], json!(1));
+        assert!(bills["dlq"].is_null() && bills.as_object().unwrap().contains_key("dlq"));
+        assert_eq!(c.overlay.as_deref(), Some("prod"));
+        assert_eq!(
+            c.overlay_contributes,
+            vec![
+                "pipeline.state",
+                "pipeline.dlq",
+                "notifications",
+                "sla",
+                "execution",
+                "delivery",
+                "matrix.bills.sla",
+                "matrix.bills.dlq",
+            ]
+        );
+        // Connector selection and stream shape are untouched.
+        assert_eq!(
+            d["pipeline"]["sinks"],
+            jsonl_pair().document["pipeline"]["sinks"]
+        );
+    }
+
+    #[test]
+    fn an_overlay_naming_an_unknown_stream_or_clashing_param_is_refused() {
+        let err = jsonl_pair()
+            .apply_overlay(&overlay(
+                "kind: deployment\nname: x\nstreams:\n  nope: { delivery: at_least_once }\n",
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("names no stream") && err.contains("bills"),
+            "{err}"
+        );
+        let err = jsonl_pair()
+            .apply_overlay(&overlay(
+                "kind: deployment\nname: x\nparams:\n  token: { type: int }\nstate: { type: memory }\n",
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("param 'token'"), "{err}");
+    }
+
+    #[test]
+    fn incremental_streams_warn_without_state_and_with_memory_state() {
+        let mut s = src();
+        s.streams[0].source.config =
+            json!({ "path": "/bills", "replication_method": { "type": "Incremental" } });
+        let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let c = compose_with(&s, &k, ALL).unwrap();
+        assert!(c.incremental);
+        assert!(
+            c.warnings[0].contains("no `state:` block"),
+            "{:?}",
+            c.warnings
+        );
+        let with_state = c
+            .clone()
+            .apply_overlay(&overlay(
+                "kind: deployment\nname: x\nstate: { type: file, config: { path: ./s } }\n",
+            ))
+            .unwrap();
+        assert!(with_state.warnings.is_empty(), "{:?}", with_state.warnings);
+        let memory = c
+            .apply_overlay(&overlay(
+                "kind: deployment\nname: x\nstate: { type: memory }\n",
+            ))
+            .unwrap();
+        assert_eq!(memory.warnings.len(), 1);
+        assert!(memory.warnings[0].contains("`memory` state store"));
+        // No incremental streams: no warning either way.
+        let plain = compose_with(&src(), &k, ALL).unwrap();
+        assert!(!plain.incremental && plain.warnings.is_empty());
+    }
+
+    #[test]
+    fn incremental_detection_reads_every_source_config_shape() {
+        let mut s = src();
+        assert!(!has_incremental_stream(&s));
+        s.source.config = json!({ "replication_method": "incremental" });
+        assert!(has_incremental_stream(&s));
+        let mut s = src();
+        s.sources.insert(
+            "other".into(),
+            serde_json::from_value(json!({ "type": "rest", "config": { "replication_method": { "type": "INCREMENTAL" } } })).unwrap(),
+        );
+        assert!(has_incremental_stream(&s));
+        let mut s = src();
+        s.source.config = json!({ "replication_method": { "type": "FullTable" } });
+        assert!(!has_incremental_stream(&s));
     }
 }

@@ -1,4 +1,4 @@
-# Replication (snapshot → CDC)
+# Mirror (snapshot → CDC)
 
 A [CDC pipeline](./upsert.md#cdc--mirror-with-cdc_unwrap) keeps a destination in
 sync with a source from the moment it starts streaming — but it knows nothing
@@ -8,7 +8,7 @@ that by hand is fiddly: start CDC too late and you miss changes that happened
 during the back-fill (a **gap**); start it too early and the back-fill replays
 rows the stream already delivered (**duplicates**).
 
-`faucet replicate` does the coordination for you. It bulk-snapshots the table
+`faucet mirror` (formerly `faucet replicate`, still accepted) does the coordination for you. It bulk-snapshots the table
 and then hands off to CDC from a position captured *before* the snapshot — so the
 result is a true mirror with **no gap and no duplicate rows** when paired with
 [`write_mode: upsert`](./upsert.md).
@@ -18,7 +18,7 @@ result is a true mirror with **no gap and no duplicate rows** when paired with
 The ordering is the whole trick:
 
 1. **Capture the CDC position `P` first.** Before reading a single row,
-   `faucet replicate` asks the CDC source for its current replication position —
+   `faucet mirror` asks the CDC source for its current replication position —
    the WAL LSN (postgres), binlog file+pos (mysql), or change-stream resume token
    (mongodb) — and ensures any server-side resource needed to resume from it
    (e.g. the postgres replication slot) exists, so the log from `P` onward is
@@ -46,13 +46,13 @@ only on capturing `P` before the snapshot starts, plus upsert idempotency.
 > **Append mode can produce boundary duplicates.** With `write_mode: append`,
 > rows that fall in the overlap window are written twice (once by the snapshot,
 > once by CDC). `upsert` is the recommended — and expected — pairing. If you run
-> the replication with an append sink, `faucet replicate` warns at validation
+> the mirror with an append sink, `faucet mirror` warns at validation
 > time; see [no primary key](#tables-without-a-primary-key) below.
 
 ## Config shape
 
 The main `pipeline` *is* the CDC pipeline (its `source` is a CDC connector, its
-`sink` the destination). A top-level `replication:` block adds the one-time
+`sink` the destination). A top-level `mirror:` block adds the one-time
 snapshot source. Both source specs point at the **same upstream database** — the
 query connector for the bulk read, the `-cdc` connector for the stream — and they
 share the destination `sink` and the pipeline-level `transforms`.
@@ -88,7 +88,7 @@ pipeline:
     type: file
     config: { path: ./.faucet-state }
 
-replication:
+mirror:
   mode: snapshot_then_cdc
   continuous: true                       # keep streaming after the snapshot
   snapshot:
@@ -105,7 +105,7 @@ A few things to note:
   [`cdc_unwrap`](./transforms.md#cdc_unwrap--normalize-cdc-change-events-into-flat-rows)
   transform flattens them into rows and stamps an `__op` marker that the sink's
   `delete_marker` routes to deletes. The snapshot source instead produces flat
-  table rows directly (no envelope), so **`faucet replicate` automatically strips
+  table rows directly (no envelope), so **`faucet mirror` automatically strips
   `cdc_unwrap` from the snapshot phase** — running it there would drop every
   snapshot row (no `after`/`op` image). Any *other* pipeline-level transforms are
   kept for both phases, so write your snapshot `query` to yield rows in the
@@ -126,12 +126,12 @@ faucet validate cli/examples/postgres_replicate_snapshot_cdc.yaml
 ## Running it
 
 ```bash
-faucet replicate cli/examples/postgres_replicate_snapshot_cdc.yaml
+faucet mirror cli/examples/postgres_replicate_snapshot_cdc.yaml
 ```
 
-`faucet replicate` runs two phases in order: the **bulk snapshot**, then the
-**CDC handoff**. `faucet run` ignores the `replication:` block entirely (exactly
-as it ignores `schedule:`), so use `faucet replicate` for a replication config.
+`faucet mirror` runs two phases in order: the **bulk snapshot**, then the
+**CDC handoff**. `faucet run` ignores the `mirror:` block entirely (exactly
+as it ignores `schedule:`), so use `faucet mirror` for a mirror config.
 
 ### `continuous`
 
@@ -151,7 +151,7 @@ completes:
 
 ## Resume behaviour
 
-`faucet replicate` records its phase in a durable marker, so an interrupted run
+`faucet mirror` records its phase in a durable marker, so an interrupted run
 picks up where it left off:
 
 - **Crash during the snapshot** — the next run redoes the *whole* snapshot. This
@@ -168,7 +168,7 @@ in place (see [`continuous`](#continuous) above). A **one-shot** run
 (`continuous: false`) instead surfaces the error and exits non-zero, so a batch
 back-fill or CI invocation still fails loudly on a real problem.
 
-On a fresh run the marker is absent, so `faucet replicate` captures `P`, seeds
+On a fresh run the marker is absent, so `faucet mirror` captures `P`, seeds
 the CDC bookmark, and starts the snapshot. On any later run the marker tells it
 whether to redo the snapshot or go straight to CDC.
 
@@ -178,7 +178,7 @@ whether to redo the snapshot or go straight to CDC.
 
 The snapshot↔CDC handoff and the resume logic both depend on the `state:` store:
 it holds the captured position, the phase marker, and the advancing CDC bookmark.
-`faucet replicate` therefore **requires a durable backend** — `file`, `redis`, or
+`faucet mirror` therefore **requires a durable backend** — `file`, `redis`, or
 `postgres` — and rejects `memory` at validation time (a `memory` store is
 per-process and would lose the marker on restart, breaking resume). See the
 [state cookbook](./state.md#state-stores) for the backend table.
@@ -196,7 +196,7 @@ for a true mirror; an append sink validates with a warning (see above).
 For `postgres-cdc`, position capture requires a **permanent** replication slot
 (`slot_type: permanent`, the default). A temporary slot is dropped when the
 short-lived capture connection closes, so it cannot retain WAL across the
-snapshot — `faucet replicate` rejects a temporary slot with a typed error.
+snapshot — `faucet mirror` rejects a temporary slot with a typed error.
 
 ### Log retention must outlast the snapshot
 
@@ -222,7 +222,7 @@ append-mode semantics (and the boundary duplicates that come with them).
 
 ## Composing with effectively-once delivery
 
-`faucet replicate` composes with [`delivery: exactly_once`](./state.md#effectively-once-delivery)
+`faucet mirror` composes with [`delivery: exactly_once`](./state.md#effectively-once-delivery)
 on the CDC phase: set `delivery: exactly_once` at the top level and pair it with
 one of the four idempotent SQL sinks (`postgres`, `mysql`, `mssql`, `sqlite`) in
 `upsert` mode. The snapshot phase always runs at-least-once (the query source is

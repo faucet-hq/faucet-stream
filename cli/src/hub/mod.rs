@@ -32,7 +32,15 @@ use crate::error::{CliError, CliResult};
 
 pub use catalog::Catalog;
 pub use compose::{Composition, compose};
-pub use spec::{SinkTemplate, SourceTemplate, Stream, TemplateKind, WriteChoice};
+pub use spec::{
+    DeploymentTemplate, SinkTemplate, SourceTemplate, Stream, StreamOverlay, TemplateKind,
+    WriteChoice,
+};
+
+/// Where a hub keeps deployment overlays (#679), beside `source-templates/`
+/// and `sink-templates/`. Overlays are usually private to one deployment, so
+/// most are passed as a file path instead.
+pub const DEPLOYMENT_DIR: &str = "deployments";
 
 /// Default hub directory (relative to the working directory), used when it
 /// exists and neither `--hub` nor `FAUCET_HUB` is set.
@@ -470,9 +478,75 @@ pub async fn load_sink(locator: &str, hub: &Path) -> CliResult<SinkTemplate> {
 
 /// Compose two locators into a [`Composition`].
 pub async fn compose_locators(source: &str, sink: &str, hub: &Path) -> CliResult<Composition> {
+    compose_locators_overlaid(source, sink, None, hub).await
+}
+
+/// [`compose_locators`] plus an optional deployment overlay (#679), applied last.
+pub async fn compose_locators_overlaid(
+    source: &str,
+    sink: &str,
+    overlay: Option<&str>,
+    hub: &Path,
+) -> CliResult<Composition> {
     let s = load_source(source, hub).await?;
     let k = load_sink(sink, hub).await?;
-    compose(&s, &k)
+    let c = compose(&s, &k)?;
+    match overlay {
+        Some(o) => c.apply_overlay(&load_deployment(o, hub)?),
+        None => Ok(c),
+    }
+}
+
+/// The error for a hub document handed to `run` / `validate` as a plain
+/// config: say what it is and how to use it instead. `None` for a pipeline.
+pub fn misplaced_document(path: &Path, verb: &str) -> Option<String> {
+    let kind = detect_kind_in_file(path)?;
+    let (what, how) = match kind {
+        TemplateKind::SourceTemplate | TemplateKind::SinkTemplate => (
+            format!("hub {}", kind.as_str()),
+            format!(
+                "compose it: `faucet {verb} --source <source-template> --sink <sink-template>`"
+            ),
+        ),
+        TemplateKind::Deployment => (
+            "deployment overlay".to_string(),
+            format!(
+                "apply it over a pairing: `faucet {verb} --source <source-template> --sink <sink-template> --overlay {}`",
+                path.display()
+            ),
+        ),
+        TemplateKind::Pipeline => return None,
+    };
+    Some(format!("{} is a {what} — {how}", path.display()))
+}
+
+/// Parse + validate a `kind: deployment` file (#679).
+pub fn parse_deployment_file(path: &Path) -> CliResult<DeploymentTemplate> {
+    let value = parse_untyped(&read(path)?, path)?;
+    match detect_kind(&value) {
+        Some(TemplateKind::Deployment) => {}
+        Some(other) => {
+            return Err(CliError::Config(format!(
+                "{}: is a {}; `--overlay` needs a deployment",
+                path.display(),
+                other.as_str()
+            )));
+        }
+        None => {
+            return Err(CliError::Config(format!(
+                "{}: not a deployment overlay — it starts with `kind: deployment`",
+                path.display()
+            )));
+        }
+    }
+    DeploymentTemplate::from_value(value)
+        .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))
+}
+
+/// Load the deployment overlay named or pathed by `locator`: a file, or an id
+/// under `<hub>/deployments/`.
+pub fn load_deployment(locator: &str, hub: &Path) -> CliResult<DeploymentTemplate> {
+    parse_deployment_file(&resolve_locator(locator, hub, DEPLOYMENT_DIR)?)
 }
 
 /// The per-template version history a catalog's `index.json` carries (#682):
@@ -512,6 +586,13 @@ pub struct IndexEntry {
 pub struct IndexVersion {
     pub version: u32,
     pub commit: String,
+    /// Retired by the publisher (#691): still resolvable by an explicit `@N`,
+    /// with a warning, but never chosen by `@newest` and hidden from listings.
+    #[serde(default)]
+    pub deprecated: bool,
+    /// Why, and usually which version to use instead.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl IndexVersions {
@@ -542,15 +623,66 @@ impl IndexEntry {
             .or(self.newest)
     }
 
+    /// The highest version the publisher has not deprecated (#691) — what
+    /// `@newest` resolves to.
+    pub fn newest_live_version(&self) -> Option<u32> {
+        if self.versions.is_empty() {
+            return self.newest;
+        }
+        self.versions
+            .iter()
+            .filter(|v| !v.deprecated)
+            .map(|v| v.version)
+            .max()
+    }
+
+    /// The versions a listing should offer: every one not deprecated.
+    pub fn live_versions(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .versions
+            .iter()
+            .filter(|v| !v.deprecated)
+            .map(|v| v.version)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The warning for resolving a deprecated version, or `None` when it is live.
+    pub fn deprecation_warning(&self, v: &IndexVersion) -> Option<String> {
+        if !v.deprecated {
+            return None;
+        }
+        let id = if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
+        };
+        let mut msg = format!("warning: {id} v{} is deprecated", v.version);
+        if let Some(reason) = v.reason.as_deref().filter(|r| !r.trim().is_empty()) {
+            msg.push_str(&format!(": {reason}"));
+        }
+        if let Some(stable) = self.stable.filter(|s| *s != v.version) {
+            msg.push_str(&format!(" — stable is v{stable}"));
+        }
+        Some(msg)
+    }
+
     /// The commit a selector resolves to, when this entry carries history.
     pub fn commit_for(&self, sel: HubVersion) -> CliResult<Option<&IndexVersion>> {
         if self.versions.is_empty() {
             return Ok(None);
         }
         let want = match sel {
-            HubVersion::Newest => self
-                .newest
-                .or_else(|| self.versions.iter().map(|v| v.version).max()),
+            HubVersion::Newest => match self.newest_live_version() {
+                Some(v) => Some(v),
+                None => {
+                    return Err(CliError::Config(format!(
+                        "hub template '{}' has no live version: every version is deprecated",
+                        self.id
+                    )));
+                }
+            },
             HubVersion::Stable => self
                 .stable
                 .or(self.newest)
@@ -599,6 +731,10 @@ pub async fn locate(locator: &str, hub: &Path, subdir: &str) -> CliResult<PathBu
         (None, None) => None,
     };
     let Some(target) = target else { return head };
+    if let Some(warning) = entry.and_then(|e| e.deprecation_warning(target)) {
+        tracing::warn!(template = %id, version = target.version, "{warning}");
+        eprintln!("{warning}");
+    }
     // The checkout's file is the newest version's body (versions are deduped by
     // body), whatever commit the index was later regenerated at (#688).
     let newest = entry.and_then(IndexEntry::newest_version);
@@ -1101,6 +1237,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn locate_resolves_a_pinned_deprecated_version_and_newest_skips_it() {
+        // #691: the head file is v2, which the publisher deprecated; stable is v1.
+        let d = hub();
+        let index = serde_json::json!({
+            "commit": "head000",
+            "sources": [{"id": "acme", "name": "acme", "newest": 2, "stable": 1,
+                          "versions": [{"version": 1, "commit": "old000"},
+                                       {"version": 2, "commit": "head000", "deprecated": true, "reason": "broken"}]}],
+            "sinks": []
+        });
+        std::fs::write(d.path().join("index.json"), index.to_string()).unwrap();
+        // An explicit pin still resolves (the warning goes to stderr).
+        assert!(
+            locate("acme@2", d.path(), catalog::SOURCE_DIR)
+                .await
+                .unwrap()
+                .ends_with("acme.yaml")
+        );
+        // `@newest` is v1 now, which a directory hub cannot fetch — proving it
+        // did not pick the deprecated head.
+        let err = locate("acme@newest", d.path(), catalog::SOURCE_DIR)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("old000") || err.contains("hub-remote"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn locate_honours_the_catalog_index_versions() {
         let d = hub();
         // No index: a selector is an error, no selector is the file.
@@ -1159,10 +1326,12 @@ mod tests {
                 IndexVersion {
                     version: 1,
                     commit: "a".into(),
+                    ..Default::default()
                 },
                 IndexVersion {
                     version: 2,
                     commit: "b".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1181,6 +1350,63 @@ mod tests {
         );
         let none = IndexEntry::default();
         assert!(none.commit_for(HubVersion::Stable).unwrap().is_none());
+
+        // #691: deprecated versions — `@newest` skips them, an explicit pin
+        // still resolves (with a warning), and live_versions omits them.
+        let v = |n: u32, dep: bool| IndexVersion {
+            version: n,
+            commit: format!("c{n}"),
+            deprecated: dep,
+            reason: dep.then(|| format!("v{n} drops a stream")),
+        };
+        let e = IndexEntry {
+            id: "acme/erp".into(),
+            stable: Some(2),
+            newest: Some(3),
+            versions: vec![v(1, true), v(2, false), v(3, true)],
+            ..Default::default()
+        };
+        assert_eq!(e.newest_live_version(), Some(2));
+        assert_eq!(e.live_versions(), vec![2]);
+        assert_eq!(
+            e.commit_for(HubVersion::Newest).unwrap().unwrap().commit,
+            "c2"
+        );
+        let pinned = e.commit_for(HubVersion::Pinned(1)).unwrap().unwrap();
+        assert_eq!(pinned.commit, "c1");
+        assert_eq!(
+            e.deprecation_warning(pinned).as_deref(),
+            Some("warning: acme/erp v1 is deprecated: v1 drops a stream — stable is v2")
+        );
+        assert!(e.deprecation_warning(&v(2, false)).is_none());
+        // No reason, and the deprecated version is stable itself: no dangling clauses.
+        let lone = IndexEntry {
+            name: "solo".into(),
+            stable: Some(1),
+            versions: vec![IndexVersion {
+                version: 1,
+                commit: "x".into(),
+                deprecated: true,
+                reason: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            lone.deprecation_warning(&lone.versions[0]).as_deref(),
+            Some("warning: solo v1 is deprecated")
+        );
+        let err = lone.commit_for(HubVersion::Newest).unwrap_err().to_string();
+        assert!(err.contains("every version is deprecated"), "{err}");
+        // An entry with no recorded history falls back to its `newest` field.
+        let bare = IndexEntry {
+            newest: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(bare.newest_live_version(), Some(4));
+        // Old index.json without the fields still parses.
+        let parsed: IndexVersion =
+            serde_json::from_value(serde_json::json!({"version": 1, "commit": "a"})).unwrap();
+        assert!(!parsed.deprecated && parsed.reason.is_none());
     }
 
     #[tokio::test]
@@ -1192,5 +1418,77 @@ mod tests {
         assert_eq!(cfg.name.as_deref(), Some("acme"));
         assert_eq!(cfg.matrix.len(), 1);
         assert_eq!(composed_path("a", "b"), PathBuf::from("<hub:a+b>.yaml"));
+    }
+
+    const OVERLAY: &str = "kind: deployment\nname: prod\nstate: { type: memory }\n";
+
+    #[tokio::test]
+    async fn overlays_load_from_a_path_or_the_hub_and_apply_over_a_pairing() {
+        let d = hub();
+        std::fs::create_dir_all(d.path().join("deployments")).unwrap();
+        std::fs::write(d.path().join("deployments/prod.yaml"), OVERLAY).unwrap();
+        let by_id = compose_locators_overlaid("acme", "files", Some("prod"), d.path())
+            .await
+            .unwrap();
+        assert_eq!(by_id.overlay.as_deref(), Some("prod"));
+        assert_eq!(
+            by_id.document["pipeline"]["state"]["type"],
+            serde_json::json!("memory")
+        );
+        let path = d.path().join("deployments/prod.yaml");
+        let by_path =
+            compose_locators_overlaid("acme", "files", Some(path.to_str().unwrap()), d.path())
+                .await
+                .unwrap();
+        assert_eq!(by_path.overlay_contributes, vec!["pipeline.state"]);
+        // The composed + overlaid document is still a loadable pipeline.
+        load_composed(&by_path, &RunInputs::default()).unwrap();
+        let plain = compose_locators("acme", "files", d.path()).await.unwrap();
+        assert!(plain.overlay.is_none());
+    }
+
+    #[test]
+    fn a_deployment_file_is_checked_for_its_kind() {
+        let d = hub();
+        let err = parse_deployment_file(&d.path().join("source-templates/acme.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a source-template") && err.contains("--overlay"),
+            "{err}"
+        );
+        let plain = d.path().join("plain.yaml");
+        std::fs::write(&plain, "version: 1\npipeline: {}\n").unwrap();
+        let err = parse_deployment_file(&plain).unwrap_err().to_string();
+        assert!(err.contains("kind: deployment"), "{err}");
+        let bad = d.path().join("bad.yaml");
+        std::fs::write(&bad, "kind: deployment\nname: x\nmatrix: []\n").unwrap();
+        let err = parse_deployment_file(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("bad.yaml") && err.contains("cannot be set here"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn misplaced_documents_point_at_the_right_flag() {
+        let d = hub();
+        let src = d.path().join("source-templates/acme.yaml");
+        let msg = misplaced_document(&src, "run").unwrap();
+        assert!(
+            msg.contains("is a hub source-template") && msg.contains("faucet run --source"),
+            "{msg}"
+        );
+        let ov = d.path().join("prod.yaml");
+        std::fs::write(&ov, OVERLAY).unwrap();
+        let msg = misplaced_document(&ov, "validate").unwrap();
+        assert!(
+            msg.contains("deployment overlay") && msg.contains("--overlay"),
+            "{msg}"
+        );
+        let plain = d.path().join("p.yaml");
+        std::fs::write(&plain, "kind: pipeline\nversion: 1\n").unwrap();
+        assert!(misplaced_document(&plain, "run").is_none());
+        assert!(misplaced_document(Path::new("/nope.yaml"), "run").is_none());
     }
 }

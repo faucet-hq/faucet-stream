@@ -38,6 +38,13 @@ pub struct SuiteFile {
     /// Version of the registered sink template. Default `stable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_select: Option<String>,
+    /// A deployment overlay applied over the composition (#679) — a registered
+    /// id when `template` is an id, a path when `template` is a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<String>,
+    /// Version of the registered overlay. Default `stable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_select: Option<String>,
     /// The cases.
     pub suite: Suite,
 }

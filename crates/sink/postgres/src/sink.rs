@@ -96,6 +96,7 @@ fn build_create_table_sql(
     table_ref: &str,
     columns: &[faucet_core::PlannedColumn],
     json_column: Option<&str>,
+    key: &[String],
 ) -> String {
     let cols = match json_column {
         // JSONB mode stores the whole record in one column, so the page's own
@@ -105,7 +106,14 @@ fn build_create_table_sql(
             quote_ident("id"),
             quote_ident(col)
         ),
-        None => faucet_core::render_columns(columns, quote_ident, pg_keyword),
+        None => {
+            let defs = faucet_core::render_columns(columns, quote_ident, pg_keyword);
+            // A keyed write needs a PRIMARY KEY for its ON CONFLICT target (#676).
+            match faucet_core::render_primary_key(key, quote_ident) {
+                Some(pk) => format!("{defs}, {pk}"),
+                None => defs,
+            }
+        }
     };
     format!("CREATE TABLE IF NOT EXISTS {table_ref} ({cols})")
 }
@@ -197,12 +205,7 @@ impl PostgresSink {
         let table_ref = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
 
         if !self.config.create_table {
-            let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
-                .bind(&table_ref)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("postgres table probe failed: {e}")))?;
-            if exists.is_none() {
+            if !self.table_exists(&self.config.table_name).await? {
                 return Err(faucet_core::missing_target_error(
                     "postgres sink",
                     &table_ref,
@@ -219,7 +222,17 @@ impl PostgresSink {
         // AutoMap needs a page to infer from; a page with nothing inferable
         // leaves the table uncreated so the next page can try, rather than
         // emitting a zero-column CREATE.
-        let columns = match (json_column, faucet_core::plan_columns(records)) {
+        let key: &[String] = if self.config.write.dedups_by_key() {
+            &self.config.write.key
+        } else {
+            &[]
+        };
+        let planned = if key.is_empty() {
+            faucet_core::plan_columns(records)
+        } else {
+            faucet_core::plan_keyed_columns(records, key)
+        };
+        let columns = match (json_column, planned) {
             (Some(_), _) => Vec::new(),
             (None, Some(c)) => c,
             (None, None) => return Ok(()),
@@ -234,13 +247,27 @@ impl PostgresSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("postgres CREATE SCHEMA failed: {e}")))?;
         }
-        let sql = build_create_table_sql(&table_ref, &columns, json_column);
+        // An overwrite writes to staging. On a first run (no target) nothing
+        // else creates staging, so it is created here from the page (#676).
+        let create_ref =
+            qualified_table_ref(self.config.schema.as_deref(), &self.effective_table_name());
+        let sql = build_create_table_sql(&create_ref, &columns, json_column, key);
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
             .map_err(|e| FaucetError::Sink(format!("postgres CREATE TABLE failed: {e}")))?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
+        let table_ref = qualified_table_ref(self.config.schema.as_deref(), table);
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&table_ref)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| FaucetError::Sink(format!("postgres table probe failed: {e}")))?;
+        Ok(exists.is_some())
     }
 
     /// Create a new PostgreSQL sink. Establishes a connection pool.
@@ -901,10 +928,16 @@ impl faucet_core::Sink for PostgresSink {
 
     /// Create the staging table as an empty clone of the target's columns
     /// (`CREATE TABLE staging (LIKE target INCLUDING DEFAULTS)`), dropping any
-    /// leftover staging from a crashed run first. The target must already exist
-    /// (the sink never auto-creates it) — overwrite replaces its rows, not its
-    /// definition.
+    /// leftover staging from a crashed run first.
+    ///
+    /// A missing target with `create_table: true` (a first run) has no shape to
+    /// clone: the first write creates staging from the page, and the commit
+    /// renames it into place (#676). Every step reads the database rather than
+    /// sink-instance memory, because the CLI runs begin, the writes and the
+    /// commit on different sink instances.
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        let first_run =
+            self.config.create_table && !self.table_exists(&self.config.table_name).await?;
         let staging =
             qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
         let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
@@ -919,6 +952,9 @@ impl faucet_core::Sink for PostgresSink {
             .map_err(|e| {
                 FaucetError::Sink(format!("postgres overwrite: drop stale staging: {e}"))
             })?;
+        if first_run {
+            return Ok(());
+        }
         sqlx::query(&format!(
             "CREATE TABLE {staging} (LIKE {target} INCLUDING DEFAULTS)"
         ))
@@ -940,6 +976,24 @@ impl faucet_core::Sink for PostgresSink {
     /// preserved. Postgres runs TRUNCATE and DDL transactionally, so a failure
     /// rolls the whole swap back and the prior rows survive.
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+        if !self.table_exists(&self.config.table_name).await? {
+            // First run: staging holds everything; publish it as the target.
+            // A run that wrote nothing has no staging either, and leaves no table.
+            if self.table_exists(&self.staging_table_name()).await? {
+                let staging =
+                    qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
+                sqlx::query(&format!(
+                    "ALTER TABLE {staging} RENAME TO {}",
+                    quote_ident(&self.config.table_name)
+                ))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    FaucetError::Sink(format!("postgres overwrite: publish staging: {e}"))
+                })?;
+            }
+            return Ok(());
+        }
         let staging =
             qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
         let target = qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name);
@@ -976,7 +1030,8 @@ impl faucet_core::Sink for PostgresSink {
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
-    /// behind. Best-effort — the destination was never touched.
+    /// behind. Best-effort — the destination was never touched (on a first run
+    /// it was never created).
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         let staging =
             qualified_table_ref(self.config.schema.as_deref(), &self.staging_table_name());
@@ -1230,6 +1285,8 @@ impl faucet_core::Sink for PostgresSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
         if !matches!(
             self.config.write.write_mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
@@ -1283,6 +1340,8 @@ impl faucet_core::Sink for PostgresSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        // The DLQ and exactly-once paths must create a missing target too (#676).
+        self.ensure_table_ready(records).await?;
         self.ensure_commit_table().await?;
 
         // For upsert/delete modes, plan the page before opening the transaction
@@ -1543,7 +1602,7 @@ mod tests {
             serde_json::json!({ "id": 1, "name": "a", "amount": 1.5, "meta": {"k": 1} }),
         ])
         .expect("a plan");
-        let sql = build_create_table_sql(r#""public"."orders""#, &cols, None);
+        let sql = build_create_table_sql(r#""public"."orders""#, &cols, None, &[]);
         assert!(
             sql.starts_with(r#"CREATE TABLE IF NOT EXISTS "public"."orders" ("#),
             "{sql}"
@@ -1558,12 +1617,22 @@ mod tests {
     }
 
     #[test]
+    fn create_table_sql_for_a_keyed_write_carries_a_primary_key() {
+        let key = vec!["id".to_string()];
+        let cols =
+            faucet_core::plan_keyed_columns(&[serde_json::json!({ "id": 1, "name": "a" })], &key)
+                .expect("a plan");
+        let sql = build_create_table_sql(r#""t""#, &cols, None, &key);
+        assert!(sql.ends_with(r#", PRIMARY KEY ("id"))"#), "{sql}");
+    }
+
+    #[test]
     fn create_table_sql_in_jsonb_mode_ignores_the_page_shape() {
         // The whole record lands in one column, so the table is the same
         // whatever arrives — inferring per-page columns here would create a
         // table the writer never uses.
         let cols = faucet_core::plan_columns(&[serde_json::json!({ "a": 1 })]).expect("plan");
-        let sql = build_create_table_sql(r#""t""#, &cols, Some("data"));
+        let sql = build_create_table_sql(r#""t""#, &cols, Some("data"), &[]);
         assert!(sql.contains(r#""data" jsonb NOT NULL"#), "{sql}");
         assert!(sql.contains(r#""id" bigserial PRIMARY KEY"#), "{sql}");
         assert!(
@@ -1576,7 +1645,7 @@ mod tests {
     fn create_table_sql_quotes_a_hostile_column_name() {
         let cols =
             faucet_core::plan_columns(&[serde_json::json!({ "we\"ird": 1 })]).expect("a plan");
-        let sql = build_create_table_sql(r#""t""#, &cols, None);
+        let sql = build_create_table_sql(r#""t""#, &cols, None, &[]);
         assert!(
             sql.contains(r#""we""ird" bigint"#),
             "a column name must never reach the DDL unquoted: {sql}"

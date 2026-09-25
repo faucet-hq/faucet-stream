@@ -1208,8 +1208,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// Ordered rather than a per-kind table so a third-party connector that names
 /// its knob one of these gets the override for free, and so the choice is
 /// deterministic for a connector that declares more than one.
-const CONCURRENCY_KNOBS: [&str; 4] = [
+const CONCURRENCY_KNOBS: [&str; 5] = [
     "max_connections",
+    "request_concurrency",
     "partition_concurrency",
     "shard_concurrency",
     "concurrency",
@@ -3106,13 +3107,17 @@ mod tests {
 
     #[cfg(feature = "source-rest")]
     #[test]
-    fn the_rest_source_resolves_to_its_partition_knob() {
+    fn the_rest_source_resolves_to_its_request_knob() {
         let mut cfg = json!({ "base_url": "https://api.example.com", "path": "/x" });
         assert_eq!(
             override_source_concurrency("rest", &mut cfg, 6),
-            Some("partition_concurrency")
+            Some("request_concurrency")
         );
-        assert_eq!(cfg["partition_concurrency"], 6);
+        assert_eq!(cfg["request_concurrency"], 6);
+        validate_source_config("rest", "row", cfg).expect("overridden config stays valid");
+        // The pre-#670 spelling still loads.
+        let old = json!({ "base_url": "https://a", "path": "/x", "partition_concurrency": 2, "partitions": [{"id": 1}] });
+        validate_source_config("rest", "row", old).expect("old spelling accepted");
     }
 
     #[test]

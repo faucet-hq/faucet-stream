@@ -53,7 +53,7 @@ pipeline:
       replication_method:
         type: FullTable
       primary_keys: ["id"]
-      partitions: []
+      requests: []
       schema_sample_size: 100
 
   # Each Airtable record is { id, createdTime, fields: {...} }. Flatten collapses

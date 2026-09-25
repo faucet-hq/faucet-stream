@@ -32,7 +32,7 @@ pipeline:
         tolerated_http_errors: []
         replication_method: { type: FullTable }
         primary_keys: [id]
-        partitions: []
+        requests: []
         schema_sample_size: 100
 
   sinks:

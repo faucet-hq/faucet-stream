@@ -39,6 +39,9 @@ pub struct RemoteTemplate {
     pub body: String,
     pub format: ConfigFormat,
     pub sidecar: Option<Sidecar>,
+    /// Set when the origin's catalog marks this body's version deprecated
+    /// (#691): the reason, and the planner skips the template.
+    pub retired: Option<String>,
 }
 
 /// Result of pairing a directory listing.
@@ -141,6 +144,7 @@ pub fn pair_files(files: Vec<RemoteFile>) -> Paired {
             body,
             format,
             sidecar,
+            retired: None,
         });
     }
     for (stem, (name, _)) in sidecars {
@@ -158,6 +162,39 @@ pub fn pair_files(files: Vec<RemoteFile>) -> Paired {
 #[async_trait]
 pub trait Fetcher: Send + Sync {
     async fn list(&self) -> CliResult<Vec<RemoteFile>>;
+
+    /// The origin's Template Hub `index.json`, when it is a catalog (#691).
+    async fn catalog_index(&self) -> CliResult<Option<crate::hub::IndexVersions>> {
+        Ok(None)
+    }
+}
+
+/// Mark every template whose body is a version the catalog deprecated.
+///
+/// The files an origin serves are each template's newest catalog version, so
+/// that is the version checked. A template id may appear in both the source
+/// and sink lists; either marking it retires the body.
+pub fn apply_catalog_index(templates: &mut [RemoteTemplate], index: &crate::hub::IndexVersions) {
+    for t in templates.iter_mut() {
+        let entries = index
+            .sources
+            .iter()
+            .chain(index.sinks.iter())
+            .filter(|e| e.id == t.stem || (e.id.is_empty() && e.name == t.stem));
+        for e in entries {
+            let Some(head) = e.newest_version() else {
+                continue;
+            };
+            if let Some(v) = e
+                .versions
+                .iter()
+                .find(|v| v.version == head && v.deprecated)
+            {
+                let why = v.reason.clone().unwrap_or_else(|| "no reason given".into());
+                t.retired = Some(format!("catalog v{head} is deprecated: {why}"));
+            }
+        }
+    }
 }
 
 /// Writes one file to an origin (`faucet template publish`).
@@ -256,6 +293,10 @@ impl GithubFetcher {
             .send()
             .await
             .map_err(|e| io_err("github", format!("{what}: {e}")))?;
+        self.check(resp, what).await
+    }
+
+    async fn check(&self, resp: reqwest::Response, what: &str) -> CliResult<reqwest::Response> {
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -318,6 +359,39 @@ impl GithubFetcher {
 
 #[async_trait]
 impl Fetcher for GithubFetcher {
+    /// A catalog origin (`paths:`, the Template Hub layout) keeps `index.json`
+    /// at the repository root. Absent → not a catalog.
+    async fn catalog_index(&self) -> CliResult<Option<crate::hub::IndexVersions>> {
+        if self.cfg.paths.is_empty() {
+            return Ok(None);
+        }
+        let url = format!(
+            "{}?ref={}",
+            self.contents_url_in("", Some("index.json")),
+            self.cfg.r#ref
+        );
+        let resp = self
+            .request(
+                reqwest::Method::GET,
+                &url,
+                "application/vnd.github.raw+json",
+            )
+            .send()
+            .await
+            .map_err(|e| io_err("github", format!("reading index.json: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = self.check(resp, "reading index.json").await?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| io_err("github", format!("reading index.json: {e}")))?;
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| io_err("github", format!("decoding index.json: {e}")))
+    }
+
     async fn list(&self) -> CliResult<Vec<RemoteFile>> {
         // Files directly in each directory, plus one level of subdirectories —
         // a Template Hub's `<owner>/<name>.yaml` layout (#682), whose stems
@@ -875,6 +949,92 @@ mod tests {
             });
             assert!(ObjectStoreFetcher::from_source(&gh).is_err());
         }
+    }
+
+    #[test]
+    fn catalog_index_retires_only_a_deprecated_head_version() {
+        let index: crate::hub::IndexVersions = serde_json::from_value(serde_json::json!({
+            "sources": [
+                {"id": "acme/erp", "stable": 2, "versions": [
+                    {"version": 2, "commit": "a"},
+                    {"version": 3, "commit": "b", "deprecated": true, "reason": "drops invoices"}]},
+                {"id": "acme/crm", "versions": [
+                    {"version": 1, "commit": "c", "deprecated": true},
+                    {"version": 2, "commit": "d"}]}
+            ],
+            "sinks": [{"name": "legacy", "versions": [
+                {"version": 1, "commit": "e", "deprecated": true}]}]
+        }))
+        .unwrap();
+        let t = |stem: &str| RemoteTemplate {
+            stem: stem.into(),
+            body: "x".into(),
+            format: ConfigFormat::Yaml,
+            sidecar: None,
+            retired: None,
+        };
+        let mut ts = vec![t("acme/erp"), t("acme/crm"), t("legacy"), t("other")];
+        apply_catalog_index(&mut ts, &index);
+        assert_eq!(
+            ts[0].retired.as_deref(),
+            Some("catalog v3 is deprecated: drops invoices")
+        );
+        assert!(
+            ts[1].retired.is_none(),
+            "only an older version is deprecated"
+        );
+        assert_eq!(
+            ts[2].retired.as_deref(),
+            Some("catalog v1 is deprecated: no reason given")
+        );
+        assert!(ts[3].retired.is_none());
+    }
+
+    #[tokio::test]
+    async fn github_catalog_index_is_read_only_for_catalog_origins() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/contents/index.json"))
+            .and(query_param("ref", "main"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"sources":[{"id":"acme/erp","versions":[{"version":1,"commit":"a"}]}]}"#,
+            ))
+            .mount(&server)
+            .await;
+        let src = |paths: Vec<String>, repo: &str| GithubSource {
+            repo: repo.into(),
+            r#ref: "main".into(),
+            path: String::new(),
+            paths,
+            token: None,
+            api_base: server.uri(),
+        };
+        let catalog =
+            GithubFetcher::new(&src(vec!["source-templates".into()], "acme/hub")).unwrap();
+        let idx = catalog.catalog_index().await.unwrap().expect("an index");
+        assert_eq!(idx.sources[0].id, "acme/erp");
+        // A plain `path:` origin is not a catalog: no request is made.
+        let plain = GithubFetcher::new(&src(Vec::new(), "acme/hub")).unwrap();
+        assert!(plain.catalog_index().await.unwrap().is_none());
+        // A catalog-shaped origin without index.json (404) is not a catalog either.
+        let missing = GithubFetcher::new(&src(vec!["s".into()], "acme/none")).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/none/contents/index.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        assert!(missing.catalog_index().await.unwrap().is_none());
+        // A malformed index is a typed error the caller turns into a warning.
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/bad/contents/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let bad = GithubFetcher::new(&src(vec!["s".into()], "acme/bad")).unwrap();
+        let err = bad.catalog_index().await.unwrap_err().to_string();
+        assert!(err.contains("decoding index.json"), "{err}");
     }
 
     #[tokio::test]

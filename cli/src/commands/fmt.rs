@@ -157,6 +157,7 @@ const KEY_ORDER: &[&str] = &[
     "resilience",
     "sla",
     "backfill",
+    "mirror",
     "replication",
     "schedule",
     "notifications",

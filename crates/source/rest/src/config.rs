@@ -82,6 +82,7 @@ fn default_csv_has_headers() -> bool {
 /// `faucet init` still marks it `# REQUIRED`. Everything else defaults to the
 /// value in the [`Default`] impl below.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-aliases" = ["partitions", "partition_concurrency"]))]
 pub struct RestStreamConfig {
     // ── Core request ──────────────────────────────────────────────────────────
     /// Base URL of the API, e.g. `https://api.example.com/v2`. Required. Joined
@@ -241,13 +242,15 @@ pub struct RestStreamConfig {
     #[serde(default = "default_schema_sample_size")]
     pub schema_sample_size: usize,
 
-    // ── Partitions ────────────────────────────────────────────────────────────
-    /// Each entry is a context map whose values are substituted into `path`
-    /// placeholders. The stream is executed once per partition and results are
-    /// concatenated.  Empty means run once with no substitution.
-    #[serde(default)]
+    // ── Requests ──────────────────────────────────────────────────────────────
+    /// `requests:` — one entry per request: a context map whose values are
+    /// substituted into `path` placeholders. The stream is executed once per
+    /// entry and results are concatenated. Empty means run once with no
+    /// substitution. The pre-#670 spelling `partitions:` is still accepted.
+    #[serde(default, rename = "requests", alias = "partitions")]
     pub partitions: Vec<HashMap<String, Value>>,
-    /// Maximum number of partitions to fetch concurrently.
+    /// `request_concurrency:` — maximum number of `requests` entries fetched
+    /// concurrently (`partition_concurrency:` is still accepted).
     /// `None` (and `0`/`1`) means sequential processing — the default.
     ///
     /// Honoured on **both** read paths since #624: the buffering `fetch_all`
@@ -258,7 +261,11 @@ pub struct RestStreamConfig {
     /// persisted bookmark is a max across all of them, so this changes
     /// throughput rather than the resume position — but a downstream that
     /// assumed partition-at-a-time page order no longer gets it.
-    #[serde(default)]
+    #[serde(
+        default,
+        rename = "request_concurrency",
+        alias = "partition_concurrency"
+    )]
     pub partition_concurrency: Option<usize>,
 
     // ── Mutual TLS ─────────────────────────────────────────────────────────────
@@ -463,6 +470,7 @@ impl ODataVersion {
 /// `$expand`/`$orderby` params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("x-faucet-aliases" = ["partition"]))]
 pub struct ODataConfig {
     /// Protocol version (default `v4`).
     #[serde(default)]
@@ -516,10 +524,16 @@ pub struct ODataConfig {
     /// Unset ⇒ defaults (`table_id: "${name_snake}"`, the default sink).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emit: Option<EmitSpec>,
-    /// Key-range partitioned extraction: split large entities into contiguous
-    /// primary-key ranges fetched concurrently, instead of one sequential
-    /// `@odata.nextLink` page walk. See [`PartitionSpec`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `key_ranges:` — split large entities into contiguous primary-key
+    /// ranges fetched concurrently, instead of one sequential
+    /// `@odata.nextLink` page walk. See [`PartitionSpec`]. The pre-#670
+    /// spelling `partition:` is still accepted.
+    #[serde(
+        default,
+        rename = "key_ranges",
+        alias = "partition",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub partition: Option<PartitionSpec>,
 }
 
@@ -1495,7 +1509,7 @@ mod tests {
             "fan_out": true,
             "objects": "Alpha,BetaV2",
             "emit": { "table_id": "raw_${name_snake}", "sink_ref": "warehouse" },
-            "partition": { "objects": ["Alpha"], "workers": 24, "count": 96 }
+            "key_ranges": { "objects": ["Alpha"], "workers": 24, "count": 96 }
         });
         let c: ODataConfig = serde_json::from_value(raw).unwrap();
         assert!(c.fan_out);
@@ -1642,5 +1656,37 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "base_url": "" })).expect("deserializes");
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.to_lowercase().contains("base_url"), "{err}");
+    }
+
+    /// #670 / RFC 0009: `requests` / `request_concurrency` / `odata.key_ranges`
+    /// are the spellings; the old ones still load, and the schema lists them as
+    /// aliases so the connector-key gate accepts them.
+    #[test]
+    fn renamed_keys_load_under_both_spellings_and_serialize_new() {
+        for (list, conc, ranges) in [
+            ("requests", "request_concurrency", "key_ranges"),
+            ("partitions", "partition_concurrency", "partition"),
+        ] {
+            let c: RestStreamConfig = serde_json::from_value(serde_json::json!({
+                "base_url": "https://a",
+                list: [{ "id": 1 }],
+                conc: 3,
+                "odata": { ranges: { "objects": ["X"] } }
+            }))
+            .unwrap();
+            assert_eq!(c.partitions.len(), 1, "{list}");
+            assert_eq!(c.partition_concurrency, Some(3), "{conc}");
+            assert!(c.odata.as_ref().unwrap().partition.is_some(), "{ranges}");
+            let out = serde_json::to_value(&c).unwrap();
+            assert!(out.get("requests").is_some() && out.get("partitions").is_none());
+            assert_eq!(out["request_concurrency"], 3);
+            assert!(out["odata"].get("key_ranges").is_some());
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(RestStreamConfig)).unwrap();
+        assert_eq!(
+            schema["x-faucet-aliases"],
+            serde_json::json!(["partitions", "partition_concurrency"])
+        );
+        assert!(schema["properties"].get("requests").is_some());
     }
 }

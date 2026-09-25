@@ -210,3 +210,80 @@ async fn write_batch_partial_routes_missing_key_per_row() {
         "id=1 must be present with name 'ok'"
     );
 }
+
+#[tokio::test]
+async fn upsert_on_a_fresh_database_creates_a_keyed_table_and_dedups() {
+    // #676: `create_table` builds the table with a PRIMARY KEY on `key`, so the
+    // first run's ON CONFLICT has a target and a re-run updates in place.
+    let (_dir, url) = fresh_db("CREATE TABLE unrelated (id INTEGER)").await;
+    let cfg = || SqliteSinkConfig {
+        database_url: url.clone(),
+        table_name: "users".into(),
+        column_mapping: SqliteColumnMapping::AutoMap,
+        batch_size: 1000,
+        max_connections: 1,
+        create_table: true,
+        write: WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            delete_marker: None,
+        },
+    };
+    let first = SqliteSink::new(cfg()).await.unwrap();
+    first
+        .write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})])
+        .await
+        .unwrap();
+    let second = SqliteSink::new(cfg()).await.unwrap();
+    second
+        .write_batch(&[
+            json!({"id": 1, "name": "a2"}),
+            json!({"id": 3, "name": "c"}),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(count_rows(&url, "users").await, 3);
+    assert_eq!(fetch_name(&url, 1).await.as_deref(), Some("a2"));
+}
+
+#[tokio::test]
+async fn dlq_and_exactly_once_paths_create_a_fresh_keyed_table() {
+    // #676: `write_batch_partial` (DLQ attached) and `write_batch_idempotent`
+    // (exactly-once) never went through the create path before.
+    for idempotent in [false, true] {
+        let (_dir, url) = fresh_db("CREATE TABLE unrelated (id INTEGER)").await;
+        let sink = SqliteSink::new(SqliteSinkConfig {
+            database_url: url.clone(),
+            table_name: "users".into(),
+            column_mapping: SqliteColumnMapping::AutoMap,
+            batch_size: 1000,
+            max_connections: 1,
+            create_table: true,
+            write: WriteSpec {
+                write_mode: WriteMode::Upsert,
+                key: vec!["id".into()],
+                delete_marker: None,
+            },
+        })
+        .await
+        .unwrap();
+        let page = [
+            json!({"id": 1, "name": "a"}),
+            json!({"id": 1, "name": "a2"}),
+        ];
+        if idempotent {
+            sink.write_batch_idempotent(&page, "scope", "0000000000000001")
+                .await
+                .unwrap();
+        } else {
+            let outcomes = sink.write_batch_partial(&page).await.unwrap();
+            assert!(outcomes.iter().all(|o| o.is_ok()));
+        }
+        assert_eq!(
+            count_rows(&url, "users").await,
+            1,
+            "idempotent={idempotent}"
+        );
+        assert_eq!(fetch_name(&url, 1).await.as_deref(), Some("a2"));
+    }
+}

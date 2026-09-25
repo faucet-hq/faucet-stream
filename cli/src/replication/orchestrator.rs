@@ -83,7 +83,7 @@ fn phase_failure(summary: &crate::executor::RunSummary, phase: &str) -> CliError
         .iter()
         .find_map(|i| i.error.clone())
         .unwrap_or_else(|| "unknown error".to_string());
-    CliError::Internal(format!("replication {phase} phase failed: {detail}"))
+    CliError::Internal(format!("mirror {phase} phase failed: {detail}"))
 }
 
 /// Build a fresh `ExecuteOptions` for one phase run.
@@ -155,7 +155,7 @@ pub async fn run_replication(
     let mut cdc_node = nodes
         .drain(..)
         .next()
-        .ok_or_else(|| CliError::Internal("replication: expand produced no node".into()))?;
+        .ok_or_else(|| CliError::Internal("mirror: expand produced no node".into()))?;
     cdc_node.id = "cdc".to_string();
     let snapshot_node = build_snapshot_node(&cdc_node, compiled.snapshot_source.clone());
 
@@ -163,7 +163,7 @@ pub async fn run_replication(
         .pipeline
         .state
         .as_ref()
-        .ok_or_else(|| CliError::Config("replication requires a state store".into()))?;
+        .ok_or_else(|| CliError::Config("mirror requires a state store".into()))?;
     let store = build_state_store(state_spec).await?;
 
     let marker_k = marker_key(&opts.pipeline_name);
@@ -185,7 +185,7 @@ pub async fn run_replication(
         .await?;
         let position = cdc_source.capture_resume_position().await?.ok_or_else(|| {
             CliError::Config(format!(
-                "replication: source '{}' does not support position capture",
+                "mirror: source '{}' does not support position capture",
                 cdc_node.source.kind
             ))
         })?;
@@ -204,7 +204,7 @@ pub async fn run_replication(
                 .to_value()?,
             )
             .await?;
-        tracing::info!(pipeline = %opts.pipeline_name, "replication bootstrap: captured CDC position, seeded bookmark");
+        tracing::info!(pipeline = %opts.pipeline_name, "mirror bootstrap: captured CDC position, seeded bookmark");
     }
 
     // Re-read the marker (it now exists). Decide the remaining work.
@@ -212,7 +212,7 @@ pub async fn run_replication(
         Some(v) => ReplicationState::from_value(v)?,
         None => {
             return Err(CliError::Internal(
-                "replication: marker missing after bootstrap".into(),
+                "mirror: marker missing after bootstrap".into(),
             ));
         }
     };
@@ -227,7 +227,7 @@ pub async fn run_replication(
 
     // ── Snapshot phase (idempotent redo on resume) ───────────────────────────
     if !marker.snapshot_done {
-        tracing::info!(pipeline = %opts.pipeline_name, "replication: running snapshot phase (Ctrl-C / SIGTERM to stop)");
+        tracing::info!(pipeline = %opts.pipeline_name, "mirror: running snapshot phase (Ctrl-C / SIGTERM to stop)");
         let summary = run_expanded(
             vec![snapshot_node.clone()],
             make_opts(&opts, Some(cancel.clone())),
@@ -244,7 +244,7 @@ pub async fn run_replication(
         if cancel.is_cancelled() {
             tracing::warn!(
                 pipeline = %opts.pipeline_name,
-                "replication: snapshot interrupted by shutdown before completion; \
+                "mirror: snapshot interrupted by shutdown before completion; \
                  it will be redone on the next run"
             );
             return Ok(());
@@ -260,12 +260,12 @@ pub async fn run_replication(
                 .to_value()?,
             )
             .await?;
-        tracing::info!(pipeline = %opts.pipeline_name, "replication: snapshot complete; handing off to CDC");
+        tracing::info!(pipeline = %opts.pipeline_name, "mirror: snapshot complete; handing off to CDC");
     }
 
     // ── CDC phase (loop until SIGTERM when continuous) ───────────────────────
     if compiled.continuous {
-        tracing::info!(pipeline = %opts.pipeline_name, "replication: streaming CDC (Ctrl-C / SIGTERM to stop)");
+        tracing::info!(pipeline = %opts.pipeline_name, "mirror: streaming CDC (Ctrl-C / SIGTERM to stop)");
     }
     // In continuous mode the CDC phase is an always-on mirror: a long-lived
     // CDC connection routinely hits transient failures (network blips, server
@@ -302,7 +302,7 @@ pub async fn run_replication(
                     pipeline = %opts.pipeline_name,
                     error = %cycle.unwrap_err(),
                     backoff_secs = backoff.as_secs(),
-                    "replication: CDC cycle failed; resuming from bookmark after backoff"
+                    "mirror: CDC cycle failed; resuming from bookmark after backoff"
                 );
                 tokio::select! {
                     biased;

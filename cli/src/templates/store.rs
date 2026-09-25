@@ -70,6 +70,14 @@ pub struct MaterializedConfig {
     /// Per-stream write-mode resolution of a composed run (empty for a
     /// `kind: pipeline` template).
     pub streams: Vec<crate::hub::compose::StreamPlan>,
+    /// The deployment overlay applied (#679): a registered id and version, or
+    /// `inline` for one supplied with the trigger.
+    pub overlay_id: Option<String>,
+    pub overlay_version: Option<u32>,
+    /// What the overlay set (`pipeline.state`, `matrix.orders.dlq`, …).
+    pub overlay_contributes: Vec<String>,
+    /// Operator-facing warnings about the composed run.
+    pub warnings: Vec<String>,
 }
 
 impl MaterializedConfig {
@@ -138,6 +146,11 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
             registry_lint(&t.id(), crate::hub::catalog::lint_sink(&t))?;
             (TemplateKind::SinkTemplate, Some(t.id()))
         }
+        Some(TemplateKind::Deployment) => {
+            let t = crate::hub::DeploymentTemplate::from_value(doc.clone())?;
+            registry_lint(&t.id(), crate::hub::catalog::lint_deployment(&t))?;
+            (TemplateKind::Deployment, Some(t.id()))
+        }
         Some(TemplateKind::Pipeline) | None => {
             if detected.is_none() {
                 tracing::warn!(
@@ -153,7 +166,7 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
         }
     };
 
-    let id = match (&req.id, kind.is_hub()) {
+    let id = match (&req.id, kind != TemplateKind::Pipeline) {
         // A hub template's registry id is its `name` — compose uses the name for
         // the pipeline name / state keys, so the two must not diverge.
         (Some(raw), true) => {
@@ -213,7 +226,9 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
             .and_then(|prev| prev.description)
             .or_else(|| match kind {
                 // Hub templates carry their own description.
-                TemplateKind::SourceTemplate | TemplateKind::SinkTemplate => doc
+                TemplateKind::SourceTemplate
+                | TemplateKind::SinkTemplate
+                | TemplateKind::Deployment => doc
                     .get("description")
                     .and_then(Value::as_str)
                     .map(str::to_string),
@@ -646,6 +661,7 @@ pub async fn materialize(
                  `--sink {id}`"
             )));
         }
+        TemplateKind::Deployment => return Err(not_runnable_deployment(id)),
     }
     let doc = parse_body(&record.body, record.format)?;
     let (body, bound) = bind_document_for_run(doc, supplied, env_overrides, mode)?;
@@ -659,6 +675,10 @@ pub async fn materialize(
         sink_id: None,
         sink_version: None,
         streams: Vec::new(),
+        overlay_id: None,
+        overlay_version: None,
+        overlay_contributes: Vec::new(),
+        warnings: Vec::new(),
     })
 }
 
@@ -668,6 +688,64 @@ pub struct SinkChoice {
     pub id: Option<String>,
     /// Defaults to `stable`, like the source side.
     pub version: VersionSelector,
+    /// The deployment overlay to apply over the pairing (#679).
+    pub overlay: Option<OverlayChoice>,
+}
+
+/// Where a trigger's deployment overlay comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverlayChoice {
+    /// A registered `kind: deployment` template.
+    Registered {
+        id: String,
+        version: VersionSelector,
+    },
+    /// A document supplied with the trigger. `kind:` and `name:` may be
+    /// omitted — they default to `deployment` / `inline`.
+    Inline(Value),
+}
+
+fn not_runnable_deployment(id: &str) -> CliError {
+    CliError::Config(format!(
+        "'{id}' is a deployment overlay and is not runnable on its own — apply it to a source \
+         template's run: `faucet template run <source> --sink <sink> --overlay {id}` (HTTP: `overlay`)"
+    ))
+}
+
+/// Resolve a trigger's overlay to a validated document and its provenance.
+pub(crate) async fn resolve_overlay(
+    store: &TemplateStore,
+    choice: &OverlayChoice,
+) -> CliResult<(crate::hub::DeploymentTemplate, String, Option<u32>)> {
+    match choice {
+        OverlayChoice::Registered { id, version } => {
+            let v = resolve_version(store, id, *version).await?;
+            let rec = fetch_version(store, id, v).await?;
+            if rec.kind != TemplateKind::Deployment {
+                return Err(CliError::Config(format!(
+                    "'{id}' is a {} — `overlay` must name a deployment",
+                    rec.kind
+                )));
+            }
+            let t = crate::hub::DeploymentTemplate::from_value(parse_body(&rec.body, rec.format)?)?;
+            Ok((t, rec.id, Some(rec.version)))
+        }
+        OverlayChoice::Inline(v) => {
+            let mut v = v.clone();
+            if let Some(obj) = v.as_object_mut() {
+                obj.entry("kind")
+                    .or_insert_with(|| Value::String("deployment".into()));
+                obj.entry("name")
+                    .or_insert_with(|| Value::String("inline".into()));
+            } else {
+                return Err(CliError::Config(
+                    "`overlay` must be a registered deployment id or a mapping".into(),
+                ));
+            }
+            let t = crate::hub::DeploymentTemplate::from_value(v)?;
+            Ok((t, "inline".into(), None))
+        }
+    }
 }
 
 /// Everything a trigger surface needs to run template `id` at `version`:
@@ -693,6 +771,12 @@ pub async fn materialize_for_run(
                     "'{id}' is a complete pipeline template — it takes no sink (got `--sink {sink_id}`)"
                 )));
             }
+            if sink.overlay.is_some() {
+                return Err(CliError::Config(format!(
+                    "'{id}' is a complete pipeline template — its operational blocks live in the \
+                     config itself; an overlay applies to a composed source × sink run"
+                )));
+            }
             materialize(store, id, version, supplied, env_overrides, mode).await
         }
         TemplateKind::SourceTemplate => {
@@ -703,10 +787,11 @@ pub async fn materialize_for_run(
                 ))
             })?;
             let sink_version = resolve_version(store, sink_id, sink.version).await?;
-            materialize_pair(
+            materialize_pair_overlaid(
                 store,
                 (id, version),
                 (sink_id, sink_version),
+                sink.overlay.as_ref(),
                 supplied,
                 env_overrides,
                 mode,
@@ -717,6 +802,7 @@ pub async fn materialize_for_run(
             "'{id}' is a sink-template and is not runnable on its own — run a source template with \
              `--sink {id}`"
         ))),
+        TemplateKind::Deployment => Err(not_runnable_deployment(id)),
     }
 }
 
@@ -726,8 +812,23 @@ pub async fn materialize_for_run(
 /// records exactly which builds it composed.
 pub async fn materialize_pair(
     store: &TemplateStore,
+    source: (&str, u32),
+    sink: (&str, u32),
+    supplied: &SuppliedParams,
+    env_overrides: &BTreeMap<String, String>,
+    mode: Materialize,
+) -> CliResult<MaterializedConfig> {
+    materialize_pair_overlaid(store, source, sink, None, supplied, env_overrides, mode).await
+}
+
+/// [`materialize_pair`] with a deployment overlay (#679) applied over the
+/// composition before params bind, so the overlay's own `${param.*}` bind too.
+#[allow(clippy::too_many_arguments)]
+pub async fn materialize_pair_overlaid(
+    store: &TemplateStore,
     (source_id, source_version): (&str, u32),
     (sink_id, sink_version): (&str, u32),
+    overlay: Option<&OverlayChoice>,
     supplied: &SuppliedParams,
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
@@ -758,7 +859,16 @@ pub async fn materialize_pair(
                 "stored sink-template '{sink_id}' v{sink_version}: {e}"
             ))
         })?;
-    let composition = crate::hub::compose(&source, &sink)?;
+    let mut composition = crate::hub::compose(&source, &sink)?;
+    let (mut overlay_id, mut overlay_version) = (None, None);
+    if let Some(choice) = overlay {
+        let (t, oid, over) = resolve_overlay(store, choice).await?;
+        composition = composition.apply_overlay(&t)?;
+        overlay_id = Some(oid);
+        overlay_version = over;
+    }
+    let overlay_contributes = std::mem::take(&mut composition.overlay_contributes);
+    let warnings = std::mem::take(&mut composition.warnings);
     let (body, bound) = bind_document_for_run(composition.document, supplied, env_overrides, mode)?;
     Ok(MaterializedConfig {
         template_id: src_rec.id.clone(),
@@ -770,6 +880,10 @@ pub async fn materialize_pair(
         sink_id: Some(sink_rec.id.clone()),
         sink_version: Some(sink_rec.version),
         streams: composition.streams,
+        overlay_id,
+        overlay_version,
+        overlay_contributes,
+        warnings,
     })
 }
 
@@ -1838,6 +1952,7 @@ write_mode_aliases:
         let with_sink = SinkChoice {
             id: Some("local-jsonl".into()),
             version: Default::default(),
+            overlay: None,
         };
         let err = materialize_for_run(
             &s,
@@ -1883,6 +1998,7 @@ write_mode_aliases:
         let pipeline_as_sink = SinkChoice {
             id: Some("tenant-sync".into()),
             version: Default::default(),
+            overlay: None,
         };
         let err = materialize_for_run(
             &s,
@@ -1962,6 +2078,7 @@ write_mode_aliases:
         let pinned = SinkChoice {
             id: Some("local-jsonl".into()),
             version: VersionSelector::Pinned(9),
+            overlay: None,
         };
         let err = materialize_for_run(
             &s,
@@ -1978,6 +2095,172 @@ write_mode_aliases:
             matches!(err, CliError::UnknownPipelineTemplate { ref id, version: Some(9) } if id == "local-jsonl"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn deployments_register_and_overlay_a_composed_trigger() {
+        let s = store();
+        let dir = tempfile::tempdir().unwrap();
+        register(&s, req_launched(&source_template(dir.path())))
+            .await
+            .unwrap();
+        register(&s, req_launched(&sink_template(dir.path())))
+            .await
+            .unwrap();
+        register(&s, req_launched(PARAMETERIZED)).await.unwrap();
+        let state_dir = dir.path().join("state");
+        let overlay_yaml = format!(
+            "kind: deployment\nname: prod-ops\ndescription: prod\nstate: {{ type: file, config: {{ path: \"{}\" }} }}\nstreams:\n  orders: {{ delivery: at_least_once }}\n",
+            state_dir.display()
+        );
+        let rec = register(&s, req_launched(&overlay_yaml)).await.unwrap();
+        assert_eq!(rec.id, "prod-ops");
+        assert_eq!(rec.kind, TemplateKind::Deployment);
+        let none = BTreeMap::new();
+        let supplied = SuppliedParams::new();
+        let run = |overlay: Option<OverlayChoice>| SinkChoice {
+            id: Some("local-jsonl".into()),
+            version: Default::default(),
+            overlay,
+        };
+
+        // A registered overlay lands on the composed document with provenance.
+        let m = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &run(Some(OverlayChoice::Registered {
+                id: "prod-ops".into(),
+                version: Default::default(),
+            })),
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap();
+        assert_eq!(m.overlay_id.as_deref(), Some("prod-ops"));
+        assert_eq!(m.overlay_version, Some(1));
+        assert_eq!(
+            m.overlay_contributes,
+            vec!["pipeline.state", "matrix.orders.delivery"]
+        );
+        let body: Value = serde_json::from_str(&m.body).unwrap();
+        assert_eq!(body["pipeline"]["state"]["type"], json!("file"));
+
+        // An inline overlay may omit `kind:` / `name:`.
+        let m = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &run(Some(OverlayChoice::Inline(
+                json!({ "state": { "type": "memory" } }),
+            ))),
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap();
+        assert_eq!(m.overlay_id.as_deref(), Some("inline"));
+        assert_eq!(m.overlay_version, None);
+        let err = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &run(Some(OverlayChoice::Inline(json!(["not", "a", "mapping"])))),
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("a registered deployment id or a mapping"),
+            "{err}"
+        );
+
+        // `overlay` must name a deployment; a deployment is never runnable; a
+        // pipeline takes no overlay.
+        let err = materialize_for_run(
+            &s,
+            "acme-exports",
+            1,
+            &run(Some(OverlayChoice::Registered {
+                id: "local-jsonl".into(),
+                version: Default::default(),
+            })),
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`overlay` must name a deployment"), "{err}");
+        for id in ["prod-ops"] {
+            let err = materialize_for_run(
+                &s,
+                id,
+                1,
+                &SinkChoice::default(),
+                &supplied,
+                &none,
+                Materialize::Local,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("deployment overlay and is not runnable"),
+                "{err}"
+            );
+            let err = materialize(&s, id, 1, &supplied, &none, Materialize::Local)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("deployment overlay and is not runnable"),
+                "{err}"
+            );
+        }
+        let err = materialize_for_run(
+            &s,
+            "tenant-sync",
+            1,
+            &SinkChoice {
+                id: None,
+                version: Default::default(),
+                overlay: Some(OverlayChoice::Inline(json!({}))),
+            },
+            &supplied,
+            &none,
+            Materialize::Local,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("an overlay applies to a composed"), "{err}");
+
+        // A deployment cannot hide a literal credential in a shared registry,
+        // and an id's kind is fixed once registered.
+        let err = register(
+            &s,
+            req("kind: deployment\nname: leaky\nstate: { type: postgres, config: { url: \"postgres://u:hunter2@db/x\" } }\n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("literal password"), "{err}");
+        let err = register(
+            &s,
+            req("kind: deployment\nname: local-jsonl\nstate: { type: memory }\n"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is a sink-template"), "{err}");
     }
 
     #[tokio::test]

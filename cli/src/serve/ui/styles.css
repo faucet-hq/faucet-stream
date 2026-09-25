@@ -28,6 +28,7 @@
   --brand-ring: rgba(20, 184, 166, 0.35);
 
   --ok: #0e9f6e;
+  --overlay: #7c3aed;
   --fail: #e02424;
   --queued: #c2700b;
   --cancelled: #64748b;
@@ -71,6 +72,7 @@
   --brand-ring: rgba(45, 212, 191, 0.40);
 
   --ok: #34d399;
+  --overlay: #a78bfa;
   --fail: #f87171;
   --queued: #fbbf24;
   --cancelled: #94a3b8;
@@ -104,6 +106,7 @@
     --brand-tint: rgba(45, 212, 191, 0.12);
     --brand-ring: rgba(45, 212, 191, 0.40);
     --ok: #34d399;
+    --overlay: #a78bfa;
     --fail: #f87171;
     --queued: #fbbf24;
     --cancelled: #94a3b8;
@@ -1209,7 +1212,8 @@ select {
 .tpl-kind-source-template { color: var(--running);   border-color: color-mix(in srgb, var(--running) 45%, transparent);   background: color-mix(in srgb, var(--running) 12%, transparent); }
 .tpl-kind-sink-template   { color: var(--queued);    border-color: color-mix(in srgb, var(--queued) 45%, transparent);    background: color-mix(in srgb, var(--queued) 12%, transparent); }
 .tpl-kind-pipeline        { color: var(--ink-dim);   border-color: var(--border-strong);                                    background: var(--surface-2); }
-.tpl-kind-source-template::before, .tpl-kind-sink-template::before, .tpl-kind-pipeline::before { display: none; }
+.tpl-kind-deployment      { color: var(--overlay);   border-color: color-mix(in srgb, var(--overlay) 45%, transparent);   background: color-mix(in srgb, var(--overlay) 12%, transparent); }
+.tpl-kind-source-template::before, .tpl-kind-sink-template::before, .tpl-kind-pipeline::before, .tpl-kind-deployment::before { display: none; }
 .tpl-row-id b { font-weight: 600; font-size: 0.95rem; }
 .tpl-row-desc {
   font-size: 0.8rem;
@@ -1321,6 +1325,10 @@ select {
 
 /* Status filter chips on the templates list (multi-toggle; launched+draft on by default). */
 .tpl-status-filter { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+/* Status and kind are separate dimensions: a label each, and a divider between. */
+.tpl-status-filter + .tpl-status-filter { border-left: 1px solid var(--border); padding-left: 14px; margin-left: 6px; }
+@media (max-width: 1100px) { .tpl-status-filter + .tpl-status-filter { border-left: 0; padding-left: 0; margin-left: 0; } }
+.tpl-filter-label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); margin-right: 2px; }
 .tpl-chip {
   border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-faint);
   border-radius: 999px; padding: 5px 12px; font-size: 0.78rem; cursor: pointer;
