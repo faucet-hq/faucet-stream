@@ -1233,6 +1233,29 @@ select {
 
 /* Source × sink compatibility matrix on the Templates page (#677). */
 .tpl-matrix { margin-bottom: 18px; }
+/* Owner / Type filters above the compatibility grid: pill buttons that open a
+   checkbox menu, one pair per axis. */
+.tpl-facets { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 10px; }
+.tpl-facet-group { display: inline-flex; align-items: center; gap: 8px; }
+.tpl-facets-sep { width: 1px; align-self: stretch; background: var(--border); margin: 2px 6px; }
+.tpl-facets-count { margin-left: auto; }
+.tpl-facet { position: relative; }
+.tpl-facet-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px 6px 14px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--ink); font: inherit; font-size: 0.84rem; cursor: pointer;
+}
+.tpl-facet-btn:hover { border-color: var(--border-strong); }
+.tpl-facet-btn.is-on { border-color: var(--brand-ring); background: var(--brand-tint); color: var(--brand); }
+.tpl-facet-caret { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid currentColor; opacity: 0.7; }
+.tpl-facet-n { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--brand); color: var(--surface); font-size: 0.7rem; line-height: 18px; text-align: center; }
+.tpl-facet-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; min-width: 180px; max-height: 260px; overflow: auto;
+  padding: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+.tpl-facet-opt { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; font-size: 0.84rem; cursor: pointer; white-space: nowrap; }
+.tpl-facet-opt:hover { background: var(--surface-2); }
 .tpl-matrix-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 .tpl-matrix-head .tpl-h2 { margin: 6px 0 8px; }
 /* The grid scrolls inside its own box both ways, with the sink header row and
@@ -1599,3 +1622,13 @@ select {
 .tpl-sync-quiet { color: var(--ink-faint); }
 .tpl-sync-warn { color: var(--queued); }
 .tpl-sync-fail { color: var(--fail); }
+.tpl-facets-clear { background: none; border: 0; padding: 0; font: inherit; font-size: 0.82rem; color: var(--brand); cursor: pointer; }
+.tpl-facets-clear:hover { text-decoration: underline; }
+/* Narrow screens: the axis separator goes (each group wraps as a unit) and the
+   pinned source column gives the grid more room. After the base grid rules on
+   purpose — same specificity, so order decides. */
+@media (max-width: 700px) {
+  .tpl-facets-sep { display: none; }
+  .tpl-matrix-table tbody th { min-width: 120px; max-width: 150px; }
+  .tpl-matrix-head .run-meta { text-align: left; }
+}

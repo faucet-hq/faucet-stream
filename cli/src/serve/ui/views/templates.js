@@ -263,43 +263,140 @@ function renderMatrix(idx) {
   const idOf = (t) => t.id || t.name;
   const el = document.createElement("section");
   el.className = "tpl-matrix";
-  const head = sinks
-    .map((k) => `<th title="${escapeHtml(idOf(k))}${k.description ? ` — ${escapeHtml(k.description)}` : ""}"><a href="#/templates/${encodeURIComponent(idOf(k))}" class="mono">${escapeHtml(k.name)}</a><span class="tpl-matrix-kind">${k.owner ? `@${escapeHtml(k.owner)} · ` : ""}${escapeHtml(k.sink_type || "")}</span></th>`)
-    .join("");
-  const rows = sources
-    .map((s) => {
-      const tds = sinks
-        .map((k) => {
-          const c = cells.get(`${idOf(s)}\u0000${idOf(k)}`);
-          if (!c) return `<td class="tpl-cell tpl-cell-none">—</td>`;
-          const total = (s.streams || []).length;
-          const plan = (c.streams || [])
-            .map((p) => `${p.stream}: ${p.write_mode}${p.satisfies ? ` (for ${p.satisfies})` : ""}`)
-            .concat((c.incompatible || []).map((i) => `${i.stream}: ✗ ${i.reason}`))
-            .join("\n");
-          const href = `#/templates/${encodeURIComponent(idOf(s))}?sink=${encodeURIComponent(idOf(k))}`;
-          if (c.compatible) {
-            return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(idOf(s))} into ${escapeHtml(idOf(k))}">✓</a></td>`;
-          }
-          const ok = (c.streams || []).length;
-          return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(plan)}">${ok ? `<a href="${href}">${ok}/${total}</a>` : "✗"}</td>`;
-        })
-        .join("");
-      const n = (s.streams || []).length;
-      return `<tr><th scope="row" title="${escapeHtml(idOf(s))}"><a href="#/templates/${encodeURIComponent(idOf(s))}" class="mono">${escapeHtml(s.name)}</a><span class="tpl-matrix-kind">${s.owner ? `@${escapeHtml(s.owner)} · ` : ""}${escapeHtml(s.source_type || "")} · ${n} stream${n === 1 ? "" : "s"}</span></th>${tds}</tr>`;
-    })
-    .join("");
+
+  // Owner / Type filters per axis: rows (sources) and columns (sinks) filter
+  // independently, since an acme source into a faucet-hq sink is a real pairing.
+  // An empty selection means "all".
+  const filters = {
+    srcOwner: new Set(), srcType: new Set(),
+    sinkOwner: new Set(), sinkType: new Set(),
+  };
+  const values = (list, key) =>
+    [...new Set(list.map((t) => (key === "owner" ? t.owner || "(none)" : t[key] || "")).filter(Boolean))].sort();
+  const pass = (t, owners, types, typeKey) =>
+    (!owners.size || owners.has(t.owner || "(none)")) && (!types.size || types.has(t[typeKey] || ""));
+
+  const head = (k) => `<th title="${escapeHtml(idOf(k))}${k.description ? ` — ${escapeHtml(k.description)}` : ""}"><a href="#/templates/${encodeURIComponent(idOf(k))}" class="mono">${escapeHtml(k.name)}</a><span class="tpl-matrix-kind">${k.owner ? `@${escapeHtml(k.owner)} · ` : ""}${escapeHtml(k.sink_type || "")}</span></th>`;
+  const cell = (s, k) => {
+    const c = cells.get(`${idOf(s)}\u0000${idOf(k)}`);
+    if (!c) return `<td class="tpl-cell tpl-cell-none">—</td>`;
+    const total = (s.streams || []).length;
+    const plan = (c.streams || [])
+      .map((p) => `${p.stream}: ${p.write_mode}${p.satisfies ? ` (for ${p.satisfies})` : ""}`)
+      .concat((c.incompatible || []).map((i) => `${i.stream}: ✗ ${i.reason}`))
+      .join("\n");
+    const href = `#/templates/${encodeURIComponent(idOf(s))}?sink=${encodeURIComponent(idOf(k))}`;
+    if (c.compatible) {
+      return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(idOf(s))} into ${escapeHtml(idOf(k))}">✓</a></td>`;
+    }
+    const ok = (c.streams || []).length;
+    return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(plan)}">${ok ? `<a href="${href}">${ok}/${total}</a>` : "✗"}</td>`;
+  };
+  const row = (s, ks) => {
+    const n = (s.streams || []).length;
+    return `<tr><th scope="row" title="${escapeHtml(idOf(s))}"><a href="#/templates/${encodeURIComponent(idOf(s))}" class="mono">${escapeHtml(s.name)}</a><span class="tpl-matrix-kind">${s.owner ? `@${escapeHtml(s.owner)} · ` : ""}${escapeHtml(s.source_type || "")} · ${n} stream${n === 1 ? "" : "s"}</span></th>${ks.map((k) => cell(s, k)).join("")}</tr>`;
+  };
+
   el.innerHTML = `
     <div class="tpl-matrix-head">
       <h2 class="tpl-h2">Compatibility</h2>
       <span class="run-meta">source × sink — ✓ every stream has a write mode the sink supports; click a cell to run that pairing</span>
     </div>
-    <div class="tpl-matrix-scroll">
-      <table class="tbl tpl-matrix-table">
-        <thead><tr><th class="tpl-matrix-corner">source \\ sink</th>${head}</tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
+    <div class="tpl-facets" role="group" aria-label="Filter the compatibility grid">
+      <span class="tpl-facet-group"><span class="tpl-filter-label">sources</span>
+        <span data-facet="srcOwner"></span><span data-facet="srcType"></span></span>
+      <span class="tpl-facets-sep" aria-hidden="true"></span>
+      <span class="tpl-facet-group"><span class="tpl-filter-label">sinks</span>
+        <span data-facet="sinkOwner"></span><span data-facet="sinkType"></span></span>
+      <span class="run-meta tpl-facets-count"></span>
+      <button type="button" class="linkish tpl-facets-clear" hidden>Clear filters</button>
+    </div>
+    <div class="tpl-matrix-grid"></div>`;
+
+  const grid = el.querySelector(".tpl-matrix-grid");
+  const count = el.querySelector(".tpl-facets-count");
+  const clear = el.querySelector(".tpl-facets-clear");
+  const draw = () => {
+    const rs = sources.filter((t) => pass(t, filters.srcOwner, filters.srcType, "source_type"));
+    const ks = sinks.filter((t) => pass(t, filters.sinkOwner, filters.sinkType, "sink_type"));
+    const active = Object.values(filters).some((f) => f.size);
+    clear.hidden = !active;
+    count.textContent = active
+      ? `${rs.length} of ${sources.length} sources × ${ks.length} of ${sinks.length} sinks`
+      : `${sources.length} sources × ${sinks.length} sinks`;
+    grid.innerHTML = rs.length && ks.length
+      ? `<div class="tpl-matrix-scroll">
+          <table class="tbl tpl-matrix-table">
+            <thead><tr><th class="tpl-matrix-corner">source \\ sink</th>${ks.map(head).join("")}</tr></thead>
+            <tbody>${rs.map((s) => row(s, ks)).join("")}</tbody>
+          </table>
+        </div>`
+      : `<div class="empty">No ${rs.length ? "sink" : "source"} templates match these filters.</div>`;
+  };
+
+  const facets = [
+    ["srcOwner", "Owner", values(sources, "owner"), (v) => `@${v}`],
+    ["srcType", "Type", values(sources, "source_type"), (v) => v],
+    ["sinkOwner", "Owner", values(sinks, "owner"), (v) => `@${v}`],
+    ["sinkType", "Type", values(sinks, "sink_type"), (v) => v],
+  ];
+  const menus = [];
+  for (const [key, label, opts, show] of facets) {
+    const host = el.querySelector(`[data-facet="${key}"]`);
+    host.className = "tpl-facet";
+    host.innerHTML = `
+      <button type="button" class="tpl-facet-btn" aria-haspopup="true" aria-expanded="false">
+        <span>${label}</span><span class="tpl-facet-n" hidden></span><span class="tpl-facet-caret" aria-hidden="true"></span>
+      </button>
+      <div class="tpl-facet-menu" hidden>
+        ${opts.map((v) => `<label class="tpl-facet-opt"><input type="checkbox" value="${escapeHtml(v)}" /> <span class="mono">${escapeHtml(show(v))}</span></label>`).join("")}
+      </div>`;
+    const btn = host.querySelector(".tpl-facet-btn");
+    const menu = host.querySelector(".tpl-facet-menu");
+    const n = host.querySelector(".tpl-facet-n");
+    menus.push([btn, menu]);
+    const sync = () => {
+      n.hidden = !filters[key].size;
+      n.textContent = filters[key].size;
+      btn.classList.toggle("is-on", filters[key].size > 0);
+      for (const box of menu.querySelectorAll("input")) box.checked = filters[key].has(box.value);
+    };
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const open = menu.hidden;
+      for (const [b, m] of menus) { m.hidden = true; b.setAttribute("aria-expanded", "false"); }
+      menu.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+    };
+    menu.onclick = (ev) => ev.stopPropagation();
+    menu.onchange = (ev) => {
+      const v = ev.target.value;
+      if (ev.target.checked) filters[key].add(v);
+      else filters[key].delete(v);
+      sync();
+      draw();
+    };
+    host.sync = sync;
+  }
+  clear.onclick = () => {
+    for (const f of Object.values(filters)) f.clear();
+    for (const h of el.querySelectorAll(".tpl-facet")) h.sync();
+    draw();
+  };
+  // Close any open menu on an outside click or Escape; the listener retires
+  // itself once this section has been replaced by a reload.
+  const close = (ev) => {
+    if (!el.isConnected) {
+      document.removeEventListener("click", close);
+      document.removeEventListener("keydown", close);
+      return;
+    }
+    if (ev.type === "keydown" && ev.key !== "Escape") return;
+    for (const [b, m] of menus) { m.hidden = true; b.setAttribute("aria-expanded", "false"); }
+  };
+  document.addEventListener("click", close);
+  document.addEventListener("keydown", close);
+  draw();
   return el;
 }
 
