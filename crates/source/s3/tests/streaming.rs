@@ -564,20 +564,20 @@ async fn stream_pages_overlaps_object_reads() {
         "concurrency must not change what the source yields, only how fast"
     );
 
+    // The proxy notices a closed connection only after its copy loop ends, so
+    // a client that drops a pooled socket and immediately opens the next one
+    // can briefly count as two. A serial reader therefore peaks at one or two;
+    // an overlapping one at well above that.
+    let (serial_peak, concurrent_peak) = (serial_proxy.peak(), concurrent_proxy.peak());
     assert!(
-        concurrent_proxy.peak() > 1,
-        "reading 60 objects with concurrency=15 never had more than \
-         {} connection open at once — the reads are not overlapping, which is \
-         exactly the #619 defect: the knob is accepted and ignored",
-        concurrent_proxy.peak()
+        serial_peak <= 2,
+        "concurrency = 1 must not overlap reads (peak {serial_peak} connections)"
     );
-    // The serial control. Without it, a proxy that miscounted (or an SDK that
-    // opened spare sockets on its own) would make the assertion above pass on
-    // a serial reader.
-    assert_eq!(
-        serial_proxy.peak(),
-        1,
-        "concurrency = 1 must keep exactly one connection open at a time"
+    assert!(
+        concurrent_peak >= 4 && concurrent_peak > serial_peak,
+        "reading 60 objects with concurrency=15 peaked at {concurrent_peak} open \
+         connections (serial: {serial_peak}) — the reads are not overlapping, \
+         which is exactly the #619 defect: the knob is accepted and ignored"
     );
 }
 

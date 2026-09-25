@@ -97,6 +97,19 @@ services:
       timeout: 5s
       retries: 10
 
+  # RabbitMQ with the management UI (http://localhost:15672, guest/guest) for
+  # the rabbitmq source/sink examples.
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   # MongoDB as a single-node replica set so the mongodb-cdc source (Change
   # Streams require a replica set) works out of the box. The healthcheck
   # self-initiates the set on first run. Query-mode mongodb examples connect to

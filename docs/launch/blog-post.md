@@ -31,7 +31,7 @@ pipeline from Rust with typed `Source`/`Sink` traits.
 
 ## What's in the box
 
-- **<!--COUNT:connectors-->66<!--/COUNT--> connectors** across REST, GraphQL, gRPC, Kafka, Postgres/MySQL/SQLite,
+- **<!--COUNT:connectors-->68<!--/COUNT--> connectors** across REST, GraphQL, gRPC, Kafka, Postgres/MySQL/SQLite,
   Postgres/MySQL/Mongo/SQL-Server CDC, S3/GCS/Azure, Parquet/Delta/Iceberg,
   MongoDB, Redis, Elasticsearch, BigQuery, Snowflake, Databricks, and more.
 - **Bring your existing Singer taps.** The `singer` source runs any Singer/Meltano

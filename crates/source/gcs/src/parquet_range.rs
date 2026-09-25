@@ -151,12 +151,8 @@ mod tests {
     /// A client pointed at a closed port. Building one contacts nothing, which
     /// is enough to drive the reader's non-I/O paths.
     ///
-    /// This crate's emulator suite is `#[ignore]`d because `fake-gcs-server`
-    /// speaks REST while the connector uses the gRPC data plane, so these unit
-    /// tests are the only automated cover this adapter gets. The I/O itself is
-    /// kept a thin shim over `read_object` for exactly that reason: what is
-    /// worth asserting — the failure messages and the range arithmetic — is
-    /// pure.
+    /// The emulator suite covers the ranged reads end to end; these tests pin
+    /// the failure messages and the range arithmetic, which are pure.
     async fn offline_storage() -> Storage {
         build_storage(&GcsCredentials::Anonymous, Some("http://127.0.0.1:1"))
             .await

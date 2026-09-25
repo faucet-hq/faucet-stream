@@ -1,0 +1,54 @@
+[package]
+name = "faucet-source-rabbitmq"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RabbitMQ (AMQP 0.9.1) source connector for the faucet-stream ecosystem"
+readme = "README.md"
+keywords = ["rabbitmq", "amqp", "messaging", "etl", "connector"]
+categories.workspace = true
+
+[features]
+default = []
+## TLS (`amqps://`) connections.
+tls = ["faucet-common-rabbitmq/tls"]
+
+[dependencies]
+faucet-core.workspace = true
+faucet-common-rabbitmq.workspace = true
+lapin.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "signal"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
+futures.workspace = true
+faucet-conformance.workspace = true
+testcontainers = "0.27"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides.
+#
+# Additive evolution is a MINOR bump by declared contract (CLAUDE.md
+# "API-Evolution & Versioning Policy"): struct-literal construction and
+# exhaustive matching of config/data types are NOT part of this crate's
+# stability surface — construct via serde deserialization, `new()`/`Default`,
+# or builders, and match with a `_` arm. So adding an optional config field
+# never forces a major. Every other API-stability lint stays at its default
+# (deny) level, so genuine removals and signature changes still fail the gate.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

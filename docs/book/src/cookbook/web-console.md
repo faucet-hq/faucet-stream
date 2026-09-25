@@ -94,7 +94,11 @@ Two modes for submitting a new pipeline run:
 - **Schema wizard** — select a source and sink from the compiled connector list,
   fill in the generated form fields, and the wizard assembles a valid config.
   The form is derived from the same JSON Schemas returned by
-  `GET /v1/schemas/{kind}/{name}`.
+  `GET /v1/schemas/{kind}/{name}`. Below the transforms, two optional
+  sections add the rest of a pipeline: **Reliability** (state, dead-letter
+  queue, delivery, resilience, SLA) and **Data governance** (quality checks,
+  contract, PII masking, schema drift). Each block is off until you add it;
+  its form comes from `GET /v1/schemas/block/{name}`.
 
 ![The Submit view in guided mode: a schema-driven form generated from the selected connector's JSON Schema](../assets/console/submit.png)
 
@@ -192,7 +196,8 @@ dataset's detail, scoped to it) showing every tracked file with its age and stat
 |---|---|
 | `present` | on disk |
 | `expired` | already cleaned — the file is gone, the record is kept |
-| `external` | faucet wrote this file but did not create it, so it is never cleaned |
+| `external` | faucet wrote this file but did not create it (appended to it), so it is never cleaned and never previewed |
+| `replaced` | the file already existed, but faucet truncated it, so it holds only faucet's output — previewable, still never cleaned |
 
 Controls, when your role holds `LocalOutputManage` (`operator` and up — a
 `viewer` sees the list and no buttons):
@@ -259,10 +264,12 @@ still stops at a 64 MiB response budget or a 30-second deadline if the dataset i
 larger than that, saying which. A partial answer always names the bound that
 produced it.
 
-Only a `present` output gets a Preview button. An `expired` one has no file left,
-and an **`external`** one — a file faucet wrote to but did not create — is never
-previewed: its contents are not faucet's to serve, which is the read-side twin of
-the retention GC's refusal to delete it. Each served preview is recorded in the
+A `present` or `replaced` output gets a Preview button. An `expired` one has no
+file left, and an **`external`** one — a file faucet appended to but did not
+create — is never previewed: the part that predates faucet is not faucet's to
+serve, which is the read-side twin of the retention GC's refusal to delete it. A
+**`replaced`** file also already existed, but faucet truncated it, so every byte
+in it is faucet's output; it is previewed, and still never cleaned. Each served preview is recorded in the
 audit log as `local_output.preview`.
 
 **It is off by default and intended for local testing** — it returns file

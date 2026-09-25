@@ -1,5 +1,8 @@
 # Coverage is measured by the CI `coverage` job (unit + integration tests via
-# cargo-llvm-cov). See .github/workflows/ci.yml.
+# cargo-llvm-cov). See .github/workflows/ci.yml. Besides the combined report it
+# uploads the unit-only and integration-only halves under the `unit` and
+# `integration` flags (#695), so the PR comment shows how much of a change ran
+# against a real backend.
 coverage:
   status:
     project:
@@ -22,24 +25,9 @@ ignore:
   - "**/examples/**"
   - "**/benches/**"
   - "cli/examples/**"
-  # The GCS connectors' data-plane I/O cannot be exercised in CI: the
-  # google-cloud-storage SDK speaks gRPC/JSON that `fake-gcs-server` (REST-only)
-  # does not implement, so the GCS integration tests are `#[ignore]`d (#220).
-  # These two files are therefore untestable here (S3 uses MinIO and IS covered;
-  # Databricks uses wiremock and IS covered). Their pure helpers are still unit
-  # tested; excluding the files keeps the coverage denominator honest rather
-  # than penalising provably-uncoverable I/O.
-  - "crates/source/gcs/src/stream.rs"
-  # The ranged-read Parquet adapter (#619) is the same surface: every line that
-  # is not a pure helper issues a `read_object` against the gRPC data plane.
-  # Its arithmetic and its failure messages — the parts a bug would hide in —
-  # are unit-tested in the file itself.
-  - "crates/source/gcs/src/parquet_range.rs"
-  - "crates/sink/gcs/src/sink.rs"
-  # BigQuery Arrow columnar I/O (#380) is provably-uncoverable in CI for the
-  # same reasons: the Storage Read API is gRPC with no emulator, and the load
-  # sink stages Parquet through the google-cloud-storage SDK (the very SDK the
-  # GCS exclusions above cover) before a live load job. The pure helpers
+  # BigQuery Arrow columnar I/O (#380) is provably-uncoverable in CI: the
+  # Storage Read API is gRPC with no emulator, and the load sink stages Parquet
+  # to a real GCS bucket before a live load job. The pure helpers
   # (`build_load_job`, `resolve_table`, Parquet encode) are unit-tested; these
   # two files are the untestable transport/I/O.
   - "crates/source/bigquery/src/storage_read.rs"
@@ -53,3 +41,9 @@ ignore:
   # in-memory object store) stays in the denominator.
   - "crates/sink/clickhouse/src/staged_exec.rs"
   - "crates/sink/mssql/src/staged_exec.rs"
+
+flags:
+  unit:
+    paths: ["crates/", "cli/src/"]
+  integration:
+    paths: ["crates/", "cli/src/"]

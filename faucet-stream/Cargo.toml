@@ -30,6 +30,7 @@ source = [
     "source-duckdb",
     "source-sqs",
     "source-nats",
+    "source-rabbitmq",
     "source-sftp",
     "source-s3",
     "source-mongodb",
@@ -68,6 +69,7 @@ sink = [
     "sink-duckdb",
     "sink-sqs",
     "sink-nats",
+    "sink-rabbitmq",
     "sink-sftp",
     "sink-s3",
     "sink-mongodb",
@@ -150,6 +152,13 @@ mtls = [
     "faucet-source-xml?/mtls",
     "faucet-source-graphql?/mtls",
 ]
+## TLS (`amqps://`) for whichever RabbitMQ connectors have been opted in
+## (optional-dep forwarding — never pulls a connector itself).
+rabbitmq-tls = [
+    "faucet-common-rabbitmq?/tls",
+    "faucet-source-rabbitmq?/tls",
+    "faucet-sink-rabbitmq?/tls",
+]
 ## OAuth1 (HMAC-SHA256) request-signing auth provider (#496).
 oauth1 = ["auth", "faucet-auth?/oauth1"]
 ## Opt-in Arrow columnar record path (RFC 0002 / #375). Activates the columnar
@@ -206,7 +215,7 @@ transform-wasm = ["dep:faucet-transform-wasm"]
 ## syntax, so this flag never pulls the connector itself).
 encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption"]
 ## Every connector and state backend.
-full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "oauth1", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "source-xml-excel", "file-formats"]
+full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "source-xml-excel", "file-formats"]
 
 ## Individual source connectors.
 source-rest = ["dep:faucet-source-rest"]
@@ -224,6 +233,7 @@ source-sqlite = ["dep:faucet-source-sqlite"]
 source-duckdb = ["dep:faucet-source-duckdb"]
 source-sqs = ["dep:faucet-source-sqs", "dep:faucet-common-sqs"]
 source-nats = ["dep:faucet-source-nats", "dep:faucet-common-nats"]
+source-rabbitmq = ["dep:faucet-source-rabbitmq", "dep:faucet-common-rabbitmq"]
 source-sftp = ["dep:faucet-source-sftp", "dep:faucet-common-sftp"]
 source-s3 = ["dep:faucet-source-s3"]
 source-mongodb = ["dep:faucet-source-mongodb"]
@@ -267,6 +277,7 @@ sink-sqlite = ["dep:faucet-sink-sqlite"]
 sink-duckdb = ["dep:faucet-sink-duckdb"]
 sink-sqs = ["dep:faucet-sink-sqs", "dep:faucet-common-sqs"]
 sink-nats = ["dep:faucet-sink-nats", "dep:faucet-common-nats"]
+sink-rabbitmq = ["dep:faucet-sink-rabbitmq", "dep:faucet-common-rabbitmq"]
 sink-sftp = ["dep:faucet-sink-sftp", "dep:faucet-common-sftp"]
 
 sink-s3 = ["dep:faucet-sink-s3"]
@@ -362,6 +373,8 @@ faucet-source-sqs = { workspace = true, optional = true }
 faucet-common-sqs = { workspace = true, optional = true }
 faucet-source-nats = { workspace = true, optional = true }
 faucet-common-nats = { workspace = true, optional = true }
+faucet-source-rabbitmq = { workspace = true, optional = true }
+faucet-common-rabbitmq = { workspace = true, optional = true }
 faucet-source-sftp = { workspace = true, optional = true }
 faucet-common-sftp = { workspace = true, optional = true }
 faucet-source-s3 = { workspace = true, optional = true }
@@ -399,6 +412,7 @@ faucet-sink-sqlite = { workspace = true, optional = true }
 faucet-sink-duckdb = { workspace = true, optional = true }
 faucet-sink-sqs = { workspace = true, optional = true }
 faucet-sink-nats = { workspace = true, optional = true }
+faucet-sink-rabbitmq = { workspace = true, optional = true }
 faucet-sink-sftp = { workspace = true, optional = true }
 
 faucet-sink-s3 = { workspace = true, optional = true }

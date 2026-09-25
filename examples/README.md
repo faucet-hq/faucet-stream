@@ -42,6 +42,7 @@ These run immediately after installing the CLI — great for a first smoke test:
 | `duckdb_to_jsonl.yaml` | local DuckDB (file or `:memory:`) query → JSONL |
 | `sqs_to_jsonl.yaml` | AWS SQS → JSONL; runs against LocalStack (`docker run -p 4566:4566 -e SERVICES=sqs localstack/localstack`) |
 | `nats_to_jsonl.yaml` | NATS → JSONL; runs against a local NATS (`docker run -p 4222:4222 nats:latest -js`) |
+| `rabbitmq_to_jsonl.yaml` | RabbitMQ → JSONL, acking each page after the sink flushes it; runs against the compose `rabbitmq` service (or `docker run -p 5672:5672 -p 15672:15672 rabbitmq:3-management`) |
 | `sftp_to_jsonl.yaml` | SFTP directory → JSONL over SSH; point `host`/`username`/`path` at a real server (set `SFTP_PASSWORD`) |
 | `airtable_to_jsonl.yaml` | Airtable base/table → JSONL via the generic `rest` source (bearer PAT + offset-token pagination); set `AIRTABLE_TOKEN` + `AIRTABLE_BASE_ID` |
 | `rest_to_jsonl.yaml`, `rest_streaming.yaml`, `rest_to_stdout_preview.yaml` | point `base_url` at any HTTP API; preview needs no sink setup |

@@ -34,7 +34,7 @@ Straight with you, because it's what makes the rest credible:
 |---|---|---|
 | Runtime | Rust, single native binary | Python |
 | Install | one binary / `brew` / `cargo` | Python env + plugins |
-| Connectors | <!--COUNT:connectors-->66<!--/COUNT--> (<!--COUNT:sources-->37<!--/COUNT--> sources, <!--COUNT:sinks-->29<!--/COUNT--> sinks), growing | 600+ taps |
+| Connectors | <!--COUNT:connectors-->68<!--/COUNT--> (<!--COUNT:sources-->38<!--/COUNT--> sources, <!--COUNT:sinks-->30<!--/COUNT--> sinks), growing | 600+ taps |
 | Throughput (1M-row CSV→JSONL) | **712k rows/s, 11.8 MiB** | 7.4k rows/s, 724 MiB |
 | In-flight transforms | ✓ 11 record transforms + filter/explode/CDC-unwrap + embedded-DuckDB `sql` | mappers; dbt post-load |
 | Data quality / contracts / masking | ✓ native, in-path | assemble (mappers, dbt tests) |

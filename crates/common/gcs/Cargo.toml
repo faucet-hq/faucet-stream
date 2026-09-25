@@ -17,7 +17,14 @@ serde.workspace = true
 serde_json.workspace = true
 google-cloud-storage.workspace = true
 google-cloud-auth.workspace = true
+google-cloud-gax.workspace = true
+reqwest.workspace = true
+urlencoding.workspace = true
 tokio = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true

@@ -776,7 +776,7 @@ select {
 }
 .sf-field {
   display: grid;
-  grid-template-columns: 180px 1fr;
+  grid-template-columns: 200px 1fr;
   gap: 12px;
   align-items: start;
   padding: 7px 0;
@@ -1131,12 +1131,12 @@ select {
 /* Click-to-highlight: the selected node, its neighbours, and their edges stay
    bright while everything else dims, so a dataset's connections read at a glance.
    Selected = solid brand; neighbour = brand tint; active edge = brand line. */
-.lineage-node.is-selected rect { fill: var(--brand-strong); stroke: var(--brand-strong); stroke-width: 2.5; }
-.lineage-node.is-selected text { fill: #fff; }
-.lineage-node.is-selected .lnode-label { color: #fff; font-weight: 600; }
-.lineage-node.is-neighbour rect { fill: color-mix(in srgb, var(--brand-strong) 34%, var(--surface)); stroke: var(--brand-strong); stroke-width: 2; }
+.lineage-node.is-selected rect { fill: color-mix(in srgb, var(--brand) 14%, var(--surface)); stroke: var(--brand); stroke-width: 1.5; }
+.lineage-node.is-selected text { fill: var(--ink); }
+.lineage-node.is-selected .lnode-label { color: var(--ink); font-weight: 600; }
+.lineage-node.is-neighbour rect { fill: color-mix(in srgb, var(--brand) 6%, var(--surface)); stroke: color-mix(in srgb, var(--brand) 55%, var(--border)); stroke-width: 1; }
 .lineage-node.is-neighbour .lnode-label { color: var(--ink); }
-.lineage-edge.is-active { stroke: var(--brand-strong); stroke-width: 3; }
+.lineage-edge.is-active { stroke: var(--brand); stroke-width: 1.5; }
 /* Non-highlighted nodes clearly recede: opacity alone barely fades an already
    pale box on a pale ground, so also wash the fill toward the background and
    grey the text — the highlighted set then reads unmistakably. */
@@ -1155,7 +1155,7 @@ select {
 /* Borderless rows with a bottom separator so Templates reads as the same table
    as Runs/Datasets (its columns are fixed-width, so they already align). */
 .tpl-row {
-  grid-template-columns: 120px 1fr 205px 56px 64px 60px;
+  grid-template-columns: 120px 1fr 108px 205px 56px 64px 60px;
   background: transparent;
   border: none;
   border-bottom: 1px solid var(--border);
@@ -1167,7 +1167,7 @@ select {
 .tpl-row .run-meta { white-space: nowrap; } /* keep the timestamp (incl. AM/PM) on one line */
 .tpl-list-head {
   display: grid;
-  grid-template-columns: 120px 1fr 205px 56px 64px 60px;
+  grid-template-columns: 120px 1fr 108px 205px 56px 64px 60px;
   align-items: center;
   gap: 14px;
   position: sticky;
@@ -1205,10 +1205,16 @@ select {
 .tpl-list-head .tpl-sort.tpl-col-r { justify-content: flex-end; }
 .tpl-sort-caret { font-size: 0.9em; }
 .tpl-list-head .tpl-sort:not(.is-active) .tpl-sort-caret { opacity: 0.4; }
+.tpl-row-kind { display: flex; align-items: center; }
+/* Every kind is the same width, so the column lines up. */
+.tpl-row-kind .tpl-kind { box-sizing: border-box; width: 96px; padding-left: 0; padding-right: 0; }
 .tpl-row-id { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .tpl-row-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 /* Template kind pills — hue per kind so a mixed list scans at a glance. */
-.tpl-kind { font-size: 0.62rem; padding: 1px 7px; letter-spacing: 0.03em; }
+.tpl-kind { font-size: 0.62rem; line-height: 1; padding: 4px 8px; letter-spacing: 0.03em; justify-content: center; }
+/* Trim the label to its cap height so the equal padding centres the (all-caps)
+   text exactly, instead of leaving the descender space below it. */
+.tpl-kind .pill-label { display: block; text-box: trim-both cap alphabetic; }
 .tpl-kind-source-template { color: var(--running);   border-color: color-mix(in srgb, var(--running) 45%, transparent);   background: color-mix(in srgb, var(--running) 12%, transparent); }
 .tpl-kind-sink-template   { color: var(--queued);    border-color: color-mix(in srgb, var(--queued) 45%, transparent);    background: color-mix(in srgb, var(--queued) 12%, transparent); }
 .tpl-kind-pipeline        { color: var(--ink-dim);   border-color: var(--border-strong);                                    background: var(--surface-2); }
@@ -1227,10 +1233,46 @@ select {
 
 /* Source × sink compatibility matrix on the Templates page (#677). */
 .tpl-matrix { margin-bottom: 18px; }
+/* Owner / Type filters above the compatibility grid: pill buttons that open a
+   checkbox menu, one pair per axis. */
+.tpl-facets { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 10px; }
+.tpl-facet-group { display: inline-flex; align-items: center; gap: 8px; }
+.tpl-facets-sep { width: 1px; align-self: stretch; background: var(--border); margin: 2px 6px; }
+.tpl-facets-count { margin-left: auto; }
+.tpl-facet { position: relative; }
+.tpl-facet-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px 6px 14px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--ink); font: inherit; font-size: 0.84rem; cursor: pointer;
+}
+.tpl-facet-btn:hover { border-color: var(--border-strong); }
+.tpl-facet-btn.is-on { border-color: var(--brand-ring); background: var(--brand-tint); color: var(--brand); }
+.tpl-facet-caret { width: 0; height: 0; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid currentColor; opacity: 0.7; }
+.tpl-facet-n { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--brand); color: var(--surface); font-size: 0.7rem; line-height: 18px; text-align: center; }
+.tpl-facet-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; min-width: 180px; max-height: 260px; overflow: auto;
+  padding: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+.tpl-facet-opt { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; font-size: 0.84rem; cursor: pointer; white-space: nowrap; }
+.tpl-facet-opt:hover { background: var(--surface-2); }
 .tpl-matrix-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 .tpl-matrix-head .tpl-h2 { margin: 6px 0 8px; }
-.tpl-matrix-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-.tpl-matrix-table { margin: 0; min-width: 100%; }
+/* The grid scrolls inside its own box both ways, with the sink header row and
+   the source column pinned, so a large catalog stays readable and the list
+   below it stays in reach. */
+.tpl-matrix-scroll { overflow: auto; max-height: 460px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+/* `.tbl` clips with `overflow: hidden`, which would make the table itself the
+   sticky containing box and let the pinned header scroll away with it. The
+   scroll box above already draws the border and the rounded corners. */
+.tpl-matrix-table { margin: 0; min-width: 100%; width: max-content; table-layout: auto; border-collapse: separate; border-spacing: 0; overflow: visible; border: 0; border-radius: 0; }
+.tpl-matrix-table th, .tpl-matrix-table td { width: auto; }
+.tpl-matrix-table td { padding: 7px 10px; vertical-align: middle; }
+.tpl-matrix-table thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); min-width: 92px; max-width: 128px; padding: 9px 10px; border-bottom: 1px solid var(--border); }
+.tpl-matrix-table thead th a, .tpl-matrix-table thead th .tpl-matrix-kind { display: block; overflow: hidden; text-overflow: ellipsis; }
+.tpl-matrix-table tbody th { position: sticky; left: 0; z-index: 1; background: var(--surface); max-width: 230px; min-width: 190px; padding: 7px 12px; border-right: 1px solid var(--border); overflow: hidden; text-overflow: ellipsis; }
+.tpl-matrix-table thead th.tpl-matrix-corner { left: 0; z-index: 3; text-align: left; border-right: 1px solid var(--border); }
+.tpl-matrix-table tbody tr:hover th { background: var(--surface-2); }
 .tpl-matrix-table th, .tpl-matrix-table td { text-align: center; white-space: nowrap; }
 .tpl-matrix-table thead th { vertical-align: bottom; }
 .tpl-matrix-table tbody th { text-align: left; font-weight: 600; text-transform: none; letter-spacing: 0; font-size: 0.9rem; }
@@ -1242,7 +1284,8 @@ select {
 .tpl-cell a { display: inline-block; padding: 4px 12px; border-radius: 999px; }
 .tpl-cell-ok a { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
 .tpl-cell-ok a:hover { background: color-mix(in srgb, var(--ok) 22%, transparent); text-decoration: none; }
-.tpl-cell-partial a { color: var(--queued); background: color-mix(in srgb, var(--queued) 14%, transparent); }
+.tpl-cell-partial a, .tpl-cell-partial > span { color: var(--queued); background: color-mix(in srgb, var(--queued) 14%, transparent); }
+.tpl-cell-partial > span { display: inline-block; padding: 4px 12px; border-radius: 999px; cursor: help; }
 .tpl-cell-bad { color: var(--fail); }
 .tpl-cell-none { color: var(--ink-faint); }
 .tpl-desc { color: var(--ink-dim); font-size: 0.88rem; margin: 12px 0 0; }
@@ -1286,10 +1329,18 @@ select {
   border-radius: var(--r);
 }
 .tpl-version-live { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+.tpl-version[data-version] { cursor: pointer; }
+.tpl-versions-hint { margin: -4px 0 8px; font-size: 0.8rem; }
+.tpl-version-picked { box-shadow: 0 0 0 2px var(--brand-ring); background: color-mix(in srgb, var(--brand-tint) 55%, var(--surface)); }
 .tpl-vnum { font-weight: 700; font-size: 0.9rem; }
 .tpl-vchannels { display: flex; flex-wrap: wrap; gap: 5px; }
 .tpl-assign { max-width: 160px; }
 .tpl-version .btn-ghost, .tpl-version .btn-danger { padding: 5px 11px; font-size: 0.8rem; }
+.tpl-launch-wrap { overflow-x: auto; }
+.tpl-launch-tbl th:nth-child(1), .tpl-launch-tbl td:nth-child(1) { width: 4rem; }
+.tpl-launch-tbl th:nth-child(2), .tpl-launch-tbl td:nth-child(2) { width: 6rem; }
+.tpl-launch-tbl th:nth-child(3), .tpl-launch-tbl td:nth-child(3) { width: 14rem; }
+.tpl-launch-when { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tpl-body {
   grid-column: 1 / -1;
   margin: 6px 0 0;
@@ -1316,12 +1367,38 @@ select {
   border: 1px solid var(--border);
   border-radius: var(--r);
 }
+/* Trigger options: a grid of label-over-control fields, so every control lines up. */
+.submit-opts.tpl-trigger-opts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 18px; align-items: end; margin: 0; padding: 0; border: 0; background: none; }
+.tpl-trigger-opts label { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0; font-size: 0.82rem; font-weight: 600; color: var(--ink); }
+.tpl-trigger-opts label.tpl-field-wide { grid-column: span 2; }
+.tpl-picked { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; box-sizing: border-box; min-height: 33px; padding: 4px 10px; border: 1px dashed var(--border); border-radius: var(--r); font-weight: 400; color: var(--ink); }
+.tpl-picked b { font-weight: 700; margin-right: 2px; }
+.tpl-trigger-opts select, .tpl-trigger-opts input:not([type="checkbox"]) { width: 100%; min-width: 0; font-weight: 400; }
+@media (max-width: 900px) { .submit-opts.tpl-trigger-opts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .submit-opts.tpl-trigger-opts { grid-template-columns: minmax(0, 1fr); } .tpl-trigger-opts label.tpl-field-wide { grid-column: auto; } }
+/* Trigger form: one section per composed template (source / sink /
+   deployment), each with its own picker row and parameters, then the run. */
+.tpl-seg { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--r); }
+.tpl-seg-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.tpl-seg-head h3 { margin: 0; font-size: 0.74rem; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-dim); }
+.tpl-seg-hint { font-size: 0.78rem; color: var(--ink-faint); }
+.tpl-seg-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 18px; align-items: start; }
+.tpl-seg-fields label { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0; font-size: 0.82rem; font-weight: 600; color: var(--ink); }
+.tpl-seg-fields label.tpl-field-wide { grid-column: span 2; }
+.tpl-seg-fields select, .tpl-seg-fields input:not([type="checkbox"]) { width: 100%; min-width: 0; font-weight: 400; }
+.tpl-seg .tpl-params:empty { display: none; }
+.tpl-seg .tpl-params > .tpl-desc { margin: 0; font-size: 0.8rem; color: var(--ink-faint); }
+@media (max-width: 700px) {
+  .tpl-seg-fields { grid-template-columns: minmax(0, 1fr); }
+  .tpl-seg-fields label.tpl-field-wide { grid-column: auto; }
+}
 .tpl-params { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px 18px; }
 .tpl-param { display: flex; flex-direction: column; gap: 5px; }
 .tpl-param-name { font-size: 0.82rem; font-weight: 600; color: var(--ink); }
 /* Tags sit on their own row beneath the variable name, and are a touch smaller. */
 .tpl-param-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-bottom: 1px; }
-.tpl-param-tags .pill { font-size: 0.6rem; padding: 1px 7px; }
+.tpl-param-tags .pill { font-size: 0.6rem; line-height: 1; padding: 3px 7px; justify-content: center; }
+.tpl-param-tags .pill::before { display: none; }
 
 /* Status filter chips on the templates list (multi-toggle; launched+draft on by default). */
 .tpl-status-filter { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
@@ -1338,12 +1415,20 @@ select {
 .tpl-chip.is-on { background: var(--brand-tint); border-color: var(--brand-ring); color: var(--brand); font-weight: 550; }
 
 @media (max-width: 760px) {
-  .tpl-version { grid-template-columns: 52px 1fr; row-gap: 8px; }
-  .tpl-version .tpl-assign { max-width: none; }
+  /* Number + channels on the first line, then the controls wrap as one row. */
+  .tpl-version { display: flex; flex-wrap: wrap; row-gap: 8px; }
+  .tpl-version .tpl-vnum { flex: 0 0 42px; }
+  .tpl-version .tpl-vchannels { flex: 1 1 calc(100% - 52px); }
+  .tpl-version .tpl-assign { max-width: none; flex: 1 1 100%; }
+  .tpl-version .tpl-body { flex: 1 1 100%; }
   /* The fixed column header can't line up once rows stack — hide it and let the
      rows collapse to status + name with the meta wrapping below. */
   .tpl-list-head { display: none; }
-  .tpl-row { grid-template-columns: auto 1fr; row-gap: 4px; }
+  /* Narrow: pills on top, the name full width, then the numbers on one labelled line. */
+  .tpl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .tpl-row .tpl-row-id { flex: 1 1 100%; }
+  .tpl-row .run-meta { font-size: 0.78rem; }
+  .tpl-row .run-meta[data-l]::before { content: attr(data-l) " "; color: var(--ink-faint); }
   .tpl-row .run-meta { text-align: left; }
 }
 
@@ -1393,6 +1478,11 @@ select {
   color: var(--queued);
   border-color: color-mix(in srgb, var(--queued) 40%, transparent);
   background: color-mix(in srgb, var(--queued) 12%, transparent);
+}
+.lo-replaced .lo-state {
+  color: var(--running);
+  border-color: color-mix(in srgb, var(--running) 40%, transparent);
+  background: color-mix(in srgb, var(--running) 12%, transparent);
 }
 .lo-present .lo-state {
   color: var(--ok);
@@ -1536,3 +1626,51 @@ select {
 .tpl-sync-quiet { color: var(--ink-faint); }
 .tpl-sync-warn { color: var(--queued); }
 .tpl-sync-fail { color: var(--fail); }
+.tpl-facets-clear { background: none; border: 0; padding: 0; font: inherit; font-size: 0.82rem; color: var(--brand); cursor: pointer; }
+.tpl-facets-clear:hover { text-decoration: underline; }
+/* Narrow screens: the axis separator goes (each group wraps as a unit) and the
+   pinned source column gives the grid more room. After the base grid rules on
+   purpose — same specificity, so order decides. */
+@media (max-width: 700px) {
+  .tpl-facets-sep { display: none; }
+  .tpl-matrix-table tbody th { min-width: 120px; max-width: 150px; }
+  .tpl-matrix-head .run-meta { text-align: left; }
+}
+
+/* Run summary (detail head): one card, split into labelled segments. */
+.run-summary { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); box-shadow: var(--shadow-1); overflow: hidden; }
+.rs-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.rs-name { margin: 0; font-size: 1.05rem; font-weight: 650; color: var(--ink); overflow-wrap: anywhere; }
+.rs-id { margin-left: auto; font-size: 0.75rem; color: var(--ink-faint); }
+.rs-segments { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.rs-seg { padding: 14px 18px; border-left: 1px solid var(--border); }
+.rs-seg:first-child { border-left: 0; }
+.rs-seg h3 { margin: 0 0 10px; font-size: 0.68rem; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+.rs-seg dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; margin: 0; align-items: baseline; }
+.rs-seg dt { font-size: 0.8rem; color: var(--ink-dim); }
+.rs-seg dd { margin: 0; font-family: var(--font-mono); font-size: 0.84rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+.rs-seg dd small { display: block; margin-top: 1px; font-family: var(--font-sans, inherit); font-size: 0.72rem; color: var(--ink-faint); }
+.rs-seg dd.rs-empty { color: var(--ink-faint); }
+.rs-seg dd a { color: var(--brand); }
+@media (max-width: 720px) {
+  .rs-seg { border-left: 0; border-top: 1px solid var(--border); }
+  .rs-seg:first-child { border-top: 0; }
+}
+
+/* Submit wizard: optional pipeline blocks */
+.wizard-step[data-group] > h3 { margin-bottom: 4px; }
+.wizard-hint { margin: 0 0 12px; font-size: 0.82rem; color: var(--ink-dim); }
+.wizard-adders { display: flex; flex-wrap: wrap; gap: 8px; }
+.wizard-adders:empty { display: none; }
+.wizard-blocks:not(:empty) { margin-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
+.wizard-block { border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-2); padding: 12px 14px; }
+.wizard-block-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.wizard-block-head b { display: block; font-size: 0.9rem; color: var(--ink); }
+.wizard-block-head small { display: block; margin-top: 2px; font-size: 0.78rem; color: var(--ink-dim); }
+.wizard-block-remove { padding: 2px 8px; line-height: 1.4; }
+.wizard-block .wizard-tx { margin-top: 10px; }
+
+/* Optional nested settings: off until switched on, so an unused feature is
+   never enabled with its defaults. */
+.sf-optional-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 34px; font-size: 0.8rem; color: var(--ink-dim); cursor: pointer; }
+.sf-optional .sf-object { margin-top: 6px; }

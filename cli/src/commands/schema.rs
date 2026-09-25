@@ -53,6 +53,155 @@ pub fn schema_targets() -> Vec<&'static str> {
     targets
 }
 
+/// A config block the web console's submit form can add beside the source,
+/// sink, and transforms: its name, a one-line description, and whether it
+/// lives under `pipeline:` or at the top level of the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PipelineBlock {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub placement: &'static str,
+}
+
+/// Every [`PipelineBlock`] compiled into this binary, in form order.
+pub fn pipeline_blocks() -> Vec<PipelineBlock> {
+    let block = |name, description, placement| PipelineBlock {
+        name,
+        description,
+        placement,
+    };
+    let mut blocks = vec![
+        block(
+            "state",
+            "Where bookmarks are kept so the next run resumes where this one stopped",
+            "pipeline",
+        ),
+        block(
+            "dlq",
+            "A sink for records that fail to write or are quarantined",
+            "pipeline",
+        ),
+        block(
+            "delivery",
+            "At-least-once, or exactly-once where the source and sink support it",
+            "top",
+        ),
+        block(
+            "resilience",
+            "Retries, circuit breaker, and poison-record handling for sink writes",
+            "top",
+        ),
+        block(
+            "sla",
+            "Freshness and volume expectations checked after every run",
+            "top",
+        ),
+    ];
+    #[cfg(feature = "quality")]
+    blocks.push(block(
+        "quality",
+        "Per-record and per-batch data-quality checks",
+        "pipeline",
+    ));
+    #[cfg(feature = "contract")]
+    blocks.push(block(
+        "contract",
+        "A versioned promise about the output's fields and types",
+        "pipeline",
+    ));
+    #[cfg(feature = "masking")]
+    blocks.push(block(
+        "masking",
+        "Detect and mask PII before it reaches any sink",
+        "pipeline",
+    ));
+    blocks.push(block(
+        "schema",
+        "What to do when incoming records drift from the destination schema",
+        "pipeline",
+    ));
+    blocks
+}
+
+fn to_schema_value(s: faucet_core::schemars::Schema) -> serde_json::Value {
+    serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+}
+
+/// The `state:` block as a discriminated union over the compiled backends, so
+/// a form can offer each backend's own fields (the Rust type keeps `config`
+/// untyped because the backends are feature-gated).
+fn state_block_schema() -> serde_json::Value {
+    use serde_json::json;
+    let variant = |kind: &str, config: serde_json::Value| {
+        json!({
+            "type": "object",
+            "properties": { "type": { "const": kind }, "config": config },
+            "required": ["type"],
+        })
+    };
+    let mut variants = vec![
+        variant(
+            "file",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "Directory holding one JSON file per bookmark" } },
+                "required": ["path"],
+            }),
+        ),
+        variant(
+            "memory",
+            json!({ "type": "object", "properties": {}, "description": "Kept in memory only; lost when the run ends" }),
+        ),
+    ];
+    #[cfg(feature = "state-redis")]
+    variants.push(variant(
+        "redis",
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Redis connection URL" },
+                "namespace": { "type": "string", "default": "faucet", "description": "Key prefix" },
+            },
+            "required": ["url"],
+        }),
+    ));
+    #[cfg(feature = "state-postgres")]
+    variants.push(variant(
+        "postgres",
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "PostgreSQL connection URL" },
+                "table": { "type": "string", "default": "faucet_state", "description": "Bookmark table" },
+                "ensure_table": { "type": "boolean", "description": "Create the table if it does not exist" },
+                "max_connections": { "type": "integer", "description": "Connection pool size" },
+            },
+            "required": ["url"],
+        }),
+    ));
+    json!({ "title": "State store", "oneOf": variants })
+}
+
+/// The JSON Schema for one [`PipelineBlock`], or `None` for an unknown or
+/// uncompiled block.
+pub fn block_schema(name: &str) -> Option<serde_json::Value> {
+    Some(match name {
+        "state" => state_block_schema(),
+        "dlq" => to_schema_value(faucet_core::schema_for!(crate::config::DlqSpec)),
+        "delivery" => to_schema_value(faucet_core::schema_for!(faucet_core::DeliveryMode)),
+        "resilience" => to_schema_value(faucet_core::schema_for!(crate::config::ResilienceSpec)),
+        "sla" => to_schema_value(faucet_core::schema_for!(crate::sla::SlaSpec)),
+        "schema" => to_schema_value(faucet_core::schema_for!(faucet_core::SchemaDriftSpec)),
+        #[cfg(feature = "quality")]
+        "quality" => to_schema_value(faucet_core::schema_for!(faucet_core::QualitySpec)),
+        #[cfg(feature = "contract")]
+        "contract" => to_schema_value(faucet_core::schema_for!(faucet_core::ContractSpec)),
+        #[cfg(feature = "masking")]
+        "masking" => to_schema_value(faucet_core::schema_for!(faucet_core::MaskingSpec)),
+        _ => return None,
+    })
+}
+
 /// Execute the `schema` subcommand.
 pub async fn run(args: SchemaArgs) -> CliResult<()> {
     if args.list {
@@ -77,11 +226,7 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         SchemaTarget::Source { name } => source_schema(&name)?,
         SchemaTarget::Sink { name } => sink_schema(&name)?,
         SchemaTarget::Transform { name } => transform_schema(&name)?,
-        SchemaTarget::Dlq => {
-            let dlq_schema = faucet_core::schema_for!(crate::config::DlqSpec);
-            serde_json::to_value(dlq_schema)
-                .unwrap_or_else(|_| serde_json::json!({"type": "object"}))
-        }
+        SchemaTarget::Dlq => block_schema("dlq").expect("dlq is always compiled"),
         SchemaTarget::Replication => {
             let s = faucet_core::schema_for!(crate::replication::spec::ReplicationSpec);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
@@ -212,6 +357,41 @@ pub fn lineage_schema() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use crate::cli::{SchemaArgs, SchemaTarget};
+
+    #[test]
+    fn every_pipeline_block_has_a_schema_and_a_known_placement() {
+        let blocks = super::pipeline_blocks();
+        assert!(blocks.iter().any(|b| b.name == "dlq"));
+        for b in &blocks {
+            assert!(matches!(b.placement, "pipeline" | "top"), "{}", b.name);
+            assert!(!b.description.is_empty(), "{}", b.name);
+            assert!(super::block_schema(b.name).is_some(), "{}", b.name);
+        }
+        assert!(super::block_schema("nope").is_none());
+    }
+
+    #[test]
+    fn state_block_offers_each_backend_with_its_own_fields() {
+        let v = super::block_schema("state").unwrap();
+        let variants = v["oneOf"].as_array().unwrap();
+        let kinds: Vec<&str> = variants
+            .iter()
+            .map(|v| v["properties"]["type"]["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(&kinds[..2], ["file", "memory"]);
+        assert_eq!(
+            variants[0]["properties"]["config"]["required"],
+            serde_json::json!(["path"])
+        );
+        let mut offered = kinds.clone();
+        offered.sort_unstable();
+        let mut compiled = crate::state::available_state_kinds();
+        compiled.sort_unstable();
+        assert_eq!(
+            offered, compiled,
+            "the form must offer exactly the compiled backends"
+        );
+    }
 
     #[cfg(feature = "lineage")]
     #[test]

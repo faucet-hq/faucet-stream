@@ -38,7 +38,7 @@ function kindPill(kind) {
     deployment: "deployment overlay — state, DLQ, notifications and SLA applied over a composed run",
     pipeline: "complete pipeline config",
   }[k];
-  return `<span class="pill tpl-kind tpl-kind-${escapeHtml(k)}" title="${escapeHtml(title)}">${KIND_LABEL[k]}</span>`;
+  return `<span class="pill tpl-kind tpl-kind-${escapeHtml(k)}" title="${escapeHtml(title)}"><span class="pill-label">${KIND_LABEL[k]}</span></span>`;
 }
 
 function statusPill(status) {
@@ -73,13 +73,14 @@ export async function renderTemplates(container) {
           <span class="tpl-filter-label">kind</span>
           <button type="button" class="tpl-chip is-on" data-kind="source-template">source</button>
           <button type="button" class="tpl-chip is-on" data-kind="sink-template">sink</button>
-          <button type="button" class="tpl-chip is-on" data-kind="deployment">deployment</button>
-          <button type="button" class="tpl-chip is-on" data-kind="pipeline">pipeline</button>
+          <button type="button" class="tpl-chip" data-kind="deployment">deployment</button>
+          <button type="button" class="tpl-chip" data-kind="pipeline">pipeline</button>
         </div>
       </div>
       <div class="tpl-list-head" id="t-list-head" hidden>
         <span>status</span>
         <button type="button" class="tpl-sort" data-sort="name">name<span class="tpl-sort-caret"></span></button>
+        <span>kind</span>
         <button type="button" class="tpl-sort tpl-col-r" data-sort="updated">last updated<span class="tpl-sort-caret"></span></button>
         <span class="tpl-col-r">live</span>
         <span class="tpl-col-r">newest</span>
@@ -125,8 +126,9 @@ export async function renderTemplates(container) {
     };
   });
 
-  // Kind filter — all three kinds on by default.
-  const kindFilter = new Set(KINDS);
+  // Kind filter — source and sink templates on by default; deployments and
+  // pipelines are one chip away.
+  const kindFilter = new Set(["source-template", "sink-template"]);
   container.querySelectorAll("#t-kind-filter .tpl-chip").forEach((chip) => {
     chip.onclick = () => {
       const k = chip.dataset.kind;
@@ -259,45 +261,146 @@ function renderMatrix(idx) {
   const sinks = idx.sinks || [];
   const cells = new Map((idx.matrix || []).map((c) => [`${c.source}\u0000${c.sink}`, c]));
   const idOf = (t) => t.id || t.name;
-  const ownerTag = (t) => (t.owner ? `<span class="tpl-matrix-kind">@${escapeHtml(t.owner)}</span>` : "");
   const el = document.createElement("section");
   el.className = "tpl-matrix";
-  const head = sinks
-    .map((k) => `<th title="${escapeHtml(k.description || "")}"><a href="#/templates/${encodeURIComponent(idOf(k))}" class="mono">${escapeHtml(k.name)}</a>${ownerTag(k)}<span class="tpl-matrix-kind">${escapeHtml(k.sink_type || "")}</span></th>`)
-    .join("");
-  const rows = sources
-    .map((s) => {
-      const tds = sinks
-        .map((k) => {
-          const c = cells.get(`${idOf(s)}\u0000${idOf(k)}`);
-          if (!c) return `<td class="tpl-cell tpl-cell-none">—</td>`;
-          const total = (s.streams || []).length;
-          const plan = (c.streams || [])
-            .map((p) => `${p.stream}: ${p.write_mode}${p.satisfies ? ` (for ${p.satisfies})` : ""}`)
-            .concat((c.incompatible || []).map((i) => `${i.stream}: ✗ ${i.reason}`))
-            .join("\n");
-          const href = `#/templates/${encodeURIComponent(idOf(s))}?sink=${encodeURIComponent(idOf(k))}`;
-          if (c.compatible) {
-            return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(idOf(s))} into ${escapeHtml(idOf(k))}">✓</a></td>`;
-          }
-          const ok = (c.streams || []).length;
-          return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(plan)}">${ok ? `<a href="${href}">${ok}/${total}</a>` : "✗"}</td>`;
-        })
-        .join("");
-      return `<tr><th scope="row"><a href="#/templates/${encodeURIComponent(idOf(s))}" class="mono">${escapeHtml(s.name)}</a>${ownerTag(s)}<span class="tpl-matrix-kind">${escapeHtml(s.source_type || "")} · ${(s.streams || []).length} stream${(s.streams || []).length === 1 ? "" : "s"}</span></th>${tds}</tr>`;
-    })
-    .join("");
+
+  // Owner / Type filters per axis: rows (sources) and columns (sinks) filter
+  // independently, since an acme source into a faucet-hq sink is a real pairing.
+  // An empty selection means "all".
+  const filters = {
+    srcOwner: new Set(), srcType: new Set(),
+    sinkOwner: new Set(), sinkType: new Set(),
+  };
+  const values = (list, key) =>
+    [...new Set(list.map((t) => (key === "owner" ? t.owner || "(none)" : t[key] || "")).filter(Boolean))].sort();
+  const pass = (t, owners, types, typeKey) =>
+    (!owners.size || owners.has(t.owner || "(none)")) && (!types.size || types.has(t[typeKey] || ""));
+
+  const head = (k) => `<th title="${escapeHtml(idOf(k))}${k.description ? ` — ${escapeHtml(k.description)}` : ""}"><a href="#/templates/${encodeURIComponent(idOf(k))}" class="mono">${escapeHtml(k.name)}</a><span class="tpl-matrix-kind">${k.owner ? `@${escapeHtml(k.owner)} · ` : ""}${escapeHtml(k.sink_type || "")}</span></th>`;
+  const cell = (s, k) => {
+    const c = cells.get(`${idOf(s)}\u0000${idOf(k)}`);
+    if (!c) return `<td class="tpl-cell tpl-cell-none">—</td>`;
+    const total = (s.streams || []).length;
+    const plan = (c.streams || [])
+      .map((p) => `${p.stream}: ${p.write_mode}${p.satisfies ? ` (for ${p.satisfies})` : ""}`)
+      .concat((c.incompatible || []).map((i) => `${i.stream}: ✗ ${i.reason}`))
+      .join("\n");
+    const href = `#/templates/${encodeURIComponent(idOf(s))}?sink=${encodeURIComponent(idOf(k))}`;
+    if (c.compatible) {
+      return `<td class="tpl-cell tpl-cell-ok" title="${escapeHtml(plan)}"><a href="${href}" aria-label="run ${escapeHtml(idOf(s))} into ${escapeHtml(idOf(k))}">✓</a></td>`;
+    }
+    // A partial pairing is shown but not linked: composition refuses a pairing
+    // with any stream the sink cannot write, so the run form could only fail.
+    // The tooltip names the streams that do and do not fit.
+    const ok = (c.streams || []).length;
+    const why = `${plan}\n\nNot runnable: every stream needs a write mode this sink supports.`;
+    return `<td class="tpl-cell ${ok ? "tpl-cell-partial" : "tpl-cell-bad"}" title="${escapeHtml(why)}">${ok ? `<span>${ok}/${total}</span>` : "✗"}</td>`;
+  };
+  const row = (s, ks) => {
+    const n = (s.streams || []).length;
+    return `<tr><th scope="row" title="${escapeHtml(idOf(s))}"><a href="#/templates/${encodeURIComponent(idOf(s))}" class="mono">${escapeHtml(s.name)}</a><span class="tpl-matrix-kind">${s.owner ? `@${escapeHtml(s.owner)} · ` : ""}${escapeHtml(s.source_type || "")} · ${n} stream${n === 1 ? "" : "s"}</span></th>${ks.map((k) => cell(s, k)).join("")}</tr>`;
+  };
+
   el.innerHTML = `
     <div class="tpl-matrix-head">
       <h2 class="tpl-h2">Compatibility</h2>
       <span class="run-meta">source × sink — ✓ every stream has a write mode the sink supports; click a cell to run that pairing</span>
     </div>
-    <div class="tpl-matrix-scroll">
-      <table class="tbl tpl-matrix-table">
-        <thead><tr><th class="tpl-matrix-corner">source \\ sink</th>${head}</tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
+    <div class="tpl-facets" role="group" aria-label="Filter the compatibility grid">
+      <span class="tpl-facet-group"><span class="tpl-filter-label">sources</span>
+        <span data-facet="srcOwner"></span><span data-facet="srcType"></span></span>
+      <span class="tpl-facets-sep" aria-hidden="true"></span>
+      <span class="tpl-facet-group"><span class="tpl-filter-label">sinks</span>
+        <span data-facet="sinkOwner"></span><span data-facet="sinkType"></span></span>
+      <span class="run-meta tpl-facets-count"></span>
+      <button type="button" class="linkish tpl-facets-clear" hidden>Clear filters</button>
+    </div>
+    <div class="tpl-matrix-grid"></div>`;
+
+  const grid = el.querySelector(".tpl-matrix-grid");
+  const count = el.querySelector(".tpl-facets-count");
+  const clear = el.querySelector(".tpl-facets-clear");
+  const draw = () => {
+    const rs = sources.filter((t) => pass(t, filters.srcOwner, filters.srcType, "source_type"));
+    const ks = sinks.filter((t) => pass(t, filters.sinkOwner, filters.sinkType, "sink_type"));
+    const active = Object.values(filters).some((f) => f.size);
+    clear.hidden = !active;
+    count.textContent = active
+      ? `${rs.length} of ${sources.length} sources × ${ks.length} of ${sinks.length} sinks`
+      : `${sources.length} sources × ${sinks.length} sinks`;
+    grid.innerHTML = rs.length && ks.length
+      ? `<div class="tpl-matrix-scroll">
+          <table class="tbl tpl-matrix-table">
+            <thead><tr><th class="tpl-matrix-corner">source \\ sink</th>${ks.map(head).join("")}</tr></thead>
+            <tbody>${rs.map((s) => row(s, ks)).join("")}</tbody>
+          </table>
+        </div>`
+      : `<div class="empty">No ${rs.length ? "sink" : "source"} templates match these filters.</div>`;
+  };
+
+  const facets = [
+    ["srcOwner", "Owner", values(sources, "owner"), (v) => v],
+    ["srcType", "Type", values(sources, "source_type"), (v) => v],
+    ["sinkOwner", "Owner", values(sinks, "owner"), (v) => v],
+    ["sinkType", "Type", values(sinks, "sink_type"), (v) => v],
+  ];
+  const menus = [];
+  for (const [key, label, opts, show] of facets) {
+    const host = el.querySelector(`[data-facet="${key}"]`);
+    host.className = "tpl-facet";
+    host.innerHTML = `
+      <button type="button" class="tpl-facet-btn" aria-haspopup="true" aria-expanded="false">
+        <span>${label}</span><span class="tpl-facet-n" hidden></span><span class="tpl-facet-caret" aria-hidden="true"></span>
+      </button>
+      <div class="tpl-facet-menu" hidden>
+        ${opts.map((v) => `<label class="tpl-facet-opt"><input type="checkbox" value="${escapeHtml(v)}" /> <span class="mono">${escapeHtml(show(v))}</span></label>`).join("")}
+      </div>`;
+    const btn = host.querySelector(".tpl-facet-btn");
+    const menu = host.querySelector(".tpl-facet-menu");
+    const n = host.querySelector(".tpl-facet-n");
+    menus.push([btn, menu]);
+    const sync = () => {
+      n.hidden = !filters[key].size;
+      n.textContent = filters[key].size;
+      btn.classList.toggle("is-on", filters[key].size > 0);
+      for (const box of menu.querySelectorAll("input")) box.checked = filters[key].has(box.value);
+    };
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const open = menu.hidden;
+      for (const [b, m] of menus) { m.hidden = true; b.setAttribute("aria-expanded", "false"); }
+      menu.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+    };
+    menu.onclick = (ev) => ev.stopPropagation();
+    menu.onchange = (ev) => {
+      const v = ev.target.value;
+      if (ev.target.checked) filters[key].add(v);
+      else filters[key].delete(v);
+      sync();
+      draw();
+    };
+    host.sync = sync;
+  }
+  clear.onclick = () => {
+    for (const f of Object.values(filters)) f.clear();
+    for (const h of el.querySelectorAll(".tpl-facet")) h.sync();
+    draw();
+  };
+  // Close any open menu on an outside click or Escape; the listener retires
+  // itself once this section has been replaced by a reload.
+  const close = (ev) => {
+    if (!el.isConnected) {
+      document.removeEventListener("click", close);
+      document.removeEventListener("keydown", close);
+      return;
+    }
+    if (ev.type === "keydown" && ev.key !== "Escape") return;
+    for (const [b, m] of menus) { m.hidden = true; b.setAttribute("aria-expanded", "false"); }
+  };
+  document.addEventListener("click", close);
+  document.addEventListener("keydown", close);
+  draw();
   return el;
 }
 
@@ -311,13 +414,14 @@ function listRow(t) {
   el.innerHTML = `
     ${statusPill(st.status || "draft")}
     <span class="tpl-row-id">
-      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b>${kindPill(kindOf(t))}</span>
+      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b></span>
       ${t.description ? `<span class="tpl-row-desc">${escapeHtml(t.description)}</span>` : ""}
     </span>
-    <span class="run-meta" title="last registered / updated">${fmtTime(t.created_at)}</span>
-    <span class="run-meta" title="live version — what an unpinned run uses">${live}</span>
-    <span class="run-meta" title="newest registered build">v${st.newest ?? t.version}</span>
-    <span class="run-meta" title="declared params">${params}</span>`;
+    <span class="tpl-row-kind">${kindPill(kindOf(t))}</span>
+    <span class="run-meta" data-l="updated" title="last registered / updated">${fmtTime(t.created_at)}</span>
+    <span class="run-meta" data-l="live" title="live version — what an unpinned run uses">${live}</span>
+    <span class="run-meta" data-l="newest" title="newest registered build">v${st.newest ?? t.version}</span>
+    <span class="run-meta" data-l="params" title="declared params">${params}</span>`;
   return el;
 }
 
@@ -534,6 +638,7 @@ export async function renderTemplateDetail(container, { id, query }) {
       ${d.description ? `<p class="tpl-desc">${escapeHtml(d.description)}</p>` : ""}
 
       <h2 class="tpl-h2">Versions</h2>
+      <p class="tpl-desc tpl-versions-hint">Click a version to run it below.</p>
       <div id="t-versions" class="tpl-versions"></div>
 
       <h2 class="tpl-h2">${{ "sink-template": "Compose with a source template", deployment: "Apply to a run" }[kindOf(d)] || "Trigger a run"}</h2>
@@ -616,6 +721,7 @@ function renderVersions(host, id, st, d, reload) {
   for (const v of st.versions) {
     const row = document.createElement("div");
     row.className = "tpl-version" + (st.stable === v ? " tpl-version-live" : "");
+    row.dataset.version = String(v);
     const pills = channelsFor(v, st)
       .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
       .join("");
@@ -739,10 +845,6 @@ async function renderSinkPairings(host, id) {
  *  template + version, and the param fields are the union of both. */
 async function renderTrigger(host, id, st, d, withSink = false, preselectSink = null) {
   const ownParams = d.params || {};
-  // Only offer channels that actually resolve — an unset one would just 422.
-  const choices = ["stable", "newest", "previous", ...Object.keys(st.tags).sort()].filter(
-    (c) => channelTarget(c, st) != null,
-  );
   let sinks = [];
   let overlays = [];
   if (withSink) {
@@ -750,7 +852,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       const data = await api("/v1/templates?kind=sink-template");
       sinks = (data.templates || []).filter((s) => ((s.state || {}).status || "draft") !== "deprecated");
       const ov = await api("/v1/templates?kind=deployment");
-      overlays = (ov.templates || []).filter((o) => ((o.state || {}).status || "draft") === "launched");
+      overlays = (ov.templates || []).filter((o) => ((o.state || {}).status || "draft") !== "deprecated");
     } catch (e) {
       host.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
       return;
@@ -761,73 +863,170 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     }
   }
   const sinkOptions = sinks
-    .map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)}${s.description ? ` — ${escapeHtml(s.description)}` : ""}</option>`)
+    .map((s) => `<option value="${escapeHtml(s.id)}" title="${escapeHtml(s.description || "")}">${escapeHtml(s.id)}</option>`)
     .join("");
+  // One section per template the run composes: the source (pinned from the
+  // version list above), the sink and the deployment (each picked here, with
+  // its own version), then the run name. Each section lists the parameters its
+  // own template declares.
+  const segment = (key, title, head, hint) => `
+    <section class="tpl-seg" data-seg="${key}">
+      <header class="tpl-seg-head"><h3>${title}</h3>${hint ? `<span class="tpl-seg-hint">${hint}</span>` : ""}</header>
+      <div class="tpl-seg-fields">${head}</div>
+      <div class="tpl-params" data-params="${key}"></div>
+    </section>`;
   host.innerHTML = `
     <div class="tpl-trigger">
       ${withSink ? `<p class="tpl-desc">Every stream of <b class="mono">${escapeHtml(id)}</b> lands in the chosen sink; the write mode per stream is resolved against the sink's capabilities when the run is submitted.</p>` : ""}
-      <fieldset class="submit-opts">
-        <label>version
-          <select id="tg-version">
-            ${choices.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}${channelTarget(c, st) != null ? ` (v${channelTarget(c, st)})` : ""}</option>`).join("")}
-            ${st.versions.map((v) => `<option value="${v}">v${v} (pinned)</option>`).join("")}
-          </select>
-        </label>
-        ${withSink ? `
-        <label>sink template <select id="tg-sink">${sinkOptions}</select></label>
-        <label>sink version
-          <select id="tg-sink-version">
-            <option value="stable">stable</option>
-            <option value="newest">newest</option>
-          </select>
-        </label>
-        <label title="state, DLQ, notifications and SLA for this run">deployment
-          <select id="tg-overlay">
-            <option value="">none</option>
-            ${overlays.map((o) => `<option value="${escapeHtml(o.id)}">${escapeHtml(o.id)}${o.description ? ` — ${escapeHtml(o.description)}` : ""}</option>`).join("")}
-          </select>
-        </label>` : ""}
-        <label>run name <input id="tg-name" placeholder="optional" /></label>
-      </fieldset>
-      <div id="tg-params" class="tpl-params"></div>
+      ${segment(
+        "source",
+        withSink ? "Source" : "Template",
+        `<label class="tpl-field-wide">template <span class="tpl-picked"><b class="mono">${escapeHtml(id)}</b></span></label>
+         <label>version
+           <input type="hidden" id="tg-version" value="${st.stable ?? st.newest}" />
+           <span id="tg-version-show" class="tpl-picked"></span>
+         </label>`,
+        "pick the version in the list above",
+      )}
+      ${withSink ? segment(
+        "sink",
+        "Sink",
+        `<label class="tpl-field-wide">template <select id="tg-sink">${sinkOptions}</select></label>
+         <label>version <select id="tg-sink-version"></select></label>`,
+      ) : ""}
+      ${withSink ? segment(
+        "overlay",
+        "Deployment",
+        `<label class="tpl-field-wide">template
+           <select id="tg-overlay">
+             <option value="">none</option>
+             ${overlays.map((o) => `<option value="${escapeHtml(o.id)}" title="${escapeHtml(o.description || "")}">${escapeHtml(o.id)}</option>`).join("")}
+           </select>
+         </label>
+         <label>version <select id="tg-overlay-version" disabled><option value="">—</option></select></label>`,
+        "state, DLQ, notifications and SLA for this run",
+      ) : ""}
+      <section class="tpl-seg">
+        <header class="tpl-seg-head"><h3>Run</h3></header>
+        <div class="tpl-seg-fields"><label class="tpl-field-wide">run name <input id="tg-name" placeholder="optional" /></label></div>
+      </section>
       <div class="submit-actions"><button id="tg-go" class="btn-primary">Run</button></div>
       <pre id="tg-out" class="submit-out" hidden></pre>
     </div>`;
 
-  const paramHost = host.querySelector("#tg-params");
+  const paramHosts = {
+    source: host.querySelector('[data-params="source"]'),
+    sink: host.querySelector('[data-params="sink"]'),
+    overlay: host.querySelector('[data-params="overlay"]'),
+  };
   const sinkSel = host.querySelector("#tg-sink");
   const overlaySel = host.querySelector("#tg-overlay");
   if (sinkSel && preselectSink && sinks.some((s) => s.id === preselectSink)) sinkSel.value = preselectSink;
-  // The params the trigger binds: the template's own, plus (for a source
-  // template) the selected sink's — the same merge the server performs.
-  let params = ownParams;
-  const renderParams = () => {
-    params = { ...ownParams };
-    if (sinkSel) {
-      const sink = sinks.find((s) => s.id === sinkSel.value);
-      for (const [n, spec] of Object.entries((sink && sink.params) || {})) params[n] = { ...spec, fromSink: sink.id };
-    }
-    if (overlaySel && overlaySel.value) {
-      const o = overlays.find((x) => x.id === overlaySel.value);
-      for (const [n, spec] of Object.entries((o && o.params) || {})) params[n] = { ...spec, fromOverlay: o.id };
-    }
-    // Computed params are derived from other params, not supplied — exclude them
-    // from the trigger form (supplying one is rejected server-side, #573).
-    const names = Object.keys(params).filter((n) => params[n].computed == null);
-    paramHost.innerHTML = "";
-    if (!names.length) {
-      paramHost.innerHTML = `<p class="tpl-desc">${withSink ? "Neither template declares parameters." : "This template declares no parameters."}</p>`;
-    }
-    for (const name of names) paramHost.appendChild(paramField(name, params[name] || {}));
+  const overlayVersionSel = host.querySelector("#tg-overlay-version");
+  // A sink's or deployment's version list is its own: rebuild the picker
+  // whenever the template changes, defaulting to the live release.
+  const fillVersions = (sel, tpl) => {
+    if (!sel) return;
+    const state = (tpl && tpl.state) || null;
+    sel.disabled = !state;
+    sel.innerHTML = state ? versionOptions(state) : `<option value="">—</option>`;
   };
+  const refillSinkVersions = () => fillVersions(host.querySelector("#tg-sink-version"), sinks.find((s) => s.id === sinkSel.value));
+  const refillOverlayVersions = () =>
+    fillVersions(overlayVersionSel, overlaySel.value ? overlays.find((o) => o.id === overlaySel.value) : null);
+  if (sinkSel) refillSinkVersions();
+  if (overlaySel) refillOverlayVersions();
+  const versionSel = host.querySelector("#tg-version");
+  const sinkVersionSel = host.querySelector("#tg-sink-version");
+  const recordCache = new Map();
+  const paramsOf = async (tid, version) => {
+    const key = `${tid}@${version}`;
+    if (!recordCache.has(key)) {
+      recordCache.set(
+        key,
+        api(`/v1/templates/${encodeURIComponent(tid)}?version=${encodeURIComponent(version)}`).then(
+          (r) => r.params || {},
+          (e) => { recordCache.delete(key); throw e; },
+        ),
+      );
+    }
+    return recordCache.get(key);
+  };
+  // Every param the run binds, by name — the same merge the server performs.
+  // A name two templates share is one value, shown in the first section that
+  // declares it.
+  let params = ownParams;
+  let renderSeq = 0;
+  const allInputs = () => host.querySelectorAll("[data-params] [data-name]");
+  const renderParams = async () => {
+    const seq = ++renderSeq;
+    const typed = {};
+    for (const el of allInputs()) if (el.value !== "") typed[el.dataset.name] = el.value;
+    const sections = [];
+    try {
+      sections.push(["source", await paramsOf(id, versionSel.value)]);
+      if (sinkSel) sections.push(["sink", await paramsOf(sinkSel.value, sinkVersionSel.value)]);
+      if (overlaySel) {
+        sections.push(["overlay", overlaySel.value ? await paramsOf(overlaySel.value, overlayVersionSel.value) : null]);
+      }
+    } catch (e) {
+      if (seq !== renderSeq) return;
+      paramHosts.source.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    if (seq !== renderSeq) return;
+    params = {};
+    for (const [key, declared] of sections) {
+      const target = paramHosts[key];
+      target.innerHTML = "";
+      if (declared === null) continue;
+      // Computed params are derived from other params, not supplied — exclude
+      // them from the trigger form (supplying one is rejected server-side, #573).
+      const names = Object.keys(declared).filter((n) => declared[n].computed == null && !(n in params));
+      for (const n of names) params[n] = declared[n];
+      if (!names.length) {
+        target.innerHTML = `<p class="tpl-desc">No parameters.</p>`;
+        continue;
+      }
+      for (const name of names) {
+        const field = paramField(name, declared[name] || {});
+        const input = field.querySelector("[data-name]");
+        if (input && typed[name] !== undefined) input.value = typed[name];
+        target.appendChild(field);
+      }
+    }
+  };
+  // The version rows above the form pick the source version to run: clicking
+  // one selects it here, and the row that matches the selection stays marked.
+  const rows = [...(host.closest(".page") || document).querySelectorAll(".tpl-version[data-version]")];
+  const markPicked = () => {
+    const picked = Number(versionSel.value);
+    const pills = channelsFor(picked, st)
+      .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
+      .join("");
+    host.querySelector("#tg-version-show").innerHTML = `<b class="mono">v${picked}</b>${pills}`;
+    for (const r of rows) r.classList.toggle("tpl-version-picked", Number(r.dataset.version) === picked);
+  };
+  for (const r of rows) {
+    r.title = `run v${r.dataset.version}`;
+    r.onclick = (ev) => {
+      if (ev.target.closest("button, select, a, pre")) return;
+      versionSel.value = r.dataset.version;
+      markPicked();
+      renderParams();
+    };
+  }
+  markPicked();
   renderParams();
-  if (sinkSel) sinkSel.onchange = renderParams;
-  if (overlaySel) overlaySel.onchange = renderParams;
+  if (sinkSel) sinkSel.onchange = () => { refillSinkVersions(); renderParams(); };
+  if (sinkVersionSel) sinkVersionSel.onchange = renderParams;
+  if (overlaySel) overlaySel.onchange = () => { refillOverlayVersions(); renderParams(); };
+  if (overlayVersionSel) overlayVersionSel.onchange = renderParams;
 
   const out = host.querySelector("#tg-out");
   host.querySelector("#tg-go").onclick = async () => {
     const supplied = {};
-    for (const el of paramHost.querySelectorAll("[data-name]")) {
+    for (const el of allInputs()) {
       const raw = el.value;
       if (raw === "") continue; // omitted → the template's default (or a typed error)
       supplied[el.dataset.name] = coerce(raw, (params[el.dataset.name] || {}).type);
@@ -837,7 +1036,10 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       body.sink = sinkSel.value;
       body.sink_version = host.querySelector("#tg-sink-version").value;
     }
-    if (overlaySel && overlaySel.value) body.overlay = overlaySel.value;
+    if (overlaySel && overlaySel.value) {
+      body.overlay = overlaySel.value;
+      body.overlay_version = overlayVersionSel.value;
+    }
     if (Object.keys(supplied).length) body.params = supplied;
     const name = host.querySelector("#tg-name").value.trim();
     if (name) body.name = name;
@@ -886,12 +1088,25 @@ function paramField(name, p) {
   return field;
 }
 
+/** Options for a version picker: every channel that resolves (with its target),
+ *  then every stored version pinned. `stable` comes first when launched, else
+ *  `newest`, so the default selection is always runnable. */
+function versionOptions(state) {
+  const channels = ["stable", "newest", "previous", ...Object.keys(state.tags || {}).sort()].filter(
+    (c) => channelTarget(c, state) != null,
+  );
+  return [
+    ...channels.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)} (v${channelTarget(c, state)})</option>`),
+    ...(state.versions || []).map((v) => `<option value="${v}">v${v} (pinned)</option>`),
+  ].join("");
+}
+
 /** The version a channel currently resolves to, or null when unset. */
 function channelTarget(channel, st) {
   if (channel === "stable") return st.stable;
   if (channel === "previous") return st.previous;
   if (channel === "newest") return st.newest;
-  const v = st.tags[channel];
+  const v = (st.tags || {})[channel];
   return v === undefined ? null : v;
 }
 
@@ -910,15 +1125,15 @@ function renderLaunches(host, launches) {
     return;
   }
   host.innerHTML = `
-    <table class="tbl">
+    <div class="tpl-launch-wrap"><table class="tbl tpl-launch-tbl">
       <thead><tr><th>#</th><th>version</th><th>when</th><th>by</th></tr></thead>
       <tbody>
         ${launches
           .map(
             (l) => `<tr><td class="mono">${l.seq}</td><td class="mono">v${l.version}</td>
-              <td>${fmtTime(l.launched_at)}</td><td>${escapeHtml(l.launched_by || "cli")}</td></tr>`,
+              <td class="tpl-launch-when">${fmtTime(l.launched_at)}</td><td>${escapeHtml(l.launched_by || "cli")}</td></tr>`,
           )
           .join("")}
       </tbody>
-    </table>`;
+    </table></div>`;
 }

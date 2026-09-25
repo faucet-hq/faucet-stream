@@ -90,7 +90,7 @@ This uploads each batch of records as one or more `events/{uuidv7}.jsonl` object
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `storage_host` | string | *(unset)* | Endpoint override for the storage host. Integration-test escape hatch (e.g. `http://localhost:4443` for an emulator) — leave unset in production. |
+| `storage_host` | string | *(unset)* | Endpoint override for the storage host. Integration-test escape hatch (e.g. `http://localhost:4443` for `fake-gcs-server`; a plaintext host uses the JSON API throughout) — leave unset in production. |
 
 ## Authentication
 
@@ -293,7 +293,7 @@ Enable the connector itself in the CLI/umbrella via the `sink-gcs` feature.
 | High memory / OOM during writes | Large chunks × high `concurrency`. Lower `concurrency`, set `max_records_per_file`, or feed the sink from a streaming source rather than a `fetch_all`-style one (see the memory note above). |
 | Downstream reader sees garbled bytes | The object is compressed but the reader didn't decompress. This sink sets no `Content-Encoding`; consumers must decompress explicitly based on the `.gz` / `.zst` suffix. |
 | Duplicate-looking data after a failed run resumed | A partial batch left some chunks behind, then the retry re-uploaded with new UUIDv7 keys. De-duplicate downstream, or size batches so a single object is the unit of retry. |
-| Integration tests fail with `h2 protocol error / GoAway` | The integration tests need a real gRPC-capable GCS backend; `fake-gcs-server` only speaks REST. Run unit tests with `cargo test -p faucet-sink-gcs`; run integration tests `--ignored` against real GCS or a gRPC emulator. |
+| `h2 protocol error / GoAway` against an emulator | The emulator was given an `https://` host, so the preflight listing went over gRPC. Use the plaintext port (`http://…`); the integration tests run `fake-gcs-server` with `-scheme=http` and need only Docker. |
 
 ## See also
 

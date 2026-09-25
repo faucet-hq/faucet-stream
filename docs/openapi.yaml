@@ -164,13 +164,22 @@ paths:
                   sinks: { type: array, items: { type: object, properties: { name: { type: string }, description: { type: string } } } }
                   transforms: { type: array, items: { type: object, properties: { name: { type: string }, description: { type: string } } } }
                   state: { type: array, items: { type: string } }
+                  blocks:
+                    type: array
+                    description: Config blocks a submitted pipeline can add; fetch each schema from /v1/schemas/block/{name}
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        description: { type: string }
+                        placement: { type: string, enum: [pipeline, top], description: "Whether the block lives under `pipeline:` or at the top level" }
         "401": { description: Missing or invalid bearer token }
   /v1/schemas/{kind}/{name}:
     get:
-      summary: Get the JSON Schema for one connector or transform
+      summary: Get the JSON Schema for one connector, transform, or pipeline block
       security: [{ bearerAuth: [] }]
       parameters:
-        - { name: kind, in: path, required: true, schema: { type: string, enum: [source, sink, transform] } }
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [source, sink, transform, block] } }
         - { name: name, in: path, required: true, schema: { type: string } }
       responses:
         "200":
@@ -526,8 +535,9 @@ paths:
         with its age, lifecycle state, and the retention window in force. The
         provenance the retention GC works from — it only ever deletes files
         listed here. `state` is `present` (on disk), `expired` (collected; the
-        record is kept), or `external` (faucet wrote the file but did not create
-        it, so it is never collected). Requires the `LocalOutputRead` permission
+        record is kept), `external` (faucet appended to a file it did not
+        create, so it is never collected or previewed), or `replaced` (faucet
+        truncated a file it did not create: previewable, never collected). Requires the `LocalOutputRead` permission
         (viewer). Requires the `catalog` Cargo feature.
       operationId: listLocalOutputs
       security: [{ bearerAuth: [] }]
@@ -743,9 +753,10 @@ paths:
           description: >
             Previews are disabled on this server (`--preview-local-outputs` was
             not passed); the principal's role lacks `LocalOutputRead`; or the
-            output is `external` — a file faucet wrote to but did not create,
+            output is `external` — a file faucet appended to but did not create,
             whose contents are not faucet's to serve, for the same reason the
-            retention GC refuses to delete it.
+            retention GC refuses to delete it. (A `replaced` output — truncated
+            by faucet — is previewable.)
         "404": { description: No such tracked output }
         "409":
           description: >
@@ -1737,8 +1748,8 @@ components:
         deleted_bytes: { type: integer, nullable: true, description: "Bytes reclaimed when it was collected." }
         state:
           type: string
-          enum: [present, expired, external]
-          description: "present = on disk; expired = collected (record kept); external = faucet did not create it."
+          enum: [present, expired, external, replaced]
+          description: "present = on disk; expired = collected (record kept); external = faucet appended to a file it did not create; replaced = faucet truncated a file it did not create (previewable, never collected)."
         age_secs: { type: integer, description: "Seconds since the last write." }
         retention_days_effective: { type: integer, nullable: true, description: "The window actually in force; null = never expires." }
       example:

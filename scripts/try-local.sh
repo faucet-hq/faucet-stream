@@ -138,7 +138,7 @@ launch_ui() {
   hdr "Starting the web console on ${base}"
   # Run from DEMO_DIR so submitted configs' ./data and ./out paths resolve.
   ( cd "$DEMO_DIR" && exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" \
-      --no-auth --history "sqlite:./faucet-meta.db" ) >"${DEMO_DIR}/serve.log" 2>&1 &
+      --no-auth --history "sqlite:./faucet-meta.db" --preview-local-outputs ) >"${DEMO_DIR}/serve.log" 2>&1 &
   SERVE_PID=$!
   trap 'echo; info "Stopping web console (pid '"$SERVE_PID"')"; stop_serve; exit 0' INT TERM
 
@@ -200,6 +200,11 @@ launch_ui() {
           -H 'content-type: application/json' -d "$body"
       fi
     fi
+    # A demo catalog big enough to show the Templates list, its filters and the
+    # compatibility grid at volume: 10 source + 10 sink templates across several
+    # owners and lifecycle states. Idempotent — existing ids are left alone.
+    info "Seeding the demo template catalog…"
+    python3 "${REPO_ROOT}/scripts/demo_catalog.py" "${base}" || info "  (demo catalog seeding reported failures — continuing)"
   else
     info "python3/curl unavailable — the console will start empty; use the Submit tab."
   fi

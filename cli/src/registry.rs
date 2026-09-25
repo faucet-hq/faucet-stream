@@ -386,6 +386,15 @@ pub async fn build_source(
             let cfg = decode::<faucet_source_nats::NatsSourceConfig>("source", "nats", config)?;
             Ok(Box::new(faucet_source_nats::NatsSource::new(cfg).await?))
         }
+        #[cfg(feature = "source-rabbitmq")]
+        "rabbitmq" => {
+            let cfg = decode::<faucet_source_rabbitmq::RabbitMqSourceConfig>(
+                "source", "rabbitmq", config,
+            )?;
+            Ok(Box::new(
+                faucet_source_rabbitmq::RabbitMqSource::new(cfg).await?,
+            ))
+        }
         #[cfg(feature = "source-sftp")]
         "sftp" => {
             let cfg = decode::<faucet_source_sftp::SftpSourceConfig>("source", "sftp", config)?;
@@ -684,6 +693,14 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         "nats" => {
             let cfg = decode::<faucet_sink_nats::NatsSinkConfig>("sink", "nats", config)?;
             Ok(Box::new(faucet_sink_nats::NatsSink::new(cfg).await?))
+        }
+        #[cfg(feature = "sink-rabbitmq")]
+        "rabbitmq" => {
+            let cfg =
+                decode::<faucet_sink_rabbitmq::RabbitMqSinkConfig>("sink", "rabbitmq", config)?;
+            Ok(Box::new(
+                faucet_sink_rabbitmq::RabbitMqSink::new(cfg).await?,
+            ))
         }
         #[cfg(feature = "sink-sftp")]
         "sftp" => {
@@ -1379,6 +1396,13 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
                 c.validate()
             })
         }
+        #[cfg(feature = "source-rabbitmq")]
+        "rabbitmq" => check_with::<faucet_source_rabbitmq::RabbitMqSourceConfig, _, _>(
+            "rabbitmq",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "source-sftp")]
         "sftp" => check::<faucet_source_sftp::SftpSourceConfig>("sftp", name, config),
         #[cfg(feature = "source-s3")]
@@ -1581,6 +1605,13 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
         "nats" => check_with::<faucet_sink_nats::NatsSinkConfig, _, _>("nats", name, config, |c| {
             c.validate()
         }),
+        #[cfg(feature = "sink-rabbitmq")]
+        "rabbitmq" => check_with::<faucet_sink_rabbitmq::RabbitMqSinkConfig, _, _>(
+            "rabbitmq",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "sink-sftp")]
         "sftp" => check::<faucet_sink_sftp::SftpSinkConfig>("sftp", name, config),
         #[cfg(feature = "sink-s3")]
@@ -1691,6 +1722,8 @@ pub fn source_schema(kind: &str) -> CliResult<Value> {
         "sqs" => Ok(schema::<faucet_source_sqs::SqsSourceConfig>()),
         #[cfg(feature = "source-nats")]
         "nats" => Ok(schema::<faucet_source_nats::NatsSourceConfig>()),
+        #[cfg(feature = "source-rabbitmq")]
+        "rabbitmq" => Ok(schema::<faucet_source_rabbitmq::RabbitMqSourceConfig>()),
         #[cfg(feature = "source-sftp")]
         "sftp" => Ok(schema::<faucet_source_sftp::SftpSourceConfig>()),
         #[cfg(feature = "source-s3")]
@@ -1787,6 +1820,8 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         "sqs" => Ok(schema::<faucet_sink_sqs::SqsSinkConfig>()),
         #[cfg(feature = "sink-nats")]
         "nats" => Ok(schema::<faucet_sink_nats::NatsSinkConfig>()),
+        #[cfg(feature = "sink-rabbitmq")]
+        "rabbitmq" => Ok(schema::<faucet_sink_rabbitmq::RabbitMqSinkConfig>()),
         #[cfg(feature = "sink-sftp")]
         "sftp" => Ok(schema::<faucet_sink_sftp::SftpSinkConfig>()),
         #[cfg(feature = "sink-s3")]
@@ -1873,6 +1908,11 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push((
         "nats",
         "NATS source. Subscribes to a subject (or a JetStream durable consumer) and drains with idle/max-messages termination.",
+    ));
+    #[cfg(feature = "source-rabbitmq")]
+    v.push((
+        "rabbitmq",
+        "RabbitMQ (AMQP 0.9.1) source. Consumes a queue (optional exchange bindings), acks each page only after the sink confirms it (at-least-once), with idle/max-messages termination.",
     ));
     #[cfg(feature = "source-sftp")]
     v.push((
@@ -2009,6 +2049,11 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push((
         "nats",
         "NATS sink. Publishes records to a subject (optionally subject-per-record) and flushes per batch.",
+    ));
+    #[cfg(feature = "sink-rabbitmq")]
+    v.push((
+        "rabbitmq",
+        "RabbitMQ (AMQP 0.9.1) sink. Publishes to an exchange with a static/per-record routing key, publisher confirms, and mandatory-return rows surfaced for the DLQ.",
     ));
     #[cfg(feature = "sink-sftp")]
     v.push((

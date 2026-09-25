@@ -120,7 +120,8 @@ impl JsonlSink {
             // `create(true)` cannot make a file faucet did not create look like
             // one it did. Idempotent + first-open-wins, so the flush→reopen
             // cycle above never reclassifies it.
-            self.outputs.record_open_probing(&self.config.path);
+            self.outputs
+                .record_open_probing_with(&self.config.path, truncate);
             let file = OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -638,5 +639,19 @@ mod tests {
         let outs = sink.local_outputs().await;
         assert_eq!(outs.len(), 1);
         assert!(!outs[0].pre_existing);
+    }
+    #[tokio::test]
+    async fn local_outputs_marks_a_truncated_existing_file_replaced_and_an_appended_one_not() {
+        // Truncating a file faucet did not create leaves only faucet's bytes in
+        // it — safe to preview, still never collected. Appending keeps the
+        // original owner's content, so it stays plain pre-existing.
+        for (append, replaced) in [(false, true), (true, false)] {
+            let tmp = NamedTempFile::new().unwrap();
+            let sink = JsonlSink::new(JsonlSinkConfig::new(tmp.path()).append(append));
+            sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+            let outs = sink.local_outputs().await;
+            assert!(outs[0].pre_existing);
+            assert_eq!(outs[0].replaced, replaced, "append = {append}");
+        }
     }
 }

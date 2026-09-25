@@ -451,6 +451,20 @@
       "description": "NATS sink; publish records to a subject, flush per batch"
     },
     {
+      "name": "rabbitmq",
+      "kind": "source",
+      "verified": true,
+      "tier": "stable",
+      "description": "RabbitMQ (AMQP 0.9.1) source; queue consume, ack after sink confirm, idle/max termination"
+    },
+    {
+      "name": "rabbitmq",
+      "kind": "sink",
+      "verified": true,
+      "tier": "stable",
+      "description": "RabbitMQ (AMQP 0.9.1) sink; exchange publish, per-record routing key, publisher confirms"
+    },
+    {
       "name": "sftp",
       "kind": "source",
       "verified": true,

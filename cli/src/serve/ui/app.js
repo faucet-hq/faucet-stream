@@ -39,9 +39,13 @@ function wireChrome() {
   document.getElementById("nav-templates").onclick = () => navigate("#/templates");
   document.getElementById("nav-datasets").onclick = () => navigate("#/catalog");
   document.getElementById("nav-lineage").onclick = () => navigate("#/lineage");
+  // One click always flips what is on screen. `auto` (follow the OS) is the
+  // starting state only: cycling through it made the first click a no-op
+  // whenever the OS theme matched the next state.
   document.getElementById("theme-toggle").onclick = () => {
     const cur = document.documentElement.dataset.theme;
-    applyTheme(cur === "dark" ? "light" : cur === "light" ? "auto" : "dark");
+    const dark = cur === "dark" || (cur !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+    applyTheme(dark ? "light" : "dark");
   };
   // Display-timezone selector: populate, reflect the saved choice, and re-render
   // the current view (all timestamps + the date picker follow it) on change.

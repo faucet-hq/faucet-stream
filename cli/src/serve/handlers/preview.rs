@@ -214,7 +214,9 @@ fn source_spec(record: &LocalOutputRecord, rows: RowCap) -> Result<PreviewReques
     // file but did not create it, so its contents are not faucet's to hand out —
     // and the part of it that predates faucet is exactly what the delete-side
     // guard protects. Refusing to *unlink* somebody's export while streaming it
-    // back over HTTP would be a guardrail in name only.
+    // back over HTTP would be a guardrail in name only. A `replaced` file —
+    // pre-existing, but truncated by faucet — holds only faucet's output, so it
+    // is previewed.
     if record.state() == LocalOutputState::External {
         return Err(ServeError::Forbidden(format!(
             "`{}` already existed when faucet first opened it, so faucet wrote to a file \
@@ -333,6 +335,7 @@ mod tests {
             row: "default".into(),
             run_id: "run-1".into(),
             pre_existing: false,
+            replaced: false,
             retention_days: None,
             observed_at: Utc::now(),
         })
@@ -444,6 +447,20 @@ mod tests {
             }
             other => panic!("expected Forbidden, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_replaced_file_is_previewable() {
+        // faucet truncated a file it did not create: every byte in it is
+        // faucet's output, so reading it back discloses nothing that predates
+        // faucet. It stays uncollectable (see the sweep tests).
+        let dir = tempfile::tempdir().unwrap();
+        let p = touch(dir.path(), "overwritten.jsonl");
+        let mut r = record(&p, "jsonl");
+        r.pre_existing = true;
+        r.replaced = true;
+        assert_eq!(r.state(), LocalOutputState::Replaced);
+        assert!(source_spec(&r, RowCap::Rows(10)).is_ok());
     }
 
     #[test]
@@ -559,6 +576,7 @@ mod tests {
             row: "default".into(),
             run_id: "run-1".into(),
             pre_existing: false,
+            replaced: false,
             retention_days: None,
             observed_at: Utc::now(),
         };
@@ -606,6 +624,7 @@ mod tests {
                 row: "default".into(),
                 run_id: "run-1".into(),
                 pre_existing: false,
+                replaced: false,
                 retention_days: None,
                 observed_at: Utc::now(),
             })
@@ -648,6 +667,7 @@ mod tests {
                 row: "default".into(),
                 run_id: "run-1".into(),
                 pre_existing: false,
+                replaced: false,
                 retention_days: None,
                 observed_at: Utc::now(),
             })
@@ -807,6 +827,7 @@ mod tests {
                 row: "default".into(),
                 run_id: "run-1".into(),
                 pre_existing: false,
+                replaced: false,
                 retention_days: None,
                 observed_at: Utc::now(),
             })

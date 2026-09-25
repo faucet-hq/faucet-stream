@@ -3,6 +3,8 @@
 //! Shared GCS credential and client construction for faucet source and
 //! sink connectors.
 
+mod json_control;
+
 use faucet_core::FaucetError;
 use google_cloud_storage::client::{Storage, StorageControl};
 use schemars::JsonSchema;
@@ -94,10 +96,20 @@ pub async fn build_storage(
 }
 
 /// Build a control-plane [`StorageControl`] client.
+///
+/// A plaintext (`http://`) storage host is an emulator: it gets a client whose
+/// `list_objects` and `get_object` go over the JSON API, since gRPC needs
+/// HTTP/2 and emulators serve that only behind TLS. Every other host uses the
+/// SDK's gRPC client.
 pub async fn build_storage_control(
     creds: &GcsCredentials,
     storage_host: Option<&str>,
 ) -> Result<StorageControl, FaucetError> {
+    if let Some(host) = storage_host.filter(|h| json_control::is_plaintext_endpoint(h)) {
+        return Ok(StorageControl::from_stub(
+            json_control::JsonApiControl::new(host),
+        ));
+    }
     let credentials = build_credentials(creds).await?;
     let mut builder = StorageControl::builder().with_credentials(credentials);
     if let Some(host) = storage_host {
@@ -285,5 +297,19 @@ mod tests {
             Ok(_) | Err(FaucetError::Auth(_)) => {}
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn only_plaintext_hosts_take_the_json_listing_path() {
+        let plain = build_storage_control(&GcsCredentials::Anonymous, Some("http://127.0.0.1:9"))
+            .await
+            .unwrap();
+        let err = plain
+            .list_objects()
+            .set_parent("projects/_/buckets/b")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_io(), "plaintext host must list over HTTP/1.1: {err}");
     }
 }

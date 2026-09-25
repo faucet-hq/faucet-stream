@@ -91,6 +91,9 @@ members = [
     "crates/common/sftp",
     "crates/source/sftp",
     "crates/sink/sftp",
+    "crates/common/rabbitmq",
+    "crates/source/rabbitmq",
+    "crates/sink/rabbitmq",
     "crates/state/redis",
     "crates/state/postgres",
     "faucet-stream",
@@ -211,6 +214,9 @@ faucet-sink-nats = { path = "crates/sink/nats", version = "1" }
 faucet-common-sftp = { path = "crates/common/sftp", version = "1" }
 faucet-source-sftp = { path = "crates/source/sftp", version = "1" }
 faucet-sink-sftp = { path = "crates/sink/sftp", version = "1" }
+faucet-common-rabbitmq = { path = "crates/common/rabbitmq", version = "1" }
+faucet-source-rabbitmq = { path = "crates/source/rabbitmq", version = "1" }
+faucet-sink-rabbitmq = { path = "crates/sink/rabbitmq", version = "1" }
 faucet-source-mssql-cdc = { path = "crates/source/mssql-cdc", version = "1" }
 
 # Shared external deps
@@ -259,6 +265,7 @@ dashmap = "6"
 uuid = { version = "1", features = ["v4", "v7"] }
 google-cloud-storage = "1.12"
 google-cloud-auth = "1.10"
+google-cloud-gax = "1.10"
 # Cloud Spanner stack: the mature community client (yoshidan/google-cloud-rust,
 # renamed gcloud-*). The official `google-cloud-spanner` is still `-preview`, so
 # per the dependency policy the stable community client is the pick. Default
@@ -283,6 +290,12 @@ aws-sdk-secretsmanager = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 # NATS (JetStream-capable async client) for the nats source/sink pair.
 async-nats = "0.50"
+# Pure-Rust AMQP 0.9.1 client for the rabbitmq source/sink pair; TLS is opt-in
+# via the connectors' `tls` feature.
+lapin = { version = "4.12", default-features = false, features = ["tokio"] }
+# Pinned alongside lapin's rustls line so the rabbitmq `tls` feature can install
+# a process-level crypto provider (several providers unify in the full build).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 # SFTP over SSH (pure-Rust) for the sftp source/sink pair.
 russh = "0.62"
 russh-sftp = "2"
