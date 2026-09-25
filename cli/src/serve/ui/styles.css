@@ -1354,7 +1354,8 @@ select {
 .tpl-param-name { font-size: 0.82rem; font-weight: 600; color: var(--ink); }
 /* Tags sit on their own row beneath the variable name, and are a touch smaller. */
 .tpl-param-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-bottom: 1px; }
-.tpl-param-tags .pill { font-size: 0.6rem; padding: 1px 7px; }
+.tpl-param-tags .pill { font-size: 0.6rem; line-height: 1; padding: 3px 7px; justify-content: center; }
+.tpl-param-tags .pill::before { display: none; }
 
 /* Status filter chips on the templates list (multi-toggle; launched+draft on by default). */
 .tpl-status-filter { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
