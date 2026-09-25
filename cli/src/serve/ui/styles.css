@@ -1262,7 +1262,10 @@ select {
    the source column pinned, so a large catalog stays readable and the list
    below it stays in reach. */
 .tpl-matrix-scroll { overflow: auto; max-height: 460px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-.tpl-matrix-table { margin: 0; min-width: 100%; width: max-content; table-layout: auto; border-collapse: separate; border-spacing: 0; }
+/* `.tbl` clips with `overflow: hidden`, which would make the table itself the
+   sticky containing box and let the pinned header scroll away with it. The
+   scroll box above already draws the border and the rounded corners. */
+.tpl-matrix-table { margin: 0; min-width: 100%; width: max-content; table-layout: auto; border-collapse: separate; border-spacing: 0; overflow: visible; border: 0; border-radius: 0; }
 .tpl-matrix-table th, .tpl-matrix-table td { width: auto; }
 .tpl-matrix-table td { padding: 7px 10px; vertical-align: middle; }
 .tpl-matrix-table thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); min-width: 92px; max-width: 128px; padding: 9px 10px; border-bottom: 1px solid var(--border); }
