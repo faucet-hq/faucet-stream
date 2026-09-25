@@ -1,7 +1,7 @@
 import { api, toast } from "../api.js";
 import { streamLogs } from "../sse.js";
 import { navigate } from "../router.js";
-import { fmtTime } from "./runs.js";
+import { formatTsSplit } from "../tz.js";
 import { escapeHtml, fmtInt, fmtCompact } from "../utils.js";
 
 /** Human duration between two RFC3339 timestamps; "—" if either is missing. */
@@ -28,14 +28,13 @@ function fmtMs(ms) {
 
 const TERMINAL = ["completed", "failed", "cancelled"];
 
-/** Provenance line for a run triggered from a template: its labels carry the
- *  template id + the numeric version it resolved to. Links to the template.
- *  Empty for non-template runs. */
-function templateProvenance(rec) {
+/** Link to the template a run was triggered from, with the numeric version it
+ *  resolved to (both carried in the run's labels). Empty for other runs. */
+function templateLink(rec) {
   const l = rec.labels || {};
   if (!l.template) return "";
   const ver = l.template_version ? ` <b>v${escapeHtml(String(l.template_version))}</b>` : "";
-  return `<div title="run triggered from a registered template">template: <a href="#/templates/${encodeURIComponent(l.template)}">${escapeHtml(l.template)}</a>${ver}</div>`;
+  return `<a href="#/templates/${encodeURIComponent(l.template)}">${escapeHtml(l.template)}</a>${ver}`;
 }
 
 // Location-driven DLQ panel: inspect / replay / discard envelopes at a
@@ -204,19 +203,44 @@ export async function renderDetail(container, { id }) {
 
   function renderHead(rec) {
     const errors = rec.error ? `<div class="error-box">${escapeHtml(rec.error)}</div>` : "";
+    const invCount = (rec.invocations || []).length;
+    const stamp = (iso) => {
+      const t = formatTsSplit(iso);
+      return t ? `<dd>${t.time}<small>${t.date}</small></dd>` : `<dd class="rs-empty">—</dd>`;
+    };
+    const provenance = [
+      templateLink(rec) && `<dt>Template</dt><dd>${templateLink(rec)}</dd>`,
+      rec.idempotency_key && `<dt>Idempotency key</dt><dd class="mono">${escapeHtml(rec.idempotency_key)}</dd>`,
+    ].filter(Boolean).join("");
     container.querySelector("#detail-head").innerHTML = `
-      <div class="detail-grid">
-        <div><span class="pill pill-${rec.status}">${rec.status}</span></div>
-        <div><b>${escapeHtml(rec.name || rec.run_id)}</b></div>
-        <div>submitted ${fmtTime(rec.submitted_at)}</div>
-        <div>started ${fmtTime(rec.started_at)}</div>
-        <div>finished ${fmtTime(rec.finished_at)}</div>
-        <div title="submitted → finished (includes time queued)">total ${fmtDur(rec.submitted_at, rec.finished_at)}</div>
-        <div title="started → finished (execution only)">run ${fmtDur(rec.started_at, rec.finished_at)}</div>
-        <div title="${fmtInt(rec.records_written ?? 0)} rows">${fmtCompact(rec.records_written ?? 0)} rows</div>
-        ${templateProvenance(rec)}
-        ${rec.idempotency_key ? `<div>idem: ${escapeHtml(rec.idempotency_key)}</div>` : ""}
-      </div>${errors}`;
+      <section class="run-summary">
+        <header class="rs-head">
+          <span class="pill pill-${rec.status}">${rec.status}</span>
+          <h2 class="rs-name">${escapeHtml(rec.name || rec.run_id)}</h2>
+          ${rec.name ? `<span class="rs-id mono" title="run id">${escapeHtml(rec.run_id)}</span>` : ""}
+        </header>
+        <div class="rs-segments">
+          <div class="rs-seg">
+            <h3>Timeline</h3>
+            <dl><dt>Submitted</dt>${stamp(rec.submitted_at)}<dt>Started</dt>${stamp(rec.started_at)}<dt>Finished</dt>${stamp(rec.finished_at)}</dl>
+          </div>
+          <div class="rs-seg">
+            <h3>Duration</h3>
+            <dl>
+              <dt title="submitted → finished">Total</dt><dd>${fmtDur(rec.submitted_at, rec.finished_at)}<small>including time queued</small></dd>
+              <dt title="started → finished">Running</dt><dd>${fmtDur(rec.started_at, rec.finished_at)}</dd>
+            </dl>
+          </div>
+          <div class="rs-seg">
+            <h3>Output</h3>
+            <dl>
+              <dt>Records written</dt><dd title="${fmtInt(rec.records_written ?? 0)}">${fmtCompact(rec.records_written ?? 0)}</dd>
+              <dt>Invocations</dt><dd>${fmtInt(invCount)}</dd>
+            </dl>
+          </div>
+          ${provenance ? `<div class="rs-seg"><h3>Provenance</h3><dl>${provenance}</dl></div>` : ""}
+        </div>
+      </section>${errors}`;
     const inv = container.querySelector("#invocations");
     // Per-row timing (#645): sort slowest-first so the object dominating the
     // run's makespan is obvious, and draw a proportional bar next to each.
@@ -225,7 +249,7 @@ export async function renderDetail(container, { id }) {
       .sort((a, b) => (b.duration_ms || 0) - (a.duration_ms || 0));
     const maxMs = Math.max(1, ...invs.map((i) => i.duration_ms || 0));
     inv.innerHTML =
-      `<table class="tbl"><thead><tr><th>row</th><th>parent key</th><th>rows</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
+      `<table class="tbl"><thead><tr><th title="the matrix row this invocation ran">matrix row</th><th>parent key</th><th>records</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
       invs
         .map((i) => {
           const ms = i.duration_ms || 0;
@@ -243,7 +267,7 @@ export async function renderDetail(container, { id }) {
           const bar =
             `<div style="height:9px;width:100%;max-width:180px;border-radius:4px;background:rgba(120,120,120,0.14);` +
             `box-shadow:inset 0 1px 1px rgba(0,0,0,0.12);margin-top:5px">${fill}</div>`;
-          return `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td>${i.records_written ?? 0}</td><td><div style="white-space:nowrap">${fmtMs(ms)}</div>${bar}</td><td>${escapeHtml(i.error || "")}</td></tr>`;
+          return `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td>${fmtInt(i.records_written ?? 0)}</td><td><div style="white-space:nowrap">${fmtMs(ms)}</div>${bar}</td><td>${escapeHtml(i.error || "")}</td></tr>`;
         })
         .join("") +
       `</tbody></table>`;

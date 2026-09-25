@@ -776,7 +776,7 @@ select {
 }
 .sf-field {
   display: grid;
-  grid-template-columns: 180px 1fr;
+  grid-template-columns: 200px 1fr;
   gap: 12px;
   align-items: start;
   padding: 7px 0;
@@ -1131,12 +1131,12 @@ select {
 /* Click-to-highlight: the selected node, its neighbours, and their edges stay
    bright while everything else dims, so a dataset's connections read at a glance.
    Selected = solid brand; neighbour = brand tint; active edge = brand line. */
-.lineage-node.is-selected rect { fill: var(--brand-strong); stroke: var(--brand-strong); stroke-width: 2.5; }
-.lineage-node.is-selected text { fill: #fff; }
-.lineage-node.is-selected .lnode-label { color: #fff; font-weight: 600; }
-.lineage-node.is-neighbour rect { fill: color-mix(in srgb, var(--brand-strong) 34%, var(--surface)); stroke: var(--brand-strong); stroke-width: 2; }
+.lineage-node.is-selected rect { fill: color-mix(in srgb, var(--brand) 14%, var(--surface)); stroke: var(--brand); stroke-width: 1.5; }
+.lineage-node.is-selected text { fill: var(--ink); }
+.lineage-node.is-selected .lnode-label { color: var(--ink); font-weight: 600; }
+.lineage-node.is-neighbour rect { fill: color-mix(in srgb, var(--brand) 6%, var(--surface)); stroke: color-mix(in srgb, var(--brand) 55%, var(--border)); stroke-width: 1; }
 .lineage-node.is-neighbour .lnode-label { color: var(--ink); }
-.lineage-edge.is-active { stroke: var(--brand-strong); stroke-width: 3; }
+.lineage-edge.is-active { stroke: var(--brand); stroke-width: 1.5; }
 /* Non-highlighted nodes clearly recede: opacity alone barely fades an already
    pale box on a pale ground, so also wash the fill toward the background and
    grey the text — the highlighted set then reads unmistakably. */
@@ -1636,3 +1636,41 @@ select {
   .tpl-matrix-table tbody th { min-width: 120px; max-width: 150px; }
   .tpl-matrix-head .run-meta { text-align: left; }
 }
+
+/* Run summary (detail head): one card, split into labelled segments. */
+.run-summary { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); box-shadow: var(--shadow-1); overflow: hidden; }
+.rs-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.rs-name { margin: 0; font-size: 1.05rem; font-weight: 650; color: var(--ink); overflow-wrap: anywhere; }
+.rs-id { margin-left: auto; font-size: 0.75rem; color: var(--ink-faint); }
+.rs-segments { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.rs-seg { padding: 14px 18px; border-left: 1px solid var(--border); }
+.rs-seg:first-child { border-left: 0; }
+.rs-seg h3 { margin: 0 0 10px; font-size: 0.68rem; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+.rs-seg dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; margin: 0; align-items: baseline; }
+.rs-seg dt { font-size: 0.8rem; color: var(--ink-dim); }
+.rs-seg dd { margin: 0; font-family: var(--font-mono); font-size: 0.84rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+.rs-seg dd small { display: block; margin-top: 1px; font-family: var(--font-sans, inherit); font-size: 0.72rem; color: var(--ink-faint); }
+.rs-seg dd.rs-empty { color: var(--ink-faint); }
+.rs-seg dd a { color: var(--brand); }
+@media (max-width: 720px) {
+  .rs-seg { border-left: 0; border-top: 1px solid var(--border); }
+  .rs-seg:first-child { border-top: 0; }
+}
+
+/* Submit wizard: optional pipeline blocks */
+.wizard-step[data-group] > h3 { margin-bottom: 4px; }
+.wizard-hint { margin: 0 0 12px; font-size: 0.82rem; color: var(--ink-dim); }
+.wizard-adders { display: flex; flex-wrap: wrap; gap: 8px; }
+.wizard-adders:empty { display: none; }
+.wizard-blocks:not(:empty) { margin-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
+.wizard-block { border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-2); padding: 12px 14px; }
+.wizard-block-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.wizard-block-head b { display: block; font-size: 0.9rem; color: var(--ink); }
+.wizard-block-head small { display: block; margin-top: 2px; font-size: 0.78rem; color: var(--ink-dim); }
+.wizard-block-remove { padding: 2px 8px; line-height: 1.4; }
+.wizard-block .wizard-tx { margin-top: 10px; }
+
+/* Optional nested settings: off until switched on, so an unused feature is
+   never enabled with its defaults. */
+.sf-optional-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 34px; font-size: 0.8rem; color: var(--ink-dim); cursor: pointer; }
+.sf-optional .sf-object { margin-top: 6px; }

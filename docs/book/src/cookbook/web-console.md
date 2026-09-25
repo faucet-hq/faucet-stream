@@ -94,7 +94,11 @@ Two modes for submitting a new pipeline run:
 - **Schema wizard** — select a source and sink from the compiled connector list,
   fill in the generated form fields, and the wizard assembles a valid config.
   The form is derived from the same JSON Schemas returned by
-  `GET /v1/schemas/{kind}/{name}`.
+  `GET /v1/schemas/{kind}/{name}`. Below the transforms, two optional
+  sections add the rest of a pipeline: **Reliability** (state, dead-letter
+  queue, delivery, resilience, SLA) and **Data governance** (quality checks,
+  contract, PII masking, schema drift). Each block is off until you add it;
+  its form comes from `GET /v1/schemas/block/{name}`.
 
 ![The Submit view in guided mode: a schema-driven form generated from the selected connector's JSON Schema](../assets/console/submit.png)
 

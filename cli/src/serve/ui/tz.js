@@ -54,6 +54,24 @@ export function formatTs(value) {
   }
 }
 
+/** `value` split into a time and a date, both in the display timezone, for
+ *  layouts that show the time prominently and the date beneath it. */
+export function formatTsSplit(value) {
+  const d = value ? new Date(value) : null;
+  if (!d || isNaN(d.getTime())) return null;
+  const fmt = (opts) => {
+    try {
+      return new Intl.DateTimeFormat("en-US", { ...opts, ...zoneOpt(getTz()) }).format(d);
+    } catch {
+      return new Intl.DateTimeFormat("en-US", opts).format(d);
+    }
+  };
+  return {
+    time: fmt({ hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }),
+    date: fmt({ year: "numeric", month: "short", day: "numeric" }),
+  };
+}
+
 function partsInZone(date, tz, withSeconds) {
   const p = new Intl.DateTimeFormat("en-US", {
     timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
