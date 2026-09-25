@@ -22,6 +22,7 @@ Closes #
 - [ ] `cargo fmt --all --check` passes
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes
 - [ ] `cargo test --workspace --all-features` passes (new behavior has tests)
+- [ ] Changed connector / serve / executor I/O runs in an integration test (`tests/`, testcontainer or wiremock) — or the description carries `no-integration-test: <reason>`
 - [ ] `cargo doc --workspace --all-features --no-deps` is warning-free
 - [ ] Updated the relevant crate `README.md` / root `README.md` / docs site if config, defaults, or behavior changed
 - [ ] If adding/removing a connector: updated the umbrella + CLI features and the `feature-check` matrix in `.github/workflows/ci.yml`

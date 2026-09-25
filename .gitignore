@@ -42,6 +42,8 @@ docs/superpowers/
 !/scripts/sync-doc-counts.py
 !/scripts/inject-page-meta.py
 !/scripts/patch-coverage.py
+!/scripts/integration-coverage.py
+!/scripts/test_integration_coverage.py
 
 # Benchmark generated artifacts (harness + configs are tracked; outputs are not)
 /.bench-venv/
