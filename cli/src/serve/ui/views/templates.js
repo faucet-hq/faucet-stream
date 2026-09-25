@@ -79,8 +79,8 @@ export async function renderTemplates(container) {
       </div>
       <div class="tpl-list-head" id="t-list-head" hidden>
         <span>status</span>
-        <span>kind</span>
         <button type="button" class="tpl-sort" data-sort="name">name<span class="tpl-sort-caret"></span></button>
+        <span>kind</span>
         <button type="button" class="tpl-sort tpl-col-r" data-sort="updated">last updated<span class="tpl-sort-caret"></span></button>
         <span class="tpl-col-r">live</span>
         <span class="tpl-col-r">newest</span>
@@ -312,11 +312,11 @@ function listRow(t) {
   const live = st.stable == null ? "—" : `v${st.stable}`;
   el.innerHTML = `
     ${statusPill(st.status || "draft")}
-    <span class="tpl-row-kind">${kindPill(kindOf(t))}</span>
     <span class="tpl-row-id">
       <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b></span>
       ${t.description ? `<span class="tpl-row-desc">${escapeHtml(t.description)}</span>` : ""}
     </span>
+    <span class="tpl-row-kind">${kindPill(kindOf(t))}</span>
     <span class="run-meta" data-l="updated" title="last registered / updated">${fmtTime(t.created_at)}</span>
     <span class="run-meta" data-l="live" title="live version — what an unpinned run uses">${live}</span>
     <span class="run-meta" data-l="newest" title="newest registered build">v${st.newest ?? t.version}</span>
