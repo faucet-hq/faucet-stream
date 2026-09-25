@@ -616,6 +616,7 @@ function renderVersions(host, id, st, d, reload) {
   for (const v of st.versions) {
     const row = document.createElement("div");
     row.className = "tpl-version" + (st.stable === v ? " tpl-version-live" : "");
+    row.dataset.version = String(v);
     const pills = channelsFor(v, st)
       .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
       .join("");
@@ -739,10 +740,6 @@ async function renderSinkPairings(host, id) {
  *  template + version, and the param fields are the union of both. */
 async function renderTrigger(host, id, st, d, withSink = false, preselectSink = null) {
   const ownParams = d.params || {};
-  // Only offer channels that actually resolve — an unset one would just 422.
-  const choices = ["stable", "newest", "previous", ...Object.keys(st.tags).sort()].filter(
-    (c) => channelTarget(c, st) != null,
-  );
   let sinks = [];
   let overlays = [];
   if (withSink) {
@@ -750,7 +747,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       const data = await api("/v1/templates?kind=sink-template");
       sinks = (data.templates || []).filter((s) => ((s.state || {}).status || "draft") !== "deprecated");
       const ov = await api("/v1/templates?kind=deployment");
-      overlays = (ov.templates || []).filter((o) => ((o.state || {}).status || "draft") === "launched");
+      overlays = (ov.templates || []).filter((o) => ((o.state || {}).status || "draft") !== "deprecated");
     } catch (e) {
       host.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
       return;
@@ -768,25 +765,20 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       ${withSink ? `<p class="tpl-desc">Every stream of <b class="mono">${escapeHtml(id)}</b> lands in the chosen sink; the write mode per stream is resolved against the sink's capabilities when the run is submitted.</p>` : ""}
       <fieldset class="submit-opts tpl-trigger-opts">
         <label>version
-          <select id="tg-version">
-            ${choices.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}${channelTarget(c, st) != null ? ` (v${channelTarget(c, st)})` : ""}</option>`).join("")}
-            ${st.versions.map((v) => `<option value="${v}">v${v} (pinned)</option>`).join("")}
-          </select>
+          <select id="tg-version">${versionOptions(st)}</select>
         </label>
         ${withSink ? `
         <label class="tpl-field-wide">sink template <select id="tg-sink">${sinkOptions}</select></label>
         <label>sink version
-          <select id="tg-sink-version">
-            <option value="stable">stable</option>
-            <option value="newest">newest</option>
-          </select>
+          <select id="tg-sink-version"></select>
         </label>
         <label class="tpl-field-wide" title="state, DLQ, notifications and SLA for this run">deployment
           <select id="tg-overlay">
             <option value="">none</option>
             ${overlays.map((o) => `<option value="${escapeHtml(o.id)}" title="${escapeHtml(o.description || "")}">${escapeHtml(o.id)}</option>`).join("")}
           </select>
-        </label>` : ""}
+        </label>
+        <label>deployment version <select id="tg-overlay-version" disabled><option value="">—</option></select></label>` : ""}
         <label>run name <input id="tg-name" placeholder="optional" /></label>
       </fieldset>
       <div id="tg-params" class="tpl-params"></div>
@@ -798,19 +790,64 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   const sinkSel = host.querySelector("#tg-sink");
   const overlaySel = host.querySelector("#tg-overlay");
   if (sinkSel && preselectSink && sinks.some((s) => s.id === preselectSink)) sinkSel.value = preselectSink;
-  // The params the trigger binds: the template's own, plus (for a source
-  // template) the selected sink's — the same merge the server performs.
+  const overlayVersionSel = host.querySelector("#tg-overlay-version");
+  // A sink's or deployment's version list is its own: rebuild the picker
+  // whenever the template changes, defaulting to the live release.
+  const fillVersions = (sel, tpl) => {
+    if (!sel) return;
+    const state = (tpl && tpl.state) || null;
+    sel.disabled = !state;
+    sel.innerHTML = state ? versionOptions(state) : `<option value="">—</option>`;
+  };
+  const refillSinkVersions = () => fillVersions(host.querySelector("#tg-sink-version"), sinks.find((s) => s.id === sinkSel.value));
+  const refillOverlayVersions = () =>
+    fillVersions(overlayVersionSel, overlaySel.value ? overlays.find((o) => o.id === overlaySel.value) : null);
+  if (sinkSel) refillSinkVersions();
+  if (overlaySel) refillOverlayVersions();
+  // The params the trigger binds: the selected version's own, plus (for a
+  // source template) the selected sink version's — the same merge the server
+  // performs. Each version can declare a different set, so both are fetched
+  // for the version actually chosen, not the one the page loaded.
+  const versionSel = host.querySelector("#tg-version");
+  const sinkVersionSel = host.querySelector("#tg-sink-version");
+  const recordCache = new Map();
+  const paramsOf = async (tid, version) => {
+    const key = `${tid}@${version}`;
+    if (!recordCache.has(key)) {
+      recordCache.set(
+        key,
+        api(`/v1/templates/${encodeURIComponent(tid)}?version=${encodeURIComponent(version)}`).then(
+          (r) => r.params || {},
+          (e) => { recordCache.delete(key); throw e; },
+        ),
+      );
+    }
+    return recordCache.get(key);
+  };
   let params = ownParams;
-  const renderParams = () => {
-    params = { ...ownParams };
-    if (sinkSel) {
-      const sink = sinks.find((s) => s.id === sinkSel.value);
-      for (const [n, spec] of Object.entries((sink && sink.params) || {})) params[n] = { ...spec, fromSink: sink.id };
+  let renderSeq = 0;
+  const renderParams = async () => {
+    const seq = ++renderSeq;
+    const typed = {};
+    for (const el of paramHost.querySelectorAll("[data-name]")) if (el.value !== "") typed[el.dataset.name] = el.value;
+    let next;
+    try {
+      next = { ...(await paramsOf(id, versionSel.value)) };
+      if (sinkSel) {
+        const sinkParams = await paramsOf(sinkSel.value, sinkVersionSel.value);
+        for (const [n, spec] of Object.entries(sinkParams)) next[n] = { ...spec, fromSink: sinkSel.value };
+      }
+      if (overlaySel && overlaySel.value) {
+        const overlayParams = await paramsOf(overlaySel.value, overlayVersionSel.value);
+        for (const [n, spec] of Object.entries(overlayParams)) next[n] = { ...spec, fromOverlay: overlaySel.value };
+      }
+    } catch (e) {
+      if (seq !== renderSeq) return;
+      paramHost.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      return;
     }
-    if (overlaySel && overlaySel.value) {
-      const o = overlays.find((x) => x.id === overlaySel.value);
-      for (const [n, spec] of Object.entries((o && o.params) || {})) params[n] = { ...spec, fromOverlay: o.id };
-    }
+    if (seq !== renderSeq) return;
+    params = next;
     // Computed params are derived from other params, not supplied — exclude them
     // from the trigger form (supplying one is rejected server-side, #573).
     const names = Object.keys(params).filter((n) => params[n].computed == null);
@@ -818,11 +855,36 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     if (!names.length) {
       paramHost.innerHTML = `<p class="tpl-desc">${withSink ? "Neither template declares parameters." : "This template declares no parameters."}</p>`;
     }
-    for (const name of names) paramHost.appendChild(paramField(name, params[name] || {}));
+    for (const name of names) {
+      const field = paramField(name, params[name] || {});
+      const input = field.querySelector("[data-name]");
+      if (input && typed[name] !== undefined) input.value = typed[name];
+      paramHost.appendChild(field);
+    }
   };
+  // The version rows above the form pick the version to run: clicking one
+  // selects it here, and the row that matches the selection stays marked.
+  const rows = [...(host.closest(".page") || document).querySelectorAll(".tpl-version[data-version]")];
+  const markPicked = () => {
+    const picked = /^\d+$/.test(versionSel.value) ? Number(versionSel.value) : channelTarget(versionSel.value, st);
+    for (const r of rows) r.classList.toggle("tpl-version-picked", Number(r.dataset.version) === picked);
+  };
+  for (const r of rows) {
+    r.title = `run v${r.dataset.version}`;
+    r.onclick = (ev) => {
+      if (ev.target.closest("button, select, a, pre")) return;
+      versionSel.value = r.dataset.version;
+      markPicked();
+      renderParams();
+    };
+  }
+  markPicked();
   renderParams();
-  if (sinkSel) sinkSel.onchange = renderParams;
-  if (overlaySel) overlaySel.onchange = renderParams;
+  versionSel.onchange = () => { markPicked(); renderParams(); };
+  if (sinkSel) sinkSel.onchange = () => { refillSinkVersions(); renderParams(); };
+  if (sinkVersionSel) sinkVersionSel.onchange = renderParams;
+  if (overlaySel) overlaySel.onchange = () => { refillOverlayVersions(); renderParams(); };
+  if (overlayVersionSel) overlayVersionSel.onchange = renderParams;
 
   const out = host.querySelector("#tg-out");
   host.querySelector("#tg-go").onclick = async () => {
@@ -837,7 +899,10 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       body.sink = sinkSel.value;
       body.sink_version = host.querySelector("#tg-sink-version").value;
     }
-    if (overlaySel && overlaySel.value) body.overlay = overlaySel.value;
+    if (overlaySel && overlaySel.value) {
+      body.overlay = overlaySel.value;
+      body.overlay_version = overlayVersionSel.value;
+    }
     if (Object.keys(supplied).length) body.params = supplied;
     const name = host.querySelector("#tg-name").value.trim();
     if (name) body.name = name;
@@ -886,12 +951,25 @@ function paramField(name, p) {
   return field;
 }
 
+/** Options for a version picker: every channel that resolves (with its target),
+ *  then every stored version pinned. `stable` comes first when launched, else
+ *  `newest`, so the default selection is always runnable. */
+function versionOptions(state) {
+  const channels = ["stable", "newest", "previous", ...Object.keys(state.tags || {}).sort()].filter(
+    (c) => channelTarget(c, state) != null,
+  );
+  return [
+    ...channels.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)} (v${channelTarget(c, state)})</option>`),
+    ...(state.versions || []).map((v) => `<option value="${v}">v${v} (pinned)</option>`),
+  ].join("");
+}
+
 /** The version a channel currently resolves to, or null when unset. */
 function channelTarget(channel, st) {
   if (channel === "stable") return st.stable;
   if (channel === "previous") return st.previous;
   if (channel === "newest") return st.newest;
-  const v = st.tags[channel];
+  const v = (st.tags || {})[channel];
   return v === undefined ? null : v;
 }
 

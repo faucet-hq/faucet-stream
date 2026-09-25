@@ -1286,6 +1286,8 @@ select {
   border-radius: var(--r);
 }
 .tpl-version-live { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+.tpl-version[data-version] { cursor: pointer; }
+.tpl-version-picked { box-shadow: 0 0 0 2px var(--brand-ring); background: color-mix(in srgb, var(--brand-tint) 55%, var(--surface)); }
 .tpl-vnum { font-weight: 700; font-size: 0.9rem; }
 .tpl-vchannels { display: flex; flex-wrap: wrap; gap: 5px; }
 .tpl-assign { max-width: 160px; }
