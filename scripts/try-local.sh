@@ -138,7 +138,7 @@ launch_ui() {
   hdr "Starting the web console on ${base}"
   # Run from DEMO_DIR so submitted configs' ./data and ./out paths resolve.
   ( cd "$DEMO_DIR" && exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" \
-      --no-auth --history "sqlite:./faucet-meta.db" ) >"${DEMO_DIR}/serve.log" 2>&1 &
+      --no-auth --history "sqlite:./faucet-meta.db" --preview-local-outputs ) >"${DEMO_DIR}/serve.log" 2>&1 &
   SERVE_PID=$!
   trap 'echo; info "Stopping web console (pid '"$SERVE_PID"')"; stop_serve; exit 0' INT TERM
 
