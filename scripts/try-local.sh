@@ -200,6 +200,11 @@ launch_ui() {
           -H 'content-type: application/json' -d "$body"
       fi
     fi
+    # A demo catalog big enough to show the Templates list, its filters and the
+    # compatibility grid at volume: 10 source + 10 sink templates across several
+    # owners and lifecycle states. Idempotent — existing ids are left alone.
+    info "Seeding the demo template catalog…"
+    python3 "${REPO_ROOT}/scripts/demo_catalog.py" "${base}" || info "  (demo catalog seeding reported failures — continuing)"
   else
     info "python3/curl unavailable — the console will start empty; use the Submit tab."
   fi
