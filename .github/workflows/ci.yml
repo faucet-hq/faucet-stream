@@ -341,6 +341,7 @@ jobs:
           - source-duckdb
           - source-sqs
           - source-nats
+          - source-rabbitmq
           - source-sftp
           - source-s3
           - source-mongodb
@@ -372,6 +373,7 @@ jobs:
           - sink-duckdb
           - sink-sqs
           - sink-nats
+          - sink-rabbitmq
           - sink-sftp
           - sink-s3
           - sink-mongodb
@@ -409,6 +411,8 @@ jobs:
           - file-formats
           # Mutual-TLS client-certificate auth on the HTTP sources (#495)
           - mtls
+          # TLS (amqps://) on the RabbitMQ pair (#561)
+          - "source-rabbitmq,sink-rabbitmq,rabbitmq-tls"
           # OAuth1 request-signing auth provider (#496)
           - oauth1
           # Opt-in Arrow columnar record path (RFC 0002 / #375)
@@ -719,37 +723,45 @@ jobs:
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      # Cover unit + integration tests. The integration tests boot Docker
-      # testcontainers whose image pulls intermittently flake, so retry the run
-      # like the `test` job does — the final successful attempt re-runs the whole
-      # suite, so the reported coverage is always complete. Split run
-      # (--no-report) from report so the suite can be retried without
-      # regenerating the report each attempt. (cargo-llvm-cov 0.8.5 forbids
-      # combining --no-report with --no-clean, so the run uses --no-report alone.)
-      - name: Collect coverage (unit + integration)
+      # Cover unit + integration tests, and keep the integration-only share
+      # separately (#695): run the integration test binaries (each crate's
+      # `tests/` targets) first, report, set their profiles aside, run the unit
+      # tests (lib + bin targets), report, then merge both for the combined
+      # report. Every test still runs exactly once. The integration tests boot
+      # Docker testcontainers whose image pulls intermittently flake, so each
+      # half is retried like the `test` job does.
+      - name: Collect coverage (integration, then unit)
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        env:
+          IGNORE_RE: '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
         run: |
+          retry() {
+            for attempt in 1 2 3; do
+              echo "::group::$* (attempt $attempt)"
+              if "$@"; then echo "::endgroup::"; return 0; fi
+              echo "::endgroup::"
+              echo "::warning::'$*' failed on attempt $attempt (often a flaky Docker image pull); retrying in 20s"
+              sleep 20
+            done
+            echo "::error::'$*' failed after 3 attempts"; return 1
+          }
           cargo llvm-cov clean --workspace
-          ok=0
-          for attempt in 1 2 3; do
-            echo "::group::instrumented tests (attempt $attempt)"
-            if cargo llvm-cov --no-report --workspace --all-features; then
-              echo "::endgroup::"; ok=1; break
-            fi
-            echo "::endgroup::"
-            echo "::warning::instrumented tests failed on attempt $attempt (often a flaky Docker image pull); retrying in 20s"
-            sleep 20
-          done
-          [ "$ok" = 1 ] || { echo "::error::instrumented tests failed after 3 attempts"; exit 1; }
-      - name: Generate lcov report
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
-        run: |
-          # The GCS data-plane I/O files are untestable in CI (no
-          # gRPC-compatible GCS emulator; integration tests are #[ignore]d, #220)
-          # so they are excluded here, in codecov.yml, and in
+          rm -f target/*.profraw
+          eval "$(cargo llvm-cov show-env --sh)"
+          retry cargo test --workspace --all-features --test '*'
+          cargo llvm-cov report --lcov --output-path integration.lcov --ignore-filename-regex "$IGNORE_RE"
+          mkdir -p target/profraw-integration
+          mv target/*.profraw target/profraw-integration/
+          retry cargo test --workspace --all-features --lib --bins
+          cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
+          mv target/profraw-integration/*.profraw target/
+          # The staged-load execution shims need a live warehouse that can reach
+          # a live bucket, so they are excluded here, in codecov.yml, and in
           # scripts/patch-coverage.py (all three kept in sync).
-          cargo llvm-cov report --lcov --output-path lcov.info \
-            --ignore-filename-regex '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/source/gcs/src/stream\.rs$|crates/source/gcs/src/parquet_range\.rs$|crates/sink/gcs/src/sink\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
+          cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$IGNORE_RE"
+      - name: Test the coverage gate scripts
+        if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Enforce >=95% patch coverage
         # The project standard is >=95% coverage of changed lines. `codecov/patch`
         # reports the same number but posts unreliably — of the eight PRs merged
@@ -770,6 +782,20 @@ jobs:
             --lcov lcov.info \
             --base "origin/${{ github.base_ref }}" \
             --min 95
+      - name: Require integration tests for changed I/O code
+        # Changed connector / state-store / serve / executor lines must run in
+        # an integration test, not only a unit test (#695). A PR description
+        # line `no-integration-test: <reason>` downgrades a failure to a
+        # warning; the job summary shows the per-file table either way.
+        if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 scripts/integration-coverage.py \
+            --lcov integration.lcov \
+            --unit-lcov unit.lcov \
+            --base "origin/${{ github.base_ref }}" \
+            --min 60
       - name: Upload to Codecov
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         # `continue-on-error` keeps a Codecov outage from failing the build — the
@@ -783,4 +809,22 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
+          fail_ci_if_error: true
+      - name: Upload unit coverage to Codecov
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: unit.lcov
+          flags: unit
+          fail_ci_if_error: true
+      - name: Upload integration coverage to Codecov
+        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: integration.lcov
+          flags: integration
           fail_ci_if_error: true
