@@ -37,7 +37,7 @@ Straight with you — for its core job it's excellent:
 |---|---|---|
 | Language / runtime | Rust, single binary | Go, single binary |
 | Orientation | discrete runs to completion | continuous stream processing |
-| Connectors | <!--COUNT:connectors-->66<!--/COUNT--> source/sink, ETL/CDC/warehouse | hundreds of components/processors |
+| Connectors | <!--COUNT:connectors-->68<!--/COUNT--> source/sink, ETL/CDC/warehouse | hundreds of components/processors |
 | Change data capture | ✓ engine-level | some CDC inputs (several enterprise-gated) |
 | Warehouse / ELT sinks | ✓ BigQuery, Snowflake, Iceberg, Delta, … | more messaging/stream-oriented |
 | Governance in-path (quality / contracts / masking / lineage / SLA) | ✓ native | ✗ |

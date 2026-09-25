@@ -23,6 +23,7 @@
 //! | `source-duckdb` | DuckDB query source |
 //! | `source-sqs` | AWS SQS source |
 //! | `source-nats` | NATS source |
+//! | `source-rabbitmq` | RabbitMQ (AMQP 0.9.1) queue source |
 //! | `source-sftp` | SFTP source |
 
 //! | `source-s3` | AWS S3 file source |
@@ -51,6 +52,7 @@
 //! | `sink-duckdb` | DuckDB sink |
 //! | `sink-sqs` | AWS SQS sink |
 //! | `sink-nats` | NATS sink |
+//! | `sink-rabbitmq` | RabbitMQ (AMQP 0.9.1) publish sink |
 //! | `sink-sftp` | SFTP sink |
 
 //! | `sink-s3` | AWS S3 file sink |
@@ -148,6 +150,11 @@ pub mod source {
     #[cfg(feature = "source-nats")]
     pub mod nats {
         pub use faucet_source_nats::*;
+    }
+
+    #[cfg(feature = "source-rabbitmq")]
+    pub mod rabbitmq {
+        pub use faucet_source_rabbitmq::*;
     }
 
     #[cfg(feature = "source-sftp")]
@@ -332,6 +339,11 @@ pub mod source {
     #[cfg(feature = "source-nats")]
     pub mod nats {
         pub use faucet_source_nats::*;
+    }
+
+    #[cfg(feature = "source-rabbitmq")]
+    pub mod rabbitmq {
+        pub use faucet_source_rabbitmq::*;
     }
 
     #[cfg(feature = "source-sftp")]
@@ -526,6 +538,11 @@ pub mod sink {
         pub use faucet_sink_nats::*;
     }
 
+    #[cfg(feature = "sink-rabbitmq")]
+    pub mod rabbitmq {
+        pub use faucet_sink_rabbitmq::*;
+    }
+
     #[cfg(feature = "sink-sftp")]
     pub mod sftp {
         pub use faucet_sink_sftp::*;
@@ -665,6 +682,13 @@ pub mod common_pubsub {
 #[cfg(any(feature = "source-clickhouse", feature = "sink-clickhouse"))]
 pub mod common_clickhouse {
     pub use faucet_common_clickhouse::*;
+}
+
+/// Shared RabbitMQ types (connection/auth/TLS config, value formats, exchange
+/// kinds), re-exported when either RabbitMQ connector is enabled.
+#[cfg(any(feature = "source-rabbitmq", feature = "sink-rabbitmq"))]
+pub mod common_rabbitmq {
+    pub use faucet_common_rabbitmq::*;
 }
 
 /// Shared Azure Blob / ADLS Gen2 types (credentials enum, object-store builder),

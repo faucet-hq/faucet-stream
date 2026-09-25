@@ -180,5 +180,5 @@ faucet run cli/examples/csv_to_jsonl.yaml   # no infra needed
 ---
 
 *faucet-stream is an MIT/Apache-2.0 Rust library + CLI for moving data between
-<!--COUNT:sources-->37<!--/COUNT--> sources and <!--COUNT:sinks-->29<!--/COUNT--> sinks. [Docs](https://faucet-hq.github.io/faucet-stream/) ·
+<!--COUNT:sources-->38<!--/COUNT--> sources and <!--COUNT:sinks-->30<!--/COUNT--> sinks. [Docs](https://faucet-hq.github.io/faucet-stream/) ·
 [GitHub](https://github.com/faucet-hq/faucet-stream).*

@@ -1,0 +1,27 @@
+# RabbitMQ → JSONL. Runs against a local RabbitMQ:
+#   docker run -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+#   faucet run cli/examples/rabbitmq_to_jsonl.yaml
+#
+# Each page's messages are acknowledged only after the JSONL sink has written
+# and flushed them (ack_mode: on_sink_confirm), so a crash redelivers instead
+# of losing messages.
+version: 1
+name: rabbitmq_to_jsonl
+pipeline:
+  source:
+    type: rabbitmq
+    config:
+      url: "amqp://guest:guest@127.0.0.1:5672/%2f"
+      queue: orders
+      bindings:
+        - exchange: events
+          exchange_kind: topic
+          routing_key: "orders.*"
+      ack_mode: on_sink_confirm
+      include_metadata: true
+      idle_timeout_secs: 5     # at least one of idle_timeout_secs / max_messages is required
+      batch_size: 500
+  sink:
+    type: jsonl
+    config:
+      path: ./out/rabbitmq_orders.jsonl

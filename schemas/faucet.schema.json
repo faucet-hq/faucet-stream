@@ -17652,6 +17652,222 @@
             "type"
           ],
           "additionalProperties": false
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for [`RabbitMqSource`](crate::RabbitMqSource).\n\nThe [`RabbitMqConnectionConfig`] surface (`url` / `host` / `port` / `vhost`\n/ `auth` / `tls` / …) is flattened in:\n\n```yaml\nurl: \"amqp://guest:guest@127.0.0.1:5672/%2f\"\nqueue: orders\nidle_timeout_secs: 5\nbatch_size: 500\n```",
+                  "properties": {
+                    "ack_mode": {
+                      "$ref": "#/$defs/source_rabbitmq__AckMode",
+                      "default": "on_sink_confirm",
+                      "description": "When deliveries are acknowledged. Defaults to `on_sink_confirm`."
+                    },
+                    "auth": {
+                      "$ref": "#/$defs/source_rabbitmq__RabbitMqAuth",
+                      "default": {
+                        "type": "none"
+                      },
+                      "description": "Authentication. Defaults to [`RabbitMqAuth::None`]."
+                    },
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Messages per emitted page (and per acknowledgement under\n`on_sink_confirm`). Defaults to [`DEFAULT_BATCH_SIZE`]. `0` drains the\nwhole run window into one page.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "bindings": {
+                      "description": "Exchange → queue bindings to declare before consuming.",
+                      "items": {
+                        "$ref": "#/$defs/source_rabbitmq__RabbitMqBinding"
+                      },
+                      "type": "array"
+                    },
+                    "connect_retries": {
+                      "default": 0,
+                      "description": "Extra TCP connect attempts (exponential backoff) before giving up.\nDefaults to 0 — an unreachable broker fails immediately.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connect_timeout_secs": {
+                      "default": 30,
+                      "description": "Upper bound, in seconds, on establishing the connection (TCP + AMQP\nhandshake, including any retries). Defaults to 30.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connection_name": {
+                      "description": "Client connection name shown in the RabbitMQ management UI.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "consumer_tag": {
+                      "description": "Consumer tag. Defaults to a broker-generated one.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "declare_queue": {
+                      "default": true,
+                      "description": "Declare the queue before consuming (idempotent when it already exists\nwith the same properties). Defaults to `true`. Set `false` to consume\na queue managed elsewhere (it must exist).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "heartbeat_secs": {
+                      "description": "Requested heartbeat interval in seconds (`0` disables heartbeats).\nUnset uses the broker's proposal.",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "host": {
+                      "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "idle_timeout_secs": {
+                      "description": "Stop after this many seconds with no new message. At least one of\n`max_messages` / `idle_timeout_secs` must be set so a run terminates.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "include_metadata": {
+                      "default": false,
+                      "description": "Wrap each record as `{ \"data\": <body>, \"exchange\", \"routing_key\",\n\"delivery_tag\", \"redelivered\", \"headers\", … }` instead of emitting the\ndecoded body alone. Defaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "max_messages": {
+                      "description": "Stop after this many messages. At least one of `max_messages` /\n`idle_timeout_secs` must be set so a run terminates.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "on_decode_error": {
+                      "$ref": "#/$defs/source_rabbitmq__OnDecodeError",
+                      "default": "fail",
+                      "description": "What to do with a body that fails to decode. Defaults to `fail`."
+                    },
+                    "port": {
+                      "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "prefetch": {
+                      "description": "Consumer QoS window: the most unacknowledged deliveries the broker\nsends ahead. `0` is unlimited. Defaults to `batch_size` (capped at\n65535; unlimited when `batch_size` is 0 or larger than 65535). Under\n`ack_mode: on_sink_confirm` it must be `0` or ≥ `batch_size`, or the\nbroker would stop delivering before a page could fill.",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "queue": {
+                      "description": "Queue to consume from.",
+                      "type": "string"
+                    },
+                    "queue_durable": {
+                      "default": true,
+                      "description": "Whether a declared queue is durable (survives a broker restart).\nDefaults to `true`. Must match an existing queue's durability.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/source_rabbitmq__RabbitMqTls",
+                      "default": {
+                        "enabled": false
+                      },
+                      "description": "TLS settings. Disabled by default."
+                    },
+                    "url": {
+                      "description": "Full AMQP URI, e.g. `amqp://user:pass@rabbit:5672/%2f` (the vhost is\nURL-encoded; `%2f` is `/`). `amqps://` selects TLS. Mutually exclusive\nwith `host`/`port`/`vhost`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "value_format": {
+                      "$ref": "#/$defs/source_rabbitmq__RabbitMqValueFormat",
+                      "default": "json",
+                      "description": "How message bodies decode into records. Defaults to `json`."
+                    },
+                    "vhost": {
+                      "description": "Virtual host. Defaults to `/`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "title": "RabbitMqSourceConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "rabbitmq"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "rabbitmq",
+          "type": "object"
         }
       ]
     },
@@ -20856,6 +21072,191 @@
             "type"
           ],
           "additionalProperties": false
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for [`RabbitMqSink`](crate::RabbitMqSink).\n\nExactly one of `routing_key` (static), `routing_key_field` (top-level\nrecord field) or `routing_key_jsonpath` (JSONPath into the record) selects\neach message's routing key. With the default exchange (`\"\"`) the routing\nkey is the destination queue name.\n\n```yaml\nurl: \"amqp://guest:guest@127.0.0.1:5672/%2f\"\nexchange: events\nexchange_kind: topic\nrouting_key_field: event_type\n```",
+                  "properties": {
+                    "auth": {
+                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqAuth",
+                      "default": {
+                        "type": "none"
+                      },
+                      "description": "Authentication. Defaults to [`RabbitMqAuth::None`]."
+                    },
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Messages published before waiting on their confirms. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` publishes the whole batch handed over by\nthe pipeline at once.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "confirm": {
+                      "default": true,
+                      "description": "Enable publisher confirms: every batch waits for the broker to\nacknowledge each message before the write returns. Defaults to `true`\n(the reliable setting — without it a broker-side failure is invisible).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "connect_retries": {
+                      "default": 0,
+                      "description": "Extra TCP connect attempts (exponential backoff) before giving up.\nDefaults to 0 — an unreachable broker fails immediately.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connect_timeout_secs": {
+                      "default": 30,
+                      "description": "Upper bound, in seconds, on establishing the connection (TCP + AMQP\nhandshake, including any retries). Defaults to 30.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connection_name": {
+                      "description": "Client connection name shown in the RabbitMQ management UI.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "exchange": {
+                      "default": "",
+                      "description": "Exchange to publish to. Defaults to `\"\"`, the default exchange, which\nroutes each message to the queue named by its routing key.",
+                      "type": "string"
+                    },
+                    "exchange_kind": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_rabbitmq__RabbitMqExchangeKind"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "When set, `exchange` is declared (durable) with this type before the\nfirst publish; otherwise it must already exist. Not allowed with the\ndefault exchange."
+                    },
+                    "heartbeat_secs": {
+                      "description": "Requested heartbeat interval in seconds (`0` disables heartbeats).\nUnset uses the broker's proposal.",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "host": {
+                      "description": "Broker host. Defaults to `127.0.0.1` when `url` is not set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mandatory": {
+                      "default": false,
+                      "description": "Publish with the `mandatory` flag: a message no queue is bound to\nreceive is returned by the broker and surfaces as a per-row error\n(DLQ-routable) instead of being silently dropped. Requires `confirm`.\nDefaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "persistent": {
+                      "default": true,
+                      "description": "Publish with delivery mode 2 (persisted to disk on durable queues).\nDefaults to `true`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "port": {
+                      "description": "Broker port. Defaults to `5672` (`5671` with TLS).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "routing_key": {
+                      "description": "Static routing key for every message.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "routing_key_field": {
+                      "description": "Top-level record field whose value (string, number or bool) is the\nrouting key.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "routing_key_jsonpath": {
+                      "description": "JSONPath (e.g. `$.meta.route`) whose first match is the routing key.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqTls",
+                      "default": {
+                        "enabled": false
+                      },
+                      "description": "TLS settings. Disabled by default."
+                    },
+                    "url": {
+                      "description": "Full AMQP URI, e.g. `amqp://user:pass@rabbit:5672/%2f` (the vhost is\nURL-encoded; `%2f` is `/`). `amqps://` selects TLS. Mutually exclusive\nwith `host`/`port`/`vhost`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "value_format": {
+                      "$ref": "#/$defs/sink_rabbitmq__RabbitMqValueFormat",
+                      "default": "json",
+                      "description": "How records encode into message bodies. Defaults to `json`."
+                    },
+                    "vhost": {
+                      "description": "Virtual host. Defaults to `/`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "title": "RabbitMqSinkConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "type": {
+              "const": "rabbitmq"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "rabbitmq",
+          "type": "object"
         }
       ]
     },
@@ -20864,6 +21265,321 @@
       "type": "string",
       "enum": [
         "pipeline"
+      ]
+    },
+    "sink_rabbitmq__RabbitMqAuth": {
+      "description": "RabbitMQ authentication.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape. The\nhand-written [`std::fmt::Debug`] never prints the password.",
+      "oneOf": [
+        {
+          "description": "No explicit credentials: the userinfo embedded in `url` is used, or the\nAMQP default (`guest`/`guest`, which RabbitMQ only accepts from\nloopback).",
+          "properties": {
+            "type": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "SASL `PLAIN` username + password. Overrides any userinfo in `url`.",
+          "properties": {
+            "config": {
+              "properties": {
+                "password": {
+                  "description": "The password.",
+                  "type": "string"
+                },
+                "username": {
+                  "description": "The username.",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "plain",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "SASL `EXTERNAL` — the broker authenticates the TLS client certificate\n(requires `tls.enabled` plus `tls.client_cert_path`/`client_key_path`).",
+          "properties": {
+            "type": {
+              "const": "external",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "sink_rabbitmq__RabbitMqExchangeKind": {
+      "description": "An AMQP exchange type, used when a connector declares an exchange.",
+      "oneOf": [
+        {
+          "const": "direct",
+          "description": "Route on an exact routing-key match.",
+          "type": "string"
+        },
+        {
+          "const": "fanout",
+          "description": "Broadcast to every bound queue, ignoring the routing key.",
+          "type": "string"
+        },
+        {
+          "const": "topic",
+          "description": "Route on a dotted routing-key pattern (`*` one word, `#` zero or more).",
+          "type": "string"
+        },
+        {
+          "const": "headers",
+          "description": "Route on message header values.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_rabbitmq__RabbitMqTls": {
+      "additionalProperties": true,
+      "description": "TLS (`amqps://`) settings. Server certificates are always verified — there\nis no insecure mode.",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of extra CA certificates to trust (in addition to the\nplatform's native root store) — for brokers with a private CA.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key_path": {
+          "description": "PEM PKCS#8 private key for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": false,
+          "description": "Connect over TLS. Also implied by an `amqps://` `url`. Requires the\nconnector's `tls` Cargo feature.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "sink_rabbitmq__RabbitMqValueFormat": {
+      "description": "How a message body maps to and from a JSON record.",
+      "oneOf": [
+        {
+          "const": "json",
+          "description": "The body is a JSON document. The source fails (or skips, per\n`on_decode_error`) a body that is not valid JSON; the sink serializes\neach record as JSON.",
+          "type": "string"
+        },
+        {
+          "const": "string",
+          "description": "The body is UTF-8 text, emitted as a JSON string. The sink requires\nstring records.",
+          "type": "string"
+        },
+        {
+          "const": "bytes",
+          "description": "The body is opaque bytes, emitted as a standard base64 JSON string. The\nsink requires base64 string records.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_rabbitmq__AckMode": {
+      "description": "When deliveries are acknowledged to the broker.",
+      "oneOf": [
+        {
+          "const": "on_sink_confirm",
+          "description": "At-least-once: a page's deliveries are acknowledged only after the\npipeline has written **and flushed** that page to the sink. A crash or\nfailed write before that leaves them unacknowledged, and the broker\nredelivers them — duplicates are possible, loss is not.",
+          "type": "string"
+        },
+        {
+          "const": "auto",
+          "description": "At-most-once: the broker considers a message delivered as soon as it is\nsent (`no_ack`). Fastest, but a crash loses in-flight messages.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_rabbitmq__OnDecodeError": {
+      "description": "What to do with a message whose body does not decode under `value_format`.",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Fail the run. The message stays unacknowledged and is redelivered.",
+          "type": "string"
+        },
+        {
+          "const": "skip",
+          "description": "Reject the message without requeue — it is dropped, or routed to the\nqueue's dead-letter exchange when one is configured — and continue.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_rabbitmq__RabbitMqAuth": {
+      "description": "RabbitMQ authentication.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape. The\nhand-written [`std::fmt::Debug`] never prints the password.",
+      "oneOf": [
+        {
+          "description": "No explicit credentials: the userinfo embedded in `url` is used, or the\nAMQP default (`guest`/`guest`, which RabbitMQ only accepts from\nloopback).",
+          "properties": {
+            "type": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "SASL `PLAIN` username + password. Overrides any userinfo in `url`.",
+          "properties": {
+            "config": {
+              "properties": {
+                "password": {
+                  "description": "The password.",
+                  "type": "string"
+                },
+                "username": {
+                  "description": "The username.",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "plain",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "SASL `EXTERNAL` — the broker authenticates the TLS client certificate\n(requires `tls.enabled` plus `tls.client_cert_path`/`client_key_path`).",
+          "properties": {
+            "type": {
+              "const": "external",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "source_rabbitmq__RabbitMqBinding": {
+      "additionalProperties": true,
+      "description": "A binding from an exchange to the consumed queue, declared before consuming.",
+      "properties": {
+        "exchange": {
+          "description": "Exchange to bind the queue to. Must not be the default exchange (`\"\"`).",
+          "type": "string"
+        },
+        "exchange_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rabbitmq__RabbitMqExchangeKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When set, the exchange is declared (durable) with this type before\nbinding; otherwise it must already exist."
+        },
+        "routing_key": {
+          "default": "",
+          "description": "Binding key (a pattern for `topic` exchanges). Defaults to `\"\"`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "source_rabbitmq__RabbitMqExchangeKind": {
+      "description": "An AMQP exchange type, used when a connector declares an exchange.",
+      "oneOf": [
+        {
+          "const": "direct",
+          "description": "Route on an exact routing-key match.",
+          "type": "string"
+        },
+        {
+          "const": "fanout",
+          "description": "Broadcast to every bound queue, ignoring the routing key.",
+          "type": "string"
+        },
+        {
+          "const": "topic",
+          "description": "Route on a dotted routing-key pattern (`*` one word, `#` zero or more).",
+          "type": "string"
+        },
+        {
+          "const": "headers",
+          "description": "Route on message header values.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_rabbitmq__RabbitMqTls": {
+      "additionalProperties": true,
+      "description": "TLS (`amqps://`) settings. Server certificates are always verified — there\nis no insecure mode.",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of extra CA certificates to trust (in addition to the\nplatform's native root store) — for brokers with a private CA.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate for mutual TLS. Must be set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key_path": {
+          "description": "PEM PKCS#8 private key for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": false,
+          "description": "Connect over TLS. Also implied by an `amqps://` `url`. Requires the\nconnector's `tls` Cargo feature.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "source_rabbitmq__RabbitMqValueFormat": {
+      "description": "How a message body maps to and from a JSON record.",
+      "oneOf": [
+        {
+          "const": "json",
+          "description": "The body is a JSON document. The source fails (or skips, per\n`on_decode_error`) a body that is not valid JSON; the sink serializes\neach record as JSON.",
+          "type": "string"
+        },
+        {
+          "const": "string",
+          "description": "The body is UTF-8 text, emitted as a JSON string. The sink requires\nstring records.",
+          "type": "string"
+        },
+        {
+          "const": "bytes",
+          "description": "The body is opaque bytes, emitted as a standard base64 JSON string. The\nsink requires base64 string records.",
+          "type": "string"
+        }
       ]
     }
   }

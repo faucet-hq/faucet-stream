@@ -68,7 +68,7 @@ S3 source in front of it.)
 inbound HTTP POST payloads → `source-webhook`; durable, replayable event stream →
 `source-kafka` or `source-redis`.
 
-## Streaming: Redis vs. Kafka vs. Kinesis
+## Streaming: Redis vs. Kafka vs. Kinesis vs. RabbitMQ
 
 - **`source-redis`** reads streams, lists, or key patterns. Great when Redis is
   already in your stack and volumes are modest.
@@ -78,10 +78,14 @@ inbound HTTP POST payloads → `source-webhook`; durable, replayable event strea
 - **`source-kinesis`** consumes AWS Kinesis Data Streams shard-by-shard with
   resumable per-shard sequence checkpoints. Use it when your event stream is
   already on AWS — same termination knobs as the Kafka source.
+- **`source-rabbitmq`** drains an AMQP 0.9.1 queue (optionally declaring it and
+  binding it to exchanges). The broker owns the position: each page is acked
+  only after the sink flushes it, so a crash redelivers instead of losing
+  messages. Use it when RabbitMQ is already your integration backbone.
 
 **Rule of thumb:** durable, high-volume event stream → Kafka (self-managed /
-Confluent) or Kinesis (AWS-native); lightweight queue/cache already on hand →
-Redis.
+Confluent) or Kinesis (AWS-native); work queues and exchange fan-out →
+RabbitMQ; lightweight queue/cache already on hand → Redis.
 
 ## HTTP APIs: REST vs. GraphQL vs. XML vs. gRPC
 
