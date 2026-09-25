@@ -1290,6 +1290,11 @@ select {
 .tpl-vchannels { display: flex; flex-wrap: wrap; gap: 5px; }
 .tpl-assign { max-width: 160px; }
 .tpl-version .btn-ghost, .tpl-version .btn-danger { padding: 5px 11px; font-size: 0.8rem; }
+.tpl-launch-wrap { overflow-x: auto; }
+.tpl-launch-tbl th:nth-child(1), .tpl-launch-tbl td:nth-child(1) { width: 4rem; }
+.tpl-launch-tbl th:nth-child(2), .tpl-launch-tbl td:nth-child(2) { width: 6rem; }
+.tpl-launch-tbl th:nth-child(3), .tpl-launch-tbl td:nth-child(3) { width: 14rem; }
+.tpl-launch-when { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tpl-body {
   grid-column: 1 / -1;
   margin: 6px 0 0;
@@ -1316,6 +1321,13 @@ select {
   border: 1px solid var(--border);
   border-radius: var(--r);
 }
+/* Trigger options: a grid of label-over-control fields, so every control lines up. */
+.submit-opts.tpl-trigger-opts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 18px; align-items: end; margin: 0; padding: 0; border: 0; background: none; }
+.tpl-trigger-opts label { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0; font-size: 0.82rem; font-weight: 600; color: var(--ink); }
+.tpl-trigger-opts label.tpl-field-wide { grid-column: span 2; }
+.tpl-trigger-opts select, .tpl-trigger-opts input:not([type="checkbox"]) { width: 100%; min-width: 0; font-weight: 400; }
+@media (max-width: 900px) { .submit-opts.tpl-trigger-opts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .submit-opts.tpl-trigger-opts { grid-template-columns: minmax(0, 1fr); } .tpl-trigger-opts label.tpl-field-wide { grid-column: auto; } }
 .tpl-params { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px 18px; }
 .tpl-param { display: flex; flex-direction: column; gap: 5px; }
 .tpl-param-name { font-size: 0.82rem; font-weight: 600; color: var(--ink); }
@@ -1338,8 +1350,12 @@ select {
 .tpl-chip.is-on { background: var(--brand-tint); border-color: var(--brand-ring); color: var(--brand); font-weight: 550; }
 
 @media (max-width: 760px) {
-  .tpl-version { grid-template-columns: 52px 1fr; row-gap: 8px; }
-  .tpl-version .tpl-assign { max-width: none; }
+  /* Number + channels on the first line, then the controls wrap as one row. */
+  .tpl-version { display: flex; flex-wrap: wrap; row-gap: 8px; }
+  .tpl-version .tpl-vnum { flex: 0 0 42px; }
+  .tpl-version .tpl-vchannels { flex: 1 1 calc(100% - 52px); }
+  .tpl-version .tpl-assign { max-width: none; flex: 1 1 100%; }
+  .tpl-version .tpl-body { flex: 1 1 100%; }
   /* The fixed column header can't line up once rows stack — hide it and let the
      rows collapse to status + name with the meta wrapping below. */
   .tpl-list-head { display: none; }

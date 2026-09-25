@@ -766,7 +766,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   host.innerHTML = `
     <div class="tpl-trigger">
       ${withSink ? `<p class="tpl-desc">Every stream of <b class="mono">${escapeHtml(id)}</b> lands in the chosen sink; the write mode per stream is resolved against the sink's capabilities when the run is submitted.</p>` : ""}
-      <fieldset class="submit-opts">
+      <fieldset class="submit-opts tpl-trigger-opts">
         <label>version
           <select id="tg-version">
             ${choices.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}${channelTarget(c, st) != null ? ` (v${channelTarget(c, st)})` : ""}</option>`).join("")}
@@ -774,14 +774,14 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
           </select>
         </label>
         ${withSink ? `
-        <label>sink template <select id="tg-sink">${sinkOptions}</select></label>
+        <label class="tpl-field-wide">sink template <select id="tg-sink">${sinkOptions}</select></label>
         <label>sink version
           <select id="tg-sink-version">
             <option value="stable">stable</option>
             <option value="newest">newest</option>
           </select>
         </label>
-        <label title="state, DLQ, notifications and SLA for this run">deployment
+        <label class="tpl-field-wide" title="state, DLQ, notifications and SLA for this run">deployment
           <select id="tg-overlay">
             <option value="">none</option>
             ${overlays.map((o) => `<option value="${escapeHtml(o.id)}">${escapeHtml(o.id)}${o.description ? ` — ${escapeHtml(o.description)}` : ""}</option>`).join("")}
@@ -910,15 +910,15 @@ function renderLaunches(host, launches) {
     return;
   }
   host.innerHTML = `
-    <table class="tbl">
+    <div class="tpl-launch-wrap"><table class="tbl tpl-launch-tbl">
       <thead><tr><th>#</th><th>version</th><th>when</th><th>by</th></tr></thead>
       <tbody>
         ${launches
           .map(
             (l) => `<tr><td class="mono">${l.seq}</td><td class="mono">v${l.version}</td>
-              <td>${fmtTime(l.launched_at)}</td><td>${escapeHtml(l.launched_by || "cli")}</td></tr>`,
+              <td class="tpl-launch-when">${fmtTime(l.launched_at)}</td><td>${escapeHtml(l.launched_by || "cli")}</td></tr>`,
           )
           .join("")}
       </tbody>
-    </table>`;
+    </table></div>`;
 }
