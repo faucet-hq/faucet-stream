@@ -434,9 +434,8 @@ fn shared_format_via_text(key: &str, format: &str) -> FaucetError {
 /// Parse file content into records for a given format. Free function (vs. a
 /// `GcsSource` method) so it is unit-testable without a GCS client — the
 /// parsing logic is pure. Previously this logic lived only inside the
-/// `parse_content` method and was duplicated by a copy in the test module;
-/// that copy could silently drift from production since the integration tests
-/// that would have caught it are `#[ignore]`d (no gRPC emulator exists).
+/// `parse_content` method and was duplicated by a copy in the test module,
+/// which could silently drift from production.
 pub(crate) fn parse_file_content(
     format: &GcsFileFormat,
     key: &str,
@@ -1075,8 +1074,7 @@ fn cap_keys(mut keys: Vec<String>, max: Option<usize>) -> Vec<String> {
 
 /// Retain only the keys owned by `shard` (hash-of-key modulo `shards`). Free
 /// function (vs. a `GcsSource` method) so the partitioning logic is
-/// unit-testable without a GCS client — constructing the source requires live
-/// credentials, and the gRPC integration tests are `#[ignore]`d (#220).
+/// unit-testable without a GCS client.
 fn filter_shard_keys(keys: Vec<String>, shard: Option<HashShard>) -> Vec<String> {
     match shard {
         Some(member) => keys.into_iter().filter(|k| member.contains(k)).collect(),

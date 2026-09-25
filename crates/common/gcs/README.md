@@ -45,7 +45,7 @@ pub async fn build_storage_control(
 - `build_credentials` resolves a `GcsCredentials` spec into a `google-cloud-auth` credential handle (the shared step both client builders call first).
 - `build_storage` returns the **data-plane** `Storage` client used by source reads and sink writes (`read_object`, `write_object`).
 - `build_storage_control` returns the **control-plane** `StorageControl` client used by source object listings (`list_objects`).
-- `storage_host` is an integration-test escape hatch — pass `None` in production. Tests target `fake-gcs-server` with `Some("http://127.0.0.1:4443")`, which sets the client endpoint.
+- `storage_host` is an integration-test escape hatch — pass `None` in production. Tests target `fake-gcs-server` with `Some("http://127.0.0.1:4443")`, which sets the client endpoint. For a plaintext (`http://`) host, `build_storage_control` returns a client whose `list_objects` and `get_object` go over the GCS JSON API: the SDK's control client speaks gRPC, which needs HTTP/2, and emulators serve HTTP/2 only behind TLS. Every other host uses the SDK's gRPC client unchanged.
 
 ## Who depends on this
 

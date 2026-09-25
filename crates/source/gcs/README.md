@@ -88,7 +88,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `compression` | enum | `auto` | *(requires the `compression` feature)* Decompression codec — `none`, `gzip`, `zstd`, or `auto`. `auto` detects `.gz` / `.zst` from the object key. |
-| `storage_host` | string | *(unset)* | Endpoint override (integration tests / emulators only, e.g. `http://localhost:4443`). Production users leave this unset. |
+| `storage_host` | string | *(unset)* | Endpoint override (integration tests / emulators only, e.g. `http://localhost:4443`). A plaintext `http://` host lists and stats objects over the JSON API, so `fake-gcs-server` works end to end. Production users leave this unset. |
 
 ## Authentication
 
@@ -392,7 +392,7 @@ Enable the connector itself in the CLI/umbrella via the `source-gcs` feature.
 | Compressed objects come through as garbled text | The `compression` feature isn't enabled, or `compression: none` is set. Build with `--features compression` and leave `compression: auto` (the default) so `.gz` / `.zst` keys are decompressed. |
 | Out-of-memory on large `raw_text` / `json_array` objects | These formats hold a whole object in memory and peak at ~`concurrency × largest-object size`. Lower `concurrency`, cap with `max_objects`, or re-emit the data as `json_lines`. |
 | Each run re-reads everything | This source has no resume bookmark. Advance the `prefix` between runs (e.g. a dated `events/dt=${now.date}/`) so each run reads only new objects. |
-| `h2 protocol error / GoAway` against `fake-gcs-server` | The SDK uses gRPC for control-plane operations; `fake-gcs-server` only speaks REST. Use a real GCS bucket or a gRPC-capable emulator, with `auth: { type: anonymous }` and a `storage_host` override. |
+| `h2 protocol error / GoAway` against an emulator | The emulator was given an `https://` host, so listing went over gRPC, which `fake-gcs-server` serves only with its self-signed TLS certificate. Point `storage_host` at the plaintext port (`-scheme=http`, `http://…`) with `auth: { type: anonymous }`; plaintext hosts use the JSON API. |
 
 ## See also
 
