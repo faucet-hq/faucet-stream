@@ -1107,8 +1107,12 @@ per_stream:
 
     #[test]
     fn sidecars_beside_templates_are_not_loaded_as_templates() {
-        assert!(!is_template_file(Path::new("sink-templates/acme/x.faucet.yaml")));
-        assert!(!is_template_file(Path::new("sink-templates/acme/.hidden.yaml")));
+        assert!(!is_template_file(Path::new(
+            "sink-templates/acme/x.faucet.yaml"
+        )));
+        assert!(!is_template_file(Path::new(
+            "sink-templates/acme/.hidden.yaml"
+        )));
         assert!(is_template_file(Path::new("sink-templates/acme/x.yaml")));
         assert!(!is_template_file(Path::new("sink-templates/acme/OWNERS")));
     }
