@@ -54,6 +54,7 @@ pub async fn record(
             row: ctx.row.clone(),
             run_id: ctx.run_id.clone(),
             pre_existing: out.pre_existing,
+            replaced: out.replaced,
             retention_days: ctx.retention_days,
             observed_at: ctx.observed_at,
         };

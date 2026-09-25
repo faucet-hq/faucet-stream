@@ -1442,6 +1442,11 @@ select {
   border-color: color-mix(in srgb, var(--queued) 40%, transparent);
   background: color-mix(in srgb, var(--queued) 12%, transparent);
 }
+.lo-replaced .lo-state {
+  color: var(--running);
+  border-color: color-mix(in srgb, var(--running) 40%, transparent);
+  background: color-mix(in srgb, var(--running) 12%, transparent);
+}
 .lo-present .lo-state {
   color: var(--ok);
   border-color: color-mix(in srgb, var(--ok) 40%, transparent);

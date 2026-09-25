@@ -205,10 +205,11 @@ impl ParquetSink {
         let (obj_path, local_path) = self.next_object_path()?;
         // Provenance for the retention GC (#587), recorded before the writer
         // creates the file so a destination that already held a file of this name
-        // is flagged `pre_existing` and never collected. In rollover mode each
-        // part lands here as its own entry.
+        // is flagged `pre_existing` and never collected. The writer always
+        // replaces the whole object, so such a file is `replaced`: previewable,
+        // never collected. In rollover mode each part lands here as its own entry.
         if let Some(local) = &local_path {
-            self.outputs.record_open_probing(local.clone());
+            self.outputs.record_open_probing_with(local.clone(), true);
         }
         let writer = ParquetObjectWriter::new(self.store.clone(), obj_path);
         let boxed: Box<dyn AsyncFileWriter> = Box::new(writer);

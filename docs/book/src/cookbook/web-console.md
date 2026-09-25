@@ -192,7 +192,8 @@ dataset's detail, scoped to it) showing every tracked file with its age and stat
 |---|---|
 | `present` | on disk |
 | `expired` | already cleaned — the file is gone, the record is kept |
-| `external` | faucet wrote this file but did not create it, so it is never cleaned |
+| `external` | faucet wrote this file but did not create it (appended to it), so it is never cleaned and never previewed |
+| `replaced` | the file already existed, but faucet truncated it, so it holds only faucet's output — previewable, still never cleaned |
 
 Controls, when your role holds `LocalOutputManage` (`operator` and up — a
 `viewer` sees the list and no buttons):
@@ -259,10 +260,12 @@ still stops at a 64 MiB response budget or a 30-second deadline if the dataset i
 larger than that, saying which. A partial answer always names the bound that
 produced it.
 
-Only a `present` output gets a Preview button. An `expired` one has no file left,
-and an **`external`** one — a file faucet wrote to but did not create — is never
-previewed: its contents are not faucet's to serve, which is the read-side twin of
-the retention GC's refusal to delete it. Each served preview is recorded in the
+A `present` or `replaced` output gets a Preview button. An `expired` one has no
+file left, and an **`external`** one — a file faucet appended to but did not
+create — is never previewed: the part that predates faucet is not faucet's to
+serve, which is the read-side twin of the retention GC's refusal to delete it. A
+**`replaced`** file also already existed, but faucet truncated it, so every byte
+in it is faucet's output; it is previewed, and still never cleaned. Each served preview is recorded in the
 audit log as `local_output.preview`.
 
 **It is off by default and intended for local testing** — it returns file

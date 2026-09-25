@@ -35,6 +35,9 @@ pub struct LocalOutputObservation {
     /// The file already existed the first time faucet opened it — never
     /// collectable. See [`faucet_core::LocalOutput`].
     pub pre_existing: bool,
+    /// The sink truncated the file on this run's first open, so its whole
+    /// content is faucet's output. See [`faucet_core::LocalOutput::replaced`].
+    pub replaced: bool,
     /// Per-pipeline override of the retention window, from the
     /// `local_outputs.retention_days` config block. `None` = use the runtime
     /// default; `Some(0)` = keep forever.
@@ -60,6 +63,10 @@ pub struct LocalOutputRecord {
     /// The run that most recently wrote this file.
     pub run_id: String,
     pub pre_existing: bool,
+    /// For a `pre_existing` file: faucet has truncated it, so everything in it
+    /// is faucet's output — safe to preview, still never collected.
+    #[serde(default)]
+    pub replaced: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u32>,
     /// When faucet first opened this path.
@@ -90,6 +97,7 @@ impl LocalOutputRecord {
             row: obs.row.clone(),
             run_id: obs.run_id.clone(),
             pre_existing: obs.pre_existing,
+            replaced: obs.pre_existing && obs.replaced,
             retention_days: obs.retention_days,
             first_written_at: obs.observed_at,
             last_written_at: obs.observed_at,
@@ -121,6 +129,11 @@ impl LocalOutputRecord {
         if obs.observed_at < self.first_written_at {
             self.first_written_at = obs.observed_at;
         }
+        // A later run that truncates the file leaves only faucet's bytes in it,
+        // from then on. `pre_existing` itself never changes.
+        if self.pre_existing && obs.replaced {
+            self.replaced = true;
+        }
         self.deleted_at = None;
         self.deleted_bytes = None;
     }
@@ -129,6 +142,8 @@ impl LocalOutputRecord {
     pub fn state(&self) -> LocalOutputState {
         if self.deleted_at.is_some() {
             LocalOutputState::Expired
+        } else if self.pre_existing && self.replaced {
+            LocalOutputState::Replaced
         } else if self.pre_existing {
             LocalOutputState::External
         } else {
@@ -183,6 +198,9 @@ pub enum LocalOutputState {
     Expired,
     /// faucet wrote it but did not create it — outside the GC's authority.
     External,
+    /// faucet did not create it but truncated it, so it holds only faucet's
+    /// output: previewable, and still outside the GC's authority.
+    Replaced,
 }
 
 impl LocalOutputState {
@@ -191,6 +209,7 @@ impl LocalOutputState {
             Self::Present => "present",
             Self::Expired => "expired",
             Self::External => "external",
+            Self::Replaced => "replaced",
         }
     }
 }
@@ -407,6 +426,7 @@ mod tests {
             row: "default".into(),
             run_id: "r1".into(),
             pre_existing: false,
+            replaced: false,
             retention_days: None,
             observed_at: ts(at),
         }
@@ -481,6 +501,32 @@ mod tests {
         rec.observe(&obs("/tmp/a.jsonl", "2026-08-10T00:00:00Z"));
         assert_eq!(rec.state(), LocalOutputState::Present);
         assert!(rec.deleted_bytes.is_none());
+    }
+
+    #[test]
+    fn a_truncated_pre_existing_file_reads_as_replaced_and_a_later_truncation_upgrades() {
+        let mut o = obs("/tmp/theirs.jsonl", "2026-08-01T00:00:00Z");
+        o.pre_existing = true;
+        o.replaced = true;
+        assert_eq!(LocalOutputRecord::new(&o).state(), LocalOutputState::Replaced);
+
+        // Appended first (external), truncated by a later run (replaced).
+        let mut first = obs("/tmp/theirs.csv", "2026-08-01T00:00:00Z");
+        first.pre_existing = true;
+        let mut rec = LocalOutputRecord::new(&first);
+        assert_eq!(rec.state(), LocalOutputState::External);
+        let mut second = obs("/tmp/theirs.csv", "2026-08-02T00:00:00Z");
+        second.pre_existing = true;
+        second.replaced = true;
+        rec.observe(&second);
+        assert_eq!(rec.state(), LocalOutputState::Replaced);
+        assert!(rec.pre_existing, "still never collectable");
+
+        // `replaced` means nothing for a file faucet created.
+        let mut ours = obs("/tmp/ours.jsonl", "2026-08-01T00:00:00Z");
+        ours.replaced = true;
+        assert_eq!(LocalOutputRecord::new(&ours).state(), LocalOutputState::Present);
+        assert_eq!(LocalOutputState::Replaced.as_str(), "replaced");
     }
 
     #[test]

@@ -526,8 +526,9 @@ paths:
         with its age, lifecycle state, and the retention window in force. The
         provenance the retention GC works from — it only ever deletes files
         listed here. `state` is `present` (on disk), `expired` (collected; the
-        record is kept), or `external` (faucet wrote the file but did not create
-        it, so it is never collected). Requires the `LocalOutputRead` permission
+        record is kept), `external` (faucet appended to a file it did not
+        create, so it is never collected or previewed), or `replaced` (faucet
+        truncated a file it did not create: previewable, never collected). Requires the `LocalOutputRead` permission
         (viewer). Requires the `catalog` Cargo feature.
       operationId: listLocalOutputs
       security: [{ bearerAuth: [] }]
@@ -743,9 +744,10 @@ paths:
           description: >
             Previews are disabled on this server (`--preview-local-outputs` was
             not passed); the principal's role lacks `LocalOutputRead`; or the
-            output is `external` — a file faucet wrote to but did not create,
+            output is `external` — a file faucet appended to but did not create,
             whose contents are not faucet's to serve, for the same reason the
-            retention GC refuses to delete it.
+            retention GC refuses to delete it. (A `replaced` output — truncated
+            by faucet — is previewable.)
         "404": { description: No such tracked output }
         "409":
           description: >
@@ -1737,8 +1739,8 @@ components:
         deleted_bytes: { type: integer, nullable: true, description: "Bytes reclaimed when it was collected." }
         state:
           type: string
-          enum: [present, expired, external]
-          description: "present = on disk; expired = collected (record kept); external = faucet did not create it."
+          enum: [present, expired, external, replaced]
+          description: "present = on disk; expired = collected (record kept); external = faucet appended to a file it did not create; replaced = faucet truncated a file it did not create (previewable, never collected)."
         age_secs: { type: integer, description: "Seconds since the last write." }
         retention_days_effective: { type: integer, nullable: true, description: "The window actually in force; null = never expires." }
       example:

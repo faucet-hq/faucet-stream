@@ -254,6 +254,8 @@ const STATE_HINT = {
   expired: "cleaned — the run record is kept",
   external:
     "faucet wrote this file but did not create it, so it is never cleaned — and not previewed either",
+  replaced:
+    "faucet overwrote a file it did not create: previewable, since it holds only faucet's output, but never cleaned",
 };
 
 /**
@@ -461,7 +463,7 @@ function outputRow(o, canManage, canPreview) {
         <span class="run-meta">${escapeHtml(fmtAge(o.age_secs))}</span>
         <span class="run-meta run-time" title="last written">${fmtTime(o.last_written_at)}</span>
         ${
-          canPreview && PREVIEWABLE.has(o.kind) && o.state === "present"
+          canPreview && PREVIEWABLE.has(o.kind) && (o.state === "present" || o.state === "replaced")
             ? `<button class="btn-ghost lo-preview-btn">Preview</button>`
             : `<span class="run-meta"></span>`
         }
@@ -488,8 +490,9 @@ function outputRow(o, canManage, canPreview) {
 // the pre-filled default), so a typed number is never silently clamped without
 // the user having been told the ceiling.
 //
-// Only a `present` output gets a button. An `expired` one has no file left, and an
-// `external` one is a file faucet wrote to but did not create — the server refuses
+// Only a `present` or `replaced` output gets a Preview button (a `replaced` file
+// already existed, but faucet truncated it, so it holds only faucet's output).
+// An `expired` one has no file left, and an `external` one is a file faucet wrote to but did not create — the server refuses
 // to serve its contents for the same reason the GC refuses to delete it — so
 // offering either would be offering a button that can only fail.
 

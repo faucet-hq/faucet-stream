@@ -1042,6 +1042,7 @@ async fn local_output_backends_agree() {
         row: "default".into(),
         run_id: "run-1".into(),
         pre_existing: false,
+        replaced: false,
         retention_days: None,
         observed_at: at(when),
     };

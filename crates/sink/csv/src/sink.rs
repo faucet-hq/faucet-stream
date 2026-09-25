@@ -146,8 +146,10 @@ impl faucet_core::Sink for CsvSink {
         // held someone else's data is never mistaken for one faucet created.
         // Idempotent and first-open-wins, so the flush→reopen cycle cannot
         // reclassify it.
-        self.outputs
-            .record_open_probing(std::path::PathBuf::from(&self.config.path));
+        self.outputs.record_open_probing_with(
+            std::path::PathBuf::from(&self.config.path),
+            !opened_before && !self.config.append,
+        );
 
         let result = tokio::task::spawn_blocking(move || {
             write_csv_blocking(
@@ -962,5 +964,19 @@ mod tests {
         let outs = sink.local_outputs().await;
         assert_eq!(outs.len(), 1);
         assert!(!outs[0].pre_existing);
+    }
+    #[tokio::test]
+    async fn local_outputs_marks_a_truncated_existing_file_replaced_and_an_appended_one_not() {
+        // Truncating a file faucet did not create leaves only faucet's bytes in
+        // it — safe to preview, still never collected. Appending keeps the
+        // original owner's content, so it stays plain pre-existing.
+        for (append, replaced) in [(false, true), (true, false)] {
+            let tmp = NamedTempFile::with_suffix(".csv").unwrap();
+            let sink = CsvSink::new(CsvSinkConfig::new(tmp.path().to_str().unwrap()).append(append));
+            sink.write_batch(&[json!({"id": "1"})]).await.unwrap();
+            let outs = sink.local_outputs().await;
+            assert!(outs[0].pre_existing);
+            assert_eq!(outs[0].replaced, replaced, "append = {append}");
+        }
     }
 }

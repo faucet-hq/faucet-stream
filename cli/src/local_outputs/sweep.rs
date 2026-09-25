@@ -383,6 +383,7 @@ mod tests {
             row: "default".into(),
             run_id: "run-1".into(),
             pre_existing: false,
+            replaced: false,
             retention_days: None,
             observed_at: ts(at),
         }
@@ -502,6 +503,20 @@ mod tests {
                 "scope {} must refuse a file faucet did not create",
                 scope.label()
             );
+        }
+    }
+
+    #[test]
+    fn a_replaced_file_is_still_never_collectable() {
+        // Being previewable does not make a file faucet did not create faucet's
+        // to delete.
+        let mut o = obs("/tmp/overwritten.jsonl", "2026-01-01T00:00:00Z");
+        o.pre_existing = true;
+        o.replaced = true;
+        let rows = vec![LocalOutputRecord::new(&o)];
+        for scope in [SweepScope::All, SweepScope::Output(rows[0].id.clone())] {
+            let sel = select(&rows, &scope, &opts());
+            assert_eq!(sel[0].skip, Some(SkipReason::PreExisting), "{}", scope.label());
         }
     }
 

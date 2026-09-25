@@ -53,6 +53,11 @@ pub struct LocalOutput {
     /// appended to (or truncated) a file it did not create. A retention GC must
     /// never delete such a file; see the module docs.
     pub pre_existing: bool,
+    /// The sink truncated the file when it first opened it, so every byte in
+    /// it is faucet's own output even when [`pre_existing`](Self::pre_existing)
+    /// is set. It makes a pre-existing file safe to *read back* (a preview can
+    /// only show what faucet wrote); it never makes it collectable.
+    pub replaced: bool,
 }
 
 impl LocalOutput {
@@ -61,6 +66,7 @@ impl LocalOutput {
         Self {
             path: path.into(),
             pre_existing: false,
+            replaced: false,
         }
     }
 
@@ -69,6 +75,16 @@ impl LocalOutput {
         Self {
             path: path.into(),
             pre_existing: true,
+            replaced: false,
+        }
+    }
+
+    /// A file that already existed and that faucet truncated on its first open.
+    pub fn replaced(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            pre_existing: true,
+            replaced: true,
         }
     }
 }
@@ -103,9 +119,9 @@ pub fn probe_pre_existing(path: &Path) -> bool {
 /// the file and leaves it on disk — the safe direction.
 #[derive(Debug, Default)]
 pub struct LocalOutputLog {
-    /// Path → (`pre_existing`, insertion index). `BTreeMap` for the dedup;
-    /// the index restores first-seen order on read.
-    seen: Mutex<BTreeMap<PathBuf, (bool, usize)>>,
+    /// Path → (`pre_existing`, `replaced`, insertion index). `BTreeMap` for the
+    /// dedup; the index restores first-seen order on read.
+    seen: Mutex<BTreeMap<PathBuf, (bool, bool, usize)>>,
 }
 
 impl LocalOutputLog {
@@ -120,10 +136,17 @@ impl LocalOutputLog {
     /// file sinks perform, or a later run truncating the same path) keeps the
     /// classification captured the first time.
     pub fn record_open(&self, path: impl Into<PathBuf>, pre_existing: bool) {
+        self.record_open_with(path, pre_existing, false);
+    }
+
+    /// [`record_open`](Self::record_open), also saying whether this first open
+    /// truncates the file (see [`LocalOutput::replaced`]). First open wins for
+    /// both flags.
+    pub fn record_open_with(&self, path: impl Into<PathBuf>, pre_existing: bool, truncates: bool) {
         let path = path.into();
         if let Ok(mut seen) = self.seen.lock() {
             let next = seen.len();
-            seen.entry(path).or_insert((pre_existing, next));
+            seen.entry(path).or_insert((pre_existing, truncates, next));
         }
     }
 
@@ -134,6 +157,12 @@ impl LocalOutputLog {
     /// `spawn_blocking`: it keeps the stat off the hot path once the file is
     /// known, and it cannot reclassify an already-recorded path.
     pub fn record_open_probing(&self, path: impl Into<PathBuf>) {
+        self.record_open_probing_with(path, false);
+    }
+
+    /// [`record_open_probing`](Self::record_open_probing) for a first open that
+    /// truncates the file when `truncates` is set (see [`LocalOutput::replaced`]).
+    pub fn record_open_probing_with(&self, path: impl Into<PathBuf>, truncates: bool) {
         let path = path.into();
         let known = self
             .seen
@@ -142,7 +171,7 @@ impl LocalOutputLog {
             .unwrap_or(true);
         if !known {
             let pre_existing = probe_pre_existing(&path);
-            self.record_open(path, pre_existing);
+            self.record_open_with(path, pre_existing, truncates);
         }
     }
 
@@ -153,12 +182,13 @@ impl LocalOutputLog {
         };
         let mut rows: Vec<(usize, LocalOutput)> = seen
             .iter()
-            .map(|(path, (pre_existing, idx))| {
+            .map(|(path, (pre_existing, replaced, idx))| {
                 (
                     *idx,
                     LocalOutput {
                         path: path.clone(),
                         pre_existing: *pre_existing,
+                        replaced: *pre_existing && *replaced,
                     },
                 )
             })
@@ -213,6 +243,34 @@ mod tests {
         log.record_open("/tmp/theirs.csv", true);
         log.record_open("/tmp/theirs.csv", false);
         assert!(log.snapshot()[0].pre_existing);
+    }
+
+    #[test]
+    fn replaced_is_first_open_wins_and_only_meaningful_for_pre_existing() {
+        let log = LocalOutputLog::new();
+        log.record_open_with("/tmp/theirs.jsonl", true, true);
+        log.record_open_with("/tmp/theirs.jsonl", true, false);
+        log.record_open_with("/tmp/ours.jsonl", false, true);
+        log.record_open("/tmp/appended.jsonl", true);
+        let snap = log.snapshot();
+        assert_eq!(snap[0], LocalOutput::replaced("/tmp/theirs.jsonl"));
+        assert_eq!(snap[1], LocalOutput::created("/tmp/ours.jsonl"));
+        assert_eq!(snap[2], LocalOutput::pre_existing("/tmp/appended.jsonl"));
+    }
+
+    #[test]
+    fn probing_with_truncation_flags_an_existing_file_as_replaced() {
+        let dir = std::env::temp_dir().join(format!("faucet-lo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("existing.jsonl");
+        std::fs::write(&existing, b"x").unwrap();
+        let log = LocalOutputLog::new();
+        log.record_open_probing_with(&existing, true);
+        log.record_open_probing_with(dir.join("new.jsonl"), true);
+        let snap = log.snapshot();
+        assert!(snap[0].pre_existing && snap[0].replaced);
+        assert!(!snap[1].pre_existing && !snap[1].replaced);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
