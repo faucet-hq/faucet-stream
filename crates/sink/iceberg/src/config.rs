@@ -17,45 +17,6 @@ use faucet_core::{FaucetError, WriteMode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-// ── Warehouse scheme classification ─────────────────────────────────────────
-
-/// Classification of a warehouse URI by scheme, used to select an Iceberg
-/// `StorageFactory` (see `crate::storage_factory`) and to validate configs.
-///
-/// The set of recognised schemes is intentionally small and feature-independent:
-/// it is the set faucet's storage-factory selector understands. REST catalogs
-/// resolve FileIO server-side and are exempt from this classification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WarehouseScheme {
-    /// No scheme, a bare path, or `file://` — local filesystem.
-    Local,
-    /// `s3://` or `s3a://`. Carries the exact scheme string ("s3" / "s3a"),
-    /// which the OpenDAL S3 operator requires to match the warehouse URI.
-    S3(&'static str),
-    /// `gs://` — Google Cloud Storage.
-    Gcs,
-    /// Any other scheme (e.g. `oss`, `abfss`) — no storage factory available.
-    Unsupported(String),
-}
-
-/// Classify a warehouse URI by its scheme.
-///
-/// A URI with no `://` (empty, bare path, or relative path) is treated as a
-/// local-filesystem warehouse. Scheme matching is case-insensitive.
-pub(crate) fn warehouse_scheme(warehouse: &str) -> WarehouseScheme {
-    let scheme = match warehouse.trim().split_once("://") {
-        Some((s, _)) => s.to_ascii_lowercase(),
-        None => return WarehouseScheme::Local,
-    };
-    match scheme.as_str() {
-        "file" => WarehouseScheme::Local,
-        "s3" => WarehouseScheme::S3("s3"),
-        "s3a" => WarehouseScheme::S3("s3a"),
-        "gs" => WarehouseScheme::Gcs,
-        other => WarehouseScheme::Unsupported(other.to_string()),
-    }
-}
-
 // ── Catalog config ────────────────────────────────────────────────────────────
 
 /// Configuration fields shared by every catalog variant.
@@ -161,6 +122,23 @@ impl fmt::Debug for CatalogConfig {
                 &inner.properties.keys().collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+impl From<&CatalogConfig> for faucet_common_iceberg::CatalogConfig {
+    fn from(c: &CatalogConfig) -> Self {
+        let inner = |i: &CatalogInner| faucet_common_iceberg::CatalogInner {
+            uri: i.uri.clone(),
+            warehouse: i.warehouse.clone(),
+            credential: i.credential.clone(),
+            properties: i.properties.clone(),
+        };
+        match c {
+            CatalogConfig::Rest(i) => Self::Rest(inner(i)),
+            CatalogConfig::Glue(i) => Self::Glue(inner(i)),
+            CatalogConfig::Sql(i) => Self::Sql(inner(i)),
+            CatalogConfig::Hms(i) => Self::Hms(inner(i)),
+        }
     }
 }
 
@@ -402,44 +380,8 @@ impl IcebergSinkConfig {
             }
         }
 
-        // Catalog connection URI. REST / SQL / HMS need an endpoint URI; Glue
-        // resolves its endpoint from AWS config (region/credentials in
-        // `properties` or the default chain), so it has no required URI. Caught
-        // here at config-load time rather than only at connect time.
-        let (uri_required, kind) = match &self.catalog {
-            CatalogConfig::Rest(_) => (true, "rest"),
-            CatalogConfig::Sql(_) => (true, "sql"),
-            CatalogConfig::Hms(_) => (true, "hms"),
-            CatalogConfig::Glue(_) => (false, "glue"),
-        };
-        if uri_required
-            && self
-                .catalog
-                .inner()
-                .uri
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
-        {
-            return Err(FaucetError::Config(format!(
-                "iceberg: catalog '{kind}' requires a non-empty `uri`"
-            )));
-        }
-
-        // Warehouse scheme: the non-REST catalogs build FileIO in-process, so
-        // faucet must have a storage factory for the scheme. REST resolves
-        // FileIO server-side and may use any scheme. (#181)
-        if !matches!(self.catalog, CatalogConfig::Rest(_)) {
-            let warehouse = self.catalog.inner().warehouse.as_deref().unwrap_or("");
-            if let WarehouseScheme::Unsupported(s) = warehouse_scheme(warehouse) {
-                return Err(FaucetError::Config(format!(
-                    "iceberg: warehouse scheme '{s}://' is not supported for the \
-                     '{kind}' catalog; use file://, s3://, s3a://, or gs:// (or the \
-                     REST catalog for other object stores)"
-                )));
-            }
-        }
+        // Catalog connection: required URI + a warehouse scheme faucet can serve. (#181)
+        faucet_common_iceberg::CatalogConfig::from(&self.catalog).validate_connection()?;
 
         // Target file size: 0 would make iceberg's rolling writer roll a new
         // (tiny) data file on every batch — almost certainly a misconfiguration.
@@ -502,56 +444,6 @@ mod tests {
     }
 
     // ── catalog tagged-enum round-trip ────────────────────────────────────────
-
-    #[test]
-    fn catalog_rest_round_trip() {
-        let v = serde_json::json!({
-            "type": "rest",
-            "uri": "https://catalog.example.com",
-            "warehouse": "s3://lake/wh",
-            "credential": "my-token",
-            "properties": { "region": "us-east-1" }
-        });
-        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
-        assert!(matches!(cat, CatalogConfig::Rest(_)));
-        let inner = cat.inner();
-        assert_eq!(inner.uri.as_deref(), Some("https://catalog.example.com"));
-        assert_eq!(inner.credential.as_deref(), Some("my-token"));
-        assert_eq!(
-            inner.properties.get("region").map(String::as_str),
-            Some("us-east-1")
-        );
-
-        // Re-serialize and re-parse.
-        let json = serde_json::to_value(&cat).unwrap();
-        assert_eq!(json["type"], "rest");
-        let _cat2: CatalogConfig = serde_json::from_value(json).unwrap();
-    }
-
-    #[test]
-    fn catalog_glue_round_trip() {
-        let v = serde_json::json!({ "type": "glue", "warehouse": "s3://lake/wh" });
-        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
-        assert!(matches!(cat, CatalogConfig::Glue(_)));
-    }
-
-    #[test]
-    fn catalog_sql_round_trip() {
-        let v = serde_json::json!({
-            "type": "sql",
-            "uri": "postgres://localhost/meta",
-            "warehouse": "s3://lake/wh"
-        });
-        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
-        assert!(matches!(cat, CatalogConfig::Sql(_)));
-    }
-
-    #[test]
-    fn catalog_hms_round_trip() {
-        let v = serde_json::json!({ "type": "hms", "uri": "thrift://hms:9083" });
-        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
-        assert!(matches!(cat, CatalogConfig::Hms(_)));
-    }
 
     // ── write_mode ────────────────────────────────────────────────────────────
 
@@ -822,7 +714,55 @@ mod tests {
             .expect("batch_size=0 sentinel should be accepted");
     }
 
-    // ── Debug redacts credential ──────────────────────────────────────────────
+    #[test]
+    fn catalog_rest_round_trip() {
+        let v = serde_json::json!({
+            "type": "rest",
+            "uri": "https://catalog.example.com",
+            "warehouse": "s3://lake/wh",
+            "credential": "my-token",
+            "properties": { "region": "us-east-1" }
+        });
+        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
+        assert!(matches!(cat, CatalogConfig::Rest(_)));
+        let inner = cat.inner();
+        assert_eq!(inner.uri.as_deref(), Some("https://catalog.example.com"));
+        assert_eq!(inner.credential.as_deref(), Some("my-token"));
+        assert_eq!(
+            inner.properties.get("region").map(String::as_str),
+            Some("us-east-1")
+        );
+
+        // Re-serialize and re-parse.
+        let json = serde_json::to_value(&cat).unwrap();
+        assert_eq!(json["type"], "rest");
+        let _cat2: CatalogConfig = serde_json::from_value(json).unwrap();
+    }
+
+    #[test]
+    fn catalog_glue_round_trip() {
+        let v = serde_json::json!({ "type": "glue", "warehouse": "s3://lake/wh" });
+        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
+        assert!(matches!(cat, CatalogConfig::Glue(_)));
+    }
+
+    #[test]
+    fn catalog_sql_round_trip() {
+        let v = serde_json::json!({
+            "type": "sql",
+            "uri": "postgres://localhost/meta",
+            "warehouse": "s3://lake/wh"
+        });
+        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
+        assert!(matches!(cat, CatalogConfig::Sql(_)));
+    }
+
+    #[test]
+    fn catalog_hms_round_trip() {
+        let v = serde_json::json!({ "type": "hms", "uri": "thrift://hms:9083" });
+        let cat: CatalogConfig = serde_json::from_value(v).unwrap();
+        assert!(matches!(cat, CatalogConfig::Hms(_)));
+    }
 
     #[test]
     fn debug_redacts_credential() {
@@ -858,61 +798,20 @@ mod tests {
         );
     }
 
-    // ── warehouse scheme classification ───────────────────────────────────────
-
     #[test]
-    fn warehouse_scheme_local_variants() {
-        use super::{WarehouseScheme, warehouse_scheme};
-        for w in [
-            "",
-            "/tmp/warehouse",
-            "./wh",
-            "relative/dir",
-            "file:///tmp/wh",
-        ] {
-            assert!(
-                matches!(warehouse_scheme(w), WarehouseScheme::Local),
-                "{w:?} should be Local"
+    fn converts_to_the_shared_catalog_config() {
+        for ty in ["rest", "glue", "sql", "hms"] {
+            let v = serde_json::json!({
+                "type": ty, "uri": "u", "warehouse": "w", "credential": "c",
+                "properties": { "k": "v" }
+            });
+            let cat: CatalogConfig = serde_json::from_value(v).unwrap();
+            let shared = faucet_common_iceberg::CatalogConfig::from(&cat);
+            assert_eq!(shared.kind(), ty);
+            assert_eq!(
+                serde_json::to_value(&shared).unwrap(),
+                serde_json::to_value(&cat).unwrap()
             );
         }
-    }
-
-    #[test]
-    fn warehouse_scheme_s3_preserves_scheme() {
-        use super::{WarehouseScheme, warehouse_scheme};
-        assert!(matches!(
-            warehouse_scheme("s3://bucket/wh"),
-            WarehouseScheme::S3("s3")
-        ));
-        assert!(matches!(
-            warehouse_scheme("s3a://bucket/wh"),
-            WarehouseScheme::S3("s3a")
-        ));
-        assert!(matches!(
-            warehouse_scheme("S3://bucket/wh"),
-            WarehouseScheme::S3("s3")
-        ));
-    }
-
-    #[test]
-    fn warehouse_scheme_gcs() {
-        use super::{WarehouseScheme, warehouse_scheme};
-        assert!(matches!(
-            warehouse_scheme("gs://bucket/wh"),
-            WarehouseScheme::Gcs
-        ));
-    }
-
-    #[test]
-    fn warehouse_scheme_unsupported() {
-        use super::{WarehouseScheme, warehouse_scheme};
-        match warehouse_scheme("oss://bucket/wh") {
-            WarehouseScheme::Unsupported(s) => assert_eq!(s, "oss"),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-        assert!(matches!(
-            warehouse_scheme("abfss://x/y"),
-            WarehouseScheme::Unsupported(_)
-        ));
     }
 }
