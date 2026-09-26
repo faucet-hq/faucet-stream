@@ -356,6 +356,9 @@ jobs:
           - source-parquet
           - source-delta
           - source-databricks
+          - source-iceberg
+          - "source-iceberg,source-iceberg-sql"
+          - source-dynamodb
           - source-gcs
           - source-bigquery
           - source-snowflake
@@ -392,6 +395,9 @@ jobs:
           - sink-pubsub
           - sink-clickhouse
           - sink-azure-blob
+          - sink-dynamodb
+          - sink-databricks
+          - sink-databricks-staging
           # Kafka extras
           - kafka-schema-registry
           # State-store backends
@@ -677,10 +683,12 @@ jobs:
           # unguarded. Restore the moment upstream yanks 1.2.0 or `deltalake`
           # moves to the `buoyant_kernel` 0.28 line that pairs with it.
           #
-          # The RabbitMQ crates (#561) are new and have no published baseline
-          # yet — cargo-semver-checks can only compare against a crates.io
-          # release. Drop them from this list once release-plz publishes 1.0.0.
-          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq
+          # The RabbitMQ (#561), Oracle (#710), Iceberg source (#711), DynamoDB
+          # (#712) and Databricks sink (#713) crates are new and have no
+          # published baseline yet — cargo-semver-checks can only compare
+          # against a crates.io release. Drop them from this list once
+          # release-plz publishes 1.0.0.
+          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq,faucet-common-oracle,faucet-source-oracle,faucet-source-oracle-cdc,faucet-sink-oracle,faucet-common-iceberg,faucet-source-iceberg,faucet-common-dynamodb,faucet-source-dynamodb,faucet-sink-dynamodb,faucet-common-databricks,faucet-sink-databricks
           # No `package:` — check the whole workspace. Gating only `faucet-core`
           # left 89 crates unguarded, so a genuine removal or signature change in
           # a connector could publish in a minor and break dependents silently
