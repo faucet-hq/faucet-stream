@@ -32,11 +32,18 @@ pub struct LoadedSubmission {
 }
 
 /// Load + merge + expand a submitted config body.
+/// The server-wide data-flow policy type (#702) — the real spec on a `policy`
+/// build, a unit placeholder otherwise so the loader's signature is stable.
+#[cfg(feature = "policy")]
+pub type ServerPolicy = faucet_core::PolicySpec;
+#[cfg(not(feature = "policy"))]
+pub type ServerPolicy = ();
+
 pub async fn load_submission(
     body: &str,
     format: ConfigFormat,
     default_base: Option<&Value>,
-    policy: Option<&faucet_core::PolicySpec>,
+    policy: Option<&ServerPolicy>,
 ) -> Result<LoadedSubmission, ServeError> {
     // 1. Parse to a Value per the declared format.
     let mut submitted: Value = match format {
