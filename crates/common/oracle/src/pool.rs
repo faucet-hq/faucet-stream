@@ -106,8 +106,8 @@ pub async fn connect_pool(
         let conn = pool
             .get()
             .map_err(|e| FaucetError::Config(format!("oracle connection failed: {e}")))?;
-        conn.ping()
-            .map_err(|e| FaucetError::Config(format!("oracle connection failed: {e}")))?;
+        conn.execute(NLS_SESSION_SQL, &[])
+            .map_err(|e| FaucetError::Config(format!("oracle session setup failed: {e}")))?;
         Ok(pool)
     })
     .await?;

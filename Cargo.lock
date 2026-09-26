@@ -6055,7 +6055,19 @@ dependencies = [
 name = "faucet-source-oracle-cdc"
 version = "1.0.0"
 dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "faucet-common-oracle",
+ "faucet-conformance",
  "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
