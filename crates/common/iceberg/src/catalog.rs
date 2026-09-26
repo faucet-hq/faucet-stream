@@ -12,6 +12,12 @@
 //! | SQL     | `catalog-sql`     | `iceberg-catalog-sql`   |
 //! | HMS     | `catalog-hms`     | `iceberg-catalog-hms`   |
 
+#[cfg(any(
+    feature = "catalog-rest",
+    feature = "catalog-glue",
+    feature = "catalog-sql",
+    feature = "catalog-hms"
+))]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,7 +31,7 @@ use crate::config::{CatalogConfig, CatalogInner};
 /// Returns `FaucetError::Config` when:
 /// - The chosen catalog type's Cargo feature is not enabled.
 /// - The catalog client fails to initialise (bad URI, auth failure, etc.).
-pub(crate) async fn build_catalog(cfg: &CatalogConfig) -> Result<Arc<dyn Catalog>, FaucetError> {
+pub async fn build_catalog(cfg: &CatalogConfig) -> Result<Arc<dyn Catalog>, FaucetError> {
     match cfg {
         CatalogConfig::Rest(inner) => build_rest(inner).await,
         CatalogConfig::Glue(inner) => build_glue(inner).await,
@@ -57,7 +63,7 @@ async fn build_rest(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
     }
 
     let catalog = RestCatalogBuilder::default()
-        .load("faucet-iceberg", props)
+        .load(crate::CATALOG_NAME, props)
         .await
         .map_err(|e| FaucetError::Config(format!("iceberg: REST catalog init failed: {e}")))?;
 
@@ -93,7 +99,7 @@ async fn build_glue(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
 
     let catalog = GlueCatalogBuilder::default()
         .with_storage_factory(storage_factory)
-        .load("faucet-iceberg", props)
+        .load(crate::CATALOG_NAME, props)
         .await
         .map_err(|e| FaucetError::Config(format!("iceberg: Glue catalog init failed: {e}")))?;
 
@@ -151,7 +157,7 @@ async fn build_sql(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError
 
     let catalog = SqlCatalogBuilder::default()
         .with_storage_factory(storage_factory)
-        .load("faucet-iceberg", props)
+        .load(crate::CATALOG_NAME, props)
         .await
         .map_err(|e| FaucetError::Config(format!("iceberg: SQL catalog init failed: {e}")))?;
 
@@ -187,7 +193,7 @@ async fn build_hms(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError
 
     let catalog = HmsCatalogBuilder::default()
         .with_storage_factory(storage_factory)
-        .load("faucet-iceberg", props)
+        .load(crate::CATALOG_NAME, props)
         .await
         .map_err(|e| FaucetError::Config(format!("iceberg: HMS catalog init failed: {e}")))?;
 
@@ -206,7 +212,6 @@ async fn build_hms(_inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CatalogInner;
 
     #[allow(dead_code)]
     fn empty_inner() -> CatalogInner {
@@ -214,8 +219,17 @@ mod tests {
             uri: None,
             warehouse: None,
             credential: None,
-            properties: HashMap::new(),
+            properties: Default::default(),
         }
+    }
+
+    #[cfg(not(feature = "catalog-rest"))]
+    #[tokio::test]
+    async fn rest_without_feature_returns_config_error() {
+        let err = build_catalog(&CatalogConfig::Rest(empty_inner()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("catalog-rest"), "{err}");
     }
 
     /// Regardless of which catalog features are compiled in, trying to build a

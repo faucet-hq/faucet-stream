@@ -4668,6 +4668,17 @@ name = "faucet-common-iceberg"
 version = "1.0.0"
 dependencies = [
  "faucet-core",
+ "iceberg",
+ "iceberg-catalog-glue",
+ "iceberg-catalog-hms",
+ "iceberg-catalog-rest",
+ "iceberg-catalog-sql",
+ "iceberg-storage-opendal",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "typetag",
 ]
 
 [[package]]
@@ -5172,13 +5183,11 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "bytes",
+ "faucet-common-iceberg",
  "faucet-conformance",
  "faucet-core",
  "futures",
  "iceberg",
- "iceberg-catalog-glue",
- "iceberg-catalog-hms",
- "iceberg-catalog-rest",
  "iceberg-catalog-sql",
  "iceberg-storage-opendal",
  "parquet",
@@ -5872,7 +5881,27 @@ dependencies = [
 name = "faucet-source-iceberg"
 version = "1.0.0"
 dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "faucet-common-iceberg",
+ "faucet-conformance",
  "faucet-core",
+ "faucet-sink-iceberg",
+ "futures",
+ "iceberg",
+ "iceberg-catalog-sql",
+ "parquet",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
