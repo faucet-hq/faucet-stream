@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.13.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-core-v1.12.0...faucet-core-v1.13.0) - 2026-09-26
+
+### Bug Fixes
+
+- SQLite write-lock contention, topology cooldown, LPT dispatch, JSON logs (issue audit #580+) ([#667](https://github.com/faucet-hq/faucet-stream/pull/667))
+- Three reliability bugs — overwrite bookmark ordering, kafka headers, source error typing ([#664](https://github.com/faucet-hq/faucet-stream/pull/664))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Features
+
+- Change requests (plan → approve → run), run budgets, and cost & usage accounting ([#730](https://github.com/faucet-hq/faucet-stream/pull/730))
+- Data-flow policies (`policy:` / `--policy`) and change impact analysis (`plan --impact`)
+- Learned column profiles with drift detection (`profiling:`) ([#726](https://github.com/faucet-hq/faucet-stream/pull/726))
+- Content verification (`faucet verify`) and run rollback (`faucet rollback`) ([#725](https://github.com/faucet-hq/faucet-stream/pull/725))
+- RabbitMQ connector pair, GCS emulator suites in CI, integration-coverage gate, sectioned trigger form ([#699](https://github.com/faucet-hq/faucet-stream/pull/699))
+- Deployment overlays, template version deprecation, first-run tables, one-meaning vocabulary ([#693](https://github.com/faucet-hq/faucet-stream/pull/693))
+- *(hub)* Owner-scoped template ids (owner/name), catalog versions with @stable/@newest/@N ([#683](https://github.com/faucet-hq/faucet-stream/pull/683))
+- *(core)* Run governance on the columnar fast path ([#673](https://github.com/faucet-hq/faucet-stream/pull/673))
+- Arrow-columnar REST→BigQuery, vectorized transforms, lighter lineage UX ([#672](https://github.com/faucet-hq/faucet-stream/pull/672))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+- Generic REST discovery, partitioned typed OData, byte-passthrough loads + BigQuery/serve upgrades ([#650](https://github.com/faucet-hq/faucet-stream/pull/650))
+- *(serve)* Retention GC for local sink outputs + Datasets-page cleanup controls ([#596](https://github.com/faucet-hq/faucet-stream/pull/596))
+
 ## [1.12.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-core-v1.11.0...faucet-core-v1.12.0) - 2026-08-24
 
 ### Features

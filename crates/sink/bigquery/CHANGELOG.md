@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-bigquery-v1.7.0...faucet-sink-bigquery-v1.8.0) - 2026-09-26
+
+### Bug Fixes
+
+- *(bigquery)* Escape the last two identifier sites instead of stripping ([#669](https://github.com/faucet-hq/faucet-stream/pull/669))
+- SQLite write-lock contention, topology cooldown, LPT dispatch, JSON logs (issue audit #580+) ([#667](https://github.com/faucet-hq/faucet-stream/pull/667))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Features
+
+- Change requests (plan → approve → run), run budgets, and cost & usage accounting ([#730](https://github.com/faucet-hq/faucet-stream/pull/730))
+- Arrow-columnar REST→BigQuery, vectorized transforms, lighter lineage UX ([#672](https://github.com/faucet-hq/faucet-stream/pull/672))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+- Generic REST discovery, partitioned typed OData, byte-passthrough loads + BigQuery/serve upgrades ([#650](https://github.com/faucet-hq/faucet-stream/pull/650))
+
 ## [1.7.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-bigquery-v1.6.0...faucet-sink-bigquery-v1.7.0) - 2026-08-24
 
 ### Features

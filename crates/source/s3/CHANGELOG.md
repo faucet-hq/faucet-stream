@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.9.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-s3-v1.8.1...faucet-source-s3-v1.9.0) - 2026-09-26
+
+### Bug Fixes
+
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Features
+
+- Change requests (plan → approve → run), run budgets, and cost & usage accounting ([#730](https://github.com/faucet-hq/faucet-stream/pull/730))
+- RabbitMQ connector pair, GCS emulator suites in CI, integration-coverage gate, sectioned trigger form ([#699](https://github.com/faucet-hq/faucet-stream/pull/699))
+- Deployment overlays, template version deprecation, first-run tables, one-meaning vocabulary ([#693](https://github.com/faucet-hq/faucet-stream/pull/693))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
+### Testing
+
+- Pull MinIO from quay.io — the Docker Hub repository was withdrawn ([#653](https://github.com/faucet-hq/faucet-stream/pull/653))
+
 ## [1.8.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-s3-v1.8.0...faucet-source-s3-v1.8.1) - 2026-08-23
 
 ### Miscellaneous

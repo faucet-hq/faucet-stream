@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-singer-v1.1.6...faucet-source-singer-v1.2.0) - 2026-09-26
+
+### Features
+
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.1.6](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-singer-v1.1.5...faucet-source-singer-v1.1.6) - 2026-08-23
 
 ### Miscellaneous

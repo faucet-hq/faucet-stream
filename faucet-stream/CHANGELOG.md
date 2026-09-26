@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.9.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.8.0...faucet-stream-v1.9.0) - 2026-09-26
+
+### Documentation
+
+- *(hub)* Examples use full owner/name template ids ([#690](https://github.com/faucet-hq/faucet-stream/pull/690))
+
+### Features
+
+- Oracle (source, LogMiner CDC, sink), Iceberg source, DynamoDB (source + Streams CDC, sink) and Databricks sink ([#739](https://github.com/faucet-hq/faucet-stream/pull/739))
+- *(serve)* Multi-tenant embedded integrations — tenants, sealed connections, hosted OAuth, fan-out ([#738](https://github.com/faucet-hq/faucet-stream/pull/738))
+- Change requests (plan → approve → run), run budgets, and cost & usage accounting ([#730](https://github.com/faucet-hq/faucet-stream/pull/730))
+- Data-flow policies (`policy:` / `--policy`) and change impact analysis (`plan --impact`)
+- Learned column profiles with drift detection (`profiling:`) ([#726](https://github.com/faucet-hq/faucet-stream/pull/726))
+- RabbitMQ connector pair, GCS emulator suites in CI, integration-coverage gate, sectioned trigger form ([#699](https://github.com/faucet-hq/faucet-stream/pull/699))
+- *(hub)* Hosted Template Hub — remote --hub catalogs, hub sync origins, registry matrix ([#681](https://github.com/faucet-hq/faucet-stream/pull/681))
+- *(templates)* Kind-aware registry — source × sink templates compose at trigger time (RFC 0008) ([#680](https://github.com/faucet-hq/faucet-stream/pull/680))
+- *(cli)* Template Hub — source/sink-split templates composed at run time
+- Arrow-columnar REST→BigQuery, vectorized transforms, lighter lineage UX ([#672](https://github.com/faucet-hq/faucet-stream/pull/672))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+- Generic REST discovery, partitioned typed OData, byte-passthrough loads + BigQuery/serve upgrades ([#650](https://github.com/faucet-hq/faucet-stream/pull/650))
+
 ## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.7.5...faucet-stream-v1.8.0) - 2026-08-23
 
 ### Features

@@ -7,6 +7,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.1.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-nats-v1.0.5...faucet-common-nats-v1.1.0) - 2026-09-26
+
+### Features
+
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.0.5](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-nats-v1.0.4...faucet-common-nats-v1.0.5) - 2026-08-23
 
 ### Miscellaneous
