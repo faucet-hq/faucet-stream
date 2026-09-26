@@ -58,6 +58,17 @@ pub(crate) fn build_redis_key(namespace: &str, key: &str) -> String {
     format!("{namespace}:{key}")
 }
 
+/// The `SCAN MATCH` pattern for keys starting with `prefix`. Neither the
+/// namespace nor a valid key can hold a glob metacharacter, so no escaping.
+pub(crate) fn scan_pattern(namespace: &str, prefix: &str) -> String {
+    format!("{namespace}:{prefix}*")
+}
+
+/// The state key behind a namespaced Redis key.
+pub(crate) fn strip_namespace<'a>(namespace: &str, raw: &'a str) -> Option<&'a str> {
+    raw.strip_prefix(namespace)?.strip_prefix(':')
+}
+
 pub(crate) fn validate_namespace(namespace: &str) -> Result<(), FaucetError> {
     if namespace.is_empty() {
         return Err(FaucetError::Config(
@@ -118,6 +129,54 @@ impl StateStore for RedisStateStore {
             .del(self.redis_key(key))
             .await
             .map_err(|e| FaucetError::State(format!("Redis DEL for key '{key}' failed: {e}")))?;
+        Ok(())
+    }
+
+    fn supports_list(&self) -> bool {
+        true
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let mut conn = self.conn.clone();
+        let pattern = scan_pattern(&self.namespace, prefix);
+        let mut iter: redis::AsyncIter<String> = conn
+            .scan_match(&pattern)
+            .await
+            .map_err(|e| FaucetError::State(format!("Redis SCAN for '{pattern}' failed: {e}")))?;
+        let mut keys = Vec::new();
+        while let Some(raw) = iter.next_item().await {
+            if let Some(key) = strip_namespace(&self.namespace, &raw)
+                && key.starts_with(prefix)
+            {
+                keys.push(key.to_owned());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    fn supports_atomic_batch(&self) -> bool {
+        true
+    }
+
+    async fn put_batch(&self, entries: &[(String, Value)]) -> Result<(), FaucetError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut pairs = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            validate_state_key(key)?;
+            let serialized = serde_json::to_string(value).map_err(|e| {
+                FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
+            })?;
+            pairs.push((self.redis_key(key), serialized));
+        }
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .mset(&pairs)
+            .await
+            .map_err(|e| FaucetError::State(format!("Redis MSET failed: {e}")))?;
         Ok(())
     }
 
@@ -183,6 +242,17 @@ mod tests {
             "faucet:github_issues"
         );
         assert_eq!(build_redis_key("a", "b"), "a:b");
+    }
+
+    #[test]
+    fn scan_pattern_and_strip_namespace_round_trip() {
+        assert_eq!(scan_pattern("faucet", "orders::"), "faucet:orders::*");
+        assert_eq!(
+            strip_namespace("faucet", "faucet:orders::a"),
+            Some("orders::a")
+        );
+        assert_eq!(strip_namespace("faucet", "other:orders::a"), None);
+        assert_eq!(strip_namespace("faucet", "faucetx"), None);
     }
 
     #[test]

@@ -147,3 +147,40 @@ async fn from_connection_and_namespace_isolation() {
         "team_b must not see team_a's namespaced key"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_by_prefix_and_atomic_batch() {
+    let (_container, url) = start_redis().await;
+    let store = RedisStateStore::connect(&url, "ns1")
+        .await
+        .expect("connect");
+    let other = RedisStateStore::connect(&url, "ns2")
+        .await
+        .expect("connect");
+    assert!(store.supports_list() && store.supports_atomic_batch());
+    for k in ["o::a", "o::b::__sla__", "p::a"] {
+        store.put(k, &json!(k)).await.expect("put");
+    }
+    other.put("o::z", &json!(1)).await.expect("put");
+    assert_eq!(
+        store.list("o::").await.expect("list"),
+        vec!["o::a", "o::b::__sla__"]
+    );
+
+    store.put_batch(&[]).await.expect("empty batch");
+    store
+        .put_batch(&[
+            ("o::a".to_string(), json!({"v": 2})),
+            ("o::c".to_string(), json!(3)),
+        ])
+        .await
+        .expect("batch");
+    assert_eq!(store.get("o::a").await.unwrap(), Some(json!({"v": 2})));
+    assert_eq!(store.get("o::c").await.unwrap(), Some(json!(3)));
+    assert!(
+        store
+            .put_batch(&[("../bad".to_string(), json!(1))])
+            .await
+            .is_err()
+    );
+}

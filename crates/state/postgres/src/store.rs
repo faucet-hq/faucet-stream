@@ -132,6 +132,13 @@ pub(crate) fn delete_sql(table: &str) -> String {
     format!("DELETE FROM {} WHERE key = $1", quote_ident(table))
 }
 
+pub(crate) fn list_sql(table: &str) -> String {
+    format!(
+        "SELECT key FROM {} WHERE left(key, char_length($1)) = $1 ORDER BY key",
+        quote_ident(table)
+    )
+}
+
 #[async_trait]
 impl StateStore for PostgresStateStore {
     async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
@@ -179,6 +186,47 @@ impl StateStore for PostgresStateStore {
             .map_err(|e| {
                 FaucetError::State(format!("Postgres DELETE for key '{key}' failed: {e}"))
             })?;
+        Ok(())
+    }
+
+    fn supports_list(&self) -> bool {
+        true
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let rows = sqlx::query(&list_sql(&self.table))
+            .bind(prefix)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FaucetError::State(format!("Postgres key listing failed: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                r.try_get::<String, _>(0)
+                    .map_err(|e| FaucetError::State(format!("failed to decode state key: {e}")))
+            })
+            .collect()
+    }
+
+    fn supports_atomic_batch(&self) -> bool {
+        true
+    }
+
+    async fn put_batch(&self, entries: &[(String, Value)]) -> Result<(), FaucetError> {
+        for (key, _) in entries {
+            validate_state_key(key)?;
+        }
+        let err = |e: sqlx::Error| FaucetError::State(format!("Postgres batch UPSERT failed: {e}"));
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        let sql = upsert_sql(&self.table);
+        for (key, value) in entries {
+            sqlx::query(&sql)
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
         Ok(())
     }
 
@@ -313,6 +361,15 @@ mod tests {
         assert!(sql.contains("ON CONFLICT (key) DO UPDATE"));
         assert!(sql.contains("value = EXCLUDED.value"));
         assert!(sql.contains("updated_at = NOW()"));
+    }
+
+    #[test]
+    fn list_sql_matches_a_literal_prefix() {
+        let sql = list_sql("faucet_state");
+        assert_eq!(
+            sql,
+            "SELECT key FROM \"faucet_state\" WHERE left(key, char_length($1)) = $1 ORDER BY key"
+        );
     }
 
     #[test]

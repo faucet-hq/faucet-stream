@@ -190,7 +190,7 @@ pub use staging::{
     StagedFile, StagingCleanup, StagingCompression, StagingFormat, StagingLocation, StagingScheme,
     StagingSpec, serialize_records,
 };
-pub use state::{FileStateStore, MemoryStateStore, StateStore};
+pub use state::{FileStateStore, MemoryStateStore, StateExport, StateStore};
 pub use tls::TlsClientConfig;
 pub use topology::{
     Edge, JoinNode, Node, NodeKind, Topology, TopologyBuilder, TopologyOnError, TopologyOptions,

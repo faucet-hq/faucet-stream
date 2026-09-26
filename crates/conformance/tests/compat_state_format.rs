@@ -249,3 +249,38 @@ fn an_envelope_from_the_future_degrades_to_a_bare_bookmark_rather_than_panicking
     assert_eq!(seq, 42, "unknown sibling fields must not break the read");
     assert_eq!(bookmark.expect("bookmark")["page"], 7);
 }
+
+#[tokio::test]
+async fn a_state_export_written_by_a_release_still_imports_and_resumes() {
+    use faucet_core::StateStore;
+    use faucet_core::state::{MemoryStateStore, StateExport, import_namespace};
+
+    let export = StateExport::from_value(fixture("state-export-v1.json"))
+        .expect("a v1 export must stay readable");
+    assert_eq!(export.pipeline, "orders");
+    assert_eq!(export.keys.len(), 3);
+
+    let store = MemoryStateStore::new();
+    let report = import_namespace(&store, &export, false)
+        .await
+        .expect("import");
+    assert!(report.error.is_none(), "{report:?}");
+
+    // The exactly-once envelope lands byte-for-byte, so the resumed run keeps
+    // its committed sequence rather than restarting the watermark at zero.
+    let (bookmark, seq) = unwrap_state(&store.get("orders::orders").await.unwrap().unwrap());
+    assert_eq!(seq, 17);
+    assert_eq!(bookmark.unwrap()["lsn"], "0/3A00F128");
+    assert_eq!(
+        store.get("orders::customers").await.unwrap().unwrap()["updated_at"],
+        "2026-09-26T06:09:00Z"
+    );
+}
+
+#[test]
+fn a_state_export_from_a_future_release_is_refused_not_half_read() {
+    let mut doc = fixture("state-export-v1.json");
+    doc["version"] = serde_json::json!(2);
+    let err = faucet_core::StateExport::from_value(doc).unwrap_err();
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
