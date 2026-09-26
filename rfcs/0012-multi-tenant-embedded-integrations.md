@@ -147,7 +147,9 @@ a Tenants page with connections and a "Connect" button per provider), metrics
 `faucet_serve_tenant_limit_rejections_total{tenant,limit}`,
 `faucet_serve_connections{status}`, `faucet_serve_connect_flows_total{provider,outcome}`),
 audit actions `tenant.*`, `connection.*`, `connect.*`. Feature flag:
-`tenants` (CLI-only, `= ["serve", "encryption", "templates"]`), in `full`.
+`tenants` (CLI-only, `= ["serve", "encryption", "templates", "notify"]`),
+in `full`. The `schedule` trigger type additionally needs the `triggers` and
+`schedule` features.
 
 ## Alternatives considered
 
