@@ -4,6 +4,26 @@ use crate::config::{ConnectorSpec, PipelineConfig};
 use crate::error::{CliError, CliResult};
 use crate::replication::spec::ReplicationSpec;
 
+const CDC_SOURCES: &str =
+    "postgres-cdc / mysql-cdc / mssql-cdc / mongodb-cdc / dynamodb in `mode: streams`";
+
+/// How a mirror's CDC source replays after the snapshot handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdcReplay {
+    /// Replays from an exact position (exactly-once-capable source).
+    Deterministic,
+    /// Replays a retained window; converges only through a keyed upsert sink.
+    Keyed,
+}
+
+fn cdc_replay(spec: &ConnectorSpec) -> Option<CdcReplay> {
+    if crate::registry::source_supports_exactly_once(&spec.kind) {
+        return Some(CdcReplay::Deterministic);
+    }
+    let streams = spec.config.get("mode").and_then(|m| m.as_str()) == Some("streams");
+    (spec.kind == "dynamodb" && streams).then_some(CdcReplay::Keyed)
+}
+
 /// Validated replication config, ready for the orchestrator.
 #[derive(Debug, Clone)]
 pub struct CompiledReplication {
@@ -29,25 +49,22 @@ impl CompiledReplication {
         }
         // The main pipeline.source must be a capture-capable CDC source.
         let cdc = cfg.pipeline.source.as_ref().ok_or_else(|| {
-            CliError::Config(
-                "mirror requires `pipeline.source` to be the CDC source \
-                 (postgres-cdc / mysql-cdc / mongodb-cdc)"
-                    .into(),
-            )
+            CliError::Config(format!(
+                "mirror requires `pipeline.source` to be the CDC source ({CDC_SOURCES})"
+            ))
         })?;
-        if !crate::registry::source_supports_exactly_once(&cdc.kind) {
+        let Some(replay) = cdc_replay(cdc) else {
             return Err(CliError::Config(format!(
-                "mirror `pipeline.source` must be a CDC source \
-                 (postgres-cdc / mysql-cdc / mongodb-cdc); got '{}'",
+                "mirror `pipeline.source` must be a CDC source ({CDC_SOURCES}); got '{}'",
                 cdc.kind
             )));
-        }
+        };
         // The snapshot source must be a non-CDC bulk reader, and must exist.
         let snap = &spec.snapshot.source;
-        if crate::registry::source_supports_exactly_once(&snap.kind) {
+        if cdc_replay(snap).is_some() {
             return Err(CliError::Config(format!(
                 "mirror.snapshot.source must be a non-CDC bulk source \
-                 (e.g. postgres / mysql / mongodb); got CDC source '{}'",
+                 (e.g. postgres / mysql / mongodb / dynamodb scan); got CDC source '{}'",
                 snap.kind
             )));
         }
@@ -76,6 +93,21 @@ impl CompiledReplication {
             .get("write_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("append");
+        if replay == CdcReplay::Keyed {
+            let has_key = sink
+                .config
+                .get("key")
+                .and_then(|v| v.as_array())
+                .is_some_and(|k| !k.is_empty());
+            if !matches!(write_mode, "upsert" | "delete") || !has_key {
+                return Err(CliError::Config(format!(
+                    "mirror from '{}' requires a keyed sink (`write_mode: upsert` with a \
+                     non-empty `key`): its change stream replays a retained window rather \
+                     than a deterministic position, so only a keyed upsert converges",
+                    cdc.kind
+                )));
+            }
+        }
         if write_mode != "upsert" {
             tracing::warn!(
                 write_mode,
@@ -207,6 +239,58 @@ replication:
         let c = cfg(&bad);
         let err = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
         assert!(format!("{err}").contains("state"), "{err}");
+    }
+
+    const DYNAMO: &str = r#"
+version: 1
+name: mirror
+pipeline:
+  source: { type: dynamodb, config: { table_name: orders, mode: streams, idle_termination_secs: 5 } }
+  sink:   { type: postgres, config: { connection_url: "postgres://y", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] } }
+  state:  { type: file, config: { path: ./st } }
+replication:
+  mode: snapshot_then_cdc
+  snapshot:
+    source: { type: dynamodb, config: { table_name: orders, mode: scan } }
+"#;
+
+    #[test]
+    fn accepts_dynamodb_streams_with_keyed_upsert_sink() {
+        let c = cfg(DYNAMO);
+        let r = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap();
+        assert_eq!(r.snapshot_source.kind, "dynamodb");
+    }
+
+    #[test]
+    fn rejects_dynamodb_streams_without_keyed_sink() {
+        for bad in [
+            DYNAMO.replace(", write_mode: upsert, key: [id]", ""),
+            DYNAMO.replace("key: [id]", "key: []"),
+        ] {
+            let c = cfg(&bad);
+            let err =
+                CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
+            assert!(format!("{err}").contains("keyed sink"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_dynamodb_scan_as_cdc_source() {
+        let bad = DYNAMO.replacen("mode: streams, idle_termination_secs: 5", "mode: scan", 1);
+        let c = cfg(&bad);
+        let err = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
+        assert!(format!("{err}").contains("CDC source"), "{err}");
+    }
+
+    #[test]
+    fn rejects_dynamodb_streams_snapshot_source() {
+        let bad = DYNAMO.replace(
+            "{ table_name: orders, mode: scan }",
+            "{ table_name: orders, mode: streams }",
+        );
+        let c = cfg(&bad);
+        let err = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
+        assert!(format!("{err}").contains("non-CDC"), "{err}");
     }
 
     #[test]

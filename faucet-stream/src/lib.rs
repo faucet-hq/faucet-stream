@@ -41,6 +41,8 @@
 //! | `source-parquet` | Apache Parquet file source (local, glob, S3) |
 //! | `source-delta` | Apache Delta Lake source (local FS or S3/Azure/GCS, time travel) |
 //! | `source-databricks` | Databricks SQL query source (Statement Execution API) |
+//! | `source-iceberg` | Apache Iceberg table source (REST/Glue/SQL/HMS catalogs, time travel, incremental) |
+//! | `source-dynamodb` | Amazon DynamoDB source (scan, query, Streams CDC) |
 //! | `sink-bigquery` | Google BigQuery streaming insert sink |
 //! | `sink-iceberg` | Apache Iceberg sink (append-only, REST/Glue/SQL/HMS catalogs) |
 //! | `sink-postgres` | PostgreSQL sink (jsonb or auto-mapped columns) |
@@ -66,6 +68,8 @@
 //! | `sink-spanner` | Google Cloud Spanner mutation sink |
 //! | `sink-parquet` | Apache Parquet file sink (local, S3) |
 //! | `encryption` | AES-256-GCM at-rest sealing for file state-store bookmarks and per-line JSONL/DLQ output |
+//! | `sink-dynamodb` | Amazon DynamoDB sink (batched writes, upsert/delete) |
+//! | `sink-databricks` | Databricks SQL warehouse sink (append/upsert/overwrite, exactly-once) |
 //! | `sink-delta` | Apache Delta Lake sink (append-only; local FS or S3/Azure/GCS) |
 //! | `kafka-schema-registry` | Schema Registry support for Kafka connectors |
 //! | `source` | All source connectors |
@@ -245,6 +249,16 @@ pub mod source {
     #[cfg(feature = "source-databricks")]
     pub mod databricks {
         pub use faucet_source_databricks::*;
+    }
+
+    #[cfg(feature = "source-iceberg")]
+    pub mod iceberg {
+        pub use faucet_source_iceberg::*;
+    }
+
+    #[cfg(feature = "source-dynamodb")]
+    pub mod dynamodb {
+        pub use faucet_source_dynamodb::*;
     }
 
     #[cfg(feature = "source-gcs")]
@@ -434,6 +448,16 @@ pub mod source {
     #[cfg(feature = "source-databricks")]
     pub mod databricks {
         pub use faucet_source_databricks::*;
+    }
+
+    #[cfg(feature = "source-iceberg")]
+    pub mod iceberg {
+        pub use faucet_source_iceberg::*;
+    }
+
+    #[cfg(feature = "source-dynamodb")]
+    pub mod dynamodb {
+        pub use faucet_source_dynamodb::*;
     }
 
     #[cfg(feature = "source-gcs")]
@@ -632,6 +656,16 @@ pub mod sink {
     pub mod azure_blob {
         pub use faucet_sink_azure_blob::*;
     }
+
+    #[cfg(feature = "sink-dynamodb")]
+    pub mod dynamodb {
+        pub use faucet_sink_dynamodb::*;
+    }
+
+    #[cfg(feature = "sink-databricks")]
+    pub mod databricks {
+        pub use faucet_sink_databricks::*;
+    }
 }
 
 // ── GCS common types ─────────────────────────────────────────────────────────
@@ -696,6 +730,20 @@ pub mod common_rabbitmq {
 #[cfg(any(feature = "source-azure-blob", feature = "sink-azure-blob"))]
 pub mod common_azure {
     pub use faucet_common_azure::*;
+}
+
+/// Shared Amazon DynamoDB types (credentials enum, client builders, attribute
+/// value conversion), re-exported when either DynamoDB connector is enabled.
+#[cfg(any(feature = "source-dynamodb", feature = "sink-dynamodb"))]
+pub mod common_dynamodb {
+    pub use faucet_common_dynamodb::*;
+}
+
+/// Shared Databricks types (connection/auth config, SQL client), re-exported
+/// when either Databricks connector is enabled.
+#[cfg(any(feature = "source-databricks", feature = "sink-databricks"))]
+pub mod common_databricks {
+    pub use faucet_common_databricks::*;
 }
 
 // ── State-store backends ─────────────────────────────────────────────────────

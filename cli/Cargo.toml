@@ -28,7 +28,7 @@ default = ["observability", "source", "sink", "state", "transforms", "compressio
 
 # Everything the default build ships, plus the long-running runtime modes:
 # `schedule` (cron scheduler) and `serve` (HTTP control plane).
-full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "source-rest-excel", "source-xml-excel", "file-formats"]
+full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-rest-excel", "source-xml-excel", "file-formats"]
 
 # Remote Template Hub catalogs (#677): `--hub github:owner/repo[@ref][/path]`
 # fetches a catalog through the GitHub contents API and caches it locally;
@@ -104,6 +104,8 @@ source = [
     "source-parquet",
     "source-delta",
     "source-databricks",
+    "source-iceberg",
+    "source-dynamodb",
     "source-gcs",
     "source-bigquery",
     "source-snowflake",
@@ -136,6 +138,8 @@ sink = [
     "sink-delta",
     "sink-gcs",
     "sink-iceberg",
+    "sink-dynamodb",
+    "sink-databricks",
     "sink-spanner",
     "sink-redshift",
     "sink-pubsub",
@@ -181,6 +185,12 @@ source-kinesis = ["dep:faucet-source-kinesis"]
 source-parquet = ["dep:faucet-source-parquet"]
 source-delta = ["dep:faucet-source-delta"]
 source-databricks = ["dep:faucet-source-databricks"]
+source-iceberg = ["dep:faucet-source-iceberg"]
+# Non-REST Iceberg catalogs for the source (optional-dep forwarding).
+source-iceberg-glue = ["faucet-source-iceberg?/catalog-glue"]
+source-iceberg-sql = ["faucet-source-iceberg?/catalog-sql"]
+source-iceberg-hms = ["faucet-source-iceberg?/catalog-hms"]
+source-dynamodb = ["dep:faucet-source-dynamodb"]
 source-gcs = ["dep:faucet-source-gcs"]
 source-bigquery = ["dep:faucet-source-bigquery"]
 source-snowflake = ["dep:faucet-source-snowflake"]
@@ -220,6 +230,10 @@ sink-clickhouse = ["dep:faucet-sink-clickhouse"]
 # Staged bulk load for the ClickHouse sink (#528): stage to S3/GCS + server-side s3()/gcs() pull.
 sink-clickhouse-staging = ["sink-clickhouse", "faucet-sink-clickhouse/staging"]
 sink-azure-blob = ["dep:faucet-sink-azure-blob"]
+sink-dynamodb = ["dep:faucet-sink-dynamodb"]
+sink-databricks = ["dep:faucet-sink-databricks"]
+# Cloud (s3:// / gs:// / abfss://) staging for the Databricks sink (#713).
+sink-databricks-staging = ["sink-databricks", "faucet-sink-databricks/staging"]
 
 ## Delta Lake cloud object-store backends. Forwarded to whichever delta
 ## connector is enabled via optional-dep (`?`) syntax, so they don't pull the
@@ -326,6 +340,7 @@ arrow = [
     "faucet-source-gcs?/arrow",
     "faucet-sink-gcs?/arrow",
     "faucet-source-databricks?/arrow",
+    "faucet-source-iceberg?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can
     # reach the BigQuery Parquet load without materializing `Value`.
     "faucet-source-rest?/arrow",
@@ -503,6 +518,8 @@ faucet-source-kinesis = { workspace = true, optional = true }
 faucet-source-parquet = { workspace = true, optional = true }
 faucet-source-delta = { workspace = true, optional = true }
 faucet-source-databricks = { workspace = true, optional = true }
+faucet-source-iceberg = { workspace = true, optional = true }
+faucet-source-dynamodb = { workspace = true, optional = true }
 faucet-source-gcs = { workspace = true, optional = true }
 faucet-source-bigquery = { workspace = true, optional = true }
 faucet-source-snowflake = { workspace = true, optional = true }
@@ -538,6 +555,8 @@ faucet-sink-redshift = { workspace = true, optional = true }
 faucet-sink-pubsub = { workspace = true, optional = true }
 faucet-sink-clickhouse = { workspace = true, optional = true }
 faucet-sink-azure-blob = { workspace = true, optional = true }
+faucet-sink-dynamodb = { workspace = true, optional = true }
+faucet-sink-databricks = { workspace = true, optional = true }
 faucet-state-redis = { workspace = true, optional = true }
 faucet-state-postgres = { workspace = true, optional = true }
 faucet-lineage = { workspace = true, optional = true }
