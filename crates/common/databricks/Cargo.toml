@@ -12,6 +12,18 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+wiremock = "0.6"
+serde_json.workspace = true
+faucet-auth.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

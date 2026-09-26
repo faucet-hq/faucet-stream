@@ -18,19 +18,10 @@
 //!
 //! A `null` cell maps to `Value::Null` regardless of declared type.
 
-use serde::Deserialize;
 use serde_json::{Map, Value};
 
-/// One entry in `manifest.schema.columns`. Only the fields we use are decoded.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ColumnInfo {
-    /// Column name (used as the JSON object key; casing preserved).
-    pub name: String,
-    /// High-level Databricks type — `BOOLEAN`, `LONG`, `DECIMAL`, `STRING`,
-    /// `DATE`, `TIMESTAMP`, `ARRAY`, … (uppercase).
-    #[serde(default)]
-    pub type_name: String,
-}
+/// One entry in `manifest.schema.columns`.
+pub use faucet_common_databricks::ResultColumn as ColumnInfo;
 
 /// Build a JSON object from one Databricks row (array of string/null cells).
 ///
