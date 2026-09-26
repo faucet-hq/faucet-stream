@@ -435,3 +435,59 @@ async fn capture_resume_position_cluster_scope() {
         "resume_token present: {pos}"
     );
 }
+
+/// #733 — `lag()` reports how old the oldest undelivered change is, against the
+/// cluster's current time: none before a position is known, near zero once a
+/// cycle has caught up, and the age of a change sitting unread behind a stored
+/// bookmark (what `faucet status --probe` asks on a fresh source).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lag_reports_the_age_of_the_oldest_unread_change() {
+    let (_container, uri) = start_repl_set().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let coll = client.database(DB).collection::<Document>(COLL);
+    coll.insert_one(doc! { "_id": 0, "seed": true })
+        .await
+        .expect("seed insert");
+
+    let source = MongoCdcSource::new(config(&uri)).await.expect("source");
+    assert_eq!(source.lag().await.expect("lag"), None);
+
+    let writer_uri = uri.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let client = Client::with_uri_str(&writer_uri).await.expect("writer");
+        client
+            .database(DB)
+            .collection::<Document>(COLL)
+            .insert_one(doc! { "_id": 1 })
+            .await
+            .expect("insert");
+    });
+    let (records, bookmark) = drain(&source).await;
+    writer.await.expect("writer task");
+    assert_eq!(records.len(), 1);
+    let caught_up = source.lag().await.expect("lag").expect("a reading");
+    assert!(
+        caught_up.seconds.unwrap() < 30.0,
+        "an idle, caught-up stream is not behind: {caught_up:?}"
+    );
+
+    coll.insert_one(doc! { "_id": 2 }).await.expect("insert");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    client
+        .database(DB)
+        .collection::<Document>("other")
+        .insert_one(doc! { "tick": 1 })
+        .await
+        .expect("advance the cluster time");
+    let probe = MongoCdcSource::new(config(&uri)).await.expect("source");
+    probe
+        .apply_start_bookmark(bookmark.expect("bookmark"))
+        .await
+        .expect("apply");
+    let behind = probe.lag().await.expect("lag").expect("a reading");
+    assert!(
+        behind.seconds.unwrap() >= 2.0,
+        "the unread insert is at least as old as the pause: {behind:?}"
+    );
+}

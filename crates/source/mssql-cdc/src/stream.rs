@@ -50,6 +50,9 @@ pub struct MssqlCdcSource {
     /// Bookmark provided by [`Source::apply_start_bookmark`], consumed at the
     /// start of the next fetch cycle.
     pending_bookmark: Mutex<Option<Bookmarks>>,
+    /// The bookmark map last handed to the pipeline this run — where
+    /// [`Source::lag`] measures from (#733).
+    emitted: Mutex<Option<Bookmarks>>,
 }
 
 impl MssqlCdcSource {
@@ -99,6 +102,7 @@ impl MssqlCdcSource {
             state_key_value,
             tables,
             pending_bookmark: Mutex::new(None),
+            emitted: Mutex::new(None),
         })
     }
 
@@ -153,6 +157,53 @@ impl Source for MssqlCdcSource {
             .lock()
             .expect("pending_bookmark mutex poisoned") = Some(marks);
         Ok(())
+    }
+
+    /// Unread change transactions and the age of the oldest (#733), measured
+    /// from the capture instance furthest behind.
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        let marks = {
+            let emitted = self.emitted.lock().expect("emitted mutex poisoned").clone();
+            emitted.or_else(|| {
+                self.pending_bookmark
+                    .lock()
+                    .expect("pending_bookmark mutex poisoned")
+                    .clone()
+            })
+        };
+        let Some(from) = marks.and_then(|m| slowest_position(&m, &self.config.capture_instances))
+        else {
+            return Ok(None);
+        };
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| FaucetError::Source(format!("mssql-cdc: lag checkout failed: {e}")))?;
+        const SQL: &str = "DECLARE @from BINARY(10) = CONVERT(BINARY(10), @P1, 2); \
+             DECLARE @max BINARY(10) = sys.fn_cdc_get_max_lsn(); \
+             SELECT COUNT_BIG(*) AS pending, \
+                    DATEDIFF_BIG(millisecond, MIN(tran_begin_time), SYSDATETIME()) AS age_ms \
+             FROM cdc.lsn_time_mapping \
+             WHERE start_lsn > @from AND start_lsn <= @max AND tran_id <> 0x00";
+        let hex = from.to_hex();
+        let p: &dyn ToSql = &hex;
+        let rows = self.run_collect(&mut conn, SQL, &[p]).await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let pending: i64 = row
+            .try_get::<i64, _>("pending")
+            .map_err(|e| FaucetError::Source(format!("mssql-cdc: lag decode failed: {e}")))?
+            .unwrap_or(0);
+        let age_ms: Option<i64> = row
+            .try_get::<i64, _>("age_ms")
+            .map_err(|e| FaucetError::Source(format!("mssql-cdc: lag decode failed: {e}")))?;
+        Ok(Some(faucet_core::SourceLag {
+            bytes: None,
+            events: Some(pending.max(0) as u64),
+            seconds: Some(age_ms.map(|ms| ms.max(0) as f64 / 1000.0).unwrap_or(0.0)),
+        }))
     }
 
     /// Capture the database's current max LSN as a bookmark for every configured
@@ -280,6 +331,11 @@ impl Source for MssqlCdcSource {
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl MssqlCdcSource {
+    fn note_emitted(&self, marks: &Bookmarks) -> Result<Value, FaucetError> {
+        *self.emitted.lock().expect("emitted mutex poisoned") = Some(marks.clone());
+        marks.to_value()
+    }
+
     /// Read the database's current maximum LSN (`None` when CDC has produced no
     /// changes yet).
     async fn query_max_lsn(
@@ -407,6 +463,17 @@ async fn fetch_change_tables(
 }
 
 /// Read an optional LSN column (a hex string or SQL NULL) from a row.
+/// The lowest committed LSN across the configured capture instances — the
+/// one furthest behind. `None` until every configured instance has a position.
+fn slowest_position(marks: &Bookmarks, capture_instances: &[String]) -> Option<Lsn> {
+    capture_instances
+        .iter()
+        .map(|ci| marks.get(ci))
+        .collect::<Option<Vec<Lsn>>>()?
+        .into_iter()
+        .min()
+}
+
 fn opt_lsn(row: &tiberius::Row, col: &str) -> Result<Option<Lsn>, FaucetError> {
     match row
         .try_get::<&str, _>(col)
@@ -478,7 +545,7 @@ impl MssqlCdcSource {
                                 if per_transaction {
                                     yield StreamPage {
                                         records: Vec::new(),
-                                        bookmark: Some(marks.to_value()?),
+                                        bookmark: Some(self.note_emitted(&marks)?),
                                     };
                                 } else {
                                     agg_dirty = true;
@@ -570,7 +637,7 @@ impl MssqlCdcSource {
                                     if per_transaction {
                                         yield StreamPage {
                                             records: recs,
-                                            bookmark: Some(marks.to_value()?),
+                                            bookmark: Some(self.note_emitted(&marks)?),
                                         };
                                     } else {
                                         agg.extend(recs);
@@ -617,7 +684,7 @@ impl MssqlCdcSource {
                             if per_transaction {
                                 yield StreamPage {
                                     records: recs,
-                                    bookmark: Some(marks.to_value()?),
+                                    bookmark: Some(self.note_emitted(&marks)?),
                                 };
                             } else {
                                 agg.extend(recs);
@@ -643,7 +710,7 @@ impl MssqlCdcSource {
             if !per_transaction && (agg_dirty || !agg.is_empty()) {
                 yield StreamPage {
                     records: std::mem::take(&mut agg),
-                    bookmark: Some(marks.to_value()?),
+                    bookmark: Some(self.note_emitted(&marks)?),
                 };
             }
 
@@ -674,6 +741,20 @@ fn changes_sql(capture_instance: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn slowest_position_waits_for_every_instance() {
+        let a = Lsn::from_hex("0000002a000000550003").unwrap();
+        let b = Lsn::from_hex("0000002a000000560001").unwrap();
+        let mut m = Bookmarks::new();
+        m.set("dbo_a", b);
+        let cis = vec!["dbo_a".to_string(), "dbo_b".to_string()];
+        assert_eq!(slowest_position(&m, &cis), None);
+        m.set("dbo_b", a);
+        assert_eq!(slowest_position(&m, &cis), Some(a));
+        assert_eq!(slowest_position(&m, &[]), None);
+    }
+
     use super::*;
 
     #[test]

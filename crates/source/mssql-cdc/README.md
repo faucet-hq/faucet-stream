@@ -122,6 +122,14 @@ pipeline:
       delete_marker: { field: "__op", values: ["d"] }
 ```
 
+## Source lag
+
+`Source::lag` (#733) reports **events** and **seconds**: the change transactions after the slowest capture instance's committed LSN, and the age of the oldest of them, from `cdc.lsn_time_mapping` (needs `SELECT` on it). The pipeline polls it on the first page, at most every
+15 s after, and when the run ends, exporting `faucet_source_lag_*{pipeline,row,connector}`;
+`faucet status --probe` and `faucet doctor` ask it from the stored bookmark,
+and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
+logged once and reported as no lag — it never fails a run.
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

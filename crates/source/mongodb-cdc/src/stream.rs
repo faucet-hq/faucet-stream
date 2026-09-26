@@ -101,6 +101,10 @@ pub struct MongoCdcSource {
     client: Client,
     state_key_value: String,
     pending_bookmark: Mutex<Option<Bookmark>>,
+    /// Cluster time (seconds) of the furthest point read this run: the last
+    /// event, or the stream's post-batch token when it went idle. 0 = none
+    /// yet. Where [`Source::lag`] measures from (#733).
+    position_secs: std::sync::atomic::AtomicU64,
 }
 
 impl MongoCdcSource {
@@ -124,6 +128,7 @@ impl MongoCdcSource {
             client,
             state_key_value,
             pending_bookmark: Mutex::new(None),
+            position_secs: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -245,6 +250,36 @@ impl Source for MongoCdcSource {
         Ok(Some(Bookmark::from_token(&token)?.to_value()?))
     }
 
+    /// Seconds between the cluster's current time and the oldest change this
+    /// source has not delivered (#733).
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        let mut position = self
+            .position_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if position == 0 {
+            let pending = self.pending_bookmark.lock().await.clone();
+            let Some(bm) = pending else {
+                return Ok(None);
+            };
+            match self.first_unread_secs(&bm).await? {
+                Some(secs) => position = secs,
+                None => return Ok(None),
+            }
+        }
+        let hello = self
+            .client
+            .database("admin")
+            .run_command(bson::doc! { "hello": 1 })
+            .await
+            .map_err(|e| FaucetError::Source(format!("mongodb-cdc lag: hello failed: {e}")))?;
+        let Ok(now) = hello.get_timestamp("operationTime") else {
+            return Ok(None);
+        };
+        Ok(Some(faucet_core::SourceLag::seconds(
+            u64::from(now.time).saturating_sub(position) as f64,
+        )))
+    }
+
     fn supports_exactly_once(&self) -> bool {
         // Durable resumeToken + deterministic replay from it + per-event
         // (per-page) bookmarks — the requirements for exactly-once delivery.
@@ -327,7 +362,96 @@ impl Source for MongoCdcSource {
     }
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The cluster time (seconds) encoded in a resume token's `_data`: a KeyString
+/// whose first byte `0x82` tags a BSON timestamp, seconds first, big-endian.
+fn token_cluster_secs(token: &Value) -> Option<u64> {
+    let data = token.get("_data")?.as_str()?;
+    if data.len() < 10 || !data.starts_with("82") {
+        return None;
+    }
+    u32::from_str_radix(&data[2..10], 16).ok().map(u64::from)
+}
+
 impl MongoCdcSource {
+    fn note_position(&self, secs: u64) {
+        self.position_secs
+            .fetch_max(secs, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Where a stream resumed after `bm` stands: the cluster time of the first
+    /// change not yet delivered, or — when there is none — the stream's
+    /// post-batch token (the present). Opens and closes one change stream.
+    async fn first_unread_secs(&self, bm: &Bookmark) -> Result<Option<u64>, FaucetError> {
+        let token = bm.to_token()?;
+        let max_await = std::time::Duration::from_millis(self.config.max_await_time_ms.min(1000));
+        let watch_err = |e: mongodb::error::Error| {
+            FaucetError::Source(format!("mongodb-cdc lag watch failed: {e}"))
+        };
+        let cs: mongodb::change_stream::ChangeStream<
+            mongodb::change_stream::event::ChangeStreamEvent<Document>,
+        > = match &self.config.scope {
+            crate::config::Scope::Collection {
+                database,
+                collection,
+            } => {
+                let coll = self
+                    .client
+                    .database(database)
+                    .collection::<Document>(collection);
+                let w = coll.watch().max_await_time(max_await);
+                (if bm.invalidate {
+                    w.start_after(token)
+                } else {
+                    w.resume_after(token)
+                })
+                .await
+                .map_err(watch_err)?
+            }
+            crate::config::Scope::Database { database } => {
+                let db = self.client.database(database);
+                let w = db.watch().max_await_time(max_await);
+                (if bm.invalidate {
+                    w.start_after(token)
+                } else {
+                    w.resume_after(token)
+                })
+                .await
+                .map_err(watch_err)?
+            }
+            crate::config::Scope::Cluster => {
+                let w = self.client.watch().max_await_time(max_await);
+                (if bm.invalidate {
+                    w.start_after(token)
+                } else {
+                    w.resume_after(token)
+                })
+                .await
+                .map_err(watch_err)?
+            }
+        };
+        let mut cs = cs;
+        match tokio::time::timeout(max_await * 4, cs.next_if_any()).await {
+            Ok(Ok(Some(event))) => Ok(event.cluster_time.map(|ts| u64::from(ts.time))),
+            // An empty batch: nothing is waiting, so the post-batch token is
+            // the present.
+            Ok(Ok(None)) => Ok(cs
+                .resume_token()
+                .and_then(|t| Bookmark::from_token(&t).ok())
+                .and_then(|b| token_cluster_secs(&b.resume_token))),
+            Ok(Err(e)) => Err(FaucetError::Source(format!(
+                "mongodb-cdc lag: change stream error: {e}"
+            ))),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Open the change stream and drain it with an idle-timeout terminator.
     fn stream_pages_impl<'a>(
         &'a self,
@@ -439,6 +563,9 @@ impl MongoCdcSource {
             loop {
                 match tokio::time::timeout(idle_timeout, change_stream.next()).await {
                     Ok(Some(Ok(event))) => {
+                        if let Some(ts) = &event.cluster_time {
+                            self.note_position(u64::from(ts.time));
+                        }
                         let bookmark = Bookmark::from_token(&event.id)?;
                         let is_invalidate = matches!(
                             event.operation_type,
@@ -483,6 +610,11 @@ impl MongoCdcSource {
                     // Idle (timeout) or cursor closed: flush whatever we have and
                     // end this fetch cycle.
                     Ok(None) | Err(_) => {
+                        // Nothing arrived for the idle window: the stream has
+                        // caught up to the present. (The driver's resume token
+                        // must not be read here — a timed-out `next()` leaves
+                        // the stream mid-poll.)
+                        self.note_position(unix_now_secs());
                         if !buffer.is_empty() {
                             yield StreamPage {
                                 records: std::mem::take(&mut buffer),
@@ -503,7 +635,6 @@ impl MongoCdcSource {
     /// snapshot→CDC handoff to anchor the stream before the bulk snapshot.
     async fn capture_now_token(&self) -> Result<ResumeToken, FaucetError> {
         use crate::config::Scope;
-        use futures::StreamExt;
         let max_await = std::time::Duration::from_millis(self.config.max_await_time_ms);
         let cs: mongodb::change_stream::ChangeStream<
             mongodb::change_stream::event::ChangeStreamEvent<Document>,
@@ -539,18 +670,17 @@ impl MongoCdcSource {
                     FaucetError::Source(format!("mongodb-cdc capture watch failed: {e}"))
                 })?,
         };
-        let mut cs = std::pin::pin!(cs);
+        let mut cs = cs;
         // The initial aggregate response usually carries a postBatchResumeToken.
-        // If the driver hasn't cached one yet, one short poll forces a getMore
-        // that returns it.
+        // If the driver hasn't cached one yet, one getMore returns it. That
+        // poll must complete (`next_if_any` returns on an empty batch): reading
+        // the token while a timed-out `next()` is mid-poll panics the driver.
         if let Some(tok) = cs.resume_token() {
             return Ok(tok);
         }
-        let _ = tokio::time::timeout(
-            max_await.max(std::time::Duration::from_millis(500)),
-            cs.next(),
-        )
-        .await;
+        cs.next_if_any()
+            .await
+            .map_err(|e| FaucetError::Source(format!("mongodb-cdc capture poll failed: {e}")))?;
         cs.resume_token().ok_or_else(|| {
             FaucetError::Source(
                 "mongodb-cdc: could not capture a resume token (no postBatchResumeToken returned)"
@@ -562,6 +692,18 @@ impl MongoCdcSource {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn token_cluster_secs_decodes_the_leading_timestamp() {
+        assert_eq!(
+            token_cluster_secs(&json!({"_data": "8266543210000000012B0229296E04"})),
+            Some(0x6654_3210)
+        );
+        assert_eq!(token_cluster_secs(&json!({"_data": "81abc"})), None);
+        assert_eq!(token_cluster_secs(&json!({"_data": "82zzzzzzzz00"})), None);
+        assert_eq!(token_cluster_secs(&json!({})), None);
+    }
+
     use super::*;
     use serde_json::json;
 

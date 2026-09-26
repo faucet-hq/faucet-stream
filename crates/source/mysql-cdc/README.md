@@ -439,6 +439,14 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [faucet-source-postgres-cdc](https://crates.io/crates/faucet-source-postgres-cdc) · [faucet-source-mongodb-cdc](https://crates.io/crates/faucet-source-mongodb-cdc) — sibling CDC sources
 - [faucet-state-redis](https://crates.io/crates/faucet-state-redis) · [faucet-state-postgres](https://crates.io/crates/faucet-state-postgres) — durable bookmark stores
 
+## Source lag
+
+`Source::lag` (#733) reports **bytes**: the binlog distance from the consumed file/position to the server's head, across files (`SHOW BINARY LOGS` + `SHOW BINARY LOG STATUS`; needs `REPLICATION CLIENT`). Before any position is known (no bookmark, no page yet) it reports none. The pipeline polls it on the first page, at most every
+15 s after, and when the run ends, exporting `faucet_source_lag_*{pipeline,row,connector}`;
+`faucet status --probe` and `faucet doctor` ask it from the stored bookmark,
+and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
+logged once and reported as no lag — it never fails a run.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

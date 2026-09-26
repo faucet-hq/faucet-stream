@@ -144,6 +144,7 @@ pub(crate) async fn run_shard(
     shard_id: String,
     bookmarked_sequence: Option<String>,
     tx: tokio::sync::mpsc::Sender<ShardEvent>,
+    behind: BehindLatest,
 ) {
     let poll_interval = config.poll_interval();
     let mut last_sequence = bookmarked_sequence.clone();
@@ -221,8 +222,11 @@ pub(crate) async fn run_shard(
                 iterator = out.next_shard_iterator().map(str::to_string);
                 // Behind records arrive back-to-back; caught-up shards wait
                 // the poll interval (the 5 reads/sec/shard API budget).
-                let behind = out.millis_behind_latest().unwrap_or(0);
-                if records.is_empty() || behind == 0 {
+                let behind_ms = out.millis_behind_latest().unwrap_or(0);
+                if let Ok(mut m) = behind.lock() {
+                    m.insert(shard_id.clone(), behind_ms);
+                }
+                if records.is_empty() || behind_ms == 0 {
                     tokio::time::sleep(poll_interval).await;
                 }
             }
@@ -272,6 +276,38 @@ pub(crate) async fn run_shard(
             }
         }
     }
+}
+
+/// Each shard's latest `MillisBehindLatest` from `GetRecords` (#733).
+pub(crate) type BehindLatest =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>;
+
+/// `MillisBehindLatest` for one shard read from `bookmarked_sequence` (or the
+/// configured start position): one `GetRecords` of at most one record. A
+/// closed, drained shard reports none.
+pub(crate) async fn probe_behind(
+    client: &Client,
+    config: &KinesisSourceConfig,
+    shard_id: &str,
+    bookmarked_sequence: Option<&str>,
+) -> Result<Option<i64>, FaucetError> {
+    let Some(iterator) = acquire_iterator(client, config, shard_id, bookmarked_sequence).await?
+    else {
+        return Ok(None);
+    };
+    let out = client
+        .get_records()
+        .shard_iterator(iterator)
+        .limit(1)
+        .send()
+        .await
+        .map_err(|e| {
+            FaucetError::Source(format!(
+                "kinesis: GetRecords on {shard_id} failed: {}",
+                e.into_service_error()
+            ))
+        })?;
+    Ok(out.millis_behind_latest())
 }
 
 /// Acquire a shard iterator at the bookmark (if any) or start position.

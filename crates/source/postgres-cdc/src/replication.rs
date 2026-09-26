@@ -454,6 +454,40 @@ pub async fn ensure_slot_and_current_lsn(
     crate::state::parse_lsn(&lsn_text)
 }
 
+/// The server's current WAL position and the slot's `confirmed_flush_lsn`
+/// (#733), or `None` when the slot does not exist. Read-only.
+pub async fn slot_positions(
+    connection_url: &str,
+    slot_name: &str,
+    tls: &crate::config::CdcTls,
+) -> Result<Option<(u64, Option<u64>)>, FaucetError> {
+    let opts: PgConnectOptions = connection_url
+        .parse()
+        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = apply_cdc_tls(opts, tls);
+    use sqlx::ConnectOptions as _;
+    let mut conn: PgConnection = opts
+        .connect()
+        .await
+        .map_err(|e| pg_err("postgres-cdc lag connect", e))?;
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT pg_current_wal_lsn()::text, confirmed_flush_lsn::text \
+         FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(slot_name)
+    .fetch_optional(&mut conn)
+    .await
+    .map_err(|e| pg_err("postgres-cdc lag query", e))?;
+    let Some((current, confirmed)) = row else {
+        return Ok(None);
+    };
+    let confirmed = confirmed
+        .as_deref()
+        .map(crate::state::parse_lsn)
+        .transpose()?;
+    Ok(Some((crate::state::parse_lsn(&current)?, confirmed)))
+}
+
 /// Open a logical replication stream and return a [`Duplex`] handle.
 ///
 /// Internally this calls `pgwire_replication::ReplicationClient::connect`

@@ -3,7 +3,7 @@
 //! idle / max-messages termination.
 
 use crate::config::KinesisSourceConfig;
-use crate::shard::{ShardEvent, run_shard};
+use crate::shard::{BehindLatest, ShardEvent, probe_behind, run_shard};
 use crate::state::{ShardBookmarks, state_key};
 use aws_sdk_kinesis::Client;
 use faucet_core::{FaucetError, Stream, StreamPage};
@@ -19,6 +19,8 @@ pub struct KinesisSource {
     client: Client,
     /// Bookmark applied by the pipeline before streaming (resume position).
     start_bookmarks: Mutex<Option<ShardBookmarks>>,
+    /// Each shard's latest `MillisBehindLatest` this run (#733).
+    behind: BehindLatest,
 }
 
 /// One discovered shard eligible for consumption.
@@ -58,6 +60,7 @@ impl KinesisSource {
             config,
             client,
             start_bookmarks: Mutex::new(None),
+            behind: BehindLatest::default(),
         })
     }
 
@@ -161,12 +164,13 @@ impl faucet_core::Source for KinesisSource {
                 let shard_id = shard.id.clone();
                 let bookmark = bookmarks.get(&shard_id).map(str::to_string);
                 let tx = tx.clone();
+                let behind = Arc::clone(&self.behind);
                 handles.push(tokio::spawn(async move {
                     let _permit = permit_sem
                         .acquire_owned()
                         .await
                         .expect("semaphore closed");
-                    run_shard(client, config, shard_id, bookmark, tx).await;
+                    run_shard(client, config, shard_id, bookmark, tx, behind).await;
                 }));
             }
             drop(tx); // the channel closes when every worker exits
@@ -274,6 +278,43 @@ impl faucet_core::Source for KinesisSource {
 
     fn state_key(&self) -> Option<String> {
         Some(state_key(&self.config.stream_name))
+    }
+
+    /// How far the furthest-behind shard trails the stream's tip (#733):
+    /// `MillisBehindLatest` from this run's reads, or — before any — one
+    /// probing read per shard from the resume position.
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        let seen = self
+            .behind
+            .lock()
+            .ok()
+            .and_then(|m| m.values().copied().max());
+        let millis = match seen {
+            Some(ms) => Some(ms),
+            None => {
+                let bookmarks = self
+                    .start_bookmarks
+                    .lock()
+                    .expect("bookmark mutex poisoned")
+                    .clone()
+                    .unwrap_or_default();
+                let mut worst: Option<i64> = None;
+                for shard in self.discover_shards().await? {
+                    if let Some(ms) = probe_behind(
+                        &self.client,
+                        &self.config,
+                        &shard.id,
+                        bookmarks.get(&shard.id),
+                    )
+                    .await?
+                    {
+                        worst = Some(worst.map_or(ms, |w| w.max(ms)));
+                    }
+                }
+                worst
+            }
+        };
+        Ok(millis.map(|ms| faucet_core::SourceLag::seconds(ms.max(0) as f64 / 1000.0)))
     }
 
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
