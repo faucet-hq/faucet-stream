@@ -31,6 +31,7 @@
   - [Airtable (via REST source)](./cookbook/airtable.md)
 - [Moving data reliably]()
   - [Incremental replication & state](./cookbook/state.md)
+  - [Pipeline state & status (`faucet state` / `faucet status`)](./cookbook/state-and-status.md)
   - [Upsert / mirror tables](./cookbook/upsert.md)
   - [Mirror (snapshot → CDC)](./cookbook/replication.md)
   - [Backfill (historical replay)](./cookbook/backfill.md)

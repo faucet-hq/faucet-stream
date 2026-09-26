@@ -146,6 +146,11 @@ the source's page with that sink preselected in its trigger form:
 
 Clicking one opens its **versions page** — the release console for that template:
 
+- for a launched **pipeline** template, a **Health** card: the live version's
+  [`faucet status`](./state-and-status.md) screen — per row a status pill,
+  last success, bookmark, DLQ backlog, and where the next run resumes, with
+  the reasons under any row that is not healthy (a template whose required
+  params have no defaults says so instead — its state location depends on them)
 - one row per stored version, with the channels currently pointing at it
   (`stable` / `previous` / `newest` derived, `dev`…`prod` assigned) and an
   **assign-channel** dropdown
@@ -157,7 +162,7 @@ Clicking one opens its **versions page** — the release console for that templa
   listing only channels that actually resolve
 - the **launch history**: who blessed which build, and when
 
-![The versions page for orders-by-country: v2 carrying stable/newest/dev/prod/staging, v1 as previous, a typed trigger form, and the launch history table](../assets/console/template-detail.png)
+![The versions page for orders-by-country: the Health card (unavailable here until the required country param is bound), v3 as newest/staging, v2 as dev, v1 as stable/prod, and the typed trigger form](../assets/console/template-detail.png)
 
 A **source template**'s page adds a **sink template** selector (plus its version
 channel) to the trigger form: the chosen sink's params join the form, tagged

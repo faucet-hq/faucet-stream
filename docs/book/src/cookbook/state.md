@@ -116,6 +116,10 @@ Each invocation has a state key so concurrent matrix rows don't collide:
 `{name}::{row_id}` for roots and `{name}::{row_id}::{parent_record_key}` for DAG
 children. The CDC source uses `postgres-cdc:<slot>`.
 
+To inspect, move, reset, back up or migrate these keys — and to see each row's
+health at a glance — use `faucet state` and `faucet status`; see
+[Pipeline state & status](state-and-status.md).
+
 ## Effectively-once delivery
 
 > **What the guarantee is — and is not.** faucet provides **effectively-once**

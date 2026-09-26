@@ -46,6 +46,8 @@ JSON-RPC stream.
 | `faucet fmt [config] [--check]` | Canonicalize a config (stable key order); `--check` is a CI gate. |
 | `faucet explain [config]` | Plain-English narration of what a pipeline does (offline, zero I/O). |
 | `faucet history [config]` | Terminal view of the run history in a config's `catalog:` store. |
+| `faucet status [config]` | One screen of per-row health: last success / failure, bookmark, resume point, DLQ backlog, SLA verdicts. Exit 0 / 1 / 2. |
+| `faucet state show\|set\|reset\|export\|import` | Inspect, move, reset, back up, and restore a pipeline's durable state. |
 | `faucet run … --output json\|ndjson` | Machine-readable end-of-run summary (per-row + totals) for scripting. |
 
 `[config]` is optional for `run` / `validate` / `preview` / `doctor` / `mirror` / `schedule`: if
@@ -749,6 +751,93 @@ values) and its drift findings; `--full` dumps every column's full profile.
 legitimate step change. `--row` narrows to one root row; both accept `--json`.
 `faucet schema profiling` prints the block's JSON Schema. See the
 [column profiling](../cookbook/profiling.md) cookbook page.
+
+## `status`
+
+```bash
+faucet status pipeline.yaml                 # one screen, every row
+faucet status pipeline.yaml --row orders    # one row
+faucet status pipeline.yaml --probe         # also read exactly-once sink watermarks
+faucet status pipeline.yaml --json          # machine-readable
+```
+
+Answers, per matrix row (or topology sink node), *is this healthy, when did it
+last succeed, how far behind is it, what failed, and where does the next run
+resume* — without running anything. It reads the run-outcome marker and run
+lease every real run keeps in the `state:` store, the SLA and profiling
+histories, the rollback markers, a `catalog:` store's run history when the
+config has one, and the backlog of a local `jsonl` DLQ.
+
+```text
+pipeline shop (3 rows) — FAILED    state: file
+  row        status    last success            bookmark               lag  dlq  next run resumes at
+  customers  ok        2026-09-26 06:10 (2h)   updated_at=2026-09-26  —    0    updated_at=2026-09-26
+  orders     FAILED    2026-09-25 23:00 (9h)   lsn=0/3A00F128         —    17   lsn=0/3A00F128 (sink watermark agrees)
+             └ last error: Sink: deadlock detected (2026-09-26 02:14, run 01a0…)
+             └ exactly-once: state seq 42 · sink seq 42 · Agree → next run trusts the state
+             └ DLQ: 17 record(s), oldest 2026-09-26 02:14 (6h)
+  refunds    warming   never                   —                      —    0    full snapshot
+```
+
+Health, worst last: `ok`, `running` (a live run lease), `warming` (never
+completed a run), `unknown` (no durable state, or unreadable), `degraded` (an
+SLA breach, a DLQ backlog, column-profile drift, a crashed run's lease, or the
+state store ahead of the sink watermark), `failed` (the most recent run
+failed). Child rows aggregate under their parent (bookmark count, failed
+invocations, worst health). **Exit code:** `0` healthy (`ok` / `running` /
+`warming`), `1` degraded or unknown, `2` failed — usable from cron or a
+Nagios-style check. Each field is read independently: an unreachable state
+backend or DLQ is reported on its row, never failing the command. `--probe`
+reads each exactly-once row's committed sink watermark (read-only) and says
+whether it agrees with the state store and which side the next run trusts.
+The `--json` document is the `StatusReport` schema in
+[`docs/openapi.yaml`](http-api.md#pipeline-status-and-state). See the
+[state and status cookbook](../cookbook/state-and-status.md).
+
+## `state`
+
+```bash
+faucet state show   pipeline.yaml [--row R] [--json]
+faucet state set    pipeline.yaml --row R --bookmark '{"updated_at":"2026-09-19T00:00:00Z"}' [--yes]
+faucet state reset  pipeline.yaml --row R [--parent-key K] [--include-markers] [--rewind-token] [--yes]
+faucet state export pipeline.yaml [-o state-backup.json]
+faucet state import pipeline.yaml state-backup.json [--to-state postgres://…] [--overwrite] [--yes]
+```
+
+Inspects and operates on a pipeline's durable state — every key under its
+namespace `{name}::…` in the `state:` store(s):
+
+- **`show`** — each row's bookmark (an exactly-once envelope unwrapped, its
+  sequence shown), child / shard sub-bookmarks, markers (SLA, profiling,
+  rollback, run outcomes, a live run lease), plus the pipeline's
+  replication / backfill markers and keys of rows the config no longer has.
+- **`set`** — move one row's bookmark (`--parent-key` for a child row). On an
+  exactly-once row the envelope is kept: its sequence is never lowered and is
+  raised to the sink's committed watermark when that is ahead, so the next run
+  honours the new position instead of re-anchoring to the sink's
+  (`--skip-watermark-check` skips reading the watermark — the command refuses
+  when it cannot be read).
+- **`reset`** — forget one row's bookmark(s) so its next run re-syncs from the
+  start; `--include-markers` also forgets its SLA / profiling baselines, run
+  outcomes and rollback markers. An exactly-once row keeps its envelope with a
+  null bookmark at the sink-safe sequence; `--rewind-token` instead deletes
+  the sink's commit token too (sinks that support it: postgres / sqlite /
+  mysql).
+- **`export`** — the versioned document `{version: 1, pipeline, exported_at,
+  keys}` (run leases excluded) on stdout or `-o FILE`.
+- **`import`** — restore an export into the config's store, or another with
+  `--to-state` (`postgres://…`, `redis://…`, `file:DIR` or a directory,
+  `memory`, or a `{type, config}` document). Refuses a namespace that already
+  holds state unless `--overwrite` (keys absent from the export are then
+  deleted), a document for another pipeline, and a newer document version.
+  Redis, Postgres and memory stores write all-or-nothing; a file store writes
+  key by key and reports exactly which keys landed before a failure.
+
+Every mutation prints the plan (before / after) first and needs `--yes`, an
+interactive confirmation on a terminal, or `--dry-run` to stop at the plan.
+It refuses while a run holds the row — a live run lease in the state store, or
+a run of the pipeline in flight in the config's `catalog:` store — unless
+`--force`.
 
 ## `catalog`
 
