@@ -64,6 +64,7 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         cluster_max_attempts: 3,
         triggers: None,
         templates_sync: None,
+        policy: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
@@ -305,6 +306,7 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::GET, "/v1/schemas/{kind}/{name}"),
         (Method::POST, "/v1/doctor"),
         (Method::POST, "/v1/backfill"),
+        (Method::POST, "/v1/plan"),
         (Method::POST, "/v1/dlq/inspect"),
         (Method::POST, "/v1/dlq/replay"),
         (Method::POST, "/v1/dlq/discard"),
@@ -323,6 +325,7 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::GET, "/v1/catalog/datasets"),
         (Method::GET, "/v1/catalog/datasets/{id}"),
         (Method::GET, "/v1/catalog/lineage"),
+        (Method::POST, "/v1/catalog/datasets/{id}/consumers"),
         (Method::GET, "/v1/local-outputs"),
         (Method::DELETE, "/v1/local-outputs/{id}"),
         (Method::POST, "/v1/local-outputs/cleanup"),
@@ -369,7 +372,12 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     //   the server to read a path on its filesystem. That is the same trust
     //   boundary as run logs (which carry record data) and is why the DLQ
     //   endpoints are not exposed to the public internet.
-    const READ_ONLY_POSTS: &[&str] = &["/mcp", "/v1/dlq/inspect"];
+    // - `/v1/plan` — plans a config: expands it, runs a caller-supplied sample
+    //   through the offline harness, reads the catalog. No sink is written and
+    //   no run starts; the one connector it builds is the sink, for its
+    //   non-mutating `check()` probe — the same as `POST /v1/doctor` does, but
+    //   doctor stays operator-only because it probes *sources* with real reads.
+    const READ_ONLY_POSTS: &[&str] = &["/mcp", "/v1/dlq/inspect", "/v1/plan"];
     if READ_ONLY_POSTS.contains(&path) {
         return false;
     }

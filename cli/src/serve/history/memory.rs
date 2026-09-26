@@ -400,6 +400,24 @@ impl RunHistory for MemoryHistory {
         Ok(())
     }
 
+    async fn catalog_annotate(
+        &self,
+        dataset_id: &str,
+        annotation: &catalog::CatalogAnnotation,
+    ) -> Result<bool, HistoryError> {
+        let mut cat = self
+            .catalog
+            .lock()
+            .map_err(|_| HistoryError::Backend("catalog lock poisoned".into()))?;
+        match cat.datasets.get_mut(dataset_id) {
+            Some(ds) => {
+                catalog::apply_annotation(ds, annotation);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn catalog_list_datasets(
         &self,
         filter: &CatalogListFilter,

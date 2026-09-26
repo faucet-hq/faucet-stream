@@ -144,6 +144,21 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
 /// Everything `validate` prints once a config is loaded — shared by the
 /// file path and the hub-composed path so both report identically.
 async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
+    // Data-flow policy (#702): merge `--policy` over the config's block.
+    #[cfg(feature = "policy")]
+    let cfg = {
+        let mut cfg = cfg;
+        crate::policy::apply_to_config(&mut cfg, args.policy.as_deref())?;
+        cfg
+    };
+    #[cfg(not(feature = "policy"))]
+    if args.policy.is_some() {
+        return Err(CliError::Config(
+            "--policy requires a binary built with the `policy` feature \
+             (e.g. `cargo install faucet-cli --features policy`)"
+                .into(),
+        ));
+    }
     if !cfg.params.is_empty() && !args.json {
         let required: Vec<&str> = cfg
             .params
@@ -173,10 +188,28 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
         let topo = crate::topology::build_topology(&cfg, &auth).await?;
         let inert: Vec<(&str, &str)> = crate::topology::inert_blocks(&cfg);
+        #[cfg(feature = "policy")]
+        let policy = match cfg.policy.as_ref() {
+            Some(spec) => Some(crate::policy::evaluate_topology(spec, &cfg)?),
+            None => None,
+        };
+        #[cfg(not(feature = "policy"))]
+        let policy: Option<()> = None;
+        let policy_ok = policy.as_ref().is_none_or(|_r| {
+            #[cfg(feature = "policy")]
+            {
+                !_r.violated()
+            }
+            #[cfg(not(feature = "policy"))]
+            {
+                true
+            }
+        });
         if args.json {
             let out = serde_json::json!({
-                "valid": true,
+                "valid": policy_ok,
                 "mode": "topology",
+                "policy": policy,
                 "name": cfg.name.as_deref().unwrap_or("unnamed"),
                 "node_count": topo.nodes().len(),
                 "edge_count": topo.edges().len(),
@@ -193,13 +226,26 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
                 "{}",
                 serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
             );
+            #[cfg(feature = "policy")]
+            if let Some(r) = policy.filter(|r| r.violated()) {
+                return Err(r.error());
+            }
             return Ok(());
         }
+        #[cfg(feature = "policy")]
+        if let Some(r) = policy.as_ref() {
+            print!("{}", crate::policy::render_human(r));
+        }
         println!(
-            "topology '{}': {} node(s), {} edge(s) — valid",
+            "topology '{}': {} node(s), {} edge(s) — {}",
             cfg.name.as_deref().unwrap_or("unnamed"),
             topo.nodes().len(),
-            topo.edges().len()
+            topo.edges().len(),
+            if policy_ok {
+                "valid"
+            } else {
+                "policy violations"
+            }
         );
         for n in topo.nodes() {
             println!("  - {} ({})", n.id, n.kind.kind_str());
@@ -209,6 +255,10 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         // is enforced when it is not (#456 M2).
         for (block, consequence) in &inert {
             println!("  WARNING: `{block}:` is ignored in topology mode — {consequence}");
+        }
+        #[cfg(feature = "policy")]
+        if let Some(r) = policy.filter(|r| r.violated()) {
+            return Err(r.error());
         }
         return Ok(());
     }
@@ -329,6 +379,23 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
     check_transforms(&nodes)?;
     check_connector_configs(&nodes)?;
 
+    // Data-flow policy (#702): the static verdict per row. Reported in both
+    // output modes; any violation makes the config invalid (exit code =
+    // violation count), exactly as `faucet run` would refuse it.
+    #[cfg(feature = "policy")]
+    let policy_report = match cfg.policy.as_ref() {
+        Some(spec) => Some(crate::policy::evaluate_nodes(
+            spec,
+            &nodes,
+            &Default::default(),
+        )?),
+        None => None,
+    };
+    #[cfg(feature = "policy")]
+    let policy_ok = policy_report.as_ref().is_none_or(|r| !r.violated());
+    #[cfg(not(feature = "policy"))]
+    let policy_ok = true;
+
     // "children" = per-parent-record fan-out rows; discovery / product rows run
     // independently (no parent), so they count as top-level like roots.
     let children = nodes
@@ -399,8 +466,12 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
                 })
             })
             .collect();
+        #[cfg(feature = "policy")]
+        let policy_json = serde_json::to_value(&policy_report).unwrap_or(serde_json::Value::Null);
+        #[cfg(not(feature = "policy"))]
+        let policy_json = serde_json::Value::Null;
         let out = serde_json::json!({
-            "valid": true,
+            "valid": policy_ok,
             "mode": "matrix",
             "name": cfg.name.as_deref().unwrap_or("(unnamed)"),
             "row_count": nodes.len(),
@@ -408,6 +479,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
             "children": children,
             "selection_active": selection_active,
             "rows": rows,
+            "policy": policy_json,
         });
         println!(
             "{}",
@@ -418,11 +490,20 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         if let Some(sel) = selected {
             sel?;
         }
+        #[cfg(feature = "policy")]
+        if let Some(r) = policy_report.filter(|r| r.violated()) {
+            return Err(r.error());
+        }
         return Ok(());
     }
 
+    #[cfg(feature = "policy")]
+    if let Some(r) = policy_report.as_ref() {
+        print!("{}", crate::policy::render_human(r));
+    }
     println!(
-        "ok: '{}' rows={} (roots={}, children={}) execution={}",
+        "{}: '{}' rows={} (roots={}, children={}) execution={}",
+        if policy_ok { "ok" } else { "policy violations" },
         cfg.name.as_deref().unwrap_or("(unnamed)"),
         nodes.len(),
         roots,
@@ -472,6 +553,10 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         if let Some(sel) = selected {
             sel?;
         }
+    }
+    #[cfg(feature = "policy")]
+    if let Some(r) = policy_report.filter(|r| r.violated()) {
+        return Err(r.error());
     }
     Ok(())
 }

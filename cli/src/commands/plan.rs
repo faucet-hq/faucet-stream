@@ -35,6 +35,17 @@ pub struct PlanReport {
     pub sink_probe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample: Option<SampleReport>,
+    /// The data-flow policy verdict for this row (#702), when a policy is in
+    /// force. With a sample the columns come from the sample's input schema,
+    /// else from the row's contract.
+    #[cfg(feature = "policy")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::policy::RowPolicyReport>,
+    /// Change impact analysis (#707), present with `--impact`: the downstream
+    /// datasets, contracts, owners and consumers the planned schema affects.
+    #[cfg(feature = "catalog")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact: Option<crate::impact::ImpactReport>,
 }
 
 /// The data-derived part of the plan (present only when a sample was supplied).
@@ -85,6 +96,10 @@ pub fn build_plan_report(node: &ExpandedNode) -> PlanReport {
         lineage: Vec::new(),
         sink_probe: None,
         sample: None,
+        #[cfg(feature = "policy")]
+        policy: None,
+        #[cfg(feature = "catalog")]
+        impact: None,
     }
 }
 
@@ -215,37 +230,38 @@ fn render_delta(dest: &Value, inferred: &Value) -> SchemaDeltaReport {
     }
 }
 
-/// Execute the `plan` subcommand.
-pub async fn run(args: PlanArgs) -> CliResult<()> {
-    if args.diff {
-        #[cfg(feature = "catalog")]
-        {
-            return run_diff(args).await;
-        }
-        #[cfg(not(feature = "catalog"))]
-        {
-            return Err(CliError::Config(
-                "`faucet plan --diff` requires a binary built with the `catalog` feature \
-                 (e.g. `cargo install faucet-cli --features catalog`)"
-                    .into(),
-            ));
-        }
-    }
-    let cwd = std::env::current_dir()?;
-    let path = match &args.config {
-        Some(p) => p.clone(),
-        None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
-    };
-    let cfg = if args.resolve_secrets {
-        crate::config::PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?
-    } else {
-        crate::config::PipelineConfig::from_path_tolerating_secrets(&path, args.profile.as_deref())?
-    };
-    let auth = auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
-    let nodes = expand::expand(&cfg)?;
-    let node = select_root(&nodes, args.row.as_deref())?;
-    let clock = chrono::Utc::now().fixed_offset();
+/// The data-dependent inputs of a plan (shared by `faucet plan` and
+/// `POST /v1/plan`).
+pub struct PlanOptions<'a> {
+    /// Sample input records + a label for where they came from.
+    pub sample: Option<(Vec<Value>, String)>,
+    /// Change impact analysis (#707) against a catalog store.
+    #[cfg(feature = "catalog")]
+    pub impact: Option<ImpactOptions<'a>>,
+    #[cfg(not(feature = "catalog"))]
+    pub _marker: std::marker::PhantomData<&'a ()>,
+}
 
+/// Where and how deep to run impact analysis.
+#[cfg(feature = "catalog")]
+pub struct ImpactOptions<'a> {
+    pub store: &'a dyn crate::serve::history::RunHistory,
+    /// The pipeline name the row's runs were recorded under.
+    pub pipeline: String,
+    pub depth: u32,
+}
+
+/// Plan one row: the resolved shape, the lineage ops, the optional sample
+/// pass (offline harness — the sink is built only to probe it and read its
+/// live schema, never to write), the data-flow policy verdict (#702) and the
+/// change impact (#707).
+pub async fn plan_node(
+    cfg: &crate::config::PipelineConfig,
+    node: &ExpandedNode,
+    auth: &auth_catalog::AuthCatalog,
+    opts: PlanOptions<'_>,
+) -> CliResult<PlanReport> {
+    let clock = chrono::Utc::now().fixed_offset();
     let mut report = build_plan_report(node);
     #[cfg(feature = "lineage")]
     {
@@ -254,16 +270,30 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
             .map(|op| format!("{op:?}"))
             .collect();
     }
+    #[cfg(not(feature = "policy"))]
+    let _ = cfg;
 
-    if let Some(input) = load_sample(&args, node, &auth).await? {
+    #[cfg(feature = "policy")]
+    let mut policy_input_schema: Option<Value> = None;
+    #[cfg_attr(
+        not(feature = "catalog"),
+        allow(unused_variables, unused_mut, unused_assignments)
+    )]
+    let mut planned_output_schema: Option<Value> = None;
+    if let Some((input, source_label)) = opts.sample {
         let input_records = input.len();
+        #[cfg(feature = "policy")]
+        {
+            policy_input_schema = Some(faucet_core::schema::infer_schema(&input));
+        }
         let case = resolved_case_from_node(node, input, clock);
         let run = run_case(&case).await?;
         let inferred = faucet_core::schema::infer_schema(&run.written);
+        planned_output_schema = Some(inferred.clone());
 
         // Build the sink ONLY to probe it and read its live schema — never to
         // write. `check()` is best-effort; `current_schema()` yields the delta.
-        let sink = crate::registry::build_sink(&node.sink.kind, node.sink.config.clone(), &auth)
+        let sink = crate::registry::build_sink(&node.sink.kind, node.sink.config.clone(), auth)
             .await
             .ok();
         let sink_schema = match &sink {
@@ -285,10 +315,7 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
             },
         };
         report.sample = Some(SampleReport {
-            source: match &args.sample {
-                Some(p) => format!("fixture:{}", p.display()),
-                None => format!("live:{} (≤{})", node.source.kind, args.limit),
-            },
+            source: source_label,
             input_records,
             output_records: run.written.len(),
             dlq_records: run.dlq_payloads.len(),
@@ -298,6 +325,124 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
             error: run.error,
         });
     }
+    #[cfg(feature = "policy")]
+    if let Some(spec) = cfg.policy.as_ref() {
+        let compiled = faucet_core::CompiledPolicy::compile(spec)
+            .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+        report.policy = Some(crate::policy::evaluate_node(
+            &compiled,
+            node,
+            policy_input_schema.as_ref(),
+        ));
+    }
+    // Change impact analysis (#707): who downstream a schema change affects.
+    #[cfg(feature = "catalog")]
+    if let Some(i) = opts.impact {
+        report.impact = Some(
+            crate::impact::analyze(
+                i.store,
+                crate::impact::ImpactInputs {
+                    pipeline: &i.pipeline,
+                    node,
+                    planned_schema: planned_output_schema.as_ref(),
+                    depth: i.depth,
+                },
+            )
+            .await?,
+        );
+    }
+    Ok(report)
+}
+
+/// Execute the `plan` subcommand.
+pub async fn run(args: PlanArgs) -> CliResult<()> {
+    if args.diff {
+        #[cfg(feature = "catalog")]
+        {
+            return run_diff(args).await;
+        }
+        #[cfg(not(feature = "catalog"))]
+        {
+            return Err(CliError::Config(
+                "`faucet plan --diff` requires a binary built with the `catalog` feature \
+                 (e.g. `cargo install faucet-cli --features catalog`)"
+                    .into(),
+            ));
+        }
+    }
+    let cwd = std::env::current_dir()?;
+    let path = match &args.config {
+        Some(p) => p.clone(),
+        None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
+    };
+    #[cfg_attr(not(feature = "policy"), allow(unused_mut))]
+    let mut cfg = if args.resolve_secrets {
+        crate::config::PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?
+    } else {
+        crate::config::PipelineConfig::from_path_tolerating_secrets(&path, args.profile.as_deref())?
+    };
+    #[cfg(feature = "policy")]
+    crate::policy::apply_to_config(&mut cfg, args.policy.as_deref())?;
+    #[cfg(not(feature = "policy"))]
+    if args.policy.is_some() {
+        return Err(CliError::Config(
+            "--policy requires a binary built with the `policy` feature \
+             (e.g. `cargo install faucet-cli --features policy`)"
+                .into(),
+        ));
+    }
+    let auth = auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
+    let nodes = expand::expand(&cfg)?;
+    let node = select_root(&nodes, args.row.as_deref())?;
+
+    let sample = match load_sample(&args, node, &auth).await? {
+        Some(input) => Some((
+            input,
+            match &args.sample {
+                Some(p) => format!("fixture:{}", p.display()),
+                None => format!("live:{} (≤{})", node.source.kind, args.limit),
+            },
+        )),
+        None => None,
+    };
+    #[cfg(feature = "catalog")]
+    let impact_handle = if args.impact {
+        let spec = cfg.catalog.as_ref().ok_or_else(|| {
+            CliError::Config(
+                "`faucet plan --impact` needs a `catalog:` block to read the lineage graph \
+                 (see `faucet schema catalog`)"
+                    .into(),
+            )
+        })?;
+        Some(crate::catalog::connect_from_spec(spec).await?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "catalog"))]
+    if args.impact {
+        return Err(CliError::Config(
+            "`faucet plan --impact` requires a binary built with the `catalog` feature \
+             (e.g. `cargo install faucet-cli --features catalog`)"
+                .into(),
+        ));
+    }
+    let report = plan_node(
+        &cfg,
+        node,
+        &auth,
+        PlanOptions {
+            sample,
+            #[cfg(feature = "catalog")]
+            impact: impact_handle.as_ref().map(|h| ImpactOptions {
+                store: h.store.as_ref(),
+                pipeline: crate::catalog::snapshot::resolve_name(&cfg, Some(&path)),
+                depth: args.depth,
+            }),
+            #[cfg(not(feature = "catalog"))]
+            _marker: std::marker::PhantomData,
+        },
+    )
+    .await?;
 
     if args.json {
         let out =
@@ -369,6 +514,28 @@ fn render_human(r: &PlanReport) {
     }
     if let Some(p) = &r.sink_probe {
         println!("  sink check: {p}");
+    }
+    #[cfg(feature = "policy")]
+    if let Some(p) = &r.policy {
+        println!(
+            "  policy: {} labelled column(s) → sink {} ({}), {} violation(s){}",
+            p.columns.len(),
+            p.sink,
+            p.sink_kind,
+            p.violations.len(),
+            if p.opaque {
+                " — opaque transform, labels carried conservatively"
+            } else {
+                ""
+            }
+        );
+        for v in &p.violations {
+            println!("    ! {v}");
+        }
+    }
+    #[cfg(feature = "catalog")]
+    if let Some(i) = &r.impact {
+        print!("{}", crate::impact::render_human(i));
     }
     match &r.sample {
         None => {
@@ -483,8 +650,11 @@ mod tests {
             limit: 10,
             json: false,
             diff: false,
+            impact: false,
+            depth: 5,
             resolve_secrets: false,
             profile: None,
+            policy: None,
         };
         super::run(args).await.expect("plan runs");
         assert!(!out.exists(), "plan must not write to the sink");
@@ -537,8 +707,11 @@ mod tests {
             limit: 10,
             json: false,
             diff: true,
+            impact: false,
+            depth: 5,
             resolve_secrets: false,
             profile: None,
+            policy: None,
         };
 
         // 1. Nothing recorded yet → first-run path.
@@ -586,8 +759,11 @@ mod tests {
             limit: 10,
             json: false,
             diff: true,
+            impact: false,
+            depth: 5,
             resolve_secrets: false,
             profile: None,
+            policy: None,
         };
         let err = super::run(args).await.unwrap_err();
         assert!(err.to_string().contains("catalog:"), "{err}");

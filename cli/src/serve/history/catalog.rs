@@ -128,6 +128,12 @@ pub struct RowSnapshot {
     pub on_error: String,
     /// Whether a DLQ sink is attached to this row.
     pub dlq: bool,
+    /// The row's data contract (#204) as it last ran (the serialized
+    /// `ContractSpec`), so impact analysis (#707) can name the downstream
+    /// contract version a change would breach. Defaulted: snapshots written
+    /// before it existed read back as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<Value>,
 }
 
 /// A connector (source or sink) with its **secret-redacted** resolved config.
@@ -176,6 +182,90 @@ pub struct CatalogDataset {
     /// Content hash of `current_schema` — the dedupe key for the timeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_schema_hash: Option<String>,
+    /// Who owns this dataset (#707): free-form handles — a team, an email, a
+    /// pager rotation. Declared in `catalog.datasets[].owners` or via
+    /// `POST /v1/catalog/datasets/{id}/consumers`; impact analysis names them.
+    /// Survives every run observation (annotations are merged, never reset).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
+    /// Declared external consumers (#707) — dashboards, models, exports that
+    /// read this dataset but are not faucet pipelines (those are consumers
+    /// automatically, via lineage edges). Keyed by `name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumers: Vec<CatalogConsumer>,
+}
+
+/// One declared external consumer of a dataset (#707).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogConsumer {
+    /// Unique per dataset — a second registration with the same name replaces
+    /// the first.
+    pub name: String,
+    /// What it is: `dashboard`, `model`, `export`, `report`, … (free-form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Who to tell when the dataset changes — an email, a channel, a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<String>,
+    /// The columns it reads. Empty = every column, so any change affects it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// `config` (declared in a `catalog.datasets[]` block), or the principal
+    /// who registered it over HTTP / the CLI.
+    #[serde(default)]
+    pub registered_by: String,
+    #[serde(default = "epoch")]
+    pub registered_at: DateTime<Utc>,
+}
+
+fn epoch() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
+}
+
+/// An owners / consumers annotation to merge into a dataset (#707).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogAnnotation {
+    /// `Some` replaces the owner list (an empty list clears it); `None` keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<String>>,
+    /// Consumers to upsert by `name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumers: Vec<CatalogConsumer>,
+    /// Drop every consumer not named in `consumers` first.
+    #[serde(default)]
+    pub replace_consumers: bool,
+}
+
+impl CatalogAnnotation {
+    /// Nothing to merge.
+    pub fn is_empty(&self) -> bool {
+        self.owners.is_none() && self.consumers.is_empty() && !self.replace_consumers
+    }
+}
+
+/// Merge an annotation into a dataset record: owners replaced when given,
+/// consumers upserted by name (declared order kept for existing entries, new
+/// ones appended). Pure; shared by every backend.
+pub fn apply_annotation(ds: &mut CatalogDataset, ann: &CatalogAnnotation) {
+    if let Some(owners) = &ann.owners {
+        let mut owners: Vec<String> = owners
+            .iter()
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+            .collect();
+        owners.dedup();
+        ds.owners = owners;
+    }
+    if ann.replace_consumers {
+        ds.consumers
+            .retain(|c| ann.consumers.iter().any(|n| n.name == c.name));
+    }
+    for c in &ann.consumers {
+        match ds.consumers.iter_mut().find(|e| e.name == c.name) {
+            Some(existing) => *existing = c.clone(),
+            None => ds.consumers.push(c.clone()),
+        }
+    }
 }
 
 /// One schema-timeline entry. Appended only when the observed schema's content
@@ -419,6 +509,8 @@ pub fn apply_observation(
             schema_versions: 0,
             current_schema: None,
             current_schema_hash: None,
+            owners: Vec::new(),
+            consumers: Vec::new(),
         },
     };
     let role = obs.role.as_str().to_string();
@@ -793,6 +885,8 @@ mod tests {
             schema_versions: 0,
             current_schema: None,
             current_schema_hash: None,
+            owners: Vec::new(),
+            consumers: Vec::new(),
         }
     }
 

@@ -42,6 +42,7 @@ pub fn test_config() -> ServeConfig {
         cluster: ClusterConfig::disabled(),
         triggers_path: None,
         templates_sync_path: None,
+        policy_path: None,
         callback_allow_hosts: Vec::new(),
     }
 }

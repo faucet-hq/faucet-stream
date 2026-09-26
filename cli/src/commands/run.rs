@@ -171,6 +171,23 @@ pub(crate) async fn execute(
     args: RunArgs,
     resolved_config_path: Option<std::path::PathBuf>,
 ) -> CliResult<()> {
+    // Data-flow policy (#702): `--policy <file>` merges over the config's own
+    // block before anything is planned, so the static gate below and the
+    // runtime backstop the executor installs see one policy.
+    #[cfg(feature = "policy")]
+    let cfg = {
+        let mut cfg = cfg;
+        crate::policy::apply_to_config(&mut cfg, args.policy.as_deref())?;
+        cfg
+    };
+    #[cfg(not(feature = "policy"))]
+    if args.policy.is_some() {
+        return Err(CliError::Config(
+            "--policy requires a binary built with the `policy` feature \
+             (e.g. `cargo install faucet-cli --features policy`)"
+                .into(),
+        ));
+    }
     #[cfg(not(feature = "cli-tui"))]
     if args.tui {
         return Err(CliError::Config(
@@ -238,6 +255,15 @@ pub(crate) async fn execute(
     // matrix entirely. Run it directly and report through the same summary
     // surfaces (`--output text|json|ndjson`), then return.
     if crate::topology::is_topology(&cfg) {
+        #[cfg(feature = "policy")]
+        if let Some(spec) = cfg.policy.as_ref() {
+            let report = crate::policy::evaluate_topology(spec, &cfg)?;
+            crate::policy::record_metrics(&pipeline_name, &report);
+            if report.violated() {
+                eprint!("{}", crate::policy::render_human(&report));
+                return Err(report.error());
+            }
+        }
         let started_at = Utc::now();
         let summary = crate::topology::run_topology(
             &cfg,
@@ -298,6 +324,18 @@ pub(crate) async fn execute(
     let selection =
         crate::select::RunSelection::from_args(&args.selection, cfg.selection.as_ref())?;
     let nodes = crate::select::select_nodes(nodes, &selection, !cfg.matrix.is_empty())?;
+    // Data-flow policy static gate (#702): a labelled column heading for a
+    // sink its rules forbid refuses the whole run before any connector is
+    // built. Rows the runtime selection dropped are not judged.
+    #[cfg(feature = "policy")]
+    if let Some(spec) = cfg.policy.as_ref() {
+        let report = crate::policy::evaluate_nodes(spec, &nodes, &Default::default())?;
+        crate::policy::record_metrics(&pipeline_name, &report);
+        if report.violated() {
+            eprint!("{}", crate::policy::render_human(&report));
+            return Err(report.error());
+        }
+    }
     // The TUI wires `q` / Ctrl-C to this token: in-flight invocations stop at
     // their next page boundary and flush (#146 H16). Plain runs keep `None`.
     #[cfg(feature = "cli-tui")]

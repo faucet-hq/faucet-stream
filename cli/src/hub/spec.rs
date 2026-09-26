@@ -605,6 +605,7 @@ pub const DEPLOYMENT_BLOCKS: &[&str] = &[
     "notifications",
     "sla",
     "profiling",
+    "policy",
     "resilience",
     "execution",
     "delivery",
@@ -681,6 +682,9 @@ pub struct DeploymentTemplate {
     /// → top-level `profiling` (#708).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profiling: Option<Value>,
+    /// → top-level `policy` (#702).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Value>,
     /// → top-level `resilience`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resilience: Option<Value>,
@@ -801,6 +805,7 @@ impl DeploymentTemplate {
             ("notifications", &self.notifications),
             ("sla", &self.sla),
             ("profiling", &self.profiling),
+            ("policy", &self.policy),
             ("resilience", &self.resilience),
             ("execution", &self.execution),
             ("delivery", &self.delivery),

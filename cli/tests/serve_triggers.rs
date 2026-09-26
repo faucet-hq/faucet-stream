@@ -42,6 +42,7 @@ fn test_config() -> ServeConfig {
         cluster: faucet_cli::serve::cluster::ClusterConfig::disabled(),
         triggers_path: None,
         templates_sync_path: None,
+        policy_path: None,
         callback_allow_hosts: Vec::new(),
     }
 }
@@ -425,6 +426,7 @@ async fn spawn_serve_with_triggers(
         cluster_max_attempts: 3,
         triggers: Some(triggers_path.to_path_buf()),
         templates_sync: None,
+        policy: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

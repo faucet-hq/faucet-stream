@@ -6,8 +6,8 @@
 
 use crate::catalog::CatalogHandle;
 use crate::cli::{
-    CatalogArgs, CatalogCommand, CatalogConfigArgs, CatalogDatasetsArgs, CatalogLineageArgs,
-    CatalogShowArgs,
+    CatalogAnnotateArgs, CatalogArgs, CatalogCommand, CatalogConfigArgs, CatalogDatasetsArgs,
+    CatalogLineageArgs, CatalogShowArgs,
 };
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
@@ -27,6 +27,7 @@ pub async fn run(args: CatalogArgs) -> CliResult<()> {
         CatalogCommand::Datasets(a) => datasets(a).await,
         CatalogCommand::Show(a) => show(a).await,
         CatalogCommand::Lineage(a) => lineage(a).await,
+        CatalogCommand::Annotate(a) => annotate(a).await,
     }
 }
 
@@ -249,6 +250,17 @@ async fn show(args: CatalogShowArgs) -> CliResult<()> {
         }
     }
 
+    if !d.owners.is_empty() || !d.consumers.is_empty() {
+        println!("\nowners: {}", render_owners(&d.owners));
+        println!("consumers:");
+        if d.consumers.is_empty() {
+            println!("  (none declared)");
+        }
+        for c in &d.consumers {
+            println!("  {}", render_consumer(c));
+        }
+    }
+
     println!("\nupstream:");
     if detail.upstream.is_empty() {
         println!("  (none)");
@@ -268,6 +280,111 @@ async fn show(args: CatalogShowArgs) -> CliResult<()> {
             "  {}  ({} run(s), pipeline {})",
             e.dst_uri, e.runs, e.pipeline
         );
+    }
+    Ok(())
+}
+
+fn render_owners(owners: &[String]) -> String {
+    if owners.is_empty() {
+        "(none declared)".to_string()
+    } else {
+        owners.join(", ")
+    }
+}
+
+fn render_consumer(c: &crate::serve::history::catalog::CatalogConsumer) -> String {
+    let mut s = c.name.clone();
+    if let Some(k) = &c.kind {
+        s.push_str(&format!(" ({k})"));
+    }
+    if let Some(ct) = &c.contact {
+        s.push_str(&format!(" → {ct}"));
+    }
+    if c.columns.is_empty() {
+        s.push_str("  reads: all columns");
+    } else {
+        s.push_str(&format!("  reads: {}", c.columns.join(", ")));
+    }
+    s.push_str(&format!("  [by {}]", c.registered_by));
+    s
+}
+
+/// Parse a `--consumer NAME[=KIND]` value.
+pub(crate) fn parse_consumer_flag(raw: &str) -> CliResult<(String, Option<String>)> {
+    let (name, kind) = match raw.split_once('=') {
+        Some((n, k)) => (
+            n.trim(),
+            Some(k.trim().to_string()).filter(|k| !k.is_empty()),
+        ),
+        None => (raw.trim(), None),
+    };
+    if name.is_empty() {
+        return Err(CliError::Config(format!(
+            "--consumer `{raw}`: the name must not be empty (expected NAME or NAME=KIND)"
+        )));
+    }
+    Ok((name.to_string(), kind))
+}
+
+async fn annotate(args: CatalogAnnotateArgs) -> CliResult<()> {
+    use crate::serve::history::catalog::{CatalogAnnotation, CatalogConsumer};
+    let handle = connect(&args.common).await?;
+    let detail = resolve_dataset(&handle, &args.id).await?.ok_or_else(|| {
+        CliError::Config(format!(
+            "no catalogued dataset with id '{}' — list ids with `faucet catalog datasets`",
+            args.id
+        ))
+    })?;
+    let id = detail.dataset.id.clone();
+    let now = chrono::Utc::now();
+    let mut consumers = Vec::new();
+    for raw in &args.consumers {
+        let (name, kind) = parse_consumer_flag(raw)?;
+        consumers.push(CatalogConsumer {
+            name,
+            kind,
+            contact: args.contact.clone(),
+            columns: args
+                .columns
+                .iter()
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect(),
+            registered_by: "cli".to_string(),
+            registered_at: now,
+        });
+    }
+    let annotation = CatalogAnnotation {
+        owners: (!args.owners.is_empty()).then(|| args.owners.clone()),
+        consumers,
+        replace_consumers: args.replace,
+    };
+    if annotation.is_empty() {
+        return Err(CliError::Config(
+            "nothing to annotate: pass --owner and/or --consumer (see --help)".into(),
+        ));
+    }
+    handle
+        .store
+        .catalog_annotate(&id, &annotation)
+        .await
+        .map_err(|e| CliError::Internal(format!("catalog write: {e}")))?;
+    let updated = resolve_dataset(&handle, &id)
+        .await?
+        .ok_or_else(|| CliError::Internal("dataset vanished while annotating".to_string()))?;
+    if args.common.json {
+        println!("{}", to_pretty(&updated.dataset)?);
+        return Ok(());
+    }
+    let d = &updated.dataset;
+    println!("dataset  {}", d.uri);
+    println!("owners   {}", render_owners(&d.owners));
+    println!("consumers:");
+    if d.consumers.is_empty() {
+        println!("  (none declared)");
+    }
+    for c in &d.consumers {
+        println!("  {}", render_consumer(c));
     }
     Ok(())
 }

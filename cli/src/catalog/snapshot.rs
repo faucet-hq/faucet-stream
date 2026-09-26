@@ -86,6 +86,7 @@ pub fn build_snapshot(
                 delivery_guarantee: format!("{:?}", node.delivery_guarantee),
                 on_error: on_error.to_owned(),
                 dlq: node.dlq.is_some(),
+                contract: row_contract(node),
             },
         );
     }
@@ -95,6 +96,19 @@ pub fn build_snapshot(
         faucet_version: env!("CARGO_PKG_VERSION").to_owned(),
         rows,
     }
+}
+
+/// The row's contract as a JSON value, when the build has contracts and the
+/// row declares one.
+#[cfg(feature = "contract")]
+fn row_contract(node: &ExpandedNode) -> Option<Value> {
+    node.contract
+        .as_ref()
+        .and_then(|c| serde_json::to_value(c).ok())
+}
+#[cfg(not(feature = "contract"))]
+fn row_contract(_node: &ExpandedNode) -> Option<Value> {
+    None
 }
 
 fn connector_snapshot(kind: &str, config: &Value) -> ConnectorSnapshot {
@@ -428,6 +442,7 @@ mod tests {
             delivery_guarantee: "AtLeastOnce".into(),
             on_error: "stop".into(),
             dlq: false,
+            contract: None,
         }
     }
 
@@ -592,6 +607,7 @@ pipeline:
         let handle = crate::catalog::connect_from_spec(&crate::catalog::CatalogSpec {
             url: "memory".into(),
             sample_records: 10,
+            datasets: Vec::new(),
         })
         .await
         .unwrap();

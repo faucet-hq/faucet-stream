@@ -52,6 +52,9 @@ struct Inner {
     /// handlers and the console.
     #[cfg(feature = "templates-sync")]
     templates_sync: RwLock<Option<Arc<crate::templates::sync::SyncFile>>>,
+    /// The server-wide data-flow policy (`--policy`, #702), when one was given.
+    #[cfg(feature = "policy")]
+    policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
 }
 
 impl ServerState {
@@ -87,8 +90,26 @@ impl ServerState {
                 triggers,
                 #[cfg(feature = "templates-sync")]
                 templates_sync: RwLock::new(None),
+                #[cfg(feature = "policy")]
+                policy: RwLock::new(None),
             }),
         }
+    }
+
+    /// Attach the server-wide data-flow policy (server startup, #702).
+    #[cfg(feature = "policy")]
+    pub fn set_policy(&self, policy: Arc<faucet_core::PolicySpec>) {
+        *self.inner.policy.write().unwrap_or_else(|e| e.into_inner()) = Some(policy);
+    }
+
+    /// The server-wide data-flow policy, if the server was started with one.
+    #[cfg(feature = "policy")]
+    pub fn policy(&self) -> Option<Arc<faucet_core::PolicySpec>> {
+        self.inner
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Attach the loaded template-sync file (server startup).
@@ -239,6 +260,7 @@ mod tests {
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
             templates_sync_path: None,
+            policy_path: None,
             callback_allow_hosts: Vec::new(),
         }
     }

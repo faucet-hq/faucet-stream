@@ -148,6 +148,12 @@ fn connector_union(
             props.insert("transforms".into(), json!({ "type": ["array", "null"] }));
             props.insert("inherit_transforms".into(), json!({ "type": "boolean" }));
         }
+        // Destination attributes a data-flow policy reasons about (#702);
+        // accepted on either side by `ConnectorSpec`, meaningful on sinks.
+        props.insert(
+            "attributes".into(),
+            json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+        );
         variants.push(json!({
             "type": "object",
             "title": kind,

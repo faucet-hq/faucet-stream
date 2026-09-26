@@ -468,6 +468,44 @@ async fn build_topology_inner(
                     }
                     _ => sink,
                 };
+                // Data-flow policy runtime backstop (#702): classify the real
+                // records with the same rules the static pass used. Attributes
+                // come from the node's resolved sink template.
+                #[cfg(feature = "policy")]
+                let sink = match cfg.policy.as_ref() {
+                    Some(policy_spec) if !opts.dry_run => {
+                        if crate::policy::quarantines(policy_spec) && spec.dlq.is_none() {
+                            return Err(CliError::Config(format!(
+                                "node '{id}': policy: a rule with `on_runtime: quarantine` needs a \
+                                 `dlq:` block to route the quarantined records to"
+                            )));
+                        }
+                        let compiled = faucet_core::CompiledPolicy::compile(policy_spec)
+                            .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+                        let template_name = template.as_deref().unwrap_or("default");
+                        let attributes = if template_name == "default" {
+                            spec.sinks.get("default").or(spec.sink.as_ref())
+                        } else {
+                            spec.sinks.get(template_name)
+                        }
+                        .map(|b| b.attributes.clone())
+                        .unwrap_or_default();
+                        Box::new(faucet_core::PolicySink::new(
+                            sink,
+                            std::sync::Arc::new(compiled),
+                            faucet_core::SinkFacts {
+                                id: (*id).clone(),
+                                kind: k.clone(),
+                                attributes,
+                            },
+                            faucet_core::PolicyScope {
+                                pipeline: cfg.name.clone().unwrap_or_default(),
+                                row: (*id).clone(),
+                            },
+                        )) as Box<_>
+                    }
+                    _ => sink,
+                };
                 NodeKind::Sink(sink)
             }
             NodeSpec::Transform { transforms } => {
@@ -995,6 +1033,9 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
         #[cfg(feature = "lineage")]
         lineage,
     } = ctx;
+    // Only the catalog / lineage passes below read these; a build without
+    // them still receives the full context.
+    let _ = (&identities, &reaching, clock);
     #[cfg(feature = "catalog")]
     let catalog = match cfg.catalog.as_ref() {
         Some(spec) => match crate::catalog::connect_from_spec(spec).await {
@@ -1375,6 +1416,61 @@ pipeline:
   edges:
     - { from: s, to: w }
 "#;
+
+    /// The runtime policy backstop (#702) wraps every sink node; a quarantining
+    /// rule needs a DLQ to route through, and that is refused before the graph
+    /// is built.
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn policy_wraps_sink_nodes_and_quarantine_needs_a_dlq() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.csv"), "id,email\n1,a@b.io\n").unwrap();
+        let yaml = |on_runtime: &str| {
+            format!(
+                r#"version: 1
+name: p
+pipeline:
+  sources:
+    a: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    o:
+      type: jsonl
+      config: {{ path: {out} }}
+      attributes: {{ residency: eu }}
+  nodes:
+    s: {{ kind: source, ref: a }}
+    w: {{ kind: sink, ref: o }}
+  edges:
+    - {{ from: s, to: w }}
+policy:
+  classifications:
+    - {{ label: pii, value_detector: email }}
+  rules:
+    - {{ name: pii-eu, when: {{ label: pii }}, require: {{ residency: [eu] }}, on_runtime: {on_runtime} }}
+"#,
+                csv = dir.path().join("a.csv").display(),
+                out = dir.path().join("o.jsonl").display(),
+            )
+        };
+        let auth = crate::auth_catalog::AuthCatalog::default();
+        let err = build_topology(&cfg(&yaml("quarantine")), &auth)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("needs a `dlq:` block"), "{err}");
+        // `fail` needs no DLQ: the sink node is wrapped and the graph builds.
+        let topo = build_topology(&cfg(&yaml("fail")), &auth).await.unwrap();
+        drop(topo);
+        // A dry run skips the wrap entirely.
+        let opts = TopologyRunOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        assert!(
+            build_topology_with(&cfg(&yaml("quarantine")), &auth, &opts)
+                .await
+                .is_ok()
+        );
+    }
 
     /// The invariant #459 exists to hold: nothing is parsed-but-ignored, so
     /// `validate` has nothing to warn about. If this fails because a block was

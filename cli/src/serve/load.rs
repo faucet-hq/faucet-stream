@@ -32,10 +32,18 @@ pub struct LoadedSubmission {
 }
 
 /// Load + merge + expand a submitted config body.
+/// The server-wide data-flow policy type (#702) — the real spec on a `policy`
+/// build, a unit placeholder otherwise so the loader's signature is stable.
+#[cfg(feature = "policy")]
+pub type ServerPolicy = faucet_core::PolicySpec;
+#[cfg(not(feature = "policy"))]
+pub type ServerPolicy = ();
+
 pub async fn load_submission(
     body: &str,
     format: ConfigFormat,
     default_base: Option<&Value>,
+    policy: Option<&ServerPolicy>,
 ) -> Result<LoadedSubmission, ServeError> {
     // 1. Parse to a Value per the declared format.
     let mut submitted: Value = match format {
@@ -94,6 +102,20 @@ pub async fn load_submission(
     }
 
     // 5. Secret-manager directives (${vault:…} etc.) with the server's creds.
+    // The server-wide data-flow policy (#702) merges over the config's own
+    // `policy:` block, so the static gate and the runtime backstop see one.
+    #[cfg(feature = "policy")]
+    if let Some(server_policy) = policy {
+        cfg.policy = Some(match cfg.policy.take() {
+            Some(own) => own
+                .merge(server_policy.clone())
+                .map_err(|e| ServeError::BadConfig(format!("policy: {e}")))?,
+            None => server_policy.clone(),
+        });
+    }
+    #[cfg(not(feature = "policy"))]
+    let _ = policy;
+
     crate::secrets::resolve_secrets(&mut cfg)
         .await
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
@@ -151,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn submitted_overrides_default() {
         let body = r#"{ "pipeline": { "source": { "config": { "path": "OVERRIDE.csv" } } } }"#;
-        let loaded = load_submission(body, ConfigFormat::Json, Some(&base()))
+        let loaded = load_submission(body, ConfigFormat::Json, Some(&base()), None)
             .await
             .unwrap();
         // The override wins; the default sink survives the merge.
@@ -165,7 +187,7 @@ mod tests {
         // version defaults to 1 via serde, so this exercises the expand/validation
         // failure path (pipeline with no source/sink). Accept either layer's error.
         let body = r#"{ "pipeline": {} }"#;
-        let err = load_submission(body, ConfigFormat::Json, None)
+        let err = load_submission(body, ConfigFormat::Json, None, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -186,7 +208,7 @@ schedule:
   cron: "0 * * * *"
   timezone: UTC
 "#;
-        let err = load_submission(body, ConfigFormat::Yaml, None)
+        let err = load_submission(body, ConfigFormat::Yaml, None, None)
             .await
             .unwrap_err();
         match err {
@@ -197,7 +219,7 @@ schedule:
 
     #[tokio::test]
     async fn invalid_yaml_is_bad_config() {
-        let err = load_submission("{[bad", ConfigFormat::Yaml, None)
+        let err = load_submission("{[bad", ConfigFormat::Yaml, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ServeError::BadConfig(_)));
@@ -210,7 +232,7 @@ schedule:
         // rejects the key during `from_value` (no I/O), and `friendly_parse_error`
         // attaches the composition hint.
         let body = "version: 1\nextends: /etc/passwd\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n";
-        let err = load_submission(body, ConfigFormat::Yaml, None)
+        let err = load_submission(body, ConfigFormat::Yaml, None, None)
             .await
             .unwrap_err();
         // ServeError doesn't implement Display; pull the inner message directly.

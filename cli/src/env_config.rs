@@ -102,6 +102,7 @@ pub fn build_source(env: &HashMap<String, String>) -> CliResult<ConnectorSpec> {
         status: None,
         tags: Vec::new(),
         complete_for: None,
+        attributes: Default::default(),
     })
 }
 
@@ -127,6 +128,7 @@ pub fn build_sink(env: &HashMap<String, String>) -> CliResult<ConnectorSpec> {
         status: None,
         tags: Vec::new(),
         complete_for: None,
+        attributes: Default::default(),
     })
 }
 
@@ -259,6 +261,7 @@ fn build_named_catalog(
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
         );
     }
@@ -348,6 +351,8 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
         // Pure-env mode doesn't (yet) assemble an `sla:` block.
         sla: None,
         profiling: None,
+        #[cfg(feature = "policy")]
+        policy: None,
         reconcile: None,
         verify: None,
         rollback: None,

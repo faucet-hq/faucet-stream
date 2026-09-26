@@ -44,6 +44,9 @@ pub struct CatalogHandle {
     pub run_id: Option<String>,
     /// Per-side schema-inference sample cap.
     pub sample_records: usize,
+    /// Dataset annotations from the `catalog.datasets:` block (#707), merged
+    /// into each matching dataset after its observation is recorded.
+    pub annotations: Vec<spec::DatasetAnnotationSpec>,
 }
 
 impl std::fmt::Debug for CatalogHandle {
@@ -74,6 +77,7 @@ pub async fn connect_from_spec(spec: &CatalogSpec) -> CliResult<CatalogHandle> {
         store,
         run_id: None,
         sample_records: spec.sample_records,
+        annotations: spec.datasets.clone(),
     })
 }
 
@@ -102,6 +106,34 @@ pub async fn record(handle: &CatalogHandle, update: &CatalogUpdate) {
             error = %e,
             "catalog write failed — run unaffected"
         );
+        return;
+    }
+    // Owners / consumers declared in `catalog.datasets:` (#707) — merged after
+    // the observation so a first run creates the dataset the annotation lands
+    // on. Same never-fails-the-run contract.
+    if handle.annotations.is_empty() {
+        return;
+    }
+    let now = update.recorded_at;
+    for obs in update.sources.iter().chain(std::iter::once(&update.sink)) {
+        let id = crate::serve::history::catalog::dataset_id(&obs.uri);
+        for ann in handle
+            .annotations
+            .iter()
+            .filter(|a| a.matches(&id, &obs.uri))
+        {
+            if let Err(e) = handle
+                .store
+                .catalog_annotate(&id, &ann.to_annotation(now))
+                .await
+            {
+                tracing::warn!(
+                    dataset = %obs.uri,
+                    error = %e,
+                    "catalog annotation write failed — run unaffected"
+                );
+            }
+        }
     }
 }
 
@@ -147,6 +179,7 @@ mod tests {
         let handle = connect_from_spec(&CatalogSpec {
             url: "memory".into(),
             sample_records: 25,
+            datasets: Vec::new(),
         })
         .await
         .unwrap();
@@ -156,6 +189,7 @@ mod tests {
         let err = connect_from_spec(&CatalogSpec {
             url: "mysql://nope".into(),
             sample_records: 100,
+            datasets: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -188,6 +222,7 @@ mod tests {
         let handle = connect_from_spec(&CatalogSpec {
             url: "memory".into(),
             sample_records: 7,
+            datasets: Vec::new(),
         })
         .await
         .unwrap();

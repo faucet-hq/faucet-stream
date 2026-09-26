@@ -18,7 +18,7 @@
 
 pub mod compile;
 pub mod config;
-mod detect;
+pub mod detect;
 mod hash;
 
 pub use compile::CompiledMasking;

@@ -897,6 +897,15 @@ fn shipped_example_yamls_pass_validate() {
                 continue;
             }
         }
+        // `policy:` is a deny_unknown_fields key gated on the `policy`
+        // feature; a build without it can't parse those examples.
+        #[cfg(not(feature = "policy"))]
+        {
+            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
+            if yaml_text.contains("\npolicy:") {
+                continue;
+            }
+        }
         // `notifications:` is a deny_unknown_fields key gated on the `notify`
         // feature; a build without it can't parse those examples.
         #[cfg(not(feature = "notify"))]

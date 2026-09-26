@@ -75,6 +75,16 @@ pub enum FaucetError {
         message: String,
     },
 
+    /// A data-flow policy rule was violated (#702): at run time a labelled
+    /// value headed for a sink the rule does not allow, or a static check
+    /// refused the run before it started.
+    #[error("Policy `{rule}` violated on column `{column}`: {message}")]
+    PolicyViolation {
+        rule: String,
+        column: String,
+        message: String,
+    },
+
     /// A run's learned column profile drifted from its baseline under a
     /// `profiling.on_drift: fail` policy (#708). Raised after the run's data
     /// is written: the failure marks the run, it does not undo it.

@@ -102,6 +102,9 @@ contract = ["dep:regex"]
 # explicit list) and redact/hash/tokenize/partial-mask them per page, before
 # every sink. `hmac`+`sha2` back the keyed hashing/tokenization actions.
 masking = ["dep:regex", "dep:sha2", "dep:hmac"]
+# Data-flow policies (#702): classification-driven residency / destination
+# rules. Reuses the masking value detectors, so it implies `masking`.
+policy = ["masking"]
 # Encryption at rest (#207): AES-256-GCM sealing for FileStateStore bookmark
 # files and per-line JSONL/DLQ output. `sha2` derives the 32-byte key from the
 # configured key string.

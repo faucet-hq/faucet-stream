@@ -1,0 +1,69 @@
+# CSV → JSONL under a data-flow policy (#702).
+#
+# A policy labels columns (`classifications`) and says which sinks a labelled
+# column may reach (`rules`). It is decided BEFORE any data moves — `faucet
+# validate` / `plan` / `doctor` report it, `faucet run` and the serve submit
+# path refuse a violating config — and re-checked at run time by value
+# detectors on the real records (the backstop for columns nobody declared).
+#
+# Sinks carry free-form `attributes` the rules reason about. This config is
+# compliant: the sink declares `residency: eu`, and the finance column is
+# hashed so `mask: [hash]` satisfies the second rule. Try breaking it:
+#
+#   faucet validate cli/examples/csv_to_jsonl_with_policy.yaml            # ok
+#   faucet policy   cli/examples/csv_to_jsonl_with_policy.yaml            # the per-row report
+#   # remove `residency: eu` below and validate again → 1 violation, exit 1
+#
+# The same policy can live in its own file and be applied to every config:
+#   faucet run pipeline.yaml --policy cli/examples/policy/eu-pii.yaml
+#   faucet serve --policy cli/examples/policy/eu-pii.yaml
+version: 1
+name: customers_csv_with_policy
+
+policy:
+  version: 1
+  description: PII stays in the EU; salaries only reach a sink hashed.
+  classifications:
+    - label: pii
+      fields: [email, phone]
+      value_detector: email
+    - label: finance
+      field_pattern: "^(salary|amount)"
+  rules:
+    - name: pii-eu
+      when: { label: pii }
+      require: { residency: [eu] }
+    - name: finance-hashed-or-nothing
+      when: { label: finance }
+      mask: [hash]
+      on_runtime: fail
+
+pipeline:
+  source:
+    type: csv
+    config:
+      path: ./customers.csv
+
+  # The contract tells the static pass which columns the row carries, so the
+  # verdict is exact. Without one, only value detectors apply (at run time).
+  contract:
+    version: "1"
+    fields:
+      - { name: id, type: string }
+      - { name: email, type: string }
+      - { name: salary, type: string }
+
+  masking:
+    rules:
+      - name: hash-salary
+        match: { fields: [salary] }
+        action: { type: hash }
+
+  sink:
+    type: jsonl
+    # Destination attributes a policy reasons about (free-form pairs).
+    attributes:
+      residency: eu
+      environment: dev
+    config:
+      path: ./out/customers.jsonl

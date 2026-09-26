@@ -278,6 +278,17 @@
           "type": "null"
         }
       ]
+    },
+    "policy": {
+      "description": "Optional data-flow policy (#702): classifications that label columns\nand rules about which sinks a labelled column may reach (`require`\nsink attributes, `mask` actions that satisfy, or `deny`). Evaluated\nbefore any data moves by `validate` / `plan` / `doctor` / `run` and the\nserve submit path, and re-checked at run time by value detectors. A\n`--policy <file>` merges on top; a deployment overlay's `policy:` lands\nhere.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PolicySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -534,6 +545,13 @@
               "type": "null"
             }
           ]
+        },
+        "attributes": {
+          "description": "Destination attributes a data-flow policy (#702) reasons about —\n`residency: eu`, `environment: prod`, `region: eu-west-1`, … Free-form\nstring pairs; a policy rule's `require` / `when.sink` names them.\nMeaningful on sinks (a sink template carries them for every row that\nresolves to it; a matrix row's `sink.attributes` adds or overrides).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false,
@@ -2239,6 +2257,16 @@
               "type": "null"
             }
           ]
+        },
+        "attributes": {
+          "description": "Per-row sink `attributes` (#702), merged over the template's\n(a key present on both sides takes the row's value).",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false
@@ -3783,6 +3811,13 @@
           "format": "uint",
           "minimum": 0,
           "default": 100
+        },
+        "datasets": {
+          "description": "Dataset annotations (#707): owners and declared external consumers,\nmerged into the catalog after every run that touches the dataset.\nPipelines that read a dataset are consumers automatically (lineage);\nlist here what the catalog cannot see — dashboards, models, exports —\nso `faucet plan --impact` can name who a change affects.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DatasetAnnotationSpec"
+          }
         }
       },
       "additionalProperties": false,
@@ -14277,6 +14312,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -14376,6 +14417,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -14511,6 +14558,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -14679,6 +14732,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -14759,6 +14818,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -14916,6 +14981,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -14990,6 +15061,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15110,6 +15187,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15184,6 +15267,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15245,6 +15334,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15344,6 +15439,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15465,6 +15566,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15681,6 +15788,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15849,6 +15962,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -15991,6 +16110,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16076,6 +16201,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16194,6 +16325,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16319,6 +16456,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16456,6 +16599,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16569,6 +16718,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16685,6 +16840,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16799,6 +16960,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -16970,6 +17137,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17033,6 +17206,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17127,6 +17306,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17281,6 +17466,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17373,6 +17564,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17464,6 +17661,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17538,6 +17741,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17679,6 +17888,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17827,6 +18042,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -17952,6 +18173,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18022,6 +18249,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18110,6 +18343,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18235,6 +18474,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18383,6 +18628,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18538,6 +18789,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18650,6 +18907,12 @@
             },
             "inherit_transforms": {
               "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18795,6 +19058,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -18903,6 +19172,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19032,6 +19307,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19104,6 +19385,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19213,6 +19500,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19318,6 +19611,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19476,6 +19775,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19576,6 +19881,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19637,6 +19948,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19763,6 +20080,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -19841,6 +20164,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20026,6 +20355,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20192,6 +20527,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20316,6 +20657,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20406,6 +20753,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20450,6 +20803,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20527,6 +20886,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20616,6 +20981,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20841,6 +21212,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -20992,6 +21369,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21120,6 +21503,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21190,6 +21579,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21255,6 +21650,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21344,6 +21745,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21437,6 +21844,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21563,6 +21976,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21736,6 +22155,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21832,6 +22257,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -21978,6 +22409,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -22127,6 +22564,12 @@
                 },
                 true
               ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "required": [
@@ -22242,6 +22685,249 @@
           "description": "As `notify`, and the run is reported as failed (the data is already\nwritten; the failure marks the run so operators look).",
           "type": "string",
           "const": "fail"
+        }
+      ]
+    },
+    "Classification": {
+      "description": "One way a column earns a label: by exact name, by a regex over the column\nname, or by a value detector (run at run time over the real values, and\nstatically over a sample when one is available).",
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "The label this classification assigns (`pii`, `finance`, `health`, …).",
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fields": {
+          "description": "Exact column names (top-level or dot-path) that carry the label.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "field_pattern": {
+          "description": "Regex over the column's dot-path; a match assigns the label.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value_detector": {
+          "description": "A value detector (`email`, `credit_card`, `ssn`, `phone`, `ipv4`): a\ncolumn whose values look like the class carries the label. Reuses the\nmasking detectors, so a masked column no longer matches.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Detector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "label"
+      ]
+    },
+    "ConsumerSpec": {
+      "description": "One declared consumer (#707).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Unique per dataset.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`dashboard`, `model`, `export`, `report`, … (free-form).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contact": {
+          "description": "Who to tell — an email, a channel, a URL.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "columns": {
+          "description": "The columns it reads. Empty = every column.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "DatasetAnnotationSpec": {
+      "description": "One dataset's owners + consumers (#707).",
+      "type": "object",
+      "properties": {
+        "dataset": {
+          "description": "The dataset's canonical URI exactly as `faucet catalog datasets` prints\nit (credential-redacted, `${now.*}` segments as tokens), or its 16-hex\nid. Matched against the run's source and sink datasets.",
+          "type": "string"
+        },
+        "owners": {
+          "description": "Owners — a team, an email, a pager rotation.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "consumers": {
+          "description": "External consumers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConsumerSpec"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dataset"
+      ]
+    },
+    "PolicyRule": {
+      "description": "A rule over one label: which sinks it applies to, and what satisfies it.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Stable rule name — named in every violation, audit entry and metric.",
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "when": {
+          "description": "What the rule applies to.",
+          "$ref": "#/$defs/RuleWhen"
+        },
+        "require": {
+          "description": "Sink attributes a labelled column's destination must carry, each with\nits allowed values: `{ residency: [eu], environment: [prod, staging] }`.\nA sink missing the attribute violates the rule.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "mask": {
+          "description": "Mask actions that satisfy the rule instead: a column masked by one of\nthese (`redact` / `hash` / `tokenize` / `partial`) may land anywhere the\nrule would otherwise refuse. Empty = masking does not satisfy the rule.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "description": "The labelled column may not reach a matching sink at all (unless a\nlisted `mask` action applies).",
+          "type": "boolean",
+          "default": false
+        },
+        "on_runtime": {
+          "description": "What a run does when a value detector finds the label at run time in a\ncolumn the static pass could not see: fail the run before the page is\nwritten, or quarantine the offending records to the DLQ.",
+          "$ref": "#/$defs/RuntimeAction",
+          "default": "fail"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "when"
+      ]
+    },
+    "PolicySpec": {
+      "description": "A data-flow policy: **classifications** (which columns carry which label)\nand **rules** (what a labelled column requires of the sink it lands in).\nDeclared once — in a policy file passed with `--policy`, in a deployment\noverlay, or as a top-level `policy:` block — and evaluated against every\npipeline before any data moves; a value detector re-checks at run time.",
+      "type": "object",
+      "properties": {
+        "version": {
+          "description": "Policy grammar version. Only `1` exists.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 1
+        },
+        "description": {
+          "description": "Free-form description shown by `faucet policy`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "classifications": {
+          "description": "How columns get their labels.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Classification"
+          },
+          "default": []
+        },
+        "rules": {
+          "description": "What each label demands of a destination.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PolicyRule"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "RuleWhen": {
+      "description": "The scope of a rule.",
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "The label the rule governs.",
+          "type": "string"
+        },
+        "sink_kind": {
+          "description": "Only sinks of these connector kinds (empty = every sink).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sink": {
+          "description": "Only sinks whose attributes match all of these (empty = every sink) —\ne.g. `{ environment: [prod] }` to govern production destinations only.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "label"
+      ]
+    },
+    "RuntimeAction": {
+      "description": "Runtime consequence of a value-detector hit that violates a rule.",
+      "oneOf": [
+        {
+          "description": "Fail the run before the page reaches the sink.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Route the offending records to the DLQ; the rest of the page is written.",
+          "type": "string",
+          "const": "quarantine"
         }
       ]
     }

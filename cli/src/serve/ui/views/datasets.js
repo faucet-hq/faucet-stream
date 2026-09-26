@@ -749,6 +749,9 @@ export async function renderDatasetDetail(container, params) {
         <div><label>Id</label><span class="mono">${escapeHtml(d.id)}</span></div>
       </div>
 
+      <h2>Owners &amp; consumers</h2>
+      <div id="stewardship"></div>
+
       <h2>Volume (recent runs)</h2>
       ${
         d.stats.length >= 3
@@ -801,6 +804,9 @@ export async function renderDatasetDetail(container, params) {
   });
 
   renderProfile(container.querySelector("#profile"), d.profile);
+  renderStewardship(container.querySelector("#stewardship"), d, () =>
+    renderDatasetDetail(container, params),
+  );
 
   const timeline = container.querySelector("#timeline");
   if (!d.schema_timeline.length) {
@@ -811,6 +817,91 @@ export async function renderDatasetDetail(container, params) {
   }
   return () => {
     if (loCleanup) loCleanup();
+  };
+}
+
+// Owners + declared consumers (#707): who is told when a change to this
+// dataset is planned. Pipelines that read it are consumers automatically (the
+// lineage edges below); dashboards, models and exports are declared here.
+// The form is gated on `catalog_annotate` (operator+) — a viewer only reads.
+function renderStewardship(el, d, reload) {
+  const owners = d.owners || [];
+  const consumers = d.consumers || [];
+  const consumerRow = (c) => `
+    <div class="consumer-row">
+      <span class="consumer-name">${escapeHtml(c.name)}</span>
+      ${c.kind ? `<span class="pill">${escapeHtml(c.kind)}</span>` : ""}
+      <span class="run-meta">${
+        c.columns && c.columns.length
+          ? `reads ${escapeHtml(c.columns.join(", "))}`
+          : "reads every column"
+      }</span>
+      ${c.contact ? `<span class="run-meta mono">${escapeHtml(c.contact)}</span>` : ""}
+      <span class="run-meta">by ${escapeHtml(c.registered_by || "?")}</span>
+    </div>`;
+  el.innerHTML = `
+    <div class="stewardship">
+      <div class="stewardship-owners">
+        <label>Owners</label>
+        ${
+          owners.length
+            ? owners.map((o) => `<span class="pill owner-pill">${escapeHtml(o)}</span>`).join(" ")
+            : `<span class="run-meta">none declared</span>`
+        }
+      </div>
+      <div class="stewardship-consumers">
+        <label>Declared consumers</label>
+        ${consumers.length ? consumers.map(consumerRow).join("") : `<div class="empty">none declared — pipelines reading this dataset are listed under Lineage</div>`}
+      </div>
+      <details class="annotate-form" data-perm="catalog_annotate">
+        <summary>Annotate…</summary>
+        <div class="annotate-fields">
+          <label>owners (comma-separated; empty = unchanged)
+            <input id="an-owners" value="${escapeHtml(owners.join(", "))}" placeholder="team-data, alice@example.com" />
+          </label>
+          <label>consumer name <input id="an-name" placeholder="revenue-dashboard" /></label>
+          <label>kind <input id="an-kind" placeholder="dashboard / model / export" /></label>
+          <label>contact <input id="an-contact" placeholder="#bi-team" /></label>
+          <label>columns it reads (comma-separated; empty = all) <input id="an-columns" placeholder="amount, currency" /></label>
+        </div>
+        <div class="submit-actions">
+          <button id="an-save" class="btn-primary">Save</button>
+          <span id="an-out" class="run-meta"></span>
+        </div>
+      </details>
+    </div>`;
+  const out = el.querySelector("#an-out");
+  el.querySelector("#an-save").onclick = async () => {
+    const split = (v) => v.split(",").map((s) => s.trim()).filter(Boolean);
+    const ownersRaw = el.querySelector("#an-owners").value;
+    const body = {};
+    const nextOwners = split(ownersRaw);
+    if (nextOwners.join("|") !== owners.join("|")) body.owners = nextOwners;
+    const name = el.querySelector("#an-name").value.trim();
+    if (name) {
+      const c = { name };
+      const kind = el.querySelector("#an-kind").value.trim();
+      const contact = el.querySelector("#an-contact").value.trim();
+      const cols = split(el.querySelector("#an-columns").value);
+      if (kind) c.kind = kind;
+      if (contact) c.contact = contact;
+      if (cols.length) c.columns = cols;
+      body.consumers = [c];
+    }
+    if (body.owners === undefined && !body.consumers) {
+      out.textContent = "nothing to save — change the owners or name a consumer";
+      return;
+    }
+    try {
+      await api(`/v1/catalog/datasets/${encodeURIComponent(d.id)}/consumers`, {
+        method: "POST",
+        body,
+      });
+      toast("annotation saved");
+      reload();
+    } catch (e) {
+      out.textContent = `✗ ${e.message}`;
+    }
   };
 }
 

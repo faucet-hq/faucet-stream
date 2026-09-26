@@ -69,11 +69,20 @@ pub enum Permission {
     /// Read the caller's own principal, role and permissions (`GET /v1/whoami`,
     /// #698) — every role, so a client can shape itself to what it may do.
     Identity,
+    /// Plan a config without running it (`POST /v1/plan`, #283/#707): the
+    /// resolved row, an offline sample pass, the schema delta and the
+    /// downstream impact. Read-only — nothing is written, no connector runs
+    /// against a destination — so every role from `viewer` up.
+    Plan,
+    /// Annotate a catalogued dataset with owners and declared consumers
+    /// (`POST /v1/catalog/datasets/{id}/consumers`, #707). Changes shared
+    /// metadata that impact reports name, so `operator` up; a viewer reads it.
+    CatalogAnnotate,
 }
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 16] = [
+    pub const ALL: [Permission; 18] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -90,6 +99,8 @@ impl Permission {
         Permission::AuditRead,
         Permission::Reload,
         Permission::Identity,
+        Permission::Plan,
+        Permission::CatalogAnnotate,
     ];
 }
 
@@ -123,6 +134,7 @@ impl Role {
                         | TemplateRead
                         | LocalOutputRead
                         | Identity
+                        | Plan
                 )
             }
             Role::Operator => {
@@ -140,6 +152,8 @@ impl Role {
                         | LocalOutputRead
                         | LocalOutputManage
                         | Identity
+                        | Plan
+                        | CatalogAnnotate
                 )
             }
             Role::Admin => true,
@@ -215,6 +229,17 @@ impl AuthContext {
     pub fn trigger(name: &str) -> Self {
         Self {
             principal: format!("trigger:{name}"),
+            role: Role::Operator,
+            source_ip: None,
+        }
+    }
+
+    /// Actor for an event the running pipeline itself raised — a data-flow
+    /// policy's runtime backstop denying a page (#702). Attributed to
+    /// `runtime`, never to the principal who submitted the run.
+    pub fn runtime() -> Self {
+        Self {
+            principal: "runtime".to_string(),
             role: Role::Operator,
             source_ip: None,
         }
@@ -360,6 +385,8 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         // Content verification (#701): a repair writes through the sink, so
         // the whole endpoint is `RunWrite` (operator+).
         (&Method::POST, "/v1/verify") => Some(RunWrite),
+        // Plan (#283/#707) is a pure read: no sink is written, no run starts.
+        (&Method::POST, "/v1/plan") => Some(Plan),
         (&Method::POST, "/v1/runs/{id}/rollback") => Some(Rollback),
         (&Method::POST, "/v1/dlq/inspect") => Some(DlqRead),
         (&Method::POST, "/v1/dlq/replay") => Some(DlqManage),
@@ -370,6 +397,7 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::GET, "/v1/catalog/datasets") => Some(CatalogRead),
         (&Method::GET, "/v1/catalog/datasets/{id}") => Some(CatalogRead),
         (&Method::GET, "/v1/catalog/lineage") => Some(CatalogRead),
+        (&Method::POST, "/v1/catalog/datasets/{id}/consumers") => Some(CatalogAnnotate),
         // Local sink output retention (#587). Listing is a read scope; deleting
         // files is `LocalOutputManage`, so a `viewer` can see what local data
         // exists but can never remove it.
@@ -423,6 +451,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/doctor") => "doctor",
         (&Method::POST, "/v1/backfill") => "backfill.submit",
         (&Method::POST, "/v1/verify") => "verify",
+        (&Method::POST, "/v1/plan") => "plan",
         (&Method::POST, "/v1/runs/{id}/rollback") => "run.rollback",
         (&Method::POST, "/v1/dlq/inspect") => "dlq.inspect",
         (&Method::POST, "/v1/dlq/replay") => "dlq.replay",
@@ -432,6 +461,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::GET, "/v1/catalog/datasets") => "catalog.list",
         (&Method::GET, "/v1/catalog/datasets/{id}") => "catalog.get",
         (&Method::GET, "/v1/catalog/lineage") => "catalog.lineage",
+        (&Method::POST, "/v1/catalog/datasets/{id}/consumers") => "catalog.annotate",
         (&Method::GET, "/v1/local-outputs") => "local_output.list",
         (&Method::DELETE, "/v1/local-outputs/{id}") => "local_output.delete",
         (&Method::POST, "/v1/local-outputs/cleanup") => "local_output.cleanup",
@@ -601,6 +631,12 @@ mod tests {
                 LocalOutputRead,
             ),
             (Method::POST, "/v1/verify", RunWrite),
+            (Method::POST, "/v1/plan", Plan),
+            (
+                Method::POST,
+                "/v1/catalog/datasets/{id}/consumers",
+                CatalogAnnotate,
+            ),
             (Method::POST, "/v1/runs/{id}/rollback", Rollback),
             (Method::POST, "/v1/templates", TemplateAdmin),
             (Method::GET, "/v1/templates", TemplateRead),
@@ -627,6 +663,10 @@ mod tests {
         assert!(!Role::Viewer.grants(Permission::Reload));
         assert!(!Role::Operator.grants(Permission::Reload));
         assert!(Role::Admin.grants(Permission::Reload));
+        // Plan is a read (viewer+); annotating shared metadata is operator+.
+        assert!(Role::Viewer.grants(Permission::Plan));
+        assert!(!Role::Viewer.grants(Permission::CatalogAnnotate));
+        assert!(Role::Operator.grants(Permission::CatalogAnnotate));
         // Every role can read the catalog; a viewer still can't write runs.
         assert!(Role::Viewer.grants(Permission::CatalogRead));
         assert!(Role::Operator.grants(Permission::CatalogRead));

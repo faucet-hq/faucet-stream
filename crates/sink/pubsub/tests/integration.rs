@@ -6,13 +6,14 @@
 //! Requires Docker (the `google/cloud-sdk:*-emulators` image). Run with:
 //! `cargo test -p faucet-sink-pubsub --test integration`.
 //!
-//! A single emulator container is shared across every test in this binary (via
-//! a leaked `OnceCell`), so its mapped port is stable. `PUBSUB_EMULATOR_HOST`
-//! is written exactly once, inside the guarded init — the SDK's
-//! `ClientConfig::default()` (used both by the read-back client here and by the
-//! sink's `build_client`) reads that env var and switches to the emulator
-//! environment (no auth). Each test uses distinct topic / subscription names so
-//! they run concurrently against the one emulator without a serialization lock.
+//! Each test starts its own emulator container and holds the handle until it
+//! returns, so the container is stopped and removed when the test ends —
+//! testcontainers-rs has no reaper, so a forgotten handle is a leaked
+//! container. `PUBSUB_EMULATOR_HOST` is process-global (the SDK's
+//! `ClientConfig::default()` — used both by the setup client here and by the
+//! connector's `build_client` — reads it and switches to the emulator
+//! environment, no auth), so the tests are serialized by [`EMULATOR_LOCK`] and
+//! the variable is rewritten under that lock for each test's own port.
 
 use faucet_core::{CheckContext, Sink};
 use faucet_sink_pubsub::{
@@ -23,40 +24,50 @@ use gcloud_pubsub::subscriber::ReceivedMessage;
 use gcloud_pubsub::subscription::Subscription;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, MutexGuard};
 
 use testcontainers_modules::google_cloud_sdk_emulators::{CloudSdk, PUBSUB_PORT};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, runners::AsyncRunner};
 
 const PROJECT: &str = "faucet-test";
 
-static EMULATOR_HOST: OnceCell<String> = OnceCell::const_new();
+/// Serializes the tests: `PUBSUB_EMULATOR_HOST` is one process-wide variable
+/// and each test's emulator listens on its own mapped port.
+static EMULATOR_LOCK: Mutex<()> = Mutex::const_new(());
 
-async fn emulator_host() -> &'static str {
-    EMULATOR_HOST
-        .get_or_init(|| async {
-            let container = CloudSdk::pubsub()
-                .start()
-                .await
-                .expect("start pubsub emulator container");
-            let port = container
-                .get_host_port_ipv4(PUBSUB_PORT)
-                .await
-                .expect("pubsub emulator host port");
-            let host = format!("127.0.0.1:{port}");
-            // SAFETY: written exactly once — `get_or_init` serializes concurrent
-            // callers, and no client is built until this future has completed.
-            unsafe {
-                std::env::set_var("PUBSUB_EMULATOR_HOST", &host);
-            }
-            // Keep the container alive for the process lifetime: never run its
-            // `Drop` (which would stop/remove it), so later tests — on their own
-            // per-test runtimes — can keep connecting to it via the host string.
-            std::mem::forget(container);
-            host
-        })
+/// One test's Pub/Sub emulator: the container (stopped + removed on drop),
+/// its `host:port`, and the serialization guard released with it.
+struct Emulator {
+    _container: ContainerAsync<CloudSdk>,
+    host: String,
+    _guard: MutexGuard<'static, ()>,
+}
+
+/// Start an emulator for the calling test and point `PUBSUB_EMULATOR_HOST` at
+/// it. Held for the test's lifetime; dropping it stops the container and lets
+/// the next test start.
+async fn emulator() -> Emulator {
+    let guard = EMULATOR_LOCK.lock().await;
+    let container = CloudSdk::pubsub()
+        .start()
         .await
-        .as_str()
+        .expect("start pubsub emulator container");
+    let port = container
+        .get_host_port_ipv4(PUBSUB_PORT)
+        .await
+        .expect("pubsub emulator host port");
+    let host = format!("127.0.0.1:{port}");
+    // SAFETY: every reader of this variable in the process is one of these
+    // tests, and they hold `EMULATOR_LOCK` while running; nothing reads it
+    // concurrently with this write.
+    unsafe {
+        std::env::set_var("PUBSUB_EMULATOR_HOST", &host);
+    }
+    Emulator {
+        _container: container,
+        host,
+        _guard: guard,
+    }
 }
 
 async fn setup_client() -> Client {
@@ -128,7 +139,8 @@ fn payload_json(m: &ReceivedMessage) -> Value {
 /// Covers `sink.rs` `write_batch` → `publish_all` → `publish_chunk`.
 #[tokio::test(flavor = "multi_thread")]
 async fn sink_json_publishes_with_attributes_and_check() {
-    let host = emulator_host().await;
+    let emu = emulator().await;
+    let host = emu.host.as_str();
     let client = setup_client().await;
     let sub = create_topic_sub(&client, "sink-json-t", "sink-json-s").await;
 
@@ -182,7 +194,8 @@ async fn sink_json_publishes_with_attributes_and_check() {
 /// the received messages. Covers the ordered branch of `publish_chunk`.
 #[tokio::test(flavor = "multi_thread")]
 async fn sink_ordering_key_field_sets_message_key() {
-    let host = emulator_host().await;
+    let emu = emulator().await;
+    let host = emu.host.as_str();
     let client = setup_client().await;
     let sub = create_topic_sub(&client, "sink-ord-t", "sink-ord-s").await;
 
@@ -214,7 +227,8 @@ async fn sink_ordering_key_field_sets_message_key() {
 /// `assemble_row_outcomes` + `write_batch_partial`.
 #[tokio::test(flavor = "multi_thread")]
 async fn sink_write_batch_partial_reports_row_failures() {
-    let host = emulator_host().await;
+    let emu = emulator().await;
+    let host = emu.host.as_str();
     let client = setup_client().await;
     let sub = create_topic_sub(&client, "sink-partial-t", "sink-partial-s").await;
 
@@ -251,7 +265,8 @@ async fn sink_write_batch_partial_reports_row_failures() {
 /// `write_batch` and its first-error extraction.
 #[tokio::test(flavor = "multi_thread")]
 async fn sink_write_batch_surfaces_encode_failure() {
-    let host = emulator_host().await;
+    let emu = emulator().await;
+    let host = emu.host.as_str();
     let client = setup_client().await;
     let _sub = create_topic_sub(&client, "sink-fail-t", "sink-fail-s").await;
 

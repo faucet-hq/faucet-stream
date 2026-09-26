@@ -1,16 +1,19 @@
-//! `GET /v1/catalog/*` — browse the Data Movement Catalog (#279): the
+//! `/v1/catalog/*` — browse the Data Movement Catalog (#279): the
 //! accumulated cross-run picture of every dataset the server's pipelines have
-//! touched. Read-only; all three routes require the `CatalogRead` permission
-//! (granted to every role, `viewer` up), enforced by the auth middleware.
+//! touched. The three `GET` routes are read-only (`CatalogRead`, every role
+//! from `viewer` up); `POST /v1/catalog/datasets/{id}/consumers` (#707)
+//! annotates a dataset with owners and declared consumers (`CatalogAnnotate`,
+//! `operator` up). Both enforced by the auth middleware.
 
 use crate::serve::error::ServeError;
 use crate::serve::history::catalog::{
-    CatalogDatasetDetail, CatalogDatasetPage, CatalogLineageEdge, CatalogListFilter,
-    LINEAGE_DEFAULT_DEPTH,
+    CatalogAnnotation, CatalogConsumer, CatalogDatasetDetail, CatalogDatasetPage,
+    CatalogLineageEdge, CatalogListFilter, LINEAGE_DEFAULT_DEPTH,
 };
+use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_LIMIT: usize = 100;
@@ -52,6 +55,96 @@ pub async fn get_dataset(
     State(state): State<ServerState>,
     Path(id): Path<String>,
 ) -> Result<Json<CatalogDatasetDetail>, ServeError> {
+    let detail = state
+        .history()
+        .catalog_get_dataset(&id)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .ok_or(ServeError::NotFound)?;
+    Ok(Json(detail))
+}
+
+/// `POST /v1/catalog/datasets/{id}/consumers` request body (#707).
+#[derive(Debug, Deserialize)]
+pub struct AnnotateRequest {
+    /// Replace the owner list (an empty list clears it); omitted = unchanged.
+    #[serde(default)]
+    pub owners: Option<Vec<String>>,
+    /// Consumers to upsert by `name`.
+    #[serde(default)]
+    pub consumers: Vec<ConsumerBody>,
+    /// Drop every consumer not listed in `consumers` first.
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// One consumer in an [`AnnotateRequest`].
+#[derive(Debug, Deserialize)]
+pub struct ConsumerBody {
+    pub name: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub contact: Option<String>,
+    #[serde(default)]
+    pub columns: Vec<String>,
+}
+
+/// `POST /v1/catalog/datasets/{id}/consumers` → 200 with the updated detail /
+/// 404 unknown dataset / 422 empty or malformed annotation.
+pub async fn annotate_dataset(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(id): Path<String>,
+    Json(req): Json<AnnotateRequest>,
+) -> Result<Json<CatalogDatasetDetail>, ServeError> {
+    let now = chrono::Utc::now();
+    let mut names = std::collections::HashSet::new();
+    for c in &req.consumers {
+        if c.name.trim().is_empty() {
+            return Err(ServeError::Unprocessable {
+                message: "consumers[].name must not be empty".into(),
+                details: None,
+            });
+        }
+        if !names.insert(c.name.as_str()) {
+            return Err(ServeError::Unprocessable {
+                message: format!("consumer `{}` is listed twice", c.name),
+                details: None,
+            });
+        }
+    }
+    let annotation = CatalogAnnotation {
+        owners: req.owners,
+        consumers: req
+            .consumers
+            .into_iter()
+            .map(|c| CatalogConsumer {
+                name: c.name,
+                kind: c.kind,
+                contact: c.contact,
+                columns: c.columns,
+                registered_by: actor.principal.clone(),
+                registered_at: now,
+            })
+            .collect(),
+        replace_consumers: req.replace,
+    };
+    if annotation.is_empty() {
+        return Err(ServeError::Unprocessable {
+            message: "nothing to annotate: pass `owners` and/or `consumers`".into(),
+            details: None,
+        });
+    }
+    let found = state
+        .history()
+        .catalog_annotate(&id, &annotation)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    if !found {
+        return Err(ServeError::NotFound);
+    }
+    crate::serve::audit::write(&state, &actor, "catalog.annotate", None, None, "ok").await;
     let detail = state
         .history()
         .catalog_get_dataset(&id)

@@ -115,7 +115,14 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             return;
         };
         let format = rec.config_format.unwrap_or_default();
-        let loaded = match load_submission(body, format, state.default_base().as_ref()).await {
+        let loaded = match load_submission(
+            body,
+            format,
+            state.default_base().as_ref(),
+            server_policy(&state).as_deref(),
+        )
+        .await
+        {
             Ok(l) => l,
             Err(e) => {
                 finalize(
@@ -307,7 +314,14 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             return;
         };
         let format = run.config_format.unwrap_or_default();
-        let loaded = match load_submission(&body, format, state.default_base().as_ref()).await {
+        let loaded = match load_submission(
+            &body,
+            format,
+            state.default_base().as_ref(),
+            server_policy(&state).as_deref(),
+        )
+        .await
+        {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(
@@ -482,7 +496,14 @@ async fn execute_shard(
 
     let server_shutdown = state.shutdown_token();
     let span = tracing::info_span!("faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
-    let work = async move { classify_run(run_expanded(nodes, opts).await) }.instrument(span);
+    let audit_state = state.clone();
+    let audit_run_id = run_id.to_string();
+    let work = async move {
+        let result = run_expanded(nodes, opts).await;
+        audit_runtime_policy_denials(&audit_state, &audit_run_id, &result).await;
+        classify_run(result)
+    }
+    .instrument(span);
     tokio::pin!(work);
     let timeout_fut = async {
         match timeout_secs {
@@ -683,7 +704,41 @@ pub async fn submit(
     }
 
     let format: ConfigFormat = req.config_format.into();
-    let loaded = load_submission(&req.config, format, state.default_base().as_ref()).await?;
+    let loaded = load_submission(
+        &req.config,
+        format,
+        state.default_base().as_ref(),
+        server_policy(&state).as_deref(),
+    )
+    .await?;
+
+    // Data-flow policy (#702): refuse a submission that would move a labelled
+    // column somewhere its rules forbid — before the queue reservation, so a
+    // refusal costs nothing, and audited as `policy.denied`.
+    #[cfg(feature = "policy")]
+    if let Some(spec) = loaded.cfg.policy.as_ref() {
+        let report = crate::policy::evaluate_nodes(spec, &loaded.nodes, &Default::default())
+            .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+        if report.violated() {
+            let merged = serde_json::to_value(&loaded.cfg).unwrap_or(serde_json::Value::Null);
+            let fp = idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
+            crate::policy::record_metrics(loaded.cfg.name.as_deref().unwrap_or("serve"), &report);
+            crate::serve::audit::write(&state, &actor, "policy.denied", None, Some(fp), "denied")
+                .await;
+            return Err(ServeError::Unprocessable {
+                message: format!(
+                    "policy: {} violation(s) — {}",
+                    report.violations,
+                    report
+                        .all_violations()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                details: serde_json::to_value(&report).ok(),
+            });
+        }
+    }
 
     // At-least-once duplicate-write warning for clustered / source-sharded runs
     // with an append-mode destination (F26/F39).
@@ -871,6 +926,18 @@ pub async fn submit(
     })
 }
 
+/// The server-wide data-flow policy handed to the submission loader (#702).
+#[cfg(feature = "policy")]
+pub(crate) fn server_policy(
+    state: &ServerState,
+) -> Option<std::sync::Arc<faucet_core::PolicySpec>> {
+    state.policy()
+}
+#[cfg(not(feature = "policy"))]
+pub(crate) fn server_policy(_state: &ServerState) -> Option<std::sync::Arc<()>> {
+    None
+}
+
 /// Run the `doctor_first` probes; on any failure return 422 with the report.
 /// Run the `doctor_first` probes. On success returns the (redacted) report so
 /// the caller can store it on the run record (`doctor_report`); on any probe
@@ -1051,6 +1118,50 @@ impl Terminal {
                 Some("server shutdown before the run finished".into()),
             ),
         }
+    }
+}
+
+/// Audit every invocation a data-flow policy's runtime backstop denied (#702)
+/// as `policy.denied` attributed to `runtime`, so the audit log carries both
+/// the submit-time refusals and the ones only the real records revealed.
+async fn audit_runtime_policy_denials(
+    state: &ServerState,
+    run_id: &str,
+    result: &crate::error::CliResult<RunSummary>,
+) {
+    let denied: Vec<String> = match result {
+        Ok(summary) => summary
+            .invocations
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.error_kind,
+                    Some(crate::executor::InvocationErrorKind::Policy)
+                )
+            })
+            .map(|i| i.row_id.clone())
+            .collect(),
+        Err(crate::error::CliError::Faucet(faucet_core::FaucetError::PolicyViolation {
+            ..
+        }))
+        | Err(crate::error::CliError::PolicyViolations { .. }) => vec![String::new()],
+        Err(_) => Vec::new(),
+    };
+    for row in denied {
+        let result = if row.is_empty() {
+            "denied".to_string()
+        } else {
+            format!("denied:{row}")
+        };
+        crate::serve::audit::write(
+            state,
+            &AuthContext::runtime(),
+            "policy.denied",
+            Some(run_id.to_string()),
+            None,
+            &result,
+        )
+        .await;
     }
 }
 
@@ -1311,15 +1422,50 @@ async fn execute_run(
             store: state.history(),
             run_id: Some(run_id.clone()),
             sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
+            annotations: Vec::new(),
         }),
     };
 
     let span = tracing::info_span!("faucet.serve.run", serve_run_id = %run_id);
+    let audit_state = state.clone();
+    let audit_run_id = run_id.clone();
+    // The resolved+expanded config snapshot (#374) a successful run leaves in
+    // the catalog — what `plan --diff` diffs against and what impact analysis
+    // (#707) reads a downstream row's contract from. Same never-fails-the-run
+    // contract as the CLI runtimes.
+    #[cfg(feature = "catalog")]
+    let snapshot_inputs = (
+        crate::catalog::CatalogHandle {
+            store: state.history(),
+            run_id: Some(run_id.clone()),
+            sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
+            annotations: Vec::new(),
+        },
+        cfg.name.clone().unwrap_or_else(|| "serve".to_string()),
+        crate::catalog::snapshot::on_error_str(&cfg.execution).to_string(),
+        nodes.clone(),
+    );
     let work = async move {
         // Emitted inside the run span so it is captured by the SSE log layer
         // (and gives every `/logs` reader at least one line to anchor on).
         tracing::info!("pipeline run starting");
-        classify_run(run_expanded(nodes, opts).await)
+        let result = run_expanded(nodes, opts).await;
+        audit_runtime_policy_denials(&audit_state, &audit_run_id, &result).await;
+        #[cfg(feature = "catalog")]
+        {
+            let (handle, pipeline, on_error, nodes) = &snapshot_inputs;
+            let succeeded = matches!(&result, Ok(s) if !s.had_failures());
+            crate::catalog::snapshot::record_if_ok(
+                Some(handle),
+                pipeline,
+                on_error,
+                nodes,
+                succeeded,
+                chrono::Utc::now(),
+            )
+            .await;
+        }
+        classify_run(result)
     }
     .instrument(span);
     tokio::pin!(work);
@@ -1587,6 +1733,7 @@ mod tests {
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
             templates_sync_path: None,
+            policy_path: None,
             callback_allow_hosts: Vec::new(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -1669,6 +1816,7 @@ mod tests {
             cluster,
             triggers_path: None,
             templates_sync_path: None,
+            policy_path: None,
             callback_allow_hosts: Vec::new(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -1741,6 +1889,7 @@ mod tests {
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
             templates_sync_path: None,
+            policy_path: None,
             callback_allow_hosts: Vec::new(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -1863,6 +2012,7 @@ mod tests {
             cluster,
             triggers_path: None,
             templates_sync_path: None,
+            policy_path: None,
             callback_allow_hosts: Vec::new(),
         };
         // A backend that is degraded from startup (primary unreachable).
@@ -1959,6 +2109,7 @@ mod tests {
                 cluster: crate::serve::cluster::ClusterConfig::disabled(),
                 triggers_path: None,
                 templates_sync_path: None,
+                policy_path: None,
                 callback_allow_hosts: Vec::new(),
             };
             ServerState::new(
@@ -1974,7 +2125,7 @@ mod tests {
         }
 
         async fn loaded(yaml: &str) -> LoadedSubmission {
-            load_submission(yaml, ConfigFormat::Yaml, None)
+            load_submission(yaml, ConfigFormat::Yaml, None, None)
                 .await
                 .expect("load submission")
         }

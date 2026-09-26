@@ -58,6 +58,7 @@ async fn source_dataset_id(dir: &Path) -> String {
     let handle = faucet_cli::catalog::connect_from_spec(&faucet_cli::catalog::CatalogSpec {
         url: format!("sqlite:{}/cat.db", dir.display()),
         sample_records: 10,
+        datasets: Vec::new(),
     })
     .await
     .unwrap();
@@ -120,6 +121,7 @@ async fn catalog_command_datasets_show_lineage_roundtrip() {
     let handle = faucet_cli::catalog::connect_from_spec(&faucet_cli::catalog::CatalogSpec {
         url: format!("sqlite:{}/cat.db", dir.path().display()),
         sample_records: 10,
+        datasets: Vec::new(),
     })
     .await
     .unwrap();

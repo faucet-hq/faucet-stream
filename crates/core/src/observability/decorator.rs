@@ -279,6 +279,7 @@ pub(crate) fn error_kind(e: &FaucetError) -> &'static str {
         FaucetError::QualityFailure { .. } => "QualityFailure",
         FaucetError::SchemaDrift { .. } => "SchemaDrift",
         FaucetError::ProfileDrift { .. } => "ProfileDrift",
+        FaucetError::PolicyViolation { .. } => "PolicyViolation",
         FaucetError::ContractViolation { .. } => "ContractViolation",
         FaucetError::State(_) => "State",
         FaucetError::CircuitOpen { .. } => "CircuitOpen",

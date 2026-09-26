@@ -23,8 +23,11 @@ fn plan_diff_args(config: PathBuf) -> faucet_cli::cli::PlanArgs {
         limit: 10,
         json: false,
         diff: true,
+        impact: false,
+        depth: 5,
         resolve_secrets: false,
         profile: None,
+        policy: None,
     }
 }
 
@@ -56,6 +59,7 @@ async fn run_records_snapshot_then_plan_diff_reads_it() {
     let handle = faucet_cli::catalog::connect_from_spec(&faucet_cli::catalog::CatalogSpec {
         url: format!("sqlite:{}", db.display()),
         sample_records: 10,
+        datasets: Vec::new(),
     })
     .await
     .unwrap();

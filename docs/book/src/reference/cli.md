@@ -70,6 +70,7 @@ Flags:
 | `--clock <value>` | Override the clock used by `${now.*}` tokens. Accepts an RFC 3339 timestamp (`2026-03-01T00:00:00Z`) or a bare date (`2026-03-01`, treated as midnight UTC). Default: process start time in UTC. Use this for backfills — run the same config with a different date without changing the file. |
 | `--concurrency <n>` | Override this run's **connector** concurrency — how many concurrent connections/fetches the source and sink may use — whatever the config says. Maps onto whichever knob the connector declares (`max_connections` / `request_concurrency` / `partition_concurrency` / `shard_concurrency` / `concurrency`); a connector with none ignores it. Does **not** change matrix parallelism (`execution.max_concurrent`), and it caps only the *client* side — it cannot raise what the upstream will accept. Must be > 0. |
 | `--profile <name>` | Select a named overlay from the config's `profiles:` block (see [Config composition](config.md#config-composition)). Overrides `FAUCET_PROFILE`. |
+| `--policy <path>` | Evaluate a [data-flow policy](../cookbook/policies.md) file on top of the config's own `policy:` block; a violation refuses the run before any connector is built (exit code = violation count). Also on `validate` / `plan` / `doctor`. |
 | `--env-file <path>` / `--no-env-file` | Same `.env` handling as `validate` / `preview`. |
 | `--from-env` | Build the pipeline entirely from `FAUCET_*` environment variables; mutually exclusive with a positional config path. |
 | `--select <id>` / `--only <glob>` / `--skip <id\|glob>` | Runtime matrix-row selection by id. `--select`/`--only` force-include by name (bypassing the status gate); `--skip` removes last. See [Row selection](config.md#row-selection). Env: `FAUCET_SELECT` / `FAUCET_SKIP`. |
@@ -194,6 +195,9 @@ faucet validate app.yaml --profile prod        # select a named overlay
 faucet validate app.yaml --show-composed       # print the fully merged config
 ```
 
+- `--policy <path>` merges a [data-flow policy](../cookbook/policies.md) file over
+  the config's own block; the per-row report is printed (`policy` in `--json`) and
+  any violation makes the config invalid (exit code = violation count).
 - `--profile <name>` selects a named overlay from `profiles:` (also settable via
   `FAUCET_PROFILE`; the flag wins). An undeclared name is a clear load-time error.
 - `--show-composed` prints the fully composed document — bases merged, the
@@ -261,6 +265,7 @@ faucet plan pipeline.yaml --sample fixtures.jsonl        # preview output schema
 faucet plan pipeline.yaml --live --limit 20 --json       # capped read-only source pull, JSON out
 faucet plan pipeline.yaml --diff                         # config-change diff vs the last run
 faucet plan pipeline.yaml --diff --json                  # machine-readable diff (CI gate)
+faucet plan pipeline.yaml --impact --sample fixtures.jsonl   # who downstream a schema change affects
 ```
 
 Reports, for the selected row (`--row`, default the first root): the resolved
@@ -272,7 +277,21 @@ output schema, the sink schema delta (adds / widenings / incompatible via
 `diff_schema` when the sink exposes `current_schema()`; "schemaless — no delta"
 otherwise), and a volume estimate. The data pass runs through the offline
 harness, so no sink is ever written. Offline by default; `--resolve-secrets`
-opts into the real secrets path.
+opts into the real secrets path. With a `policy:` block or `--policy`, the
+row's [data-flow policy](../cookbook/policies.md) verdict is reported too
+(`policy` in the JSON; a preview never fails on it).
+
+### `plan --impact` — change impact analysis (#707)
+
+Walks the catalog's lineage graph downstream of the row's sink and reports
+the datasets, contracts, owners and declared consumers the planned schema
+affects, each with a severity (`breaking` / `additive` / `unknown`). The
+planned schema is the `--sample`'s output (exact), else the catalog's last
+source schema pushed through the row's transform chain; the delta is diffed
+against the sink's last observed schema, with a `rename_field` /
+`rename_keys` in the chain reported as a rename. `--depth N` bounds the walk
+(default 5). Requires a `catalog:` block and a recorded run of the row; see
+the [impact cookbook](../cookbook/impact.md).
 
 ### `plan --diff` — config-change preview (#374)
 
@@ -693,6 +712,24 @@ apply — the fast way to confirm `applies_to` scoping. Offline-safe: secrets ar
 never fetched. Requires the `masking` Cargo feature (in the default build). See
 the [masking](../cookbook/masking.md) cookbook page.
 
+## `policy`
+
+```bash
+faucet policy pipeline.yaml                          # the config's own policy: block
+faucet policy pipeline.yaml --policy eu-pii.yaml     # merged with a policy file
+faucet policy pipeline.yaml --row customers --json
+```
+
+Evaluates a [data-flow policy](../cookbook/policies.md) against a config and
+prints, per row, the labelled columns heading into each sink (with how they
+were labelled — by name, through a rename, or conservatively past an opaque
+transform — and whether the row's masking provably masks them) and every
+violated rule. Exit code = violation count, so it doubles as a CI gate.
+Offline-safe. The same verdict refuses `faucet run` and is reported by
+`validate` / `plan` / `doctor` (`--policy` on each). `faucet schema policy`
+prints the JSON Schema. Requires the `policy` Cargo feature (in the default
+build).
+
 ## `profiling`
 
 ```bash
@@ -722,15 +759,21 @@ faucet catalog datasets --config pipeline.yaml                 # list catalogued
 faucet catalog datasets --config pipeline.yaml --kind csv --q users --json
 faucet catalog show 3f2a9c1e0b7d4a55 --config pipeline.yaml    # detail (id prefix ok)
 faucet catalog lineage --config pipeline.yaml --root 3f2a9c1e0b7d4a55 --depth 3
+faucet catalog annotate 3f2a9c1e --config pipeline.yaml \
+  --owner team-bi --consumer revenue-dashboard=dashboard --contact "#bi" --columns amount,currency
 ```
 
 Browses the [Data Movement Catalog](../cookbook/catalog.md) named by the
 config's `catalog:` block: the dataset list (newest activity first, `--kind` /
 `--q` filters), one dataset's detail (schema timeline with diffs, recent
-volume, upstream/downstream edges, and the column profiles recorded by a
-`profiling:` pipeline), and the lineage graph. All subcommands
-accept `--json`; `--config` auto-discovers `faucet.yaml` in cwd when omitted.
-Read-only — it never mutates the store.
+volume, upstream/downstream edges, declared owners / consumers, and the
+column profiles recorded by a `profiling:` pipeline), and the lineage graph.
+All subcommands accept `--json`; `--config` auto-discovers `faucet.yaml` in
+cwd when omitted. `annotate` is the one write: it sets a dataset's owners
+(`--owner`, repeatable; replaces the list) and upserts declared consumers
+(`--consumer NAME[=KIND]`, repeatable, with `--contact` / `--columns` for the
+consumers named in that call; `--replace` drops the unlisted) — what
+[`plan --impact`](#plan) names. The others are read-only.
 
 ## `template`
 

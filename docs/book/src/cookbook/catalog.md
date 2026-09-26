@@ -82,7 +82,9 @@ faucet catalog lineage --config pipeline.yaml --root 3f2a9c1e0b7d4a55 --depth 3
 
 `show` accepts a unique prefix of the dataset id. Every subcommand takes
 `--json` for machine-readable output. `faucet schema catalog` prints the
-`catalog:` block's JSON Schema.
+`catalog:` block's JSON Schema. `faucet catalog annotate <id> --owner … --consumer …`
+sets a dataset's owners and declared consumers (the one write; see
+[change impact analysis](./impact.md)).
 
 `show` renders the schema timeline with diff markers:
 
@@ -101,11 +103,22 @@ Three read-only endpoints (viewer-readable under RBAC):
 | `GET /v1/catalog/datasets` | Paginated dataset list (`kind`, `q`, `limit`, `cursor` filters) |
 | `GET /v1/catalog/datasets/{id}` | Current schema, schema timeline (with diffs), recent volume points, upstream/downstream edges, column profiles (`profile.latest` + `profile.history`) |
 | `GET /v1/catalog/lineage` | The edge graph (`root` + `depth` for a bounded slice) |
+| `POST /v1/catalog/datasets/{id}/consumers` | Merge owners / declared consumers into a dataset (operator+) — see [impact analysis](./impact.md) |
 
 The embedded [web console](./web-console.md) adds a **Datasets** browser
 (filterable list → per-dataset detail with the schema timeline, volume bars,
 and the column-profile table with null-rate sparklines and drift markers) and
 a **Lineage** graph view (layered SVG; click a node for its detail).
+
+## Owners & consumers
+
+A dataset carries declared **owners** and **consumers** (#707): who is
+responsible for it and what reads it besides faucet pipelines (those are
+consumers automatically, through the lineage edges). Declare them in the
+`catalog.datasets:` block (merged after every run that touches the dataset),
+with `faucet catalog annotate`, over `POST /v1/catalog/datasets/{id}/consumers`,
+or in the console's **Owners & consumers** section. They are what
+[`faucet plan --impact`](./impact.md) names when a change reaches the dataset.
 
 ## Dataset identity & cardinality
 

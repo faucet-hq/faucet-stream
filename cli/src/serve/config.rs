@@ -128,6 +128,9 @@ pub struct ServeConfig {
     /// Path to a `--templates-sync` file. `None` = no remote template origins.
     /// Loaded + validated at startup (gated on the `templates-sync` feature).
     pub templates_sync_path: Option<PathBuf>,
+    /// Path to a `--policy` file (#702). Loaded + validated at startup; every
+    /// submission is checked against it (gated on the `policy` feature).
+    pub policy_path: Option<PathBuf>,
     /// Allowlist of hosts a per-run completion callback may target (#481).
     /// Empty = any host except link-local / cloud-metadata addresses.
     pub callback_allow_hosts: Vec<String>,
@@ -325,6 +328,7 @@ impl ServeConfig {
             cluster,
             triggers_path: args.triggers,
             templates_sync_path: args.templates_sync,
+            policy_path: args.policy,
             callback_allow_hosts: args.callback_allow_host,
         })
     }
@@ -370,6 +374,7 @@ mod tests {
             cluster_max_attempts: 3,
             triggers: None,
             templates_sync: None,
+            policy: None,
             callback_allow_host: Vec::new(),
             mcp: false,
             mcp_allow_mutations: false,

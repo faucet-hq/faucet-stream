@@ -3,7 +3,7 @@
 use crate::error::{CliError, CliResult};
 use crate::serve::config::ServeConfig;
 use crate::serve::handlers::{
-    audit, backfill, dlq, doctor, health, logs, reload, runs, schemas, verify, whoami,
+    audit, backfill, dlq, doctor, health, logs, plan, reload, runs, schemas, verify, whoami,
 };
 use crate::serve::history::RunHistory;
 use crate::serve::state::ServerState;
@@ -46,6 +46,7 @@ pub fn build_router(
         .route("/v1/doctor", post(doctor::doctor))
         .route("/v1/backfill", post(backfill::submit_backfill))
         .route("/v1/verify", post(verify::verify))
+        .route("/v1/plan", post(plan::plan))
         .route("/v1/dlq/inspect", post(dlq::inspect))
         .route("/v1/dlq/replay", post(dlq::replay))
         .route("/v1/dlq/discard", post(dlq::discard))
@@ -66,6 +67,10 @@ pub fn build_router(
         api = api
             .route("/v1/catalog/datasets", get(catalog::list_datasets))
             .route("/v1/catalog/datasets/{id}", get(catalog::get_dataset))
+            .route(
+                "/v1/catalog/datasets/{id}/consumers",
+                post(catalog::annotate_dataset),
+            )
             .route("/v1/catalog/lineage", get(catalog::lineage))
             // Local sink output retention (#587) — the control surface behind the
             // Datasets page's cleanup controls (#588).
@@ -534,6 +539,20 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         ));
     }
 
+    // Data-flow policy (#702): load + validate fail-fast; a policy that does
+    // not parse must refuse to start the server rather than silently not apply.
+    #[cfg(feature = "policy")]
+    let policy = match &config.policy_path {
+        Some(path) => Some(std::sync::Arc::new(crate::policy::load_file(path)?)),
+        None => None,
+    };
+    #[cfg(not(feature = "policy"))]
+    if config.policy_path.is_some() {
+        return Err(CliError::Serve(
+            "--policy requires a build with the `policy` feature".into(),
+        ));
+    }
+
     let shutdown = CancellationToken::new();
     let state = ServerState::new(
         &config,
@@ -545,6 +564,11 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    #[cfg(feature = "policy")]
+    if let Some(p) = policy {
+        tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
+        state.set_policy(p);
+    }
     // Attach the origins, pull each once so the registry is populated before
     // the listener opens, then start the periodic pulls. A network failure on
     // the initial pull is logged and counted, not fatal — the server must come

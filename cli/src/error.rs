@@ -496,6 +496,13 @@ pub enum CliError {
     #[error("{differences} differing key(s) between source and destination")]
     VerifyFailed { differences: usize },
 
+    /// A data-flow policy (#702) refused the config before any data moved:
+    /// `validate` / `policy` / `run` / the serve submit path print the report
+    /// and `main` maps this to an exit code equal to the violation count
+    /// (clamped to 255).
+    #[error("{violations} data-flow policy violation(s) — nothing was run")]
+    PolicyViolations { violations: usize },
+
     /// `faucet rollback` was refused because a later run changed keys the run
     /// touched (#706); nothing was changed. `main` maps this to an exit code
     /// equal to the conflict count (clamped to 255).

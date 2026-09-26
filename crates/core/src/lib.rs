@@ -46,6 +46,8 @@ pub mod native;
 pub mod object_rollover;
 pub mod observability;
 pub mod pipeline;
+#[cfg(feature = "policy")]
+pub mod policy;
 pub mod profiling;
 #[cfg(feature = "quality")]
 pub mod quality;
@@ -147,6 +149,11 @@ pub use observability::{
 pub use pipeline::{
     DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE, Pipeline, PipelineResult, StreamPage, run_stream,
     validate_batch_size,
+};
+#[cfg(feature = "policy")]
+pub use policy::{
+    ColumnFacts, CompiledPolicy, PolicyRule, PolicyScope, PolicySink, PolicySpec, RuntimeAction,
+    SinkFacts, Violation, ViolationKind,
 };
 pub use profiling::{
     ColumnProfile, DriftMetric, OnProfileDrift, ProfileDrift, Profiler, ProfilingSink,

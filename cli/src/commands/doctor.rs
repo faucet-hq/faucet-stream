@@ -81,7 +81,18 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
     };
 
     let t_cfg = Instant::now();
-    let cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
+    #[cfg_attr(not(feature = "policy"), allow(unused_mut))]
+    let mut cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
+    #[cfg(feature = "policy")]
+    crate::policy::apply_to_config(&mut cfg, args.policy.as_deref())?;
+    #[cfg(not(feature = "policy"))]
+    if args.policy.is_some() {
+        return Err(CliError::Config(
+            "--policy requires a binary built with the `policy` feature \
+             (e.g. `cargo install faucet-cli --features policy`)"
+                .into(),
+        ));
+    }
     let cfg_ms = t_cfg.elapsed().as_millis();
 
     let nodes = expand(&cfg)?;
@@ -315,11 +326,27 @@ pub async fn probe_roots(
             )
         });
         let guarantee = node.delivery_guarantee.to_string();
+        // Data-flow policy (#702): the static verdict for this row, as
+        // `policy` probes — read-only, no connector needed.
+        #[cfg(feature = "policy")]
+        let policy_probes: Vec<ProbeOut> = node
+            .policy
+            .as_ref()
+            .map(|spec| {
+                crate::policy::doctor_probes(spec, node)
+                    .into_iter()
+                    .map(|p| ProbeOut::from_probe("policy", "policy".to_string(), p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "policy"))]
+        let policy_probes: Vec<ProbeOut> = Vec::new();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore not closed");
             let mut inv =
                 probe_invocation(id, source, sink, state, &auth, &ctx, sla, profiling).await;
             inv.delivery = Some(guarantee);
+            inv.probes.extend(policy_probes);
             inv
         }));
     }
@@ -871,6 +898,7 @@ pipeline:
             json: false,
             offline: true,
             profile: None,
+            policy: None,
         }
     }
 

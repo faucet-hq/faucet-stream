@@ -484,6 +484,7 @@ impl TemplateRecord {
             created_at: self.created_at,
             created_by: self.created_by.clone(),
             state: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -519,6 +520,11 @@ pub struct TemplateSummary {
     /// record that was built without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<TemplateState>,
+    /// Non-fatal findings from registration (#702): a data-flow policy the
+    /// template would violate when run as registered. It may still be composed
+    /// with a compliant sink later, so registration warns and triggering refuses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// One entry in a template's append-only **launch log**.

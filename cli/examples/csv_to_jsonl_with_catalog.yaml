@@ -19,6 +19,20 @@ catalog:
   url: sqlite:./faucet-catalog.db
   # How many records to sample per run for schema inference (default 100).
   sample_records: 100
+  # Owners + declared external consumers (#707), merged into the catalog after
+  # every run that touches the dataset. Pipelines that read a dataset are
+  # consumers automatically (lineage); declare here what the catalog cannot
+  # see — dashboards, models, exports — so `faucet plan --impact` can name who
+  # a change affects. `dataset` is the canonical URI `faucet catalog datasets`
+  # prints (or the 16-hex id).
+  datasets:
+    - dataset: file://./out/records.jsonl
+      owners: [data-platform]
+      consumers:
+        - name: records-dashboard
+          kind: dashboard
+          contact: "#analytics"
+          columns: [id, name]
 
 pipeline:
   source:

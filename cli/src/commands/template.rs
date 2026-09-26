@@ -1448,6 +1448,7 @@ pipeline:
             params,
             created_at: chrono::Utc::now(),
             created_by: None,
+            warnings: Vec::new(),
         };
         let hint = required_param_hint(&summary);
         assert_eq!(hint, " --param tag=<string>");

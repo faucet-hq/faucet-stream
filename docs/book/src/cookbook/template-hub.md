@@ -203,7 +203,7 @@ faucet validate --source acme/billing --sink faucet-hq/bigquery --overlay ops/pr
 ```
 
 An overlay may set only operational blocks — `state`, `dlq`,
-`notifications` (alias `notify`), `sla`, `profiling`, `resilience`, `execution`,
+`notifications` (alias `notify`), `sla`, `profiling`, `policy`, `resilience`, `execution`,
 `delivery`, `schedule` — and per-stream `sla` / `dlq` / `delivery` under
 `streams:`. Anything that would change which connectors run or what the streams
 produce (`pipeline`, `matrix`, `source`, `sink`, `transforms`) is refused with a
