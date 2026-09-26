@@ -367,6 +367,53 @@ paths:
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
         "422": { description: Config failed validation / expansion }
+  /v1/plan:
+    post:
+      summary: Plan a config without running it
+      description: >
+        The read-only "what would this change do" preview behind `faucet plan`
+        (#283): the resolved row (source / sink / write mode / delivery
+        guarantee / transform chain / lineage ops), and — given `sample`
+        records — the output schema, volume and sink schema delta computed by
+        running the sample through the offline harness. With `impact: true`
+        (#707) the report also walks this server's Data Movement Catalog
+        downstream of the row's sink and lists the affected datasets,
+        contracts, owners and declared consumers with a severity each
+        (`breaking` / `additive` / `unknown`). The server's `--policy` (#702)
+        is evaluated for the row and reported under `policy`. Nothing is
+        written and no run starts; the sink is built only for its
+        non-mutating `check()` probe. Requires the `Plan` permission (viewer).
+        `impact` requires the `catalog` Cargo feature (422 otherwise).
+      operationId: planConfig
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config: { type: string, description: "The pipeline config document." }
+                config_format: { type: string, enum: [yaml, json], default: yaml }
+                row: { type: string, nullable: true, description: "Root row to plan (default: the first root)." }
+                sample:
+                  type: array
+                  nullable: true
+                  items: { type: object }
+                  description: "Input records to run through the row's transforms offline (no source is read)."
+                impact: { type: boolean, default: false, description: "Change impact analysis against this server's catalog (#707)." }
+                depth: { type: integer, nullable: true, default: 5, description: "Downstream hop bound for `impact`." }
+      responses:
+        "200":
+          description: The plan report (the same shape `faucet plan --json` prints).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlanReport" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "422": { $ref: "#/components/responses/Error" }
   /v1/backfill:
     post:
       summary: Submit a windowed backfill as tracked runs (one per window unit)
@@ -581,6 +628,53 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "404": { $ref: "#/components/responses/Error" }
+  /v1/catalog/datasets/{id}/consumers:
+    post:
+      summary: Annotate a dataset with owners and declared consumers
+      description: >
+        Merge an owners / consumers annotation into one catalogued dataset
+        (#707). `owners` replaces the owner list when given (an empty list
+        clears it); `consumers` are upserted by `name` (`replace: true` drops
+        every consumer not listed first). Pipelines that read the dataset are
+        consumers automatically via lineage — declare here what the catalog
+        cannot see (dashboards, models, exports) so `faucet plan --impact` /
+        `POST /v1/plan` can name who a change affects. A dataset exists once a
+        run has observed it (404 otherwise). Requires the `CatalogAnnotate`
+        permission (operator). Requires the `catalog` Cargo feature. Audited
+        as `catalog.annotate`.
+      operationId: annotateCatalogDataset
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                owners: { type: array, nullable: true, items: { type: string } }
+                consumers:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name: { type: string }
+                      kind: { type: string, nullable: true, description: "dashboard / model / export / report / … (free-form)." }
+                      contact: { type: string, nullable: true }
+                      columns: { type: array, items: { type: string }, description: "The columns it reads; empty = every column." }
+                replace: { type: boolean, default: false }
+      responses:
+        "200":
+          description: The updated dataset detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogDatasetDetail" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
   /v1/catalog/lineage:
     get:
       summary: Get the dataset lineage graph
@@ -1803,6 +1897,11 @@ components:
         schema_versions: { type: integer }
         current_schema: { type: object, nullable: true, description: "Latest observed record schema (infer_schema shape)." }
         current_schema_hash: { type: string, nullable: true }
+        owners: { type: array, items: { type: string }, description: "Declared owners (#707); absent when none." }
+        consumers:
+          type: array
+          items: { $ref: "#/components/schemas/CatalogConsumer" }
+          description: "Declared external consumers (#707); absent when none."
       example:
         id: orders_to_warehouse
         uri: example
@@ -1821,6 +1920,131 @@ components:
         current_schema:
           key: value
         current_schema_hash: example
+    CatalogConsumer:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        kind: { type: string, nullable: true }
+        contact: { type: string, nullable: true }
+        columns: { type: array, items: { type: string }, description: "Columns it reads; empty = every column." }
+        registered_by: { type: string, description: "`config`, or the principal who registered it." }
+        registered_at: { type: string, format: date-time }
+      example:
+        name: revenue-dashboard
+        kind: dashboard
+        contact: "#bi-team"
+        columns: [amount, currency]
+        registered_by: alice
+        registered_at: '2026-01-01T00:00:00Z'
+    PlanReport:
+      type: object
+      description: >
+        The `faucet plan` report. `sample` is present when input records were
+        supplied; `policy` when a data-flow policy is in force (#702);
+        `impact` when `impact: true` was requested (#707).
+      required: [row, source, sink, write_mode, transforms, delivery_guarantee, quality, contract, masking]
+      properties:
+        row: { type: string }
+        source: { type: string }
+        sink: { type: string }
+        write_mode: { type: string }
+        transforms: { type: array, items: { type: string } }
+        delivery_guarantee: { type: string }
+        quality: { type: boolean }
+        contract: { type: boolean }
+        masking: { type: boolean }
+        schema_drift: { type: string, nullable: true }
+        lineage: { type: array, items: { type: string } }
+        sink_probe: { type: string, nullable: true }
+        sample: { type: object, nullable: true, description: "input_records / output_records / dlq_records / inferred_schema / sink_schema / schema_delta / error." }
+        policy: { type: object, nullable: true, description: "The row's data-flow policy verdict: labelled columns + violations." }
+        impact: { $ref: "#/components/schemas/ImpactReport" }
+      example:
+        row: default
+        source: csv
+        sink: jsonl
+        write_mode: append
+        transforms: [rename_field]
+        delivery_guarantee: AtLeastOnce
+        quality: false
+        contract: false
+        masking: false
+    ImpactReport:
+      type: object
+      description: Change impact analysis (#707).
+      required: [pipeline, row, planned_from, delta, severity, affected, owners, notes]
+      properties:
+        pipeline: { type: string }
+        row: { type: string }
+        dataset:
+          type: object
+          nullable: true
+          description: The row's sink dataset; absent when the row has never recorded a run.
+          properties:
+            id: { type: string }
+            uri: { type: string }
+            last_run_id: { type: string }
+        planned_from: { type: string, enum: [sample, lineage, unknown] }
+        delta:
+          type: object
+          properties:
+            added: { type: array, items: { type: string } }
+            removed: { type: array, items: { type: string } }
+            retyped: { type: array, items: { type: object, properties: { column: { type: string }, from: { type: string }, to: { type: string } } } }
+            renamed: { type: array, items: { type: object, properties: { from: { type: string }, to: { type: string } } } }
+        severity: { type: string, enum: [none, additive, unknown, breaking] }
+        affected:
+          type: array
+          description: Downstream datasets, nearest first (depth 0 = the row's own sink).
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              uri: { type: string }
+              pipeline: { type: string }
+              row: { type: string }
+              depth: { type: integer }
+              severity: { type: string, enum: [none, additive, unknown, breaking] }
+              opaque: { type: boolean, description: "An edge on the path carries no column lineage." }
+              columns:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    column: { type: string }
+                    change: { type: object, description: "{kind: added|removed|retyped|renamed, …}" }
+                    reads: { type: array, items: { type: string } }
+              contract:
+                type: object
+                nullable: true
+                properties:
+                  pipeline: { type: string }
+                  row: { type: string }
+                  version: { type: string }
+                  fields: { type: array, items: { type: string } }
+              owners: { type: array, items: { type: string } }
+              consumers:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    kind: { type: string, nullable: true }
+                    contact: { type: string, nullable: true }
+                    severity: { type: string, enum: [none, additive, unknown, breaking] }
+                    columns: { type: array, items: { type: string } }
+        owners: { type: array, items: { type: string }, description: Every owner of an affected dataset. }
+        notes: { type: array, items: { type: string } }
+      example:
+        pipeline: orders
+        row: default
+        planned_from: sample
+        delta: { added: [], removed: [email], retyped: [], renamed: [] }
+        severity: breaking
+        affected: []
+        owners: [team-bi]
+        notes: []
     CatalogSchemaVersion:
       type: object
       required: [dataset_id, version, recorded_at, run_id, schema, schema_hash]

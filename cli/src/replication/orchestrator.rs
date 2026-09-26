@@ -399,6 +399,7 @@ pipeline:
             status: None,
             tags: Vec::new(),
             complete_for: None,
+            attributes: Default::default(),
         };
         let node = build_snapshot_node(&cdc, snap_src);
         assert_eq!(node.id, "snapshot");
@@ -433,6 +434,7 @@ pipeline:
             status: None,
             tags: Vec::new(),
             complete_for: None,
+            attributes: Default::default(),
         };
         let node = build_snapshot_node(&cdc, snap_src);
         let kinds: Vec<&str> = node.transforms.iter().map(|t| t.kind.as_str()).collect();

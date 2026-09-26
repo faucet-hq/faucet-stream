@@ -4502,6 +4502,7 @@ dependencies = [
  "ratatui",
  "rdkafka",
  "redis",
+ "regex",
  "reqwest 0.13.3",
  "rust-embed",
  "schemars 1.2.1",

@@ -115,7 +115,35 @@ pub async fn register_template(
         "ok",
     )
     .await;
-    Ok((StatusCode::CREATED, Json(record.summary())))
+    let mut summary = record.summary();
+    // Data-flow policy (#702): a registered pipeline that would violate the
+    // server policy is warned about — it may be composed with a compliant sink
+    // later — and refused at trigger time by the submit gate.
+    #[cfg(feature = "policy")]
+    if let Some(policy) = state.policy()
+        && record.kind == crate::hub::TemplateKind::Pipeline
+    {
+        let parsed: Result<serde_json::Value, String> = match record.format {
+            crate::serve::load::ConfigFormat::Yaml => {
+                serde_yaml::from_str(&record.body).map_err(|e| e.to_string())
+            }
+            crate::serve::load::ConfigFormat::Json => {
+                serde_json::from_str(&record.body).map_err(|e| e.to_string())
+            }
+        };
+        if let Ok(doc) = parsed
+            && let Ok(cfg) = crate::templates::store::validate_pipeline_body(&doc)
+            && let Ok(nodes) = crate::expand::expand(&cfg)
+            && let Ok(report) = crate::policy::evaluate_nodes(&policy, &nodes, &Default::default())
+            && report.violated()
+        {
+            for v in report.all_violations() {
+                tracing::warn!(template = %record.id, "policy: {v}");
+                summary.warnings.push(format!("policy: {v}"));
+            }
+        }
+    }
+    Ok((StatusCode::CREATED, Json(summary)))
 }
 
 // ── GET /v1/templates ───────────────────────────────────────────────────────

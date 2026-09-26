@@ -32,6 +32,8 @@ pub mod new;
 #[cfg(feature = "notify")]
 pub mod notify;
 pub mod plan;
+#[cfg(feature = "policy")]
+pub mod policy;
 pub mod preview;
 pub mod profiling;
 pub mod replicate;

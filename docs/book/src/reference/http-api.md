@@ -74,6 +74,7 @@ someone does.
 | `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
 | `POST /v1/backfill` | — | ✓ | ✓ |
 | `POST /v1/verify` | — | ✓ | ✓ |
+| `POST /v1/plan` | ✓ | ✓ | ✓ |
 | `POST /v1/runs/{id}/rollback` | — | — | ✓ |
 | `GET /v1/schemas`, `/v1/schemas/{kind}/{name}` | ✓ | ✓ | ✓ |
 | `POST /v1/doctor` | — | ✓ | ✓ |
@@ -81,6 +82,7 @@ someone does.
 | `POST /v1/dlq/replay`, `/v1/dlq/discard` | — | ✓ | ✓ |
 | `POST`/`PUT /v1/triggers/{name}` | — | ✓ | ✓ |
 | `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
+| `POST /v1/catalog/datasets/{id}/consumers` | — | ✓ | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
 | `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
@@ -95,10 +97,13 @@ someone does.
 | `POST /v1/reload` | — | — | ✓ |
 | *any unclassified `/v1` route* | — | — | ✓ |
 
-Two entries are POSTs a **read** token can reach, because they change nothing:
+Three entries are POSTs a **read** token can reach, because they change nothing:
 
 - `POST /mcp` — the MCP transport's baseline is a read scope; its one mutating
   tool (`run_pipeline`) re-checks `RunWrite` inside the handler.
+- `POST /v1/plan` — plans a config: expands it, runs a caller-supplied sample
+  through the offline harness, reads the catalog. No sink is written and no
+  run starts.
 - `POST /v1/dlq/inspect` — summarises a DLQ location. The location is
   caller-supplied, so a read token can ask the server to read a path on its
   filesystem. That is the same trust boundary as run logs (which carry record
@@ -126,8 +131,10 @@ each route still enforces its own permission.
 
 **Audit log.** Every mutating action (`run.submit` / `run.cancel` / `run.delete` /
 `template.register` / `template.delete` / `template.run` / `template.promote` /
-`template.version_deprecate` / `local_output.delete` / `local_output.cleanup`)
-and every denied attempt is recorded with principal, role, action, run id,
+`template.version_deprecate` / `local_output.delete` / `local_output.cleanup` /
+`catalog.annotate`), every plan (`plan`), every data-flow-policy refusal
+(`policy.denied` — by the submitting principal at submit time, by `runtime`
+when the backstop denied a page mid-run) and every denied attempt is recorded with principal, role, action, run id,
 config fingerprint (submit), source IP, timestamp, and result. Admins read it via
 `GET /v1/audit`. Records persist in the run-history backend (`faucet_serve_audit`
 for the SQL backends; an in-memory ring otherwise) and expire with the
@@ -327,6 +334,13 @@ it automatically). Viewer-readable under RBAC; requires a build with the
   + drift findings, and the recent history). `404` for an unknown id.
 - `GET /v1/catalog/lineage?root=&depth=` — the source→sink edge graph; with
   `root` (a dataset id), a BFS slice bounded by `depth` hops.
+- `POST /v1/catalog/datasets/{id}/consumers` — merge an owners / consumers
+  annotation (#707): `{ owners?: [..], consumers: [{name, kind?, contact?,
+  columns?}], replace?: bool }`. Owners replace the list when given;
+  consumers upsert by `name`. `200` with the updated detail, `404` for an
+  unknown id, `422` for an empty annotation. `CatalogAnnotate` (operator);
+  audited `catalog.annotate`. What [impact analysis](../cookbook/impact.md)
+  names.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
@@ -537,7 +551,7 @@ works as a pipeline but is deprecated: add `kind: pipeline`.
 
 **Deployment overlays.** A `kind: deployment` template carries the operational
 blocks a composed run gets from neither template — `state`, `dlq`,
-`notifications`, `sla`, `profiling`, `resilience`, `execution`, `delivery`, `schedule`, and
+`notifications`, `sla`, `profiling`, `policy`, `resilience`, `execution`, `delivery`, `schedule`, and
 per-stream `sla` / `dlq` / `delivery` under `streams:` (see
 [Deployment overlays](../cookbook/template-hub.md#deployment-overlays)). It is
 registered like any template, never triggered on its own (`422`), and applied
@@ -663,6 +677,35 @@ model.
 `rows_fetched_dest`, `differences: [{key, kind, columns?}]`, `truncated`, and
 `repaired_upserts` / `repaired_deletes` when a repair ran. A mismatch is a
 result, not an error. Requires `RunWrite` (operator); audited as `verify`.
+
+### `POST /v1/plan`
+
+Plan a config without running it (#283 / #707) — the report behind
+[`faucet plan`](./cli.md#plan).
+
+```json
+{ "config": "version: 1\n…", "config_format": "yaml", "row": "orders",
+  "sample": [{ "id": 1, "email": "a@x.io" }], "impact": true, "depth": 5 }
+```
+
+`200` with the plan: the resolved row, the lineage ops, and — given
+`sample` records — the output schema / volume / sink schema delta from the
+offline harness; `policy` when the server's `--policy` (or the config's
+block) applies; `impact` with `impact: true` — the downstream datasets,
+contracts, owners and declared consumers the planned schema affects, each
+with a severity (`breaking` / `additive` / `unknown`), walked over this
+server's catalog. Nothing is written and no run starts (the sink is built
+only for its non-mutating probe), so it is `Plan` (viewer); audited as
+`plan`. `impact` needs the `catalog` feature (`422` otherwise).
+
+**Policy refusals.** With `faucet serve --policy FILE`, every submission
+(`POST /v1/runs`, template triggers, backfills, trigger fires) is checked
+against the policy merged with the config's own `policy:` block before it is
+queued: a violation is a `422` whose `details` carry the per-row report, and
+a `policy.denied` audit entry. Registering a violating pipeline template
+warns (`warnings[]` on the summary) instead — it may be composed with a
+compliant sink later. A runtime backstop denial fails the run and is audited
+as `policy.denied` by principal `runtime`.
 
 ### `POST /v1/runs/{id}/rollback`
 

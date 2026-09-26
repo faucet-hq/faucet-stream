@@ -45,6 +45,7 @@
   - [Data-quality checks](./cookbook/quality.md)
   - [Data contracts](./cookbook/contracts.md)
   - [PII detection & masking](./cookbook/masking.md)
+  - [Data-flow policies](./cookbook/policies.md)
   - [Schema drift](./cookbook/schema-drift.md)
 - [Config & reuse]()
   - [Config composition](./cookbook/composition.md)
@@ -61,6 +62,7 @@
   - [Lineage (OpenLineage)](./cookbook/lineage.md)
   - [Dashboards & alerts](./cookbook/dashboards.md)
   - [Data Movement Catalog](./cookbook/catalog.md)
+  - [Change impact analysis](./cookbook/impact.md)
 
 # Reference
 

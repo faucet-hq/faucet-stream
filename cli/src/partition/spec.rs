@@ -88,6 +88,7 @@ pub enum PartitionSpec {
 /// A discoverable upper bound for an integer range.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum IntBound {
     /// Known up front.
     Literal(i64),
@@ -99,6 +100,7 @@ pub enum IntBound {
 /// A discoverable row count for an offset range.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum CountBound {
     Literal(u64),
     Discovered(BoundProbe),

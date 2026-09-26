@@ -210,6 +210,7 @@ mod tests {
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             value_path: "$.max_id".into(),
         }

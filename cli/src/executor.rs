@@ -181,6 +181,10 @@ pub enum InvocationErrorKind {
     /// `faucet schedule` delays its next tick by the policy cooldown rather
     /// than re-firing immediately at a destination that just tripped.
     CircuitOpen,
+    /// [`FaucetError::PolicyViolation`] — a data-flow policy (#702) refused the
+    /// run before it started or a rule fired at run time. Serve writes a
+    /// `policy.denied` audit entry for it.
+    Policy,
     /// Any other failure. No consumer needs to distinguish these yet, and it
     /// stays separate from `None` (= this outcome was never classified, e.g. a
     /// synthetic placeholder outcome) so the two are never confused.
@@ -256,6 +260,8 @@ pub struct InvocationOutcome {
 pub fn classify_error(err: &CliError) -> InvocationErrorKind {
     match err {
         CliError::Faucet(FaucetError::CircuitOpen { .. }) => InvocationErrorKind::CircuitOpen,
+        CliError::Faucet(FaucetError::PolicyViolation { .. })
+        | CliError::PolicyViolations { .. } => InvocationErrorKind::Policy,
         _ => InvocationErrorKind::Other,
     }
 }
@@ -2091,6 +2097,38 @@ async fn run_one_invocation(
         Some(p) => Box::new(faucet_core::ProfilingSink::new(sink, Arc::clone(p))),
         None => sink,
     };
+    // Data-flow policy runtime backstop (#702): classify the real records
+    // (names + value detectors) with the same rules the static pass used and
+    // fail / quarantine per the violated rule. Post-masking, so a properly
+    // masked value no longer trips its detector.
+    #[cfg(feature = "policy")]
+    let sink: Box<dyn Sink> = match &node.policy {
+        Some(spec) => {
+            if crate::policy::quarantines(spec) && node.dlq.is_none() {
+                return Err(CliError::Config(format!(
+                    "row '{}': policy: a rule with `on_runtime: quarantine` needs a `dlq:` \
+                     block to route the quarantined records to",
+                    node.id
+                )));
+            }
+            let compiled = faucet_core::CompiledPolicy::compile(spec)
+                .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+            Box::new(faucet_core::PolicySink::new(
+                sink,
+                Arc::new(compiled),
+                faucet_core::SinkFacts {
+                    id: node.sink_ref.clone(),
+                    kind: node.sink.kind.clone(),
+                    attributes: node.sink.attributes.clone(),
+                },
+                faucet_core::PolicyScope {
+                    pipeline: pipeline_name.clone(),
+                    row: row_id.clone(),
+                },
+            ))
+        }
+        None => sink,
+    };
 
     // 5) Assemble the runtime pipeline. The whole `with_*` builder chain (state,
     //    DLQ, cancellation, quality, contract, masking, schema-drift, adaptive
@@ -2753,6 +2791,7 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::QualityFailure { .. } => "quality",
         FaucetError::SchemaDrift { .. } => "schema_drift",
         FaucetError::ProfileDrift { .. } => "profile_drift",
+        FaucetError::PolicyViolation { .. } => "policy",
         _ => "error",
     }
 }
@@ -3161,6 +3200,7 @@ mod tests {
                     status: None,
                     tags: Vec::new(),
                     complete_for: None,
+                    attributes: Default::default(),
                 },
                 sink: ConnectorSpec {
                     kind: "jsonl".into(),
@@ -3170,12 +3210,15 @@ mod tests {
                     status: None,
                     tags: Vec::new(),
                     complete_for: None,
+                    attributes: Default::default(),
                 },
                 transforms: Vec::new(),
                 state: None,
                 dlq: None,
                 sla: None,
                 profiling: None,
+                #[cfg(feature = "policy")]
+                policy: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -3435,6 +3478,7 @@ mod tests {
                     status: None,
                     tags: Vec::new(),
                     complete_for: None,
+                    attributes: Default::default(),
                 }),
                 sink: Some(ConnectorSpec {
                     kind: "jsonl".into(),
@@ -3444,6 +3488,7 @@ mod tests {
                     status: None,
                     tags: Vec::new(),
                     complete_for: None,
+                    attributes: Default::default(),
                 }),
                 sources: Default::default(),
                 sinks: Default::default(),
@@ -3471,6 +3516,8 @@ mod tests {
             resilience: None,
             sla: None,
             profiling: None,
+            #[cfg(feature = "policy")]
+            policy: None,
             reconcile: None,
             verify: None,
             rollback: None,
@@ -3852,6 +3899,7 @@ mod tests {
             store: store.clone(),
             run_id: None,
             sample_records: 10,
+            annotations: Vec::new(),
         };
 
         std::fs::write(&input, "id,name\n1,alice\n2,bob\n").unwrap();
@@ -3996,6 +4044,7 @@ mod tests {
             store: Arc::new(FailingCatalogStore),
             run_id: None,
             sample_records: 10,
+            annotations: Vec::new(),
         };
         let summary = run_expanded(nodes, opts_with_catalog("cat-fail", handle))
             .await
@@ -4795,6 +4844,7 @@ matrix:
                     status: None,
                     tags: Vec::new(),
                     complete_for: None,
+                    attributes: Default::default(),
                 },
                 sink: ConnectorSpec {
                     kind: "jsonl".into(),
@@ -4804,12 +4854,15 @@ matrix:
                     status: None,
                     tags: Vec::new(),
                     complete_for: None,
+                    attributes: Default::default(),
                 },
                 transforms: Vec::new(),
                 state: None,
                 dlq: None,
                 sla: None,
                 profiling: None,
+                #[cfg(feature = "policy")]
+                policy: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -4881,6 +4934,7 @@ matrix:
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             sink: ConnectorSpec {
                 kind: "jsonl".into(),
@@ -4890,12 +4944,15 @@ matrix:
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             transforms: Vec::new(),
             state: None,
             dlq: None,
             sla: None,
             profiling: None,
+            #[cfg(feature = "policy")]
+            policy: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]
@@ -5126,6 +5183,7 @@ matrix:
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             on_batch_error: OnBatchErrorSpec::DlqAll,
             max_failures_per_page: Some(7),
@@ -5212,6 +5270,7 @@ matrix:
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             sink: ConnectorSpec {
                 kind: "jsonl".into(),
@@ -5221,12 +5280,15 @@ matrix:
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             transforms: Vec::new(),
             state,
             dlq: None,
             sla: None,
             profiling: None,
+            #[cfg(feature = "policy")]
+            policy: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]
@@ -5441,6 +5503,7 @@ matrix:
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             sink: ConnectorSpec {
                 kind: "jsonl".into(),
@@ -5450,12 +5513,15 @@ matrix:
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             transforms: Vec::new(),
             state: None,
             dlq: None,
             sla: None,
             profiling: None,
+            #[cfg(feature = "policy")]
+            policy: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]

@@ -468,6 +468,44 @@ async fn build_topology_inner(
                     }
                     _ => sink,
                 };
+                // Data-flow policy runtime backstop (#702): classify the real
+                // records with the same rules the static pass used. Attributes
+                // come from the node's resolved sink template.
+                #[cfg(feature = "policy")]
+                let sink = match cfg.policy.as_ref() {
+                    Some(policy_spec) if !opts.dry_run => {
+                        if crate::policy::quarantines(policy_spec) && spec.dlq.is_none() {
+                            return Err(CliError::Config(format!(
+                                "node '{id}': policy: a rule with `on_runtime: quarantine` needs a \
+                                 `dlq:` block to route the quarantined records to"
+                            )));
+                        }
+                        let compiled = faucet_core::CompiledPolicy::compile(policy_spec)
+                            .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+                        let template_name = template.as_deref().unwrap_or("default");
+                        let attributes = if template_name == "default" {
+                            spec.sinks.get("default").or(spec.sink.as_ref())
+                        } else {
+                            spec.sinks.get(template_name)
+                        }
+                        .map(|b| b.attributes.clone())
+                        .unwrap_or_default();
+                        Box::new(faucet_core::PolicySink::new(
+                            sink,
+                            std::sync::Arc::new(compiled),
+                            faucet_core::SinkFacts {
+                                id: (*id).clone(),
+                                kind: k.clone(),
+                                attributes,
+                            },
+                            faucet_core::PolicyScope {
+                                pipeline: cfg.name.clone().unwrap_or_default(),
+                                row: (*id).clone(),
+                            },
+                        )) as Box<_>
+                    }
+                    _ => sink,
+                };
                 NodeKind::Sink(sink)
             }
             NodeSpec::Transform { transforms } => {

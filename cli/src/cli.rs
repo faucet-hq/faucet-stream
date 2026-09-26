@@ -181,6 +181,10 @@ pub enum Command {
     /// each destination sink.
     #[cfg(feature = "masking")]
     Masking(MaskingArgs),
+    /// Evaluate a data-flow policy against a config: which labelled columns
+    /// reach which sinks, and every violated rule. Exit code = violations.
+    #[cfg(feature = "policy")]
+    Policy(PolicyArgs),
     /// Run a pipeline on a cron schedule (long-running; Ctrl-C / SIGTERM to stop).
     #[cfg(feature = "schedule")]
     Schedule(ScheduleArgs),
@@ -409,6 +413,9 @@ pub enum CatalogCommand {
     Show(CatalogShowArgs),
     /// Print the dataset lineage graph (optionally rooted at a dataset).
     Lineage(CatalogLineageArgs),
+    /// Set a dataset's owners and declared consumers (#707), so
+    /// `faucet plan --impact` can name who a change affects.
+    Annotate(CatalogAnnotateArgs),
 }
 
 /// Shared config-loading flags for the `faucet catalog` subcommands.
@@ -461,6 +468,33 @@ pub struct CatalogShowArgs {
     pub id: String,
     #[command(flatten)]
     pub common: CatalogConfigArgs,
+}
+
+/// `faucet catalog annotate` arguments (#707).
+#[cfg(feature = "catalog")]
+#[derive(Debug, Parser)]
+pub struct CatalogAnnotateArgs {
+    /// Dataset id (from `faucet catalog datasets`), or a unique prefix of one.
+    pub id: String,
+    #[command(flatten)]
+    pub common: CatalogConfigArgs,
+    /// Replace the owner list with these (repeatable). `--owner ""` clears it.
+    #[arg(long = "owner", value_name = "OWNER")]
+    pub owners: Vec<String>,
+    /// Upsert a consumer by name (repeatable): `NAME` or `NAME=KIND`
+    /// (e.g. `revenue-dashboard=dashboard`).
+    #[arg(long = "consumer", value_name = "NAME[=KIND]")]
+    pub consumers: Vec<String>,
+    /// Contact for the consumers named in this call (an email, a channel).
+    #[arg(long)]
+    pub contact: Option<String>,
+    /// The columns the consumers named in this call read (comma-separated).
+    /// Omitted = every column.
+    #[arg(long, value_delimiter = ',')]
+    pub columns: Vec<String>,
+    /// Drop every consumer not named in this call.
+    #[arg(long)]
+    pub replace: bool,
 }
 
 /// `faucet catalog lineage` arguments.
@@ -1320,6 +1354,11 @@ pub struct DoctorArgs {
     /// it over the composed base. Overrides the `FAUCET_PROFILE` env var.
     #[arg(long, env = "FAUCET_PROFILE")]
     pub profile: Option<String>,
+    /// Evaluate this data-flow policy file (#702) on top of the config's own
+    /// `policy:` block: classifications label columns, rules say which sinks
+    /// a labelled column may reach. Violations are reported and refuse a run.
+    #[arg(long, value_name = "PATH")]
+    pub policy: Option<PathBuf>,
 }
 
 /// `faucet contract` arguments.
@@ -1365,6 +1404,33 @@ pub struct MaskingArgs {
     pub no_env_file: bool,
     /// Select a named overlay from the config's `profiles:` block and deep-merge
     /// it over the composed base. Overrides the `FAUCET_PROFILE` env var.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
+}
+
+/// `faucet policy` arguments.
+#[cfg(feature = "policy")]
+#[derive(Debug, Parser)]
+pub struct PolicyArgs {
+    /// Path to a `.yaml`, `.yml`, or `.json` pipeline config. If omitted,
+    /// auto-discover `faucet.yaml` / `faucet.yml` / `faucet.json` in cwd.
+    pub config: Option<PathBuf>,
+    /// The policy file (merged over the config's own `policy:` block).
+    #[arg(long, value_name = "PATH")]
+    pub policy: Option<PathBuf>,
+    /// Only this row (default: every row).
+    #[arg(long)]
+    pub row: Option<String>,
+    /// Emit the report as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file to load for `${env:VAR}` interpolation.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Select a named overlay from the config's `profiles:` block.
     #[arg(long, env = "FAUCET_PROFILE")]
     pub profile: Option<String>,
 }
@@ -1597,6 +1663,12 @@ pub struct ServeArgs {
     /// See `faucet schema templates-sync`.
     #[arg(long)]
     pub templates_sync: Option<std::path::PathBuf>,
+    /// Data-flow policy file (#702) every submission is checked against
+    /// before it is queued (a violation is a 422 + a `policy.denied` audit
+    /// entry) and merged into each run for the runtime backstop. Requires a
+    /// build with the `policy` feature.
+    #[arg(long, value_name = "PATH")]
+    pub policy: Option<std::path::PathBuf>,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless
@@ -1694,6 +1766,11 @@ pub struct RunArgs {
     /// Not applicable in `--from-env` mode (no config file to compose).
     #[arg(long, env = "FAUCET_PROFILE")]
     pub profile: Option<String>,
+    /// Evaluate this data-flow policy file (#702) on top of the config's own
+    /// `policy:` block: classifications label columns, rules say which sinks
+    /// a labelled column may reach. Violations are reported and refuse a run.
+    #[arg(long, value_name = "PATH")]
+    pub policy: Option<PathBuf>,
     /// Show a live full-screen terminal UI (per-invocation throughput, errors,
     /// DLQ counts, bookmark age) while the pipeline runs. Requires a binary
     /// built with the `cli-tui` feature and a real terminal on stdout —
@@ -1940,6 +2017,11 @@ pub struct ValidateArgs {
     /// it over the composed base. Overrides the `FAUCET_PROFILE` env var.
     #[arg(long, env = "FAUCET_PROFILE")]
     pub profile: Option<String>,
+    /// Evaluate this data-flow policy file (#702) on top of the config's own
+    /// `policy:` block: classifications label columns, rules say which sinks
+    /// a labelled column may reach. Violations are reported and refuse a run.
+    #[arg(long, value_name = "PATH")]
+    pub policy: Option<PathBuf>,
     /// Print the fully-composed config (after extends/!include/profile, before
     /// `${...}` interpolation) and exit. For debugging composition precedence.
     /// `--no-secrets` is redundant here (no interpolation or secret fetch occurs).
@@ -2060,6 +2142,9 @@ pub enum SchemaTarget {
     /// JSON Schema for the top-level `profiling:` (learned column profiles +
     /// drift detection) block.
     Profiling,
+    /// JSON Schema for a data-flow policy (`policy:` block / `--policy` file).
+    #[cfg(feature = "policy")]
+    Policy,
     /// JSON Schema for the `quality:` block.
     #[cfg(feature = "quality")]
     Quality,
@@ -2216,9 +2301,24 @@ pub struct PlanArgs {
     /// default so `plan` works offline like `faucet test`. Implied by `--diff`.
     #[arg(long)]
     pub resolve_secrets: bool,
+    /// Change impact analysis (#707): walk the catalog's lineage graph
+    /// downstream of this row's sink and report the datasets, contracts,
+    /// owners and declared consumers a schema change would affect, with a
+    /// severity per item (breaking / additive / unknown). Requires a
+    /// `catalog:` block; pass `--sample` for the most precise planned schema.
+    #[arg(long)]
+    pub impact: bool,
+    /// Downstream hop bound for `--impact`.
+    #[arg(long, default_value_t = 5)]
+    pub depth: u32,
     /// Select a `profiles:` overlay.
     #[arg(long, env = "FAUCET_PROFILE")]
     pub profile: Option<String>,
+    /// Evaluate this data-flow policy file (#702) on top of the config's own
+    /// `policy:` block: classifications label columns, rules say which sinks
+    /// a labelled column may reach. Violations are reported and refuse a run.
+    #[arg(long, value_name = "PATH")]
+    pub policy: Option<PathBuf>,
 }
 
 /// `faucet dev` arguments.

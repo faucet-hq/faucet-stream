@@ -59,6 +59,10 @@ pub struct ExpandedNode {
     /// The effective column-profiling spec (#708): the row's own `profiling:`
     /// or the top-level block; `None` when neither is set.
     pub profiling: Option<faucet_core::ProfilingSpec>,
+    /// The effective data-flow policy (#702) — the top-level `policy:` block
+    /// with any `--policy` file already merged in; `None` when neither is set.
+    #[cfg(feature = "policy")]
+    pub policy: Option<faucet_core::PolicySpec>,
     /// Pipeline-level quality spec, shared by every node. `quality:` has no
     /// matrix-row override in v1, so this is `cfg.pipeline.quality` verbatim.
     #[cfg(feature = "quality")]
@@ -305,6 +309,9 @@ impl<'a> Registry<'a> {
             // replace) in `expand`, since `PartialConnector` carries no `tags`.
             if p.status.is_some() {
                 out.status = p.status;
+            }
+            if let Some(attrs) = &p.attributes {
+                out.attributes.extend(attrs.clone());
             }
         }
         Ok(out)
@@ -723,6 +730,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     status: None,
                     tags: Vec::new(),
                     complete_for: None,
+                    attributes: Default::default(),
                 }
             };
             out.push(ExpandedNode {
@@ -745,6 +753,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 dlq: None,
                 sla: None,
                 profiling: None,
+                #[cfg(feature = "policy")]
+                policy: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -1464,6 +1474,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             dlq,
             sla: row.sla.clone(),
             profiling: row.profiling.clone().or_else(|| cfg.profiling.clone()),
+            #[cfg(feature = "policy")]
+            policy: cfg.policy.clone(),
             delivery,
             delivery_guarantee,
             #[cfg(feature = "quality")]

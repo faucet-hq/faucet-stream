@@ -73,6 +73,7 @@ async fn history_reads_seeded_sqlite_catalog() {
     let handle = faucet_cli::catalog::connect_from_spec(&faucet_cli::catalog::CatalogSpec {
         url: format!("sqlite:{}", db.display()),
         sample_records: 10,
+        datasets: Vec::new(),
     })
     .await
     .unwrap();

@@ -2667,6 +2667,39 @@ macro_rules! impl_sql_history {
                 Ok(())
             }
 
+            async fn catalog_annotate(
+                &self,
+                dataset_id: &str,
+                annotation: &$crate::serve::history::catalog::CatalogAnnotation,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                use $crate::serve::history::catalog;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let Some(row) = sqlx::query(&self.stmts.catalog_select_dataset)
+                    .bind(dataset_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                else {
+                    return Ok(false);
+                };
+                let body: String = row.try_get("body").map_err(backend)?;
+                let mut ds: catalog::CatalogDataset =
+                    sql::decode_json(&body, "catalog dataset")?;
+                catalog::apply_annotation(&mut ds, annotation);
+                sqlx::query(&self.stmts.catalog_upsert_dataset)
+                    .bind(&ds.id)
+                    .bind(&ds.uri)
+                    .bind(&ds.kind)
+                    .bind(sql::fmt_ts(ds.last_seen))
+                    .bind(sql::encode_json(&ds, "catalog dataset")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(true)
+            }
+
             async fn catalog_list_datasets(
                 &self,
                 filter: &$crate::serve::history::catalog::CatalogListFilter,

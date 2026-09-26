@@ -152,11 +152,13 @@ const KEY_ORDER: &[&str] = &[
     "tags",
     "inherit_transforms",
     "config",
+    "attributes",
     // ── remaining top-level blocks (kept deterministic, after the canonical set) ─
     "delivery",
     "resilience",
     "sla",
     "profiling",
+    "policy",
     "reconcile",
     "verify",
     "rollback",

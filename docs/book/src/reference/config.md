@@ -54,6 +54,10 @@ Each declaring layer (source template, matrix row) carries an
 `inherit_transforms: bool` (default `true`); setting it `false` drops every
 upstream layer for that scope.
 
+A sink may carry free-form `attributes:` (string pairs such as `residency: eu`,
+`environment: prod`) that a [data-flow policy](#policy) reasons about; a
+matrix row's `sink.attributes` adds or overrides the template's.
+
 Sinks reject both `transforms:` and `inherit_transforms:` at expand time —
 destination shaping belongs at the pipeline or row layer. See the
 [transforms cookbook](../cookbook/transforms.md) for the full model and
@@ -769,6 +773,57 @@ pipelines that share a `key`. A malformed policy (empty rules, an empty
 - `faucet_masking_fields_total{pipeline,row,rule,action,detector}` — one
   increment per masked field (`detector` empty for name-based matches).
 
+## `policy`
+
+Optional **top-level** block declaring a [data-flow policy](../cookbook/policies.md):
+classifications that label columns and rules about which sinks a labelled
+column may reach. Decided before any data moves (`validate` / `policy` /
+`plan` / `doctor` report; `run` and the `serve` submit path refuse) and backed
+at run time by value detectors on the real records. A `--policy <file>` merges
+on top of this block; a deployment overlay's `policy:` lands here. Requires
+the `policy` Cargo feature (in the default build; implies `masking`).
+`faucet schema policy` prints the JSON Schema.
+
+```yaml
+policy:
+  version: 1
+  description: PII stays in the EU.
+  classifications:
+    - label: pii
+      fields: [email, phone]              # full dot-path or leaf key
+      field_pattern: "(?i)_?name$"        # regex over the dot-path
+      value_detector: email               # email | credit_card | ssn | phone | ipv4
+  rules:
+    - name: pii-eu
+      when: { label: pii }                # + optional sink_kind: [..], sink: { attr: [..] }
+      require: { residency: [eu] }        # sink attribute must be one of these
+      mask: [hash, tokenize]              # or the column reaches the sink masked
+      on_runtime: fail                    # fail | quarantine (needs a dlq: block)
+    - name: finance-no-prod-files
+      when: { label: finance, sink_kind: [jsonl, csv], sink: { environment: [prod] } }
+      deny: true
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `version` | `1` | Policy document version. |
+| `classifications[].label` | — | The label a matching column earns. Several classifications may share one. |
+| `classifications[].fields` | `[]` | Column names — the full dot-path or its leaf key (`ssn` covers `user.ssn`). |
+| `classifications[].field_pattern` | — | Regex over the column's dot-path. |
+| `classifications[].value_detector` | — | A masking detector run over string values at run time. |
+| `rules[].when.label` | — | The label the rule governs. |
+| `rules[].when.sink_kind` | `[]` (all) | Only sinks of these connector kinds. |
+| `rules[].when.sink` | `{}` | Only sinks whose attribute has one of the listed values (a sink without the attribute is out of scope). |
+| `rules[].require` | `{}` | Sink attributes that must be present with a listed value. |
+| `rules[].mask` | `[]` | Masking actions (`redact` / `hash` / `tokenize` / `partial`) that satisfy the rule when the column reaches the sink masked. |
+| `rules[].deny` | `false` | Never satisfied. |
+| `rules[].on_runtime` | `fail` | What the runtime backstop does: fail the page, or quarantine the rows to the DLQ. |
+
+Every classification needs at least one of `fields` / `field_pattern` /
+`value_detector`; every rule needs a `when.label` and one of `require` /
+`mask` / `deny`; two rules with one name are refused. Metric:
+`faucet_policy_violations_total{pipeline,row,rule,phase,action}`.
+
 ## `execution`
 
 - `max_concurrent` — one shared concurrency budget across roots and child
@@ -1314,7 +1369,20 @@ Requires a build with the `catalog` feature (in `--features full`).
 catalog:
   url: sqlite:./faucet-catalog.db   # REQUIRED. sqlite:<path> | postgres://… | memory
   sample_records: 100               # Records sampled per side for schema inference.
+  datasets:                         # Owners + declared consumers (#707), optional.
+    - dataset: file://./out/records.jsonl   # canonical URI (as `faucet catalog datasets` prints it) or the id
+      owners: [data-platform]
+      consumers:
+        - name: records-dashboard
+          kind: dashboard           # free-form
+          contact: "#analytics"
+          columns: [id, name]       # what it reads; empty = every column
 ```
+
+`datasets[]` annotations are merged into the catalog after every run that
+touches the dataset (owners replace, consumers upsert by name) and are what
+[`faucet plan --impact`](../cookbook/impact.md) names; the same annotation can
+be made with `faucet catalog annotate` or `POST /v1/catalog/datasets/{id}/consumers`.
 
 SQL stores additionally require the matching `serve-history-sqlite` /
 `serve-history-postgres` build feature. Browse the store with

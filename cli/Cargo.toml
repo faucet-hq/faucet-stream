@@ -24,7 +24,7 @@ path = "src/main.rs"
 # `serve` (HTTP control plane; links a web-server dependency tree and opens a
 # network listener). Opt in with `--features schedule` / `--features serve`, or
 # take everything with `--features full`.
-default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "cli-progress", "hub-remote"]
+default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "policy", "cli-progress", "hub-remote"]
 
 # Everything the default build ships, plus the long-running runtime modes:
 # `schedule` (cron scheduler) and `serve` (HTTP control plane).
@@ -60,6 +60,9 @@ contract = ["faucet-core/contract"]
 # masking` verb, #206): classify sensitive fields and redact/hash/tokenize/
 # partial-mask them per page, before every sink. Forwarded to `faucet-core`.
 masking = ["faucet-core/masking"]
+# Data-flow policies (#702): classification-driven residency / destination
+# rules enforced before any data moves (`policy:` / `--policy`, `faucet policy`).
+policy = ["faucet-core/policy", "masking", "dep:regex"]
 
 # Encryption at rest (#207): the `encryption:` block on the `file` state store
 # (AES-256-GCM bookmark files) and on the jsonl sink (per-line sealing — the
@@ -460,6 +463,7 @@ templates-sync = ["templates", "dep:base64"]
 templates-sync-object-store = ["templates-sync", "dep:object_store"]
 
 [dependencies]
+regex = { workspace = true, optional = true }
 faucet-core.workspace = true
 faucet-auth.workspace = true
 faucet-source-rest = { workspace = true, optional = true }

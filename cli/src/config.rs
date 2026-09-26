@@ -139,6 +139,17 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profiling: Option<faucet_core::ProfilingSpec>,
 
+    /// Optional data-flow policy (#702): classifications that label columns
+    /// and rules about which sinks a labelled column may reach (`require`
+    /// sink attributes, `mask` actions that satisfy, or `deny`). Evaluated
+    /// before any data moves by `validate` / `plan` / `doctor` / `run` and the
+    /// serve submit path, and re-checked at run time by value detectors. A
+    /// `--policy <file>` merges on top; a deployment overlay's `policy:` lands
+    /// here.
+    #[cfg(feature = "policy")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<faucet_core::PolicySpec>,
+
     /// Optional completeness reconciliation (#502): after a successful root run,
     /// compare rows written against an authoritative count probe and **fail the
     /// run** on a shortfall beyond tolerance — a silent-truncation guard,
@@ -478,6 +489,14 @@ pub struct ConnectorSpec {
     /// whether a fetch returned every record for a scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complete_for: Option<CompletenessClaim>,
+
+    /// Destination attributes a data-flow policy (#702) reasons about —
+    /// `residency: eu`, `environment: prod`, `region: eu-west-1`, … Free-form
+    /// string pairs; a policy rule's `require` / `when.sink` names them.
+    /// Meaningful on sinks (a sink template carries them for every row that
+    /// resolves to it; a matrix row's `sink.attributes` adds or overrides).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attributes: std::collections::BTreeMap<String, String>,
 }
 
 /// "For these column values, this fetch returns *all* the records" (#478).
@@ -539,6 +558,10 @@ pub struct PartialConnector {
     /// `source:` override; a `sink:` override's `status` is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<SourceStatus>,
+    /// Per-row sink `attributes` (#702), merged over the template's
+    /// (a key present on both sides takes the row's value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A single transform declaration.

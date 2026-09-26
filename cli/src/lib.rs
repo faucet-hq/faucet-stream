@@ -31,6 +31,8 @@ pub mod exec_metrics;
 pub mod executor;
 pub mod expand;
 pub mod hub;
+#[cfg(feature = "catalog")]
+pub mod impact;
 pub mod init_template;
 pub mod interpolate;
 #[cfg(feature = "lineage")]
@@ -51,6 +53,8 @@ pub mod obs;
 pub mod params;
 pub mod partition;
 pub mod pipeline_test;
+#[cfg(feature = "policy")]
+pub mod policy;
 pub mod profiling;
 #[cfg(feature = "cli-progress")]
 pub mod progress;
@@ -182,6 +186,9 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
             Err(CliError::BackfillFailed { failed }) => ExitCode::from(failed.min(255) as u8),
             // `verify` printed its report; the exit code is the differing-key
             // count. A blocked `rollback` exits with the conflict count.
+            Err(CliError::PolicyViolations { violations }) => {
+                ExitCode::from(violations.clamp(1, 255) as u8)
+            }
             Err(CliError::VerifyFailed { differences }) => {
                 ExitCode::from(differences.clamp(1, 255) as u8)
             }
@@ -232,6 +239,8 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         Command::Contract(args) => commands::contract::run(args).await,
         #[cfg(feature = "masking")]
         Command::Masking(args) => commands::masking::run(args).await,
+        #[cfg(feature = "policy")]
+        Command::Policy(args) => commands::policy::run(args).await,
         #[cfg(feature = "schedule")]
         Command::Schedule(args) => commands::schedule::run(args).await,
         #[cfg(feature = "serve")]

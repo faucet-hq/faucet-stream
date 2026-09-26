@@ -1,0 +1,46 @@
+# A data-flow policy (#702): label columns, then say which sinks a labelled
+# column may reach. Apply it to any config with
+#
+#   faucet validate pipeline.yaml --policy cli/examples/policy/eu-pii.yaml
+#   faucet policy   pipeline.yaml --policy cli/examples/policy/eu-pii.yaml
+#   faucet run      pipeline.yaml --policy cli/examples/policy/eu-pii.yaml
+#   faucet serve --policy cli/examples/policy/eu-pii.yaml     # every submission
+#
+# or paste it under a top-level `policy:` block (a deployment overlay may
+# carry one too). `faucet schema policy` prints the JSON Schema.
+version: 1
+description: PII stays in the EU and never lands in plain files in production.
+
+# Classifications label a column by name (`fields` matches the full dot-path
+# or its leaf key; `field_pattern` is a regex over the dot-path) and/or by
+# value (`value_detector`: email / credit_card / ssn / phone / ipv4 — the
+# masking detectors). Name matches are decided before any data moves; value
+# detectors are enforced by the runtime backstop on the real records.
+classifications:
+  - label: pii
+    fields: [email, phone, ssn, date_of_birth]
+    field_pattern: "(?i)(^|[._])(first|last|full)_?name$"
+    value_detector: email
+  - label: pii
+    value_detector: ssn
+  - label: finance
+    field_pattern: "^(amount|balance|salary)"
+
+# Rules: `when` selects the columns (by label; optionally only for some sink
+# kinds / sink attributes), then either `require` sink attributes, list `mask`
+# actions that satisfy the rule (the column may reach the sink masked), or
+# `deny` outright. `on_runtime` is what the backstop does when a value
+# detector fires on a record heading for a non-compliant sink: `fail` the
+# page (default) or `quarantine` the row to the DLQ.
+rules:
+  - name: pii-eu
+    when: { label: pii }
+    require: { residency: [eu] }
+    mask: [hash, tokenize, redact]
+  - name: finance-no-prod-files
+    when:
+      label: finance
+      sink_kind: [jsonl, csv, stdout]
+      sink: { environment: [prod] }
+    deny: true
+    on_runtime: quarantine

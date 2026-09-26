@@ -67,6 +67,7 @@ pub fn failed_dlq_spec(path: &Path, original: Option<&DlqSpec>) -> DlqSpec {
         status: None,
         tags: Vec::new(),
         complete_for: None,
+        attributes: Default::default(),
     };
     match original {
         Some(o) => DlqSpec {
@@ -293,6 +294,7 @@ mod tests {
                 status: None,
                 tags: Vec::new(),
                 complete_for: None,
+                attributes: Default::default(),
             },
             on_batch_error: OnBatchErrorSpec::DlqAll,
             max_failures_per_page: Some(5),

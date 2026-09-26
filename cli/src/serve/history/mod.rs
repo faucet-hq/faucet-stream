@@ -799,6 +799,18 @@ pub trait RunHistory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Merge an owners / consumers annotation into a catalogued dataset (#707).
+    /// Returns `Ok(false)` when no dataset has that id (nothing is created —
+    /// a dataset exists once a run has observed it). Default: `Ok(false)`.
+    async fn catalog_annotate(
+        &self,
+        dataset_id: &str,
+        annotation: &catalog::CatalogAnnotation,
+    ) -> Result<bool, HistoryError> {
+        let _ = (dataset_id, annotation);
+        Ok(false)
+    }
+
     /// Record the latest resolved+expanded config snapshot for a pipeline
     /// (#374). Latest-wins per pipeline (upsert). Best-effort at the call site —
     /// recording never fails a run. Default: no-op.

@@ -31,6 +31,7 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     ("POST", "/v1/doctor"),
     ("POST", "/v1/backfill"),
     ("POST", "/v1/verify"),
+    ("POST", "/v1/plan"),
     ("POST", "/v1/dlq/inspect"),
     ("POST", "/v1/dlq/replay"),
     ("POST", "/v1/dlq/discard"),
@@ -54,6 +55,7 @@ const ROUTES_TRIGGERS: &[(&str, &str)] = &[
 const ROUTES_CATALOG: &[(&str, &str)] = &[
     ("GET", "/v1/catalog/datasets"),
     ("GET", "/v1/catalog/datasets/{id}"),
+    ("POST", "/v1/catalog/datasets/{id}/consumers"),
     ("GET", "/v1/catalog/lineage"),
     // Local sink output retention (#587).
     ("GET", "/v1/local-outputs"),
@@ -221,6 +223,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         cluster_max_attempts: 3,
         triggers: None,
         templates_sync: None,
+        policy: None,
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,

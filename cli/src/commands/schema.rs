@@ -30,6 +30,8 @@ pub fn schema_targets() -> Vec<&'static str> {
     targets.push("quality");
     #[cfg(feature = "contract")]
     targets.push("contract");
+    #[cfg(feature = "policy")]
+    targets.push("policy");
     #[cfg(feature = "masking")]
     targets.push("masking");
     targets.push("test");
@@ -107,6 +109,12 @@ pub fn pipeline_blocks() -> Vec<PipelineBlock> {
         block(
             "verify",
             "Compare the destination to the source by content after every run; repair differences",
+            "top",
+        ),
+        #[cfg(feature = "policy")]
+        block(
+            "policy",
+            "Data-flow policy: label columns and say which sinks they may reach",
             "top",
         ),
         block(
@@ -210,6 +218,8 @@ pub fn block_schema(name: &str) -> Option<serde_json::Value> {
         "resilience" => to_schema_value(faucet_core::schema_for!(crate::config::ResilienceSpec)),
         "sla" => to_schema_value(faucet_core::schema_for!(crate::sla::SlaSpec)),
         "profiling" => to_schema_value(faucet_core::schema_for!(faucet_core::ProfilingSpec)),
+        #[cfg(feature = "policy")]
+        "policy" => to_schema_value(faucet_core::schema_for!(faucet_core::PolicySpec)),
         "verify" => to_schema_value(faucet_core::schema_for!(crate::verify::VerifySpec)),
         "rollback" => to_schema_value(faucet_core::schema_for!(crate::rollback::RollbackSpec)),
         "schema" => to_schema_value(faucet_core::schema_for!(faucet_core::SchemaDriftSpec)),
@@ -280,6 +290,11 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         }
         SchemaTarget::Profiling => {
             let s = faucet_core::schema_for!(faucet_core::ProfilingSpec);
+            serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
+        #[cfg(feature = "policy")]
+        SchemaTarget::Policy => {
+            let s = faucet_core::schema_for!(faucet_core::PolicySpec);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
         }
         #[cfg(feature = "quality")]

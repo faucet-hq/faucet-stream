@@ -1058,6 +1058,19 @@ select {
 .diff-removed { color: var(--cancelled); border-color: color-mix(in srgb, var(--cancelled) 40%, transparent); }
 .edge-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 12px; }
 .edge-lists h3 { margin: 4px 0; font-size: 0.85rem; color: var(--ink-dim); }
+/* Owners + declared consumers (#707). */
+.stewardship { display: flex; flex-direction: column; gap: 12px; padding: 12px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); margin-bottom: 12px; }
+.stewardship > div > label { display: block; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-dim); margin-bottom: 6px; }
+.stewardship-owners { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.stewardship-owners > label { flex-basis: 100%; }
+.owner-pill { color: var(--brand); border-color: var(--brand-ring); background: var(--brand-tint); text-transform: none; letter-spacing: 0; }
+.consumer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 6px 0; border-top: 1px solid var(--border); font-size: 0.84rem; }
+.consumer-row:first-of-type { border-top: 0; }
+.consumer-name { font-weight: 600; color: var(--ink); }
+.annotate-form > summary { cursor: pointer; font-size: 0.84rem; color: var(--ink-dim); }
+.annotate-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; margin: 10px 0; }
+.annotate-fields label { display: flex; flex-direction: column; justify-content: flex-end; gap: 4px; font-size: 0.78rem; color: var(--ink-dim); min-width: 0; }
+.annotate-fields input { width: 100%; min-width: 0; }
 /* The graph scrolls both ways inside its card. The SVG keeps its natural pixel
    size (set as width/height attributes) rather than stretching to 100% — that
    is what lets wide labels overflow and scroll left/right instead of squashing. */

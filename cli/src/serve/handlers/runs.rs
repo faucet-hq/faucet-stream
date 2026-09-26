@@ -346,8 +346,13 @@ pub async fn rollback_run(
             });
         }
     };
-    let loaded =
-        crate::serve::load::load_submission(&config, format, state.default_base().as_ref()).await?;
+    let loaded = crate::serve::load::load_submission(
+        &config,
+        format,
+        state.default_base().as_ref(),
+        crate::serve::runner::server_policy(&state).as_deref(),
+    )
+    .await?;
     let auth = crate::auth_catalog::build_auth_catalog(loaded.cfg.auth.as_ref())
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
     let pipeline_name = loaded

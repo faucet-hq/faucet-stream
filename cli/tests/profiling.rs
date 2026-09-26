@@ -466,6 +466,7 @@ async fn each_run_profile_is_recorded_on_the_sink_dataset() {
     let handle = faucet_cli::catalog::connect_from_spec(&faucet_cli::catalog::CatalogSpec {
         url: format!("sqlite:{}/cat.db", dir.path().display()),
         sample_records: 10,
+        datasets: Vec::new(),
     })
     .await
     .unwrap();

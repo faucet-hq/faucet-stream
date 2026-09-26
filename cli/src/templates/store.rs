@@ -290,7 +290,7 @@ fn registry_lint(name: &str, findings: Vec<String>) -> CliResult<()> {
 /// placeholder-bound copy. `${env:…}` and secret directives are left untouched —
 /// registration must never read the server's secrets, and the body persisted
 /// is the one that was submitted.
-fn validate_pipeline_body(doc: &Value) -> CliResult<crate::config::PipelineConfig> {
+pub(crate) fn validate_pipeline_body(doc: &Value) -> CliResult<crate::config::PipelineConfig> {
     let mut probe = doc.clone();
     params::bind_document(&mut probe, &SuppliedParams::new(), BindMode::Placeholder)?;
     let cfg = crate::config::PipelineConfig::from_value(probe)?;

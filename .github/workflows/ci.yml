@@ -426,6 +426,8 @@ jobs:
           - contract
           # PII detection + column-level masking
           - masking
+          # Data-flow policies (#702)
+          - policy
           # OpenLineage emission
           - lineage
           - lineage-kafka

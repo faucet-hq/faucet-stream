@@ -103,6 +103,7 @@ async fn connect(args: &CleanupArgs) -> CliResult<(Arc<dyn RunHistory>, u32)> {
         let spec = crate::catalog::CatalogSpec {
             url: url.clone(),
             sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
+            datasets: Vec::new(),
         };
         let handle = crate::catalog::connect_from_spec(&spec).await?;
         return Ok((

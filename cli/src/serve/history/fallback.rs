@@ -325,6 +325,13 @@ impl RunHistory for FallbackHistory {
             f => f.local_output_mark_deleted(id, at, bytes)
         )
     }
+    async fn catalog_annotate(
+        &self,
+        dataset_id: &str,
+        annotation: &crate::serve::history::catalog::CatalogAnnotation,
+    ) -> Result<bool, HistoryError> {
+        via!(self, p => p.catalog_annotate(dataset_id, annotation), f => f.catalog_annotate(dataset_id, annotation))
+    }
     async fn catalog_record_config_snapshot(
         &self,
         snapshot: &crate::serve::history::catalog::ConfigSnapshot,
