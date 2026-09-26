@@ -201,6 +201,10 @@ mod tests {
             ServeError::Conflict("x".into()).status(),
             StatusCode::CONFLICT
         );
+        let limit = ServeError::TooManyRequests("tenant acme at its limit".into());
+        assert_eq!(limit.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limit.api_error().error.code, "limit_exceeded");
+        assert_eq!(limit.api_error().error.message, "tenant acme at its limit");
         assert_eq!(
             ServeError::QueueFull {
                 retry_after_secs: 5

@@ -250,6 +250,25 @@ pub fn render_name(template: &str, event: &TriggerEvent, name: &str, fired_at: &
 mod tests {
     use super::*;
 
+    #[test]
+    fn schedule_events_substitute_label_and_key_by_tick() {
+        let e = TriggerEvent::Schedule {
+            tick: "2026-09-26T02:00:00Z".into(),
+        };
+        assert_eq!(e.type_label(), "schedule");
+        assert_eq!(
+            substitute_plain("since=${trigger.tick}", &e, "n", "f").unwrap(),
+            "since=2026-09-26T02:00:00Z"
+        );
+        assert_eq!(
+            substitute("t: ${trigger.tick}", &e, "n", "f").unwrap(),
+            "t: \"2026-09-26T02:00:00Z\""
+        );
+        assert!(substitute_plain("${trigger.depth}", &e, "n", "f").is_err());
+        assert_eq!(idempotency_key("n", &e), "trig:n:2026-09-26T02:00:00Z");
+        assert_eq!(labels("n", &e)["faucet.trigger.tick"], "2026-09-26T02:00:00Z");
+    }
+
     fn obj() -> TriggerEvent {
         TriggerEvent::Object {
             bucket: "b".into(),

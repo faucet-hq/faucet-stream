@@ -5847,6 +5847,13 @@ matrix:
     fn build_state_key_with_and_without_parent() {
         assert_eq!(build_state_key("pipe", "row", None), "pipe::row");
         assert_eq!(build_state_key("pipe", "row", Some("k")), "pipe::row::k");
+        let scope = StateScope {
+            namespace: Some("acme".into()),
+            on_key: None,
+        };
+        assert_eq!(scope.prefix("pipe"), "acme::pipe");
+        assert_eq!(StateScope::default().prefix("pipe"), "pipe");
+        assert!(format!("{scope:?}").contains("acme"));
     }
 
     #[test]

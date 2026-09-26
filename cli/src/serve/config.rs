@@ -398,6 +398,25 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
+    #[test]
+    fn vault_keys_parse_and_never_print() {
+        let mut a = base_args();
+        a.no_auth = true;
+        a.vault_key = Some("sekrit-vault-key".into());
+        a.vault_previous_key = vec!["old-key".into()];
+        a.connect_providers = Some("p.yaml".into());
+        let cfg = ServeConfig::from_args(a).unwrap();
+        let v = cfg.vault.as_ref().unwrap();
+        assert_eq!((v.key.as_str(), v.previous.len()), ("sekrit-vault-key", 1));
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("sekrit") && dbg.contains("1 keys"), "{dbg}");
+        assert_eq!(cfg.connect_providers_path.as_deref(), Some(std::path::Path::new("p.yaml")));
+        let mut empty = base_args();
+        empty.no_auth = true;
+        empty.vault_key = Some(String::new());
+        assert!(ServeConfig::from_args(empty).unwrap().vault.is_none());
+    }
+
     fn base_args() -> crate::cli::ServeArgs {
         crate::cli::ServeArgs {
             listen: "127.0.0.1:8080".into(),

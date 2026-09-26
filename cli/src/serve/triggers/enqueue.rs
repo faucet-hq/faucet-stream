@@ -352,6 +352,106 @@ async fn submit_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combine_prefers_drops_then_errors_then_ids() {
+        use FireOutcome::*;
+        assert!(matches!(combine(vec![Enqueued("a".into())]), Enqueued(ref id) if id == "a"));
+        assert!(matches!(
+            combine(vec![Enqueued("a".into()), Dropped("queue_full"), Error("e".into())]),
+            Dropped("queue_full")
+        ));
+        assert!(matches!(
+            combine(vec![Enqueued("a".into()), Error("x".into()), Error("y".into())]),
+            Error(ref e) if e == "x; y"
+        ));
+        assert!(matches!(
+            combine(vec![Enqueued("a".into()), Coalesced, Enqueued("b".into())]),
+            Enqueued(ref ids) if ids == "a,b"
+        ));
+        assert!(matches!(combine(vec![Coalesced, Coalesced]), Coalesced));
+    }
+
+    #[cfg(feature = "templates")]
+    #[test]
+    fn template_bodies_carry_params_labels_and_the_tick_key() {
+        use crate::serve::triggers::spec::TemplateTrigger;
+        let mut c = compiled_webhook();
+        c.spec.run.name = Some("{name}@{tick}".into());
+        let tpl = TemplateTrigger {
+            id: "crm".into(),
+            version: Some("3".into()),
+            params: std::collections::BTreeMap::from([
+                ("since".to_string(), serde_json::json!("${trigger.tick}")),
+                ("n".to_string(), serde_json::json!(5)),
+            ]),
+            sink: Some("wh".into()),
+            sink_version: Some("stable".into()),
+            overlay: Some("prod".into()),
+            overlay_version: None,
+        };
+        let e = TriggerEvent::Schedule {
+            tick: "2026-01-01T00:00:00Z".into(),
+        };
+        let b = template_body(&c, &tpl, &e, "now").unwrap();
+        assert_eq!(b.params["since"], "2026-01-01T00:00:00Z");
+        assert_eq!(b.params["n"], 5);
+        assert_eq!(b.name.as_deref(), Some("hook@2026-01-01T00:00:00Z"));
+        assert_eq!(b.idempotency_key.as_deref(), Some("trig:hook:2026-01-01T00:00:00Z"));
+        assert_eq!(b.labels["faucet.trigger.type"], "schedule");
+        assert_eq!(b.sink.as_deref(), Some("wh"));
+        assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay.is_some());
+        let bad = TemplateTrigger {
+            version: Some("latest".into()),
+            ..tpl.clone()
+        };
+        assert!(template_body(&c, &bad, &e, "now").unwrap_err().contains("version"));
+        let bad_token = TemplateTrigger {
+            params: std::collections::BTreeMap::from([(
+                "x".to_string(),
+                serde_json::json!("${trigger.nope}"),
+            )]),
+            ..tpl
+        };
+        assert!(template_body(&c, &bad_token, &e, "now").is_err());
+    }
+
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_tenant_fan_out_fires_once_per_tenant_and_skips_missing_ones() {
+        let state = crate::serve::test_support::test_state();
+        let now = chrono::Utc::now();
+        for id in ["acme", "globex"] {
+            state
+                .history()
+                .tenant_upsert(&crate::serve::history::tenants::TenantRecord {
+                    id: id.into(),
+                    name: None,
+                    labels: Default::default(),
+                    limits: Default::default(),
+                    notifications: Vec::new(),
+                    suspended: false,
+                    created_at: now,
+                    updated_at: now,
+                    created_by: "t".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let mut c = compiled_webhook();
+        c.spec.config = Some(PipelineRef::Path("/definitely/missing.yaml".into()));
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::Named(vec![
+            "acme".into(),
+            "ghost".into(),
+        ]));
+        assert_eq!(fire_targets(&state, &c).await.unwrap(), vec![Some("acme".into())]);
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::All("all".into()));
+        let event = TriggerEvent::Schedule { tick: "t".into() };
+        let out = fire(&state, &c, event.clone(), "now").await;
+        assert!(matches!(out, FireOutcome::Error(ref e) if e.contains("missing.yaml")), "{out:?}");
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::Named(vec!["ghost".into()]));
+        assert!(matches!(fire(&state, &c, event, "now").await, FireOutcome::Coalesced));
+    }
     use crate::serve::triggers::spec::{RunTemplate, TriggerKind, TriggerSpec};
 
     fn compiled_webhook() -> CompiledTrigger {

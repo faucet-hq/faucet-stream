@@ -421,6 +421,13 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     assert_eq!(tenants.as_array().unwrap().len(), 1);
     let (code, _) = api.get("acme-tok", "/v1/audit").await;
     assert_eq!(code, 403);
+    // An operator-level route outside the tenant's scope is refused for the
+    // scoped principal even though its role would allow it.
+    let (code, err) = api
+        .post("acme-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": "all"}))
+        .await;
+    assert_eq!(code, 403, "{err}");
+    assert!(err.to_string().contains("confined to tenant"), "{err}");
     let (code, _) = api
         .post("acme-tok", "/v1/tenants", json!({"id": "x"}))
         .await;
@@ -677,6 +684,78 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         "the tenant budget stops the run: {rec}"
     );
     assert!(rec.to_string().to_lowercase().contains("budget"), "{rec}");
+
+    // ── Edges: patch fields, 404s, callback errors, fan-out outcomes ───────
+    let (code, t) = api
+        .send(
+            reqwest::Method::PATCH,
+            "admin-tok",
+            "/v1/tenants/acme",
+            Some(json!({"name": "Acme Inc", "labels": {"region": "us"}, "notifications": []})),
+        )
+        .await;
+    assert_eq!(code, 200, "{t}");
+    assert_eq!(t["name"], "Acme Inc");
+    assert_eq!(t["labels"]["region"], "us");
+    let (code, _) = api
+        .send(
+            reqwest::Method::PATCH,
+            "admin-tok",
+            "/v1/tenants/acme",
+            Some(json!({"notifications": [{"nope": 1}]})),
+        )
+        .await;
+    assert_eq!(code, 400);
+    let (code, _) = api.get("admin-tok", "/v1/tenants/ghost/connections").await;
+    assert_eq!(code, 404);
+    let (code, _) = api.get("admin-tok", "/v1/tenants/acme/connections/ghost").await;
+    assert_eq!(code, 404);
+    let (code, _) = api
+        .send(reqwest::Method::DELETE, "op-tok", "/v1/tenants/acme/connections/ghost", None)
+        .await;
+    assert_eq!(code, 404);
+    let (code, _) = api
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/connections",
+            json!({"name": "scratch", "provider": {"type": "static", "config": {"token": "s"}}}),
+        )
+        .await;
+    assert_eq!(code, 201);
+    let (code, _) = api
+        .send(reqwest::Method::DELETE, "op-tok", "/v1/tenants/acme/connections/scratch", None)
+        .await;
+    assert_eq!(code, 204);
+    let resp = api.client.get(format!("{}/v1/connect/callback", api.base)).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 400, "a callback without state");
+    let (_, started) = api
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/connect/crm",
+            json!({"connection": "crm3", "redirect": "https://app.example/done"}),
+        )
+        .await;
+    let url = reqwest::Url::parse(started["authorize_url"].as_str().unwrap()).unwrap();
+    let st = url.query_pairs().find(|(k, _)| k == "state").unwrap().1.into_owned();
+    let resp = api
+        .client
+        .get(format!("{}/v1/connect/callback?state={st}", api.base))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers()["location"].to_str().unwrap().contains("error=missing_code"));
+    let (_, fan) = api
+        .post("op-tok", "/v1/templates/no-such-template/fanout", json!({"tenants": ["acme"]}))
+        .await;
+    assert_eq!(fan["results"][0]["status"], "failed", "{fan}");
+    let (_, fan) = api
+        .post("op-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": ["globex"]}))
+        .await;
+    assert_eq!(fan["results"][0]["status"], "skipped", "a suspended tenant: {fan}");
+    let (code, _) = api
+        .post("op-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": []}))
+        .await;
+    assert_eq!(code, 400);
 
     // ── Audit carries the tenant ───────────────────────────────────────────
     let (_, audit) = api

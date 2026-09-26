@@ -771,6 +771,18 @@ mod tests {
     }
 
     #[test]
+    fn a_principal_tenant_must_be_a_slug_and_reaches_its_context() {
+        let mut p = spec("a", "tok", Role::Operator);
+        p.tenant = Some("Bad Tenant".into());
+        assert!(RbacConfig::new(vec![p]).is_err());
+        let mut p = spec("a", "tok", Role::Operator);
+        p.tenant = Some("acme".into());
+        assert!(format!("{p:?}").contains("acme"));
+        let cfg = RbacConfig::new(vec![p]).unwrap();
+        assert_eq!(cfg.authenticate("tok").unwrap().tenant.as_deref(), Some("acme"));
+    }
+
+    #[test]
     fn tenant_filters_and_visibility() {
         let scoped = AuthContext {
             principal: "p".into(),

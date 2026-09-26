@@ -126,6 +126,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synth_connection_needs_reauth_names_the_connection() {
+        let e = synth_event("connection_needs_reauth", "acme").unwrap();
+        assert_eq!(e.kind.as_str(), "connection_needs_reauth");
+        assert_eq!(e.details["tenant"], "acme");
+        assert_eq!(e.details["connection"], "synthetic-connection");
+        assert!(e.run.is_none());
+    }
+
+    #[test]
     fn synth_event_maps_known_kinds() {
         use crate::notify::EventKind;
         assert_eq!(

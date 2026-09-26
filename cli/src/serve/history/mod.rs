@@ -1436,6 +1436,107 @@ fn into_history<H: RunHistory + 'static>(
 mod tests {
     use super::*;
 
+    /// A backend implementing only the required methods, so the tenant
+    /// defaults (#709) can be observed.
+    struct Bare;
+
+    #[async_trait]
+    impl RunHistory for Bare {
+        async fn claim_idempotency(
+            &self,
+            _key: &str,
+            _fingerprint: &str,
+            _run_id: &str,
+            _window: Duration,
+        ) -> Result<Claim, HistoryError> {
+            Ok(Claim::Fresh)
+        }
+        async fn upsert(&self, _rec: &RunRecord) -> Result<(), HistoryError> {
+            Ok(())
+        }
+        async fn get(&self, _id: &str) -> Result<Option<RunRecord>, HistoryError> {
+            Ok(None)
+        }
+        async fn list(&self, _filter: &ListFilter) -> Result<ListPage, HistoryError> {
+            Ok(ListPage {
+                runs: Vec::new(),
+                next_cursor: None,
+            })
+        }
+        async fn delete(&self, _id: &str) -> Result<DeleteOutcome, HistoryError> {
+            Ok(DeleteOutcome::NotFound)
+        }
+        async fn purge_expired(&self, _retain_for: Duration) -> Result<usize, HistoryError> {
+            Ok(0)
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_defaults_refuse_writes_and_read_empty() {
+        let h = Bare;
+        let now = Utc::now();
+        let t = tenants::TenantRecord {
+            id: "acme".into(),
+            name: None,
+            labels: BTreeMap::new(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            suspended: false,
+            created_at: now,
+            updated_at: now,
+            created_by: "x".into(),
+        };
+        assert!(h.tenant_upsert(&t).await.is_err());
+        assert!(h.tenant_get("acme").await.unwrap().is_none());
+        assert!(h.tenant_list().await.unwrap().is_empty());
+        assert!(!h.tenant_delete("acme").await.unwrap());
+        let c = tenants::ConnectionRecord {
+            tenant: "acme".into(),
+            name: "c".into(),
+            provider_type: "static".into(),
+            connect_provider: None,
+            sealed: "s".into(),
+            status: Default::default(),
+            reauth_reason: None,
+            created_at: now,
+            updated_at: now,
+            updated_by: "x".into(),
+        };
+        assert!(h.connection_upsert(&c).await.is_err());
+        assert!(h.connection_get("acme", "c").await.unwrap().is_none());
+        assert!(h.connection_list("acme").await.unwrap().is_empty());
+        assert!(!h.connection_delete("acme", "c").await.unwrap());
+        let sess = tenants::ConnectSession {
+            state: "st".into(),
+            tenant: "acme".into(),
+            provider: "p".into(),
+            connection: "c".into(),
+            redirect: "https://x".into(),
+            sealed_verifier: "v".into(),
+            created_by: "x".into(),
+            created_at: now,
+            expires_at: now,
+        };
+        assert!(h.connect_session_put(&sess).await.is_err());
+        assert!(h.connect_session_take("st").await.unwrap().is_none());
+        h.tenant_run_link("r", "acme").await.unwrap();
+        let r = tenants::TenantStateRef {
+            tenant: "acme".into(),
+            key: "k".into(),
+            spec: None,
+        };
+        h.tenant_state_ref_add(&r).await.unwrap();
+        assert!(h.tenant_state_refs("acme").await.unwrap().is_empty());
+        assert!(!h.change_delete("c1").await.unwrap());
+        assert_eq!(h.usage_delete_runs(&["r".to_string()]).await.unwrap(), 0);
+    }
+
     #[test]
     fn run_status_parse_round_trips_every_variant() {
         // The match forces this list to grow with the enum at compile time —

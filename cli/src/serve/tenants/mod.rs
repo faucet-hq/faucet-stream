@@ -732,6 +732,275 @@ fn decode_state_spec(
 mod tests {
     use super::*;
 
+    use crate::serve::history::RunRecord;
+
+    fn tenant(id: &str) -> TenantRecord {
+        let now = Utc::now();
+        TenantRecord {
+            id: id.into(),
+            name: None,
+            labels: BTreeMap::new(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            suspended: false,
+            created_at: now,
+            updated_at: now,
+            created_by: "t".into(),
+        }
+    }
+
+    fn conn(vault: &Vault, tenant: &str, name: &str, spec: Value) -> ConnectionRecord {
+        let now = Utc::now();
+        ConnectionRecord {
+            tenant: tenant.into(),
+            name: name.into(),
+            provider_type: spec["type"].as_str().unwrap_or("static").into(),
+            connect_provider: None,
+            sealed: vault.seal(&spec),
+            status: ConnectionStatus::Active,
+            reauth_reason: None,
+            created_at: now,
+            updated_at: now,
+            updated_by: "t".into(),
+        }
+    }
+
+    fn state_with_vault() -> (ServerState, Arc<Vault>) {
+        let state = crate::serve::test_support::test_state();
+        state.set_tenants(TenantsRuntime::new(
+            Some(Vault::new("k", &[]).unwrap()),
+            Default::default(),
+        ));
+        let v = state.tenants().vault.clone().unwrap();
+        (state, v)
+    }
+
+    #[tokio::test]
+    async fn scope_refuses_missing_and_suspended_tenants_and_needs_a_vault() {
+        let state = crate::serve::test_support::test_state();
+        assert!(matches!(scope(&state, "nope").await, Err(ServeError::NotFound)));
+        let mut t = tenant("acme");
+        t.suspended = true;
+        state.history().tenant_upsert(&t).await.unwrap();
+        assert!(matches!(scope(&state, "acme").await, Err(ServeError::Conflict(_))));
+        t.suspended = false;
+        state.history().tenant_upsert(&t).await.unwrap();
+        let v = Vault::new("k", &[]).unwrap();
+        state
+            .history()
+            .connection_upsert(&conn(&v, "acme", "api", serde_json::json!({"type": "static", "config": {"token": "x"}})))
+            .await
+            .unwrap();
+        assert!(matches!(scope(&state, "acme").await, Err(ServeError::Unavailable(_))));
+        assert!(matches!(
+            TenantsRuntime::default().require_vault(),
+            Err(ServeError::Unavailable(_))
+        ));
+        assert!(format!("{:?}", TenantsRuntime::default()).contains("vault: false"));
+    }
+
+    #[tokio::test]
+    async fn scope_unseals_connections_blocks_revoked_ones_and_refreshes_provider_creds() {
+        let state = crate::serve::test_support::test_state();
+        let providers = connect::ConnectProviders::from_file(connect::ConnectProvidersFile {
+            version: 1,
+            providers: vec![serde_json::from_value(serde_json::json!({
+                "name": "crm", "authorize_url": "https://i/a", "token_url": "https://i/new-token",
+                "client_id": "new-id", "client_secret": "new-secret",
+                "redirect_base": "https://f", "allowed_redirects": ["https://app"]
+            }))
+            .unwrap()],
+        })
+        .unwrap();
+        state.set_tenants(TenantsRuntime::new(Some(Vault::new("k", &[]).unwrap()), providers));
+        let v = state.tenants().vault.clone().unwrap();
+        let mut t = tenant("acme");
+        t.limits.max_records_per_run = Some(5);
+        state.history().tenant_upsert(&t).await.unwrap();
+        let mut oauth = conn(
+            &v,
+            "acme",
+            "crm",
+            serde_json::json!({"type": "oauth2_refresh", "config": {
+                "token_url": "https://i/old", "client_id": "old", "client_secret": "old", "refresh_token": "rt"}}),
+        );
+        oauth.connect_provider = Some("crm".into());
+        state.history().connection_upsert(&oauth).await.unwrap();
+        let mut revoked = conn(&v, "acme", "gone", serde_json::json!({"type": "static", "config": {"token": "x"}}));
+        revoked.status = ConnectionStatus::NeedsReauth;
+        state.history().connection_upsert(&revoked).await.unwrap();
+        let sc = scope(&state, "acme").await.unwrap();
+        assert_eq!(sc.connections["crm"]["config"]["client_secret"], "new-secret");
+        assert_eq!(sc.connections["crm"]["config"]["token_url"], "https://i/new-token");
+        assert!(sc.blocked["gone"].contains("revoked"));
+        assert_eq!(sc.budget.as_ref().unwrap().max_records, Some(5));
+        assert_eq!(sc.state_scope().prefix("p"), "acme::p");
+        assert!(format!("{sc:?}").contains("acme"));
+        // The catalog builder wraps connections and builds the rest plainly.
+        let mut specs = std::collections::HashMap::new();
+        specs.insert("crm".to_string(), sc.connections["crm"].clone());
+        specs.insert(
+            "plain".to_string(),
+            serde_json::json!({"type": "static", "config": {"token": "p"}}),
+        );
+        let catalog = (sc.build_catalog)(Some(&specs)).unwrap();
+        assert_eq!(catalog.len(), 2);
+        assert!(format!("{:?}", catalog["crm"]).contains("ReauthWatch"));
+        assert!((sc.build_catalog)(None).unwrap().is_empty());
+        specs.insert("bad".to_string(), serde_json::json!({"type": "nope"}));
+        assert!((sc.build_catalog)(Some(&specs)).is_err());
+    }
+
+    #[tokio::test]
+    async fn admission_enforces_suspension_concurrency_and_merges_the_budget() {
+        let (state, _) = state_with_vault();
+        let mut req: crate::serve::runner::SubmitRequest =
+            serde_json::from_value(serde_json::json!({"config": "x"})).unwrap();
+        assert!(matches!(admit(&state, "acme", &mut req).await, Err(ServeError::NotFound)));
+        let mut t = tenant("acme");
+        t.suspended = true;
+        state.history().tenant_upsert(&t).await.unwrap();
+        assert!(matches!(admit(&state, "acme", &mut req).await, Err(ServeError::Conflict(_))));
+        t.suspended = false;
+        t.limits.max_concurrent_runs = Some(1);
+        t.limits.max_records_per_run = Some(10);
+        state.history().tenant_upsert(&t).await.unwrap();
+        req.budget = Some(faucet_core::BudgetSpec {
+            max_records: Some(50),
+            max_bytes: Some(7),
+            ..Default::default()
+        });
+        drop(admit(&state, "acme", &mut req).await.unwrap());
+        let b = req.budget.clone().unwrap();
+        assert_eq!((b.max_records, b.max_bytes), (Some(10), Some(7)));
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, Utc::now());
+        rec.tenant = Some("acme".into());
+        state.history().upsert(&rec).await.unwrap();
+        assert!(matches!(
+            admit(&state, "acme", &mut req).await,
+            Err(ServeError::TooManyRequests(_))
+        ));
+        assert!(matches!(delete_tenant(&state, "acme").await, Err(ServeError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn the_token_store_persists_rotated_refresh_tokens() {
+        let (state, v) = state_with_vault();
+        let store = ConnectionTokenStore {
+            state: state.clone(),
+            tenant: "acme".into(),
+            name: "crm".into(),
+        };
+        assert_eq!(store.get("k").await.unwrap(), None);
+        store.put("k", &serde_json::json!({"refresh_token": "x"})).await.unwrap();
+        state
+            .history()
+            .connection_upsert(&conn(
+                &v,
+                "acme",
+                "crm",
+                serde_json::json!({"type": "oauth2_refresh", "config": {"refresh_token": "rt1"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.get("k").await.unwrap().unwrap()["refresh_token"], "rt1");
+        store.put("k", &serde_json::json!({"other": 1})).await.unwrap();
+        store.put("k", &serde_json::json!({"refresh_token": "rt2"})).await.unwrap();
+        assert_eq!(store.get("k").await.unwrap().unwrap()["refresh_token"], "rt2");
+        store.delete("k").await.unwrap();
+        assert!(format!("{store:?}").contains("crm"));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_grant_marks_the_connection_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let idp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("{\"error\":\"invalid_grant\"}"))
+            .mount(&idp)
+            .await;
+        let (state, v) = state_with_vault();
+        let mut t = tenant("acme");
+        t.notifications = vec![serde_json::json!({"bad": true})];
+        state.history().tenant_upsert(&t).await.unwrap();
+        let spec = serde_json::json!({"type": "oauth2_refresh", "config": {
+            "token_url": format!("{}/token", idp.uri()), "client_id": "c",
+            "client_secret": "s", "refresh_token": "rt"}});
+        state
+            .history()
+            .connection_upsert(&conn(&v, "acme", "crm", spec.clone()))
+            .await
+            .unwrap();
+        let p = connection_provider(&state, "acme", "crm", &spec).unwrap();
+        assert!(p.credential().await.is_err());
+        let rec = state.history().connection_get("acme", "crm").await.unwrap().unwrap();
+        assert_eq!(rec.status, ConnectionStatus::NeedsReauth);
+        assert!(rec.reauth_reason.unwrap().contains("400"));
+        // Forwarded surface.
+        assert!(p.invalidate(&Credential::Bearer("x".into())).await.is_err());
+        assert!(p.sign_request("GET", "https://x", &BTreeMap::new()).await.unwrap().is_none());
+        assert!(p.request_auth("GET", "https://x", &BTreeMap::new()).await.unwrap().is_empty());
+        assert!(p.reauth_statuses().is_empty());
+        assert!(!p.provider_name().is_empty());
+        // Marking again, or a missing connection, is a no-op.
+        mark_needs_reauth(&state, "acme", "crm", "again").await;
+        mark_needs_reauth(&state, "acme", "ghost", "x").await;
+        notify_tenant(&state, "ghost", crate::notify::NotifyEvent::connection_needs_reauth("g", "c", "r")).await;
+    }
+
+    #[test]
+    fn notifications_validate_like_a_config() {
+        assert!(validate_notifications(&[]).is_ok());
+        assert!(validate_notifications(&[serde_json::json!({"x": 1})]).unwrap_err().contains("notifications"));
+    }
+
+    #[tokio::test]
+    async fn the_state_key_hook_records_what_it_can_safely_keep() {
+        let state = crate::serve::test_support::test_state();
+        let hook = state_key_hook(state.clone(), "acme".into());
+        let file: crate::config::StateStoreSpec =
+            serde_json::from_value(serde_json::json!({"type": "file", "config": {"path": "/tmp/x"}})).unwrap();
+        let redis: crate::config::StateStoreSpec =
+            serde_json::from_value(serde_json::json!({"type": "redis", "config": {"url": "redis://u:p@h"}})).unwrap();
+        hook(&file, "acme::p::a");
+        hook(&redis, "acme::p::b");
+        let (vstate, _) = state_with_vault();
+        let vhook = state_key_hook(vstate.clone(), "acme".into());
+        vhook(&redis, "acme::p::c");
+        let mut refs = Vec::new();
+        for _ in 0..100 {
+            refs = state.history().tenant_state_refs("acme").await.unwrap();
+            let v = vstate.history().tenant_state_refs("acme").await.unwrap();
+            if refs.len() == 2 && v.len() == 1 {
+                assert!(v[0].spec.as_deref().unwrap().starts_with("sealed:"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(refs.iter().any(|r| r.spec.as_deref().is_some_and(|s| s.starts_with("plain:"))));
+        assert!(refs.iter().any(|r| r.spec.is_none()));
+    }
+
+    #[tokio::test]
+    async fn delete_reports_keys_it_cannot_delete() {
+        let (state, _) = state_with_vault();
+        state.history().tenant_upsert(&tenant("acme")).await.unwrap();
+        state
+            .history()
+            .tenant_state_ref_add(&TenantStateRef {
+                tenant: "acme".into(),
+                key: "acme::p::r".into(),
+                spec: None,
+            })
+            .await
+            .unwrap();
+        let report = delete_tenant(&state, "acme").await.unwrap();
+        assert_eq!(report.state_keys_deleted, 0);
+        assert!(report.state_keys_not_deleted[0].starts_with("acme::p::r"));
+        assert!(matches!(delete_tenant(&state, "acme").await, Err(ServeError::NotFound)));
+    }
+
     #[test]
     fn revocation_is_recognized_from_the_token_endpoint_error() {
         let e = |m: &str| FaucetError::Auth(m.to_string());
