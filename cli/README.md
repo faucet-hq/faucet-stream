@@ -54,7 +54,7 @@ cargo install faucet-cli --no-default-features \
 | `faucet doctor --offline [config]` | Static, credential-free config lints (no network): dangling / unreferenced `auth:` providers, unused `vars:`, no-op sink `batch_size: 0`. Exits non-zero on any lint error. |
 | `faucet fmt [config] [--check\|--stdout]` | Canonicalize a config in place (stable key order); idempotent. `--check` is a CI gate (non-zero if not canonical); `--stdout` previews. Comments are not preserved. |
 | `faucet explain [config] [--json\|--rows]` | Plain-English narration of a pipeline (source → transforms → sink, matrix, delivery). Fully offline; never prints secrets. |
-| `faucet status [config] [--row R] [--probe] [--json]` | One screen of per-row health (#732): last success / failure (run-outcome marker, SLA history, `catalog:` run history), bookmark and its age, where the next run resumes, the exactly-once watermark (`--probe` compares it with the sink's), DLQ backlog, SLA / profiling verdicts, rollback markers, a live or crashed run lease; child rows fold under their parent. Exit `0` healthy, `1` degraded / unknown, `2` failed. Also `GET`/`POST /v1/status` and the console's template Health card. |
+| `faucet status [config] [--row R] [--probe] [--json]` | One screen of per-row health (#732): last success / failure (run-outcome marker, SLA history, `catalog:` run history), bookmark and its age, where the next run resumes, the exactly-once watermark (`--probe` compares it with the sink's), source lag (#733; `--probe` asks the source now), the last run's sink-write outcomes (#737), DLQ backlog, SLA / profiling verdicts, rollback markers, a live or crashed run lease; child rows fold under their parent. Exit `0` healthy, `1` degraded / unknown, `2` failed. Also `GET`/`POST /v1/status` and the console's template Health card. |
 | `faucet state show\|set\|reset\|export\|import <config> …` | Operate on a pipeline's durable state (#735): `show` bookmarks, envelope sequences and markers; `set --row R --bookmark JSON` / `reset --row R [--include-markers] [--rewind-token]` with plan-then-confirm (`--yes` / `--dry-run`), refused while a run lease or the `catalog:` run history says a run is in flight (`--force`), exactly-once envelopes kept sink-safe; `export` the versioned `{version, pipeline, exported_at, keys}` document; `import FILE [--to-state URL] [--overwrite]` to restore or migrate between file / Redis / Postgres stores. Also `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` (admin). |
 | `faucet history [config] [--limit N\|--row R\|--json]` | Terminal view of the run history in the config's `catalog:` store (status/duration/throughput), newest first. Read-only; requires the `catalog` feature. |
 | `faucet run … --output <text\|json\|ndjson>` | End-of-run summary format. `json`/`ndjson` emit a machine-readable per-row + totals summary (clean stdout, logs on stderr) for CI/cron/Slack. |
@@ -1056,7 +1056,8 @@ Sibling of `source`, `sink`, `transforms`, `state` under `pipeline:`.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `sink` | ConnectorSpec | required | Any sink — typically `jsonl`, `s3`, `kafka`, `http`. |
-| `on_batch_error` | `propagate` \| `dlq_all` | `propagate` | What to do when the main sink fails wholesale (no per-row info). |
+| `on_batch_error` | `propagate` \| `dlq_all` | `propagate` | What to do when the main sink fails wholesale (no per-row info). `dlq_all` is refused on a sink whose failed write can land part of a batch (#737) — see the capability matrix's *batch atomicity* column. |
+| `allow_duplicates_on_dlq_all` | bool | `false` | Accept `dlq_all` on such a sink anyway: rows that already landed also go to the DLQ, so a replay writes them twice. |
 | `max_failures_per_page` | integer | unset (unlimited) | Abort if a single page produces more than this many DLQ records. |
 | `max_failures_total` | integer | unset (unlimited) | Abort if the run-wide DLQ count exceeds this. |
 | `include_original_payload` | bool | `true` | Reserved for a future headers-only mode. Always `true` in v1. |
@@ -1126,9 +1127,13 @@ sla:
   volume_anomaly:            # learned baseline over recent successful runs (needs state:)
     method: zscore           # zscore | iqr
     min_history: 5           # successful runs before detection starts
+  max_lag_bytes: 1073741824  # CDC/streaming sources: at most 1 GiB behind the head (#733)
 ```
 
-`faucet schema sla` prints the block's JSON Schema. Full model:
+`max_lag_bytes` / `max_lag_events` / `max_lag_seconds` compare the source's
+reported lag (Postgres slot, MySQL binlog, SQL Server LSN, MongoDB change
+stream, Kafka consumer lag, Kinesis `MillisBehindLatest`) at the end of each
+run, and in `faucet status` / `faucet doctor`. `faucet schema sla` prints the block's JSON Schema. Full model:
 [SLA monitoring](https://faucet-hq.github.io/faucet-stream/cookbook/sla.html).
 
 ### `profiling:` (optional)

@@ -757,7 +757,7 @@ legitimate step change. `--row` narrows to one root row; both accept `--json`.
 ```bash
 faucet status pipeline.yaml                 # one screen, every row
 faucet status pipeline.yaml --row orders    # one row
-faucet status pipeline.yaml --probe         # also read exactly-once sink watermarks
+faucet status pipeline.yaml --probe         # also ask sinks (watermarks, staging) and sources (lag)
 faucet status pipeline.yaml --json          # machine-readable
 ```
 
@@ -772,7 +772,7 @@ config has one, and the backlog of a local `jsonl` DLQ.
 pipeline shop (3 rows) — FAILED    state: file
   row        status    last success            bookmark               lag  dlq  next run resumes at
   customers  ok        2026-09-26 06:10 (2h)   updated_at=2026-09-26  —    0    updated_at=2026-09-26
-  orders     FAILED    2026-09-25 23:00 (9h)   lsn=0/3A00F128         —    17   lsn=0/3A00F128 (sink watermark agrees)
+  orders     FAILED    2026-09-25 23:00 (9h)   lsn=0/3A00F128         412 MiB 17   lsn=0/3A00F128 (sink watermark agrees)
              └ last error: Sink: deadlock detected (2026-09-26 02:14, run 01a0…)
              └ exactly-once: state seq 42 · sink seq 42 · Agree → next run trusts the state
              └ DLQ: 17 record(s), oldest 2026-09-26 02:14 (6h)
@@ -781,8 +781,9 @@ pipeline shop (3 rows) — FAILED    state: file
 
 Health, worst last: `ok`, `running` (a live run lease), `warming` (never
 completed a run), `unknown` (no durable state, or unreadable), `degraded` (an
-SLA breach, a DLQ backlog, column-profile drift, a crashed run's lease, or the
-state store ahead of the sink watermark), `failed` (the most recent run
+SLA breach — including a `max_lag_*` source-lag threshold —, a DLQ backlog,
+a last run that sent sink writes to the DLQ, column-profile drift, a crashed
+run's lease, or the state store ahead of the sink watermark), `failed` (the most recent run
 failed). Child rows aggregate under their parent (bookmark count, failed
 invocations, worst health). **Exit code:** `0` healthy (`ok` / `running` /
 `warming`), `1` degraded or unknown, `2` failed — usable from cron or a
@@ -792,7 +793,12 @@ reads each exactly-once row's committed sink watermark (read-only) and says
 whether it agrees with the state store and which side the next run trusts, and
 asks each `write_mode: overwrite` row's sink whether its `…__faucet_ovw` staging
 object exists (`present` / `absent` / `unknown`; without `--probe` a failed
-overwrite run is reported as an *unverified* `unknown`).
+overwrite run is reported as an *unverified* `unknown`), and asks each
+lag-reporting source (`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`,
+`kafka`, `kinesis`) how far behind its head the stored bookmark is — without
+`--probe` the **lag** column shows what the source reported when the last run
+ended. The `batches` field (and a detail line when not all committed) says how
+the last run's sink writes ended (#737).
 The `--json` document is the `StatusReport` schema in
 [`docs/openapi.yaml`](http-api.md#pipeline-status-and-state). See the
 [state and status cookbook](../cookbook/state-and-status.md).

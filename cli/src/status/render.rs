@@ -59,7 +59,7 @@ fn cells(r: &RowStatus, now: DateTime<Utc>) -> [String; 7] {
             .unwrap_or_else(|| "—".into()),
         r.lag
             .as_ref()
-            .map(|l| clip(&l.to_string(), 12))
+            .map(|l| clip(&l.human, 16))
             .unwrap_or_else(|| "—".into()),
         dlq,
         clip(&r.resume, 60),
@@ -192,6 +192,23 @@ fn details(r: &RowStatus, now: DateTime<Utc>) -> Vec<String> {
     }
     if let Some(n) = &r.dlq.note {
         marks.push(format!("DLQ: {n}"));
+    }
+    if let Some(b) = &r.batches
+        && b.unclean() > 0
+    {
+        marks.push(super::batch_note(b));
+    }
+    if let Some(l) = &r.lag {
+        marks.push(format!(
+            "lag: {} ({}, {})",
+            l.human,
+            if l.measured == "probe" {
+                "queried now"
+            } else {
+                "at the end of the last run"
+            },
+            when(l.at, now)
+        ));
     }
     if let Some(p) = &r.profiling
         && p.drift > 0

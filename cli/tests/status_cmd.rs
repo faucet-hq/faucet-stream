@@ -302,6 +302,8 @@ catalog: {{ url: "{catalog_url}" }}
         duration_ms: 3,
         error: Some("server-side failure".into()),
         usage: None,
+        batches: None,
+        source_lag: None,
     }];
     handle.store.upsert(&rec).await.unwrap();
     let r = faucet_cli::commands::status::build(&args(&cfg))

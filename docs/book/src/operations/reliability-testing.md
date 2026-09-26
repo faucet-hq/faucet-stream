@@ -193,6 +193,14 @@ fails the run instead of swallowing the row; the per-page failure budget
 aborts rather than silently capping; and whether row outcomes are consulted at
 all is decided by the *presence of a DLQ*, not by the sink.
 
+It also pins the batch-atomicity guard (#737): `on_batch_error: dlq_all`
+against a sink declared **best-effort** is refused before a single row is read,
+written, dead-lettered or bookmarked — routing such a batch would send rows
+that had already landed to the DLQ too, and a replay would duplicate them —
+while the same sink runs when it writes by key or the caller opts in to the
+duplicates. `ScriptedSink` is per-row by default (an outer failure lands
+nothing), and `.best_effort()` declares the other case.
+
 `Boundary::RowsInWrite { batch, rows }` is the row-level injector this needed
 — `Boundary::Write` is whole-batch, and deliberately stays an **outer** error
 even on the `write_batch_partial` path, because that is exactly what

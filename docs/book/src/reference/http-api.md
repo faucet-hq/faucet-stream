@@ -287,7 +287,9 @@ is the last `run_id` from the previous page.
   "elapsed_secs": 12.4,
   "records_written": 4096,
   "invocations": [
-    {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null}
+    {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
+     "batches": {"attempted": 5, "committed": 5, "dlq_partial": 0, "dlq_all": 0, "failed": 0},
+     "source_lag": {"bytes": 4096}}
   ],
   "error": null,
   "idempotency_key": "airflow-task-123-attempt-2",
@@ -296,7 +298,10 @@ is the last `run_id` from the previous page.
 ```
 
 `status` is one of `queued`, `running`, `completed`, `failed`, `cancelled`.
-`elapsed_secs` is filled live for running runs.
+`elapsed_secs` is filled live for running runs. Each invocation carries
+`batches` — how its sink writes ended (`committed` / `dlq_partial` / `dlq_all` /
+`failed`, #737) — and, for a source with a head, `source_lag` at the end of the
+invocation (`bytes` / `events` / `seconds`, #733).
 
 > **Bookmarks:** run records carry record counts + per-row outcomes, not
 > replication bookmarks. Bookmark state is per-row/per-state-key and lives in the
@@ -406,7 +411,10 @@ the SLA history, and this server's run history — each tagged with its
 `source`), `bookmark` and `bookmark_age_secs`, `exactly_once`
 (`state_seq`, and with `probe=true` the sink's watermark, `agreement` and which
 side the next run `trusted`), `overwrite_staging` (`state` present / absent /
-unknown, `verified` only with `probe=true`), `dlq` backlog, `sla` verdicts, `profiling`,
+unknown, `verified` only with `probe=true`), `lag` (the source's lag reported
+when the last run ended, or with `probe=true` queried now — `measured`
+`last_run` / `probe`, plus `human`), `batches` (the last run's sink-write
+outcomes), `dlq` backlog, `sla` verdicts (including `lag`), `profiling`,
 `rollback`, `children`, the `resume` sentence, and per-field `errors`. The
 top-level `health` / `exit_code` are the worst row's. A run in flight on this
 server shows as `running` — every submitted run carries a `pipeline` label

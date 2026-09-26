@@ -254,6 +254,9 @@ impl Sink for MetadataSink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
         self.inner.sink_guarantee()
     }
@@ -359,6 +362,10 @@ mod tests {
         .unwrap();
         let inner = Box::new(CapturingSink::default());
         let sink = MetadataSink::new(inner, meta, ctx());
+        assert_eq!(
+            sink.batch_atomicity(),
+            crate::dlq::BatchAtomicity::BestEffort
+        );
         let n = sink
             .write_batch(&[json!({"id": 1}), json!({"id": 2})])
             .await

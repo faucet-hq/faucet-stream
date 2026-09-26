@@ -76,6 +76,7 @@ pub fn failed_dlq_spec(path: &Path, original: Option<&DlqSpec>) -> DlqSpec {
             max_failures_per_page: o.max_failures_per_page,
             max_failures_total: o.max_failures_total,
             include_original_payload: o.include_original_payload,
+            allow_duplicates_on_dlq_all: o.allow_duplicates_on_dlq_all,
         },
         None => DlqSpec {
             sink,
@@ -83,6 +84,7 @@ pub fn failed_dlq_spec(path: &Path, original: Option<&DlqSpec>) -> DlqSpec {
             max_failures_per_page: None,
             max_failures_total: None,
             include_original_payload: true,
+            allow_duplicates_on_dlq_all: false,
         },
     }
 }
@@ -300,6 +302,7 @@ mod tests {
             max_failures_per_page: Some(5),
             max_failures_total: Some(50),
             include_original_payload: true,
+            allow_duplicates_on_dlq_all: false,
         };
         let spec = failed_dlq_spec(Path::new("failed.jsonl"), Some(&orig));
         assert_eq!(spec.sink.kind, "jsonl");

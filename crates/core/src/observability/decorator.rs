@@ -130,6 +130,9 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
+    async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
 
     async fn fetch_with_context(
         &self,
@@ -647,6 +650,9 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
 
     async fn write_batch_idempotent(
         &self,
@@ -1015,6 +1021,7 @@ pub(crate) mod source_tests {
             crate::idempotency::ReplayGuarantee::NonDeterministic
         );
         assert_eq!(wrapped.capture_resume_position().await.unwrap(), None);
+        assert_eq!(wrapped.lag().await.unwrap(), None);
     }
 
     /// A source advertising exactly-once — the decorator must not mask it
@@ -1199,6 +1206,10 @@ mod sink_tests {
             "sink_guarantee must delegate"
         );
         assert!(wrapped.dedups_by_key(), "dedups_by_key must delegate");
+        assert_eq!(
+            wrapped.batch_atomicity(),
+            crate::dlq::BatchAtomicity::BestEffort
+        );
     }
 
     #[tokio::test]

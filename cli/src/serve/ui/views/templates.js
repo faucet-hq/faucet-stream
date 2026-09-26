@@ -746,15 +746,25 @@ async function renderHealth(host, id) {
   const rows = r.rows
     .map((row) => {
       const dlq = !row.dlq.configured ? "—" : row.dlq.readable ? String(row.dlq.count) : "?";
-      const detail = [...(row.reasons || []), ...(row.errors || []).map((e) => `unreadable: ${e}`)];
+      const lag = row.lag ? row.lag.human : "—";
+      const lagTitle = row.lag
+        ? `${row.lag.measured === "probe" ? "queried" : "reported at the end of the last run"} ${fmtTime(row.lag.at)}`
+        : "the source does not report lag";
+      const b = row.batches;
+      const batchNote =
+        b && b.failed > 0 && !(row.reasons || []).some((r) => r.startsWith("last run: of"))
+          ? [`last run: ${b.failed} of ${b.attempted} sink write(s) failed`]
+          : [];
+      const detail = [...(row.reasons || []), ...batchNote, ...(row.errors || []).map((e) => `unreadable: ${e}`)];
       return `<tr class="health-row health-${escapeHtml(row.health)}">
         <td class="mono">${escapeHtml(row.row)}</td>
         <td>${healthPill(row.health)}</td>
         <td class="ds-meta">${row.last_success ? fmtTime(row.last_success.at) : "never"}</td>
         <td class="ds-meta health-bm" title="${escapeHtml(bookmarkText(row.bookmark))}">${escapeHtml(bookmarkText(row.bookmark))}</td>
+        <td class="health-num health-lag" title="${escapeHtml(lagTitle)}">${escapeHtml(lag)}</td>
         <td class="health-num">${dlq}</td>
         <td class="health-resume" title="${escapeHtml(row.resume)}">${escapeHtml(row.resume)}</td>
-      </tr>${detail.length ? `<tr class="health-why"><td></td><td colspan="5">${detail.map(escapeHtml).join(" · ")}</td></tr>` : ""}`;
+      </tr>${detail.length ? `<tr class="health-why"><td></td><td colspan="6">${detail.map(escapeHtml).join(" · ")}</td></tr>` : ""}`;
     })
     .join("");
   host.innerHTML = `
@@ -765,8 +775,8 @@ async function renderHealth(host, id) {
     </div>
     ${r.state.note ? `<p class="tpl-desc">${escapeHtml(r.state.note)}</p>` : ""}
     <div class="table-scroll"><table class="ds-table health-table">
-      <thead><tr><th>row</th><th>status</th><th>last success</th><th>bookmark</th><th>dlq</th><th>next run resumes at</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="6" class="run-meta">no rows</td></tr>`}</tbody>
+      <thead><tr><th>row</th><th>status</th><th>last success</th><th>bookmark</th><th>lag</th><th>dlq</th><th>next run resumes at</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="run-meta">no rows</td></tr>`}</tbody>
     </table></div>`;
 }
 

@@ -25,6 +25,7 @@ async fn build_dlq_config_constructs_runtime_config_from_spec() {
         max_failures_per_page: Some(100),
         max_failures_total: Some(10000),
         include_original_payload: true,
+        allow_duplicates_on_dlq_all: false,
     };
     let cfg = build_dlq_config(&spec).await.expect("build_dlq_config");
     assert!(cfg.include_original_payload);
@@ -56,6 +57,7 @@ async fn build_dlq_config_defaults_propagate_policy() {
         max_failures_per_page: None,
         max_failures_total: None,
         include_original_payload: true,
+        allow_duplicates_on_dlq_all: false,
     };
     let cfg = build_dlq_config(&spec).await.expect("build_dlq_config");
     assert!(matches!(

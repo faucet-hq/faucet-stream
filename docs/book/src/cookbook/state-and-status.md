@@ -33,7 +33,7 @@ faucet status orders.yaml
 pipeline orders (3 rows) — FAILED    state: file
   row        status    last success            bookmark               lag  dlq  next run resumes at
   customers  ok        2026-09-26 06:10 (2h)   updated_at=2026-09-26  —    0    updated_at=2026-09-26
-  orders     FAILED    2026-09-25 23:00 (9h)   lsn=0/3A00F128         —    17   lsn=0/3A00F128
+  orders     FAILED    2026-09-25 23:00 (9h)   lsn=0/3A00F128         412 MiB 17   lsn=0/3A00F128
              └ last error: Sink: deadlock detected (2026-09-26 02:14, run 01a0…)
              └ SLA staleness: last success 32400s ago exceeds max_staleness_secs 21600
              └ DLQ: 17 record(s), oldest 2026-09-26 02:14 (6h)
@@ -81,9 +81,19 @@ What each row reports:
 - **running** — a live run lease (pid / host / since). An *expired* lease
   means a run stopped without releasing it — it most likely crashed — and the
   row is degraded until the next run.
-- **lag** — the source's lag, when the source reports it
-  ([#733](https://github.com/faucet-hq/faucet-stream/issues/733)); `—`
-  otherwise.
+- **lag** — how far the source is behind its head
+  ([#733](https://github.com/faucet-hq/faucet-stream/issues/733)): unread
+  Postgres WAL or MySQL binlog, unconsumed Kafka messages, the age of the oldest
+  unread MongoDB / SQL Server / Kinesis change. The value the source reported
+  when the last run ended is kept on the status marker; `--probe` asks the
+  source again now, from the stored bookmark (the gauge between scheduled runs
+  is stale). `—` for sources without a head. A `max_lag_*`
+  [SLA threshold](sla.md#source-lag) marks the row degraded when exceeded.
+- **batches** — how the last run's sink writes ended: all committed, some
+  rows per row to the DLQ, whole writes to the DLQ (`dlq_all`), or failed
+  ([#737](https://github.com/faucet-hq/faucet-stream/issues/737)). A run that
+  sent writes to the DLQ marks the row degraded even when the DLQ sink cannot be
+  counted here.
 
 Every field is read on its own: an unreachable state backend, run-history
 store or DLQ shows up as a note on the row, never as a failure of the command.

@@ -94,6 +94,8 @@ mod tests {
             duration_ms: 1,
             error: error.map(str::to_owned),
             usage: None,
+            batches: None,
+            source_lag: None,
         }
     }
 

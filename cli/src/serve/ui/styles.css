@@ -1805,6 +1805,10 @@ select {
 .ds-table.health-table th:nth-child(6), .ds-table.health-table td:nth-child(6) { width: auto; }
 .health-bm, .health-resume { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .health-num { font-variant-numeric: tabular-nums; }
+.health-lag { white-space: nowrap; }
+.batch-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.batch-warn { color: var(--queued); }
+.batch-bad { color: var(--fail); }
 .ds-table.health-table tr.health-row:has(+ tr.health-why) td { border-bottom: none; padding-bottom: 4px; }
 .ds-table.health-table tr.health-why td { padding-top: 0; color: var(--ink-dim); font-size: 0.8rem; }
 .ds-table.health-table tr.health-failed td:first-child { box-shadow: inset 3px 0 0 var(--fail); }

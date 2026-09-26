@@ -325,6 +325,27 @@ pub struct InvocationMetrics {
     pub records_read: Option<u64>,
     pub dlq_count: u64,
     pub bookmark: Option<Value>,
+    /// How the sink writes ended (#737); `None` when nothing was written.
+    pub batches: Option<faucet_core::BatchOutcomes>,
+    /// The source's lag at the end of the run (#733), when it reports one.
+    pub source_lag: Option<faucet_core::SourceLag>,
+}
+
+/// Counters one invocation's pipeline fills in and the caller reads afterwards
+/// — on failure too: usage (#704), batch outcomes (#737) and source lag (#733).
+#[derive(Clone, Default)]
+pub(crate) struct RunObservers {
+    pub(crate) meter: Arc<faucet_core::UsageMeter>,
+    pub(crate) batches: Arc<faucet_core::BatchOutcomeCounters>,
+    pub(crate) lag: Arc<faucet_core::LagObserver>,
+}
+
+impl RunObservers {
+    /// Batch outcomes, when any write was attempted.
+    pub(crate) fn batch_outcomes(&self) -> Option<faucet_core::BatchOutcomes> {
+        let b = self.batches.snapshot();
+        (!b.is_empty()).then_some(b)
+    }
 }
 
 /// What [`run_one_invocation`] hands back on success alongside the captured
@@ -1222,7 +1243,8 @@ async fn run_unit(
     // inside `run_one_invocation`, so a failed invocation still gets a usage
     // record: what it read and wrote before failing cost something too.
     let run_id = uuid::Uuid::now_v7().to_string();
-    let meter = Arc::new(faucet_core::UsageMeter::default());
+    let observers = RunObservers::default();
+    let meter = Arc::clone(&observers.meter);
     // Run lease + run-outcome marker (#732 / #735): what `faucet status`
     // reports and what `faucet state` refuses to change under a live run.
     let cancel_seen = cancel.clone();
@@ -1244,7 +1266,7 @@ async fn run_unit(
         suppress_overwrite,
         overwrite_grouped,
         run_id.clone(),
-        Arc::clone(&meter),
+        observers.clone(),
         markers.store.clone(),
     )
     .await;
@@ -1259,6 +1281,10 @@ async fn run_unit(
             },
             duration_ms,
             !cancel_seen.is_cancelled(),
+            crate::pipeline_state::markers::OutcomeExtras {
+                batches: observers.batch_outcomes(),
+                lag: observers.lag.last(),
+            },
         )
         .await;
     let row_id = unit.node.id.clone();
@@ -1291,6 +1317,8 @@ async fn run_unit(
         source_kind: unit.node.source.kind.clone(),
         sink_kind: unit.node.sink.kind.clone(),
         duration_ms,
+        batches: observers.batch_outcomes(),
+        source_lag: observers.lag.last(),
         ..Default::default()
     };
     match result {
@@ -1428,7 +1456,7 @@ fn boxed_run_one_invocation<'a>(
     suppress_overwrite: bool,
     overwrite_grouped: bool,
     run_id: String,
-    meter: Arc<faucet_core::UsageMeter>,
+    observers: RunObservers,
     prebuilt_state: Option<Arc<dyn StateStore>>,
 ) -> futures::future::BoxFuture<'a, CliResult<(Vec<Value>, PipelineStats)>> {
     Box::pin(run_one_invocation(
@@ -1442,7 +1470,7 @@ fn boxed_run_one_invocation<'a>(
         suppress_overwrite,
         overwrite_grouped,
         run_id,
-        meter,
+        observers,
         prebuilt_state,
     ))
 }
@@ -1771,19 +1799,23 @@ async fn build_pipeline<'a>(
     run_id: &str,
     cleanup_scope: Option<Value>,
     suppress_overwrite: bool,
-    meter: Arc<faucet_core::UsageMeter>,
+    observers: RunObservers,
 ) -> CliResult<Pipeline<'a, dyn Source + 'a, dyn Sink + 'a>> {
     let mut pipeline = Pipeline::new(source, sink)
         .with_name(pipeline_name.to_owned())
         .with_row(row_id.to_owned())
         .with_run_id(run_id.to_owned())
-        .with_usage_meter(meter);
+        .with_usage_meter(observers.meter)
+        .with_batch_outcomes(observers.batches)
+        .with_lag_observer(observers.lag);
     if let Some(store) = state {
         pipeline = pipeline.with_state_store(store);
     }
     if let Some(ref dlq_spec) = node.dlq {
         let dlq_cfg = build_dlq_config(dlq_spec).await?;
-        pipeline = pipeline.with_dlq(dlq_cfg);
+        pipeline = pipeline
+            .with_dlq(dlq_cfg)
+            .allow_dlq_all_duplicates(dlq_spec.allow_duplicates_on_dlq_all);
     }
     // Cooperative cancellation: a cancelled token makes the streaming loop stop
     // at the next page boundary and flush the sink (#146 H16). The pipeline takes
@@ -1919,7 +1951,7 @@ async fn run_one_invocation(
     suppress_overwrite: bool,
     overwrite_grouped: bool,
     run_id: String,
-    meter: Arc<faucet_core::UsageMeter>,
+    observers: RunObservers,
     prebuilt_state: Option<Arc<dyn StateStore>>,
 ) -> CliResult<(Vec<Value>, PipelineStats)> {
     // Observability identity for this invocation — created by the caller
@@ -2371,7 +2403,7 @@ async fn run_one_invocation(
         &run_id,
         cleanup_scope,
         suppress_overwrite,
-        Arc::clone(&meter),
+        observers.clone(),
     )
     .await?;
     // ── Lineage: START + heartbeat + terminal ────────────────────────────────
@@ -2637,7 +2669,7 @@ async fn run_one_invocation(
             },
             Err(_) => crate::sla::RunOutcome::Failure,
         };
-        crate::sla::evaluate_post_run(
+        let mut v = crate::sla::evaluate_post_run(
             spec,
             sla_store.as_ref(),
             state_key,
@@ -2646,7 +2678,14 @@ async fn run_one_invocation(
             outcome,
             chrono::Utc::now().timestamp(),
         )
-        .await
+        .await;
+        v.extend(crate::sla::evaluate_lag_post_run(
+            spec,
+            &obs_labels.pipeline,
+            &obs_labels.row,
+            observers.lag.last().as_ref(),
+        ));
+        v
     } else {
         Vec::new()
     };
@@ -3178,6 +3217,9 @@ impl Source for StateKeyOverride {
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
     // Forward the fast-path capabilities so wrapping the source for a per-row
     // state key never silently disables the columnar (#375) or native
     // byte-passthrough (#633) transfer paths.
@@ -3284,6 +3326,9 @@ impl Sink for CapturingSink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
         self.inner.supported_write_modes()
     }
@@ -3360,6 +3405,12 @@ impl Sink for LimitedSink {
     async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
         self.inner.local_outputs().await
     }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
+    fn dedups_by_key(&self) -> bool {
+        self.inner.dedups_by_key()
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);
         if remaining == 0 {
@@ -3395,6 +3446,9 @@ impl CountingSink {
 impl Sink for CountingSink {
     fn connector_name(&self) -> &'static str {
         "dry-run"
+    }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::Atomic
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.seen.fetch_add(records.len(), Ordering::Relaxed);
@@ -4033,7 +4087,7 @@ mod tests {
             false,
             false,
             "size".to_string(),
-            Arc::new(faucet_core::UsageMeter::default()),
+            RunObservers::default(),
             None,
         );
         let size = std::mem::size_of_val(&fut);
@@ -5451,6 +5505,7 @@ matrix:
             max_failures_per_page: Some(7),
             max_failures_total: Some(42),
             include_original_payload: false,
+            allow_duplicates_on_dlq_all: false,
         };
         let cfg = build_dlq_config(&spec).await.unwrap();
         assert!(matches!(cfg.on_batch_error, OnBatchError::DlqAll));
@@ -5608,6 +5663,7 @@ matrix:
             faucet_core::ReplayGuarantee::NonDeterministic
         );
         assert_eq!(ov.capture_resume_position().await.unwrap(), None);
+        assert_eq!(ov.lag().await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -5720,6 +5776,10 @@ matrix:
         // inner sink's delivery semantics.
         assert!(sink.supports_idempotent_writes());
         assert!(sink.dedups_by_key());
+        assert_eq!(
+            sink.batch_atomicity(),
+            faucet_core::BatchAtomicity::BestEffort
+        );
         assert_eq!(
             sink.sink_guarantee(),
             faucet_core::SinkGuarantee::AtomicWatermark

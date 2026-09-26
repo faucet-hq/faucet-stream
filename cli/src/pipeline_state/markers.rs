@@ -9,6 +9,13 @@ use faucet_core::StateStore;
 use futures::future::BoxFuture;
 use std::sync::Arc;
 
+/// What the run reported beyond its result, kept on the outcome marker.
+#[derive(Debug, Clone, Default)]
+pub struct OutcomeExtras {
+    pub batches: Option<faucet_core::BatchOutcomes>,
+    pub lag: Option<faucet_core::SourceLag>,
+}
+
 /// The bracket's state between `begin` and `finish`.
 #[derive(Default)]
 pub struct RunMarkers {
@@ -45,6 +52,7 @@ impl RunMarkers {
         outcome: Result<u64, (String, String)>,
         duration_ms: u64,
         record: bool,
+        extras: OutcomeExtras,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async move {
             if let (Some(store), true) = (&self.store, record) {
@@ -62,6 +70,8 @@ impl RunMarkers {
                         duration_ms,
                         error_kind,
                         error,
+                        batches: extras.batches,
+                        lag: extras.lag,
                     },
                 )
                 .await;
@@ -125,6 +135,7 @@ mod tests {
             Err(("Sink".into(), "boom".into())),
             5,
             true,
+            Default::default(),
         )
         .await;
         assert!(lease::read(store.as_ref(), "p::r").await.unwrap().is_none());
@@ -132,21 +143,36 @@ mod tests {
         assert_eq!(o.last_failure.unwrap().error_kind.as_deref(), Some("Sink"));
 
         let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-2", false).await;
-        m.finish("p::r".into(), "run-2".into(), Ok(3), 5, true)
+        let extras = OutcomeExtras {
+            batches: Some(faucet_core::BatchOutcomes {
+                attempted: 2,
+                committed: 1,
+                dlq_all: 1,
+                ..Default::default()
+            }),
+            lag: Some(faucet_core::SourceLag::bytes(10)),
+        };
+        m.finish("p::r".into(), "run-2".into(), Ok(3), 5, true, extras)
             .await;
-        assert_eq!(
-            outcome::read(store.as_ref(), "p::r")
-                .await
-                .unwrap()
-                .last_success
-                .unwrap()
-                .records,
-            3
-        );
+        let success = outcome::read(store.as_ref(), "p::r")
+            .await
+            .unwrap()
+            .last_success
+            .unwrap();
+        assert_eq!(success.records, 3);
+        assert_eq!(success.batches.unwrap().dlq_all, 1);
+        assert_eq!(success.lag, Some(faucet_core::SourceLag::bytes(10)));
 
         let m = RunMarkers::begin(Some(Arc::clone(&store)), "p::r", "run-3", true).await;
-        m.finish("p::r".into(), "run-3".into(), Ok(9), 5, false)
-            .await;
+        m.finish(
+            "p::r".into(),
+            "run-3".into(),
+            Ok(9),
+            5,
+            false,
+            Default::default(),
+        )
+        .await;
         let o = outcome::read(store.as_ref(), "p::r").await.unwrap();
         assert_eq!(
             o.last_success.unwrap().run_id,
@@ -156,10 +182,24 @@ mod tests {
 
         RunMarkers::begin(None, "p::r", "x", true)
             .await
-            .finish("p::r".into(), "x".into(), Ok(1), 1, true)
+            .finish(
+                "p::r".into(),
+                "x".into(),
+                Ok(1),
+                1,
+                true,
+                Default::default(),
+            )
             .await;
         RunMarkers::default()
-            .finish("p::r".into(), "x".into(), Ok(1), 1, true)
+            .finish(
+                "p::r".into(),
+                "x".into(),
+                Ok(1),
+                1,
+                true,
+                Default::default(),
+            )
             .await;
     }
 }

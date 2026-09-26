@@ -2115,6 +2115,22 @@ components:
         note: { type: string, nullable: true }
         bookmark_rewound: { type: boolean }
         token_rewound: { type: boolean }
+    BatchOutcomes:
+      type: object
+      description: "How an invocation's sink writes ended (#737). `attempted` is the sum of the other four."
+      properties:
+        attempted: { type: integer }
+        committed: { type: integer, description: Writes where every row committed }
+        dlq_partial: { type: integer, description: Writes where some rows failed per row and went to the DLQ }
+        dlq_all: { type: integer, description: "Failed writes routed whole to the DLQ by `on_batch_error: dlq_all`" }
+        failed: { type: integer, description: Failed writes whose error propagated }
+    SourceLag:
+      type: object
+      description: "Distance from the source's head (#733), in the units the source can measure."
+      properties:
+        bytes: { type: integer, description: Unread change log (Postgres WAL, MySQL binlog) }
+        events: { type: integer, description: Unconsumed messages or change transactions }
+        seconds: { type: number, description: Age of the oldest unread change }
     InvocationRecord:
       type: object
       properties:
@@ -2124,6 +2140,8 @@ components:
         records_written: { type: integer }
         duration_ms: { type: integer, description: "Wall-clock duration of this invocation in milliseconds (#645)." }
         error: { type: string, nullable: true }
+        batches: { $ref: "#/components/schemas/BatchOutcomes" }
+        source_lag: { $ref: "#/components/schemas/SourceLag" }
       example:
         row_id: orders_to_warehouse
         parent_record_key: example
@@ -3343,7 +3361,15 @@ components:
             agreement: { type: string, enum: [agree, sink_ahead, state_ahead, no_token, not_probed] }
             trusted: { type: string, enum: [state, sink] }
             probe_error: { type: string }
-        lag: { description: "Source lag when the source reports it (#733); null otherwise", nullable: true }
+        lag:
+          nullable: true
+          description: "How far the source is behind its head (#733): reported when the last run ended, or queried now with `probe=true`. Null when the source has no notion of a head."
+          allOf: [{ $ref: "#/components/schemas/SourceLag" }]
+          properties:
+            human: { type: string, description: "e.g. `412 MiB · 3m 20s`" }
+            measured: { type: string, enum: [last_run, probe] }
+            at: { type: string, format: date-time }
+        batches: { $ref: "#/components/schemas/BatchOutcomes" }
         dlq:
           type: object
           properties:

@@ -232,6 +232,19 @@ pub trait Source: Send + Sync {
         Ok(None)
     }
 
+    /// How far this source is behind its head (#733) — unread WAL bytes, binlog
+    /// distance, unconsumed messages, or the age of the oldest unread change.
+    ///
+    /// The pipeline polls it at page boundaries and exports
+    /// `faucet_source_lag_{bytes,events,seconds}`; `faucet status --probe`
+    /// asks for it on demand after applying the stored bookmark. It must be a
+    /// cheap, read-only query. An `Err` is logged once and reported as no lag;
+    /// it never fails a run. Default: `Ok(None)` (no notion of a head).
+    /// Decorators must forward this.
+    async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
+        Ok(None)
+    }
+
     /// Whether this source **deterministically replays** the same page sequence
     /// from a given bookmark — the requirement for the atomic-watermark
     /// effectively-once path (a non-deterministic replay could cause the pipeline
@@ -451,6 +464,19 @@ pub trait Sink: Send + Sync {
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         self.write_batch(records).await?;
         Ok(records.iter().map(|_| Ok(())).collect())
+    }
+
+    /// What a failed batch write leaves behind (#737): nothing
+    /// ([`Atomic`](crate::BatchAtomicity::Atomic)), per-row outcomes with
+    /// nothing committed on an outer `Err`
+    /// ([`PerRow`](crate::BatchAtomicity::PerRow)), or possibly some rows
+    /// ([`BestEffort`](crate::BatchAtomicity::BestEffort), the default).
+    ///
+    /// `on_batch_error: dlq_all` is refused on a best-effort sink unless it
+    /// writes by key or the user opts in to the duplicates. Decorators must
+    /// forward this.
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        crate::dlq::BatchAtomicity::BestEffort
     }
 
     /// Whether this sink can consume **columnar** (`arrow::RecordBatch`) writes

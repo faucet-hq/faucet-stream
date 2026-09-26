@@ -25,6 +25,12 @@ pub struct OutcomeEvent {
     pub error_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// How the run's sink writes ended (#737).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batches: Option<faucet_core::BatchOutcomes>,
+    /// The source's lag when the run ended (#733).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<faucet_core::SourceLag>,
 }
 
 /// The stored marker.
@@ -118,6 +124,8 @@ mod tests {
             duration_ms: 10,
             error_kind: err.map(|_| "sink".into()),
             error: err.map(str::to_owned),
+            batches: None,
+            lag: None,
         }
     }
 

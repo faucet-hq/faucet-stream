@@ -252,6 +252,9 @@ impl Source for TransformingSource {
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
+    async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
 
     fn connector_name(&self) -> &'static str {
         self.inner.connector_name()
@@ -555,6 +558,7 @@ mod tests {
             wrapped.capture_resume_position().await.unwrap(),
             Some(json!("captured"))
         );
+        assert_eq!(wrapped.lag().await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -312,6 +312,40 @@ pub fn source_node_count(cfg: &PipelineConfig) -> usize {
         .count()
 }
 
+/// The graph's only source node as `(kind, config)`, or `None` when it has
+/// zero or several (a sink's position cannot then be attributed to one source).
+pub fn single_source_node(cfg: &PipelineConfig) -> CliResult<Option<(String, Value)>> {
+    let spec = &cfg.pipeline;
+    let sources: Vec<(&String, &NodeSpec)> = spec
+        .nodes
+        .iter()
+        .filter(|(_, n)| matches!(n, NodeSpec::Source { .. }))
+        .collect();
+    let [
+        (
+            id,
+            NodeSpec::Source {
+                template,
+                kind,
+                config,
+            },
+        ),
+    ] = sources.as_slice()
+    else {
+        return Ok(None);
+    };
+    let (k, c) = resolve_connector(
+        &spec.sources,
+        &spec.source,
+        template.as_deref(),
+        kind.as_deref(),
+        config.as_ref(),
+        id,
+        "source",
+    )?;
+    Ok(Some((k, c)))
+}
+
 /// Build a [`faucet_core::Topology`] from the config's `pipeline.nodes` /
 /// `edges` block, with default run options (no preview, process-start clock).
 pub async fn build_topology(cfg: &PipelineConfig, auth: &AuthCatalog) -> CliResult<Topology> {
@@ -487,6 +521,21 @@ async fn build_topology_inner(
                 } else {
                     let sink = build_sink(&k, c.clone(), auth).await?;
                     record_identity(&mut identities, id, &k, c, sink.dataset_uri());
+                    if let Some(dlq) = &spec.dlq {
+                        faucet_core::check_dlq_all_policy(
+                            sink.as_ref(),
+                            match dlq.on_batch_error {
+                                crate::config::OnBatchErrorSpec::Propagate => {
+                                    faucet_core::OnBatchError::Propagate
+                                }
+                                crate::config::OnBatchErrorSpec::DlqAll => {
+                                    faucet_core::OnBatchError::DlqAll
+                                }
+                            },
+                            dlq.allow_duplicates_on_dlq_all,
+                        )
+                        .map_err(|e| CliError::Config(format!("node '{id}': {e}")))?;
+                    }
                     sink
                 };
                 let sink = match opts.limit {
@@ -863,6 +912,7 @@ pub async fn run_topology(
                     Err((kind.clone(), e.to_string())),
                     started.elapsed().as_millis() as u64,
                     record,
+                    Default::default(),
                 )
                 .await;
             }
@@ -913,8 +963,15 @@ pub async fn run_topology(
     let elapsed = started.elapsed().as_millis() as u64;
     for (id, base, m) in markers {
         let outcome = node_outcome(&id, &reported, &failures);
-        m.finish(base, run_id.clone(), outcome, elapsed, record)
-            .await;
+        m.finish(
+            base,
+            run_id.clone(),
+            outcome,
+            elapsed,
+            record,
+            Default::default(),
+        )
+        .await;
     }
     Ok(build_summary(&reported.result.per_sink, &failures))
 }

@@ -12,7 +12,7 @@ name that no longer exists in the code.
 | Dashboard (uid) | Focus |
 |-----------------|-------|
 | `faucet-pipeline-overview` | Run outcomes + duration percentiles, source/sink throughput and errors by connector, transform in/out, bookmark staleness, effectively-once page skips, state-store traffic. `faucet_build_info` annotates version rollouts. |
-| `faucet-reliability` | Retries / give-ups / circuit-breaker state, DLQ traffic, poison rows, quality quarantines, contract violations, schema drift, PII masking activity, SLA violations, backfill progress. |
+| `faucet-reliability` | Retries / give-ups / circuit-breaker state, DLQ traffic, poison rows, quality quarantines, contract violations, schema drift, PII masking activity, SLA violations, backfill progress, source lag, sink batch outcomes. |
 | `faucet-schedule` | Scheduled-run outcomes, heartbeat staleness, next-tick countdown, lateness p95, overlaps, consecutive-failure streak. |
 | `faucet-serve` | Control-plane request rate/latency, run queue, terminal statuses, history degradation, idempotency replays, cluster claims/reclaims, trigger health. |
 
@@ -25,7 +25,9 @@ Alert rules (`observability/prometheus/alerts.yml`):
 |-------|-----------|----------|
 | `FaucetPipelineErrorRateSpike` | >50% of a pipeline's runs fail over 15 m | critical |
 | `FaucetNoBookmarkProgress` (+`Critical`) | no durable bookmark progress for 1 h / 6 h | warning / critical |
-| `FaucetSlaViolations` | any freshness/volume SLA violation in 1 h | warning |
+| `FaucetSlaViolations` | any freshness/volume/lag SLA violation in 1 h | warning |
+| `FaucetSourceLagHigh` | a source reports > 1 GiB unread or an oldest unread change > 1 h, for 15 m | warning |
+| `FaucetBatchesRoutedWhole` | a sink write was routed whole to the DLQ (`dlq_all`) or failed in the last hour | warning |
 | `FaucetCircuitBreakerOpen` | the resilience breaker stays open 5 m | critical |
 | `FaucetStuckScheduler` | schedule heartbeat silent for 90 s | critical |
 | `FaucetScheduleRunLateness` | tick lateness p95 > 60 s for 15 m | warning |

@@ -172,6 +172,8 @@ mod tests {
                 duration_ms: 0,
                 error: None,
                 usage: None,
+                batches: None,
+                source_lag: None,
             }],
             error: (status == RunStatus::Failed).then(|| "boom".to_string()),
             idempotency_key: None,

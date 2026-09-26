@@ -341,10 +341,22 @@ pub async fn probe_roots(
             .unwrap_or_default();
         #[cfg(not(feature = "policy"))]
         let policy_probes: Vec<ProbeOut> = Vec::new();
+        let lag_sla = sla.as_ref().map(|(s, _)| s.clone());
+        let lag_key = crate::executor::build_state_key(pipeline_name, &node.id, None);
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+            let lag = lag_probe(
+                &source,
+                state.as_ref(),
+                &lag_key,
+                lag_sla.as_ref(),
+                &auth,
+                &ctx,
+            )
+            .await;
             let mut inv =
                 probe_invocation(id, source, sink, state, &auth, &ctx, sla, profiling).await;
+            inv.probes.extend(lag);
             inv.delivery = Some(guarantee);
             inv.probes.extend(policy_probes);
             inv
@@ -355,6 +367,68 @@ pub async fn probe_roots(
         out.push(h.await.expect("doctor probe task panicked"));
     }
     out
+}
+
+/// How far a lag-reporting source is behind its head (#733), measured from
+/// the row's stored bookmark — the position the next run resumes from. Fails
+/// only when an `sla:` `max_lag_*` threshold is exceeded; the reading is the
+/// probe's note either way.
+pub async fn lag_probe(
+    source: &ConnectorSpec,
+    state: Option<&StateStoreSpec>,
+    base_key: &str,
+    sla: Option<&crate::sla::SlaSpec>,
+    auth: &AuthCatalog,
+    ctx: &CheckContext,
+) -> Option<ProbeOut> {
+    if !crate::registry::source_reports_lag(&source.kind) {
+        return None;
+    }
+    let start = Instant::now();
+    let measured = tokio::time::timeout(ctx.timeout, async {
+        let src = build_source(&source.kind, source.config.clone(), auth, None).await?;
+        if let Some(spec) = state {
+            let store = build_state_store(spec).await?;
+            if let Some(v) = store.get(base_key).await? {
+                let (bookmark, _) = crate::pipeline_state::ops::decode_bookmark(&v);
+                if let Some(bm) = bookmark {
+                    src.apply_start_bookmark(bm).await?;
+                }
+            }
+        }
+        Ok::<_, CliError>(src.lag().await?)
+    })
+    .await;
+    let probe = match measured {
+        Err(_) => Probe::fail("lag", start.elapsed(), "lag query timed out"),
+        Ok(Err(e)) => Probe::fail(
+            "lag",
+            start.elapsed(),
+            crate::secrets::registry::redact(&e.to_string()).into_owned(),
+        ),
+        Ok(Ok(None)) => Probe::skip("lag", "the source reported no lag"),
+        Ok(Ok(Some(lag))) => {
+            let breaches = sla
+                .map(|s| crate::sla::eval::evaluate_lag(s, &lag))
+                .unwrap_or_default();
+            let mut p = if breaches.is_empty() {
+                Probe::pass("lag", start.elapsed())
+            } else {
+                Probe::fail(
+                    "lag",
+                    start.elapsed(),
+                    breaches
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            };
+            p.hint = Some(format!("behind by {}", lag.human()));
+            p
+        }
+    };
+    Some(ProbeOut::from_probe("source", source.kind.clone(), probe))
 }
 
 /// Total number of failed probes across all invocations.
@@ -917,5 +991,54 @@ pipeline:
         );
         let err = super::run(offline_args(path)).await;
         assert!(matches!(err, Err(CliError::DoctorFailed { failed }) if failed >= 1));
+    }
+
+    fn spec(kind: &str, config: serde_json::Value) -> ConnectorSpec {
+        ConnectorSpec {
+            kind: kind.into(),
+            config,
+            transforms: None,
+            inherit_transforms: true,
+            status: None,
+            tags: Vec::new(),
+            complete_for: None,
+            attributes: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lag_probe_only_asks_sources_with_a_head() {
+        let auth = AuthCatalog::new();
+        let ctx = CheckContext {
+            timeout: Duration::from_millis(1500),
+        };
+        let csv = spec("csv", serde_json::json!({"path": "in.csv"}));
+        assert!(
+            lag_probe(&csv, None, "p::r", None, &auth, &ctx)
+                .await
+                .is_none()
+        );
+
+        #[cfg(feature = "source-kafka")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateStoreSpec {
+                kind: "file".into(),
+                config: serde_json::json!({"path": dir.path()}),
+            };
+            let kafka = spec(
+                "kafka",
+                serde_json::json!({"brokers": "127.0.0.1:1", "topics": ["t"], "group_id": "g"}),
+            );
+            let p = lag_probe(&kafka, Some(&state), "p::r", None, &auth, &ctx)
+                .await
+                .expect("a lag probe for kafka");
+            assert_eq!(p.name, "lag");
+            assert!(
+                matches!(p.status, ProbeStatus::Fail { .. }),
+                "{:?}",
+                p.status
+            );
+        }
     }
 }

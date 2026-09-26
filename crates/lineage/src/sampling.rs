@@ -261,6 +261,9 @@ impl Sink for SamplingSink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
         self.inner.supported_write_modes()
     }
@@ -508,6 +511,9 @@ impl Source for SamplingSource {
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +684,7 @@ mod tests {
         let s = SamplingSink::new(Box::new(IdemSink), Arc::clone(&shared));
         assert!(s.supports_idempotent_writes());
         assert!(s.dedups_by_key());
+        assert_eq!(s.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
         assert_eq!(
             s.sink_guarantee(),
             faucet_core::SinkGuarantee::AtomicWatermark
@@ -747,6 +754,7 @@ mod tests {
             s.capture_resume_position().await.unwrap(),
             Some(json!("pos"))
         );
+        assert_eq!(s.lag().await.unwrap(), None);
     }
 
     // ---- #639: native byte-passthrough must survive lineage/catalog sampling ----

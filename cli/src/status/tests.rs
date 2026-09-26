@@ -50,6 +50,8 @@ fn ev(ago_secs: i64, err: Option<&str>) -> OutcomeEvent {
         duration_ms: 5,
         error_kind: err.map(|_| "Sink".into()),
         error: err.map(str::to_owned),
+        batches: None,
+        lag: None,
     }
 }
 
@@ -383,4 +385,91 @@ fn health_codes_and_bookmark_text() {
     assert_eq!(bookmark_text(&json!({"a": 1, "b": "x"})), "a=1 b=x");
     assert_eq!(bookmark_text(&json!("s")), "s");
     assert_eq!(bookmark_text(&json!(5)), "5");
+}
+
+#[tokio::test]
+async fn last_run_batches_and_lag_surface_and_breach_the_lag_sla() {
+    let t = target("sla:\n  max_lag_bytes: 1000\n", "");
+    let (s, store) = stores(&t).await;
+    let auth = AuthCatalog::new();
+    let mut e = ev(60, None);
+    e.batches = Some(faucet_core::BatchOutcomes {
+        attempted: 4,
+        committed: 2,
+        dlq_partial: 1,
+        dlq_all: 1,
+        failed: 0,
+    });
+    e.lag = Some(faucet_core::SourceLag::bytes(4096));
+    put_outcome(store.as_ref(), "orders::a", vec![e]).await;
+    let r = assemble(&t, Ok(&s), &inputs(&auth)).await.unwrap();
+    let row = &r.rows[0];
+    assert_eq!(row.batches.unwrap().dlq_all, 1);
+    let lag = row.lag.as_ref().unwrap();
+    assert_eq!(lag.measured, "last_run");
+    assert_eq!(lag.lag.bytes, Some(4096));
+    assert_eq!(lag.human, "4 KiB");
+    assert_eq!(row.health, Health::Degraded);
+    assert!(row.sla.iter().any(|v| v.kind == "lag"), "{:?}", row.sla);
+    assert!(
+        row.reasons
+            .iter()
+            .any(|r| r.contains("went to the DLQ whole")),
+        "{:?}",
+        row.reasons
+    );
+    let text = render::render(&r);
+    assert!(text.contains("4 KiB"), "{text}");
+    assert!(text.contains("at the end of the last run"), "{text}");
+    assert!(text.contains("1 partly"), "{text}");
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(json["rows"][0]["lag"]["bytes"], 4096);
+    assert_eq!(json["rows"][0]["batches"]["dlq_partial"], 1);
+}
+
+#[test]
+fn batch_note_names_every_unclean_outcome() {
+    let all = faucet_core::BatchOutcomes {
+        attempted: 3,
+        committed: 3,
+        ..Default::default()
+    };
+    assert_eq!(
+        batch_note(&all),
+        "last run: of 3 sink write(s), all committed"
+    );
+    let failed = faucet_core::BatchOutcomes {
+        attempted: 2,
+        committed: 1,
+        failed: 1,
+        ..Default::default()
+    };
+    assert!(batch_note(&failed).ends_with("1 failed"));
+}
+
+#[tokio::test]
+async fn probe_asks_a_lag_capable_source_and_reports_failure_as_unreadable() {
+    let text = r#"version: 1
+name: cdc
+pipeline:
+  source: { type: kafka, config: { brokers: "127.0.0.1:1", topics: [t], group_id: g } }
+  sink: { type: stdout, config: {} }
+  state: { type: file, config: { path: ./unused-state } }
+"#;
+    let cfg = PipelineConfig::from_text(text, Path::new("t.yaml")).unwrap();
+    let t = PipelineTarget::resolve(&cfg, "cdc").unwrap();
+    let (s, store) = stores(&t).await;
+    let base = t.base_key(&t.rows[0].id);
+    put_outcome(store.as_ref(), &base, vec![ev(10, None)]).await;
+    let auth = AuthCatalog::new();
+    let mut i = inputs(&auth);
+    i.probe = true;
+    let r = assemble(&t, Ok(&s), &i).await.unwrap();
+    if crate::registry::source_kinds().contains(&"kafka") {
+        assert!(
+            r.rows[0].errors.iter().any(|e| e.starts_with("lag probe:")),
+            "{:?}",
+            r.rows[0].errors
+        );
+    }
 }

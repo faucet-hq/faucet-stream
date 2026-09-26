@@ -306,6 +306,9 @@ pub struct ScriptedSink {
     write_delay: Option<Duration>,
     /// Log writes as [`Event::DlqWrite`] — this instance is the DLQ sink.
     dlq: bool,
+    /// What a failed write leaves behind (#737). The double lands nothing on
+    /// an outer failure, so it is truthfully per-row unless told otherwise.
+    atomicity: faucet_core::BatchAtomicity,
 }
 
 impl ScriptedSink {
@@ -326,6 +329,7 @@ impl ScriptedSink {
             tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
             write_delay: None,
             dlq: false,
+            atomicity: faucet_core::BatchAtomicity::PerRow,
         }
     }
 
@@ -338,6 +342,13 @@ impl ScriptedSink {
     /// before the bookmark that covers them.
     pub fn as_dlq(mut self) -> Self {
         self.dlq = true;
+        self
+    }
+
+    /// Declare the sink best-effort (#737): a failed write may have landed
+    /// some rows, so `on_batch_error: dlq_all` must be refused against it.
+    pub fn best_effort(mut self) -> Self {
+        self.atomicity = faucet_core::BatchAtomicity::BestEffort;
         self
     }
 
@@ -549,6 +560,10 @@ impl Sink for ScriptedSink {
 
     fn dedups_by_key(&self) -> bool {
         self.keyed
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.atomicity
     }
 
     async fn write_batch_idempotent(

@@ -15,6 +15,12 @@ pub enum SlaViolation {
     MinRows { rows: u64, min: u64 },
     /// A successful run's volume is anomalous against the rolling baseline.
     Volume { rows: u64, detail: String },
+    /// The source's lag exceeds a `max_lag_*` threshold (#733).
+    Lag {
+        unit: &'static str,
+        observed: String,
+        max: u64,
+    },
 }
 
 impl SlaViolation {
@@ -25,6 +31,7 @@ impl SlaViolation {
             SlaViolation::Staleness { .. } => "staleness",
             SlaViolation::MinRows { .. } => "min_rows",
             SlaViolation::Volume { .. } => "volume",
+            SlaViolation::Lag { .. } => "lag",
         }
     }
 }
@@ -46,6 +53,11 @@ impl fmt::Display for SlaViolation {
             SlaViolation::Volume { rows, detail } => {
                 write!(f, "run volume {rows} is anomalous: {detail}")
             }
+            SlaViolation::Lag {
+                unit,
+                observed,
+                max,
+            } => write!(f, "source lag {observed} exceeds max_lag_{unit} {max}"),
         }
     }
 }
@@ -88,6 +100,40 @@ pub fn evaluate_failure(spec: &SlaSpec, prior: &SlaState, now_unix: i64) -> Vec<
     }
 }
 
+/// `max_lag_*` thresholds against one lag reading (#733). A unit the source
+/// does not report is not checked.
+pub fn evaluate_lag(spec: &SlaSpec, lag: &faucet_core::SourceLag) -> Vec<SlaViolation> {
+    let mut out = Vec::new();
+    if let (Some(max), Some(b)) = (spec.max_lag_bytes, lag.bytes)
+        && b > max
+    {
+        out.push(SlaViolation::Lag {
+            unit: "bytes",
+            observed: format!("{b} bytes"),
+            max,
+        });
+    }
+    if let (Some(max), Some(e)) = (spec.max_lag_events, lag.events)
+        && e > max
+    {
+        out.push(SlaViolation::Lag {
+            unit: "events",
+            observed: format!("{e} events"),
+            max,
+        });
+    }
+    if let (Some(max), Some(s)) = (spec.max_lag_seconds, lag.seconds)
+        && s > max as f64
+    {
+        out.push(SlaViolation::Lag {
+            unit: "seconds",
+            observed: format!("{s:.0}s"),
+            max,
+        });
+    }
+    out
+}
+
 /// Run the configured detector; `Some(detail)` when `rows` is anomalous
 /// against `baseline`. Callers guarantee `baseline.len() >= min_history >= 2`.
 /// The math is the shared [`faucet_core::anomaly`] module (column profiling
@@ -111,6 +157,9 @@ mod tests {
         SlaSpec {
             max_staleness_secs: staleness,
             min_rows_per_run: min_rows,
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: va,
         }
     }
@@ -244,5 +293,38 @@ mod tests {
         let v = evaluate_success(&s, &prior, 10);
         let kinds: Vec<_> = v.iter().map(|x| x.kind()).collect();
         assert_eq!(kinds, vec!["min_rows", "volume"]);
+    }
+
+    #[test]
+    fn lag_thresholds_fire_per_reported_unit() {
+        let mut spec = spec(None, None, None);
+        spec.max_lag_bytes = Some(100);
+        spec.max_lag_events = Some(10);
+        spec.max_lag_seconds = Some(60);
+        let over = faucet_core::SourceLag {
+            bytes: Some(101),
+            events: Some(11),
+            seconds: Some(61.0),
+        };
+        let v = evaluate_lag(&spec, &over);
+        assert_eq!(v.len(), 3);
+        assert!(v.iter().all(|x| x.kind() == "lag"));
+        assert_eq!(
+            v[0].to_string(),
+            "source lag 101 bytes exceeds max_lag_bytes 100"
+        );
+        assert!(v[1].to_string().contains("max_lag_events 10"));
+        assert!(v[2].to_string().contains("61s"));
+        let under = faucet_core::SourceLag {
+            bytes: Some(100),
+            events: None,
+            seconds: Some(60.0),
+        };
+        assert!(evaluate_lag(&spec, &under).is_empty());
+        assert!(evaluate_lag(&spec_no_lag(), &over).is_empty());
+    }
+
+    fn spec_no_lag() -> SlaSpec {
+        spec(Some(10), None, None)
     }
 }

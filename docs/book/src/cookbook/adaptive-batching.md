@@ -73,7 +73,8 @@ pipeline:
         type: service_account_key
         config:
           json: ${env:GCP_KEY_JSON}
-      batch_size: 1000   # starting write size; the controller tunes this
+      batch_size: 0      # one insertAll per write — the controller picks the size,
+                         # and a failed write lands nothing (dlq_all needs that)
 
   dlq:
     sink:
@@ -181,7 +182,9 @@ The error signal comes from per-row outcomes reported via the DLQ path
 (`Sink::write_batch_partial`). If no `dlq:` block is present, the controller
 sees zero errors regardless of the sink response — only `target_latency_ms`
 can drive shrinks. Add a `dlq:` block with `on_batch_error: dlq_all` if you
-want the controller to react to sink-side write errors.
+want the controller to react to sink-side write errors — on a sink whose failed
+write is all-or-nothing (see [batch atomicity](dlq.md#batch-atomicity-and-dlq_all)),
+which for BigQuery means `batch_size: 0`.
 
 ### Within-page ceiling: `max` is capped at the source page size
 

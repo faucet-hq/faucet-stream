@@ -39,6 +39,7 @@ pub mod error;
 pub mod file_format;
 pub mod idempotency;
 pub mod join;
+pub mod lag;
 pub mod local_outputs;
 #[cfg(feature = "masking")]
 pub mod masking;
@@ -108,8 +109,9 @@ pub use diff::{
 };
 pub use discover::{DatasetDescriptor, columns_to_schema, nullable_type, sql_type_to_json_schema};
 pub use dlq::{
-    DlqConfig, DlqReason, DlqStats, EnvelopeError, OnBatchError, UnwrappedEnvelope, build_envelope,
-    unwrap_envelope,
+    BatchAtomicity, BatchOutcome, BatchOutcomeCounters, BatchOutcomes, DlqConfig, DlqReason,
+    DlqStats, EnvelopeError, OnBatchError, UnwrappedEnvelope, build_envelope, check_dlq_all_policy,
+    dlq_all_is_safe, dlq_all_refusal, unwrap_envelope,
 };
 pub use drift::{
     ColumnChange, OnDrift, OnIncompatible, SchemaDiff, SchemaDriftPolicy, SchemaDriftSpec,
@@ -127,6 +129,7 @@ pub use idempotency::{
 pub use join::{
     HashJoin, JoinConfig, JoinMode, JoinStats, KeyNormalize, OnCollision, OnDuplicate, Projection,
 };
+pub use lag::{LagObserver, SourceLag};
 pub use local_outputs::{LocalOutput, LocalOutputLog, probe_pre_existing};
 pub use metadata::{
     CompiledMetadata, MetadataColumn, MetadataColumnsSpec, MetadataContext, MetadataSink,

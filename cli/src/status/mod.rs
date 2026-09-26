@@ -173,6 +173,30 @@ pub struct ChildrenStatus {
     pub latest_failure: Option<RunRef>,
 }
 
+/// A source-lag reading (#733).
+#[derive(Debug, Clone, Serialize)]
+pub struct LagStatus {
+    #[serde(flatten)]
+    pub lag: faucet_core::SourceLag,
+    /// `412 MiB · 3m 20s`.
+    pub human: String,
+    /// `last_run` (reported when the last run ended) or `probe` (asked now,
+    /// `--probe`).
+    pub measured: &'static str,
+    pub at: DateTime<Utc>,
+}
+
+impl LagStatus {
+    fn new(lag: faucet_core::SourceLag, measured: &'static str, at: DateTime<Utc>) -> Self {
+        Self {
+            human: lag.human(),
+            lag,
+            measured,
+            at,
+        }
+    }
+}
+
 /// One row's status.
 #[derive(Debug, Clone, Serialize)]
 pub struct RowStatus {
@@ -197,7 +221,10 @@ pub struct RowStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exactly_once: Option<ExactlyOnceStatus>,
     /// Source lag, when the source reports it (#733); `null` otherwise.
-    pub lag: Option<Value>,
+    pub lag: Option<LagStatus>,
+    /// How the last run's sink writes ended (#737).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batches: Option<faucet_core::BatchOutcomes>,
     pub dlq: DlqStatus,
     pub sla: Vec<SlaVerdict>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,9 +370,20 @@ fn sla_verdicts(
     spec: &crate::sla::SlaSpec,
     state: &crate::sla::SlaState,
     last_success: Option<&RunRef>,
+    lag: Option<&faucet_core::SourceLag>,
     now: DateTime<Utc>,
 ) -> Vec<SlaVerdict> {
     let mut out = Vec::new();
+    if let Some(lag) = lag {
+        out.extend(
+            crate::sla::eval::evaluate_lag(spec, lag)
+                .into_iter()
+                .map(|v| SlaVerdict {
+                    kind: "lag",
+                    message: v.to_string(),
+                }),
+        );
+    }
     if let (Some(max), Some(last)) = (spec.max_staleness_secs, last_success) {
         let since = (now - last.at).num_seconds().max(0) as u64;
         if since > max {
@@ -682,6 +720,7 @@ async fn row_status(
         bookmark_age_secs: None,
         exactly_once: None,
         lag: None,
+        batches: None,
         dlq: dlq::backlog(row.dlq.as_ref(), &target.pipeline, &row.id),
         sla: Vec::new(),
         profiling: None,
@@ -774,8 +813,16 @@ async fn row_status(
             ));
         }
     }
-    if let Some(spec) = &row.sla {
-        st.sla = sla_verdicts(spec, &facts.sla, st.last_success.as_ref(), now);
+    let last_event = match (
+        facts.outcomes.last_success.as_ref(),
+        facts.outcomes.last_failure.as_ref(),
+    ) {
+        (Some(s), Some(f)) => Some(if f.at > s.at { f } else { s }),
+        (s, f) => s.or(f),
+    };
+    if let Some(e) = last_event {
+        st.batches = e.batches;
+        st.lag = e.lag.map(|l| LagStatus::new(l, "last_run", e.at));
     }
     if row.profiling {
         st.profiling = profiling_status(store.as_ref(), &base, &mut errors).await;
@@ -835,6 +882,31 @@ async fn row_status(
         }
     }
 
+    if inputs.probe
+        && let Some((kind, _)) = &row.source
+        && crate::registry::source_reports_lag(kind)
+    {
+        match crate::pipeline_state::ops::probe_lag(row, st.resume_bookmark.as_ref(), inputs.auth)
+            .await
+        {
+            Ok(Some(l)) => st.lag = Some(LagStatus::new(l, "probe", now)),
+            Ok(None) => {}
+            Err(e) => errors.push(format!(
+                "lag probe: {}",
+                crate::secrets::registry::redact(&e.to_string())
+            )),
+        }
+    }
+    if let Some(spec) = &row.sla {
+        st.sla = sla_verdicts(
+            spec,
+            &facts.sla,
+            st.last_success.as_ref(),
+            st.lag.as_ref().map(|l| &l.lag),
+            now,
+        );
+    }
+
     if row.overwrite {
         st.overwrite_staging = staging_status(row, facts.outcomes.failing(), inputs).await;
     }
@@ -854,6 +926,29 @@ async fn row_status(
     let failing = facts.outcomes.failing()
         || matches!((&st.last_failure, &st.last_success), (Some(f), s) if s.as_ref().is_none_or(|s| f.at > s.at));
     finish(st, failing, inputs)
+}
+
+/// `last run: 2 of 40 sink writes went to the DLQ whole (dlq_all), 1 partly`.
+pub fn batch_note(b: &faucet_core::BatchOutcomes) -> String {
+    let mut parts = Vec::new();
+    if b.dlq_all > 0 {
+        parts.push(format!("{} went to the DLQ whole (dlq_all)", b.dlq_all));
+    }
+    if b.dlq_partial > 0 {
+        parts.push(format!("{} partly", b.dlq_partial));
+    }
+    if b.failed > 0 {
+        parts.push(format!("{} failed", b.failed));
+    }
+    format!(
+        "last run: of {} sink write(s), {}",
+        b.attempted,
+        if parts.is_empty() {
+            "all committed".to_string()
+        } else {
+            parts.join(", ")
+        }
+    )
 }
 
 fn finish(mut st: RowStatus, failing: bool, inputs: &StatusInputs<'_>) -> RowStatus {
@@ -885,6 +980,11 @@ fn finish(mut st: RowStatus, failing: bool, inputs: &StatusInputs<'_>) -> RowSta
         );
         if st.dlq.count > 0 {
             degraded.push(format!("{} record(s) waiting in the DLQ", st.dlq.count));
+        }
+        if let Some(b) = &st.batches
+            && b.dlq_all + b.dlq_partial > 0
+        {
+            degraded.push(batch_note(b));
         }
         if let Some(p) = &st.profiling
             && p.drift > 0

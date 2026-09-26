@@ -302,7 +302,7 @@ export async function renderDetail(container, { id }) {
       .sort((a, b) => (b.duration_ms || 0) - (a.duration_ms || 0));
     const maxMs = Math.max(1, ...invs.map((i) => i.duration_ms || 0));
     inv.innerHTML =
-      `<table class="tbl"><thead><tr><th title="the matrix row this invocation ran">matrix row</th><th>parent key</th><th title="the invocation's own run id — what faucet rollback --run undoes">run id</th><th>records</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
+      `<table class="tbl"><thead><tr><th title="the matrix row this invocation ran">matrix row</th><th>parent key</th><th title="the invocation's own run id — what faucet rollback --run undoes">run id</th><th>records</th><th title="sink writes: committed / partly to the DLQ / whole to the DLQ (dlq_all) / failed">batches</th><th title="how far the source was behind its head when the invocation ended">lag</th><th style="min-width:160px">duration</th><th>error</th></tr></thead><tbody>` +
       invs
         .map((i) => {
           const ms = i.duration_ms || 0;
@@ -320,7 +320,7 @@ export async function renderDetail(container, { id }) {
           const bar =
             `<div style="height:9px;width:100%;max-width:180px;border-radius:4px;background:rgba(120,120,120,0.14);` +
             `box-shadow:inset 0 1px 1px rgba(0,0,0,0.12);margin-top:5px">${fill}</div>`;
-          return `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td class="mono">${escapeHtml(i.run_id || "—")}</td><td>${fmtInt(i.records_written ?? 0)}</td><td><div style="white-space:nowrap">${fmtMs(ms)}</div>${bar}</td><td>${escapeHtml(i.error || "")}</td></tr>`;
+          return `<tr><td>${escapeHtml(i.row_id)}</td><td>${escapeHtml(i.parent_record_key || "—")}</td><td class="mono" title="${escapeHtml(i.run_id || "")}">${escapeHtml(i.run_id ? i.run_id.slice(0, 8) + "…" : "—")}</td><td>${fmtInt(i.records_written ?? 0)}</td><td>${batchCell(i.batches)}</td><td class="mono">${escapeHtml(lagText(i.source_lag))}</td><td><div style="white-space:nowrap">${fmtMs(ms)}</div>${bar}</td><td>${escapeHtml(i.error || "")}</td></tr>`;
         })
         .join("") +
       `</tbody></table>`;
@@ -372,4 +372,33 @@ export async function renderDetail(container, { id }) {
     clearTimeout(pollTimer);
     logCtrl?.abort();
   };
+}
+
+/** `12 ok` or `10 ok · 1 partial · 1 dlq_all` for one invocation's sink writes (#737). */
+function batchCell(b) {
+  if (!b || !b.attempted) return `<span class="run-meta">—</span>`;
+  const parts = [`${fmtInt(b.committed)} ok`];
+  if (b.dlq_partial) parts.push(`<span class="batch-warn">${fmtInt(b.dlq_partial)} partial</span>`);
+  if (b.dlq_all) parts.push(`<span class="batch-warn">${fmtInt(b.dlq_all)} dlq_all</span>`);
+  if (b.failed) parts.push(`<span class="batch-bad">${fmtInt(b.failed)} failed</span>`);
+  return `<span class="batch-cell" title="${fmtInt(b.attempted)} sink write(s)">${parts.join(" · ")}</span>`;
+}
+
+/** `412 MiB · 3m 20s` from a source-lag reading (#733). */
+function lagText(l) {
+  if (!l) return "—";
+  const out = [];
+  if (l.bytes != null) {
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let v = l.bytes;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    out.push(i === 0 ? `${l.bytes} B` : `${Math.round(v)} ${units[i]}`);
+  }
+  if (l.events != null) out.push(`${fmtInt(l.events)} event${l.events === 1 ? "" : "s"}`);
+  if (l.seconds != null) {
+    const sec = Math.max(0, Math.floor(l.seconds));
+    out.push(sec < 60 ? `${sec}s` : sec < 3600 ? `${Math.floor(sec / 60)}m ${sec % 60}s` : `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`);
+  }
+  return out.join(" · ") || "—";
 }

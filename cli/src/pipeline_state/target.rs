@@ -31,6 +31,9 @@ pub struct RowTarget {
     pub state: Option<StateStoreSpec>,
     pub sink_kind: String,
     pub sink_config: Value,
+    /// The source this row reads, as `(kind, config)` — `None` when it cannot
+    /// be attributed to one (a multi-source graph).
+    pub source: Option<(String, Value)>,
     pub dlq: Option<DlqSpec>,
     pub sla: Option<crate::sla::SlaSpec>,
     pub profiling: bool,
@@ -72,6 +75,7 @@ impl PipelineTarget {
         })?;
         if crate::topology::is_topology(cfg) {
             let atomic = cfg.delivery == faucet_core::DeliveryMode::ExactlyOnce;
+            let source = crate::topology::single_source_node(cfg)?;
             let rows = crate::topology::sink_nodes(cfg)?
                 .into_iter()
                 .map(|(id, kind, config)| RowTarget {
@@ -84,6 +88,7 @@ impl PipelineTarget {
                     state: cfg.pipeline.state.clone(),
                     sink_kind: kind,
                     sink_config: config,
+                    source: source.clone(),
                     dlq: cfg.pipeline.dlq.clone(),
                     sla: cfg.sla.clone(),
                     profiling: cfg.profiling.is_some(),
@@ -119,6 +124,7 @@ impl PipelineTarget {
                 state: node.state,
                 sink_kind: node.sink.kind,
                 sink_config: node.sink.config,
+                source: Some((node.source.kind, node.source.config)),
                 dlq: node.dlq,
             });
         }
@@ -130,6 +136,12 @@ impl PipelineTarget {
             let mut snapshot = root.clone();
             snapshot.id = "snapshot".to_string();
             snapshot.atomic_watermark = false;
+            snapshot.source = cfg.replication.as_ref().map(|r| {
+                (
+                    r.snapshot.source.kind.clone(),
+                    r.snapshot.source.config.clone(),
+                )
+            });
             rows.push(snapshot);
         }
         Ok(Self {

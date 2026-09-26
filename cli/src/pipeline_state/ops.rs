@@ -385,6 +385,25 @@ pub async fn probe_watermark(
     })
 }
 
+/// Ask the row's source how far behind its head it is (#733), after pointing
+/// it at `bookmark` — the position the next run resumes from. Read-only.
+pub async fn probe_lag(
+    row: &RowTarget,
+    bookmark: Option<&Value>,
+    auth: &AuthCatalog,
+) -> CliResult<Option<faucet_core::SourceLag>> {
+    let Some((kind, config)) = &row.source else {
+        return Ok(None);
+    };
+    let mut cfg = config.clone();
+    crate::executor::resolve_now_inplace(&mut cfg, Utc::now().fixed_offset())?;
+    let source = crate::registry::build_source(kind, cfg, auth, None).await?;
+    if let Some(bm) = bookmark {
+        source.apply_start_bookmark(bm.clone()).await?;
+    }
+    Ok(source.lag().await?)
+}
+
 pub(crate) async fn build_row_sink(
     row: &RowTarget,
     auth: &AuthCatalog,
