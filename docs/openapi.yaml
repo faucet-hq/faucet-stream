@@ -379,6 +379,172 @@ paths:
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
         "422": { description: Config failed validation / expansion }
+  /v1/status:
+    get:
+      summary: One-screen pipeline health (#732)
+      description: >
+        Per matrix row (or topology sink node): health (`ok` / `running` /
+        `warming` / `unknown` / `degraded` / `failed`), last success and last
+        failure (from the run-outcome marker in the state store, the SLA
+        history, and this server's run history), bookmark and its age, the
+        exactly-once watermark (with `probe`, compared against the sink's),
+        DLQ backlog, SLA / profiling verdicts, rollback markers, and where the
+        next run resumes. Reads only — nothing runs. The config is inline
+        (`config`) or a registered template (`template`, `templates` builds).
+        A failed pipeline is a result, not an error. Requires `StatusRead`
+        (viewer+); audited as `status`.
+      operationId: getStatus
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: config, in: query, schema: { type: string }, description: Inline config document (URL-encoded) }
+        - { name: config_format, in: query, schema: { type: string, enum: [yaml, json], default: yaml } }
+        - { name: template, in: query, schema: { type: string }, description: Registered template id }
+        - { name: version, in: query, schema: { type: string }, description: "Template version: a number or a channel (default `stable`)" }
+        - { name: sink, in: query, schema: { type: string }, description: Sink template to compose a source template with }
+        - { name: row, in: query, schema: { type: string } }
+        - { name: probe, in: query, schema: { type: boolean, default: false }, description: Also read exactly-once sink watermarks (read-only) }
+      responses:
+        "200":
+          description: The status report
+          content: { application/json: { schema: { $ref: "#/components/schemas/StatusReport" } } }
+        "400": { description: Neither (or both of) `config` and `template` given, or an unparseable config }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { description: Unknown template }
+        "422": { description: Config failed validation / expansion, or an unknown row }
+    post:
+      summary: One-screen pipeline health, config in the body (#732)
+      description: >
+        `GET /v1/status` with the config (and template `params`) in a JSON
+        body instead of the query string. Read-only; `StatusRead` (viewer+).
+      operationId: postStatus
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config: { type: string }
+                config_format: { type: string, enum: [yaml, json], default: yaml }
+                template: { type: string }
+                version: { type: string }
+                sink: { type: string }
+                params: { type: object, additionalProperties: true }
+                row: { type: string }
+                probe: { type: boolean, default: false }
+      responses:
+        "200":
+          description: The status report
+          content: { application/json: { schema: { $ref: "#/components/schemas/StatusReport" } } }
+        "400": { description: Neither (or both of) `config` and `template` given, or an unparseable config }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { description: Unknown template }
+        "422": { description: Config failed validation / expansion, or an unknown row }
+  /v1/state/{pipeline}/{row}:
+    parameters:
+      - { name: pipeline, in: path, required: true, schema: { type: string }, description: "The pipeline name (the config's `name:`); must match the resolved config" }
+      - { name: row, in: path, required: true, schema: { type: string }, description: Matrix row id or topology sink node id }
+    get:
+      summary: Read a row's durable state (#735)
+      description: >
+        The row's bookmark (an exactly-once envelope is unwrapped, its
+        sequence reported separately), child / shard sub-bookmarks, markers
+        (SLA, profiling, rollback, run outcomes) and a live run lease.
+        Admin-only (`StateAdmin`); audited as `state.get`.
+      operationId: getState
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: config, in: query, schema: { type: string } }
+        - { name: config_format, in: query, schema: { type: string, enum: [yaml, json], default: yaml } }
+        - { name: template, in: query, schema: { type: string } }
+        - { name: version, in: query, schema: { type: string } }
+        - { name: sink, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The row's state (`bookmark`, `exactly_once.seq`, `sub_bookmarks[]`, `markers[]`, `running`)
+          content: { application/json: { schema: { type: object } } }
+        "400": { description: No config named }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { description: Unknown template }
+        "422": { description: The config names a different pipeline, an unknown row, or failed validation }
+    put:
+      summary: Move a row's bookmark (#735)
+      description: >
+        Writes `bookmark` as the row's resume position. On an exactly-once row
+        the envelope is kept: its sequence is never lowered and is raised to
+        the sink's committed watermark when that is ahead (read from the sink
+        unless `skip_watermark_check`), so the next run honours the new
+        position instead of re-anchoring to the sink's. `dry_run` returns the
+        plan without writing. Refused with 409 while a run holds the row (a
+        live run lease, or a non-terminal run of the pipeline on this server)
+        unless `force`. Admin-only (`StateAdmin`); audited as `state.set`.
+      operationId: putState
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bookmark]
+              properties:
+                config: { type: string }
+                config_format: { type: string, enum: [yaml, json], default: yaml }
+                template: { type: string }
+                version: { type: string }
+                sink: { type: string }
+                params: { type: object, additionalProperties: true }
+                bookmark: { description: The new bookmark (any JSON value but null) }
+                parent_key: { type: string, description: A child row's parent-record key }
+                dry_run: { type: boolean, default: false }
+                force: { type: boolean, default: false }
+                skip_watermark_check: { type: boolean, default: false }
+      responses:
+        "200":
+          description: What changed (`key`, `before`, `after`, `exactly_once`, `applied`, `warnings`)
+          content: { application/json: { schema: { type: object } } }
+        "400": { description: No config named }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "409": { description: A run holds the row }
+        "422": { description: Unknown row, a child row without `parent_key`, a null bookmark, or an unreadable sink watermark }
+    delete:
+      summary: Reset a row so its next run re-syncs (#735)
+      description: >
+        Deletes the row's bookmark (and a child row's per-parent bookmarks;
+        with `include_markers` also its SLA / profiling / run-outcome /
+        rollback markers). An exactly-once row keeps its envelope with a null
+        bookmark at the sink-safe sequence, unless `rewind_token` deletes the
+        sink's commit token too. `dry_run` returns the plan. 409 while a run
+        holds the row unless `force`. Admin-only (`StateAdmin`); audited as
+        `state.reset`.
+      operationId: deleteState
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: config, in: query, schema: { type: string } }
+        - { name: config_format, in: query, schema: { type: string, enum: [yaml, json], default: yaml } }
+        - { name: template, in: query, schema: { type: string } }
+        - { name: version, in: query, schema: { type: string } }
+        - { name: sink, in: query, schema: { type: string } }
+        - { name: parent_key, in: query, schema: { type: string } }
+        - { name: include_markers, in: query, schema: { type: boolean, default: false } }
+        - { name: rewind_token, in: query, schema: { type: boolean, default: false } }
+        - { name: dry_run, in: query, schema: { type: boolean, default: false } }
+        - { name: force, in: query, schema: { type: boolean, default: false } }
+        - { name: skip_watermark_check, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: Every key changed (`changes[]` with `before` / `after`), `applied`, `warnings`
+          content: { application/json: { schema: { type: object } } }
+        "400": { description: No config named }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "409": { description: A run holds the row }
+        "422": { description: Unknown row, or the sink cannot rewind its token }
   /v1/plan:
     post:
       summary: Plan a config without running it
@@ -3120,6 +3286,115 @@ components:
         params:
           key: value
         deprecated: example
+    StatusReport:
+      type: object
+      description: "`faucet status` / `GET /v1/status` (#732)"
+      properties:
+        pipeline: { type: string }
+        generated_at: { type: string, format: date-time }
+        topology: { type: boolean }
+        state:
+          type: object
+          properties:
+            kinds: { type: array, items: { type: string } }
+            durable: { type: boolean }
+            note: { type: string }
+        health: { $ref: "#/components/schemas/Health" }
+        exit_code: { type: integer, description: "0 healthy, 1 degraded or unknown, 2 failed" }
+        notes: { type: array, items: { type: string } }
+        rows:
+          type: array
+          items: { $ref: "#/components/schemas/RowStatus" }
+    Health:
+      type: string
+      enum: [ok, running, warming, unknown, degraded, failed]
+    RowStatus:
+      type: object
+      properties:
+        row: { type: string }
+        role: { type: string, enum: [root, child, product, topology_sink] }
+        state_key: { type: string }
+        health: { $ref: "#/components/schemas/Health" }
+        reasons: { type: array, items: { type: string } }
+        last_success: { $ref: "#/components/schemas/StatusRunRef" }
+        last_failure: { $ref: "#/components/schemas/StatusRunRef" }
+        consecutive_failures: { type: integer }
+        running:
+          type: object
+          description: The live run lease
+          properties:
+            run_id: { type: string }
+            pid: { type: integer }
+            host: { type: string }
+            acquired_at: { type: string, format: date-time }
+            expires_at: { type: string, format: date-time }
+        bookmark: { description: The resume position (an exactly-once envelope's inner bookmark) }
+        bookmark_age_secs: { type: integer }
+        exactly_once:
+          type: object
+          properties:
+            state_seq: { type: integer }
+            sink:
+              type: object
+              properties:
+                token: { type: string }
+                seq: { type: integer }
+                bookmark: {}
+            agreement: { type: string, enum: [agree, sink_ahead, state_ahead, no_token, not_probed] }
+            trusted: { type: string, enum: [state, sink] }
+            probe_error: { type: string }
+        lag: { description: "Source lag when the source reports it (#733); null otherwise", nullable: true }
+        dlq:
+          type: object
+          properties:
+            configured: { type: boolean }
+            readable: { type: boolean }
+            location: { type: string }
+            count: { type: integer }
+            oldest: { type: string, format: date-time }
+            unreadable_lines: { type: integer }
+            note: { type: string }
+        sla:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [staleness, min_rows, volume] }
+              message: { type: string }
+        profiling:
+          type: object
+          properties:
+            baseline_runs: { type: integer }
+            latest_at: { type: string, format: date-time }
+            drift: { type: integer }
+        rollback:
+          type: object
+          properties:
+            undoable_runs: { type: integer }
+            newest: { type: string }
+        overwrite_staging: { type: string }
+        resume: { type: string, description: What the next run reads from, in words }
+        resume_bookmark: {}
+        children:
+          type: array
+          items:
+            type: object
+            properties:
+              row: { type: string }
+              bookmarks: { type: integer }
+              failed: { type: integer }
+              worst: { $ref: "#/components/schemas/Health" }
+              latest_failure: { $ref: "#/components/schemas/StatusRunRef" }
+        errors: { type: array, items: { type: string } }
+    StatusRunRef:
+      type: object
+      properties:
+        at: { type: string, format: date-time }
+        run_id: { type: string }
+        records: { type: integer }
+        error_kind: { type: string }
+        error: { type: string }
+        source: { type: string, enum: [state, sla, history] }
     ApiError:
       type: object
       required: [error]

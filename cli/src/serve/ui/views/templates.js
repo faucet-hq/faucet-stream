@@ -640,6 +640,8 @@ export async function renderTemplateDetail(container, { id, query }) {
       </div>
       ${d.description ? `<p class="tpl-desc">${escapeHtml(d.description)}</p>` : ""}
 
+      ${kindOf(d) === "pipeline" && st.stable != null ? `<div id="t-health" class="health-card" data-perm="status_read"></div>` : ""}
+
       <h2 class="tpl-h2">Versions</h2>
       <p class="tpl-desc tpl-versions-hint"${runnable ? ' data-perm="run_write"' : ""}>Click a version to run it below.</p>
       <div id="t-versions" class="tpl-versions"></div>
@@ -703,6 +705,69 @@ export async function renderTemplateDetail(container, { id, query }) {
   else if (kind === "deployment") renderDeploymentUse(container.querySelector("#t-trigger"), id);
   else renderTrigger(container.querySelector("#t-trigger"), id, st, d, kind === "source-template", preselectSink);
   renderLaunches(container.querySelector("#t-launches"), d.launches || []);
+  const healthHost = container.querySelector("#t-health");
+  if (healthHost) renderHealth(healthHost, id);
+}
+
+const HEALTH_PILL = {
+  ok: "pill-completed",
+  running: "pill-running",
+  warming: "pill-queued",
+  unknown: "pill-cancelled",
+  degraded: "pill-queued",
+  failed: "pill-failed",
+};
+
+function healthPill(h) {
+  return `<span class="pill ${HEALTH_PILL[h] || "pill-cancelled"}">${escapeHtml(h)}</span>`;
+}
+
+function bookmarkText(b) {
+  if (b == null) return "—";
+  if (typeof b === "object" && !Array.isArray(b)) {
+    return Object.entries(b)
+      .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+      .join(" ");
+  }
+  return typeof b === "string" ? b : JSON.stringify(b);
+}
+
+/** The launched version's `faucet status` screen (#732), one row per pipeline row. */
+async function renderHealth(host, id) {
+  host.innerHTML = `<div class="health-head"><h2 class="tpl-h2">Health</h2></div><div class="empty">loading…</div>`;
+  let r;
+  try {
+    r = await api(`/v1/status?template=${encodeURIComponent(id)}`);
+  } catch (e) {
+    host.innerHTML = `<div class="health-head"><h2 class="tpl-h2">Health</h2></div>
+      <p class="tpl-desc">Health is unavailable for the live version: ${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  const rows = r.rows
+    .map((row) => {
+      const dlq = !row.dlq.configured ? "—" : row.dlq.readable ? String(row.dlq.count) : "?";
+      const detail = [...(row.reasons || []), ...(row.errors || []).map((e) => `unreadable: ${e}`)];
+      return `<tr class="health-row health-${escapeHtml(row.health)}">
+        <td class="mono">${escapeHtml(row.row)}</td>
+        <td>${healthPill(row.health)}</td>
+        <td class="ds-meta">${row.last_success ? fmtTime(row.last_success.at) : "never"}</td>
+        <td class="ds-meta health-bm" title="${escapeHtml(bookmarkText(row.bookmark))}">${escapeHtml(bookmarkText(row.bookmark))}</td>
+        <td class="health-num">${dlq}</td>
+        <td class="health-resume" title="${escapeHtml(row.resume)}">${escapeHtml(row.resume)}</td>
+      </tr>${detail.length ? `<tr class="health-why"><td></td><td colspan="5">${detail.map(escapeHtml).join(" · ")}</td></tr>` : ""}`;
+    })
+    .join("");
+  host.innerHTML = `
+    <div class="health-head">
+      <h2 class="tpl-h2">Health</h2>
+      ${healthPill(r.health)}
+      <span class="run-meta">state: ${escapeHtml((r.state.kinds || []).join(", ") || "none")} · as of ${fmtTime(r.generated_at)}</span>
+    </div>
+    ${r.state.note ? `<p class="tpl-desc">${escapeHtml(r.state.note)}</p>` : ""}
+    <div class="table-scroll"><table class="ds-table health-table">
+      <thead><tr><th>row</th><th>status</th><th>last success</th><th>bookmark</th><th>dlq</th><th>next run resumes at</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6" class="run-meta">no rows</td></tr>`}</tbody>
+    </table></div>`;
 }
 
 /** Which channels — derived and assigned — currently point at `v`. */

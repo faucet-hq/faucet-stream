@@ -321,6 +321,11 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::GET, "/v1/changes/{id}"),
         (Method::POST, "/v1/changes/{id}/approve"),
         (Method::POST, "/v1/changes/{id}/reject"),
+        (Method::GET, "/v1/status"),
+        (Method::POST, "/v1/status"),
+        (Method::GET, "/v1/state/{pipeline}/{row}"),
+        (Method::PUT, "/v1/state/{pipeline}/{row}"),
+        (Method::DELETE, "/v1/state/{pipeline}/{row}"),
     ];
     #[cfg(feature = "triggers")]
     v.extend([
@@ -385,7 +390,10 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     //   no run starts; the one connector it builds is the sink, for its
     //   non-mutating `check()` probe — the same as `POST /v1/doctor` does, but
     //   doctor stays operator-only because it probes *sources* with real reads.
-    const READ_ONLY_POSTS: &[&str] = &["/mcp", "/v1/dlq/inspect", "/v1/plan"];
+    // - `/v1/status` — assembles a health report from state, history and the
+    //   DLQ; the POST form only carries the config in a body. `--probe` builds
+    //   the sink for its read-only watermark read, nothing more.
+    const READ_ONLY_POSTS: &[&str] = &["/mcp", "/v1/dlq/inspect", "/v1/plan", "/v1/status"];
     if READ_ONLY_POSTS.contains(&path) {
         return false;
     }
@@ -424,8 +432,12 @@ fn a_read_token_can_reach_every_read_route() {
 
     let mut denied: Vec<String> = Vec::new();
     for (method, path) in all_v1_routes() {
-        if method != axum::http::Method::GET || path == "/v1/audit" {
-            continue; // the audit log is admin-only by design
+        // The audit log and pipeline state (#735) are admin-only by design.
+        if method != axum::http::Method::GET
+            || path == "/v1/audit"
+            || path == "/v1/state/{pipeline}/{row}"
+        {
+            continue;
         }
         let ok = required_permission(&method, path).is_some_and(|p| Role::Viewer.grants(p));
         if !ok {

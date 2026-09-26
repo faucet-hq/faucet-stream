@@ -274,6 +274,44 @@ fn resolve_connector(
     Ok((kind, config))
 }
 
+/// Every sink node's id with its resolved `(kind, config)`, sorted by id — the
+/// topology analogue of a matrix config's rows for `faucet state` / `status`.
+pub fn sink_nodes(cfg: &PipelineConfig) -> CliResult<Vec<(String, String, Value)>> {
+    let spec = &cfg.pipeline;
+    let mut ids: Vec<&String> = spec.nodes.keys().collect();
+    ids.sort();
+    let mut out = Vec::new();
+    for id in ids {
+        if let NodeSpec::Sink {
+            template,
+            kind,
+            config,
+        } = &spec.nodes[id]
+        {
+            let (k, c) = resolve_connector(
+                &spec.sinks,
+                &spec.sink,
+                template.as_deref(),
+                kind.as_deref(),
+                config.as_ref(),
+                id,
+                "sink",
+            )?;
+            out.push((id.clone(), k, c));
+        }
+    }
+    Ok(out)
+}
+
+/// Number of source nodes in the graph.
+pub fn source_node_count(cfg: &PipelineConfig) -> usize {
+    cfg.pipeline
+        .nodes
+        .values()
+        .filter(|n| matches!(n, NodeSpec::Source { .. }))
+        .count()
+}
+
 /// Build a [`faucet_core::Topology`] from the config's `pipeline.nodes` /
 /// `edges` block, with default run options (no preview, process-start clock).
 pub async fn build_topology(cfg: &PipelineConfig, auth: &AuthCatalog) -> CliResult<Topology> {
@@ -789,7 +827,48 @@ pub async fn run_topology(
     // which node failed (#459).
     let state_store = opts.state_store.clone();
     let cancelled = run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
-    let reported = topo.run_reported(opts, build_governance(cfg)?).await?;
+    let governance = build_governance(cfg)?;
+    // Run lease + run-outcome marker per sink node (#732 / #735), like a
+    // matrix invocation's.
+    let mut markers = Vec::new();
+    if !run.is_preview()
+        && cfg
+            .pipeline
+            .state
+            .as_ref()
+            .is_some_and(|s| s.kind != "memory")
+    {
+        for (id, _, _) in sink_nodes(cfg)? {
+            let base = format!("{pipeline_name}::{id}");
+            let m = crate::pipeline_state::markers::RunMarkers::begin(
+                state_store.clone(),
+                &base,
+                &run_id,
+                true,
+            )
+            .await;
+            markers.push((id, base, m));
+        }
+    }
+    let started = std::time::Instant::now();
+    let reported = match topo.run_reported(opts, governance).await {
+        Ok(r) => r,
+        Err(e) => {
+            let kind = crate::pipeline_state::markers::kind_label(&format!("{e:?}"));
+            let record = !run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
+            for (_, base, m) in markers {
+                m.finish(
+                    base,
+                    run_id.clone(),
+                    Err((kind.clone(), e.to_string())),
+                    started.elapsed().as_millis() as u64,
+                    record,
+                )
+                .await;
+            }
+            return Err(e.into());
+        }
+    };
 
     // Per-sink-node observability. A sink node is a topology's analogue of a
     // matrix invocation — it owns a state key, a bookmark, and a record count —
@@ -830,7 +909,45 @@ pub async fn run_topology(
     for (node_id, message) in &profile_failures {
         failures.push((node_id.as_str(), message.as_str(), None));
     }
+    let record = !run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
+    let elapsed = started.elapsed().as_millis() as u64;
+    for (id, base, m) in markers {
+        let outcome = node_outcome(&id, &reported, &failures);
+        m.finish(base, run_id.clone(), outcome, elapsed, record)
+            .await;
+    }
     Ok(build_summary(&reported.result.per_sink, &failures))
+}
+
+/// A sink node's run outcome for its marker: its own failure, else the
+/// graph's first failure (an upstream node failing fails the run), else its
+/// record count.
+fn node_outcome(
+    id: &str,
+    reported: &faucet_core::topology::TopologyRun,
+    failures: &[(&str, &str, Option<faucet_core::topology::NodeErrorKind>)],
+) -> Result<u64, (String, String)> {
+    let failure = failures
+        .iter()
+        .find(|(n, _, _)| *n == id)
+        .or_else(|| failures.first());
+    match failure {
+        Some((n, msg, kind)) => Err((
+            kind.map(|k| crate::pipeline_state::markers::kind_label(&format!("{k:?}")))
+                .unwrap_or_else(|| "Node".into()),
+            if *n == id {
+                (*msg).to_string()
+            } else {
+                format!("node '{n}' failed: {msg}")
+            },
+        )),
+        None => Ok(reported
+            .nodes
+            .iter()
+            .find(|r| r.node_id == id)
+            .map(|r| r.records as u64)
+            .unwrap_or(0)),
+    }
 }
 
 /// Flatten a topology run's per-node attribution into the same

@@ -1223,6 +1223,16 @@ async fn run_unit(
     // record: what it read and wrote before failing cost something too.
     let run_id = uuid::Uuid::now_v7().to_string();
     let meter = Arc::new(faucet_core::UsageMeter::default());
+    // Run lease + run-outcome marker (#732 / #735): what `faucet status`
+    // reports and what `faucet state` refuses to change under a live run.
+    let cancel_seen = cancel.clone();
+    let markers = crate::pipeline_state::markers::RunMarkers::begin(
+        markers_store(&unit.node, opts).await,
+        &unit.state_key,
+        &run_id,
+        matches!(unit.node.role, NodeRole::Root | NodeRole::Product { .. }),
+    )
+    .await;
     let result = boxed_run_one_invocation(
         &unit.node,
         unit.parent_record.as_deref(),
@@ -1235,9 +1245,22 @@ async fn run_unit(
         overwrite_grouped,
         run_id.clone(),
         Arc::clone(&meter),
+        markers.store.clone(),
     )
     .await;
     let duration_ms = started.elapsed().as_millis() as u64;
+    markers
+        .finish(
+            unit.state_key.clone(),
+            run_id.clone(),
+            match &result {
+                Ok((_, stats)) => Ok(stats.records_written as u64),
+                Err(e) => Err((crate::pipeline_state::markers::error_kind(e), e.to_string())),
+            },
+            duration_ms,
+            !cancel_seen.is_cancelled(),
+        )
+        .await;
     let row_id = unit.node.id.clone();
     let parent_record_key = unit.parent_record_key.clone();
     let usage = build_usage_record(
@@ -1406,6 +1429,7 @@ fn boxed_run_one_invocation<'a>(
     overwrite_grouped: bool,
     run_id: String,
     meter: Arc<faucet_core::UsageMeter>,
+    prebuilt_state: Option<Arc<dyn StateStore>>,
 ) -> futures::future::BoxFuture<'a, CliResult<(Vec<Value>, PipelineStats)>> {
     Box::pin(run_one_invocation(
         node,
@@ -1419,7 +1443,31 @@ fn boxed_run_one_invocation<'a>(
         overwrite_grouped,
         run_id,
         meter,
+        prebuilt_state,
     ))
+}
+
+/// The durable store the run lease and run-outcome marker are written to —
+/// `None` for preview / `--limit` / shard runs and memory or absent state,
+/// whose markers would describe nothing durable.
+fn markers_store<'a>(
+    node: &'a ExpandedNode,
+    opts: &'a ExecuteOptions,
+) -> futures::future::BoxFuture<'a, Option<Arc<dyn StateStore>>> {
+    Box::pin(async move {
+        let durable = opts.state_path_override.is_some()
+            || node.state.as_ref().is_some_and(|s| s.kind != "memory");
+        if !durable || opts.dry_run || opts.limit.is_some() || opts.shard.is_some() {
+            return None;
+        }
+        match build_state_for_node(node, opts.state_path_override.as_deref()).await {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!(row = %node.id, error = %e, "run markers skipped: state store unavailable");
+                None
+            }
+        }
+    })
 }
 
 /// Run a discovery row (#501): build its source, drain it, project `select`,
@@ -1872,6 +1920,7 @@ async fn run_one_invocation(
     overwrite_grouped: bool,
     run_id: String,
     meter: Arc<faucet_core::UsageMeter>,
+    prebuilt_state: Option<Arc<dyn StateStore>>,
 ) -> CliResult<(Vec<Value>, PipelineStats)> {
     // Observability identity for this invocation — created by the caller
     // (`run_unit`), reused by both the Pipeline builder and the transform
@@ -2176,7 +2225,10 @@ async fn run_one_invocation(
     // 4) Build state store. If the source opts into state, wrap it so the
     //    executor's per-row state key is used instead of the source's natural
     //    one (which is shared across all matrix rows of the same kind).
-    let state = build_state_for_node(node, opts.state_path_override.as_deref()).await?;
+    let state = match prebuilt_state {
+        Some(store) => Some(store),
+        None => build_state_for_node(node, opts.state_path_override.as_deref()).await?,
+    };
     // Preview modes must not persist bookmarks: the counting/truncating sinks
     // return `Ok` without a real write, so a persisted (advanced) bookmark would
     // make the next real run skip unwritten records (#321 H1). Wrap the store so
@@ -3982,6 +4034,7 @@ mod tests {
             false,
             "size".to_string(),
             Arc::new(faucet_core::UsageMeter::default()),
+            None,
         );
         let size = std::mem::size_of_val(&fut);
         drop(fut);

@@ -91,11 +91,18 @@ pub enum Permission {
     /// `reject`, #703) — operator+ to reach the route; the `approvals:`
     /// policy in `--auth-config` then decides per kind who counts.
     ChangeApprove,
+    /// Read a pipeline's health screen (`GET`/`POST /v1/status`, #732) —
+    /// read-only, every role from `viewer` up.
+    StatusRead,
+    /// Read, move or reset a pipeline row's durable state
+    /// (`/v1/state/{pipeline}/{row}`, #735) — admin-only: moving a bookmark
+    /// skips or replays data, a release-grade decision.
+    StateAdmin,
 }
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 22] = [
+    pub const ALL: [Permission; 24] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -118,6 +125,8 @@ impl Permission {
         Permission::ChangeRead,
         Permission::ChangeRequest,
         Permission::ChangeApprove,
+        Permission::StatusRead,
+        Permission::StateAdmin,
     ];
 }
 
@@ -154,6 +163,7 @@ impl Role {
                         | Plan
                         | UsageRead
                         | ChangeRead
+                        | StatusRead
                 )
             }
             Role::Operator => {
@@ -177,6 +187,7 @@ impl Role {
                         | ChangeRead
                         | ChangeRequest
                         | ChangeApprove
+                        | StatusRead
                 )
             }
             Role::Admin => true,
@@ -494,6 +505,14 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::POST, "/v1/templates/{id}/publish") => Some(TemplateAdmin),
         (&Method::POST, "/v1/reload") => Some(Reload),
         (&Method::GET, "/v1/whoami") => Some(Identity),
+        // Pipeline health (#732) is a pure read — viewer+; the POST form only
+        // carries the config in a body.
+        (&Method::GET | &Method::POST, "/v1/status") => Some(StatusRead),
+        // Durable state (#735): even reading is admin-only, next to the verbs
+        // that move or reset a bookmark.
+        (&Method::GET | &Method::PUT | &Method::DELETE, "/v1/state/{pipeline}/{row}") => {
+            Some(StateAdmin)
+        }
         // MCP endpoint (#420): baseline access needs only a read scope (Viewer+);
         // the mutating `run_pipeline` tool is separately gated on RunWrite inside
         // the handler.
@@ -528,6 +547,10 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::GET, "/v1/catalog/lineage") => "catalog.lineage",
         (&Method::POST, "/v1/catalog/datasets/{id}/consumers") => "catalog.annotate",
         (&Method::GET, "/v1/usage") => "usage.list",
+        (&Method::GET | &Method::POST, "/v1/status") => "status",
+        (&Method::GET, "/v1/state/{pipeline}/{row}") => "state.get",
+        (&Method::PUT, "/v1/state/{pipeline}/{row}") => "state.set",
+        (&Method::DELETE, "/v1/state/{pipeline}/{row}") => "state.reset",
         (&Method::POST, "/v1/changes") => "change.request",
         (&Method::GET, "/v1/changes") => "change.list",
         (&Method::GET, "/v1/changes/{id}") => "change.get",
@@ -733,9 +756,33 @@ mod tests {
             (Method::POST, "/v1/templates/{id}/publish", TemplateAdmin),
             (Method::POST, "/v1/reload", Reload),
             (Method::GET, "/v1/whoami", Identity),
+            (Method::GET, "/v1/status", StatusRead),
+            (Method::POST, "/v1/status", StatusRead),
+            (Method::GET, "/v1/state/{pipeline}/{row}", StateAdmin),
+            (Method::PUT, "/v1/state/{pipeline}/{row}", StateAdmin),
+            (Method::DELETE, "/v1/state/{pipeline}/{row}", StateAdmin),
         ] {
             assert_eq!(required_permission(&m, path), Some(want), "{m} {path}");
         }
+        // Status is a read (viewer+); pipeline state is admin-only (#732/#735).
+        assert!(Role::Viewer.grants(Permission::StatusRead));
+        assert!(Role::Operator.grants(Permission::StatusRead));
+        assert!(!Role::Viewer.grants(Permission::StateAdmin));
+        assert!(!Role::Operator.grants(Permission::StateAdmin));
+        assert!(Role::Admin.grants(Permission::StateAdmin));
+        assert_eq!(audit_action(&Method::POST, "/v1/status"), "status");
+        assert_eq!(
+            audit_action(&Method::GET, "/v1/state/{pipeline}/{row}"),
+            "state.get"
+        );
+        assert_eq!(
+            audit_action(&Method::PUT, "/v1/state/{pipeline}/{row}"),
+            "state.set"
+        );
+        assert_eq!(
+            audit_action(&Method::DELETE, "/v1/state/{pipeline}/{row}"),
+            "state.reset"
+        );
         // Reload is admin-only.
         assert!(!Role::Viewer.grants(Permission::Reload));
         assert!(!Role::Operator.grants(Permission::Reload));

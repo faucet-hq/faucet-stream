@@ -16,6 +16,7 @@ pub mod preview;
 pub mod reload;
 pub mod runs;
 pub mod schemas;
+pub mod state;
 #[cfg(feature = "templates")]
 pub mod templates;
 #[cfg(feature = "catalog")]

@@ -45,6 +45,8 @@ pub mod schema;
 pub mod search;
 #[cfg(feature = "serve")]
 pub mod serve;
+pub mod state;
+pub mod status;
 #[cfg(feature = "templates")]
 pub mod template;
 pub mod test;

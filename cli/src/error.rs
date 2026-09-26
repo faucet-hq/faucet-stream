@@ -524,6 +524,18 @@ pub enum CliError {
     )]
     RollbackBlocked { conflicts: u64 },
 
+    /// `faucet state set|reset|import` refused because a run holds the state
+    /// it would change (#735): a live run lease, or the run history reports
+    /// the pipeline in flight.
+    #[error("{0}")]
+    StateBusy(String),
+
+    /// `faucet status` found a row that is not healthy (#732). The screen is
+    /// printed by the command; `main` maps this to the exit code (1 degraded
+    /// or unknown, 2 failed).
+    #[error("pipeline status: {health}")]
+    StatusUnhealthy { code: u8, health: String },
+
     /// A `faucet serve` startup or runtime failure (bind, auth gate, etc.).
     #[error("serve error: {0}")]
     Serve(String),
