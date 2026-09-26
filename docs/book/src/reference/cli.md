@@ -781,14 +781,16 @@ consumers named in that call; `--replace` drops the unlisted) — what
 
 ```bash
 faucet usage [--config PATH] [--since WHEN] [--until WHEN] [--pipeline NAME] \
-             [--by pipeline|row|dataset|sink|day] [--limit N] [--json]
+             [--tenant ID] [--by pipeline|row|dataset|sink|day|tenant] [--limit N] [--json]
 ```
 
 Aggregate the cost & usage records (#704) a config's `catalog:` store has
 accumulated: runs, rows in / out, estimated bytes, duration, backend
 requests, the priced estimate and the hosted per-row equivalent, one row per
 group plus a total. `--since` / `--until` take RFC 3339 or `YYYY-MM-DD`
-(half-open window). Estimates use each run's `usage:` pricing table; a
+(half-open window). `--tenant` keeps only invocations run for one
+[tenant](../cookbook/embedded-integrations.md) and `--by tenant` groups by it.
+Estimates use each run's `usage:` pricing table; a
 connector that reported no cost signal is marked *compute not reported*.
 `faucet run --output json` carries the same record per row under `usage`, and
 `run`'s text summary prints one usage line per invocation. See the
@@ -1117,6 +1119,9 @@ Selected flags (`faucet serve --help` for the full list):
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
 | `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
+| `--vault-key <key>` | Key that seals tenant connection credentials at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`). Without it the server refuses to store or open [tenant connections](../cookbook/embedded-integrations.md). Requires the `tenants` feature. |
+| `--vault-previous-key <key>` | A previous vault key, tried when opening credentials sealed before a rotation; never used to seal. Repeatable. |
+| `--connect-providers <path>` | Hosted OAuth connect providers (a YAML/JSON file), validated at startup; needs `--vault-key`. |
 | `--callback-allow-host <host>` | Restrict per-run completion callbacks to these hosts. Repeatable. Unset = any host except link-local / cloud-metadata addresses, which are always refused unless named here. See [Completion callbacks](./http-api.md#completion-callbacks). |
 
 ### Optional embedded web console (`serve-ui`)

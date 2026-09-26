@@ -153,7 +153,8 @@ pub fn estimate(
 
     CostEstimate {
         currency: pricing.currency.clone(),
-        total: lines.iter().map(|l| l.amount).sum(),
+        // An empty float sum is -0.0; adding 0.0 normalizes it.
+        total: lines.iter().map(|l| l.amount).sum::<f64>() + 0.0,
         lines,
         not_reported,
         hosted_equivalent: usage.records_written as f64 / 1_000_000.0
@@ -185,6 +186,9 @@ pub struct UsageRecord {
     pub failed: bool,
     pub usage: UsageSnapshot,
     pub cost: CostEstimate,
+    /// The tenant the invocation ran for (#709).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// `GET /v1/usage` / `faucet usage` filter.
@@ -193,6 +197,8 @@ pub struct UsageFilter {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub pipeline: Option<String>,
+    /// Only invocations run for this tenant (#709).
+    pub tenant: Option<String>,
     /// Records to scan at most (newest first); `0` = backend default.
     pub limit: usize,
 }
@@ -202,8 +208,15 @@ impl UsageFilter {
         self.since.is_none_or(|s| r.recorded_at >= s)
             && self.until.is_none_or(|u| r.recorded_at < u)
             && self.pipeline.as_deref().is_none_or(|p| r.pipeline == p)
+            && self
+                .tenant
+                .as_deref()
+                .is_none_or(|t| r.tenant.as_deref() == Some(t))
     }
 }
+
+/// The `--by tenant` key for invocations not run for a tenant.
+pub const NO_TENANT: &str = "(no tenant)";
 
 /// What `faucet usage --by` groups by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -214,6 +227,7 @@ pub enum GroupBy {
     Dataset,
     Sink,
     Day,
+    Tenant,
 }
 
 impl GroupBy {
@@ -224,6 +238,7 @@ impl GroupBy {
             "dataset" => Some(Self::Dataset),
             "sink" => Some(Self::Sink),
             "day" => Some(Self::Day),
+            "tenant" => Some(Self::Tenant),
             _ => None,
         }
     }
@@ -235,6 +250,7 @@ impl GroupBy {
             Self::Dataset => "dataset",
             Self::Sink => "sink",
             Self::Day => "day",
+            Self::Tenant => "tenant",
         }
     }
 }
@@ -290,6 +306,7 @@ pub fn aggregate(records: &[UsageRecord], by: GroupBy, currency: &str) -> UsageR
                 .unwrap_or_else(|| format!("(uncatalogued) {}::{}", r.pipeline, r.row)),
             GroupBy::Sink => r.sink_kind.clone(),
             GroupBy::Day => r.recorded_at.format("%Y-%m-%d").to_string(),
+            GroupBy::Tenant => r.tenant.clone().unwrap_or_else(|| NO_TENANT.to_string()),
         };
         let row = groups.entry(key.clone()).or_insert_with(|| empty_row(&key));
         fold(row, r);
@@ -354,6 +371,22 @@ mod tests {
     use super::*;
     use faucet_core::usage::CostSignal;
 
+    #[test]
+    fn an_unpriced_run_costs_positive_zero() {
+        let est = estimate(
+            &UsageSnapshot::default(),
+            "rest",
+            "jsonl",
+            &PricingSpec::default(),
+        );
+        assert_eq!(est.total, 0.0);
+        assert!(est.total.is_sign_positive());
+        assert_eq!(
+            serde_json::to_value(&est).unwrap()["total"],
+            serde_json::json!(0.0)
+        );
+    }
+
     fn snap(written: u64, bytes: u64) -> UsageSnapshot {
         UsageSnapshot {
             records_read: written,
@@ -384,6 +417,7 @@ mod tests {
             failed,
             usage: snap(1_000_000, 5000),
             cost,
+            tenant: (pipeline == "a").then(|| "acme".to_string()),
         }
     }
 
@@ -475,6 +509,7 @@ mod tests {
             since: Some("2026-09-02T00:00:00Z".parse().unwrap()),
             until: None,
             pipeline: None,
+            tenant: None,
             limit: 0,
         };
         assert_eq!(recs.iter().filter(|r| f.matches(r)).count(), 1);
@@ -483,6 +518,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(recs.iter().filter(|r| f.matches(r)).count(), 2);
+        let f = UsageFilter {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        };
+        assert_eq!(recs.iter().filter(|r| f.matches(r)).count(), 2);
+        let by_tenant = aggregate(&recs, GroupBy::Tenant, "USD");
+        let keys: Vec<&str> = by_tenant.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec![NO_TENANT, "acme"]);
+        assert_eq!(GroupBy::parse("tenant"), Some(GroupBy::Tenant));
+        assert_eq!(GroupBy::Tenant.as_str(), "tenant");
         assert_eq!(GroupBy::parse("day"), Some(GroupBy::Day));
         assert_eq!(GroupBy::parse("nope"), None);
         assert_eq!(GroupBy::Dataset.as_str(), "dataset");

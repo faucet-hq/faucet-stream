@@ -94,6 +94,11 @@ pub const DDL: &[&str] = &[
         result TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS faucet_serve_audit_ts_idx \
         ON faucet_serve_audit (ts)",
+    // The tenant an audited action was taken for (#709) — a companion table
+    // rather than a column, so an existing audit table needs no migration.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_audit_tenants (\
+        id TEXT PRIMARY KEY,\
+        tenant TEXT NOT NULL)",
     // Persistent run logs (#529). `seq` is a zero-padded fixed-width string so it
     // sorts lexically = numerically; purged on its own retention window (`ts`).
     "CREATE TABLE IF NOT EXISTS faucet_serve_run_logs (\
@@ -253,7 +258,56 @@ pub const DDL: &[&str] = &[
         body TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS faucet_serve_changes_status_idx \
         ON faucet_serve_changes (status, created_at)",
+    // Tenants (#709): tenants, their sealed connections, single-use
+    // hosted-OAuth sessions, the run → tenant mapping (a listing filters by
+    // it; the run's own body carries the tenant too) and the ledger of state
+    // keys a tenant's runs used. Never purged by run retention except the
+    // mapping, which is dropped with its run.
+    "CREATE TABLE IF NOT EXISTS faucet_tenants (\
+        id TEXT PRIMARY KEY,\
+        updated_at TEXT NOT NULL,\
+        body TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS faucet_tenant_connections (\
+        tenant TEXT NOT NULL,\
+        name TEXT NOT NULL,\
+        status TEXT NOT NULL,\
+        updated_at TEXT NOT NULL,\
+        body TEXT NOT NULL,\
+        PRIMARY KEY (tenant, name))",
+    "CREATE TABLE IF NOT EXISTS faucet_connect_sessions (\
+        state TEXT PRIMARY KEY,\
+        tenant TEXT NOT NULL,\
+        expires_at TEXT NOT NULL,\
+        body TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS faucet_tenant_runs (\
+        run_id TEXT PRIMARY KEY,\
+        tenant TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS faucet_tenant_runs_tenant_idx \
+        ON faucet_tenant_runs (tenant)",
+    "CREATE TABLE IF NOT EXISTS faucet_tenant_state_refs (\
+        tenant TEXT NOT NULL,\
+        state_key TEXT NOT NULL,\
+        body TEXT NOT NULL,\
+        PRIMARY KEY (tenant, state_key))",
 ];
+
+/// The usage-listing cap for `filter`.
+pub fn usage_limit(filter: &crate::usage::UsageFilter) -> usize {
+    if filter.limit > 0 {
+        filter.limit
+    } else {
+        crate::usage::DEFAULT_LIST_LIMIT
+    }
+}
+
+/// The change-request listing cap for `filter`.
+pub fn change_limit(filter: &crate::serve::changes::ChangeListFilter) -> usize {
+    if filter.limit > 0 {
+        filter.limit
+    } else {
+        crate::serve::changes::DEFAULT_LIST_LIMIT
+    }
+}
 
 /// SQL placeholder dialect.
 #[derive(Clone, Copy, Debug)]
@@ -359,6 +413,8 @@ pub struct Stmts {
     pub list_audit: String,
     /// Purge audit records older than a threshold (retention).
     pub purge_audit: String,
+    pub insert_audit_tenant: String,
+    pub purge_audit_tenants: String,
     // ── Persistent run logs (#529) ────────────────────────────────────────────
     /// Insert one run-log line. Params: run_id, seq, ts, level, line.
     pub insert_run_log: String,
@@ -387,6 +443,28 @@ pub struct Stmts {
     /// Change requests (#703).
     pub change_upsert: String,
     pub change_select: String,
+    pub change_delete: String,
+    pub usage_delete_run: String,
+    pub tenant_upsert: String,
+    pub tenant_select: String,
+    pub tenant_list: String,
+    pub tenant_delete: String,
+    pub tenant_delete_connections: String,
+    pub tenant_delete_sessions: String,
+    pub tenant_delete_runs: String,
+    pub tenant_delete_state_refs: String,
+    pub connection_upsert: String,
+    pub connection_select: String,
+    pub connection_list: String,
+    pub connection_delete: String,
+    pub session_insert: String,
+    pub session_purge: String,
+    pub session_take: String,
+    pub tenant_run_link: String,
+    pub tenant_run_delete: String,
+    pub purge_orphan_tenant_runs: String,
+    pub state_ref_insert: String,
+    pub state_ref_select: String,
     pub catalog_upsert_dataset: String,
     /// Every dataset body — filtering/ordering happens in shared pure code
     /// ([`catalog::filter_datasets`](super::catalog::filter_datasets)), so the
@@ -568,12 +646,11 @@ impl Stmts {
             sql.push_str(&clauses.join(" AND "));
         }
         sql.push_str(" ORDER BY recorded_at DESC, run_id ASC, row_id ASC");
-        let limit = if filter.limit > 0 {
-            filter.limit
-        } else {
-            crate::usage::DEFAULT_LIST_LIMIT
-        };
-        sql.push_str(&format!(" LIMIT {limit}"));
+        // The tenant lives in the body, so a tenant filter runs on the decoded
+        // rows; the cap is applied after it rather than here.
+        if filter.tenant.is_none() {
+            sql.push_str(&format!(" LIMIT {}", usage_limit(filter)));
+        }
         (sql, binds)
     }
 
@@ -604,12 +681,9 @@ impl Stmts {
             sql.push_str(&clauses.join(" AND "));
         }
         sql.push_str(" ORDER BY created_at DESC, id ASC");
-        let limit = if filter.limit > 0 {
-            filter.limit
-        } else {
-            crate::serve::changes::DEFAULT_LIST_LIMIT
-        };
-        sql.push_str(&format!(" LIMIT {limit}"));
+        if filter.tenant.is_none() {
+            sql.push_str(&format!(" LIMIT {}", change_limit(filter)));
+        }
         (sql, binds)
     }
 
@@ -645,7 +719,9 @@ impl Stmts {
                 AND ($7::text IS NULL OR submitted_at <= $8::text) \
                 AND ($9::text IS NULL OR (submitted_at < $10::text \
                     OR (submitted_at = $11::text AND run_id < $12::text))) \
-                ORDER BY submitted_at DESC, run_id DESC LIMIT $13"
+                AND ($13::text IS NULL OR run_id IN \
+                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = $14::text)) \
+                ORDER BY submitted_at DESC, run_id DESC LIMIT $15"
                 .into(),
             purge_runs: "DELETE FROM faucet_serve_runs \
                 WHERE status IN ('completed','failed','cancelled') \
@@ -785,15 +861,23 @@ impl Stmts {
                 (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result) \
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"
                 .into(),
-            list_audit: "SELECT id, ts, principal, role, action, run_id, config_fingerprint, \
-                source_ip, result FROM faucet_serve_audit \
+            list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
+                config_fingerprint, source_ip, result, t.tenant AS tenant \
+                FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE ($1::text IS NULL OR principal = $2::text) \
                 AND ($3::text IS NULL OR action = $4::text) \
                 AND ($5::text IS NULL OR ts >= $6::text) \
                 AND ($7::text IS NULL OR ts <= $8::text) \
-                ORDER BY ts DESC, id DESC LIMIT $9"
+                AND ($9::text IS NULL OR t.tenant = $10::text) \
+                ORDER BY a.ts DESC, a.id DESC LIMIT $11"
                 .into(),
             purge_audit: "DELETE FROM faucet_serve_audit WHERE ts < $1".into(),
+            insert_audit_tenant: "INSERT INTO faucet_serve_audit_tenants (id, tenant) \
+                VALUES ($1,$2) ON CONFLICT (id) DO NOTHING"
+                .into(),
+            purge_audit_tenants: "DELETE FROM faucet_serve_audit_tenants \
+                WHERE id NOT IN (SELECT id FROM faucet_serve_audit)"
+                .into(),
             insert_run_log: "INSERT INTO faucet_serve_run_logs \
                 (run_id, seq, ts, level, line) VALUES ($1,$2,$3,$4,$5) \
                 ON CONFLICT (run_id, seq) DO NOTHING"
@@ -831,6 +915,54 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=$1".into(),
+            change_delete: "DELETE FROM faucet_serve_changes WHERE id=$1".into(),
+            usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=$1".into(),
+            tenant_upsert: "INSERT INTO faucet_tenants (id, updated_at, body) \
+                VALUES ($1,$2,$3) \
+                ON CONFLICT (id) DO UPDATE SET updated_at=excluded.updated_at, body=excluded.body"
+                .into(),
+            tenant_select: "SELECT body FROM faucet_tenants WHERE id=$1".into(),
+            tenant_list: "SELECT body FROM faucet_tenants ORDER BY id".into(),
+            tenant_delete: "DELETE FROM faucet_tenants WHERE id=$1".into(),
+            tenant_delete_connections: "DELETE FROM faucet_tenant_connections WHERE tenant=$1"
+                .into(),
+            tenant_delete_sessions: "DELETE FROM faucet_connect_sessions WHERE tenant=$1".into(),
+            tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=$1".into(),
+            tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=$1"
+                .into(),
+            connection_upsert: "INSERT INTO faucet_tenant_connections \
+                (tenant, name, status, updated_at, body) VALUES ($1,$2,$3,$4,$5) \
+                ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
+                updated_at=excluded.updated_at, body=excluded.body"
+                .into(),
+            connection_select: "SELECT body FROM faucet_tenant_connections \
+                WHERE tenant=$1 AND name=$2"
+                .into(),
+            connection_list: "SELECT body FROM faucet_tenant_connections \
+                WHERE tenant=$1 ORDER BY name"
+                .into(),
+            connection_delete: "DELETE FROM faucet_tenant_connections \
+                WHERE tenant=$1 AND name=$2"
+                .into(),
+            session_insert: "INSERT INTO faucet_connect_sessions (state, tenant, expires_at, body) \
+                VALUES ($1,$2,$3,$4)"
+                .into(),
+            session_purge: "DELETE FROM faucet_connect_sessions WHERE expires_at < $1".into(),
+            session_take: "DELETE FROM faucet_connect_sessions WHERE state=$1 RETURNING body"
+                .into(),
+            tenant_run_link: "INSERT INTO faucet_tenant_runs (run_id, tenant) VALUES ($1,$2) \
+                ON CONFLICT (run_id) DO UPDATE SET tenant=excluded.tenant"
+                .into(),
+            tenant_run_delete: "DELETE FROM faucet_tenant_runs WHERE run_id=$1".into(),
+            purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
+                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
+            state_ref_insert: "INSERT INTO faucet_tenant_state_refs (tenant, state_key, body) \
+                VALUES ($1,$2,$3) ON CONFLICT (tenant, state_key) DO NOTHING"
+                .into(),
+            state_ref_select: "SELECT body FROM faucet_tenant_state_refs \
+                WHERE tenant=$1 ORDER BY state_key"
+                .into(),
             catalog_upsert_dataset: "INSERT INTO faucet_catalog_datasets \
                 (id, uri, kind, last_seen, body) VALUES ($1,$2,$3,$4,$5) \
                 ON CONFLICT (id) DO UPDATE SET uri=excluded.uri, kind=excluded.kind, \
@@ -975,6 +1107,8 @@ impl Stmts {
                 AND (? IS NULL OR submitted_at <= ?) \
                 AND (? IS NULL OR (submitted_at < ? \
                     OR (submitted_at = ? AND run_id < ?))) \
+                AND (? IS NULL OR run_id IN \
+                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = ?)) \
                 ORDER BY submitted_at DESC, run_id DESC LIMIT ?"
                 .into(),
             purge_runs: "DELETE FROM faucet_serve_runs \
@@ -1109,15 +1243,23 @@ impl Stmts {
                 (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result) \
                 VALUES (?,?,?,?,?,?,?,?,?)"
                 .into(),
-            list_audit: "SELECT id, ts, principal, role, action, run_id, config_fingerprint, \
-                source_ip, result FROM faucet_serve_audit \
+            list_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
+                config_fingerprint, source_ip, result, t.tenant AS tenant \
+                FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
                 WHERE (? IS NULL OR principal = ?) \
                 AND (? IS NULL OR action = ?) \
                 AND (? IS NULL OR ts >= ?) \
                 AND (? IS NULL OR ts <= ?) \
-                ORDER BY ts DESC, id DESC LIMIT ?"
+                AND (? IS NULL OR t.tenant = ?) \
+                ORDER BY a.ts DESC, a.id DESC LIMIT ?"
                 .into(),
             purge_audit: "DELETE FROM faucet_serve_audit WHERE ts < ?".into(),
+            insert_audit_tenant: "INSERT INTO faucet_serve_audit_tenants (id, tenant) \
+                VALUES (?,?) ON CONFLICT (id) DO NOTHING"
+                .into(),
+            purge_audit_tenants: "DELETE FROM faucet_serve_audit_tenants \
+                WHERE id NOT IN (SELECT id FROM faucet_serve_audit)"
+                .into(),
             insert_run_log: "INSERT INTO faucet_serve_run_logs \
                 (run_id, seq, ts, level, line) VALUES (?,?,?,?,?) \
                 ON CONFLICT (run_id, seq) DO NOTHING"
@@ -1155,6 +1297,54 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=?".into(),
+            change_delete: "DELETE FROM faucet_serve_changes WHERE id=?".into(),
+            usage_delete_run: "DELETE FROM faucet_usage WHERE run_id=?".into(),
+            tenant_upsert: "INSERT INTO faucet_tenants (id, updated_at, body) \
+                VALUES (?,?,?) \
+                ON CONFLICT (id) DO UPDATE SET updated_at=excluded.updated_at, body=excluded.body"
+                .into(),
+            tenant_select: "SELECT body FROM faucet_tenants WHERE id=?".into(),
+            tenant_list: "SELECT body FROM faucet_tenants ORDER BY id".into(),
+            tenant_delete: "DELETE FROM faucet_tenants WHERE id=?".into(),
+            tenant_delete_connections: "DELETE FROM faucet_tenant_connections WHERE tenant=?"
+                .into(),
+            tenant_delete_sessions: "DELETE FROM faucet_connect_sessions WHERE tenant=?".into(),
+            tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=?".into(),
+            tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=?"
+                .into(),
+            connection_upsert: "INSERT INTO faucet_tenant_connections \
+                (tenant, name, status, updated_at, body) VALUES (?,?,?,?,?) \
+                ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
+                updated_at=excluded.updated_at, body=excluded.body"
+                .into(),
+            connection_select: "SELECT body FROM faucet_tenant_connections \
+                WHERE tenant=? AND name=?"
+                .into(),
+            connection_list: "SELECT body FROM faucet_tenant_connections \
+                WHERE tenant=? ORDER BY name"
+                .into(),
+            connection_delete: "DELETE FROM faucet_tenant_connections \
+                WHERE tenant=? AND name=?"
+                .into(),
+            session_insert: "INSERT INTO faucet_connect_sessions (state, tenant, expires_at, body) \
+                VALUES (?,?,?,?)"
+                .into(),
+            session_purge: "DELETE FROM faucet_connect_sessions WHERE expires_at < ?".into(),
+            session_take: "DELETE FROM faucet_connect_sessions WHERE state=? RETURNING body"
+                .into(),
+            tenant_run_link: "INSERT INTO faucet_tenant_runs (run_id, tenant) VALUES (?,?) \
+                ON CONFLICT (run_id) DO UPDATE SET tenant=excluded.tenant"
+                .into(),
+            tenant_run_delete: "DELETE FROM faucet_tenant_runs WHERE run_id=?".into(),
+            purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
+                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
+            state_ref_insert: "INSERT INTO faucet_tenant_state_refs (tenant, state_key, body) \
+                VALUES (?,?,?) ON CONFLICT (tenant, state_key) DO NOTHING"
+                .into(),
+            state_ref_select: "SELECT body FROM faucet_tenant_state_refs \
+                WHERE tenant=? ORDER BY state_key"
+                .into(),
             catalog_upsert_dataset: "INSERT INTO faucet_catalog_datasets \
                 (id, uri, kind, last_seen, body) VALUES (?,?,?,?,?) \
                 ON CONFLICT (id) DO UPDATE SET uri=excluded.uri, kind=excluded.kind, \
@@ -1531,6 +1721,48 @@ macro_rules! impl_sql_history {
                 }
             }
 
+            /// Run a statement returning at most one `body` row and decode it.
+            async fn select_one_body<T: serde::de::DeserializeOwned>(
+                &self,
+                stmt: &str,
+                binds: &[&str],
+                what: &str,
+            ) -> Result<Option<T>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut query = sqlx::query(stmt);
+                for b in binds {
+                    query = query.bind(*b);
+                }
+                let Some(row) = query.fetch_optional(&self.pool).await.map_err(backend)? else {
+                    return Ok(None);
+                };
+                let body: String = row.try_get("body").map_err(backend)?;
+                Ok(Some($crate::serve::history::sql::decode_json(&body, what)?))
+            }
+
+            /// Run a statement returning `body` rows and decode each.
+            async fn select_bodies<T: serde::de::DeserializeOwned>(
+                &self,
+                stmt: &str,
+                binds: &[&str],
+                what: &str,
+            ) -> Result<Vec<T>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut query = sqlx::query(stmt);
+                for b in binds {
+                    query = query.bind(*b);
+                }
+                let rows = query.fetch_all(&self.pool).await.map_err(backend)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let body: String = row.try_get("body").map_err(backend)?;
+                    out.push($crate::serve::history::sql::decode_json(&body, what)?);
+                }
+                Ok(out)
+            }
+
             /// Borrow the underlying pool (tests close it to exercise fallback).
             pub fn pool(&self) -> &$pool {
                 &self.pool
@@ -1735,6 +1967,8 @@ macro_rules! impl_sql_history {
                     .bind(cursor_ts.as_deref())
                     .bind(cursor_ts.as_deref())
                     .bind(cur_id)
+                    .bind(filter.tenant.as_deref())
+                    .bind(filter.tenant.as_deref())
                     .bind(fetch_n)
                     .fetch_all(&self.pool)
                     .await
@@ -1778,6 +2012,11 @@ macro_rules! impl_sql_history {
                     }
                     Some(_) => {
                         sqlx::query(&self.stmts.delete)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await
+                            .map_err(backend)?;
+                        sqlx::query(&self.stmts.tenant_run_delete)
                             .bind(id)
                             .execute(&self.pool)
                             .await
@@ -1848,9 +2087,15 @@ macro_rules! impl_sql_history {
                 let _ = sqlx::query(&self.stmts.purge_orphan_shards)
                     .execute(&self.pool)
                     .await;
+                let _ = sqlx::query(&self.stmts.purge_orphan_tenant_runs)
+                    .execute(&self.pool)
+                    .await;
                 // Drop audit records older than the run-retention window (#205).
                 let _ = sqlx::query(&self.stmts.purge_audit)
                     .bind(sql::threshold(now, retain_for))
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query(&self.stmts.purge_audit_tenants)
                     .execute(&self.pool)
                     .await;
                 Ok(removed)
@@ -2565,6 +2810,14 @@ macro_rules! impl_sql_history {
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
+                if let Some(tenant) = &entry.tenant {
+                    sqlx::query(&self.stmts.insert_audit_tenant)
+                        .bind(&entry.id)
+                        .bind(tenant)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(backend)?;
+                }
                 Ok(())
             }
 
@@ -2593,6 +2846,8 @@ macro_rules! impl_sql_history {
                     .bind(since.as_deref())
                     .bind(until.as_deref())
                     .bind(until.as_deref())
+                    .bind(filter.tenant.as_deref())
+                    .bind(filter.tenant.as_deref())
                     .bind(limit)
                     .fetch_all(&self.pool)
                     .await
@@ -2610,6 +2865,7 @@ macro_rules! impl_sql_history {
                         run_id: r.try_get("run_id").map_err(backend)?,
                         config_fingerprint: r.try_get("config_fingerprint").map_err(backend)?,
                         source_ip: r.try_get("source_ip").map_err(backend)?,
+                        tenant: r.try_get("tenant").map_err(backend)?,
                         result: r.try_get("result").map_err(backend)?,
                     });
                 }
@@ -3167,7 +3423,205 @@ macro_rules! impl_sql_history {
                 Ok(n > 0)
             }
 
+            // ── Tenants (#709) ───────────────────────────────────────────────
+
+            async fn tenant_upsert(
+                &self,
+                tenant: &$crate::serve::history::tenants::TenantRecord,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.tenant_upsert)
+                    .bind(&tenant.id)
+                    .bind(sql::fmt_ts(tenant.updated_at))
+                    .bind(sql::encode_json(tenant, "tenant")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn tenant_get(
+                &self,
+                id: &str,
+            ) -> Result<Option<$crate::serve::history::tenants::TenantRecord>, $crate::serve::history::HistoryError> {
+                self.select_one_body(&self.stmts.tenant_select, &[id], "tenant")
+                    .await
+            }
+
+            async fn tenant_list(&self) -> Result<Vec<$crate::serve::history::tenants::TenantRecord>, $crate::serve::history::HistoryError> {
+                self.select_bodies(&self.stmts.tenant_list, &[], "tenant").await
+            }
+
+            async fn tenant_delete(&self, id: &str) -> Result<bool, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                for stmt in [
+                    &self.stmts.tenant_delete_connections,
+                    &self.stmts.tenant_delete_sessions,
+                    &self.stmts.tenant_delete_runs,
+                    &self.stmts.tenant_delete_state_refs,
+                ] {
+                    sqlx::query(stmt)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
+                let n = sqlx::query(&self.stmts.tenant_delete)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                tx.commit().await.map_err(backend)?;
+                Ok(n > 0)
+            }
+
+            async fn connection_upsert(
+                &self,
+                connection: &$crate::serve::history::tenants::ConnectionRecord,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.connection_upsert)
+                    .bind(&connection.tenant)
+                    .bind(&connection.name)
+                    .bind(connection.status.as_str())
+                    .bind(sql::fmt_ts(connection.updated_at))
+                    .bind(sql::encode_json(connection, "connection")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn connection_get(
+                &self,
+                tenant: &str,
+                name: &str,
+            ) -> Result<Option<$crate::serve::history::tenants::ConnectionRecord>, $crate::serve::history::HistoryError> {
+                self.select_one_body(&self.stmts.connection_select, &[tenant, name], "connection")
+                    .await
+            }
+
+            async fn connection_list(
+                &self,
+                tenant: &str,
+            ) -> Result<Vec<$crate::serve::history::tenants::ConnectionRecord>, $crate::serve::history::HistoryError> {
+                self.select_bodies(&self.stmts.connection_list, &[tenant], "connection")
+                    .await
+            }
+
+            async fn connection_delete(&self, tenant: &str, name: &str) -> Result<bool, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.connection_delete)
+                    .bind(tenant)
+                    .bind(name)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn connect_session_put(
+                &self,
+                session: &$crate::serve::history::tenants::ConnectSession,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.session_purge)
+                    .bind(sql::fmt_ts(chrono::Utc::now()))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                sqlx::query(&self.stmts.session_insert)
+                    .bind(&session.state)
+                    .bind(&session.tenant)
+                    .bind(sql::fmt_ts(session.expires_at))
+                    .bind(sql::encode_json(session, "connect session")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn connect_session_take(
+                &self,
+                state: &str,
+            ) -> Result<Option<$crate::serve::history::tenants::ConnectSession>, $crate::serve::history::HistoryError> {
+                self.select_one_body(&self.stmts.session_take, &[state], "connect session")
+                    .await
+            }
+
+            async fn tenant_run_link(&self, run_id: &str, tenant: &str) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.tenant_run_link)
+                    .bind(run_id)
+                    .bind(tenant)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn tenant_state_ref_add(
+                &self,
+                state_ref: &$crate::serve::history::tenants::TenantStateRef,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.state_ref_insert)
+                    .bind(&state_ref.tenant)
+                    .bind(&state_ref.key)
+                    .bind(sql::encode_json(state_ref, "tenant state ref")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn tenant_state_refs(
+                &self,
+                tenant: &str,
+            ) -> Result<Vec<$crate::serve::history::tenants::TenantStateRef>, $crate::serve::history::HistoryError> {
+                self.select_bodies(&self.stmts.state_ref_select, &[tenant], "tenant state ref")
+                    .await
+            }
+
             // ── Change requests (#703) ───────────────────────────────────────
+
+            async fn change_delete(
+                &self,
+                id: &str,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.change_delete)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn usage_delete_runs(
+                &self,
+                run_ids: &[String],
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut total = 0usize;
+                for id in run_ids {
+                    total += sqlx::query(&self.stmts.usage_delete_run)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(backend)?
+                        .rows_affected() as usize;
+                }
+                Ok(total)
+            }
 
             async fn change_upsert(
                 &self,
@@ -3236,6 +3690,7 @@ macro_rules! impl_sql_history {
                         out.push(rec);
                     }
                 }
+                out.truncate(sql::change_limit(filter));
                 Ok(out)
             }
 
@@ -3281,6 +3736,7 @@ macro_rules! impl_sql_history {
                         out.push(rec);
                     }
                 }
+                out.truncate(sql::usage_limit(filter));
                 Ok(out)
             }
 

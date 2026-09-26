@@ -233,6 +233,11 @@ pub struct ChangeRequest {
     /// Why execution failed or the approval was invalidated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The tenant the proposed run is for (#709): the requester's own tenant
+    /// or the tenant route it was proposed through. Execution runs it as that
+    /// tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl ChangeRequest {
@@ -255,6 +260,8 @@ pub struct ChangeListFilter {
     pub status: Option<ChangeStatus>,
     pub kind: Option<ChangeKind>,
     pub requester: Option<String>,
+    /// Only requests for this tenant (#709).
+    pub tenant: Option<String>,
     /// Newest first; `0` = backend default.
     pub limit: usize,
 }
@@ -264,6 +271,10 @@ impl ChangeListFilter {
         self.status.is_none_or(|s| c.status == s)
             && self.kind.is_none_or(|k| c.kind == k)
             && self.requester.as_deref().is_none_or(|r| c.requester == r)
+            && self
+                .tenant
+                .as_deref()
+                .is_none_or(|t| c.tenant.as_deref() == Some(t))
     }
 }
 
@@ -380,15 +391,10 @@ async fn plan_run(
     req: &SubmitRequest,
 ) -> Result<ChangePlan, ServeError> {
     let format: crate::serve::load::ConfigFormat = req.config_format.into();
-    let loaded = crate::serve::load::load_submission(
-        &req.config,
-        format,
-        state.default_base().as_ref(),
-        runner::server_policy(state).as_deref(),
-    )
-    .await?;
+    let loaded = runner::load_for(state, &req.config, format, actor.tenant.as_deref()).await?;
     runner::policy_gate(state, actor, &loaded).await?;
-    let auth = crate::auth_catalog::build_auth_catalog(loaded.cfg.auth.as_ref())
+    let auth = loaded
+        .auth_catalog()
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
     let mut rows = Vec::new();
     for node in loaded
@@ -640,6 +646,7 @@ pub async fn create(
         run_id: None,
         template: None,
         error: None,
+        tenant: actor.tenant.clone(),
     };
     save(state, &change).await?;
     record_metric(change.kind, "requested");
@@ -852,6 +859,7 @@ async fn execute(
         principal: change.requester.clone(),
         role: change.requester_role,
         source_ip: None,
+        tenant: change.tenant.clone(),
     };
     // Re-plan against the world as it is now. A planning failure (the
     // template is gone, the config no longer loads) fails the request.
@@ -1183,13 +1191,22 @@ mod tests {
             run_id: None,
             template: None,
             error: None,
+            tenant: Some("acme".into()),
         };
         assert!(ChangeListFilter::default().matches(&c));
+        assert!(
+            !ChangeListFilter {
+                tenant: Some("globex".into()),
+                ..Default::default()
+            }
+            .matches(&c)
+        );
         assert!(
             ChangeListFilter {
                 status: Some(ChangeStatus::Pending),
                 kind: Some(ChangeKind::Run),
                 requester: Some("bob".into()),
+                tenant: Some("acme".into()),
                 limit: 0
             }
             .matches(&c)
@@ -1232,6 +1249,7 @@ mod tests {
             principal: name.into(),
             role: Role::Admin,
             source_ip: None,
+            tenant: None,
         }
     }
 
@@ -1260,6 +1278,7 @@ mod tests {
             run_id: None,
             template: None,
             error: None,
+            tenant: None,
         }
     }
 

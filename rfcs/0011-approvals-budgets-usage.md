@@ -109,4 +109,5 @@ externally constructible and therefore frozen under the semver contract.
 ## Out of scope
 
 - Real billing: faucet reports estimates with their inputs, never invoices.
-- Per-tenant budgets and quotas — #709.
+- Per-tenant budgets and quotas — delivered by #709 (RFC 0012): a tenant's
+  `limits` join every run's budget.

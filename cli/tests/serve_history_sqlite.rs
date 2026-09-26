@@ -395,6 +395,9 @@ async fn server_with_sqlite_history_persists_runs() {
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        vault_key: None,
+        vault_previous_key: Vec::new(),
+        connect_providers: None,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -1393,6 +1396,7 @@ async fn change_requests_round_trip_and_filter() {
             run_id: None,
             template: None,
             error: None,
+            tenant: None,
         }
     };
     store
@@ -1431,6 +1435,7 @@ async fn change_requests_round_trip_and_filter() {
         status,
         kind,
         requester: requester.map(str::to_string),
+        tenant: None,
         limit,
     };
     let got = store

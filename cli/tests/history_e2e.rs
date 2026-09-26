@@ -53,6 +53,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         attempt: 0,
         replay_of: None,
         callback: None,
+        tenant: None,
     }
 }
 

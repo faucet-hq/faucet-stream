@@ -33,7 +33,7 @@ cargo install faucet-cli --no-default-features \
 | `faucet verify <config> [--row R] [--repair] [--allow-delete] [--dry-run] [--json]` | Prove a destination matches its source **by content** (#701): rows matched on the sink's `key` (or `verify.key`), key ranges compared by digest — inside the database when both sides are the same SQL backend, so matching ranges ship no rows — bisected down to the differing keys (`missing_in_dest` / `extra_in_dest` / `changed` / `duplicate`). `--repair` re-syncs exactly those keys through the row's sink (`write_mode: upsert`; deletes only with `--allow-delete`). Exit code = differing keys. A top-level `verify:` block runs the same check after every run. |
 | `faucet profiling show\|reset <config> [--row R] [--column C] [--full] [--json]` | Inspect or re-baseline the learned column profiles a config's `profiling:` block keeps in its `state:` store (#708): `show` prints per root row the baseline depth, the latest run's per-column statistics and drift findings; `reset` forgets the history (or one column's) so the next `min_history` runs learn the new normal. |
 | `faucet rollback <config> --run <id> [--row R] [--dry-run] [--force]` · `--list` | Undo a run (#706): delete the rows it appended (by `_faucet_run_id`), restore the journaled before-images of the keys it upserted, or swap back the table it overwrote — then rewind the row's bookmark and exactly-once watermark so the next run re-reads what was undone. Needs a top-level `rollback:` block (journal + kept previous table + pre-run marker in a durable `state:`) on a postgres / sqlite / mysql column-mode sink. A key a later run changed is a conflict that blocks the rollback unless `--force`. `faucet run` prints each row's run id. |
-| `faucet usage [--since W] [--until W] [--by pipeline\|row\|dataset\|sink\|day] [--pipeline P] [--json]` · `faucet run --max-records N --max-bytes B --max-duration-secs S --allowed-sink X` | Cost & usage accounting (#704) and run budgets (#703). Every invocation is metered — records, estimated bytes, backend round trips, connector cost signals (BigQuery bytes billed, S3/GCS requests) — priced against the `usage:` rate table (shipped defaults = public list prices, all overridable) and compared to a per-row-priced hosted ELT equivalent; estimates are labelled as estimates and a connector that reports nothing is *compute not reported*, never zero. `faucet run` prints a usage line per row, `--output json` and serve run records carry the record, `faucet usage` / `GET /v1/usage` / the console's Usage page aggregate the `catalog:` store. A `budget:` block (or the run flags) puts hard ceilings on one invocation: the page that would cross `max_records` / `max_bytes` is refused whole (bookmark untouched), `max_duration_secs` cancels at the next page boundary, `allowed_sinks` refuses before anything runs. Requires the `catalog` build feature for `faucet usage`. |
+| `faucet usage [--since W] [--until W] [--by pipeline\|row\|dataset\|sink\|day\|tenant] [--pipeline P] [--tenant T] [--json]` · `faucet run --max-records N --max-bytes B --max-duration-secs S --allowed-sink X` | Cost & usage accounting (#704) and run budgets (#703). Every invocation is metered — records, estimated bytes, backend round trips, connector cost signals (BigQuery bytes billed, S3/GCS requests) — priced against the `usage:` rate table (shipped defaults = public list prices, all overridable) and compared to a per-row-priced hosted ELT equivalent; estimates are labelled as estimates and a connector that reports nothing is *compute not reported*, never zero. `faucet run` prints a usage line per row, `--output json` and serve run records carry the record, `faucet usage` / `GET /v1/usage` / the console's Usage page aggregate the `catalog:` store. A `budget:` block (or the run flags) puts hard ceilings on one invocation: the page that would cross `max_records` / `max_bytes` is refused whole (bookmark untouched), `max_duration_secs` cancels at the next page boundary, `allowed_sinks` refuses before anything runs. Requires the `catalog` build feature for `faucet usage`. |
 | `faucet list` | List every compiled-in source, sink, transform, and state-store backend, each with its conformance maturity tier. |
 | `faucet conformance [name] [--kind K] [--json] [--min-tier T]` | Score connectors against the SDK contract, print a scorecard + maturity tier (Stable/Experimental/Beta/Draft) and capability badges. `--min-tier` exits non-zero as an opt-in CI gate. |
 | `faucet preview <config> --limit N` | Run only the source side and emit the first N records to stdout as JSONL. |
@@ -440,6 +440,27 @@ approver (`invalidated`). `faucet serve --require-approval run` turns every
 `POST /v1/runs` and template trigger into a pending request; the MCP
 `propose_run` / `propose_template` tools let agents file requests. See the
 [approvals cookbook](../docs/book/src/cookbook/approvals.md).
+
+#### Tenants (`--vault-key`, `--connect-providers`)
+
+With the `tenants` feature (#709) a server runs the same pipelines for many
+customers. `POST /v1/tenants` creates a tenant with `limits`
+(`max_concurrent_runs` → `429`; per-run ceilings join every run's budget) and
+tenant-level `notifications`. `POST /v1/tenants/{t}/connections` stores
+`{type, config}` credentials sealed under `--vault-key` (`FAUCET_VAULT_KEY`;
+rotate with `--vault-previous-key`), and `--connect-providers providers.yaml`
+adds a hosted OAuth flow (`POST /v1/tenants/{t}/connect/{provider}` → an
+authorization URL; PKCE; the public `/v1/connect/callback` stores the grant).
+A run for a tenant (`POST /v1/tenants/{t}/runs`,
+`/v1/tenants/{t}/templates/{id}/runs`, `POST /v1/templates/{id}/fanout`, or a
+`schedule` trigger with `tenants: all`) resolves `auth: { ref }` against the
+tenant's connections, binds `${tenant.*}`, keeps state under
+`{tenant}::{pipeline}::{row}`, and carries the tenant on its run, usage, audit
+and change records. Rotated refresh tokens are written back; a revoked grant
+marks the connection `needs_reauth`, notifies the tenant and pauses its runs.
+A principal with `tenant:` in `--auth-config` is confined to one tenant.
+`DELETE /v1/tenants/{t}` removes everything faucet holds for it. See the
+[embedded integrations cookbook](../docs/book/src/cookbook/embedded-integrations.md).
 
 ### `faucet mcp` / `faucet serve --mcp`
 

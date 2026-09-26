@@ -304,6 +304,22 @@ of an output that retention already cleaned shows the "cleaned up — the run
 record is kept" message in place of the table, never an error toast. Full detail:
 [Dataset preview](../reference/cli.md#dataset-preview-of-local-outputs).
 
+### Tenants
+
+On a server built with the `tenants` feature, the **Tenants** page lists every
+[tenant](./embedded-integrations.md) with its connections (and any that need
+re-authorization), active runs and limits. A tenant's page edits its limits,
+lists its connections — names, types and status, never credentials — and
+offers a **Connect** button per `--connect-providers` provider (the
+authorization page opens in a new tab and returns to the console), a form for
+stored credentials, and suspend / delete. Delete asks you to type the tenant id
+first. The **tenant switcher** in the top bar scopes Runs, Usage and Changes to
+one tenant; a tenant-scoped principal is pinned to its own. Controls follow
+the caller's role: creating, suspending and deleting tenants needs
+`tenant_admin`, connections need `connection_manage`.
+
+![A tenant's page: its limits form, the connections table with each connection's type and status, the connect-provider panel, a stored-credentials form, and the suspend and delete controls](../assets/console/tenants.png)
+
 ## Disabling the console at runtime
 
 If you built with `serve-ui` but want to serve only the API (no static assets),

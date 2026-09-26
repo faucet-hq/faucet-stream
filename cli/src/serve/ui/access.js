@@ -16,7 +16,7 @@ export const can = (perm) => !me || me.permissions.includes(perm);
 
 const ALL = [
   "run_write", "doctor", "dlq_manage", "template_admin", "local_output_manage", "audit_read", "reload",
-  "change_request", "change_approve",
+  "change_request", "change_approve", "tenant_admin", "connection_manage",
 ];
 
 function applyStyle() {

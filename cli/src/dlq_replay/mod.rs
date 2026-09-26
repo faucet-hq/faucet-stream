@@ -215,6 +215,7 @@ pub async fn replay(
             dry_run: inputs.dry_run,
             limit: None,
             state_path_override: None,
+            state_scope: Default::default(),
             shard: None,
             auth: inputs.auth,
             clock: inputs.clock,

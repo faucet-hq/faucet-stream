@@ -71,6 +71,7 @@ paths:
         - { name: until, in: query, schema: { type: string, format: date-time } }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
         - { name: cursor, in: query, schema: { type: string }, description: "Last run_id from the previous page." }
+        - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
       responses:
         "200":
           description: A page of runs, newest first.
@@ -758,6 +759,7 @@ paths:
         - { name: status, in: query, required: false, schema: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] } }
         - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch] } }
         - { name: requester, in: query, required: false, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 2000 } }
       responses:
         "200":
@@ -865,7 +867,8 @@ paths:
         - { name: since, in: query, required: false, schema: { type: string }, description: "RFC 3339 or YYYY-MM-DD; invocations recorded at or after it." }
         - { name: until, in: query, required: false, schema: { type: string }, description: "RFC 3339 or YYYY-MM-DD; invocations recorded before it." }
         - { name: pipeline, in: query, required: false, schema: { type: string }, description: "Only this pipeline." }
-        - { name: by, in: query, required: false, schema: { type: string, enum: [pipeline, row, dataset, sink, day], default: pipeline } }
+        - { name: by, in: query, required: false, schema: { type: string, enum: [pipeline, row, dataset, sink, day, tenant], default: pipeline } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only invocations run for this tenant (#709); forced for a tenant-scoped principal." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 5000, maximum: 50000 }, description: "Most invocation records to read (newest first)." }
         - { name: include_records, in: query, required: false, schema: { type: boolean, default: false }, description: "Also return the raw records the report was built from." }
       responses:
@@ -884,6 +887,395 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the `UsageRead` permission }
+  /v1/tenants:
+    get:
+      summary: List tenants
+      description: Every tenant with its connections' state (never credentials) and its active run count. A tenant-scoped principal sees only its own. Requires `TenantRead` (viewer). Requires the `tenants` Cargo feature.
+      operationId: listTenants
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The tenants.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TenantView" }
+        "401": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Create a tenant
+      description: Requires `TenantAdmin` (admin).
+      operationId: createTenant
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              additionalProperties: false
+              properties:
+                id: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" }
+                name: { type: string }
+                labels: { type: object, additionalProperties: { type: string } }
+                limits: { $ref: "#/components/schemas/TenantLimits" }
+                notifications: { type: array, items: { type: object }, description: "Notification rules (the config `notifications:` shape) for tenant-level events such as `connection_needs_reauth`." }
+      responses:
+        "201":
+          description: The created tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantView" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { description: A tenant with this id exists }
+  /v1/tenants/{tenant}:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Get a tenant
+      description: Requires `TenantRead` (viewer).
+      operationId: getTenant
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantView" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      summary: Update, suspend or resume a tenant
+      description: Every field is optional; a present field replaces the stored one. A suspended tenant's runs are refused (409). Requires `TenantAdmin` (admin).
+      operationId: patchTenant
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                labels: { type: object, additionalProperties: { type: string } }
+                limits: { $ref: "#/components/schemas/TenantLimits" }
+                notifications: { type: array, items: { type: object } }
+                suspended: { type: boolean }
+      responses:
+        "200":
+          description: The updated tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantView" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a tenant and everything faucet holds for it
+      description: >
+        Deletes the tenant's runs, usage records, change requests, recorded
+        state keys (and their SLA / profiling / rollback markers),
+        connections and pending connect sessions. Destination data is never
+        touched. Refused (409) while a run is queued or running. Requires
+        `TenantAdmin` (admin).
+      operationId: deleteTenant
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: What was deleted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantDeleteReport" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The tenant has active runs }
+  /v1/tenants/{tenant}/connections:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+    get:
+      summary: List a tenant's connections
+      description: Names, provider types and status — never credentials. Requires `TenantRead` (viewer).
+      operationId: listConnections
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The connections.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Connection" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Store a connection
+      description: >
+        Validates the provider spec (the `auth:` catalog `{type, config}`
+        shape), seals it with the server's vault key and stores it. A run for
+        the tenant resolves `auth: { ref: <name> }` against it. 503 without a
+        vault key. Requires `ConnectionManage` (operator).
+      operationId: createConnection
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, provider]
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                provider: { type: object, description: "`{ type, config }` — static, oauth2, oauth2_refresh, token_endpoint, flow." }
+      responses:
+        "201":
+          description: The stored connection.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Connection" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The tenant already has a connection with this name }
+        "503": { description: The server has no vault key }
+  /v1/tenants/{tenant}/connections/{name}:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+      - { name: name, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Get a connection
+      description: Requires `TenantRead` (viewer).
+      operationId: getConnection
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The connection.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Connection" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace (or create) a connection
+      description: Storing new credentials is how a tenant reconnects — the connection becomes `active` again. Requires `ConnectionManage` (operator).
+      operationId: putConnection
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider]
+              additionalProperties: false
+              properties:
+                provider: { type: object }
+      responses:
+        "200":
+          description: The stored connection.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Connection" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { description: The server has no vault key }
+    delete:
+      summary: Delete a connection
+      description: Requires `ConnectionManage` (operator).
+      operationId: deleteConnection
+      security: [{ bearerAuth: [] }]
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/connect/{provider}:
+    post:
+      summary: Start a hosted OAuth connect flow
+      description: >
+        For the embedding product's backend: returns the provider's
+        authorization URL (authorization code + PKCE S256, a single-use
+        `state` valid for ten minutes) to send its user to. The provider
+        redirects to `/v1/connect/callback`, which stores the grant as an
+        `oauth2_refresh` connection and redirects to `redirect`. `redirect`
+        must start with one of the provider's `allowed_redirects`. Requires
+        `ConnectionManage` (operator).
+      operationId: startConnect
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string } }
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connection, redirect]
+              additionalProperties: false
+              properties:
+                connection: { type: string }
+                redirect: { type: string, format: uri }
+      responses:
+        "200":
+          description: Where to send the user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorize_url, expires_at]
+                properties:
+                  authorize_url: { type: string, format: uri }
+                  expires_at: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { description: Unknown provider, or a redirect outside `allowed_redirects` }
+        "503": { description: The server has no vault key }
+  /v1/connect/callback:
+    get:
+      summary: OAuth redirect target (public)
+      description: >
+        Unauthenticated: the single-use `state` is the credential. Exchanges
+        the code at the provider's token endpoint and redirects to the
+        caller's `redirect` with `connection=<name>&status=ok`, or
+        `status=error&error=<code>` (`expired`, `access_denied`,
+        `exchange_failed`, …). An unknown or already-used `state` is a 400.
+      operationId: connectCallback
+      parameters:
+        - { name: state, in: query, required: true, schema: { type: string } }
+        - { name: code, in: query, required: false, schema: { type: string } }
+        - { name: error, in: query, required: false, schema: { type: string } }
+        - { name: error_description, in: query, required: false, schema: { type: string } }
+      responses:
+        "303": { description: Redirect to the caller's `redirect` }
+        "400": { $ref: "#/components/responses/Error" }
+  /v1/connect/providers:
+    get:
+      summary: List hosted OAuth connect providers
+      description: The providers configured with `--connect-providers` (names and scopes). Requires `TenantRead` (viewer).
+      operationId: listConnectProviders
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The providers.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    scopes: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/runs:
+    post:
+      summary: Submit a run for a tenant
+      description: >
+        A `POST /v1/runs` body, run as the tenant: `auth: { ref }` resolves
+        against the tenant's connections first, `${tenant.id}` /
+        `${tenant.name}` / `${tenant.labels.<key>}` are bound, state keys are
+        namespaced `{tenant}::{pipeline}::{row}`, and the tenant's limits
+        apply (429 at `max_concurrent_runs`; the per-run ceilings join the
+        budget). 409 when the tenant is suspended or a referenced connection
+        is missing or needs re-authorization. Requires `RunWrite` (operator).
+      operationId: submitTenantRun
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubmitRequest" }
+      responses:
+        "202":
+          description: Accepted (or a pending change request under an approval gate).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SubmitResponse" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "429": { description: The tenant is at its `max_concurrent_runs` limit, or the queue is full }
+  /v1/tenants/{tenant}/templates/{id}/runs:
+    post:
+      summary: Trigger a registered template for a tenant
+      description: A template trigger body, run as the tenant (see `POST /v1/tenants/{tenant}/runs`). Requires `RunWrite` (operator).
+      operationId: triggerTenantTemplate
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TriggerTemplateRequest" }
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TriggerTemplateResponse" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "429": { description: The tenant is at its `max_concurrent_runs` limit, or the queue is full }
+  /v1/templates/{id}/fanout:
+    post:
+      summary: Trigger a template once per tenant
+      description: >
+        A template trigger body plus `tenants` (`"all"` — every tenant not
+        suspended — or a list) and `concurrency` (submissions in flight,
+        default 4). Each tenant runs as itself; a tenant whose connection is
+        missing or needs re-authorization, that is suspended, or that is at
+        its limit is `skipped`, not failed. An `idempotency_key` is suffixed
+        `:<tenant>`. Each run carries the `fanout` label. Requires `RunWrite`
+        (operator).
+      operationId: fanoutTemplate
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/TriggerTemplateRequest" }
+                - type: object
+                  required: [tenants]
+                  properties:
+                    tenants:
+                      oneOf:
+                        - { type: string, enum: [all] }
+                        - { type: array, items: { type: string } }
+                    concurrency: { type: integer, minimum: 1, maximum: 64, default: 4 }
+      responses:
+        "200":
+          description: One result per tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FanoutResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
   /v1/local-outputs:
     get:
       summary: List local sink outputs
@@ -1666,6 +2058,7 @@ paths:
       parameters:
         - { name: principal, in: query, required: false, schema: { type: string } }
         - { name: action, in: query, required: false, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only actions taken for this tenant (#709)." }
         - { name: since, in: query, required: false, schema: { type: string, format: date-time } }
         - { name: until, in: query, required: false, schema: { type: string, format: date-time } }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 100, maximum: 1000 } }
@@ -1826,6 +2219,69 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
   schemas:
+    TenantLimits:
+      type: object
+      additionalProperties: false
+      description: Per-tenant ceilings (#709). `max_concurrent_runs` is checked at submit; the rest join every run's budget.
+      properties:
+        max_concurrent_runs: { type: integer, minimum: 1 }
+        max_records_per_run: { type: integer, minimum: 1 }
+        max_bytes_per_run: { type: integer, minimum: 1 }
+        max_duration_secs: { type: integer, minimum: 1 }
+    Connection:
+      type: object
+      description: A tenant connection — never its credentials.
+      required: [name, provider_type, status, created_at, updated_at, updated_by]
+      properties:
+        name: { type: string }
+        provider_type: { type: string }
+        connect_provider: { type: string, description: "The hosted-OAuth provider that created it." }
+        status: { type: string, enum: [active, needs_reauth] }
+        reauth_reason: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        updated_by: { type: string }
+    TenantView:
+      type: object
+      required: [id, limits, suspended, created_at, updated_at, created_by, connections, active_runs]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        labels: { type: object, additionalProperties: { type: string } }
+        limits: { $ref: "#/components/schemas/TenantLimits" }
+        notifications: { type: array, items: { type: object } }
+        suspended: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        created_by: { type: string }
+        connections: { type: array, items: { $ref: "#/components/schemas/Connection" } }
+        active_runs: { type: integer }
+    TenantDeleteReport:
+      type: object
+      required: [runs, usage_records, change_requests, state_keys_deleted]
+      properties:
+        runs: { type: integer }
+        usage_records: { type: integer }
+        change_requests: { type: integer }
+        state_keys_deleted: { type: integer }
+        state_keys_not_deleted: { type: array, items: { type: string }, description: "Keys left in place, with why." }
+    FanoutResponse:
+      type: object
+      required: [fanout_id, template_id, results]
+      properties:
+        fanout_id: { type: string }
+        template_id: { type: string }
+        results:
+          type: array
+          items:
+            type: object
+            required: [tenant, status]
+            properties:
+              tenant: { type: string }
+              status: { type: string, enum: [submitted, pending_approval, skipped, failed] }
+              run_id: { type: string }
+              change_id: { type: string }
+              reason: { type: string }
     RunStatus:
       type: string
       enum: [pending, queued, running, sharded, completed, failed, cancelled]
@@ -1977,6 +2433,7 @@ components:
         finished_at: { type: string, format: date-time, nullable: true }
         elapsed_secs: { type: number, nullable: true }
         records_written: { type: integer }
+        tenant: { type: string, description: "The tenant this run was started for (#709); absent for an ordinary run." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -2050,6 +2507,7 @@ components:
         principal: { type: string, description: "Principal name (anonymous / token / <name> / trigger:<name>)." }
         role: { type: string, enum: [viewer, operator, admin] }
         action: { type: string, description: "e.g. run.submit / run.cancel / run.delete / trigger.fire / <route> (denials)." }
+        tenant: { type: string, description: "The tenant the action was taken for (#709)." }
         run_id: { type: string, nullable: true }
         config_fingerprint: { type: string, nullable: true, description: "sha256 of the merged config (submit actions)." }
         source_ip: { type: string, nullable: true }
@@ -2310,6 +2768,7 @@ components:
         kind: { type: string, enum: [run, template_register, template_launch] }
         status: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] }
         requester: { type: string }
+        tenant: { type: string, description: "The tenant the proposed run is for (#709)." }
         requester_role: { type: string, enum: [viewer, operator, admin] }
         reason: { type: string }
         payload: { type: object, description: "The proposed action, verbatim; secrets are never resolved into it." }
@@ -2407,6 +2866,7 @@ components:
       required: [run_id, pipeline, row, source_kind, sink_kind, recorded_at, duration_ms, failed, usage, cost]
       properties:
         run_id: { type: string }
+        tenant: { type: string, description: "The tenant the invocation ran for (#709)." }
         pipeline: { type: string }
         row: { type: string }
         source_kind: { type: string }
