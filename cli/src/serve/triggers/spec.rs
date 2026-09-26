@@ -317,7 +317,7 @@ triggers:
         let t = &f.triggers[0];
         assert_eq!(t.name, "drop");
         assert!(t.enabled);
-        assert!(matches!(t.config, PipelineRef::Path(ref p) if p == "./pipelines/load.yaml"));
+        assert!(matches!(t.config, Some(PipelineRef::Path(ref p)) if p == "./pipelines/load.yaml"));
         match &t.kind {
             TriggerKind::ObjectArrival {
                 poll_interval_secs,
@@ -350,7 +350,7 @@ triggers:
     threshold: 5
 "#;
         let f: TriggersFile = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(f.triggers[0].config, PipelineRef::Inline(_)));
+        assert!(matches!(f.triggers[0].config, Some(PipelineRef::Inline(_))));
         match &f.triggers[0].kind {
             TriggerKind::Webhook {
                 methods,

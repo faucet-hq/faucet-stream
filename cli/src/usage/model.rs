@@ -153,7 +153,8 @@ pub fn estimate(
 
     CostEstimate {
         currency: pricing.currency.clone(),
-        total: lines.iter().map(|l| l.amount).sum(),
+        // An empty float sum is -0.0; adding 0.0 normalizes it.
+        total: lines.iter().map(|l| l.amount).sum::<f64>() + 0.0,
         lines,
         not_reported,
         hosted_equivalent: usage.records_written as f64 / 1_000_000.0
@@ -373,6 +374,19 @@ mod tests {
     use super::*;
     use faucet_core::usage::CostSignal;
 
+    #[test]
+    fn an_unpriced_run_costs_positive_zero() {
+        let est = estimate(
+            &UsageSnapshot::default(),
+            "rest",
+            "jsonl",
+            &PricingSpec::default(),
+        );
+        assert_eq!(est.total, 0.0);
+        assert!(est.total.is_sign_positive());
+        assert_eq!(serde_json::to_value(&est).unwrap()["total"], serde_json::json!(0.0));
+    }
+
     fn snap(written: u64, bytes: u64) -> UsageSnapshot {
         UsageSnapshot {
             records_read: written,
@@ -403,6 +417,7 @@ mod tests {
             failed,
             usage: snap(1_000_000, 5000),
             cost,
+            tenant: (pipeline == "a").then(|| "acme".to_string()),
         }
     }
 
@@ -494,6 +509,7 @@ mod tests {
             since: Some("2026-09-02T00:00:00Z".parse().unwrap()),
             until: None,
             pipeline: None,
+            tenant: None,
             limit: 0,
         };
         assert_eq!(recs.iter().filter(|r| f.matches(r)).count(), 1);
@@ -502,6 +518,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(recs.iter().filter(|r| f.matches(r)).count(), 2);
+        let f = UsageFilter {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        };
+        assert_eq!(recs.iter().filter(|r| f.matches(r)).count(), 2);
+        let by_tenant = aggregate(&recs, GroupBy::Tenant, "USD");
+        let keys: Vec<&str> = by_tenant.rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec![NO_TENANT, "acme"]);
+        assert_eq!(GroupBy::parse("tenant"), Some(GroupBy::Tenant));
+        assert_eq!(GroupBy::Tenant.as_str(), "tenant");
         assert_eq!(GroupBy::parse("day"), Some(GroupBy::Day));
         assert_eq!(GroupBy::parse("nope"), None);
         assert_eq!(GroupBy::Dataset.as_str(), "dataset");

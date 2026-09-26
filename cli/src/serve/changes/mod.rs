@@ -1192,13 +1192,22 @@ mod tests {
             run_id: None,
             template: None,
             error: None,
+            tenant: Some("acme".into()),
         };
         assert!(ChangeListFilter::default().matches(&c));
+        assert!(
+            !ChangeListFilter {
+                tenant: Some("globex".into()),
+                ..Default::default()
+            }
+            .matches(&c)
+        );
         assert!(
             ChangeListFilter {
                 status: Some(ChangeStatus::Pending),
                 kind: Some(ChangeKind::Run),
                 requester: Some("bob".into()),
+                tenant: Some("acme".into()),
                 limit: 0
             }
             .matches(&c)

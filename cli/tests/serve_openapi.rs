@@ -98,6 +98,26 @@ const ROUTES_TEMPLATES_SYNC: &[(&str, &str)] = &[
     ("POST", "/v1/templates/{id}/publish"),
 ];
 
+#[cfg(feature = "tenants")]
+const ROUTES_TENANTS: &[(&str, &str)] = &[
+    ("GET", "/v1/tenants"),
+    ("POST", "/v1/tenants"),
+    ("GET", "/v1/tenants/{tenant}"),
+    ("PATCH", "/v1/tenants/{tenant}"),
+    ("DELETE", "/v1/tenants/{tenant}"),
+    ("GET", "/v1/tenants/{tenant}/connections"),
+    ("POST", "/v1/tenants/{tenant}/connections"),
+    ("GET", "/v1/tenants/{tenant}/connections/{name}"),
+    ("PUT", "/v1/tenants/{tenant}/connections/{name}"),
+    ("DELETE", "/v1/tenants/{tenant}/connections/{name}"),
+    ("POST", "/v1/tenants/{tenant}/connect/{provider}"),
+    ("POST", "/v1/tenants/{tenant}/runs"),
+    ("POST", "/v1/tenants/{tenant}/templates/{id}/runs"),
+    ("POST", "/v1/templates/{id}/fanout"),
+    ("GET", "/v1/connect/providers"),
+    ("GET", "/v1/connect/callback"),
+];
+
 /// Returns the full canonical route set for the current feature configuration.
 fn canonical_routes() -> BTreeSet<(String, String)> {
     #[allow(unused_mut)]
@@ -119,6 +139,10 @@ fn canonical_routes() -> BTreeSet<(String, String)> {
     }
     #[cfg(feature = "templates-sync")]
     for (m, p) in ROUTES_TEMPLATES_SYNC {
+        set.insert((m.to_string(), p.to_string()));
+    }
+    #[cfg(feature = "tenants")]
+    for (m, p) in ROUTES_TENANTS {
         set.insert((m.to_string(), p.to_string()));
     }
     set

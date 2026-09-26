@@ -470,6 +470,31 @@ mod tests {
         );
     }
 
+    fn global() -> AuthContext {
+        AuthContext::system("test")
+    }
+
+    #[test]
+    fn list_query_scopes_a_tenant_principal() {
+        let q = |tenant: Option<&str>| ListQuery {
+            status: None,
+            name: None,
+            since: None,
+            until: None,
+            limit: None,
+            cursor: None,
+            tenant: tenant.map(str::to_string),
+        };
+        let mut scoped = global();
+        scoped.tenant = Some("acme".into());
+        assert_eq!(q(None).into_filter(&scoped).unwrap().tenant.as_deref(), Some("acme"));
+        assert!(q(Some("globex")).into_filter(&scoped).is_err());
+        assert_eq!(
+            q(Some("globex")).into_filter(&global()).unwrap().tenant.as_deref(),
+            Some("globex")
+        );
+    }
+
     #[test]
     fn list_query_clamps_limit() {
         let q = ListQuery {
@@ -479,8 +504,9 @@ mod tests {
             until: None,
             limit: Some(99999),
             cursor: None,
+            tenant: None,
         };
-        assert_eq!(q.into_filter().unwrap().limit, MAX_LIMIT);
+        assert_eq!(q.into_filter(&global()).unwrap().limit, MAX_LIMIT);
         let q = ListQuery {
             status: Some("failed, completed".to_string()),
             name: None,
@@ -488,8 +514,9 @@ mod tests {
             until: None,
             limit: None,
             cursor: None,
+            tenant: None,
         };
-        let f = q.into_filter().unwrap();
+        let f = q.into_filter(&global()).unwrap();
         assert_eq!(f.limit, DEFAULT_LIMIT);
         assert_eq!(f.status, vec![RunStatus::Failed, RunStatus::Completed]);
     }
@@ -505,8 +532,9 @@ mod tests {
             until: None,
             limit: None,
             cursor: None,
+            tenant: None,
         };
-        let err = q.into_filter().unwrap_err();
+        let err = q.into_filter(&global()).unwrap_err();
         assert!(matches!(err, ServeError::BadConfig(ref m) if m.contains("faild")));
         // …and one bad token among good ones still rejects the request.
         let q = ListQuery {
@@ -516,8 +544,9 @@ mod tests {
             until: None,
             limit: None,
             cursor: None,
+            tenant: None,
         };
-        assert!(q.into_filter().is_err(), "case-sensitive tokens");
+        assert!(q.into_filter(&global()).is_err(), "case-sensitive tokens");
         // A trailing comma (empty token) is tolerated.
         let q = ListQuery {
             status: Some("failed,".to_string()),
@@ -526,8 +555,9 @@ mod tests {
             until: None,
             limit: None,
             cursor: None,
+            tenant: None,
         };
-        assert_eq!(q.into_filter().unwrap().status, vec![RunStatus::Failed]);
+        assert_eq!(q.into_filter(&global()).unwrap().status, vec![RunStatus::Failed]);
     }
 
     #[tokio::test]

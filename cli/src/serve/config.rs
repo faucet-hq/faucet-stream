@@ -491,6 +491,7 @@ mod tests {
             name: "bob".into(),
             token: "viewer-tok".into(),
             role: Role::Viewer,
+            tenant: None,
         }])
         .unwrap();
         let mode = AuthMode::Rbac(Arc::new(cfg));
@@ -525,6 +526,7 @@ mod tests {
             name: "x".into(),
             token: "supersecretrbac".into(),
             role: Role::Admin,
+            tenant: None,
         }])
         .unwrap();
         let s = format!("{:?}", AuthMode::Rbac(Arc::new(cfg)));

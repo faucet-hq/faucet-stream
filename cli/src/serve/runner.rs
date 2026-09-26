@@ -2342,7 +2342,7 @@ mod tests {
         use crate::serve::config::{AuthMode, HistoryBackendSpec, ServeConfig};
         use crate::serve::history::RunHistory;
         use crate::serve::history::sqlite::SqliteHistory;
-        use crate::serve::load::{ConfigFormat, load_submission};
+        use crate::serve::load::ConfigFormat;
         use crate::serve::state::ServerState;
         use faucet_core::ShardSpec;
         use std::collections::BTreeMap;
