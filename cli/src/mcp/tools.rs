@@ -986,6 +986,100 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn propose_tools_file_change_requests_on_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "id\n1\n").unwrap();
+        let config = format!(
+            "version: 1\nname: mcp-chg\npipeline:\n  source:\n    type: csv\n    config:\n      path: {}\n  sink:\n    type: jsonl\n    config:\n      path: {}\n",
+            csv.display(),
+            dir.path().join("out.jsonl").display()
+        );
+        for tool in ["propose_run", "propose_template"] {
+            let out = call_tool(&ctx(true), tool, &json!({})).await;
+            assert_eq!(out["isError"], true);
+            assert!(
+                out["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("server transport")
+            );
+        }
+        let proposer = crate::mcp::ChangeProposer {
+            state: crate::serve::test_support::test_state(),
+            actor: crate::serve::rbac::AuthContext::system("agent"),
+        };
+        let c = ctx(true).with_changes(proposer);
+        assert!(format!("{:?}", c.changes.as_ref().unwrap()).contains("system:agent"));
+
+        let out = call_tool(
+            &c,
+            "propose_run",
+            &json!({"config": config, "reason": "nightly", "name": "n", "labels": null,
+                    "budget": {"max_records": 10}}),
+        )
+        .await;
+        assert_eq!(out["isError"], false, "{out}");
+        assert!(
+            out["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("pending")
+        );
+        let bad = call_tool(
+            &c,
+            "propose_run",
+            &json!({"config": config, "reason": "r", "budget": {"max_records": "x"}}),
+        )
+        .await;
+        assert!(
+            bad["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("budget")
+        );
+        let bad = call_tool(&c, "propose_run", &json!({"config": "{", "reason": "r"})).await;
+        assert_eq!(bad["isError"], true);
+
+        let bad = call_tool(
+            &c,
+            "propose_template",
+            &json!({"reason": "r", "action": "burn"}),
+        )
+        .await;
+        assert!(
+            bad["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown action")
+        );
+        let reg = call_tool(
+            &c,
+            "propose_template",
+            &json!({"reason": "r", "config": config, "id": "mcp-chg", "launch": null}),
+        )
+        .await;
+        #[cfg(feature = "templates")]
+        assert_eq!(reg["isError"], false, "{reg}");
+        #[cfg(not(feature = "templates"))]
+        assert_eq!(reg["isError"], true);
+        let launch = call_tool(
+            &c,
+            "propose_template",
+            &json!({"reason": "r", "action": "launch", "id": "ghost", "version": 1}),
+        )
+        .await;
+        assert!(launch["content"][0]["text"].is_string());
+        let missing = call_tool(
+            &c,
+            "propose_template",
+            &json!({"reason": "r", "action": "launch"}),
+        )
+        .await;
+        assert_eq!(missing["isError"], true);
+    }
+
     #[test]
     fn tool_defs_gate_mutations() {
         let ro = tool_defs(&ctx(false));

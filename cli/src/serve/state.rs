@@ -364,4 +364,18 @@ mod tests {
         assert_eq!(s.registry().queued(), 0);
         assert_eq!(s.registry().in_flight(), 0);
     }
+
+    #[test]
+    fn approval_settings_come_from_the_config() {
+        let mut cfg = crate::serve::test_support::test_config();
+        cfg.require_approval = vec![crate::serve::changes::ChangeKind::Run];
+        cfg.approval_expiry = Duration::from_secs(90);
+        let st = crate::serve::test_support::state_from(&cfg);
+        assert_eq!(
+            st.require_approval(),
+            &[crate::serve::changes::ChangeKind::Run]
+        );
+        assert!(st.requires_approval(crate::serve::changes::ChangeKind::Run));
+        assert_eq!(st.approval_expiry(), Duration::from_secs(90));
+    }
 }

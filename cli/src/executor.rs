@@ -5939,4 +5939,81 @@ matrix:
         assert!(dir.path().join("child-1.jsonl").exists());
         assert!(dir.path().join("child-2.jsonl").exists());
     }
+
+    #[cfg(feature = "notify")]
+    #[test]
+    fn errors_map_to_their_notification_events() {
+        use crate::notify::EventKind;
+        let kind = |e: FaucetError| super::error_event("p", "r", &e).kind;
+        assert_eq!(
+            kind(FaucetError::CircuitOpen {
+                failures: 3,
+                cooldown: std::time::Duration::from_secs(1)
+            }),
+            EventKind::CircuitOpen
+        );
+        assert_eq!(
+            kind(FaucetError::ContractViolation {
+                version: "1".into(),
+                message: "m".into()
+            }),
+            EventKind::ContractAbort
+        );
+        assert_eq!(
+            kind(FaucetError::BudgetExceeded {
+                budget: "max_records".into(),
+                limit: 1,
+                actual: 2
+            }),
+            EventKind::BudgetExceeded
+        );
+        let cases = [
+            (FaucetError::Config("x".into()), "config"),
+            (FaucetError::Source("x".into()), "source"),
+            (FaucetError::Sink("x".into()), "sink"),
+            (FaucetError::State("x".into()), "state"),
+            (
+                FaucetError::QualityFailure {
+                    check: "c".into(),
+                    message: "m".into(),
+                },
+                "quality",
+            ),
+            (
+                FaucetError::SchemaDrift {
+                    columns: vec![],
+                    message: "m".into(),
+                },
+                "schema_drift",
+            ),
+            (
+                FaucetError::ProfileDrift {
+                    columns: vec![],
+                    message: "m".into(),
+                },
+                "profile_drift",
+            ),
+            (
+                FaucetError::PolicyViolation {
+                    rule: "r".into(),
+                    column: "c".into(),
+                    message: "m".into(),
+                },
+                "policy",
+            ),
+            (
+                FaucetError::BudgetExceeded {
+                    budget: "b".into(),
+                    limit: 1,
+                    actual: 2,
+                },
+                "budget_exceeded",
+            ),
+            (FaucetError::Transform("x".into()), "error"),
+        ];
+        for (e, want) in cases {
+            assert_eq!(super::faucet_error_kind(&e), want);
+        }
+        assert_eq!(kind(FaucetError::Sink("x".into())), EventKind::RunFailure);
+    }
 }

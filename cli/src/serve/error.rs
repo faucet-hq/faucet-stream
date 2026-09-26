@@ -237,4 +237,10 @@ mod tests {
             "7"
         );
     }
+
+    #[test]
+    fn display_is_code_then_message() {
+        let e = ServeError::Conflict("busy".into());
+        assert_eq!(e.to_string(), format!("{}: {}", e.code(), e.message()));
+    }
 }

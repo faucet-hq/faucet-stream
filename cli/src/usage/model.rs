@@ -487,4 +487,39 @@ mod tests {
         assert_eq!(GroupBy::parse("nope"), None);
         assert_eq!(GroupBy::Dataset.as_str(), "dataset");
     }
+
+    #[test]
+    fn snowflake_credits_are_priced_and_unpriced_signals_still_count() {
+        let mut usage = snap(10, 100);
+        for (connector, kind, unit, q) in [
+            ("snowflake", "credits", "credits", 2.0),
+            ("bigquery", "bytes_loaded", "bytes", 1e9),
+        ] {
+            usage.signals.push(CostSignal {
+                kind: kind.into(),
+                unit: unit.into(),
+                quantity: q,
+                side: faucet_core::usage::UsageSide::Sink,
+                connector: connector.into(),
+            });
+        }
+        let est = estimate(&usage, "csv", "snowflake", &PricingSpec::default());
+        let line = est
+            .lines
+            .iter()
+            .find(|l| l.item == "snowflake_credits")
+            .expect("credits line");
+        assert_eq!(line.unit, "credits");
+        assert!(est.lines.iter().all(|l| l.item != "bigquery_bytes_loaded"));
+        assert!(!est.not_reported.contains(&"snowflake".to_string()));
+        for by in [
+            GroupBy::Pipeline,
+            GroupBy::Row,
+            GroupBy::Dataset,
+            GroupBy::Sink,
+            GroupBy::Day,
+        ] {
+            assert_eq!(GroupBy::parse(by.as_str()), Some(by));
+        }
+    }
 }

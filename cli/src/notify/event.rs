@@ -461,4 +461,14 @@ mod redaction_tests {
         let ev = NotifyEvent::run_success("p", "row", 7);
         assert_eq!(ev.details["records_written"], Value::from(7u64));
     }
+
+    #[test]
+    fn change_requested_names_the_request_with_or_without_a_reason() {
+        let with = NotifyEvent::change_requested("p", "c1", "run", "bob", "nightly load");
+        assert_eq!(with.kind, EventKind::ChangeRequested);
+        assert!(with.message.contains("nightly load"));
+        let without = NotifyEvent::change_requested("p", "c1", "run", "bob", "");
+        assert!(without.message.contains("/v1/changes/c1/approve"));
+        assert_eq!(EventKind::ChangeRequested.as_str(), "change_requested");
+    }
 }

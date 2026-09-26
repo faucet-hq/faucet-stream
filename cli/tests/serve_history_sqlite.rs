@@ -1363,3 +1363,93 @@ async fn usage_records_round_trip_filter_and_dedupe() {
     assert_eq!(until.len(), 1);
     assert_eq!(until[0].run_id, "run-a");
 }
+
+// ── Change requests (#703) ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn change_requests_round_trip_and_filter() {
+    use faucet_cli::serve::changes::{ChangeKind, ChangeListFilter, ChangeRequest, ChangeStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir, "changes.db").await;
+    let now = Utc::now();
+    let mk = |id: &str, kind: ChangeKind, status: ChangeStatus, who: &str, age: i64| {
+        let at = now - chrono::Duration::seconds(age);
+        ChangeRequest {
+            id: id.into(),
+            kind,
+            status,
+            requester: who.into(),
+            requester_role: faucet_cli::serve::rbac::Role::Operator,
+            reason: None,
+            payload: serde_json::json!({"config": "x"}),
+            plan: None,
+            budget: None,
+            required_approvals: 1,
+            approvals: Vec::new(),
+            rejection: None,
+            created_at: at,
+            updated_at: at,
+            expires_at: at,
+            run_id: None,
+            template: None,
+            error: None,
+        }
+    };
+    store
+        .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
+        .await
+        .unwrap();
+    store
+        .change_upsert(&mk(
+            "b",
+            ChangeKind::TemplateLaunch,
+            ChangeStatus::Executed,
+            "amy",
+            20,
+        ))
+        .await
+        .unwrap();
+    let mut c = mk("c", ChangeKind::Run, ChangeStatus::Pending, "amy", 10);
+    store.change_upsert(&c).await.unwrap();
+    c.status = ChangeStatus::Rejected;
+    store.change_upsert(&c).await.unwrap();
+
+    assert_eq!(
+        store.change_get("c").await.unwrap().unwrap().status,
+        ChangeStatus::Rejected
+    );
+    assert!(store.change_get("zz").await.unwrap().is_none());
+    let all = store
+        .change_list(&ChangeListFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        ["c", "b", "a"]
+    );
+    let f = |status, kind, requester: Option<&str>, limit| ChangeListFilter {
+        status,
+        kind,
+        requester: requester.map(str::to_string),
+        limit,
+    };
+    let got = store
+        .change_list(&f(
+            Some(ChangeStatus::Pending),
+            Some(ChangeKind::Run),
+            Some("bob"),
+            5,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].id, "a");
+    assert_eq!(
+        store
+            .change_list(&f(None, None, Some("amy"), 1))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}

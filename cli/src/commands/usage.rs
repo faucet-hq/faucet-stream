@@ -89,4 +89,39 @@ mod tests {
         assert!(parse_when("yesterday").unwrap_err().contains("yesterday"));
         assert_eq!(report_currency(&[]), "USD");
     }
+
+    #[tokio::test]
+    async fn run_reads_the_catalog_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("faucet.yaml");
+        std::fs::write(
+            &cfg,
+            "version: 1\nname: u\ncatalog:\n  url: memory\npipeline:\n  source:\n    type: csv\n    config:\n      path: in.csv\n  sink:\n    type: jsonl\n    config:\n      path: out.jsonl\n",
+        )
+        .unwrap();
+        let args = |by: &str, since: Option<&str>, json: bool| UsageArgs {
+            common: crate::cli::CatalogConfigArgs {
+                config: Some(cfg.clone()),
+                env_file: None,
+                no_env_file: true,
+                profile: None,
+                json,
+            },
+            since: since.map(str::to_string),
+            until: Some("2099-01-01".into()),
+            pipeline: None,
+            by: by.into(),
+            limit: 10,
+        };
+        run(args("pipeline", Some("2020-01-01"), false))
+            .await
+            .unwrap();
+        run(args("day", None, true)).await.unwrap();
+        assert!(run(args("planet", None, false)).await.is_err());
+        assert!(
+            run(args("row", Some("yesterday-ish"), false))
+                .await
+                .is_err()
+        );
+    }
 }

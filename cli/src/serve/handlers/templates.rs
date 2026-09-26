@@ -1413,6 +1413,52 @@ write_mode_aliases:
     }
 
     #[tokio::test]
+    async fn a_trigger_under_require_approval_becomes_a_change_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::serve::test_support::test_config();
+        cfg.require_approval = vec![crate::serve::changes::ChangeKind::Run];
+        let state = crate::serve::test_support::state_from(&cfg);
+        register_demo(&state, &dir.path().join("o.jsonl")).await;
+        let resp = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(TriggerBody {
+                params: [("tag".to_string(), json!("alpha"))].into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trigger");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "pending_approval", "{v}");
+        assert!(v["change_id"].is_string());
+
+        let ok = trigger_template(
+            State(test_state_with(&dir).await),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(TriggerBody {
+                params: [("tag".to_string(), json!("beta"))].into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trigger");
+        assert_eq!(ok.status(), StatusCode::ACCEPTED);
+    }
+
+    async fn test_state_with(dir: &tempfile::TempDir) -> ServerState {
+        let state = test_state();
+        register_demo(&state, &dir.path().join("o2.jsonl")).await;
+        state
+    }
+
+    #[tokio::test]
     async fn trigger_binds_params_and_stamps_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state();

@@ -2930,4 +2930,65 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn request_budgets_fold_into_the_config() {
+        let req = |config: &str, fmt: &str, budget: serde_json::Value| -> SubmitRequest {
+            serde_json::from_value(serde_json::json!({
+                "config": config, "config_format": fmt, "budget": budget
+            }))
+            .unwrap()
+        };
+        let none: SubmitRequest =
+            serde_json::from_value(serde_json::json!({"config": "a: 1"})).unwrap();
+        assert_eq!(apply_request_budget(none).unwrap().config, "a: 1");
+
+        let out = apply_request_budget(req(
+            "budget:\n  max_records: 5\n",
+            "yaml",
+            serde_json::json!({"max_records": 50, "max_bytes": 10}),
+        ))
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&out.config).unwrap();
+        assert_eq!(doc["budget"]["max_records"], 5);
+        assert_eq!(doc["budget"]["max_bytes"], 10);
+
+        let out =
+            apply_request_budget(req("{}", "json", serde_json::json!({"max_records": 3}))).unwrap();
+        assert!(out.config.contains("\"max_records\":3"));
+
+        for (config, fmt, budget, needle) in [
+            (
+                "{",
+                "yaml",
+                serde_json::json!({"max_records": 1}),
+                "invalid YAML",
+            ),
+            (
+                "{",
+                "json",
+                serde_json::json!({"max_records": 1}),
+                "invalid JSON",
+            ),
+            (
+                "[1]",
+                "json",
+                serde_json::json!({"max_records": 1}),
+                "mapping",
+            ),
+            (
+                "budget: 7",
+                "yaml",
+                serde_json::json!({"max_records": 1}),
+                "budget",
+            ),
+            ("{}", "json", serde_json::json!({"max_records": 0}), ""),
+        ] {
+            let e = apply_request_budget(req(config, fmt, budget)).unwrap_err();
+            assert!(
+                matches!(&e, ServeError::BadConfig(m) if m.contains(needle)),
+                "{e:?}"
+            );
+        }
+    }
 }

@@ -563,6 +563,129 @@ mod tests {
         assert!(e.to_string().contains("max_records"), "{e}");
     }
 
+    #[test]
+    fn merge_keeps_the_one_sink_list_that_is_set() {
+        let listed = BudgetSpec {
+            allowed_sinks: vec!["pg".into()],
+            ..Default::default()
+        };
+        let open = BudgetSpec::default();
+        assert_eq!(listed.merge(&open).allowed_sinks, vec!["pg"]);
+        assert_eq!(open.merge(&listed).allowed_sinks, vec!["pg"]);
+    }
+
+    #[tokio::test]
+    async fn every_capability_is_forwarded_to_the_inner_sink() {
+        let (sink, _state, _t) = BudgetSink::wrap(
+            Box::new(CountingSink(AtomicUsize::new(0))),
+            BudgetSpec::default(),
+            CancellationToken::new(),
+        );
+        let inner = CountingSink(AtomicUsize::new(0));
+        sink.flush().await.unwrap();
+        assert_eq!(sink.connector_name(), inner.connector_name());
+        assert_eq!(sink.dataset_uri(), inner.dataset_uri());
+        assert!(sink.local_outputs().await.is_empty());
+        assert_eq!(
+            sink.supports_idempotent_writes(),
+            inner.supports_idempotent_writes()
+        );
+        assert_eq!(sink.sink_guarantee(), inner.sink_guarantee());
+        assert_eq!(
+            sink.write_batch_is_replay_safe(),
+            inner.write_batch_is_replay_safe()
+        );
+        assert_eq!(sink.dedups_by_key(), inner.dedups_by_key());
+        assert_eq!(sink.supported_write_modes(), inner.supported_write_modes());
+        assert_eq!(sink.last_committed_token("s").await.unwrap(), None);
+        assert_eq!(sink.current_schema().await.unwrap(), None);
+        assert!(!sink.supports_schema_evolution());
+        assert!(
+            sink.evolve_schema(&crate::drift::SchemaEvolution::default())
+                .await
+                .is_err()
+        );
+        assert!(!sink.supports_cleanup());
+        assert!(!sink.supports_staged_load());
+        let _ = sink
+            .cleanup_scope(&BTreeMap::new(), &crate::cleanup::SeenKeys::new())
+            .await;
+        assert!(!sink.is_overwrite());
+        let _ = sink.begin_overwrite().await;
+        let _ = sink.commit_overwrite().await;
+        let _ = sink.abort_overwrite().await;
+        assert!(!sink.supports_rollback());
+        let opts = crate::rollback::RollbackOptions {
+            run_id_column: "_faucet_run_id".into(),
+            mode: crate::rollback::RollbackMode::Append,
+            force: false,
+            dry_run: true,
+        };
+        assert!(sink.rollback_run("r", &opts).await.is_err());
+        let _ = sink.forget_run("r").await;
+        let _ = sink.rewind_commit_token("s", None).await;
+        assert_eq!(sink.readback_source(), None);
+        sink.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+            crate::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "c",
+        )));
+        let _ = sink.check(&crate::check::CheckContext::default()).await;
+    }
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn columnar_pages_are_admitted_by_row_count() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        struct ColSink;
+        #[async_trait]
+        impl Sink for ColSink {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            async fn flush(&self) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            fn supports_columnar(&self) -> bool {
+                true
+            }
+            async fn write_batch_columnar(&self, b: &RecordBatch) -> Result<usize, FaucetError> {
+                Ok(b.num_rows())
+            }
+        }
+        let batch = |n: i64| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from((0..n).collect::<Vec<_>>()))],
+            )
+            .unwrap()
+        };
+        let cancel = CancellationToken::new();
+        let (sink, state, _t) = BudgetSink::wrap(
+            Box::new(ColSink),
+            BudgetSpec {
+                max_records: Some(5),
+                ..Default::default()
+            },
+            cancel.clone(),
+        );
+        assert!(sink.supports_columnar());
+        assert_eq!(sink.write_batch_columnar(&batch(3)).await.unwrap(), 3);
+        assert_eq!(state.records(), 3);
+        let err = sink.write_batch_columnar(&batch(3)).await.unwrap_err();
+        assert!(
+            matches!(err, FaucetError::BudgetExceeded { actual: 6, .. }),
+            "{err}"
+        );
+        assert!(cancel.is_cancelled());
+        assert!(
+            sink.write_batch_columnar(&batch(1)).await.is_err(),
+            "after the verdict"
+        );
+    }
+
     #[tokio::test]
     async fn records_ceiling_refuses_the_crossing_page_and_cancels() {
         let cancel = CancellationToken::new();

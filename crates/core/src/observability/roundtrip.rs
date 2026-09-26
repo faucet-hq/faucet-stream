@@ -199,6 +199,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metered_recorders_feed_the_usage_meter_through_a_slot() {
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        for side in [RoundtripSide::Source, RoundtripSide::Sink] {
+            let slot = RecorderSlot::new();
+            slot.record("get");
+            slot.record_timed("get", Duration::from_millis(1));
+            slot.signal("bytes_billed", "bytes", 10.0);
+            assert!(slot.recorder().is_none());
+            slot.install(Arc::new(
+                RoundtripRecorder::new(side, "p", "r", "c").with_meter(meter.clone()),
+            ));
+            slot.record("get");
+            slot.record_timed("put", Duration::from_millis(2));
+            slot.signal("bytes_billed", "bytes", 1024.4);
+            assert!(slot.recorder().is_some());
+        }
+        let snap = meter.snapshot();
+        assert_eq!(snap.source_roundtrips["get"], 1);
+        assert_eq!(snap.source_roundtrips["put"], 1);
+        assert_eq!(snap.sink_roundtrips["get"], 1);
+        assert_eq!(snap.signals.len(), 2);
+        assert_eq!(snap.signals[0].kind, "bytes_billed");
+        assert_eq!(snap.signals[0].connector, "c");
+        assert_eq!(snap.signals[1].side, crate::usage::UsageSide::Sink);
+    }
+
+    #[test]
     fn side_selects_the_metric_names() {
         assert_eq!(
             RoundtripSide::Source.counter_name(),

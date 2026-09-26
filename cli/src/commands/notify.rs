@@ -178,4 +178,11 @@ mod tests {
         // No owning invocation in production either — faithful null shape.
         assert!(synth_event("scheduler_stuck", "p").unwrap().run.is_none());
     }
+
+    #[test]
+    fn synth_change_requested_names_the_synthetic_request() {
+        let e = synth_event("change_requested", "p").unwrap();
+        assert_eq!(e.kind, crate::notify::EventKind::ChangeRequested);
+        assert!(e.message.contains("synthetic change request"));
+    }
 }

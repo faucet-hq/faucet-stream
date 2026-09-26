@@ -259,4 +259,38 @@ mod tests {
         assert_eq!(opts.pricing.currency, "USD");
         assert_eq!(UsageOptions::default().pricing.currency, "USD");
     }
+
+    #[test]
+    fn report_windows_and_long_keys_render() {
+        let long = "p".repeat(80);
+        let r = build_record(
+            RecordIdentity {
+                run_id: "r1",
+                pipeline: &long,
+                row: "row-0",
+                source_kind: "csv",
+                sink_kind: "jsonl",
+                dataset_id: None,
+                dataset_uri: None,
+            },
+            UsageSnapshot::default(),
+            10,
+            false,
+            &PricingSpec::default(),
+            Utc::now(),
+        );
+        let mut rep = aggregate(&[r], GroupBy::Pipeline, "USD");
+        let at = Utc::now();
+        for (since, until, needle) in [
+            (Some(at), Some(at), "→"),
+            (Some(at), None, "since "),
+            (None, Some(at), "until "),
+        ] {
+            rep.since = since;
+            rep.until = until;
+            let text = render_report(&rep);
+            assert!(text.contains(needle), "{text}");
+            assert!(text.contains('…'), "a 60+ char key is truncated: {text}");
+        }
+    }
 }

@@ -596,4 +596,16 @@ mod tests {
         // The target must also be discoverable from `--list`.
         assert!(super::schema_targets().contains(&"template-test"));
     }
+
+    #[tokio::test]
+    async fn usage_and_budget_targets_print_their_schemas() {
+        for target in [SchemaTarget::Usage, SchemaTarget::Budget] {
+            let r = super::run(SchemaArgs {
+                target: Some(target),
+                list: false,
+            })
+            .await;
+            assert!(r.is_ok(), "{r:?}");
+        }
+    }
 }

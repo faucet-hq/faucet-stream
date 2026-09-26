@@ -744,4 +744,13 @@ mod tests {
         a.no_auth = true;
         assert!(!ServeConfig::from_args(a).unwrap().cluster.enabled);
     }
+
+    #[test]
+    fn approval_expiry_must_be_positive() {
+        let mut a = base_args();
+        a.no_auth = true;
+        a.approval_expiry_secs = 0;
+        let err = ServeConfig::from_args(a).unwrap_err();
+        assert!(err.to_string().contains("--approval-expiry-secs"), "{err}");
+    }
 }

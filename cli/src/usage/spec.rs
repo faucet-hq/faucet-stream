@@ -282,4 +282,51 @@ mod tests {
         let spec: UsageSpec = serde_yaml::from_str("pricing: { currency: \" \" }\n").unwrap();
         assert!(spec.resolve_pricing(None).unwrap_err().contains("currency"));
     }
+
+    #[test]
+    fn every_override_applies_and_pricing_files_resolve() {
+        let o = PricingOverrides {
+            currency: Some("EUR".into()),
+            egress_per_gb: Some(0.1),
+            object_storage: Some(ObjectStorageOverrides {
+                read_per_1k_requests: Some(1.0),
+                write_per_1k_requests: Some(2.0),
+            }),
+            warehouse: Some(WarehouseOverrides {
+                bigquery_per_tib_scanned: Some(3.0),
+                bigquery_streaming_per_gib: Some(4.0),
+                snowflake_per_credit: Some(5.0),
+            }),
+            hosted_elt_per_million_rows: Some(6.0),
+        };
+        let p = o.apply(PricingSpec::default());
+        assert_eq!(p.object_storage.read_per_1k_requests, 1.0);
+        assert_eq!(p.object_storage.write_per_1k_requests, 2.0);
+        assert_eq!(p.warehouse.bigquery_per_tib_scanned, 3.0);
+        assert_eq!(p.warehouse.bigquery_streaming_per_gib, 4.0);
+        assert_eq!(p.warehouse.snowflake_per_credit, 5.0);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rates.yaml"), "currency: GBP\n").unwrap();
+        let rel = UsageSpec {
+            pricing_file: Some("rates.yaml".into()),
+            pricing: None,
+        };
+        assert_eq!(
+            rel.resolve_pricing(Some(dir.path())).unwrap().currency,
+            "GBP"
+        );
+        let json = dir.path().join("rates.json");
+        std::fs::write(&json, r#"{"currency": "JPY"}"#).unwrap();
+        let abs = UsageSpec {
+            pricing_file: Some(json.display().to_string()),
+            pricing: None,
+        };
+        assert_eq!(
+            abs.resolve_pricing(Some(dir.path())).unwrap().currency,
+            "JPY"
+        );
+        std::fs::write(&json, "{").unwrap();
+        assert!(abs.resolve_pricing(None).is_err());
+    }
 }

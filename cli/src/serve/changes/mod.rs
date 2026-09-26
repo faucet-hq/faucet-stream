@@ -1216,4 +1216,314 @@ mod tests {
         let back: ChangeRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back, c);
     }
+
+    fn csv_yaml(dir: &std::path::Path, name: &str, notify: &str) -> String {
+        let input = dir.join("in.csv");
+        std::fs::write(&input, "id,name\n1,a\n").unwrap();
+        format!(
+            "version: 1\nname: {name}\npipeline:\n  source:\n    type: csv\n    config:\n      path: {}\n  sink:\n    type: jsonl\n    config:\n      path: {}\n{notify}",
+            input.display(),
+            dir.join("out.jsonl").display()
+        )
+    }
+
+    fn actor(name: &str) -> AuthContext {
+        AuthContext {
+            principal: name.into(),
+            role: Role::Admin,
+            source_ip: None,
+        }
+    }
+
+    fn stored(kind: ChangeKind, payload: Value, material: &str, quorum: u32) -> ChangeRequest {
+        let now = Utc::now();
+        ChangeRequest {
+            id: uuid::Uuid::now_v7().to_string(),
+            kind,
+            status: ChangeStatus::Pending,
+            requester: "bob".into(),
+            requester_role: Role::Operator,
+            reason: None,
+            payload,
+            plan: Some(ChangePlan {
+                material: material.into(),
+                rows: vec![json!({"row": "r", "sink": "old"})],
+                summary: json!({"v": 1}),
+            }),
+            budget: None,
+            required_approvals: quorum,
+            approvals: Vec::new(),
+            rejection: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            run_id: None,
+            template: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn quorum_duplicates_rejection_and_expiry() {
+        let state = crate::serve::test_support::test_state();
+        let c = stored(ChangeKind::Run, json!({"config": "x"}), "m", 2);
+        save(&state, &c).await.unwrap();
+
+        let once = approve(&state, &actor("alice"), &c.id, Some("  ".into()))
+            .await
+            .unwrap();
+        assert_eq!(once.status, ChangeStatus::Pending);
+        assert_eq!(once.approvals.len(), 1);
+        assert!(once.approvals[0].comment.is_none());
+        let dup = approve(&state, &actor("alice"), &c.id, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(dup, ServeError::Conflict(m) if m.contains("already approved")));
+
+        let rejected = reject(&state, &actor("bob"), &c.id, "withdrawn".into())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status, ChangeStatus::Rejected);
+        let again = reject(&state, &actor("bob"), &c.id, "x".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(again, ServeError::Conflict(m) if m.contains("not pending")));
+        let late = approve(&state, &actor("carol"), &c.id, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(late, ServeError::Conflict(_)));
+
+        let mut old = stored(ChangeKind::Run, json!({}), "m", 1);
+        old.expires_at = Utc::now() - chrono::Duration::seconds(5);
+        save(&state, &old).await.unwrap();
+        let fresh = stored(ChangeKind::Run, json!({}), "m", 1);
+        save(&state, &fresh).await.unwrap();
+        assert_eq!(expire_due(&state).await, 1);
+        assert_eq!(
+            get(&state, &old.id).await.unwrap().status,
+            ChangeStatus::Expired
+        );
+        assert_eq!(expire_due(&state).await, 0);
+        assert!(matches!(
+            get(&state, "nope").await,
+            Err(ServeError::NotFound)
+        ));
+
+        let listed = list(&state, &ChangeListFilter::default()).await.unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(
+            listed
+                .iter()
+                .all(|c| c.plan.as_ref().unwrap().rows.is_empty())
+        );
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(expiry_loop(
+            state.clone(),
+            std::time::Duration::from_millis(10),
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bad_payloads_fail_planning_and_execution() {
+        let state = crate::serve::test_support::test_state();
+        let err = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::Run,
+                payload: json!({"nope": 1}),
+                reason: None,
+                budget: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::BadConfig(m) if m.contains("run payload")));
+        let err = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::Run,
+                payload: json!({"config": "x"}),
+                reason: None,
+                budget: Some(BudgetSpec {
+                    max_records: Some(0),
+                    ..Default::default()
+                }),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::BadConfig(_)));
+
+        // A stored request whose payload no longer plans fails on approval.
+        let c = stored(ChangeKind::Run, json!({"nope": 1}), "m", 1);
+        save(&state, &c).await.unwrap();
+        let done = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+        assert_eq!(done.status, ChangeStatus::Failed);
+        assert!(done.error.unwrap().contains("run payload"));
+    }
+
+    #[tokio::test]
+    async fn a_changed_plan_invalidates_and_an_unchanged_one_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let notify = "notifications:\n  - name: log\n    on: [change_requested]\n    channel:\n      type: webhook\n      config:\n        url: http://127.0.0.1:9/hook\n";
+        let created = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::Run,
+                payload: json!({
+                    "config": csv_yaml(dir.path(), "chg", notify),
+                    "require_approval": true,
+                    "reason": "gone",
+                    "budget": {"max_records": 100}
+                }),
+                reason: Some("nightly".into()),
+                budget: Some(BudgetSpec {
+                    max_records: Some(50),
+                    ..Default::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(created.payload.get("require_approval").is_none());
+        let executed = approve(&state, &actor("alice"), &created.id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            executed.status,
+            ChangeStatus::Executed,
+            "{:?}",
+            executed.error
+        );
+        assert!(executed.run_id.is_some());
+
+        let payload = json!({"config": csv_yaml(dir.path(), "chg2", "")});
+        let mut c = stored(ChangeKind::Run, payload.clone(), "stale", 1);
+        save(&state, &c).await.unwrap();
+        let inv = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+        assert_eq!(inv.status, ChangeStatus::Invalidated);
+        assert!(inv.error.unwrap().contains("plan changed"));
+
+        // Same material, no row diff: the summary explains the change.
+        c = stored(ChangeKind::Run, payload, "stale", 1);
+        c.plan.as_mut().unwrap().rows.clear();
+        save(&state, &c).await.unwrap();
+        let fresh_rows = plan_for(&state, &actor("bob"), ChangeKind::Run, &c.payload)
+            .await
+            .unwrap()
+            .rows;
+        c.plan.as_mut().unwrap().rows = fresh_rows;
+        save(&state, &c).await.unwrap();
+        let inv = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+        assert_eq!(inv.status, ChangeStatus::Invalidated);
+        assert!(inv.error.unwrap().contains("→"));
+    }
+
+    #[cfg(feature = "notify")]
+    #[tokio::test]
+    async fn requested_notifications_skip_what_they_cannot_read() {
+        let mut c = stored(ChangeKind::TemplateLaunch, json!({"config": "x"}), "m", 1);
+        notify_requested(&c).await;
+        c.kind = ChangeKind::Run;
+        c.payload = json!({});
+        notify_requested(&c).await;
+        c.payload = json!({"config": "{ nope"});
+        notify_requested(&c).await;
+        c.payload = json!({"config": "notifications:\n  - name: x\n    on: [change_requested]\n    channel:\n      type: webhook\n      config:\n        url: \"\"\n"});
+        notify_requested(&c).await;
+        c.payload = json!({"config": "name: p\n"});
+        notify_requested(&c).await;
+    }
+
+    #[test]
+    fn store_errors_are_internal() {
+        let e = store_err(HistoryError::Backend("down".into()));
+        assert!(matches!(e, ServeError::Internal(m) if m.contains("change store")));
+    }
+
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn template_changes_plan_execute_and_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let new = |kind, payload| NewChange {
+            kind,
+            payload,
+            reason: None,
+            budget: None,
+        };
+        for (kind, needle) in [
+            (ChangeKind::TemplateRegister, "template_register payload"),
+            (ChangeKind::TemplateLaunch, "template_launch payload"),
+        ] {
+            let err = create(&state, &actor("bob"), new(kind, json!({"x": 1})))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServeError::BadConfig(m) if m.contains(needle)));
+        }
+        let err = create(
+            &state,
+            &actor("bob"),
+            new(ChangeKind::TemplateLaunch, json!({"id": "ghost"})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::NotFound), "{err:?}");
+        let err = create(
+            &state,
+            &actor("bob"),
+            new(ChangeKind::TemplateRegister, json!({"config": "{ nope"})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServeError::Unprocessable { .. }), "{err:?}");
+
+        let reg = create(
+            &state,
+            &actor("bob"),
+            new(
+                ChangeKind::TemplateRegister,
+                json!({"id": "tpl", "config": csv_yaml(dir.path(), "tpl", "")}),
+            ),
+        )
+        .await
+        .unwrap();
+        let reg = approve(&state, &actor("alice"), &reg.id, None)
+            .await
+            .unwrap();
+        assert_eq!(reg.status, ChangeStatus::Executed, "{:?}", reg.error);
+        assert_eq!(reg.template.as_ref().unwrap().version, 1);
+
+        let launch = create(
+            &state,
+            &actor("bob"),
+            new(ChangeKind::TemplateLaunch, json!({"id": "tpl"})),
+        )
+        .await
+        .unwrap();
+        let launch = approve(&state, &actor("alice"), &launch.id, None)
+            .await
+            .unwrap();
+        assert_eq!(launch.status, ChangeStatus::Executed, "{:?}", launch.error);
+
+        for kind in [ChangeKind::TemplateRegister, ChangeKind::TemplateLaunch] {
+            let c = stored(kind, json!({"x": 1}), "m", 1);
+            save(&state, &c).await.unwrap();
+            let done = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+            assert_eq!(done.status, ChangeStatus::Failed);
+        }
+        assert!(matches!(
+            template_err(crate::error::CliError::Internal("x".into())),
+            ServeError::Internal(_)
+        ));
+    }
 }
