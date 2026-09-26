@@ -318,6 +318,8 @@ one tenant; a tenant-scoped principal is pinned to its own. Controls follow
 the caller's role: creating, suspending and deleting tenants needs
 `tenant_admin`, connections need `connection_manage`.
 
+![A tenant's page: its limits form, the connections table with each connection's type and status, the connect-provider panel, a stored-credentials form, and the suspend and delete controls](../assets/console/tenants.png)
+
 ## Disabling the console at runtime
 
 If you built with `serve-ui` but want to serve only the API (no static assets),
