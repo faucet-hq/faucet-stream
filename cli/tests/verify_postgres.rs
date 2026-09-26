@@ -77,6 +77,7 @@ pipeline:
     let summary = run_expanded(
         expand(&cfg).unwrap(),
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: "pg_mirror".into(),
             run_id: None,
             execution: None,

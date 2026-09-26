@@ -204,6 +204,7 @@ async fn dry_run_skips_sla_evaluation() {
     let summary = run_expanded(
         nodes,
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: "slatest".into(),
             run_id: None,
             execution: None,

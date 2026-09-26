@@ -354,9 +354,11 @@ pub async fn probe_roots(
                 &ctx,
             )
             .await;
+            let format = state_format_probe(&source, state.as_ref(), &lag_key).await;
             let mut inv =
                 probe_invocation(id, source, sink, state, &auth, &ctx, sla, profiling).await;
             inv.probes.extend(lag);
+            inv.probes.extend(format);
             inv.delivery = Some(guarantee);
             inv.probes.extend(policy_probes);
             inv
@@ -429,6 +431,63 @@ pub async fn lag_probe(
         }
     };
     Some(ProbeOut::from_probe("source", source.kind.clone(), probe))
+}
+
+/// Whether the row's stored bookmark is one this release's source reads
+/// (#736): current, stored before versioning, due a migration, or refused.
+pub async fn state_format_probe(
+    source: &ConnectorSpec,
+    state: Option<&StateStoreSpec>,
+    base_key: &str,
+) -> Option<ProbeOut> {
+    use faucet_core::state_version::{StateCompat, StoredState, check_compat};
+    let spec = state.filter(|s| s.kind != "memory")?;
+    let start = Instant::now();
+    let codec = crate::registry::state_codec_for(Some((&source.kind, &source.config)));
+    let probe = match build_state_store(spec).await {
+        Err(e) => Probe::fail(
+            "format",
+            start.elapsed(),
+            redact(&e.to_string()).into_owned(),
+        ),
+        Ok(store) => match store.get(base_key).await {
+            Err(e) => Probe::fail(
+                "format",
+                start.elapsed(),
+                redact(&e.to_string()).into_owned(),
+            ),
+            Ok(None) => return None,
+            Ok(Some(v)) => {
+                let st = StoredState::parse(&v);
+                match check_compat(&st, &codec.owner, codec.schema) {
+                    StateCompat::Current if st.is_legacy() => {
+                        let mut p = Probe::pass("format", start.elapsed());
+                        p.hint = Some(
+                            "stored before versioning — the next run rewrites it in the envelope"
+                                .into(),
+                        );
+                        p
+                    }
+                    StateCompat::Current => Probe::pass("format", start.elapsed()),
+                    StateCompat::Migrate { from, to } => Probe::skip(
+                        "format",
+                        format!(
+                            "bookmark schema {from} → {to} pending: migrated by the next run, or \
+                             now with `faucet migrate --state`"
+                        ),
+                    ),
+                    StateCompat::Incompatible { found, expected } => Probe::fail_hint(
+                        "format",
+                        start.elapsed(),
+                        format!("found {found}, expected {expected}"),
+                        "run the release that wrote it, or `faucet state reset` the row after \
+                         confirming where it should resume",
+                    ),
+                }
+            }
+        },
+    };
+    Some(ProbeOut::from_probe("state", spec.kind.clone(), probe))
 }
 
 /// Total number of failed probes across all invocations.

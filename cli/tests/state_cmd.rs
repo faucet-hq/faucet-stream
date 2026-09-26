@@ -101,7 +101,11 @@ async fn verbs_round_trip_on_a_file_store() {
     .await
     .unwrap();
     assert_eq!(
-        store.get("orders::a").await.unwrap(),
+        store
+            .get("orders::a")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 2}))
     );
     run(&[
@@ -118,7 +122,11 @@ async fn verbs_round_trip_on_a_file_store() {
     .await
     .unwrap();
     assert_eq!(
-        store.get("orders::a").await.unwrap(),
+        store
+            .get("orders::a")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 9}))
     );
     let err = run(&[
@@ -187,7 +195,11 @@ async fn verbs_round_trip_on_a_file_store() {
     .unwrap();
     let target = FileStateStore::new(&moved);
     assert_eq!(
-        target.get("orders::a").await.unwrap(),
+        target
+            .get("orders::a")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 9}))
     );
     let err = run(&[
@@ -343,7 +355,14 @@ async fn a_live_run_lease_blocks_mutations_until_forced() {
     ])
     .await
     .unwrap();
-    assert_eq!(store.get("orders::a").await.unwrap(), Some(json!(1)));
+    assert_eq!(
+        store
+            .get("orders::a")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
+        Some(json!(1))
+    );
     lease.release().await;
 }
 
@@ -605,7 +624,11 @@ async fn verbs_work_against_redis_and_postgres_and_migrate_between_them() {
     .await
     .unwrap();
     assert_eq!(
-        redis_store.get("orders::b").await.unwrap(),
+        redis_store
+            .get("orders::b")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 4}))
     );
     let backup = dir.path().join("redis.json");
@@ -636,11 +659,19 @@ async fn verbs_work_against_redis_and_postgres_and_migrate_between_them() {
         .await
         .unwrap();
     assert_eq!(
-        pg_store.get("orders::a").await.unwrap(),
+        pg_store
+            .get("orders::a")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 1}))
     );
     assert_eq!(
-        pg_store.get("orders::b").await.unwrap(),
+        pg_store
+            .get("orders::b")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 4}))
     );
     assert!(pg_store.get("orders::b::__sla__").await.unwrap().is_some());
@@ -669,7 +700,11 @@ async fn verbs_work_against_redis_and_postgres_and_migrate_between_them() {
     .await
     .unwrap();
     assert_eq!(
-        pg_store.get("orders::a").await.unwrap(),
+        pg_store
+            .get("orders::a")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 1}))
     );
     run(&["state", "reset", &rcfg, "--row", "b", "--yes"])

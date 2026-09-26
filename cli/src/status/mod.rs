@@ -225,6 +225,10 @@ pub struct RowStatus {
     /// How the last run's sink writes ended (#737).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batches: Option<faucet_core::BatchOutcomes>,
+    /// The stored bookmark's owner / shape version against what the source
+    /// reads (#736).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_format: Option<crate::pipeline_state::ops::StateFormat>,
     pub dlq: DlqStatus,
     pub sla: Vec<SlaVerdict>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -721,6 +725,7 @@ async fn row_status(
         exactly_once: None,
         lag: None,
         batches: None,
+        state_format: None,
         dlq: dlq::backlog(row.dlq.as_ref(), &target.pipeline, &row.id),
         sla: Vec::new(),
         profiling: None,
@@ -764,6 +769,7 @@ async fn row_status(
     let mut errors = Vec::new();
     match store.get(&base).await {
         Ok(Some(v)) => {
+            st.state_format = Some(crate::pipeline_state::ops::state_format(row, &v));
             let (bm, eo) = decode_bookmark(&v);
             st.bookmark = bm;
             if let Some(eo) = eo {
@@ -985,6 +991,14 @@ fn finish(mut st: RowStatus, failing: bool, inputs: &StatusInputs<'_>) -> RowSta
             && b.dlq_all + b.dlq_partial > 0
         {
             degraded.push(batch_note(b));
+        }
+        if let Some(f) = &st.state_format
+            && f.status == "incompatible"
+        {
+            degraded.push(format!(
+                "stored state cannot be read by this release: {}",
+                f.detail.as_deref().unwrap_or_default()
+            ));
         }
         if let Some(p) = &st.profiling
             && p.drift > 0

@@ -514,6 +514,14 @@ impl Source for SamplingSource {
     async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
         self.inner.lag().await
     }
+
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
 }
 
 #[cfg(test)]

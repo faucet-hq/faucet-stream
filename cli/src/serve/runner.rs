@@ -594,6 +594,7 @@ async fn execute_shard(
         }
     };
     let opts = ExecuteOptions {
+        legacy_state_writes: state.cluster().legacy_state_writes(),
         pipeline_name,
         // Correlate notifications to the submitted run (#480). Every shard of a
         // sharded run reports the same `run_id`; they differ by `invocation_id`.
@@ -1566,6 +1567,7 @@ async fn execute_run(
         }
     };
     let opts = ExecuteOptions {
+        legacy_state_writes: state.cluster().legacy_state_writes(),
         pipeline_name,
         // The id returned by `POST /v1/runs`, so a completion notification can be
         // matched back to the submission (#480).

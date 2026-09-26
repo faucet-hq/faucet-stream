@@ -58,6 +58,9 @@ use tokio_util::sync::CancellationToken;
 
 /// Knobs passed to [`run_expanded`].
 pub struct ExecuteOptions {
+    /// Store bookmarks bare instead of in the versioned envelope (#736): a
+    /// `faucet serve --cluster` member that predates it is still live.
+    pub legacy_state_writes: bool,
     /// Pipeline name — used in log lines and as the first segment of every
     /// state key.
     pub pipeline_name: String,
@@ -1807,7 +1810,8 @@ async fn build_pipeline<'a>(
         .with_run_id(run_id.to_owned())
         .with_usage_meter(observers.meter)
         .with_batch_outcomes(observers.batches)
-        .with_lag_observer(observers.lag);
+        .with_lag_observer(observers.lag)
+        .with_legacy_state_writes(opts.legacy_state_writes);
     if let Some(store) = state {
         pipeline = pipeline.with_state_store(store);
     }
@@ -3220,6 +3224,14 @@ impl Source for StateKeyOverride {
     async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
         self.inner.lag().await
     }
+
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
     // Forward the fast-path capabilities so wrapping the source for a per-row
     // state key never silently disables the columnar (#375) or native
     // byte-passthrough (#633) transfer paths.
@@ -3840,6 +3852,7 @@ mod tests {
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "t".into(),
                 run_id: None,
                 execution: None,
@@ -3885,6 +3898,7 @@ mod tests {
 
     fn exec_opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -4393,6 +4407,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "matrix".into(),
                 run_id: None,
                 execution: None,
@@ -4462,6 +4477,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "dagtest".into(),
                 run_id: None,
                 execution: None,
@@ -4696,6 +4712,7 @@ execution:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "stoptest".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -4790,6 +4807,7 @@ pipeline:
         let err = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "bad name".into(), // space is illegal in a state key
                 run_id: None,
                 execution: None,
@@ -4858,6 +4876,7 @@ matrix:
         let err = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "ok".into(),
                 run_id: None,
                 execution: None,
@@ -4935,6 +4954,7 @@ execution:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "stop_parallel".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -5013,6 +5033,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "continuetest".into(),
                 run_id: None,
                 execution: None,
@@ -5300,6 +5321,7 @@ matrix:
     /// Helper: minimal `ExecuteOptions` with all optional knobs cleared.
     fn opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -6014,6 +6036,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "projtest".into(),
                 run_id: None,
                 execution: None,

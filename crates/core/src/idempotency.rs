@@ -215,13 +215,21 @@ pub fn wrap_state(bookmark: Option<&Value>, seq: u64) -> Value {
     })
 }
 
-/// Unwrap a stored state value into `(bookmark, seq)`.
+/// Whether `value` is the exactly-once wrapper (`{"__faucet_eo": 1, …}`).
+pub fn is_eo_envelope(value: &Value) -> bool {
+    value.get(EO_MARKER).and_then(Value::as_u64) == Some(1)
+}
+
+/// Unwrap a stored state value into `(bookmark, seq)`. A versioned envelope
+/// (#736) is looked through first.
 ///
 /// A value that is the exactly-once wrapper object unwraps to its inner
 /// bookmark + seq. Anything else is treated as a legacy/at-least-once **bare
 /// bookmark** with `seq = 0` — so switching an existing pipeline to
 /// `exactly_once` resumes cleanly (the sink's own watermark is authoritative).
 pub fn unwrap_state(value: &Value) -> (Option<Value>, u64) {
+    let peeled = crate::state_version::peel_versioned(value);
+    let value = &peeled;
     if let Value::Object(map) = value
         && map.get(EO_MARKER).and_then(Value::as_u64) == Some(1)
     {

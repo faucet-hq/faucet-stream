@@ -245,6 +245,31 @@ pub trait Source: Send + Sync {
         Ok(None)
     }
 
+    /// The version of this source's bookmark shape (#736). Stored state carries
+    /// it; bump it whenever the shape changes and teach
+    /// [`migrate_state`](Self::migrate_state) the step. Default `0`. Decorators
+    /// must forward this.
+    fn state_schema(&self) -> u32 {
+        0
+    }
+
+    /// Bring a bookmark stored at shape version `from` up to
+    /// [`state_schema`](Self::state_schema) (#736). Must be pure — the
+    /// migrated value is only persisted by the next bookmark write, so a crash
+    /// in between re-runs it. The default knows only its own version. Decorators
+    /// must forward this.
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        if from == self.state_schema() {
+            Ok(data)
+        } else {
+            Err(FaucetError::State(format!(
+                "{} has no migration from bookmark schema {from} to {}",
+                self.connector_name(),
+                self.state_schema()
+            )))
+        }
+    }
+
     /// Whether this source **deterministically replays** the same page sequence
     /// from a given bookmark — the requirement for the atomic-watermark
     /// effectively-once path (a non-deterministic replay could cause the pipeline

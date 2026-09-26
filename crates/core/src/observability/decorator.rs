@@ -134,6 +134,14 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         self.inner.lag().await
     }
 
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
+
     async fn fetch_with_context(
         &self,
         context: &HashMap<String, Value>,
@@ -303,6 +311,7 @@ pub(crate) fn error_kind(e: &FaucetError) -> &'static str {
         FaucetError::BudgetExceeded { .. } => "BudgetExceeded",
         FaucetError::ContractViolation { .. } => "ContractViolation",
         FaucetError::State(_) => "State",
+        FaucetError::StateIncompatible { .. } => "StateIncompatible",
         FaucetError::CircuitOpen { .. } => "CircuitOpen",
         FaucetError::Custom(_) => "Custom",
     }

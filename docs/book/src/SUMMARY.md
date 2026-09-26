@@ -103,6 +103,7 @@
 - [Running a cluster](./cookbook/cluster.md)
 - [Observability](./operations/observability.md)
 - [Reliability testing](./operations/reliability-testing.md)
+- [Upgrading faucet safely](./operations/upgrading.md)
 - [Performance tuning](./operations/tuning.md)
 - [Troubleshooting with `faucet doctor`](./cookbook/troubleshooting.md)
 - [Troubleshooting & FAQ](./operations/troubleshooting.md)

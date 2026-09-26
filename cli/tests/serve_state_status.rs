@@ -291,7 +291,11 @@ async fn status_and_state_endpoints() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        store.get("shop::row-0").await.unwrap(),
+        store
+            .get("shop::row-0")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!({"id": 1}))
     );
 

@@ -1,0 +1,1 @@
+{"faucet_state": 1, "owner": "mysql-cdc", "schema": 0, "data": {"__faucet_eo": 1, "bookmark": {"file": "mysql-bin.000003", "pos": 4567}, "seq": 7}}

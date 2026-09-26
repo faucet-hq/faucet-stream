@@ -133,7 +133,11 @@ async fn pipeline_persists_bookmark_only_after_final_page() {
         .unwrap();
 
     assert_eq!(
-        store.get("multipage_test").await.unwrap(),
+        store
+            .get("multipage_test")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!("final-checkpoint"))
     );
 }

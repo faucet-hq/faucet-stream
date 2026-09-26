@@ -208,6 +208,7 @@ pub async fn replay(
     let summary = run_expanded(
         vec![node],
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: inputs.pipeline_name,
             run_id: None,
             execution: inputs.execution,

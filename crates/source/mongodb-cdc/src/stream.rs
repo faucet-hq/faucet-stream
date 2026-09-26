@@ -280,6 +280,14 @@ impl Source for MongoCdcSource {
         )))
     }
 
+    fn state_schema(&self) -> u32 {
+        crate::state::STATE_SCHEMA
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        crate::state::migrate_state(from, data)
+    }
+
     fn supports_exactly_once(&self) -> bool {
         // Durable resumeToken + deterministic replay from it + per-event
         // (per-page) bookmarks — the requirements for exactly-once delivery.

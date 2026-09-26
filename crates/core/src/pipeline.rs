@@ -160,6 +160,9 @@ pub struct Pipeline<'a, So: Source + ?Sized, Si: Sink + ?Sized> {
     allow_dlq_all_duplicates: bool,
     /// Receives the run's source-lag samples (#733).
     lag_observer: Option<Arc<crate::lag::LagObserver>>,
+    /// Store bookmarks bare instead of in the versioned envelope (#736): a
+    /// cluster member that predates the envelope is still live.
+    legacy_state_writes: bool,
 }
 
 /// Build and install the source/sink round-trip recorders for one run (#638).
@@ -223,6 +226,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             batch_outcomes: None,
             allow_dlq_all_duplicates: false,
             lag_observer: None,
+            legacy_state_writes: false,
         }
     }
 
@@ -393,6 +397,15 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// Store bookmarks bare instead of in the versioned envelope (#736) — for
+    /// a rolling upgrade in which a process that predates the envelope still
+    /// reads this state. A source whose bookmark shape is past schema 0 is
+    /// then refused, because such a reader would misread it.
+    pub fn with_legacy_state_writes(mut self, legacy: bool) -> Self {
+        self.legacy_state_writes = legacy;
+        self
+    }
+
     /// Run the pipeline in streaming mode.
     ///
     /// 1. Loads the stored bookmark and pushes it to the source (if a state
@@ -519,10 +532,37 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             // Bookmark resume — goes through the wrapped state store so the
             // get is instrumented too.
             let state_key = self.source.state_key();
+            let codec = crate::state_version::StateCodec::for_source(
+                &wrapped_source,
+                self.legacy_state_writes,
+            );
+            if codec.legacy && codec.schema > 0 {
+                return Err(crate::state_version::incompatible(
+                    state_key.as_deref().unwrap_or_default(),
+                    format!(
+                        "a reader that predates versioned state (bare '{}' bookmarks)",
+                        codec.owner
+                    ),
+                    format!("'{}' state schema {}", codec.owner, codec.schema),
+                ));
+            }
+            // Every bookmark write goes into the versioned envelope (#736).
+            let wrapped_state_store: Option<Arc<dyn StateStore>> =
+                match (wrapped_state_store.clone(), state_key.as_ref()) {
+                    (Some(store), Some(key)) => Some(Arc::new(
+                        crate::state_version::VersionedStateStore::new(store, key.clone(), codec),
+                    )),
+                    (store, _) => store,
+                };
             let mut start_seq = 0u64;
             if let (Some(store), Some(key)) = (wrapped_state_store.as_ref(), state_key.as_ref()) {
                 validate_state_key(key)?;
-                if let Some(prior) = store.get(key).await? {
+                if let Some(stored) = store.get(key).await? {
+                    // Refuse state this release or source cannot read before
+                    // anything is read from the source; migrate an older shape.
+                    let prior =
+                        crate::state_version::resolve_for_source(key, &stored, &wrapped_source)?
+                            .data;
                     if self.delivery == crate::idempotency::DeliveryMode::ExactlyOnce {
                         let (bookmark, seq) = crate::idempotency::unwrap_state(&prior);
                         start_seq = seq;
@@ -3311,7 +3351,14 @@ mod tests {
         assert_eq!(r.records_written, 1);
         assert_eq!(sink.0.written(), vec![json!({"id": 1})]);
         // Bare bookmark, not the exactly-once wrapper.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("b1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("b1"))
+        );
     }
 
     #[tokio::test]
@@ -3844,7 +3891,11 @@ mod tests {
         assert_eq!(result.records_written, 2);
         assert_eq!(result.bookmark, Some(json!("checkpoint-final")));
         assert_eq!(
-            store.get("k").await.unwrap(),
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!("checkpoint-final"))
         );
     }
@@ -3874,7 +3925,14 @@ mod tests {
         .unwrap();
 
         // Latest per-page bookmark wins.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("tx-2")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("tx-2"))
+        );
     }
 
     // ── State-store integration tests ───────────────────────────────────────
@@ -3948,7 +4006,11 @@ mod tests {
         assert_eq!(result.records_written, 1);
         assert_eq!(result.bookmark, Some(json!("2026-05-01")));
         // Stored value matches what the source returned.
-        let stored = store.get("github_issues").await.unwrap();
+        let stored = store
+            .get("github_issues")
+            .await
+            .unwrap()
+            .map(|v| crate::state_version::peel_versioned(&v));
         assert_eq!(stored, Some(json!("2026-05-01")));
     }
 
@@ -3973,7 +4035,11 @@ mod tests {
         assert_eq!(source.observed_start(), Some(json!("2026-04-30")));
         // And then overwrote it with the new value from this run.
         assert_eq!(
-            store.get("github_issues").await.unwrap(),
+            store
+                .get("github_issues")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!("2026-05-01"))
         );
     }
@@ -4117,7 +4183,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s1.observed_start(), None);
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
 
         // Run 2: resume from v1, persist v2.
         let s2 = StatefulSource::new("k", vec![json!({"i": 2})], json!("v2"));
@@ -4128,7 +4201,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s2.observed_start(), Some(json!("v1")));
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v2")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v2"))
+        );
     }
 
     #[tokio::test]
@@ -4478,7 +4558,14 @@ mod tests {
                 assert!(msg.contains("write failed"), "got: {msg}");
             }
         }
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
         assert_eq!(result.dlq.unwrap().records_dlq, 3);
     }
 
@@ -4564,7 +4651,14 @@ mod tests {
         // The two failures were routed to the DLQ (not lost on abort).
         assert_eq!(dlq.0.lock().unwrap().len(), 2);
         // The bookmark was persisted, so the survivor will NOT re-deliver.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
     }
 
     #[tokio::test]
@@ -4598,7 +4692,14 @@ mod tests {
         );
         assert_eq!(main.committed.lock().unwrap().len(), 1);
         assert_eq!(dlq.0.lock().unwrap().len(), 2);
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
     }
 
     /// DLQ sink that always fails. Used to assert the router does not
@@ -4683,7 +4784,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
         assert_eq!(dlq.0.lock().unwrap().len(), 1);
         assert_eq!(main.committed.lock().unwrap().len(), 1);
     }
@@ -5479,7 +5587,14 @@ mod tests {
         assert_eq!(result.records_written, 1); // row 0 committed
         assert_eq!(result.bookmark, Some(json!("ckpt")));
         // Bookmark was persisted after the page was made durable.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("ckpt")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("ckpt"))
+        );
         // The single failed row reached the DLQ.
         let envelopes = dlq.0.lock().unwrap();
         assert_eq!(envelopes.len(), 1);
@@ -7504,7 +7619,11 @@ mod cleanup_tests {
         // The final batch's bookmark landed in the state store under the
         // source's natural key.
         assert_eq!(
-            store.get("native-test").await.unwrap(),
+            store
+                .get("native-test")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!({"page": 0}))
         );
     }
@@ -7560,7 +7679,11 @@ mod cleanup_tests {
         assert_eq!(flush_count(&events), 1, "one terminal flush: {events:?}");
         assert_eq!(result.bookmark, Some(json!({"page": 2})));
         assert_eq!(
-            store.get("ovw-key").await.unwrap(),
+            store
+                .get("ovw-key")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!({"page": 2})),
             "bookmark persisted after the terminal flush"
         );

@@ -723,8 +723,34 @@ impl Topology {
         } else {
             None
         };
-        let start_bookmark =
-            compute_start_bookmark(&opts, &sink_ids, source_count, governance.delivery).await;
+        // How sink nodes store their bookmarks (#736): owned by the graph's
+        // only source when there is one; a multi-source graph never resumes
+        // from a sink bookmark, so its bookmarks are owned by the graph.
+        let codec = nodes
+            .iter()
+            .find_map(|n| match &n.kind {
+                NodeKind::Source(src) if source_count == 1 => Some(
+                    crate::state_version::StateCodec::for_source(src.as_ref(), false),
+                ),
+                _ => None,
+            })
+            .unwrap_or(crate::state_version::StateCodec {
+                owner: "topology".into(),
+                schema: 0,
+                legacy: false,
+            });
+        let only_source = nodes.iter().find_map(|n| match &n.kind {
+            NodeKind::Source(src) if source_count == 1 => Some(src.as_ref()),
+            _ => None,
+        });
+        let start_bookmark = compute_start_bookmark(
+            &opts,
+            &sink_ids,
+            source_count,
+            governance.delivery,
+            only_source,
+        )
+        .await?;
 
         // Build channels.
         let mut outs: HashMap<String, Vec<mpsc::Sender<StreamPage>>> = HashMap::new();
@@ -816,6 +842,7 @@ impl Topology {
                         resilience: governance.resilience.clone(),
                         delivery: governance.delivery,
                         replay: source_replay,
+                        codec: codec.clone(),
                     };
                     Box::pin(run_sink_node(id, sink, rx, sopts))
                 }
@@ -1068,17 +1095,24 @@ async fn compute_start_bookmark(
     sink_ids: &[String],
     source_count: usize,
     delivery: crate::idempotency::DeliveryMode,
-) -> Option<Value> {
-    let store = opts.state_store.as_ref()?;
+    source: Option<&dyn Source>,
+) -> Result<Option<Value>, FaucetError> {
+    let Some(store) = opts.state_store.as_ref() else {
+        return Ok(None);
+    };
     if sink_ids.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut values = Vec::with_capacity(sink_ids.len());
     for id in sink_ids {
         let key = format!("{}::{}", opts.pipeline_name, id);
         match store.get(&key).await {
-            Ok(Some(v)) => values.push(v),
-            _ => return None, // a sink with no bookmark → full replay.
+            // Refuse a bookmark the source cannot read; migrate an older one (#736).
+            Ok(Some(v)) => values.push(match source {
+                Some(src) => crate::state_version::resolve_for_source(&key, &v, src)?.data,
+                None => crate::state_version::peel_versioned(&v),
+            }),
+            _ => return Ok(None), // a sink with no bookmark → full replay.
         }
     }
     if delivery == crate::idempotency::DeliveryMode::ExactlyOnce {
@@ -1094,9 +1128,9 @@ async fn compute_start_bookmark(
                 (seq, bm)
             })
             .collect();
-        return eo_start_bookmark(&ranked, source_count);
+        return Ok(eo_start_bookmark(&ranked, source_count));
     }
-    start_bookmark(&values, source_count)
+    Ok(start_bookmark(&values, source_count))
 }
 
 /// Exactly-once resume point: the bookmark of the lowest-`seq` sink.
@@ -1375,6 +1409,8 @@ struct SinkNodeOpts {
     /// atomic-watermark run from a keyed-upsert one. `None` when there is not
     /// exactly one source (in which case exactly-once is gated off anyway).
     replay: Option<crate::idempotency::ReplayGuarantee>,
+    /// How this node's bookmark is stored (#736).
+    codec: crate::state_version::StateCodec,
 }
 
 async fn run_sink_node(
@@ -1395,6 +1431,11 @@ async fn run_sink_node(
         .with_run_id(opts.run_id.clone());
     if let Some(store) = opts.state_store {
         let key = format!("{}::{}", opts.pipeline_name, node_id);
+        let store: Arc<dyn StateStore> = Arc::new(crate::state_version::VersionedStateStore::new(
+            store,
+            key.clone(),
+            opts.codec,
+        ));
         // Exactly-once: this node's state holds `(bookmark, seq)`, and `seq` is
         // where its commit-token sequence resumes. Read it before handing the
         // store to `run_stream`, which owns the writes from here (#458).
@@ -2168,7 +2209,14 @@ mod tests {
         let opts = TopologyOptions::new("p").with_state_store(store.clone());
         let result = topo.run(opts).await.unwrap();
         assert_eq!(result.bookmarks.get("k"), Some(&Some(json!("v9"))));
-        assert_eq!(store.get("p::k").await.unwrap(), Some(json!("v9")));
+        assert_eq!(
+            store
+                .get("p::k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v9"))
+        );
     }
 
     /// #456 M1: a node failure under `Propagate` must let its siblings stop at a
@@ -2475,8 +2523,15 @@ mod delivery_and_report_tests {
             .await
             .unwrap();
         let opts = TopologyOptions::new("p").with_state_store(store.clone());
-        let bm =
-            compute_start_bookmark(&opts, &["k".to_string()], 1, DeliveryMode::ExactlyOnce).await;
+        let bm = compute_start_bookmark(
+            &opts,
+            &["k".to_string()],
+            1,
+            DeliveryMode::ExactlyOnce,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(bm, Some(json!({"pos": 5})), "envelope must be unwrapped");
         // A bare token round-trips through parse_token_parts the same way.
         let t = format_token_with_bookmark(5, Some(&json!({"pos": 5})));

@@ -350,6 +350,7 @@ pub(crate) async fn execute(
     let run_fut = run_expanded(
         nodes,
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: pipeline_name.clone(),
             run_id: None,
             execution: cfg.execution.clone(),
@@ -791,6 +792,7 @@ mod tests {
         eprintln!("commands::run::execute future: {size} bytes");
         let nodes = crate::expand::expand(&cfg).unwrap();
         let opts = crate::executor::ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: "p".into(),
             run_id: None,
             execution: None,

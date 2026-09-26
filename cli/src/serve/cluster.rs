@@ -48,6 +48,8 @@ struct ClusterInner {
     started_at: chrono::DateTime<chrono::Utc>,
     kick: Notify,
     members: AtomicUsize,
+    /// The state format every live member reads (#736).
+    state_format: std::sync::atomic::AtomicU32,
 }
 
 impl ClusterHandle {
@@ -62,6 +64,9 @@ impl ClusterHandle {
                 started_at: chrono::Utc::now(),
                 kick: Notify::new(),
                 members: AtomicUsize::new(0),
+                state_format: std::sync::atomic::AtomicU32::new(
+                    faucet_core::state_version::STATE_FORMAT,
+                ),
             }),
         }
     }
@@ -100,6 +105,21 @@ impl ClusterHandle {
     }
     pub fn set_members(&self, n: usize) {
         self.inner.members.store(n, Ordering::Release);
+    }
+
+    /// The state format every live member reads (#736), refreshed by the
+    /// lease loop.
+    pub fn state_format(&self) -> u32 {
+        self.inner.state_format.load(Ordering::Acquire)
+    }
+    pub fn set_state_format(&self, format: u32) {
+        self.inner.state_format.store(format, Ordering::Release);
+    }
+
+    /// Whether runs must store bookmarks bare, because a live member predates
+    /// versioned state (#736).
+    pub fn legacy_state_writes(&self) -> bool {
+        self.enabled() && self.state_format() < faucet_core::state_version::STATE_FORMAT
     }
 }
 
@@ -199,6 +219,25 @@ pub async fn claim_loop(state: ServerState, shutdown: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_live_member_turns_on_legacy_state_writes() {
+        let state = crate::serve::test_support::test_state_clustered();
+        let cluster = state.cluster();
+        assert_eq!(
+            cluster.state_format(),
+            faucet_core::state_version::STATE_FORMAT
+        );
+        assert!(!cluster.legacy_state_writes());
+        cluster.set_state_format(0);
+        assert!(cluster.legacy_state_writes());
+        let single = crate::serve::test_support::test_state();
+        single.cluster().set_state_format(0);
+        assert!(
+            !single.cluster().legacy_state_writes(),
+            "only a cluster mixes versions"
+        );
+    }
 
     #[test]
     fn disabled_handle_reports_disabled() {

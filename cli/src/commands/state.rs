@@ -319,6 +319,18 @@ fn render_show(r: &ops::ShowReport) -> String {
         if let Some(eo) = &row.exactly_once {
             out.push_str(&format!("  exactly-once    envelope sequence {}\n", eo.seq));
         }
+        if let Some(f) = &row.state_format {
+            out.push_str(&format!(
+                "  state format    {} schema {} ({}{})\n",
+                f.owner.as_deref().unwrap_or(&f.expected_owner),
+                f.schema,
+                f.status,
+                f.detail
+                    .as_deref()
+                    .map(|d| format!(": {d}"))
+                    .unwrap_or_default()
+            ));
+        }
         if let Some(l) = &row.running {
             out.push_str(&format!(
                 "  running         run {} (pid {}) since {}\n",

@@ -98,6 +98,9 @@ println!("Wrote {} records", result.records_written);
 | `connector_name()` | Stable `&'static str` label for metrics/spans. | stripped `type_name` |
 | `dataset_uri()` | Credential-free OpenLineage dataset URI. | `"<connector_name>://unknown"` |
 | `check(ctx)` | Non-mutating preflight probe for `faucet doctor`. | pulls one page via `stream_pages` |
+| `lag()` | How far the source is behind its head — `SourceLag { bytes, events, seconds }` (#733). Polled by the pipeline on the first page, at most every 15 s after, and at the end of the run; must be cheap and read-only. | `Ok(None)` |
+| `state_schema()` | Version of this source's bookmark shape, stored in the versioned state envelope (#736). Bump it when the shape changes. | `0` |
+| `migrate_state(from, data)` | Pure migration of a bookmark stored at shape version `from` to `state_schema()`. | identity at the current version, error otherwise |
 
 ## The `Sink` trait
 
@@ -112,6 +115,7 @@ println!("Wrote {} records", result.records_written);
 | `write_batch_idempotent(records, scope, token)` | Atomic effectively-once write + watermark. | delegates to `write_batch` (not idempotent) |
 | `last_committed_token(scope)` | Highest committed token for resume-skip. | `None` |
 | `supported_write_modes()` | The `WriteMode`s this sink accepts (`Append` / `Upsert` / `Delete`). | `[Append]` |
+| `batch_atomicity()` | What a failed `write_batch` leaves behind — `Atomic` (nothing), `PerRow` (per-row outcomes), `BestEffort` (unknown). The pipeline refuses `on_batch_error: dlq_all` on a `BestEffort` sink that does not dedup by key (#737). | `BestEffort` |
 | `config_schema()` | JSON Schema of the config struct. | empty object |
 | `connector_name()` / `dataset_uri()` | Metrics label / lineage URI. | as for `Source` |
 | `local_outputs()` | The concrete **local files** this sink opened, for faucet's local-output retention GC. Return one entry per file (a rolling parquet sink returns each part), each flagged `pre_existing` if the file already existed — such a file is never deleted. | `[]` (nothing local to collect) |
@@ -238,6 +242,7 @@ let wrapped = TransformingSource::new(source, stages);
 | `QualityFailure { check, message }` | A quality check failed under `abort` |
 | `ContractViolation { version, message }` | A record breached the data contract under `on_breach: fail` |
 | `State(String)` | State-store read/write/delete failures |
+| `StateIncompatible { key, found, expected }` | A stored bookmark written by a newer release or another source (#736) — refused before the source is read |
 | `Custom(Box<dyn Error + Send + Sync>)` | Wrap any third-party connector error |
 
 `FaucetError::is_retriable()` classifies transient failures (network errors, 5xx, 429) so connectors can drive `execute_with_retry` (exponential backoff + jitter, also re-exported). The `Custom` variant is intentionally permanent in the public API so connector authors can wrap their own error types without losing the chain.
@@ -265,6 +270,14 @@ let result = Pipeline::new(&source, &sink)
 ```
 
 State keys are validated via `state::validate_state_key`.
+
+The pipeline stores each bookmark in a **versioned envelope** (#736,
+`state_version`): `{ "faucet_state": 1, "owner": <connector_name>, "schema":
+<state_schema>, "data": <bookmark> }`. On resume it refuses
+(`FaucetError::StateIncompatible`) a value from a newer release or another
+source, migrates an older shape through `Source::migrate_state`, and reads a
+bare pre-envelope value as schema 0. `Pipeline::with_legacy_state_writes(true)`
+writes the bare value instead — for a mixed-version cluster.
 
 ## Dead-letter queue (DLQ)
 
@@ -523,6 +536,7 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 | `state` | `StateStore` trait, `MemoryStateStore`, `FileStateStore`, `validate_state_key` |
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
 | `idempotency` | `DeliveryMode`, `format_token`, `parse_token`, `wrap_state`, `unwrap_state` |
+| `state_version` | Versioned state envelope (#736) — `StoredState`, `wrap_versioned`, `peel_versioned`, `check_compat`, `resolve_for_source`, `StateCodec`, `VersionedStateStore` |
 | `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `WritePlan` |
 | `quality` | Per-record / per-batch checks (`quality` / `quality-jsonschema` features) |
 | `contract` | Versioned data contracts — `ContractSpec`, `CompiledContract`, `apply_contract`, JSON-Schema / OpenLineage exports (the `contract` feature) |

@@ -7,7 +7,7 @@
 
 use crate::auth_catalog::{self, AuthCatalog};
 use crate::error::{CliError, CliResult};
-use faucet_core::{Sink, Source};
+use faucet_core::{FaucetError, Sink, Source};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -845,6 +845,58 @@ pub const LAG_SOURCE_KINDS: &[&str] = &[
 /// See [`LAG_SOURCE_KINDS`].
 pub fn source_reports_lag(kind: &str) -> bool {
     LAG_SOURCE_KINDS.contains(&kind)
+}
+
+/// The bookmark shape version a source kind stores (#736) — the offline
+/// answer `faucet state show`, `faucet migrate --state` and `faucet doctor`
+/// use, matching the built source's `Source::state_schema`. A kind that
+/// never changed its shape is at `0`.
+pub fn source_state_schema(kind: &str) -> u32 {
+    match kind {
+        #[cfg(feature = "source-mongodb-cdc")]
+        "mongodb-cdc" => faucet_source_mongodb_cdc::STATE_SCHEMA,
+        _ => 0,
+    }
+}
+
+/// Migrate a bookmark a source kind stored at shape version `from` to
+/// [`source_state_schema`] offline (#736), with the same code the built
+/// source's `Source::migrate_state` runs.
+pub fn migrate_source_state(kind: &str, from: u32, data: Value) -> Result<Value, FaucetError> {
+    match kind {
+        #[cfg(feature = "source-mongodb-cdc")]
+        "mongodb-cdc" => faucet_source_mongodb_cdc::migrate_state(from, data),
+        _ if from == source_state_schema(kind) => Ok(data),
+        _ => Err(FaucetError::State(format!(
+            "{kind} has no migration from bookmark schema {from} to {}",
+            source_state_schema(kind)
+        ))),
+    }
+}
+
+/// The owner and shape version a row's bookmark is stored under (#736): its
+/// source kind, or `topology` for a graph whose sink nodes cannot be
+/// attributed to one source.
+pub fn state_codec_for(source: Option<(&str, &Value)>) -> faucet_core::state_version::StateCodec {
+    match source {
+        Some((kind, config)) => {
+            if let Some(entry) = global().sources.get(kind)
+                && let Ok(built) = (entry.factory)(config.clone())
+            {
+                return faucet_core::state_version::StateCodec::for_source(built.as_ref(), false);
+            }
+            faucet_core::state_version::StateCodec {
+                owner: kind.to_string(),
+                schema: source_state_schema(kind),
+                legacy: false,
+            }
+        }
+        None => faucet_core::state_version::StateCodec {
+            owner: "topology".into(),
+            schema: 0,
+            legacy: false,
+        },
+    }
 }
 
 /// Sink connector kinds that can durably commit a token atomically with data.
@@ -2330,6 +2382,30 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bookmark_schema_and_migration_per_source_kind() {
+        assert_eq!(source_state_schema("csv"), 0);
+        assert_eq!(
+            migrate_source_state("csv", 0, json!({"a": 1})).unwrap(),
+            json!({"a": 1})
+        );
+        assert!(migrate_source_state("csv", 1, json!({})).is_err());
+        #[cfg(feature = "source-mongodb-cdc")]
+        {
+            assert_eq!(source_state_schema("mongodb-cdc"), 1);
+            let m = migrate_source_state("mongodb-cdc", 0, json!({"resume_token": {"_data": "A"}}))
+                .unwrap();
+            assert_eq!(m["invalidate"], json!(false));
+            assert_eq!(state_codec_for(Some(("mongodb-cdc", &json!({})))).schema, 1);
+        }
+        let topo = state_codec_for(None);
+        assert_eq!(
+            (topo.owner.as_str(), topo.schema, topo.legacy),
+            ("topology", 0, false)
+        );
+        assert_eq!(state_codec_for(Some(("csv", &json!({})))).owner, "csv");
+    }
 
     /// Every compiled source kind reaches a real deserializer (#609).
     ///

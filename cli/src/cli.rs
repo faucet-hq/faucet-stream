@@ -336,6 +336,18 @@ pub struct MigrateArgs {
     /// Write the migrated config to stdout instead of rewriting the file.
     #[arg(long, conflicts_with = "check")]
     pub stdout: bool,
+    /// Migrate the pipeline's **stored state** instead of the config (#736):
+    /// rewrite every row's bookmark into the current versioned envelope and
+    /// bookmark schema. With `--check`, only report (exit non-zero when a key
+    /// needs work).
+    #[arg(long, conflicts_with = "stdout")]
+    pub state: bool,
+    /// With `--state`: only this row.
+    #[arg(long, requires = "state")]
+    pub row: Option<String>,
+    /// With `--state`: emit the report as JSON.
+    #[arg(long, requires = "state")]
+    pub json: bool,
 }
 
 /// `faucet fmt` arguments.

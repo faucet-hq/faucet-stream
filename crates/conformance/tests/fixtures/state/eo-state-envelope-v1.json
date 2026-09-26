@@ -1,0 +1,6 @@
+{
+  "faucet_state": 1,
+  "owner": "postgres-cdc",
+  "schema": 0,
+  "data": { "__faucet_eo": 1, "bookmark": { "last_lsn": "0/16B3748" }, "seq": 42 }
+}

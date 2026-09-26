@@ -94,6 +94,13 @@ What each row reports:
   ([#737](https://github.com/faucet-hq/faucet-stream/issues/737)). A run that
   sent writes to the DLQ marks the row degraded even when the DLQ sink cannot be
   counted here.
+- **state format** — how the stored bookmark relates to what this release's
+  source reads ([#736](https://github.com/faucet-hq/faucet-stream/issues/736)):
+  `current`, `legacy` (stored before versioning; the next run rewrites it),
+  `migrate` (an older bookmark shape the next run — or
+  `faucet migrate --state` — migrates), or `incompatible` (written by a newer
+  faucet or another source; the next run refuses it and the row is degraded).
+  See [Upgrading faucet safely](../operations/upgrading.md).
 
 Every field is read on its own: an unreachable state backend, run-history
 store or DLQ shows up as a note on the row, never as a failure of the command.
@@ -110,6 +117,12 @@ web console shows it as the **Health** card on a pipeline template's page.
 faucet state show orders.yaml               # every row's bookmark + markers
 faucet state show orders.yaml --row orders --json
 ```
+
+Every bookmark is stored in a versioned envelope naming the source that owns
+its shape and that shape's version; `show` prints it as a `state format` line
+per row and `set` / `reset` write the envelope for you. `faucet migrate
+--state` upgrades every row's stored bookmark ahead of a run
+([Upgrading faucet safely](../operations/upgrading.md)).
 
 **Replay from last Tuesday:**
 

@@ -256,6 +256,14 @@ impl Source for TransformingSource {
         self.inner.lag().await
     }
 
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
+
     fn connector_name(&self) -> &'static str {
         self.inner.connector_name()
     }

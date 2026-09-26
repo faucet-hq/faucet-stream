@@ -198,6 +198,15 @@ fn details(r: &RowStatus, now: DateTime<Utc>) -> Vec<String> {
     {
         marks.push(super::batch_note(b));
     }
+    if let Some(f) = &r.state_format
+        && f.status != "current"
+    {
+        marks.push(format!(
+            "state: {} — {}",
+            f.status,
+            f.detail.as_deref().unwrap_or_default()
+        ));
+    }
     if let Some(l) = &r.lag {
         marks.push(format!(
             "lag: {} ({}, {})",

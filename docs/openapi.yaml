@@ -3326,6 +3326,17 @@ components:
     Health:
       type: string
       enum: [ok, running, warming, unknown, degraded, failed]
+    StateFormat:
+      type: object
+      description: "How a row's stored bookmark relates to what this release's source reads (#736)."
+      properties:
+        format: { type: integer, description: "Envelope version; 0 = stored before versioning" }
+        owner: { type: string, description: "The connector that owns the stored bookmark shape" }
+        schema: { type: integer }
+        expected_owner: { type: string }
+        expected_schema: { type: integer }
+        status: { type: string, enum: [current, legacy, migrate, incompatible] }
+        detail: { type: string }
     RowStatus:
       type: object
       properties:
@@ -3370,6 +3381,7 @@ components:
             measured: { type: string, enum: [last_run, probe] }
             at: { type: string, format: date-time }
         batches: { $ref: "#/components/schemas/BatchOutcomes" }
+        state_format: { $ref: "#/components/schemas/StateFormat" }
         dlq:
           type: object
           properties:

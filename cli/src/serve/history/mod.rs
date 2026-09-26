@@ -242,6 +242,8 @@ pub struct InstanceHeartbeat {
     pub listen: Option<String>,
     pub max_concurrent: u32,
     pub in_flight: u32,
+    /// The newest state format this instance reads (#736).
+    pub state_format: u32,
 }
 
 /// One live cluster member (for `/readyz` + metrics).
@@ -253,6 +255,19 @@ pub struct InstanceRecord {
     pub listen: Option<String>,
     pub max_concurrent: u32,
     pub in_flight: u32,
+    /// The newest state format the member reads (#736); `0` for a member that
+    /// predates versioned state (it never advertised one).
+    pub state_format: u32,
+}
+
+/// The state format every live member reads (#736): the lowest any of them
+/// advertises, or this release's when there are none.
+pub fn cluster_state_format(members: &[InstanceRecord]) -> u32 {
+    members
+        .iter()
+        .map(|m| m.state_format)
+        .min()
+        .unwrap_or(faucet_core::state_version::STATE_FORMAT)
 }
 
 /// Filter + pagination for `list`. `limit`/`cursor` are resolved by the handler.

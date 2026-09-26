@@ -29,3 +29,9 @@ catch it, because both sides change together.
   versioned `{ version, pipeline, exported_at, keys }` snapshot of a pipeline's
   namespace, holding a bare bookmark, an SLA marker, and an exactly-once
   envelope. `faucet state import` of a release's export must keep working.
+- `state-envelope-v1.json` — the versioned state envelope (#736):
+  `{ faucet_state, owner, schema, data }` around a bare bookmark.
+- `eo-state-envelope-v1.json` — the versioned envelope around an exactly-once
+  wrapper (the wrapper lives inside `data`).
+- `scalar-state-envelope-v1.json` — the versioned envelope around a scalar
+  bookmark.

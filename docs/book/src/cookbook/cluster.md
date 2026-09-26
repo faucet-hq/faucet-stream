@@ -390,6 +390,17 @@ How it differs from the other sharders:
 Mode B metrics: `faucet_serve_shards_claimed_total`,
 `faucet_serve_shards_reclaimed_total{outcome}`.
 
+## Rolling upgrades and stored state
+
+Members share one state store, so during a rolling upgrade an old and a new
+member can resume the same pipeline. Every member advertises the newest state
+format it reads (the `faucet_serve_instance_caps` table, written with each
+heartbeat); while a live member predates versioned state (#736), the others
+write bookmarks bare so it can still read them, and refuse to run a pipeline
+whose source bookmark shape is past schema 0. When the last old member stops
+heartbeating, the versioned envelope is written again — nothing to configure.
+See [Upgrading faucet safely](../operations/upgrading.md).
+
 ## Related pages
 
 - [Running faucet as a service](./serve.md) — `faucet serve` fundamentals,

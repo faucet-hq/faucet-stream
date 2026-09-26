@@ -197,6 +197,9 @@ pub struct RowState {
     pub bookmark: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exactly_once: Option<EnvelopeInfo>,
+    /// The bookmark's owner / shape version against what the source reads (#736).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_format: Option<StateFormat>,
     /// Child / product / shard bookmarks under the row.
     pub sub_bookmarks: Vec<KeyEntry>,
     pub markers: Vec<KeyEntry>,
@@ -215,19 +218,82 @@ pub struct ShowReport {
     pub orphans: Vec<KeyEntry>,
 }
 
-/// Decode a stored bookmark value into `(bookmark, envelope)`.
+/// Decode a stored bookmark value into `(bookmark, envelope)`, looking through
+/// the versioned state envelope (#736).
 pub fn decode_bookmark(value: &Value) -> (Option<Value>, Option<EnvelopeInfo>) {
-    if is_envelope(value) {
-        let (bm, seq) = unwrap_state(value);
+    let payload = faucet_core::state_version::peel_versioned(value);
+    if faucet_core::idempotency::is_eo_envelope(&payload) {
+        let (bm, seq) = unwrap_state(&payload);
         (bm, Some(EnvelopeInfo { seq }))
     } else {
-        (Some(value.clone()), None)
+        (Some(payload), None)
     }
 }
 
-/// Whether `value` is an exactly-once state envelope.
+/// Whether `value` holds an exactly-once state envelope (inside the versioned
+/// envelope or bare).
 pub fn is_envelope(value: &Value) -> bool {
-    value.get("__faucet_eo").and_then(Value::as_u64) == Some(1)
+    faucet_core::idempotency::is_eo_envelope(&faucet_core::state_version::peel_versioned(value))
+}
+
+/// How a row's stored bookmark relates to what its source reads (#736).
+#[derive(Debug, Clone, Serialize)]
+pub struct StateFormat {
+    /// Envelope version (`0` = stored before versioning).
+    pub format: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub schema: u32,
+    /// The owner and shape version this release's source reads.
+    pub expected_owner: String,
+    pub expected_schema: u32,
+    /// `current`, `legacy` (rewritten in the envelope by the next run),
+    /// `migrate` (migrated by the next run or `faucet migrate --state`), or
+    /// `incompatible` (the next run refuses it).
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Compare a stored bookmark with what `row`'s source reads.
+pub fn state_format(row: &RowTarget, stored: &Value) -> StateFormat {
+    use faucet_core::state_version::{StateCompat, StoredState, check_compat};
+    let codec = row_codec(row);
+    let st = StoredState::parse(stored);
+    let (status, detail) = match check_compat(&st, &codec.owner, codec.schema) {
+        StateCompat::Current if st.is_legacy() => (
+            "legacy",
+            Some("stored before versioning — the next run rewrites it in the envelope".to_string()),
+        ),
+        StateCompat::Current => ("current", None),
+        StateCompat::Migrate { from, to } => (
+            "migrate",
+            Some(format!(
+                "bookmark schema {from} → {to}: migrated by the next run, or now with \
+                 `faucet migrate --state`"
+            )),
+        ),
+        StateCompat::Incompatible { found, expected } => (
+            "incompatible",
+            Some(format!(
+                "found {found}, expected {expected} — the next run refuses it"
+            )),
+        ),
+    };
+    StateFormat {
+        format: st.format,
+        owner: st.owner,
+        schema: st.schema,
+        expected_owner: codec.owner,
+        expected_schema: codec.schema,
+        status,
+        detail,
+    }
+}
+
+/// The owner / shape version a row's bookmark is written under.
+pub fn row_codec(row: &RowTarget) -> faucet_core::state_version::StateCodec {
+    crate::registry::state_codec_for(row.source.as_ref().map(|(k, c)| (k.as_str(), c)))
 }
 
 /// Read every row's state (optionally one row).
@@ -249,6 +315,7 @@ pub async fn show(
             store: stores.kind_for_row(&r.id).map(str::to_owned),
             bookmark: None,
             exactly_once: None,
+            state_format: None,
             sub_bookmarks: Vec::new(),
             markers: Vec::new(),
             running: None,
@@ -262,6 +329,7 @@ pub async fn show(
                     let (bm, eo) = decode_bookmark(&e.value);
                     state.bookmark = bm;
                     state.exactly_once = eo;
+                    state.state_format = Some(state_format(r, &e.value));
                 }
                 (KeyKind::Bookmark, Some(_)) => state.sub_bookmarks.push(e.clone()),
                 (KeyKind::Lease, None) => {
@@ -541,6 +609,7 @@ pub async fn set(
     } else {
         (req.bookmark.clone(), None)
     };
+    let after = row_codec(row).encode(&after);
     if !req.dry_run {
         store.put(&key, &after).await?;
     }
@@ -657,7 +726,7 @@ pub async fn reset(
             changes.push(KeyChange {
                 key: e.key.key.clone(),
                 before: e.value.clone(),
-                after: Some(wrap_state(None, adj.written_seq)),
+                after: Some(row_codec(row).encode(&wrap_state(None, adj.written_seq))),
             });
             exactly_once = Some(adj);
         } else {
@@ -1013,7 +1082,11 @@ matrix:
             .unwrap();
         assert!(o.applied && o.before.is_none());
         assert_eq!(
-            store.get("orders::a").await.unwrap(),
+            store
+                .get("orders::a")
+                .await
+                .unwrap()
+                .map(|v| faucet_core::state_version::peel_versioned(&v)),
             Some(json!({"id": 1}))
         );
 
@@ -1028,7 +1101,11 @@ matrix:
         };
         set(&t, &s, &auth, &with_pk, now()).await.unwrap();
         assert_eq!(
-            store.get("orders::kid::7").await.unwrap(),
+            store
+                .get("orders::kid::7")
+                .await
+                .unwrap()
+                .map(|v| faucet_core::state_version::peel_versioned(&v)),
             Some(json!({"c": 2}))
         );
         let err = set(&t, &s, &auth, &req("a", Value::Null), now())
@@ -1322,7 +1399,11 @@ matrix:
         let o = import(&t, &s2, &req(false, false), now()).await.unwrap();
         assert!(o.atomic && o.error.is_none());
         assert_eq!(
-            store2.get("orders::a").await.unwrap(),
+            store2
+                .get("orders::a")
+                .await
+                .unwrap()
+                .map(|v| faucet_core::state_version::peel_versioned(&v)),
             Some(json!({"id": 1}))
         );
 

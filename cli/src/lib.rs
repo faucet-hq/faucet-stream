@@ -363,6 +363,7 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
     executor::run_expanded(
         nodes,
         executor::ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name,
             run_id: None,
             execution: cfg.execution.clone(),

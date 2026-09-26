@@ -298,6 +298,7 @@ fn make_opts(
     #[cfg(feature = "catalog")] catalog: &Option<crate::catalog::CatalogHandle>,
 ) -> ExecuteOptions {
     ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: pipeline_name.to_string(),
         run_id: None,
         execution: execution.clone(),

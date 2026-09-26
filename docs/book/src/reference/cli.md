@@ -41,7 +41,7 @@ JSON-RPC stream.
 | `faucet schedule [config]` | Run a pipeline on a cron schedule (long-running foreground process). |
 | `faucet serve` | Run a long-running HTTP control plane: submit / poll / cancel pipeline runs over REST. |
 | `faucet completions <shell>` | Print a shell tab-completion script (bash / zsh / fish / powershell / elvish). |
-| `faucet migrate [config]` | Upgrade a config written against an older grammar to the current shape (idempotent). |
+| `faucet migrate [config]` | Upgrade a config written against an older grammar to the current shape (idempotent); `--state` upgrades the pipeline's stored bookmarks instead. |
 | `faucet doctor --offline [config]` | Static, credential-free config lints (no network) — dangling/unused auth, unused vars, no-op sink `batch_size`. |
 | `faucet fmt [config] [--check]` | Canonicalize a config (stable key order); `--check` is a CI gate. |
 | `faucet explain [config]` | Plain-English narration of what a pipeline does (offline, zero I/O). |
@@ -1465,6 +1465,30 @@ Rules applied today:
 
 Each rule is a pure, unit-tested transform. Comments are not preserved (the
 config is parsed and re-serialized).
+
+### `migrate --state`
+
+`faucet migrate --state [config]` upgrades the pipeline's **stored state**
+instead of the config: every row's bookmark is rewritten into the versioned
+state envelope and, when the row's source changed its bookmark shape, migrated
+to the current shape (#736). See [Upgrading faucet safely](../operations/upgrading.md).
+
+```bash
+faucet migrate --state orders.yaml            # rewrite every row's bookmark
+faucet migrate --state orders.yaml --check    # report only; exit non-zero if any key needs work
+faucet migrate --state orders.yaml --row cdc --json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--state` | Migrate stored state rather than the config file. |
+| `--check` | Report without writing; exits non-zero when a key is not current. |
+| `--row <id>` | Only this matrix row. |
+| `--json` | Machine-readable report (`pipeline`, `check`, `keys[]` with `row`, `key`, `owner`, `action` = `current` / `enveloped` / `migrated` / `refused`, `from_schema`, `to_schema`, `detail`). |
+
+A key this release cannot read (written by a newer faucet, or by another
+source) is reported as `refused`, left untouched, and makes the command exit
+non-zero.
 
 ## `doctor --offline`
 

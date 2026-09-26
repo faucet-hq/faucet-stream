@@ -28,7 +28,7 @@ test checks and which stays green through a real regression.
 | Tier | What it covers | Docker? | Runs |
 |---|---|---|---|
 | **Engine guarantees** | Bookmark ordering, exactly-once (both mechanisms), overwrite atomicity, cleanup safety, cancel-still-flushes | No | Every PR, **required** |
-| **State compatibility** | Bookmarks / exactly-once envelopes / commit tokens written by a release still load | No | Every PR, **required** |
+| **State compatibility** | Bookmarks / exactly-once envelopes / versioned state envelopes / commit tokens written by a release still load; an older bookmark shape migrates; a newer one is refused | No | Every PR, **required** |
 | **Connector conformance** | Per-connector battery (capabilities truthful, bounded memory, idempotent replay, …) | Per connector | Every PR |
 | **Drift policy matrix** | All five `on_drift` policies against a live evolving destination | No | Every PR, **required** |
 | **Containerized integration** | Real databases, Kafka, object stores; CDC replication | Yes | Every PR, reported |
@@ -56,6 +56,10 @@ cargo test -p faucet-conformance --test reliability_lifecycle
 cargo test -p faucet-conformance --test reliability_cleanup_safety
 cargo test -p faucet-conformance --test reliability_fault_injection
 cargo test -p faucet-conformance --test compat_state_format
+cargo test -p faucet-conformance --test reliability_state_migration
+
+# Each resumable source's frozen bookmark shapes (#736).
+cargo test -p faucet-source-postgres-cdc --test state_compat
 
 # The drift-policy matrix (Docker-free, required tier).
 cargo test -p faucet-sink-sqlite --test drift_policy_matrix
@@ -138,6 +142,32 @@ deserializes with the same code — both halves move together and the test stays
 green through a breaking change. If one of these fails, the fixture is not what
 is wrong: either the reader regressed, or the change needs an explicit
 migration.
+
+Since #736 every bookmark is stored in a versioned envelope
+(`{faucet_state, owner, schema, data}`); the envelope fixtures
+(`state-envelope-v1.json`, `eo-state-envelope-v1.json`,
+`scalar-state-envelope-v1.json`) freeze its shape, and every pre-envelope
+fixture must still resolve as a legacy schema-0 bookmark. Each resumable
+source (`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, `kafka`,
+`kinesis`) keeps its own released bookmark shapes under
+`crates/source/<kind>/tests/fixtures/state/`, read by its `state_compat.rs`.
+
+### State migration (`reliability_state_migration`)
+
+Two guarantees about state crossing a boundary, both asserted through a real
+`Pipeline::run`:
+
+- **Across backends (#735)** — `faucet state export` → `import` onto another
+  backend resumes exactly where the last run stopped, at-least-once and
+  exactly-once.
+- **Across releases (#736)** — a bare bookmark in an older shape is migrated
+  by the source and resumed with no gap and no re-read, and the next bookmark
+  is written in the envelope at the current schema; inside an exactly-once
+  wrapper only the bookmark is migrated and the sequence carries on; state
+  from a newer release, a newer envelope, or another source is refused with
+  `StateIncompatible` before anything is read or written; legacy writes (a
+  mixed-version cluster) store the bare bookmark and refuse a source past
+  schema 0.
 
 ### Drift policies (`sink/sqlite/tests/drift_policy_matrix`)
 
@@ -270,6 +300,13 @@ here" is an explicit statement, not a loose comparison hiding a bug.
 Commit a fixture named `<shape>-v<version>.json`, byte-exact as the writer
 emitted it, and read it in `compat_state_format.rs`. Never edit an existing
 fixture to make a test pass.
+
+A source that changes its **bookmark shape** bumps `Source::state_schema`,
+teaches `Source::migrate_state` the step (a pure function), commits the old
+shape as a fixture under its own `tests/fixtures/state/`, and asserts in its
+`state_compat.rs` that the fixture migrates (see `mongodb-cdc`, schema 0 → 1).
+The CLI mirrors the version offline in `registry::source_state_schema` /
+`migrate_source_state`.
 
 ## Coverage expectations
 
