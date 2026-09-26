@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-databricks.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 schemars.workspace = true

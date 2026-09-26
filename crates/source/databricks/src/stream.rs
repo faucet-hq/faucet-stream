@@ -14,13 +14,16 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use faucet_common_databricks::{
+    ErrorSide, StatementClient, StatementOptions, resolve_authorization, value_to_param_string,
+};
 use faucet_core::replication::{filter_incremental, max_value};
-use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Source, Stream, StreamPage};
+use faucet_core::{FaucetError, SharedAuthProvider, Source, Stream, StreamPage};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{DatabricksReplication, DatabricksSourceConfig};
+use crate::config::{DatabricksReplication, DatabricksSourceConfig, shared_auth};
 use crate::convert::{ColumnInfo, row_to_json};
 
 /// Databricks SQL query source.
@@ -35,47 +38,6 @@ pub struct DatabricksSource {
     auth_provider: Option<SharedAuthProvider>,
     /// Bookmark applied via [`Source::apply_start_bookmark`].
     start_bookmark: Mutex<Option<Value>>,
-}
-
-/// The statement lifecycle response (only the fields we consume).
-#[derive(Debug, Deserialize)]
-struct StatementResponse {
-    #[serde(default)]
-    statement_id: Option<String>,
-    #[serde(default)]
-    status: Option<StatusInfo>,
-    #[serde(default)]
-    manifest: Option<Manifest>,
-    #[serde(default)]
-    result: Option<ResultChunk>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StatusInfo {
-    #[serde(default)]
-    state: String,
-    #[serde(default)]
-    error: Option<ErrorInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorInfo {
-    #[serde(default)]
-    error_code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Manifest {
-    #[serde(default)]
-    schema: Option<SchemaInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SchemaInfo {
-    #[serde(default)]
-    columns: Vec<ColumnInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +75,12 @@ fn next_chunk_link(chunk: &ResultChunk) -> Option<String> {
             .and_then(|l| l.first())
             .and_then(|e| e.next_chunk_internal_link.clone())
     })
+}
+
+/// A terminal statement: its result columns and first chunk.
+struct Executed {
+    columns: Vec<ColumnInfo>,
+    result: Option<ResultChunk>,
 }
 
 /// Client-side incremental filter context.
@@ -162,19 +130,24 @@ impl DatabricksSource {
     /// Resolve the `Authorization` header value: shared provider first, else
     /// inline auth.
     async fn auth_header(&self) -> Result<String, FaucetError> {
-        if let Some(p) = &self.auth_provider {
-            let cred = p.credential().await?;
-            return cred.authorization_value().ok_or_else(|| {
-                FaucetError::Auth("databricks: shared provider yielded no bearer credential".into())
-            });
-        }
-        match &self.config.auth {
-            AuthSpec::Inline(a) => Ok(a.authorization_value()),
-            AuthSpec::Reference(r) => Err(FaucetError::Auth(format!(
-                "databricks: auth references provider '{}' but none was supplied",
-                r.name
-            ))),
-        }
+        resolve_authorization(&shared_auth(&self.config.auth), self.auth_provider.as_ref()).await
+    }
+
+    /// A Statement Execution API client for this source's warehouse.
+    fn statement_client(&self) -> StatementClient {
+        StatementClient::new(
+            self.client.clone(),
+            self.base_url(),
+            self.config.warehouse_id.clone(),
+            shared_auth(&self.config.auth),
+            self.auth_provider.clone(),
+            StatementOptions {
+                wait_timeout_secs: self.config.wait_timeout_secs,
+                poll_interval: Duration::from_secs(self.config.poll_interval_secs.max(1)),
+                ..StatementOptions::default()
+            },
+            ErrorSide::Source,
+        )
     }
 
     /// The effective incremental start bookmark (persisted bookmark, else the
@@ -277,82 +250,17 @@ impl DatabricksSource {
         &self,
         context: &HashMap<String, Value>,
         incr: Option<&IncrementalCtx>,
-    ) -> Result<StatementResponse, FaucetError> {
-        let auth = self.auth_header().await?;
+    ) -> Result<Executed, FaucetError> {
         let body = self.build_body(context, incr);
-        let resp = self
-            .client
-            .post(self.statements_url())
-            .header("Authorization", &auth)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| FaucetError::Source(format!("databricks: submit request failed: {e}")))?;
-        let parsed = parse_http(resp).await?;
-        self.poll_until_terminal(parsed, &auth).await
-    }
-
-    /// Poll `GET /statements/{id}` until the state is terminal (or the initial
-    /// response already is), returning the terminal response.
-    async fn poll_until_terminal(
-        &self,
-        first: StatementResponse,
-        auth: &str,
-    ) -> Result<StatementResponse, FaucetError> {
-        let mut current = first;
-        loop {
-            let state = current
-                .status
-                .as_ref()
-                .map(|s| s.state.as_str())
-                .unwrap_or("");
-            match state {
-                "SUCCEEDED" => return Ok(current),
-                "FAILED" | "CANCELED" | "CLOSED" => {
-                    return Err(statement_error(state, current.status.as_ref()));
-                }
-                "PENDING" | "RUNNING" => {
-                    let id = current.statement_id.clone().ok_or_else(|| {
-                        FaucetError::Source(
-                            "databricks: pending statement without a statement_id to poll".into(),
-                        )
-                    })?;
-                    tokio::time::sleep(Duration::from_secs(self.config.poll_interval_secs.max(1)))
-                        .await;
-                    let url = format!("{}/{}", self.statements_url(), id);
-                    let resp = self
-                        .client
-                        .get(&url)
-                        .header("Authorization", auth)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            FaucetError::Source(format!("databricks: poll request failed: {e}"))
-                        })?;
-                    current = parse_http(resp).await?;
-                }
-                other => {
-                    return Err(FaucetError::Source(format!(
-                        "databricks: unexpected statement state '{other}'"
-                    )));
-                }
-            }
-        }
+        let resp = self.statement_client().execute_body(&body).await?;
+        let columns = resp.columns().to_vec();
+        let result = resp.result.map(decode_chunk).transpose()?;
+        Ok(Executed { columns, result })
     }
 
     /// Fetch a follow-up chunk by its `next_chunk_internal_link` (a full API path).
-    async fn fetch_chunk(&self, link: &str, auth: &str) -> Result<ResultChunk, FaucetError> {
-        let url = format!("{}{}", self.base_url(), link);
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-            .map_err(|e| FaucetError::Source(format!("databricks: chunk request failed: {e}")))?;
-        let parsed = parse_http::<ResultChunk>(resp).await?;
-        Ok(parsed)
+    async fn fetch_chunk(&self, link: &str) -> Result<ResultChunk, FaucetError> {
+        decode_chunk(self.statement_client().fetch_chunk(link).await?)
     }
 
     /// Fetch a presigned external link and decode its body as an Arrow IPC
@@ -413,47 +321,9 @@ fn default_state_key(config: &DatabricksSourceConfig) -> String {
     format!("databricks:{:016x}", h.finish())
 }
 
-/// Stringify a JSON value for a Databricks named parameter (`value` is a
-/// string or null in the API).
-fn value_to_param_string(v: &Value) -> Value {
-    match v {
-        Value::Null => Value::Null,
-        Value::String(s) => Value::String(s.clone()),
-        Value::Bool(b) => Value::String(b.to_string()),
-        Value::Number(n) => Value::String(n.to_string()),
-        other => Value::String(other.to_string()),
-    }
-}
-
-/// Build a typed error from a terminal non-success statement state.
-fn statement_error(state: &str, status: Option<&StatusInfo>) -> FaucetError {
-    let detail = status.and_then(|s| s.error.as_ref()).map(|e| {
-        format!(
-            " [{}] {}",
-            e.error_code.as_deref().unwrap_or("UNKNOWN"),
-            e.message.as_deref().unwrap_or("")
-        )
-    });
-    FaucetError::Source(format!(
-        "databricks: statement {state}{}",
-        detail.unwrap_or_default()
-    ))
-}
-
-/// Parse an HTTP response into `T`, surfacing non-2xx as a typed error with the
-/// body (429/5xx/4xx transport errors; SQL errors come back as 200 + FAILED).
-async fn parse_http<T: for<'de> Deserialize<'de>>(
-    resp: reqwest::Response,
-) -> Result<T, FaucetError> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(FaucetError::Source(format!(
-            "databricks: HTTP {status}: {body}"
-        )));
-    }
-    resp.json::<T>()
-        .await
+/// Decode a raw result chunk.
+fn decode_chunk(v: Value) -> Result<ResultChunk, FaucetError> {
+    serde_json::from_value(v)
         .map_err(|e| FaucetError::Source(format!("databricks: could not parse response: {e}")))
 }
 
@@ -528,7 +398,6 @@ impl Source for DatabricksSource {
                     "databricks: stream_batches requires `arrow_native: true`".into(),
                 ))?;
             }
-            let auth = self.auth_header().await?;
             let resp = self.run_statement(context, None).await?;
             let mut chunk = resp.result;
             let mut total_records = 0usize;
@@ -550,7 +419,7 @@ impl Source for DatabricksSource {
                     }
                 }
                 chunk = match next_chunk_link(&c) {
-                    Some(link) => Some(self.fetch_chunk(&link, &auth).await?),
+                    Some(link) => Some(self.fetch_chunk(&link).await?),
                     None => None,
                 };
             }
@@ -568,8 +437,6 @@ impl Source for DatabricksSource {
         _batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         Box::pin(async_stream::try_stream! {
-            let auth = self.auth_header().await?;
-
             // Arrow-native row path: fetch ARROW_STREAM chunks and decode each
             // RecordBatch to JSON rows (for a non-columnar sink). `arrow_native`
             // is Full-replication only (enforced by config validation), so no
@@ -603,7 +470,7 @@ impl Source for DatabricksSource {
                         }
                     }
                     chunk = match next_chunk_link(&c) {
-                        Some(link) => Some(self.fetch_chunk(&link, &auth).await?),
+                        Some(link) => Some(self.fetch_chunk(&link).await?),
                         None => None,
                     };
                 }
@@ -616,11 +483,7 @@ impl Source for DatabricksSource {
             let incr = self.incremental_ctx();
             let resp = self.run_statement(context, incr.as_ref()).await?;
 
-            let columns: Vec<ColumnInfo> = resp
-                .manifest
-                .and_then(|m| m.schema)
-                .map(|s| s.columns)
-                .unwrap_or_default();
+            let columns: Vec<ColumnInfo> = resp.columns;
 
             let batch = self.config.batch_size;
             let cap = if batch == 0 { 1024 } else { batch };
@@ -654,7 +517,7 @@ impl Source for DatabricksSource {
                     }
                 }
                 chunk = match c.next_chunk_internal_link {
-                    Some(link) => Some(self.fetch_chunk(&link, &auth).await?),
+                    Some(link) => Some(self.fetch_chunk(&link).await?),
                     None => None,
                 };
             }
@@ -749,6 +612,7 @@ fn apply_incr_filter(page: Vec<Value>, incr: Option<&IncrementalCtx>) -> Vec<Val
 mod tests {
     use super::*;
     use crate::config::{DatabricksAuth, DatabricksParam};
+    use faucet_core::AuthSpec;
 
     fn cfg() -> DatabricksSourceConfig {
         DatabricksSourceConfig {
@@ -857,6 +721,13 @@ mod tests {
         assert_eq!(value_to_param_string(&json!(true)), json!("true"));
         assert_eq!(value_to_param_string(&json!("x")), json!("x"));
         assert_eq!(value_to_param_string(&Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn decode_chunk_rejects_non_objects() {
+        assert!(decode_chunk(json!({"data_array": [["1"]]})).is_ok());
+        let err = decode_chunk(json!(5)).unwrap_err().to_string();
+        assert!(err.contains("could not parse"), "{err}");
     }
 
     #[test]
