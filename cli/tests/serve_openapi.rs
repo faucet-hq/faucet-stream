@@ -175,6 +175,14 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         {
             continue;
         }
+        // …and the `tenants` feature's routes (#709).
+        #[cfg(not(feature = "tenants"))]
+        if path.starts_with("/v1/tenants")
+            || path.starts_with("/v1/connect/")
+            || path.ends_with("/fanout")
+        {
+            continue;
+        }
         // …and the `templates` feature's routes (#444).
         #[cfg(not(feature = "templates"))]
         if path.starts_with("/v1/templates") {

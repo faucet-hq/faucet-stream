@@ -5,8 +5,11 @@
 import { api } from "../api.js";
 import { escapeHtml, fmtInt } from "../utils.js";
 import { catalogUnavailable } from "./datasets.js";
+import { withTenant, tenantList } from "../tenant.js";
 
-const GROUPS = ["pipeline", "row", "dataset", "sink", "day"];
+const BASE_GROUPS = ["pipeline", "row", "dataset", "sink", "day"];
+// `tenant` is offered only where the server has tenants (#709).
+const groups = () => (tenantList() ? [...BASE_GROUPS, "tenant"] : BASE_GROUPS);
 
 export function fmtBytes(b) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -38,7 +41,7 @@ export async function renderUsage(container) {
       </div>
       <div class="filters filters-1line usage-filters">
         <label class="usage-by">by
-          <select id="u-by">${GROUPS.map((g) => `<option value="${g}">${g}</option>`).join("")}</select>
+          <select id="u-by">${groups().map((g) => `<option value="${g}">${g}</option>`).join("")}</select>
         </label>
         <input id="u-pipeline" placeholder="pipeline" />
         <input id="u-from" class="date-input" type="text" placeholder="from YYYY-MM-DD" />
@@ -76,6 +79,7 @@ export async function renderUsage(container) {
     if (pipeline.value.trim()) p.set("pipeline", pipeline.value.trim());
     if (from.value.trim()) p.set("since", from.value.trim());
     if (to.value.trim()) p.set("until", to.value.trim());
+    withTenant(p);
     let data;
     try {
       data = await api(`/v1/usage?${p}`);

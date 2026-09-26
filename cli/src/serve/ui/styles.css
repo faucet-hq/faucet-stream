@@ -1788,3 +1788,15 @@ select {
 .chg-approvals li { margin: 2px 0; }
 .chg-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
 .chg-actions input { flex: 1 1 180px; min-width: 140px; }
+
+/* Tenants (#709) */
+.tn-create, .tn-connect { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 8px 0 4px; }
+.tn-create input { flex: 1 1 200px; min-width: 0; }
+.tn-connect input, .tn-connect select { flex: 1 1 160px; min-width: 0; }
+.tn-connect textarea { flex: 1 1 100%; min-width: 0; font-family: var(--mono, ui-monospace, monospace); font-size: 0.82rem; }
+.tn-limits { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+.tn-limits label { display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; color: var(--ink-faint); }
+.tn-limits input { width: 150px; }
+.tn-row-actions { display: flex; gap: 6px; justify-content: flex-end; white-space: nowrap; }
+.tn-spacer { flex: 1 1 auto; }
+.chg-actions #td-confirm { flex: 0 1 220px; }
