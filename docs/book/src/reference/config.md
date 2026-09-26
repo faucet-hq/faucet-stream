@@ -949,6 +949,50 @@ matrix:
   - id: customers
 ```
 
+## `profiling`
+
+Optional top-level block declaring learned column profiles with drift
+detection (#708): every root invocation profiles the records it wrote (null
+rate, type mix, distinct estimate, numeric / string summaries, top values)
+into a bounded-memory sketch, compares the result with a rolling baseline of
+earlier runs kept in the `state:` store, and reports a statistically
+significant change per column — no thresholds to write. See the
+[column profiling cookbook](../cookbook/profiling.md).
+
+```yaml
+profiling:
+  min_history: 5               # baseline runs before detection starts
+  window: 20                   # rolling baseline size
+  method: zscore               # zscore | iqr (numeric metrics)
+  new_value_min_share: 0.05    # share a new value / type must reach to be reported
+  psi_threshold: 0.2           # value-distribution shift threshold
+  categorical_max_distinct: 100
+  exclude: ["_faucet_*"]
+  on_drift: warn               # warn | notify | fail
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `columns` | list | all | Only these top-level columns. |
+| `exclude` | list | `["_faucet_*"]` | Exact names or `prefix*` globs to skip. |
+| `max_columns` | int | `200` | Cap on profiled columns per run. |
+| `top_values` | int | `10` | Frequent values kept per categorical column; `0` disables. |
+| `categorical_max_distinct` | int | `100` | Distinct estimate above which a column publishes no example values. |
+| `window` | int | `20` | Rolling baseline size (≥ `min_history`). |
+| `min_history` | int | `5` | Baseline runs before detection starts (≥ 2). |
+| `method` | `zscore` \| `iqr` | `zscore` | Test for the numeric metrics (null rate, distinct, mean, min, max, string length). |
+| `sensitivity` | float | `3.0` / `1.5` | z-score threshold, or the IQR fence multiplier. |
+| `new_value_min_share` | float | `0.05` | Share a previously unseen value or JSON type must reach. |
+| `psi_threshold` | float | `0.2` | Population stability index above which the value distribution counts as drifted. |
+| `on_drift` | `warn` \| `notify` \| `fail` | `warn` | Log + metric; plus a `profile_drift` notification; plus the run is reported failed (data already written). |
+
+Requires a `state:` block (the baseline lives under
+`{name}::{row}::__profiling__`); a `memory` store only baselines within one
+process. Profiling runs after transforms and masking, for real root
+invocations only. A matrix row's own `profiling:` replaces the top-level
+block for that row. Inspect and re-baseline with
+[`faucet profiling`](cli.md#profiling). Schema: `faucet schema profiling`.
+
 ## `reconcile`
 
 Opt-in **completeness reconciliation** (#502): after a successful root run,
@@ -1033,7 +1077,8 @@ Schema: `faucet schema rollback`.
 A list of rules that fan pipeline lifecycle / health events out to Slack,
 PagerDuty, or a signed webhook. Events: `run_failure`, `run_success`,
 `sla_breach`, `circuit_open`, `contract_abort`, `dlq_threshold`,
-`scheduler_stuck`. Fires from every runtime; delivery never fails a run.
+`scheduler_stuck`, `profile_drift`. Fires from every runtime; delivery never
+fails a run.
 
 ```yaml
 notifications:

@@ -129,6 +129,16 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sla: Option<crate::sla::SlaSpec>,
 
+    /// Optional learned column profiles with drift detection (#708). Every
+    /// root invocation profiles the records it wrote (null rate, distinct
+    /// count, numeric / string summaries, type mix, top values) into a
+    /// bounded-memory sketch, compares it against a rolling baseline of
+    /// earlier runs kept in the `state:` store, and warns / notifies / fails
+    /// on a statistically significant change per `on_drift`. A matrix row's
+    /// own `profiling:` replaces it for that row. Requires a `state:` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profiling: Option<faucet_core::ProfilingSpec>,
+
     /// Optional completeness reconciliation (#502): after a successful root run,
     /// compare rows written against an authoritative count probe and **fail the
     /// run** on a shortfall beyond tolerance — a silent-truncation guard,
@@ -635,6 +645,11 @@ pub struct MatrixRow {
     /// row's invocations; `None` inherits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sla: Option<crate::sla::SlaSpec>,
+
+    /// Per-row profiling override (#708). Replaces the top-level `profiling:`
+    /// for this row's invocations; `None` inherits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profiling: Option<faucet_core::ProfilingSpec>,
 
     /// Free-form classification tags for this row (#376). Orthogonal to the
     /// source's `status:` readiness ladder — `status` gates whether a row is

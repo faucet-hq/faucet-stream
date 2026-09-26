@@ -60,6 +60,18 @@ groups:
             The `sla:` monitor recorded a {{ $labels.kind }} violation
             (staleness / min_rows / volume anomaly) in the last hour.
 
+      - alert: FaucetProfileDrift
+        expr: increase(faucet_profile_drift_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Column profile drift on pipeline {{ $labels.pipeline }} ({{ $labels.column }}.{{ $labels.metric }})"
+          description: >
+            The `profiling:` monitor found the column's {{ $labels.metric }}
+            statistically different from its learned baseline in the last
+            hour. Inspect with `faucet profiling show`; re-baseline a planned
+            change with `faucet profiling reset`.
+
       - alert: FaucetCircuitBreakerOpen
         expr: faucet_resilience_circuit_state == 1
         for: 5m

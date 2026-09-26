@@ -693,6 +693,26 @@ apply — the fast way to confirm `applies_to` scoping. Offline-safe: secrets ar
 never fetched. Requires the `masking` Cargo feature (in the default build). See
 the [masking](../cookbook/masking.md) cookbook page.
 
+## `profiling`
+
+```bash
+faucet profiling show pipeline.yaml                    # latest profile + drift per root row
+faucet profiling show pipeline.yaml --row invoices --full --json
+faucet profiling reset pipeline.yaml                   # forget the whole baseline
+faucet profiling reset pipeline.yaml --column amount   # re-baseline one column
+```
+
+Inspects or re-baselines the learned column profiles a config's
+[`profiling:`](config.md#profiling) block keeps in its `state:` store. `show`
+prints, per root row, the baseline depth, the latest run's per-column
+statistics (null rate, type mix, distinct, numeric / string summary, top
+values) and its drift findings; `--full` dumps every column's full profile.
+`reset` drops the stored history (or one column's with `--column`) so the next
+`min_history` runs learn the new normal — for a planned migration or a
+legitimate step change. `--row` narrows to one root row; both accept `--json`.
+`faucet schema profiling` prints the block's JSON Schema. See the
+[column profiling](../cookbook/profiling.md) cookbook page.
+
 ## `catalog`
 
 *(requires the `catalog` build feature — included in `full`)*
@@ -707,7 +727,8 @@ faucet catalog lineage --config pipeline.yaml --root 3f2a9c1e0b7d4a55 --depth 3
 Browses the [Data Movement Catalog](../cookbook/catalog.md) named by the
 config's `catalog:` block: the dataset list (newest activity first, `--kind` /
 `--q` filters), one dataset's detail (schema timeline with diffs, recent
-volume, upstream/downstream edges), and the lineage graph. All subcommands
+volume, upstream/downstream edges, and the column profiles recorded by a
+`profiling:` pipeline), and the lineage graph. All subcommands
 accept `--json`; `--config` auto-discovers `faucet.yaml` in cwd when omitted.
 Read-only — it never mutates the store.
 
@@ -875,7 +896,7 @@ Fires one **synthetic** event through the config's `notifications:` rules using
 the real delivery path (no pipeline runs) — the fast way to confirm a Slack /
 PagerDuty / webhook channel is wired correctly. `--event` accepts any event
 kind (`run_failure`, `run_success`, `sla_breach`, `circuit_open`,
-`contract_abort`, `dlq_threshold`, `scheduler_stuck`). See the
+`contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`). See the
 [Notifications](../cookbook/notifications.md) cookbook page.
 
 ## `mirror`

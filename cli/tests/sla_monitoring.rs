@@ -270,7 +270,7 @@ async fn doctor_reports_sla_probes_cold_and_warm() {
     let ctx = CheckContext::default();
 
     // Cold start: staleness (no success yet) and baseline (0/3) both skip.
-    let invs = probe_roots(&nodes, &auth, &ctx, cfg.sla.as_ref(), "slatest").await;
+    let invs = probe_roots(&nodes, &auth, &ctx, cfg.sla.as_ref(), None, "slatest").await;
     let sla_probes: Vec<_> = invs[0].probes.iter().filter(|p| p.role == "sla").collect();
     assert_eq!(sla_probes.len(), 2, "{:?}", invs[0].probes);
     assert_eq!(sla_probes[0].name, "staleness");
@@ -281,7 +281,7 @@ async fn doctor_reports_sla_probes_cold_and_warm() {
     // After a successful run the staleness probe passes (fresh); the baseline
     // is still warming (1/3).
     faucet_cli::run_from_yaml_str(&yaml).await.expect("run ok");
-    let invs = probe_roots(&nodes, &auth, &ctx, cfg.sla.as_ref(), "slatest").await;
+    let invs = probe_roots(&nodes, &auth, &ctx, cfg.sla.as_ref(), None, "slatest").await;
     let sla_probes: Vec<_> = invs[0].probes.iter().filter(|p| p.role == "sla").collect();
     assert!(
         matches!(sla_probes[0].status, ProbeStatus::Pass),
@@ -298,7 +298,7 @@ async fn doctor_reports_sla_probes_cold_and_warm() {
         )
         .await
         .unwrap();
-    let invs = probe_roots(&nodes, &auth, &ctx, cfg.sla.as_ref(), "slatest").await;
+    let invs = probe_roots(&nodes, &auth, &ctx, cfg.sla.as_ref(), None, "slatest").await;
     let sla_probes: Vec<_> = invs[0].probes.iter().filter(|p| p.role == "sla").collect();
     assert!(
         matches!(sla_probes[0].status, ProbeStatus::Fail { .. }),
@@ -308,6 +308,6 @@ async fn doctor_reports_sla_probes_cold_and_warm() {
     assert!(matches!(sla_probes[1].status, ProbeStatus::Pass));
 
     // Without an `sla:` block no probes are added.
-    let invs = probe_roots(&nodes, &auth, &ctx, None, "slatest").await;
+    let invs = probe_roots(&nodes, &auth, &ctx, None, None, "slatest").await;
     assert!(invs[0].probes.iter().all(|p| p.role != "sla"));
 }

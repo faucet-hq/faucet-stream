@@ -117,7 +117,15 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
         .collect();
     let n_children = nodes.len() - roots.len();
 
-    let mut invocations = probe_roots(&nodes, &auth, &ctx, cfg.sla.as_ref(), &pipeline_name).await;
+    let mut invocations = probe_roots(
+        &nodes,
+        &auth,
+        &ctx,
+        cfg.sla.as_ref(),
+        cfg.profiling.as_ref(),
+        &pipeline_name,
+    )
+    .await;
 
     // Lineage transport reachability — one pipeline-wide probe (the `lineage:`
     // block is top-level, not per-row), rendered as its own invocation entry so
@@ -156,6 +164,7 @@ pub async fn run(args: DoctorArgs) -> CliResult<()> {
 /// `sla:` block is configured, `sla` carries the spec plus the invocation's
 /// base state key so the persisted SLA history can be probed read-only
 /// (staleness vs `max_staleness_secs`, volume-baseline warm-up).
+#[allow(clippy::too_many_arguments)]
 pub async fn probe_invocation(
     id: String,
     source: ConnectorSpec,
@@ -164,6 +173,7 @@ pub async fn probe_invocation(
     auth: &AuthCatalog,
     ctx: &CheckContext,
     sla: Option<(crate::sla::SlaSpec, String)>,
+    profiling: Option<(faucet_core::ProfilingSpec, String)>,
 ) -> InvocationOut {
     let mut probes = Vec::new();
 
@@ -213,6 +223,27 @@ pub async fn probe_invocation(
         );
     }
 
+    // Column-profiling baseline (#708): read-only depth / warm-up state.
+    if let Some((spec, base_key)) = profiling {
+        let probes_out = tokio::time::timeout(
+            ctx.timeout,
+            crate::profiling::doctor_probes(&spec, store.as_ref(), &base_key),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            vec![Probe::fail(
+                "baseline",
+                ctx.timeout,
+                "profiling state read timed out",
+            )]
+        });
+        probes.extend(
+            probes_out
+                .into_iter()
+                .map(|p| ProbeOut::from_probe("profiling", "profiling".to_string(), p)),
+        );
+    }
+
     InvocationOut {
         id,
         probes,
@@ -258,6 +289,7 @@ pub async fn probe_roots(
     auth: &AuthCatalog,
     ctx: &CheckContext,
     sla: Option<&crate::sla::SlaSpec>,
+    profiling: Option<&faucet_core::ProfilingSpec>,
     pipeline_name: &str,
 ) -> Vec<InvocationOut> {
     let sem = Arc::new(Semaphore::new(8));
@@ -276,10 +308,17 @@ pub async fn probe_roots(
                 crate::executor::build_state_key(pipeline_name, &node.id, None),
             )
         });
+        let profiling = node.profiling.as_ref().or(profiling).map(|p| {
+            (
+                p.clone(),
+                crate::executor::build_state_key(pipeline_name, &node.id, None),
+            )
+        });
         let guarantee = node.delivery_guarantee.to_string();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore not closed");
-            let mut inv = probe_invocation(id, source, sink, state, &auth, &ctx, sla).await;
+            let mut inv =
+                probe_invocation(id, source, sink, state, &auth, &ctx, sla, profiling).await;
             inv.delivery = Some(guarantee);
             inv
         }));

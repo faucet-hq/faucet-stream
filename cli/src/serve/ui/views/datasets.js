@@ -768,6 +768,9 @@ export async function renderDatasetDetail(container, params) {
             : `<div class="empty">no volume points yet</div>`
       }
 
+      <h2>Column profiles</h2>
+      <div id="profile"></div>
+
       <h2>Schema timeline</h2>
       <div id="timeline"></div>
 
@@ -797,6 +800,8 @@ export async function renderDatasetDetail(container, params) {
     a.onclick = () => navigate(`#/catalog/${a.dataset.id}`);
   });
 
+  renderProfile(container.querySelector("#profile"), d.profile);
+
   const timeline = container.querySelector("#timeline");
   if (!d.schema_timeline.length) {
     timeline.innerHTML = `<div class="empty">no schema observed yet</div>`;
@@ -807,6 +812,145 @@ export async function renderDatasetDetail(container, params) {
   return () => {
     if (loCleanup) loCleanup();
   };
+}
+
+// Learned column profiles (#708): the latest run's per-column statistics with
+// a null-rate sparkline over the recorded history and the drift findings.
+function renderProfile(el, profile) {
+  if (!profile) {
+    el.innerHTML = `<div class="empty">no column profiles yet — add a <code>profiling:</code> block to the pipeline that writes this dataset</div>`;
+    return;
+  }
+  const latest = profile.latest;
+  const history = profile.history.slice().reverse(); // oldest first
+  const columns = Object.entries(latest.profile.columns || {});
+  const drift = latest.drift || [];
+  const driftFor = (col) => drift.filter((d) => d.column === col);
+  const driftRuns = (col) =>
+    history.map((r) => (r.drift || []).some((d) => d.column === col));
+
+  const head = `<div class="profile-head">
+      <span>latest run <span class="mono">${escapeHtml(latest.run_id)}</span> · ${fmtTime(latest.recorded_at)}</span>
+      <span>${fmtInt(latest.profile.rows)} rows · ${columns.length} column${columns.length === 1 ? "" : "s"}${
+        latest.profile.skipped_columns ? ` (+${fmtInt(latest.profile.skipped_columns)} beyond max_columns)` : ""
+      }</span>
+      <span>baseline ${fmtInt(latest.baseline_runs)} run${latest.baseline_runs === 1 ? "" : "s"} · ${history.length} recorded</span>
+      ${
+        drift.length
+          ? `<span class="pill drift-flag">${drift.length} drift finding${drift.length === 1 ? "" : "s"}</span>`
+          : `<span class="pill diff-added">stable</span>`
+      }
+    </div>`;
+
+  const findings = drift.length
+    ? `<ul class="profile-drift">${drift
+        .map(
+          (d) =>
+            `<li><span class="pill drift-flag">${escapeHtml(d.column)}.${escapeHtml(d.metric)}</span> <span class="run-meta">${escapeHtml(d.detail)}</span></li>`,
+        )
+        .join("")}</ul>`
+    : "";
+
+  const rows = columns
+    .map(([name, c]) => {
+      const types = Object.entries(c.types || {})
+        .filter(([t, n]) => t !== "null" && n > 0)
+        .sort((a, b) => b[1] - a[1])
+        .map(([t]) => t)
+        .join("/");
+      const summary = c.numeric
+        ? `min ${fmtNum(c.numeric.min)} · mean ${fmtNum(c.numeric.mean)} · max ${fmtNum(c.numeric.max)}`
+        : c.string
+          ? `len ${c.string.len_min}–${c.string.len_max} · mean ${fmtNum(c.string.len_mean)}`
+          : "";
+      const top = c.high_cardinality
+        ? `<span class="run-meta">high cardinality</span>`
+        : (c.top_values || [])
+            .slice(0, 4)
+            .map(
+              (t) =>
+                `<span class="profile-chip" title="${escapeHtml(`${fmtInt(t.count)} occurrences`)}">${escapeHtml(
+                  t.value,
+                )} <b>${(t.share * 100).toFixed(1)}%</b></span>`,
+            )
+            .join("");
+      const flagged = driftFor(name);
+      return `<tr class="${flagged.length ? "profile-drifted" : ""}">
+          <td class="mono">${escapeHtml(name)}${
+            flagged.length
+              ? `<div class="profile-flags">${[...new Set(flagged.map((d) => d.metric))]
+                  .map(
+                    (m) =>
+                      `<span class="pill drift-flag" title="${escapeHtml(
+                        flagged
+                          .filter((d) => d.metric === m)
+                          .map((d) => d.detail)
+                          .join("\n"),
+                      )}">${escapeHtml(m)}</span>`,
+                  )
+                  .join("")}</div>`
+              : ""
+          }</td>
+          <td><span class="pill">${escapeHtml(types || "null")}</span></td>
+          <td class="profile-null">${(c.null_rate * 100).toFixed(1)}% ${sparkline(
+            history.map((r) => (r.profile.columns[name] ? r.profile.columns[name].null_rate : null)),
+            driftRuns(name),
+          )}</td>
+          <td class="num">${fmtInt(c.distinct)}</td>
+          <td class="run-meta">${escapeHtml(summary)}</td>
+          <td>${top}</td>
+        </tr>`;
+    })
+    .join("");
+
+  el.innerHTML = `${head}${findings}
+    <div class="table-scroll"><table class="ds-table profile-table">
+      <thead><tr>
+        <th>column</th><th>type</th><th>null rate</th><th>distinct</th><th>values</th><th>top values</th>
+      </tr></thead>
+      <tbody>${rows || `<tr><td colspan="6" class="run-meta">no columns profiled</td></tr>`}</tbody>
+    </table></div>`;
+}
+
+function fmtNum(x) {
+  if (x === null || x === undefined || !Number.isFinite(x)) return "–";
+  return Number.isInteger(x) ? fmtInt(x) : x.toFixed(Math.abs(x) < 10 ? 3 : 1);
+}
+
+// A tiny inline null-rate trend, oldest → newest, with a marker on every run
+// that raised drift on the column. Missing points (the column was absent that
+// run) break the line.
+function sparkline(values, flagged) {
+  const n = values.length;
+  if (n < 2) return "";
+  const w = 84;
+  const h = 18;
+  const max = Math.max(0.01, ...values.filter((v) => v !== null));
+  const x = (i) => (n === 1 ? w / 2 : (i / (n - 1)) * (w - 4) + 2);
+  const y = (v) => h - 2 - (v / max) * (h - 4);
+  let d = "";
+  let pen = false;
+  values.forEach((v, i) => {
+    if (v === null) {
+      pen = false;
+      return;
+    }
+    d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)} `;
+    pen = true;
+  });
+  const dots = values
+    .map((v, i) =>
+      v !== null && flagged[i]
+        ? `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.2" class="spark-drift"/>`
+        : "",
+    )
+    .join("");
+  const last = values[n - 1];
+  const end =
+    last !== null
+      ? `<circle cx="${x(n - 1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="1.8" class="spark-end"/>`
+      : "";
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true"><path d="${d.trim()}"/>${dots}${end}</svg>`;
 }
 
 function edgeList(edges, idOf, uriOf) {

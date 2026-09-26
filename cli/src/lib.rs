@@ -51,6 +51,7 @@ pub mod obs;
 pub mod params;
 pub mod partition;
 pub mod pipeline_test;
+pub mod profiling;
 #[cfg(feature = "cli-progress")]
 pub mod progress;
 pub mod reconcile;
@@ -225,6 +226,7 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         Command::Dlq(args) => commands::dlq::run(args).await,
         Command::Verify(args) => commands::verify::run(args).await,
         Command::Rollback(args) => commands::rollback::run(args).await,
+        Command::Profiling(args) => commands::profiling::run(args).await,
         Command::Hub(args) => commands::hub::run(args).await,
         #[cfg(feature = "contract")]
         Command::Contract(args) => commands::contract::run(args).await,

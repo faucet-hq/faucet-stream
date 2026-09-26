@@ -1745,6 +1745,23 @@ async fn run_one_invocation(
         && !opts.dry_run
         && opts.limit.is_none()
         && opts.shard.is_none();
+    // Column profiling (#708): roots only, real runs only — the same scoping
+    // as SLA / catalog. The profiler is shared with the sink decorator below
+    // and read back after the run.
+    let profiling_active = node.profiling.is_some()
+        && matches!(node.role, NodeRole::Root)
+        && !opts.dry_run
+        && opts.limit.is_none()
+        && opts.shard.is_none();
+    let profiler: Option<Arc<std::sync::Mutex<faucet_core::Profiler>>> = node
+        .profiling
+        .as_ref()
+        .filter(|_| profiling_active)
+        .map(|spec| {
+            Arc::new(std::sync::Mutex::new(faucet_core::Profiler::new(
+                spec.clone(),
+            )))
+        });
     // 1) Resolve `${parent.path}` in the per-row source + sink configs.
     let mut source_cfg = node.source.config.clone();
     let mut sink_cfg = node.sink.config.clone();
@@ -2068,6 +2085,12 @@ async fn run_one_invocation(
         )),
         None => sink,
     };
+    // Column profiling (#708): outermost too, so the profile describes the
+    // post-transform, post-masking records without the `_faucet_*` columns.
+    let sink: Box<dyn Sink> = match &profiler {
+        Some(p) => Box::new(faucet_core::ProfilingSink::new(sink, Arc::clone(p))),
+        None => sink,
+    };
 
     // 5) Assemble the runtime pipeline. The whole `with_*` builder chain (state,
     //    DLQ, cancellation, quality, contract, masking, schema-drift, adaptive
@@ -2360,6 +2383,35 @@ async fn run_one_invocation(
         Vec::new()
     };
 
+    // ── Column profiling (#708) ──────────────────────────────────────────────
+    // On a successful, complete root run: finish the profile, compare it with
+    // the rolling baseline in the state store (persisting this run into it),
+    // and apply `on_drift` — `fail` turns the run into a typed failure here so
+    // the notification and reporting passes below all observe it.
+    let profile_outcome = match (&profiler, node.profiling.as_ref(), &result) {
+        (Some(p), Some(spec), Ok(_)) if is_notifiable_root => {
+            let profile = p.lock().map(|g| g.finish()).unwrap_or_default();
+            Some(
+                crate::profiling::evaluate_post_run(
+                    spec,
+                    sla_store.as_ref(),
+                    state_key,
+                    &obs_labels.pipeline,
+                    &obs_labels.row,
+                    &run_id,
+                    profile,
+                    chrono::Utc::now(),
+                )
+                .await,
+            )
+        }
+        _ => None,
+    };
+    let result = match (&profile_outcome, node.profiling.as_ref()) {
+        (Some(o), Some(spec)) if o.fails_run(spec) => Err(o.error()),
+        _ => result,
+    };
+
     // ── Notifications (#280) ─────────────────────────────────────────────────
     // Fan run success/failure, SLA breach, circuit-open, contract-abort, and
     // DLQ-threshold out to the configured channels. Same root/real-run scoping
@@ -2414,6 +2466,26 @@ async fn run_one_invocation(
                         .with_run(run_ctx.clone()),
                 )
                 .await;
+        }
+        // Profile drift (#708): one event per finding under `notify` / `fail`
+        // (`warn` stays log + metric only).
+        if let (Some(o), Some(spec)) = (&profile_outcome, node.profiling.as_ref())
+            && spec.on_drift != faucet_core::OnProfileDrift::Warn
+        {
+            for d in &o.drift {
+                notifier
+                    .emit(
+                        NotifyEvent::profile_drift(
+                            pipeline.clone(),
+                            row.clone(),
+                            &d.column,
+                            d.metric.as_str(),
+                            d.to_string(),
+                        )
+                        .with_run(run_ctx.clone()),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -2504,6 +2576,30 @@ async fn run_one_invocation(
             column_lineage,
         };
         crate::catalog::record(handle, &update).await;
+    }
+
+    // Column profile → catalog (#708): a browsable copy of this run's profile
+    // + drift on the sink dataset (the detector's baseline stays in the state
+    // store). Recorded whenever a profile was evaluated, even when `on_drift:
+    // fail` turned the run into a failure — the data was written either way.
+    #[cfg(feature = "catalog")]
+    if let (Some(handle), Some(o)) = (&opts.catalog, &profile_outcome)
+        && catalog_active
+        && !cancel.is_cancelled()
+    {
+        use crate::catalog::model::canonicalize_uri;
+        use crate::serve::history::catalog::{CatalogProfileRecord, dataset_id};
+        let uri = canonicalize_uri(&sink_dataset_uri, &node.sink.config, opts.clock);
+        let record = CatalogProfileRecord {
+            run_id: handle.run_id.clone().unwrap_or_else(|| run_id.clone()),
+            pipeline: obs_labels.pipeline.to_string(),
+            row: obs_labels.row.to_string(),
+            recorded_at: chrono::Utc::now(),
+            profile: o.profile.clone(),
+            drift: o.drift.clone(),
+            baseline_runs: o.baseline_runs,
+        };
+        crate::catalog::record_profile(handle, &dataset_id(&uri), &record).await;
     }
 
     // Local sink outputs (#587): record the concrete files this invocation's
@@ -2656,6 +2752,7 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::State(_) => "state",
         FaucetError::QualityFailure { .. } => "quality",
         FaucetError::SchemaDrift { .. } => "schema_drift",
+        FaucetError::ProfileDrift { .. } => "profile_drift",
         _ => "error",
     }
 }
@@ -3078,6 +3175,7 @@ mod tests {
                 state: None,
                 dlq: None,
                 sla: None,
+                profiling: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -3372,6 +3470,7 @@ mod tests {
             delivery: faucet_core::DeliveryMode::default(),
             resilience: None,
             sla: None,
+            profiling: None,
             reconcile: None,
             verify: None,
             rollback: None,
@@ -4710,6 +4809,7 @@ matrix:
                 state: None,
                 dlq: None,
                 sla: None,
+                profiling: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -4795,6 +4895,7 @@ matrix:
             state: None,
             dlq: None,
             sla: None,
+            profiling: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]
@@ -5125,6 +5226,7 @@ matrix:
             state,
             dlq: None,
             sla: None,
+            profiling: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]
@@ -5353,6 +5455,7 @@ matrix:
             state: None,
             dlq: None,
             sla: None,
+            profiling: None,
             delivery: faucet_core::DeliveryMode::AtLeastOnce,
             delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
             #[cfg(feature = "quality")]

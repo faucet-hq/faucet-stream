@@ -259,4 +259,24 @@ async fn a_backend_without_version_deprecation_gets_safe_defaults() {
     );
     let st = Minimal.template_state("x").await.unwrap();
     assert!(st.deprecated_versions.is_empty() && st.newest.is_none());
+
+    // Column profiles (#708) default the same way: a record is accepted and
+    // dropped, and the history reads back empty.
+    let record = faucet_cli::serve::history::catalog::CatalogProfileRecord {
+        run_id: "r".into(),
+        pipeline: "p".into(),
+        row: "row".into(),
+        recorded_at: chrono::Utc::now(),
+        profile: faucet_core::RunProfile::default(),
+        drift: Vec::new(),
+        baseline_runs: 0,
+    };
+    Minimal.catalog_record_profile("ds", &record).await.unwrap();
+    assert!(
+        Minimal
+            .catalog_profile_history("ds", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

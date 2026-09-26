@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_MIN_HISTORY: u32 = 5;
 /// Default rolling-window size (successful runs kept in the volume baseline).
 pub const DEFAULT_WINDOW: u32 = 20;
-/// Default z-score threshold.
-pub const DEFAULT_ZSCORE_SENSITIVITY: f64 = 3.0;
 /// Default Tukey-fence IQR multiplier.
-pub const DEFAULT_IQR_SENSITIVITY: f64 = 1.5;
+pub use faucet_core::anomaly::DEFAULT_IQR_SENSITIVITY;
+/// Default z-score threshold.
+pub use faucet_core::anomaly::DEFAULT_ZSCORE_SENSITIVITY;
 
 /// Declared service-level agreement for a pipeline: freshness and volume
 /// expectations. Violations emit the
@@ -78,25 +78,15 @@ fn default_window() -> u32 {
     DEFAULT_WINDOW
 }
 
-/// Volume anomaly detection method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AnomalyMethod {
-    /// Flag when |volume − mean| / std exceeds `sensitivity`.
-    #[default]
-    Zscore,
-    /// Flag when the volume falls outside the Tukey fences
-    /// [Q1 − k·IQR, Q3 + k·IQR] with k = `sensitivity`.
-    Iqr,
-}
+/// Volume anomaly detection method — the shared
+/// [`faucet_core::anomaly::AnomalyMethod`] (column profiling uses it too).
+pub use faucet_core::anomaly::AnomalyMethod;
 
 impl VolumeAnomalySpec {
     /// The configured sensitivity, or the method's conventional default.
     pub fn effective_sensitivity(&self) -> f64 {
-        self.sensitivity.unwrap_or(match self.method {
-            AnomalyMethod::Zscore => DEFAULT_ZSCORE_SENSITIVITY,
-            AnomalyMethod::Iqr => DEFAULT_IQR_SENSITIVITY,
-        })
+        self.sensitivity
+            .unwrap_or_else(|| self.method.default_sensitivity())
     }
 }
 

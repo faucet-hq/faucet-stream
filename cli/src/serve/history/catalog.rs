@@ -28,6 +28,13 @@ pub const STATS_DETAIL_LIMIT: usize = 50;
 /// Default depth bound for the lineage graph read.
 pub const LINEAGE_DEFAULT_DEPTH: u32 = 5;
 
+/// How many per-run column profiles a dataset keeps (#708); older ones are
+/// pruned on write.
+pub const PROFILE_RETAIN: usize = 100;
+
+/// How many of the most recent profiles a detail read returns.
+pub const PROFILE_DETAIL_LIMIT: usize = 30;
+
 /// Which side of a pipeline a dataset was observed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,6 +258,46 @@ pub struct CatalogDatasetDetail {
     pub upstream: Vec<CatalogLineageEdge>,
     /// Edges whose source is this dataset.
     pub downstream: Vec<CatalogLineageEdge>,
+    /// Learned column profiles (#708): the latest run's profile + drift and
+    /// the recent history, present once a `profiling:` pipeline has written
+    /// this dataset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<CatalogProfile>,
+}
+
+/// One run's column profile as recorded in the catalog (#708), keyed by the
+/// sink dataset it describes. The detector's baseline lives in the pipeline's
+/// state store; this is the browsable copy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogProfileRecord {
+    pub run_id: String,
+    pub pipeline: String,
+    pub row: String,
+    pub recorded_at: DateTime<Utc>,
+    pub profile: faucet_core::RunProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drift: Vec<faucet_core::ProfileDrift>,
+    /// Runs in the baseline this profile was compared against.
+    #[serde(default)]
+    pub baseline_runs: usize,
+}
+
+/// The profile section of a dataset detail.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CatalogProfile {
+    /// The most recent run's profile.
+    pub latest: CatalogProfileRecord,
+    /// Recent profiles, newest first (bounded by [`PROFILE_DETAIL_LIMIT`];
+    /// includes `latest`).
+    pub history: Vec<CatalogProfileRecord>,
+}
+
+/// Build the profile section from records **newest first**; `None` when
+/// nothing was recorded.
+pub fn profile_view(mut history: Vec<CatalogProfileRecord>) -> Option<CatalogProfile> {
+    history.truncate(PROFILE_DETAIL_LIMIT);
+    let latest = history.first()?.clone();
+    Some(CatalogProfile { latest, history })
 }
 
 /// Stable dataset id: the first 16 hex chars of sha256(uri). Short enough for

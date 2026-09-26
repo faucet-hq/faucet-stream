@@ -56,6 +56,7 @@
   - [Testing pipelines](./cookbook/testing.md)
 - [Observability & lineage]()
   - [SLA monitoring (freshness & volume)](./cookbook/sla.md)
+  - [Column profiling (learned baselines & drift)](./cookbook/profiling.md)
   - [Notifications (Slack / PagerDuty / webhook)](./cookbook/notifications.md)
   - [Lineage (OpenLineage)](./cookbook/lineage.md)
   - [Dashboards & alerts](./cookbook/dashboards.md)

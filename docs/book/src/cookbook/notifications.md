@@ -26,6 +26,7 @@ block, nothing changes.
 | `contract_abort` | a data-contract breach aborted the run (`on_breach: fail`) | error |
 | `dlq_threshold` | a run routed rows to the DLQ at/over the rule's threshold | warning |
 | `scheduler_stuck` | `faucet schedule` is exiting on consecutive failures | critical |
+| `profile_drift` | a column's learned profile drifted from its baseline (`profiling.on_drift: notify` or `fail`) — one event per finding | warning |
 
 Events fire from every runtime — `faucet run`, `faucet schedule`,
 `faucet serve`, and `faucet mirror` — because the emit sites live in the

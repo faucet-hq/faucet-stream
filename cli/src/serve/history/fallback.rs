@@ -331,6 +331,20 @@ impl RunHistory for FallbackHistory {
     ) -> Result<(), HistoryError> {
         via!(self, p => p.catalog_record_config_snapshot(snapshot), f => f.catalog_record_config_snapshot(snapshot))
     }
+    async fn catalog_record_profile(
+        &self,
+        dataset_id: &str,
+        record: &crate::serve::history::catalog::CatalogProfileRecord,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.catalog_record_profile(dataset_id, record), f => f.catalog_record_profile(dataset_id, record))
+    }
+    async fn catalog_profile_history(
+        &self,
+        dataset_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::serve::history::catalog::CatalogProfileRecord>, HistoryError> {
+        via!(self, p => p.catalog_profile_history(dataset_id, limit), f => f.catalog_profile_history(dataset_id, limit))
+    }
     async fn catalog_last_config_snapshot(
         &self,
         pipeline: &str,

@@ -227,6 +227,28 @@ async fn show(args: CatalogShowArgs) -> CliResult<()> {
         );
     }
 
+    if let Some(p) = &detail.profile {
+        let latest = &p.latest;
+        println!(
+            "\nprofile (latest run {} at {}, {} row(s), baseline {} run(s), {} recorded):",
+            latest.run_id,
+            latest.recorded_at.format("%Y-%m-%dT%H:%M:%SZ"),
+            latest.profile.rows,
+            latest.baseline_runs,
+            p.history.len()
+        );
+        if latest.drift.is_empty() {
+            println!("  drift: none");
+        } else {
+            for d in &latest.drift {
+                println!("  ! {d}");
+            }
+        }
+        for (name, c) in &latest.profile.columns {
+            println!("{}", crate::commands::profiling::column_line(name, c));
+        }
+    }
+
     println!("\nupstream:");
     if detail.upstream.is_empty() {
         println!("  (none)");

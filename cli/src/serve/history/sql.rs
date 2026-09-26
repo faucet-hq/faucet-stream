@@ -138,6 +138,14 @@ pub const DDL: &[&str] = &[
         run_id TEXT NOT NULL,\
         records TEXT NOT NULL,\
         PRIMARY KEY (dataset_id, recorded_at))",
+    // Per-run column profiles (#708), capped per dataset at
+    // `catalog::PROFILE_RETAIN`; `body` is the `CatalogProfileRecord` JSON.
+    "CREATE TABLE IF NOT EXISTS faucet_catalog_profiles (\
+        dataset_id TEXT NOT NULL,\
+        recorded_at TEXT NOT NULL,\
+        run_id TEXT NOT NULL,\
+        body TEXT NOT NULL,\
+        PRIMARY KEY (dataset_id, recorded_at))",
     // Resolved+expanded config snapshots for `faucet plan --diff` (#374). One
     // row per pipeline (latest-wins upsert); `body` is the redacted
     // `ConfigSnapshot` JSON — no secret material is ever stored.
@@ -365,6 +373,15 @@ pub struct Stmts {
     /// Drop volume points beyond the newest `STATS_RETAIN` for one dataset.
     /// Params: dataset_id, dataset_id, keep-limit.
     pub catalog_prune_stats: String,
+    /// Append one column profile (#708). Params: dataset_id, recorded_at,
+    /// run_id, body. `ON CONFLICT DO NOTHING` so a replay is idempotent.
+    pub catalog_insert_profile: String,
+    /// A dataset's most recent profile bodies, newest first. Params:
+    /// dataset_id, limit.
+    pub catalog_select_profiles: String,
+    /// Drop profiles beyond the newest `PROFILE_RETAIN` for one dataset.
+    /// Params: dataset_id, dataset_id, keep-limit.
+    pub catalog_prune_profiles: String,
     /// Upsert the latest config snapshot for a pipeline (#374).
     /// Params: pipeline, recorded_at, faucet_version, body.
     pub catalog_upsert_config_snapshot: String,
@@ -728,6 +745,18 @@ impl Stmts {
                     SELECT recorded_at FROM faucet_catalog_stats WHERE dataset_id=$2 \
                     ORDER BY recorded_at DESC LIMIT $3)"
                 .into(),
+            catalog_insert_profile: "INSERT INTO faucet_catalog_profiles \
+                (dataset_id, recorded_at, run_id, body) VALUES ($1,$2,$3,$4) \
+                ON CONFLICT (dataset_id, recorded_at) DO NOTHING"
+                .into(),
+            catalog_select_profiles: "SELECT body FROM faucet_catalog_profiles \
+                WHERE dataset_id=$1 ORDER BY recorded_at DESC LIMIT $2"
+                .into(),
+            catalog_prune_profiles: "DELETE FROM faucet_catalog_profiles \
+                WHERE dataset_id=$1 AND recorded_at NOT IN (\
+                    SELECT recorded_at FROM faucet_catalog_profiles WHERE dataset_id=$2 \
+                    ORDER BY recorded_at DESC LIMIT $3)"
+                .into(),
             catalog_upsert_config_snapshot: "INSERT INTO faucet_config_snapshots \
                 (pipeline, recorded_at, faucet_version, body) VALUES ($1,$2,$3,$4) \
                 ON CONFLICT (pipeline) DO UPDATE SET recorded_at=excluded.recorded_at, \
@@ -1026,6 +1055,18 @@ impl Stmts {
             catalog_prune_stats: "DELETE FROM faucet_catalog_stats \
                 WHERE dataset_id=? AND recorded_at NOT IN (\
                     SELECT recorded_at FROM faucet_catalog_stats WHERE dataset_id=? \
+                    ORDER BY recorded_at DESC LIMIT ?)"
+                .into(),
+            catalog_insert_profile: "INSERT INTO faucet_catalog_profiles \
+                (dataset_id, recorded_at, run_id, body) VALUES (?,?,?,?) \
+                ON CONFLICT (dataset_id, recorded_at) DO NOTHING"
+                .into(),
+            catalog_select_profiles: "SELECT body FROM faucet_catalog_profiles \
+                WHERE dataset_id=? ORDER BY recorded_at DESC LIMIT ?"
+                .into(),
+            catalog_prune_profiles: "DELETE FROM faucet_catalog_profiles \
+                WHERE dataset_id=? AND recorded_at NOT IN (\
+                    SELECT recorded_at FROM faucet_catalog_profiles WHERE dataset_id=? \
                     ORDER BY recorded_at DESC LIMIT ?)"
                 .into(),
             catalog_upsert_config_snapshot: "INSERT INTO faucet_config_snapshots \
@@ -2707,13 +2748,69 @@ macro_rules! impl_sql_history {
                 let (downstream, rest): (Vec<_>, Vec<_>) =
                     edges.into_iter().partition(|e| e.src_id == id);
                 let upstream = rest.into_iter().filter(|e| e.dst_id == id).collect();
+                let profile = catalog::profile_view(
+                    self.catalog_profile_history(id, catalog::PROFILE_DETAIL_LIMIT)
+                        .await?,
+                );
                 Ok(Some(catalog::CatalogDatasetDetail {
                     dataset,
                     schema_timeline,
                     stats,
                     upstream,
                     downstream,
+                    profile,
                 }))
+            }
+
+            async fn catalog_record_profile(
+                &self,
+                dataset_id: &str,
+                record: &$crate::serve::history::catalog::CatalogProfileRecord,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::catalog;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.catalog_insert_profile)
+                    .bind(dataset_id)
+                    .bind(sql::fmt_ts(record.recorded_at))
+                    .bind(&record.run_id)
+                    .bind(sql::encode_json(record, "catalog profile")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                sqlx::query(&self.stmts.catalog_prune_profiles)
+                    .bind(dataset_id)
+                    .bind(dataset_id)
+                    .bind(catalog::PROFILE_RETAIN as i64)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn catalog_profile_history(
+                &self,
+                dataset_id: &str,
+                limit: usize,
+            ) -> Result<
+                Vec<$crate::serve::history::catalog::CatalogProfileRecord>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let rows = sqlx::query(&self.stmts.catalog_select_profiles)
+                    .bind(dataset_id)
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    out.push(sql::decode_json(&body, "catalog profile")?);
+                }
+                Ok(out)
             }
 
             async fn catalog_lineage(

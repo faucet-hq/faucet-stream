@@ -494,6 +494,59 @@ async fn server_with_sqlite_history_persists_runs() {
     );
 }
 
+/// Column profiles (#708) append per (dataset, recorded_at), read back newest
+/// first, and are pruned to `PROFILE_RETAIN`.
+#[tokio::test]
+async fn catalog_profiles_append_read_back_and_prune() {
+    use faucet_cli::serve::history::catalog::{CatalogProfileRecord, PROFILE_RETAIN};
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(&dir, "profiles.db").await;
+    let base = Utc::now() - ChronoDuration::hours(48);
+    let record = |i: i64| {
+        let mut p = faucet_core::Profiler::new(faucet_core::ProfilingSpec::default());
+        p.observe_page(&[serde_json::json!({"a": i, "b": "x"})]);
+        CatalogProfileRecord {
+            run_id: format!("run-{i}"),
+            pipeline: "p".into(),
+            row: "r".into(),
+            recorded_at: base + ChronoDuration::seconds(i),
+            profile: p.finish(),
+            drift: Vec::new(),
+            baseline_runs: i.max(0) as usize,
+        }
+    };
+    assert!(
+        s.catalog_profile_history("ds", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for i in 0..(PROFILE_RETAIN as i64 + 5) {
+        s.catalog_record_profile("ds", &record(i)).await.unwrap();
+    }
+    // A replay of the same (dataset, recorded_at) is a no-op.
+    s.catalog_record_profile("ds", &record(PROFILE_RETAIN as i64 + 4))
+        .await
+        .unwrap();
+    let all = s.catalog_profile_history("ds", 1000).await.unwrap();
+    assert_eq!(
+        all.len(),
+        PROFILE_RETAIN,
+        "pruned to the newest {PROFILE_RETAIN}"
+    );
+    assert_eq!(all[0].run_id, format!("run-{}", PROFILE_RETAIN + 4));
+    assert_eq!(all.last().unwrap().run_id, "run-5");
+    assert_eq!(all[0].profile.columns["a"].distinct, 1);
+    let two = s.catalog_profile_history("ds", 2).await.unwrap();
+    assert_eq!(two.len(), 2);
+    assert!(
+        s.catalog_profile_history("other", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn purge_drops_expired_terminal_runs() {
     let dir = tempfile::tempdir().unwrap();

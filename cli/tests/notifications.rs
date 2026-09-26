@@ -256,6 +256,138 @@ async fn severity_floor_filters_delivery() {
 /// is distinct from it. Drives a real csv → jsonl pipeline through the executor
 /// rather than emitting a synthetic event, so the whole propagation path
 /// (options → `run_one_invocation` → `RunContext` → render → HTTP) is covered.
+/// Column-profile drift (#708) under `on_drift: fail`: one `profile_drift`
+/// event per finding, and the run itself is reported as a failure whose
+/// `error_kind` is `profile_drift`.
+#[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+#[tokio::test]
+async fn executor_notifies_profile_drift_and_the_failed_run() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/cb"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    let output = dir.path().join("out.jsonl");
+    let cfg_yaml = format!(
+        r#"
+version: 1
+name: drift_pipeline
+pipeline:
+  source: {{ type: csv, config: {{ path: "{}" }} }}
+  sink: {{ type: jsonl, config: {{ path: "{}", append: false }} }}
+  state: {{ type: file, config: {{ path: "{}" }} }}
+profiling: {{ min_history: 2, window: 5, on_drift: fail }}
+notifications:
+  - name: cb
+    on: [profile_drift, run_failure, run_success]
+    channel:
+      type: webhook
+      config:
+        url: "{}/cb"
+"#,
+        input.display(),
+        output.display(),
+        dir.path().join("state").display(),
+        server.uri()
+    );
+    let cfg = faucet_cli::config::PipelineConfig::from_text(&cfg_yaml, &dir.path().join("p.yaml"))
+        .expect("config parses");
+    let run = |csv: &str| {
+        std::fs::write(&input, csv).unwrap();
+        let nodes = faucet_cli::expand::expand(&cfg).expect("expand");
+        let notifier = faucet_cli::notify::Notifier::from_specs(&cfg.notifications)
+            .unwrap()
+            .expect("notifier built");
+        faucet_cli::executor::run_expanded(
+            nodes,
+            faucet_cli::executor::ExecuteOptions {
+                pipeline_name: "drift_pipeline".into(),
+                run_id: None,
+                execution: None,
+                concurrency: None,
+                dry_run: false,
+                limit: None,
+                state_path_override: None,
+                shard: None,
+                auth: Default::default(),
+                clock: chrono::Utc::now().fixed_offset(),
+                cancel: None,
+                resilience: None,
+                sla: None,
+                reconcile: None,
+                verify: None,
+                rollback: None,
+                #[cfg(feature = "lineage")]
+                lineage: None,
+                #[cfg(feature = "lineage")]
+                lineage_cfg: None,
+                notifier: Some(notifier),
+                #[cfg(feature = "catalog")]
+                catalog: None,
+            },
+        )
+    };
+    for _ in 0..2 {
+        let summary = run("id,region
+1,eu
+2,us
+3,eu
+4,us
+")
+        .await
+        .unwrap();
+        assert!(!summary.had_failures(), "{summary:?}");
+    }
+    let summary = run("id,region
+1,eu
+2,latam
+3,eu
+4,latam
+")
+    .await
+    .unwrap();
+    assert!(summary.had_failures(), "{summary:?}");
+
+    let events: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "run_success").count(),
+        2,
+        "{kinds:?}"
+    );
+    let drift: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event"] == "profile_drift")
+        .collect();
+    assert!(
+        drift
+            .iter()
+            .any(|e| e["details"]["column"] == "region" && e["details"]["metric"] == "new_value"),
+        "{events:?}"
+    );
+    let failure = events
+        .iter()
+        .find(|e| e["event"] == "run_failure")
+        .expect("the drifted run notifies a failure");
+    assert_eq!(
+        failure["details"]["error_kind"], "profile_drift",
+        "{failure}"
+    );
+}
+
 #[tokio::test]
 async fn executor_propagates_submitted_run_id_into_the_payload() {
     let server = MockServer::start().await;

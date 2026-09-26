@@ -1022,6 +1022,32 @@ select {
 .lo-manage[open] > summary { border-color: var(--brand-strong); color: var(--brand-strong); }
 .lo-manage-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 40; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px; min-width: 320px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-1); }
 .volume-bar { width: 14px; border-radius: 3px 3px 0 0; background: var(--running, #4a9eda); opacity: 0.85; }
+/* Column profiles (#708) on the dataset detail page. */
+.profile-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; margin: 0 0 10px; color: var(--ink-dim); font-size: 0.88rem; }
+.profile-drift { list-style: none; margin: 0 0 12px; padding: 10px 14px; display: grid; gap: 6px; background: var(--surface); border: 1px solid color-mix(in srgb, var(--queued) 40%, transparent); border-radius: var(--r); }
+.profile-drift li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 0.85rem; }
+.pill.drift-flag { color: var(--queued); border-color: color-mix(in srgb, var(--queued) 45%, transparent); background: color-mix(in srgb, var(--queued) 12%, transparent); }
+.ds-table.profile-table th, .ds-table.profile-table td { text-align: left; padding: 10px 14px; }
+.ds-table.profile-table th:nth-child(1), .ds-table.profile-table td:nth-child(1) { width: 22%; padding-right: 14px; }
+.ds-table.profile-table th:nth-child(2), .ds-table.profile-table td:nth-child(2) { width: 104px; }
+.ds-table.profile-table th:nth-child(3), .ds-table.profile-table td:nth-child(3) { width: 168px; }
+.ds-table.profile-table th:nth-child(4), .ds-table.profile-table td:nth-child(4) { width: 84px; text-align: right; }
+.ds-table.profile-table th:nth-child(5), .ds-table.profile-table td:nth-child(5) { width: 20%; }
+.ds-table.profile-table th:nth-child(6), .ds-table.profile-table td:nth-child(6) { width: auto; }
+.ds-table.profile-table td.num { font-variant-numeric: tabular-nums; }
+.profile-flags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.profile-drift .run-meta { text-align: left; flex: 1 1 240px; }
+.table-scroll { overflow-x: auto; }
+.ds-table.profile-table { min-width: 760px; }
+.ds-table.profile-table td:nth-child(5) { overflow-wrap: anywhere; }
+.ds-table.profile-table tr.profile-drifted td:first-child { box-shadow: inset 3px 0 0 var(--queued); }
+.profile-null { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.spark { vertical-align: middle; margin-left: 6px; }
+.spark path { fill: none; stroke: var(--brand-strong); stroke-width: 1.4; stroke-linejoin: round; stroke-linecap: round; }
+.spark .spark-end { fill: var(--brand-strong); }
+.spark .spark-drift { fill: var(--queued); }
+.profile-chip { display: inline-block; margin: 2px 6px 2px 0; padding: 1px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); font-size: 0.78rem; font-family: var(--font-mono); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+.profile-chip b { font-weight: 600; color: var(--ink-dim); font-family: inherit; }
 .volume-bar:hover { opacity: 1; }
 .schema-version { border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); margin-bottom: 8px; }
 .schema-version summary { display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; flex-wrap: wrap; }

@@ -56,6 +56,9 @@ pub struct ExpandedNode {
     pub dlq: Option<crate::config::DlqSpec>,
     /// This row's SLA override (#679), or `None` to use the top-level `sla:`.
     pub sla: Option<crate::sla::SlaSpec>,
+    /// The effective column-profiling spec (#708): the row's own `profiling:`
+    /// or the top-level block; `None` when neither is set.
+    pub profiling: Option<faucet_core::ProfilingSpec>,
     /// Pipeline-level quality spec, shared by every node. `quality:` has no
     /// matrix-row override in v1, so this is `cfg.pipeline.quality` verbatim.
     #[cfg(feature = "quality")]
@@ -342,6 +345,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             dlq: None,
             delivery: None,
             sla: None,
+            profiling: None,
             tags: Vec::new(),
             partition: None,
             discover: None,
@@ -740,6 +744,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 state: None,
                 dlq: None,
                 sla: None,
+                profiling: None,
                 delivery: faucet_core::DeliveryMode::AtLeastOnce,
                 delivery_guarantee: faucet_core::DeliveryGuarantee::AtLeastOnce,
                 #[cfg(feature = "quality")]
@@ -970,6 +975,28 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     }
                     Some(_) => {}
                 }
+            }
+        }
+
+        // Profiling gate (#708): validate the spec once per row and require a
+        // `state:` block — the rolling baseline lives there. A memory store
+        // only baselines within one process.
+        if let Some(pf) = row.profiling.as_ref().or(cfg.profiling.as_ref()) {
+            pf.validate()
+                .map_err(|e| CliError::Config(format!("profiling: {e}")))?;
+            match state.as_ref() {
+                None => {
+                    return Err(CliError::Config(format!(
+                        "row '{row_id}': profiling: needs a `state:` block — the rolling                          baseline of column profiles is kept there"
+                    )));
+                }
+                Some(s) if s.kind == "memory" => {
+                    tracing::warn!(
+                        row = %row_id,
+                        "profiling: the `memory` state store resets on process exit — the                          profile baseline only persists within a single `faucet                          schedule`/`serve` process; use `file`, `redis`, or `postgres`                          for one-shot runs"
+                    );
+                }
+                Some(_) => {}
             }
         }
 
@@ -1436,6 +1463,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             state,
             dlq,
             sla: row.sla.clone(),
+            profiling: row.profiling.clone().or_else(|| cfg.profiling.clone()),
             delivery,
             delivery_guarantee,
             #[cfg(feature = "quality")]

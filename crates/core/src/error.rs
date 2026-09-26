@@ -75,6 +75,15 @@ pub enum FaucetError {
         message: String,
     },
 
+    /// A run's learned column profile drifted from its baseline under a
+    /// `profiling.on_drift: fail` policy (#708). Raised after the run's data
+    /// is written: the failure marks the run, it does not undo it.
+    #[error("Profile drift on columns {columns:?}: {message}")]
+    ProfileDrift {
+        columns: Vec<String>,
+        message: String,
+    },
+
     /// A record breached the pipeline's data contract under an
     /// `on_breach: fail` policy. `version` is the contract version the
     /// record was validated against.
