@@ -11,7 +11,7 @@
 use faucet_conformance::{assert_config_schema_valid_value, assert_errors_not_panics};
 use faucet_source_gcs::{GcsCredentials, GcsSource, GcsSourceConfig};
 use testcontainers::{
-    GenericImage, ImageExt,
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
@@ -40,7 +40,7 @@ async fn conformance_connector_name_nonempty() {
 
 /// Spawn `fake-gcs-server` and return `(host_url, bucket_name)`.
 /// Returns `None` when Docker is unavailable so tests skip cleanly.
-async fn spawn_fake_gcs() -> Option<(String, String)> {
+async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
     let image = GenericImage::new("fsouza/fake-gcs-server", "latest")
         .with_exposed_port(4443.tcp())
         .with_wait_for(WaitFor::message_on_stderr("server started at"))
@@ -71,9 +71,11 @@ async fn spawn_fake_gcs() -> Option<(String, String)> {
         return None;
     }
 
-    // Container lifetime tied to process exit.
-    std::mem::forget(container);
-    Some((host, bucket))
+    // The handle is returned so the container lives exactly as long as the
+    // test that owns it: dropping it stops and removes the container.
+    // testcontainers-rs has no reaper — a forgotten handle is a leaked
+    // container, one per test, forever.
+    Some((container, host, bucket))
 }
 
 /// Upload an object via fake-gcs-server's REST surface.
@@ -105,7 +107,7 @@ fn jsonl_body(n: i64) -> String {
 
 #[tokio::test]
 async fn conformance_bounded_memory() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(
@@ -146,7 +148,7 @@ async fn conformance_bounded_memory() {
 /// that prefix, then read it.
 #[tokio::test]
 async fn conformance_discover_roundtrips() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(

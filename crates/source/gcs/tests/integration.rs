@@ -8,14 +8,14 @@ use faucet_core::Source;
 use faucet_source_gcs::{GcsCredentials, GcsFileFormat, GcsSource, GcsSourceConfig};
 use std::collections::HashMap;
 use testcontainers::{
-    GenericImage, ImageExt,
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
 
 /// Spawn `fake-gcs-server` and return `(host_url, bucket_name)`.
 /// Returns `None` when Docker is unavailable so tests skip cleanly.
-async fn spawn_fake_gcs() -> Option<(String, String)> {
+async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
     let image = GenericImage::new("fsouza/fake-gcs-server", "latest")
         .with_exposed_port(4443.tcp())
         .with_wait_for(WaitFor::message_on_stderr("server started at"))
@@ -46,10 +46,11 @@ async fn spawn_fake_gcs() -> Option<(String, String)> {
         return None;
     }
 
-    // Container lifetime tied to process exit (drops at the end of the
-    // test binary). Cleaner than per-test setup/teardown for a smoke suite.
-    std::mem::forget(container);
-    Some((host, bucket))
+    // The handle is returned so the container lives exactly as long as the
+    // test that owns it: dropping it stops and removes the container.
+    // testcontainers-rs has no reaper — a forgotten handle is a leaked
+    // container, one per test, forever.
+    Some((container, host, bucket))
 }
 
 /// Upload an object via fake-gcs-server's REST surface.
@@ -76,7 +77,7 @@ async fn seed_bytes(host: &str, bucket: &str, name: &str, body: Vec<u8>, content
 
 #[tokio::test]
 async fn source_reads_json_lines() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(
@@ -103,7 +104,7 @@ async fn source_reads_json_lines() {
 
 #[tokio::test]
 async fn source_reads_json_array() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(
@@ -127,7 +128,7 @@ async fn source_reads_json_array() {
 
 #[tokio::test]
 async fn source_reads_raw_text() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(&host, &bucket, "raw/a.txt", "hello world", "text/plain").await;
@@ -146,7 +147,7 @@ async fn source_reads_raw_text() {
 
 #[tokio::test]
 async fn source_object_keys_skips_listing() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(
@@ -188,7 +189,7 @@ async fn source_object_keys_skips_listing() {
 #[tokio::test]
 async fn source_stream_pages_batch_size_zero_yields_one_page_per_object() {
     use futures::StreamExt;
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(
@@ -230,7 +231,7 @@ async fn source_stream_pages_batch_size_zero_yields_one_page_per_object() {
 /// completion time and change the sequence a downstream sink writes.
 #[tokio::test]
 async fn source_streams_objects_concurrently_in_listing_order() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     for i in 1..=12i64 {
@@ -262,7 +263,7 @@ async fn source_streams_objects_concurrently_in_listing_order() {
 /// clamped to a serial read rather than stalling.
 #[tokio::test]
 async fn source_concurrency_zero_reads_serially_rather_than_stalling() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     for i in 1..=3i64 {
@@ -303,7 +304,7 @@ async fn stream_all(source: &GcsSource) -> Vec<serde_json::Value> {
 #[tokio::test]
 async fn preflight_check_passes_and_fails_against_the_emulator() {
     use faucet_core::Source as _;
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let ctx = faucet_core::check::CheckContext::default();
@@ -324,7 +325,7 @@ async fn preflight_check_passes_and_fails_against_the_emulator() {
 /// they cover every object.
 #[tokio::test]
 async fn shards_partition_the_listing() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     for i in 0..8i64 {
@@ -363,7 +364,7 @@ async fn shards_partition_the_listing() {
 /// A key that does not exist fails the read with a typed error naming it.
 #[tokio::test]
 async fn missing_object_key_is_a_typed_error() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     for format in [GcsFileFormat::JsonLines, GcsFileFormat::JsonArray] {
@@ -387,7 +388,7 @@ async fn missing_object_key_is_a_typed_error() {
 #[cfg(feature = "compression")]
 #[tokio::test]
 async fn gzip_objects_are_decompressed_by_extension() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let body = faucet_core::compression::compress_buf(
@@ -415,7 +416,7 @@ async fn gzip_objects_are_decompressed_by_extension() {
 #[cfg(feature = "file-format-csv")]
 #[tokio::test]
 async fn csv_objects_decode_through_the_shared_format_layer() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     seed_object(
@@ -460,7 +461,7 @@ fn parquet_bytes(rows: &[serde_json::Value], row_group: usize) -> Vec<u8> {
 #[cfg(feature = "arrow")]
 #[tokio::test]
 async fn parquet_reads_by_row_group_and_whole_object() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let rows: Vec<_> = (0..5).map(|i| serde_json::json!({"id": i})).collect();
@@ -520,7 +521,7 @@ async fn parquet_reads_by_row_group_and_whole_object() {
 #[cfg(feature = "arrow")]
 #[tokio::test]
 async fn parquet_schema_mismatch_across_objects_is_an_error() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let a = parquet_bytes(&[serde_json::json!({"id": 1})], 10);

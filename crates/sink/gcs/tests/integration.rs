@@ -10,12 +10,12 @@ use faucet_source_gcs::{GcsSource, GcsSourceConfig};
 use serde_json::json;
 use std::collections::HashMap;
 use testcontainers::{
-    GenericImage, ImageExt,
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
 
-async fn spawn_fake_gcs() -> Option<(String, String)> {
+async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {
     let image = GenericImage::new("fsouza/fake-gcs-server", "latest")
         .with_exposed_port(4443.tcp())
         .with_wait_for(WaitFor::message_on_stderr("server started at"))
@@ -45,13 +45,16 @@ async fn spawn_fake_gcs() -> Option<(String, String)> {
         eprintln!("Skipping: could not create bucket ({})", resp.status());
         return None;
     }
-    std::mem::forget(container);
-    Some((host, bucket))
+    // The handle is returned so the container lives exactly as long as the
+    // test that owns it: dropping it stops and removes the container.
+    // testcontainers-rs has no reaper — a forgotten handle is a leaked
+    // container, one per test, forever.
+    Some((container, host, bucket))
 }
 
 #[tokio::test]
 async fn sink_writes_and_source_reads_them_back() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
 
@@ -88,7 +91,7 @@ async fn sink_writes_and_source_reads_them_back() {
 #[tokio::test]
 async fn sink_rolls_files_per_max_records_per_file() {
     use futures::StreamExt;
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
 
@@ -131,7 +134,7 @@ async fn sink_rolls_files_per_max_records_per_file() {
 #[tokio::test]
 async fn preflight_check_passes_and_fails_against_the_emulator() {
     use faucet_core::Sink as _;
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let ctx = faucet_core::check::CheckContext::default();
@@ -188,7 +191,7 @@ async fn download(host: &str, bucket: &str, name: &str) -> Vec<u8> {
 /// flush, instead of appending per record.
 #[tokio::test]
 async fn sink_writes_a_whole_object_format_on_flush() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let sink = GcsSink::new(
@@ -219,7 +222,7 @@ async fn sink_writes_a_whole_object_format_on_flush() {
 /// the write, never a silent success.
 #[tokio::test]
 async fn sink_upload_to_a_missing_bucket_is_an_error() {
-    let Some((host, _bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, _bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let sink = GcsSink::new(
@@ -240,7 +243,7 @@ async fn sink_upload_to_a_missing_bucket_is_an_error() {
 #[cfg(feature = "compression")]
 #[tokio::test]
 async fn sink_compresses_objects_by_extension() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let sink = GcsSink::new(
@@ -265,7 +268,7 @@ async fn sink_compresses_objects_by_extension() {
 #[cfg(feature = "arrow")]
 #[tokio::test]
 async fn sink_writes_parquet_on_the_row_and_columnar_paths() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let config = GcsSinkConfig::new(&bucket)
@@ -298,7 +301,7 @@ async fn sink_writes_parquet_on_the_row_and_columnar_paths() {
 #[cfg(feature = "arrow")]
 #[tokio::test]
 async fn sink_columnar_batch_falls_back_to_rows_for_jsonl() {
-    let Some((host, bucket)) = spawn_fake_gcs().await else {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
         return;
     };
     let sink = GcsSink::new(
