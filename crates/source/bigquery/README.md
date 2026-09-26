@@ -276,3 +276,10 @@ source:
 This mode is **full-extract only** (no incremental bookmark) and requires a
 `read_table`; enabling it on an `arrow`-off binary is rejected at construction.
 The Snowflake source has no equivalent (its REST API is jsonv2-only).
+
+## Usage signals (#704)
+
+The source reports its backend round trips (`query`, `poll`, `job`) and the
+`bytes_processed` cost signal (`totalBytesProcessed` of each query job) to
+faucet's usage meter, priced with `usage.pricing.warehouse.bigquery_per_tib_scanned`;
+see the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).

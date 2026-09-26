@@ -67,10 +67,27 @@ async fn sink_writes_and_source_reads_them_back() {
     .await
     .unwrap();
 
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "gcs",
+        )
+        .with_meter(meter.clone()),
+    ));
     let records: Vec<_> = (0..50).map(|i| json!({"i": i})).collect();
     let n = sink.write_batch(&records).await.unwrap();
     assert_eq!(n, 50);
     sink.flush().await.unwrap();
+    assert!(
+        meter
+            .snapshot()
+            .sink_roundtrips
+            .get("put")
+            .is_some_and(|n| *n >= 1)
+    );
 
     let source = GcsSource::new(
         GcsSourceConfig::new(&bucket)
@@ -80,8 +97,22 @@ async fn sink_writes_and_source_reads_them_back() {
     )
     .await
     .unwrap();
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "gcs",
+        )
+        .with_meter(meter.clone()),
+    ));
     let read = source.fetch_with_context(&HashMap::new()).await.unwrap();
     assert_eq!(read.len(), 50);
+    let ops = meter.snapshot().source_roundtrips;
+    assert!(
+        ops.contains_key("list") && ops.contains_key("get"),
+        "{ops:?}"
+    );
     let mut got: Vec<i64> = read.iter().map(|r| r["i"].as_i64().unwrap()).collect();
     got.sort();
     let want: Vec<i64> = (0..50).collect();

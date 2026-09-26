@@ -59,6 +59,10 @@ pub struct S3Source {
     /// degenerate single-shard set) reads every listed object. Stored behind a
     /// `Mutex` so `apply_shard(&self, …)` can record it before streaming.
     applied_shard: Mutex<Option<HashShard>>,
+    /// Round-trip recorder installed by the pipeline (#638 / #704). Ops:
+    /// `list` (one per `ListObjectsV2` page), `get` (one per `GetObject`,
+    /// including each ranged Parquet read).
+    roundtrips: faucet_core::observability::RecorderSlot,
 }
 
 impl S3Source {
@@ -71,6 +75,7 @@ impl S3Source {
             config,
             client,
             applied_shard: Mutex::new(None),
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
         })
     }
 
@@ -114,6 +119,7 @@ impl S3Source {
         let effective_prefix = prefix_override.or(self.config.prefix.as_deref());
 
         loop {
+            self.roundtrips.record("list");
             let mut req = self.client.list_objects_v2().bucket(&self.config.bucket);
 
             if let Some(prefix) = effective_prefix {
@@ -295,9 +301,13 @@ impl S3Source {
             return Ok(None);
         }
 
-        let reader =
-            crate::parquet_range::S3RangeReader::open(&self.client, &self.config.bucket, key)
-                .await?;
+        let reader = crate::parquet_range::S3RangeReader::open(
+            &self.client,
+            &self.config.bucket,
+            key,
+            self.roundtrips.recorder(),
+        )
+        .await?;
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -362,6 +372,7 @@ impl S3Source {
         &self,
         key: &str,
     ) -> Result<std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>, FaucetError> {
+        self.roundtrips.record("get");
         let mut request = self
             .client
             .get_object()
@@ -486,6 +497,12 @@ impl S3Source {
 
 #[async_trait]
 impl faucet_core::Source for S3Source {
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.roundtrips.install(recorder);
+    }
     async fn fetch_with_context(
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
@@ -978,6 +995,7 @@ impl faucet_core::Source for S3Source {
     /// counts would require paging the whole listing, so `estimated_rows`
     /// is never set.
     async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
+        self.roundtrips.record("list");
         let mut req = self
             .client
             .list_objects_v2()
@@ -1144,6 +1162,7 @@ mod tests {
             config,
             client,
             applied_shard: Mutex::new(None),
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
         }
     }
 

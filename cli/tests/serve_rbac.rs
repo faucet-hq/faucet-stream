@@ -68,6 +68,8 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
+        require_approval: Vec::new(),
+        approval_expiry_secs: 86_400,
     }
 }
 
@@ -314,6 +316,11 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::POST, "/v1/reload"),
         (Method::GET, "/v1/whoami"),
         (Method::POST, "/mcp"),
+        (Method::POST, "/v1/changes"),
+        (Method::GET, "/v1/changes"),
+        (Method::GET, "/v1/changes/{id}"),
+        (Method::POST, "/v1/changes/{id}/approve"),
+        (Method::POST, "/v1/changes/{id}/reject"),
     ];
     #[cfg(feature = "triggers")]
     v.extend([
@@ -326,6 +333,7 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::GET, "/v1/catalog/datasets/{id}"),
         (Method::GET, "/v1/catalog/lineage"),
         (Method::POST, "/v1/catalog/datasets/{id}/consumers"),
+        (Method::GET, "/v1/usage"),
         (Method::GET, "/v1/local-outputs"),
         (Method::DELETE, "/v1/local-outputs/{id}"),
         (Method::POST, "/v1/local-outputs/cleanup"),

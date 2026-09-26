@@ -61,6 +61,10 @@ pub struct GcsSource {
     /// degenerate single-shard set) reads every listed object. Stored behind a
     /// `Mutex` so `apply_shard(&self, …)` can record it before streaming.
     applied_shard: Mutex<Option<HashShard>>,
+    /// Round-trip recorder installed by the pipeline (#638 / #704). Ops:
+    /// `list` (one per listing page), `get` (one per object metadata read
+    /// or body read, including each ranged Parquet read).
+    roundtrips: faucet_core::observability::RecorderSlot,
 }
 
 impl GcsSource {
@@ -75,6 +79,7 @@ impl GcsSource {
             storage,
             control,
             applied_shard: Mutex::new(None),
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
         })
     }
 
@@ -103,6 +108,7 @@ impl GcsSource {
         }
 
         let effective_prefix = prefix_override.or(self.config.prefix.as_deref());
+        self.roundtrips.record("list");
         let mut req = self.control.list_objects().set_parent(self.bucket_path());
         if let Some(p) = effective_prefix {
             req = req.set_prefix(p.to_string());
@@ -216,6 +222,7 @@ impl GcsSource {
 
         // The footer's position is only knowable from the object's size, which
         // the control plane reports without transferring any data.
+        self.roundtrips.record("get");
         let meta = self
             .control
             .get_object()
@@ -238,6 +245,7 @@ impl GcsSource {
             &self.bucket_path(),
             key,
             len,
+            self.roundtrips.recorder(),
         )
         .await?;
         let object_len = reader.len();
@@ -303,6 +311,7 @@ impl GcsSource {
         &self,
         key: &str,
     ) -> Result<std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>, FaucetError> {
+        self.roundtrips.record("get");
         let resp = self
             .storage
             .read_object(self.bucket_path(), key.to_string())
@@ -550,6 +559,12 @@ fn decode_parquet_bytes(
 
 #[async_trait]
 impl faucet_core::Source for GcsSource {
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.roundtrips.install(recorder);
+    }
     async fn fetch_with_context(
         &self,
         context: &std::collections::HashMap<String, Value>,
@@ -1000,6 +1015,7 @@ impl faucet_core::Source for GcsSource {
     /// and no data scan — object counts would require paging the whole
     /// listing, so `estimated_rows` is never set.
     async fn discover(&self) -> Result<Vec<faucet_core::DatasetDescriptor>, FaucetError> {
+        self.roundtrips.record("list");
         let mut req = self
             .control
             .list_objects()

@@ -116,7 +116,8 @@ async fn mount_job_done(server: &MockServer, job_id: &str) {
         .and(path(format!("/projects/{PROJECT_ID}/jobs/{job_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobReference": {"projectId": PROJECT_ID, "jobId": job_id},
-            "status": {"state": "DONE"}
+            "status": {"state": "DONE"},
+            "statistics": {"query": {"totalBytesBilled": "10485760"}}
         })))
         .mount(server)
         .await;
@@ -168,12 +169,32 @@ async fn write_batch_idempotent_posts_transaction_with_params() {
     mount_job_done(&server, "job-x").await;
 
     let (sink, _sa) = build_sink(&server).await;
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "bigquery",
+        )
+        .with_meter(meter.clone()),
+    ));
     let records = vec![json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})];
     let written = sink
         .write_batch_idempotent(&records, "pipe::row1", "00000000000000000003")
         .await
         .expect("idempotent write");
     assert_eq!(written, 2);
+    let usage = meter.snapshot();
+    assert!(usage.sink_roundtrips.get("job").is_some_and(|n| *n >= 1));
+    assert!(
+        usage
+            .signals
+            .iter()
+            .any(|s| s.kind == "bytes_billed" && s.quantity == 10_485_760.0),
+        "{:?}",
+        usage.signals
+    );
 
     let bodies = captured_query_bodies(&server).await;
     let tx = bodies

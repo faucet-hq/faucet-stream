@@ -85,6 +85,19 @@ pub enum FaucetError {
         message: String,
     },
 
+    /// A run budget ceiling was crossed (#703): `budget` names the ceiling
+    /// (`max_records` / `max_bytes` / `max_duration_secs`), `limit` its value
+    /// and `actual` what the run reached or would have reached. A records /
+    /// bytes crossing refuses the whole page **before** it is written, so
+    /// the bookmark never advances past it; a duration crossing cancels the
+    /// run cooperatively at the next page boundary.
+    #[error("Budget `{budget}` exceeded: limit {limit}, actual {actual}")]
+    BudgetExceeded {
+        budget: String,
+        limit: u64,
+        actual: u64,
+    },
+
     /// A run's learned column profile drifted from its baseline under a
     /// `profiling.on_drift: fail` policy (#708). Raised after the run's data
     /// is written: the failure marks the run, it does not undo it.

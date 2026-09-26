@@ -107,6 +107,8 @@ fn opts(name: &str) -> ExecuteOptions {
         notifier: None,
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage: Default::default(),
+        budget: None,
     }
 }
 

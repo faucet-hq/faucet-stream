@@ -78,11 +78,24 @@ pub enum Permission {
     /// (`POST /v1/catalog/datasets/{id}/consumers`, #707). Changes shared
     /// metadata that impact reports name, so `operator` up; a viewer reads it.
     CatalogAnnotate,
+    /// Read cost & usage accounting (`GET /v1/usage`, #704) — read-only,
+    /// every role from `viewer` up: the same volumes the catalog already
+    /// shows, priced.
+    UsageRead,
+    /// Read change requests (`GET /v1/changes*`, #703) — viewer+.
+    ChangeRead,
+    /// Propose a change request (`POST /v1/changes`, the MCP `propose_*`
+    /// tools, #703) — operator+: the same scope that may submit a run.
+    ChangeRequest,
+    /// Approve or reject a change request (`POST /v1/changes/{id}/approve` /
+    /// `reject`, #703) — operator+ to reach the route; the `approvals:`
+    /// policy in `--auth-config` then decides per kind who counts.
+    ChangeApprove,
 }
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 18] = [
+    pub const ALL: [Permission; 22] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -101,13 +114,17 @@ impl Permission {
         Permission::Identity,
         Permission::Plan,
         Permission::CatalogAnnotate,
+        Permission::UsageRead,
+        Permission::ChangeRead,
+        Permission::ChangeRequest,
+        Permission::ChangeApprove,
     ];
 }
 
 /// A named role. Roles are a fixed, built-in ladder — `viewer` ⊂ `operator` ⊂
 /// `admin` — chosen so the common cases (read-only dashboard user, run
 /// operator, full admin) need no custom permission wiring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, faucet_core::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     /// Read-only: runs + logs + schemas.
@@ -135,6 +152,8 @@ impl Role {
                         | LocalOutputRead
                         | Identity
                         | Plan
+                        | UsageRead
+                        | ChangeRead
                 )
             }
             Role::Operator => {
@@ -154,6 +173,10 @@ impl Role {
                         | Identity
                         | Plan
                         | CatalogAnnotate
+                        | UsageRead
+                        | ChangeRead
+                        | ChangeRequest
+                        | ChangeApprove
                 )
             }
             Role::Admin => true,
@@ -205,6 +228,9 @@ impl std::fmt::Debug for PrincipalSpec {
 #[serde(deny_unknown_fields)]
 struct AuthConfigFile {
     principals: Vec<PrincipalSpec>,
+    /// Who may approve which change requests (#703).
+    #[serde(default)]
+    approvals: Option<crate::serve::changes::ApprovalPolicy>,
 }
 
 /// A validated RBAC configuration: a non-empty set of principals with unique
@@ -212,6 +238,9 @@ struct AuthConfigFile {
 #[derive(Debug, Clone)]
 pub struct RbacConfig {
     principals: Vec<PrincipalSpec>,
+    /// The `approvals:` block (#703); default = admins approve, one each, no
+    /// self-approval.
+    approvals: crate::serve::changes::ApprovalPolicy,
 }
 
 /// The resolved identity for one request, carried in the request extensions for
@@ -224,6 +253,16 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    /// Actor for a server-internal task (the change-request expiry sweep,
+    /// #703) — `system:<name>`, an admin for audit attribution.
+    pub fn system(name: &str) -> Self {
+        Self {
+            principal: format!("system:{name}"),
+            role: Role::Admin,
+            source_ip: None,
+        }
+    }
+
     /// Actor for a trigger-originated (non-HTTP) submission — `trigger:<name>`,
     /// treated as an operator for audit attribution.
     pub fn trigger(name: &str) -> Self {
@@ -255,7 +294,19 @@ impl RbacConfig {
         let file: AuthConfigFile = serde_yaml::from_str(&text).map_err(|e| {
             CliError::Serve(format!("parsing --auth-config {}: {e}", path.display()))
         })?;
-        Self::new(file.principals)
+        let mut cfg = Self::new(file.principals)?;
+        if let Some(approvals) = file.approvals {
+            approvals
+                .validate()
+                .map_err(|e| CliError::Serve(format!("--auth-config {}: {e}", path.display())))?;
+            cfg.approvals = approvals;
+        }
+        Ok(cfg)
+    }
+
+    /// The approval policy (#703) this config carries.
+    pub fn approvals(&self) -> &crate::serve::changes::ApprovalPolicy {
+        &self.approvals
     }
 
     /// Build an in-memory config from the `--read-token` / `--write-token` /
@@ -340,7 +391,10 @@ impl RbacConfig {
                 )));
             }
         }
-        Ok(Self { principals })
+        Ok(Self {
+            principals,
+            approvals: crate::serve::changes::ApprovalPolicy::default(),
+        })
     }
 
     /// Resolve a bearer token to its principal in constant time. Every principal
@@ -398,6 +452,17 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::GET, "/v1/catalog/datasets/{id}") => Some(CatalogRead),
         (&Method::GET, "/v1/catalog/lineage") => Some(CatalogRead),
         (&Method::POST, "/v1/catalog/datasets/{id}/consumers") => Some(CatalogAnnotate),
+        // Cost & usage accounting (#704): a priced read of what the catalog
+        // already shows, so viewer+.
+        (&Method::GET, "/v1/usage") => Some(UsageRead),
+        // Change requests (#703). Reading is viewer+; proposing needs the run
+        // scope; approving/rejecting reach the route as operator+ and the
+        // `approvals:` policy decides further.
+        (&Method::POST, "/v1/changes") => Some(ChangeRequest),
+        (&Method::GET, "/v1/changes") => Some(ChangeRead),
+        (&Method::GET, "/v1/changes/{id}") => Some(ChangeRead),
+        (&Method::POST, "/v1/changes/{id}/approve") => Some(ChangeApprove),
+        (&Method::POST, "/v1/changes/{id}/reject") => Some(ChangeApprove),
         // Local sink output retention (#587). Listing is a read scope; deleting
         // files is `LocalOutputManage`, so a `viewer` can see what local data
         // exists but can never remove it.
@@ -462,6 +527,12 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::GET, "/v1/catalog/datasets/{id}") => "catalog.get",
         (&Method::GET, "/v1/catalog/lineage") => "catalog.lineage",
         (&Method::POST, "/v1/catalog/datasets/{id}/consumers") => "catalog.annotate",
+        (&Method::GET, "/v1/usage") => "usage.list",
+        (&Method::POST, "/v1/changes") => "change.request",
+        (&Method::GET, "/v1/changes") => "change.list",
+        (&Method::GET, "/v1/changes/{id}") => "change.get",
+        (&Method::POST, "/v1/changes/{id}/approve") => "change.approve",
+        (&Method::POST, "/v1/changes/{id}/reject") => "change.reject",
         (&Method::GET, "/v1/local-outputs") => "local_output.list",
         (&Method::DELETE, "/v1/local-outputs/{id}") => "local_output.delete",
         (&Method::POST, "/v1/local-outputs/cleanup") => "local_output.cleanup",
@@ -622,6 +693,12 @@ mod tests {
             (Method::GET, "/v1/catalog/datasets", CatalogRead),
             (Method::GET, "/v1/catalog/datasets/{id}", CatalogRead),
             (Method::GET, "/v1/catalog/lineage", CatalogRead),
+            (Method::GET, "/v1/usage", UsageRead),
+            (Method::POST, "/v1/changes", ChangeRequest),
+            (Method::GET, "/v1/changes", ChangeRead),
+            (Method::GET, "/v1/changes/{id}", ChangeRead),
+            (Method::POST, "/v1/changes/{id}/approve", ChangeApprove),
+            (Method::POST, "/v1/changes/{id}/reject", ChangeApprove),
             (Method::GET, "/v1/local-outputs", LocalOutputRead),
             (Method::DELETE, "/v1/local-outputs/{id}", LocalOutputManage),
             (Method::POST, "/v1/local-outputs/cleanup", LocalOutputManage),
@@ -667,6 +744,22 @@ mod tests {
         assert!(Role::Viewer.grants(Permission::Plan));
         assert!(!Role::Viewer.grants(Permission::CatalogAnnotate));
         assert!(Role::Operator.grants(Permission::CatalogAnnotate));
+        // Usage accounting is a priced read of the catalog's volumes: viewer+.
+        assert!(Role::Viewer.grants(Permission::UsageRead));
+        assert!(Role::Operator.grants(Permission::UsageRead));
+        assert!(Role::Admin.grants(Permission::UsageRead));
+        assert_eq!(audit_action(&Method::GET, "/v1/usage"), "usage.list");
+        // Change requests (#703): everyone reads; proposing and approving are
+        // operator scopes (the approvals policy narrows approving further).
+        assert!(Role::Viewer.grants(Permission::ChangeRead));
+        assert!(!Role::Viewer.grants(Permission::ChangeRequest));
+        assert!(!Role::Viewer.grants(Permission::ChangeApprove));
+        assert!(Role::Operator.grants(Permission::ChangeRequest));
+        assert!(Role::Operator.grants(Permission::ChangeApprove));
+        assert_eq!(
+            audit_action(&Method::POST, "/v1/changes/{id}/approve"),
+            "change.approve"
+        );
         // Every role can read the catalog; a viewer still can't write runs.
         assert!(Role::Viewer.grants(Permission::CatalogRead));
         assert!(Role::Operator.grants(Permission::CatalogRead));

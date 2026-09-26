@@ -171,6 +171,10 @@ pub(crate) async fn execute(
     args: RunArgs,
     resolved_config_path: Option<std::path::PathBuf>,
 ) -> CliResult<()> {
+    // A relative `usage.pricing_file` resolves against the config's directory.
+    let config_dir = resolved_config_path
+        .as_ref()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
     // Data-flow policy (#702): `--policy <file>` merges over the config's own
     // block before anything is planned, so the static gate below and the
     // runtime backstop the executor installs see one policy.
@@ -373,6 +377,19 @@ pub(crate) async fn execute(
             notifier,
             #[cfg(feature = "catalog")]
             catalog,
+            usage: crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), config_dir.as_deref())
+                .map_err(CliError::Config)?,
+            budget: crate::budget::effective_budget(
+                cfg.budget.as_ref(),
+                crate::budget::BudgetFlags {
+                    max_records: args.max_records,
+                    max_bytes: args.max_bytes,
+                    max_duration_secs: args.max_duration_secs,
+                    allowed_sinks: args.allowed_sinks.clone(),
+                }
+                .into_spec(),
+            )
+            .map_err(CliError::Config)?,
         },
     );
     #[cfg(feature = "cli-tui")]
@@ -490,6 +507,13 @@ pub(crate) async fn execute(
                 total_written,
                 if total_written == 1 { "" } else { "s" }
             );
+            // Cost & usage (#704): one line per invocation, estimates
+            // labelled as such.
+            for i in &summary.invocations {
+                if let Some(u) = &i.usage {
+                    eprintln!("  {:<30} {}", i.row_id, crate::usage::summary_line(u));
+                }
+            }
             // Undoable runs (#706): print each invocation's run id so the
             // operator can `faucet rollback --run <id>` without digging it
             // out of the destination's `_faucet_run_id` column.
@@ -598,6 +622,9 @@ pub(crate) struct RunRowSummary {
     pub bookmark: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Cost & usage of the invocation (#704), estimates labelled as such.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage::UsageRecord>,
 }
 
 /// Aggregate counters across every row.
@@ -641,6 +668,7 @@ pub(crate) fn summary_rows(summary: &RunSummary) -> Vec<RunRowSummary> {
                 dlq_count: m.dlq_count,
                 bookmark: m.bookmark,
                 error: o.error.clone(),
+                usage: o.usage.clone(),
             }
         })
         .collect()
@@ -779,6 +807,8 @@ mod tests {
             notifier: None,
             #[cfg(feature = "catalog")]
             catalog: None,
+            usage: Default::default(),
+            budget: None,
         };
         let fut = crate::executor::run_expanded(nodes, opts);
         let exp = std::mem::size_of_val(&fut);
@@ -805,6 +835,7 @@ mod tests {
                 dlq_count: 0,
                 bookmark: None,
             }),
+            usage: None,
         }
     }
 

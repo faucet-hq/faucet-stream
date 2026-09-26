@@ -328,6 +328,8 @@ notifications:
                 notifier: Some(notifier),
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
     };
@@ -464,6 +466,8 @@ notifications:
         notifier: Some(notifier),
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage: Default::default(),
+        budget: None,
     };
 
     let summary = faucet_cli::executor::run_expanded(nodes, opts)

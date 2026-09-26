@@ -117,6 +117,8 @@ async fn run_once(url: &str, state_dir: &str) {
             reconcile: None,
             verify: None,
             rollback: None,
+            usage: Default::default(),
+            budget: None,
             #[cfg(feature = "notify")]
             notifier: None,
             #[cfg(feature = "catalog")]

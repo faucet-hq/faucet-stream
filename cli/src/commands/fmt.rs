@@ -162,6 +162,8 @@ const KEY_ORDER: &[&str] = &[
     "reconcile",
     "verify",
     "rollback",
+    "usage",
+    "budget",
     "backfill",
     "mirror",
     "replication",

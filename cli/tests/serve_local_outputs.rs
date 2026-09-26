@@ -84,6 +84,8 @@ fn serve_args_with_retention(
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
+        require_approval: Vec::new(),
+        approval_expiry_secs: 86_400,
     }
 }
 

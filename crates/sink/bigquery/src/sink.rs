@@ -581,6 +581,12 @@ pub struct BigQuerySink {
     /// columnar write and reused for every staged file.
     #[cfg(feature = "arrow")]
     gcs_store: tokio::sync::OnceCell<google_cloud_storage::client::Storage>,
+    /// Round-trip recorder installed by the pipeline (#638 / #704). Ops:
+    /// `insert` (`tabledata.insertAll`), `query` (`jobs.query`), `job`
+    /// (`jobs.get`), `load` (a load job or media upload). Cost signals:
+    /// `bytes_streamed` (estimated insertAll payload), `bytes_loaded` (media
+    /// upload size), `bytes_billed` (a query job's `totalBytesBilled`).
+    roundtrips: faucet_core::observability::RecorderSlot,
 }
 
 impl BigQuerySink {
@@ -603,6 +609,7 @@ impl BigQuerySink {
             config,
             client,
             schema_cache: RwLock::new(None),
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
@@ -625,6 +632,7 @@ impl BigQuerySink {
             config,
             client,
             schema_cache: RwLock::new(None),
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
             table_ready: AtomicBool::new(false),
             overwrite_setup: AtomicBool::new(false),
             upload_session: tokio::sync::Mutex::new(None),
@@ -672,6 +680,12 @@ impl BigQuerySink {
                 FaucetError::Sink(format!("failed to serialize row for BigQuery: {e}"))
             })?;
         }
+        self.roundtrips.record("insert");
+        self.roundtrips.signal(
+            "bytes_streamed",
+            "bytes",
+            faucet_core::usage::estimate_page_bytes(rows) as f64,
+        );
         self.client
             .tabledata()
             .insert_all(
@@ -920,6 +934,7 @@ impl BigQuerySink {
         req.use_legacy_sql = false;
         req.parameter_mode = Some("NAMED".to_string());
         req.query_parameters = Some(vec![Self::string_param("payload", &payload)]);
+        self.roundtrips.record("query");
         let resp = self
             .client
             .job()
@@ -1020,6 +1035,9 @@ impl BigQuerySink {
     /// serializes `Value` rows) and by [`load_native`](faucet_core::Sink::load_native)
     /// (which forwards the source's raw wire bytes, #633).
     async fn load_media(&self, job_json: &str, media_gzipped: &[u8]) -> Result<u64, FaucetError> {
+        self.roundtrips.record("load");
+        self.roundtrips
+            .signal("bytes_loaded", "bytes", media_gzipped.len() as f64);
         let boundary = media_boundary(media_gzipped);
         let body = build_multipart_related(&boundary, job_json, media_gzipped);
 
@@ -1077,6 +1095,7 @@ impl BigQuerySink {
     ) -> Result<u64, FaucetError> {
         let started = std::time::Instant::now();
         loop {
+            self.roundtrips.record("job");
             let job = self
                 .client
                 .job()
@@ -1361,6 +1380,7 @@ impl BigQuerySink {
             let mut req = QueryRequest::new(sql.clone());
             req.use_legacy_sql = false;
             req.location = self.config.location.clone();
+            self.roundtrips.record("query");
             self.client.job().query(&self.config.project_id, req)
         })
         .await
@@ -1481,6 +1501,7 @@ impl BigQuerySink {
             idempotent::build_create_commit_table(&self.config.project_id, &self.config.dataset_id);
         let mut req = QueryRequest::new(sql);
         req.use_legacy_sql = false;
+        self.roundtrips.record("query");
         let resp = self
             .client
             .job()
@@ -1551,12 +1572,22 @@ impl BigQuerySink {
         // mean we cannot confirm the transaction durably committed — fail safe
         // (returning `Ok` here would advance the bookmark over data that may
         // never have landed, the silent-data-loss failure mode).
+        self.roundtrips.record("job");
         let job = self
             .client
             .job()
             .get_job(&self.config.project_id, &job_id, location.as_deref())
             .await
             .map_err(|e| FaucetError::Sink(format!("BigQuery jobs.get failed: {e}")))?;
+        if let Some(b) = job
+            .statistics
+            .as_ref()
+            .and_then(|s| s.query.as_ref())
+            .and_then(|q| q.total_bytes_billed.as_deref())
+            .and_then(|n| n.parse::<f64>().ok())
+        {
+            self.roundtrips.signal("bytes_billed", "bytes", b);
+        }
         // Read the two fields we judge on, then drop the borrow so the job body
         // itself can be handed back to the caller.
         let (state, error_result) = {
@@ -1674,6 +1705,8 @@ impl BigQuerySink {
         }
         req.query_parameters = Some(params);
 
+        self.roundtrips.record("query");
+
         let resp = self
             .client
             .job()
@@ -1733,6 +1766,8 @@ impl BigQuerySink {
             Self::string_param("keys", &keys_payload),
         ]);
 
+        self.roundtrips.record("query");
+
         let resp = self
             .client
             .job()
@@ -1757,6 +1792,12 @@ impl BigQuerySink {
 
 #[async_trait]
 impl faucet_core::Sink for BigQuerySink {
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.roundtrips.install(recorder);
+    }
     fn connector_name(&self) -> &'static str {
         "bigquery"
     }
@@ -2330,6 +2371,8 @@ impl faucet_core::Sink for BigQuerySink {
         req.parameter_mode = Some("NAMED".to_string());
         req.query_parameters = Some(vec![Self::string_param("scope", scope)]);
 
+        self.roundtrips.record("query");
+
         let resp = self
             .client
             .job()
@@ -2419,6 +2462,8 @@ impl faucet_core::Sink for BigQuerySink {
             Self::string_param("scope", scope),
             Self::string_param("token", token),
         ]);
+
+        self.roundtrips.record("query");
 
         let resp = self
             .client
@@ -2558,10 +2603,12 @@ impl faucet_core::Sink for BigQuerySink {
                         .into(),
                 ));
             }
+            self.roundtrips.record("load");
             return crate::load::write_columnar(&self.client, &self.config, &self.gcs_store, batch)
                 .await;
         }
         let token = self.access_token().await?;
+        self.roundtrips.record("load");
         crate::load::write_columnar_media(
             &self.client,
             &self.config,

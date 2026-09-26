@@ -27,6 +27,9 @@ pub struct GcsSink {
     /// records are buffered and encoded together at the rollover. Always empty
     /// for JSON Lines, which streams through `open`.
     pending: tokio::sync::Mutex<faucet_core::object_rollover::PageAccumulator>,
+    /// Round-trip recorder installed by the pipeline (#638 / #704). Op: `put`
+    /// (one per object upload).
+    roundtrips: faucet_core::observability::RecorderSlot,
 }
 
 impl GcsSink {
@@ -46,6 +49,7 @@ impl GcsSink {
             storage,
             open,
             pending,
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
         })
     }
 
@@ -88,6 +92,7 @@ impl GcsSink {
         };
 
         let payload = bytes::Bytes::from(body);
+        self.roundtrips.record("put");
         self.storage
             .write_object(self.bucket_path(), key.to_string(), payload)
             .set_content_type("application/x-ndjson")
@@ -104,6 +109,7 @@ impl GcsSink {
     #[cfg(feature = "arrow")]
     async fn upload_parquet_object(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
         let payload = bytes::Bytes::from(body);
+        self.roundtrips.record("put");
         self.storage
             .write_object(self.bucket_path(), key.to_string(), payload)
             .set_content_type("application/vnd.apache.parquet")
@@ -117,6 +123,12 @@ impl GcsSink {
 
 #[async_trait]
 impl faucet_core::Sink for GcsSink {
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.roundtrips.install(recorder);
+    }
     fn dataset_uri(&self) -> String {
         format!("gs://{}/{}", self.config.bucket, self.config.prefix)
     }

@@ -150,12 +150,29 @@ async fn write_batch_rechunks_into_batch_size_objects() {
         .prefix(prefix)
         .with_batch_size(500);
     let sink = build_sink(&endpoint, config).await;
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "s3",
+        )
+        .with_meter(meter.clone()),
+    ));
 
     let written = sink.write_batch(&records(1_500)).await.expect("write");
     assert_eq!(written, 1_500, "all records reported written");
     // Since #618 the remainder of the open object is closed at `flush`, which
     // the pipeline calls at every bookmark-carrying page and at the end.
     sink.flush().await.expect("flush");
+    assert!(
+        meter
+            .snapshot()
+            .sink_roundtrips
+            .get("put")
+            .is_some_and(|n| *n >= 3)
+    );
 
     let admin = assertion_client(&endpoint).await;
     let keys = list_keys(&admin, prefix).await;

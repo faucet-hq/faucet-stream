@@ -75,6 +75,12 @@ pub struct MemoryHistory {
     /// retention GC deletes from; ephemeral like everything else here, so a
     /// restart simply forgets (and therefore never collects) earlier files.
     local_outputs: Mutex<BTreeMap<String, crate::local_outputs::LocalOutputRecord>>,
+    /// Usage records (#704), append order. Capped at [`USAGE_MEMORY_CAP`] so an
+    /// in-memory server cannot grow without bound; the SQL backends keep
+    /// everything.
+    usage: Mutex<VecDeque<crate::usage::UsageRecord>>,
+    /// Change requests (#703) by id.
+    changes: Mutex<BTreeMap<String, crate::serve::changes::ChangeRequest>>,
     /// Retention window for idempotency claims (separate from run retention).
     idem_retention: Duration,
 }
@@ -93,10 +99,15 @@ impl MemoryHistory {
             template_version_deprecations: Mutex::new(std::collections::HashMap::new()),
             run_logs: Mutex::new(std::collections::HashMap::new()),
             local_outputs: Mutex::new(BTreeMap::new()),
+            usage: Mutex::new(VecDeque::new()),
+            changes: Mutex::new(BTreeMap::new()),
             idem_retention,
         }
     }
 }
+
+/// Most usage records the in-memory backend keeps (newest win).
+pub const USAGE_MEMORY_CAP: usize = 10_000;
 
 /// True when `claimed_at` is older than `window` relative to `now`. A claim
 /// timestamped in the future (clock skew) is treated as *not* expired.
@@ -557,6 +568,98 @@ impl RunHistory for MemoryHistory {
             .lock()
             .map_err(|_| HistoryError::Backend("catalog lock poisoned".into()))?;
         Ok(cat.config_snapshots.get(pipeline).cloned())
+    }
+
+    // ── Change requests (#703) ───────────────────────────────────────────────
+
+    async fn change_upsert(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+    ) -> Result<(), HistoryError> {
+        self.changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?
+            .insert(change.id.clone(), change.clone());
+        Ok(())
+    }
+
+    async fn change_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::serve::changes::ChangeRequest>, HistoryError> {
+        Ok(self
+            .changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?
+            .get(id)
+            .cloned())
+    }
+
+    async fn change_list(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
+        let rows = self
+            .changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?;
+        let mut out: Vec<_> = rows
+            .values()
+            .filter(|c| filter.matches(c))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let limit = if filter.limit > 0 {
+            filter.limit
+        } else {
+            crate::serve::changes::DEFAULT_LIST_LIMIT
+        };
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    // ── Cost & usage accounting (#704) ───────────────────────────────────────
+
+    async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
+        let mut rows = self
+            .usage
+            .lock()
+            .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
+        rows.push_back(record.clone());
+        while rows.len() > USAGE_MEMORY_CAP {
+            rows.pop_front();
+        }
+        Ok(())
+    }
+
+    async fn usage_list(
+        &self,
+        filter: &crate::usage::UsageFilter,
+    ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
+        let rows = self
+            .usage
+            .lock()
+            .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
+        let mut out: Vec<_> = rows.iter().filter(|r| filter.matches(r)).cloned().collect();
+        // Newest first; `run_id`/`row` break ties so a limited page is the
+        // same on every backend.
+        out.sort_by(|a, b| {
+            b.recorded_at
+                .cmp(&a.recorded_at)
+                .then_with(|| a.run_id.cmp(&b.run_id))
+                .then_with(|| a.row.cmp(&b.row))
+        });
+        let limit = if filter.limit > 0 {
+            filter.limit
+        } else {
+            crate::usage::DEFAULT_LIST_LIMIT
+        };
+        out.truncate(limit);
+        Ok(out)
     }
 
     // ── Local sink output ledger (#587) ──────────────────────────────────────

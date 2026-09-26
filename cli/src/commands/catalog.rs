@@ -32,7 +32,7 @@ pub async fn run(args: CatalogArgs) -> CliResult<()> {
 }
 
 /// Load the config named by the shared flags and connect its `catalog:` store.
-async fn connect(common: &CatalogConfigArgs) -> CliResult<CatalogHandle> {
+pub(crate) async fn connect(common: &CatalogConfigArgs) -> CliResult<CatalogHandle> {
     let cwd = std::env::current_dir()?;
     let env_path =
         crate::env_loader::resolve_env_file(common.env_file.as_deref(), common.no_env_file, &cwd)?;

@@ -260,6 +260,14 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         SchemaTarget::Dlq => block_schema("dlq").expect("dlq is always compiled"),
         SchemaTarget::Verify => block_schema("verify").expect("verify is always compiled"),
         SchemaTarget::Rollback => block_schema("rollback").expect("rollback is always compiled"),
+        SchemaTarget::Usage => {
+            let s = faucet_core::schema_for!(crate::usage::UsageSpec);
+            serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
+        SchemaTarget::Budget => {
+            let s = faucet_core::schema_for!(faucet_core::BudgetSpec);
+            serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
         SchemaTarget::Replication => {
             let s = faucet_core::schema_for!(crate::replication::spec::ReplicationSpec);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
@@ -587,5 +595,17 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         // The target must also be discoverable from `--list`.
         assert!(super::schema_targets().contains(&"template-test"));
+    }
+
+    #[tokio::test]
+    async fn usage_and_budget_targets_print_their_schemas() {
+        for target in [SchemaTarget::Usage, SchemaTarget::Budget] {
+            let r = super::run(SchemaArgs {
+                target: Some(target),
+                list: false,
+            })
+            .await;
+            assert!(r.is_ok(), "{r:?}");
+        }
     }
 }

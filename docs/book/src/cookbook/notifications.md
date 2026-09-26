@@ -27,6 +27,8 @@ block, nothing changes.
 | `dlq_threshold` | a run routed rows to the DLQ at/over the rule's threshold | warning |
 | `scheduler_stuck` | `faucet schedule` is exiting on consecutive failures | critical |
 | `profile_drift` | a column's learned profile drifted from its baseline (`profiling.on_drift: notify` or `fail`) — one event per finding | warning |
+| `change_requested` | a [change request](./approvals.md) awaits approval — sent through the proposed config's own `notifications:` rules | info |
+| `budget_exceeded` | a run crossed a [`budget:`](./usage.md#run-budgets) ceiling and was stopped | error |
 
 Events fire from every runtime — `faucet run`, `faucet schedule`,
 `faucet serve`, and `faucet mirror` — because the emit sites live in the

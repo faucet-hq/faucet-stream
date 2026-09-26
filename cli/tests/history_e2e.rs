@@ -41,6 +41,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
             records_written: 10,
             duration_ms: 0,
             error: None,
+            usage: None,
         }],
         error: None,
         idempotency_key: None,

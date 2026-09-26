@@ -3,7 +3,8 @@
 use crate::error::{CliError, CliResult};
 use crate::serve::config::ServeConfig;
 use crate::serve::handlers::{
-    audit, backfill, dlq, doctor, health, logs, plan, reload, runs, schemas, verify, whoami,
+    audit, backfill, changes, dlq, doctor, health, logs, plan, reload, runs, schemas, verify,
+    whoami,
 };
 use crate::serve::history::RunHistory;
 use crate::serve::state::ServerState;
@@ -52,7 +53,15 @@ pub fn build_router(
         .route("/v1/dlq/discard", post(dlq::discard))
         .route("/v1/audit", get(audit::list_audit))
         .route("/v1/reload", post(reload::reload))
-        .route("/v1/whoami", get(whoami::whoami));
+        .route("/v1/whoami", get(whoami::whoami))
+        // Change requests (#703): plan → approve → run.
+        .route(
+            "/v1/changes",
+            post(changes::create_change).get(changes::list_changes),
+        )
+        .route("/v1/changes/{id}", get(changes::get_change))
+        .route("/v1/changes/{id}/approve", post(changes::approve_change))
+        .route("/v1/changes/{id}/reject", post(changes::reject_change));
     #[cfg(feature = "triggers")]
     {
         api = api.route(
@@ -63,8 +72,10 @@ pub fn build_router(
     }
     #[cfg(feature = "catalog")]
     {
-        use crate::serve::handlers::{catalog, local_outputs, preview};
+        use crate::serve::handlers::{catalog, local_outputs, preview, usage};
         api = api
+            // Cost & usage accounting (#704): priced usage of finished runs.
+            .route("/v1/usage", get(usage::list_usage))
             .route("/v1/catalog/datasets", get(catalog::list_datasets))
             .route("/v1/catalog/datasets/{id}", get(catalog::get_dataset))
             .route(
@@ -657,6 +668,20 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     let lease_period = lease_interval(config.lease_ttl);
     let leases = tokio::spawn(lease_loop(state.clone(), lease_period, shutdown.clone()));
 
+    // Change-request expiry sweep (#703): a pending request past its window
+    // lapses even if nobody looks at it.
+    if !state.require_approval().is_empty() {
+        tracing::info!(
+            kinds = ?state.require_approval(),
+            "approval required for these change kinds"
+        );
+    }
+    let change_expiry = tokio::spawn(crate::serve::changes::expiry_loop(
+        state.clone(),
+        Duration::from_secs(60),
+        shutdown.clone(),
+    ));
+
     // Cluster claim loop: pulls Pending runs from the shared DB (cluster only).
     let claim = if config.cluster.enabled {
         tracing::info!(
@@ -734,6 +759,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     .await;
     maintenance.abort();
     leases.abort();
+    change_expiry.abort();
     #[cfg(feature = "catalog")]
     if let Some(gc) = local_output_gc {
         gc.abort();

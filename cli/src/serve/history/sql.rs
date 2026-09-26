@@ -224,6 +224,35 @@ pub const DDL: &[&str] = &[
         ON faucet_local_outputs (last_written_at)",
     "CREATE INDEX IF NOT EXISTS faucet_local_outputs_dataset_idx \
         ON faucet_local_outputs (dataset_id)",
+    // Cost & usage accounting (#704): one row per finished invocation,
+    // append-only, never purged by run retention (a quarter's report must
+    // not depend on the run-record window). The whole `UsageRecord` is the
+    // JSON `body`; the columns are what the listing filters and orders by.
+    "CREATE TABLE IF NOT EXISTS faucet_usage (\
+        run_id TEXT NOT NULL,\
+        row_id TEXT NOT NULL,\
+        pipeline TEXT NOT NULL,\
+        recorded_at TEXT NOT NULL,\
+        body TEXT NOT NULL,\
+        PRIMARY KEY (run_id, row_id))",
+    "CREATE INDEX IF NOT EXISTS faucet_usage_recorded_idx \
+        ON faucet_usage (recorded_at)",
+    "CREATE INDEX IF NOT EXISTS faucet_usage_pipeline_idx \
+        ON faucet_usage (pipeline, recorded_at)",
+    // Change requests (#703): plan → approve → run. Shared across cluster
+    // instances; never purged by run retention (who approved what must
+    // outlive the run). The whole `ChangeRequest` is the JSON `body`; the
+    // columns are what the listing filters and orders by.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_changes (\
+        id TEXT PRIMARY KEY,\
+        kind TEXT NOT NULL,\
+        status TEXT NOT NULL,\
+        requester TEXT NOT NULL,\
+        created_at TEXT NOT NULL,\
+        expires_at TEXT NOT NULL,\
+        body TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS faucet_serve_changes_status_idx \
+        ON faucet_serve_changes (status, created_at)",
 ];
 
 /// SQL placeholder dialect.
@@ -352,6 +381,12 @@ pub struct Stmts {
     pub local_output_select: String,
     pub local_output_upsert: String,
     pub local_output_mark_deleted: String,
+    /// Usage accounting (#704): append one invocation's record (idempotent per
+    /// `(run_id, row_id)` so a retried write cannot double-count).
+    pub usage_insert: String,
+    /// Change requests (#703).
+    pub change_upsert: String,
+    pub change_select: String,
     pub catalog_upsert_dataset: String,
     /// Every dataset body — filtering/ordering happens in shared pure code
     /// ([`catalog::filter_datasets`](super::catalog::filter_datasets)), so the
@@ -502,6 +537,79 @@ impl Stmts {
         if filter.limit > 0 {
             sql.push_str(&format!(" LIMIT {}", filter.limit));
         }
+        (sql, binds)
+    }
+
+    /// Build the usage listing query for `filter`: the SQL and its binds in
+    /// order. Same rationale as [`Stmts::local_output_query`] — `faucet_usage`
+    /// is never purged, so the window / pipeline clauses and the cap go into
+    /// SQL where the `recorded_at` / `(pipeline, recorded_at)` indexes serve
+    /// them. The clauses mirror [`UsageFilter::matches`](crate::usage::UsageFilter::matches)
+    /// exactly (half-open `[since, until)`, equality on pipeline), and the
+    /// predicate still runs on the decoded rows so the two cannot drift.
+    pub fn usage_query(&self, filter: &crate::usage::UsageFilter) -> (String, Vec<String>) {
+        let mut sql = String::from("SELECT body FROM faucet_usage");
+        let mut binds: Vec<String> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(since) = filter.since {
+            binds.push(fmt_ts(since));
+            clauses.push(format!("recorded_at >= {}", self.placeholder(binds.len())));
+        }
+        if let Some(until) = filter.until {
+            binds.push(fmt_ts(until));
+            clauses.push(format!("recorded_at < {}", self.placeholder(binds.len())));
+        }
+        if let Some(pipeline) = &filter.pipeline {
+            binds.push(pipeline.clone());
+            clauses.push(format!("pipeline={}", self.placeholder(binds.len())));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY recorded_at DESC, run_id ASC, row_id ASC");
+        let limit = if filter.limit > 0 {
+            filter.limit
+        } else {
+            crate::usage::DEFAULT_LIST_LIMIT
+        };
+        sql.push_str(&format!(" LIMIT {limit}"));
+        (sql, binds)
+    }
+
+    /// Build the change-request listing query for `filter` (#703): clauses
+    /// mirror [`ChangeListFilter::matches`](crate::serve::changes::ChangeListFilter::matches)
+    /// exactly, pushed into SQL so a never-purged table is not scanned whole.
+    pub fn change_query(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> (String, Vec<String>) {
+        let mut sql = String::from("SELECT body FROM faucet_serve_changes");
+        let mut binds: Vec<String> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(status) = filter.status {
+            binds.push(status.as_str().to_string());
+            clauses.push(format!("status={}", self.placeholder(binds.len())));
+        }
+        if let Some(kind) = filter.kind {
+            binds.push(kind.as_str().to_string());
+            clauses.push(format!("kind={}", self.placeholder(binds.len())));
+        }
+        if let Some(requester) = &filter.requester {
+            binds.push(requester.clone());
+            clauses.push(format!("requester={}", self.placeholder(binds.len())));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id ASC");
+        let limit = if filter.limit > 0 {
+            filter.limit
+        } else {
+            crate::serve::changes::DEFAULT_LIST_LIMIT
+        };
+        sql.push_str(&format!(" LIMIT {limit}"));
         (sql, binds)
     }
 
@@ -711,6 +819,18 @@ impl Stmts {
             local_output_mark_deleted: "UPDATE faucet_local_outputs \
                 SET deleted_at=$2, body=$3 WHERE id=$1"
                 .into(),
+            usage_insert: "INSERT INTO faucet_usage \
+                (run_id, row_id, pipeline, recorded_at, body) VALUES ($1,$2,$3,$4,$5) \
+                ON CONFLICT (run_id, row_id) DO NOTHING"
+                .into(),
+            change_upsert: "INSERT INTO faucet_serve_changes \
+                (id, kind, status, requester, created_at, expires_at, body) \
+                VALUES ($1,$2,$3,$4,$5,$6,$7) \
+                ON CONFLICT (id) DO UPDATE SET kind=excluded.kind, status=excluded.status, \
+                requester=excluded.requester, created_at=excluded.created_at, \
+                expires_at=excluded.expires_at, body=excluded.body"
+                .into(),
+            change_select: "SELECT body FROM faucet_serve_changes WHERE id=$1".into(),
             catalog_upsert_dataset: "INSERT INTO faucet_catalog_datasets \
                 (id, uri, kind, last_seen, body) VALUES ($1,$2,$3,$4,$5) \
                 ON CONFLICT (id) DO UPDATE SET uri=excluded.uri, kind=excluded.kind, \
@@ -1023,6 +1143,18 @@ impl Stmts {
             local_output_mark_deleted: "UPDATE faucet_local_outputs \
                 SET deleted_at=?2, body=?3 WHERE id=?1"
                 .into(),
+            usage_insert: "INSERT INTO faucet_usage \
+                (run_id, row_id, pipeline, recorded_at, body) VALUES (?,?,?,?,?) \
+                ON CONFLICT (run_id, row_id) DO NOTHING"
+                .into(),
+            change_upsert: "INSERT INTO faucet_serve_changes \
+                (id, kind, status, requester, created_at, expires_at, body) \
+                VALUES (?,?,?,?,?,?,?) \
+                ON CONFLICT (id) DO UPDATE SET kind=excluded.kind, status=excluded.status, \
+                requester=excluded.requester, created_at=excluded.created_at, \
+                expires_at=excluded.expires_at, body=excluded.body"
+                .into(),
+            change_select: "SELECT body FROM faucet_serve_changes WHERE id=?".into(),
             catalog_upsert_dataset: "INSERT INTO faucet_catalog_datasets \
                 (id, uri, kind, last_seen, body) VALUES (?,?,?,?,?) \
                 ON CONFLICT (id) DO UPDATE SET uri=excluded.uri, kind=excluded.kind, \
@@ -3033,6 +3165,123 @@ macro_rules! impl_sql_history {
                     .map_err(backend)?
                     .rows_affected();
                 Ok(n > 0)
+            }
+
+            // ── Change requests (#703) ───────────────────────────────────────
+
+            async fn change_upsert(
+                &self,
+                change: &$crate::serve::changes::ChangeRequest,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.change_upsert)
+                    .bind(&change.id)
+                    .bind(change.kind.as_str())
+                    .bind(change.status.as_str())
+                    .bind(&change.requester)
+                    .bind(sql::fmt_ts(change.created_at))
+                    .bind(sql::fmt_ts(change.expires_at))
+                    .bind(sql::encode_json(change, "change request")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn change_get(
+                &self,
+                id: &str,
+            ) -> Result<
+                Option<$crate::serve::changes::ChangeRequest>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let Some(row) = sqlx::query(&self.stmts.change_select)
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?
+                else {
+                    return Ok(None);
+                };
+                let body: String = row.try_get("body").map_err(backend)?;
+                Ok(Some(sql::decode_json(&body, "change request")?))
+            }
+
+            async fn change_list(
+                &self,
+                filter: &$crate::serve::changes::ChangeListFilter,
+            ) -> Result<
+                Vec<$crate::serve::changes::ChangeRequest>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let (sql, binds) = self.stmts.change_query(filter);
+                let mut query = sqlx::query(&sql);
+                for bind in &binds {
+                    query = query.bind(bind);
+                }
+                let rows = query.fetch_all(&self.pool).await.map_err(backend)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let body: String = row.try_get("body").map_err(backend)?;
+                    let rec: $crate::serve::changes::ChangeRequest =
+                        sql::decode_json(&body, "change request")?;
+                    if filter.matches(&rec) {
+                        out.push(rec);
+                    }
+                }
+                Ok(out)
+            }
+
+            // ── Cost & usage accounting (#704) ───────────────────────────────
+
+            async fn usage_record(
+                &self,
+                record: &$crate::usage::UsageRecord,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.usage_insert)
+                    .bind(&record.run_id)
+                    .bind(&record.row)
+                    .bind(&record.pipeline)
+                    .bind(sql::fmt_ts(record.recorded_at))
+                    .bind(sql::encode_json(record, "usage record")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn usage_list(
+                &self,
+                filter: &$crate::usage::UsageFilter,
+            ) -> Result<Vec<$crate::usage::UsageRecord>, $crate::serve::history::HistoryError>
+            {
+                use sqlx::Row as _;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let (sql, binds) = self.stmts.usage_query(filter);
+                let mut query = sqlx::query(&sql);
+                for bind in &binds {
+                    query = query.bind(bind);
+                }
+                let rows = query.fetch_all(&self.pool).await.map_err(backend)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let body: String = row.try_get("body").map_err(backend)?;
+                    let rec: $crate::usage::UsageRecord = sql::decode_json(&body, "usage record")?;
+                    if filter.matches(&rec) {
+                        out.push(rec);
+                    }
+                }
+                Ok(out)
             }
 
             // ── Pipeline-template registry (#444) ────────────────────────────

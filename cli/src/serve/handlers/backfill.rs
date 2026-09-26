@@ -102,6 +102,15 @@ pub async fn submit_backfill(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<BackfillSubmitRequest>,
 ) -> Result<(StatusCode, Json<BackfillSubmitResponse>), ServeError> {
+    // A backfill is N runs; under `--require-approval run` each window is a
+    // change request of its own, proposed through POST /v1/changes (#703).
+    if state.requires_approval(crate::serve::changes::ChangeKind::Run) {
+        return Err(ServeError::Forbidden(
+            "this server requires an approved change request for runs (--require-approval run); \
+             propose each backfill window as a `run` change through POST /v1/changes"
+                .into(),
+        ));
+    }
     // A backfill fans out into one run per window unit, so a single completion
     // callback is ambiguous. Refuse it explicitly rather than dropping it: a
     // caller who set it would otherwise wait on a callback that never arrives.
@@ -222,6 +231,10 @@ pub async fn submit_backfill(
             idempotency_key: Some(format!("backfill:{hash}:{}", unit.id)),
             clock: Some(unit.start.to_rfc3339()),
             concurrency: None,
+            require_approval: false,
+            reason: None,
+            budget: None,
+            approved_change: None,
         };
         match runner::submit(state.clone(), submit, actor.clone()).await {
             Ok(resp) => {

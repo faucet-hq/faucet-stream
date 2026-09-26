@@ -486,6 +486,16 @@ async fn parquet_reads_by_row_group_and_whole_object() {
         )
         .await
         .unwrap();
+        let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+        source.set_roundtrip_recorder(std::sync::Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "gcs",
+            )
+            .with_meter(meter.clone()),
+        ));
         let ids: Vec<i64> = stream_all(&source)
             .await
             .iter()
@@ -494,6 +504,14 @@ async fn parquet_reads_by_row_group_and_whole_object() {
         assert_eq!(
             ids,
             (0..5).collect::<Vec<i64>>(),
+            "verify_checksum={verify_checksum}"
+        );
+        assert!(
+            meter
+                .snapshot()
+                .source_roundtrips
+                .get("get")
+                .is_some_and(|n| *n >= 1),
             "verify_checksum={verify_checksum}"
         );
         assert_eq!(

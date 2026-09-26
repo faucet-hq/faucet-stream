@@ -295,6 +295,33 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Vec<crate::serve::history::catalog::CatalogLineageEdge>, HistoryError> {
         via!(self, p => p.catalog_lineage(root, depth), f => f.catalog_lineage(root, depth))
     }
+    async fn change_upsert(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.change_upsert(change), f => f.change_upsert(change))
+    }
+    async fn change_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::serve::changes::ChangeRequest>, HistoryError> {
+        via!(self, p => p.change_get(id), f => f.change_get(id))
+    }
+    async fn change_list(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
+        via!(self, p => p.change_list(filter), f => f.change_list(filter))
+    }
+    async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
+        via!(self, p => p.usage_record(record), f => f.usage_record(record))
+    }
+    async fn usage_list(
+        &self,
+        filter: &crate::usage::UsageFilter,
+    ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
+        via!(self, p => p.usage_list(filter), f => f.usage_list(filter))
+    }
     async fn local_output_record(
         &self,
         obs: &crate::local_outputs::LocalOutputObservation,
@@ -511,6 +538,62 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
+    }
+
+    fn change(id: &str) -> crate::serve::changes::ChangeRequest {
+        use crate::serve::changes::*;
+        let now = chrono::Utc::now();
+        ChangeRequest {
+            id: id.into(),
+            kind: ChangeKind::Run,
+            status: ChangeStatus::Pending,
+            requester: "bob".into(),
+            requester_role: crate::serve::rbac::Role::Operator,
+            reason: None,
+            payload: serde_json::json!({}),
+            plan: None,
+            budget: None,
+            required_approvals: 1,
+            approvals: Vec::new(),
+            rejection: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now,
+            run_id: None,
+            template: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn defaults_are_inert_and_changes_and_usage_forward() {
+        let bare = AlwaysFail;
+        assert!(bare.change_upsert(&change("c0")).await.is_err());
+        assert!(bare.change_get("c0").await.unwrap().is_none());
+        assert!(
+            bare.change_list(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let usage = crate::usage::UsageFilter::default();
+        assert!(bare.usage_list(&usage).await.unwrap().is_empty());
+
+        let fb = FallbackHistory::healthy(Box::new(AlwaysFail), Duration::from_secs(60), "test");
+        assert!(fb.change_get("c1").await.unwrap().is_none());
+        assert!(
+            fb.change_list(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(fb.usage_list(&usage).await.unwrap().is_empty());
+        // The primary refuses the write, so the store trips and memory serves.
+        fb.change_upsert(&change("c1")).await.unwrap();
+        assert!(fb.degraded());
+        assert_eq!(fb.change_get("c1").await.unwrap().unwrap().id, "c1");
+        assert_eq!(fb.change_list(&Default::default()).await.unwrap().len(), 1);
+        assert!(fb.usage_list(&usage).await.unwrap().is_empty());
     }
 
     #[tokio::test]

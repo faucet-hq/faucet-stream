@@ -69,6 +69,12 @@ pub enum EventKind {
     /// A column's learned profile drifted from its baseline (#708), under
     /// `profiling.on_drift: notify` or `fail`. One event per finding.
     ProfileDrift,
+    /// A change request was proposed and awaits approval (#703). Emitted
+    /// through the proposed config's own `notifications:` block, so the
+    /// channels it names are the approvers'.
+    ChangeRequested,
+    /// A run crossed a `budget:` ceiling (#703) and was stopped.
+    BudgetExceeded,
 }
 
 impl EventKind {
@@ -83,6 +89,8 @@ impl EventKind {
             EventKind::DlqThreshold => "dlq_threshold",
             EventKind::SchedulerStuck => "scheduler_stuck",
             EventKind::ProfileDrift => "profile_drift",
+            EventKind::ChangeRequested => "change_requested",
+            EventKind::BudgetExceeded => "budget_exceeded",
         }
     }
 }

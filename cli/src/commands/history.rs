@@ -171,6 +171,7 @@ mod tests {
                 records_written: rows as usize,
                 duration_ms: 0,
                 error: None,
+                usage: None,
             }],
             error: (status == RunStatus::Failed).then(|| "boom".to_string()),
             idempotency_key: None,

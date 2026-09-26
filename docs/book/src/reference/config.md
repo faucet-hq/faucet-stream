@@ -1125,6 +1125,52 @@ otherwise, or when `metadata_columns.enabled` is `false`. `faucet run` prints
 each row's run id. See the [rollback cookbook](../cookbook/rollback.md).
 Schema: `faucet schema rollback`.
 
+## `usage`
+
+Cost & usage accounting (#704) — the pricing table estimates are computed
+from. Accounting itself is always on: every invocation reports records,
+estimated bytes, round trips and connector-reported cost signals, priced
+against these rates. Every rate has a shipped default (public list prices,
+USD).
+
+```yaml
+usage:
+  pricing_file: ./pricing.yaml       # optional; merged under the inline table
+  pricing:
+    currency: USD
+    egress_per_gb: 0                 # bytes read when source + sink are not both local files
+    object_storage: { read_per_1k_requests: 0.0004, write_per_1k_requests: 0.005 }
+    warehouse:
+      bigquery_per_tib_scanned: 6.25
+      bigquery_streaming_per_gib: 0.05
+      snowflake_per_credit: 3.0
+    hosted_elt_per_million_rows: 15  # the `hosted_equivalent` comparison rate
+```
+
+Recording across runs (for `faucet usage` / `GET /v1/usage`) rides the
+[`catalog`](#catalog) store or a `faucet serve` history backend. A config
+submitted to `faucet serve` may not set `pricing_file`. See the
+[usage cookbook](../cookbook/usage.md). Schema: `faucet schema usage`.
+
+## `budget`
+
+Run budgets (#703): hard ceilings on what one invocation may move.
+
+```yaml
+budget:
+  max_records: 1000000        # the page that would cross it is refused whole
+  max_bytes: 5368709120       # estimated bytes written, same rule
+  max_duration_secs: 1800     # cancels cooperatively at the next page boundary
+  allowed_sinks: [warehouse]  # sink template names / connector kinds; checked before anything runs
+```
+
+A refused page never lands and the bookmark stays put; the run fails with
+`budget_exceeded`. `faucet run --max-records / --max-bytes /
+--max-duration-secs / --allowed-sink` merge with the block (the stricter of
+each ceiling, the intersection of the sink lists). Applies to `run`,
+`schedule` and `serve`; a backfill is bounded by its window instead. See the
+[usage cookbook](../cookbook/usage.md#run-budgets). Schema: `faucet schema budget`.
+
 ## `notifications`
 
 *(requires the `notify` build feature)*
@@ -1132,7 +1178,7 @@ Schema: `faucet schema rollback`.
 A list of rules that fan pipeline lifecycle / health events out to Slack,
 PagerDuty, or a signed webhook. Events: `run_failure`, `run_success`,
 `sla_breach`, `circuit_open`, `contract_abort`, `dlq_threshold`,
-`scheduler_stuck`, `profile_drift`. Fires from every runtime; delivery never
+`scheduler_stuck`, `profile_drift`, `change_requested`, `budget_exceeded`. Fires from every runtime; delivery never
 fails a run.
 
 ```yaml
