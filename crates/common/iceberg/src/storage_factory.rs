@@ -4,7 +4,7 @@
 //! build `FileIO` in-process and need an explicit `StorageFactory`:
 //!
 //! - Local (`file://` / bare path) warehouses → `iceberg::io::LocalFsStorageFactory`.
-//! - Cloud (`s3://` / `s3a://` / `gs://`) warehouses → an [`OpendalPropInjector`]
+//! - Cloud (`s3://` / `s3a://` / `gs://`) warehouses → an `OpendalPropInjector`
 //!   wrapping `iceberg_storage_opendal::OpenDalStorageFactory`.
 //!
 //! The wrapper exists because `iceberg-catalog-sql` builds its `FileIO` with
@@ -86,7 +86,7 @@ fn cloud_factory_gcs(props: &HashMap<String, String>) -> Arc<dyn StorageFactory>
 /// - `s3://` / `s3a://` → OpenDAL S3 (scheme matched to the URI)
 /// - `gs://` → OpenDAL GCS
 /// - anything else → `FaucetError::Config`
-pub(crate) fn select_storage_factory(
+pub fn select_storage_factory(
     inner: &CatalogInner,
 ) -> Result<Arc<dyn StorageFactory>, FaucetError> {
     let warehouse = inner.warehouse.as_deref().unwrap_or("");

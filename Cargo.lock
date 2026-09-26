@@ -1047,6 +1047,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-dynamodbstreams"
+version = "1.105.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa698c295599dbbc026fcc4b1a2b140e9954a47c2a0de8b4b30693c31ed9b9a3"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.64.0",
+ "aws-smithy-json 0.63.0",
+ "aws-smithy-observability 0.3.0",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.4.1",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-glue"
 version = "1.145.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2543,7 +2569,7 @@ dependencies = [
  "anstream",
  "anstyle",
  "clap_lex",
- "strsim",
+ "strsim 0.11.1",
 ]
 
 [[package]]
@@ -3364,6 +3390,16 @@ dependencies = [
 
 [[package]]
 name = "darling"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a01d95850c592940db9b8194bc39f4bc0e89dee5c4265e4b1807c34a9aba453c"
+dependencies = [
+ "darling_core 0.13.4",
+ "darling_macro 0.13.4",
+]
+
+[[package]]
+name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
@@ -3384,6 +3420,20 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "859d65a907b6852c9361e3185c862aae7fafd2887876799fa55f5f99dc40d610"
+dependencies = [
+ "fnv",
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim 0.10.0",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "darling_core"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
@@ -3392,7 +3442,7 @@ dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
- "strsim",
+ "strsim 0.11.1",
  "syn 2.0.117",
 ]
 
@@ -3405,8 +3455,19 @@ dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
- "strsim",
+ "strsim 0.11.1",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "darling_macro"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c972679f83bdf9c42bd905396b6c3588a843a17f0f16dfcfa3e2c5d57441835"
+dependencies = [
+ "darling_core 0.13.4",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -4416,8 +4477,10 @@ dependencies = [
  "faucet-sink-bigquery",
  "faucet-sink-clickhouse",
  "faucet-sink-csv",
+ "faucet-sink-databricks",
  "faucet-sink-delta",
  "faucet-sink-duckdb",
+ "faucet-sink-dynamodb",
  "faucet-sink-elasticsearch",
  "faucet-sink-gcs",
  "faucet-sink-http",
@@ -4429,6 +4492,7 @@ dependencies = [
  "faucet-sink-mssql",
  "faucet-sink-mysql",
  "faucet-sink-nats",
+ "faucet-sink-oracle",
  "faucet-sink-parquet",
  "faucet-sink-postgres",
  "faucet-sink-pubsub",
@@ -4449,10 +4513,12 @@ dependencies = [
  "faucet-source-databricks",
  "faucet-source-delta",
  "faucet-source-duckdb",
+ "faucet-source-dynamodb",
  "faucet-source-elasticsearch",
  "faucet-source-gcs",
  "faucet-source-graphql",
  "faucet-source-grpc",
+ "faucet-source-iceberg",
  "faucet-source-kafka",
  "faucet-source-kinesis",
  "faucet-source-mongodb",
@@ -4462,6 +4528,8 @@ dependencies = [
  "faucet-source-mysql",
  "faucet-source-mysql-cdc",
  "faucet-source-nats",
+ "faucet-source-oracle",
+ "faucet-source-oracle-cdc",
  "faucet-source-parquet",
  "faucet-source-postgres",
  "faucet-source-postgres-cdc",
@@ -4563,6 +4631,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-common-databricks"
+version = "1.0.0"
+dependencies = [
+ "faucet-auth",
+ "faucet-core",
+ "reqwest 0.13.3",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "faucet-common-delta"
 version = "1.0.6"
 dependencies = [
@@ -4576,6 +4659,23 @@ dependencies = [
  "serde_json",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "faucet-common-dynamodb"
+version = "1.0.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
+ "base64 0.22.1",
+ "faucet-core",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4603,6 +4703,24 @@ dependencies = [
  "tokio",
  "urlencoding",
  "wiremock",
+]
+
+[[package]]
+name = "faucet-common-iceberg"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
+ "iceberg",
+ "iceberg-catalog-glue",
+ "iceberg-catalog-hms",
+ "iceberg-catalog-rest",
+ "iceberg-catalog-sql",
+ "iceberg-storage-opendal",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "typetag",
 ]
 
 [[package]]
@@ -4673,6 +4791,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "faucet-common-oracle"
+version = "1.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "faucet-core",
+ "oracle",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4953,6 +5086,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-sink-databricks"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "faucet-common-databricks",
+ "faucet-conformance",
+ "faucet-core",
+ "futures",
+ "object_store",
+ "parquet",
+ "reqwest 0.13.3",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "faucet-sink-delta"
 version = "1.1.5"
 dependencies = [
@@ -4987,6 +5142,26 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "faucet-sink-dynamodb"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "aws-sdk-dynamodb",
+ "faucet-common-dynamodb",
+ "faucet-conformance",
+ "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -5058,13 +5233,11 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "bytes",
+ "faucet-common-iceberg",
  "faucet-conformance",
  "faucet-core",
  "futures",
  "iceberg",
- "iceberg-catalog-glue",
- "iceberg-catalog-hms",
- "iceberg-catalog-rest",
  "iceberg-catalog-sql",
  "iceberg-storage-opendal",
  "parquet",
@@ -5217,6 +5390,24 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faucet-sink-oracle"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "faucet-common-oracle",
+ "faucet-conformance",
+ "faucet-core",
+ "faucet-source-oracle",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "testcontainers",
  "tokio",
  "tracing",
 ]
@@ -5578,6 +5769,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
+ "faucet-common-databricks",
  "faucet-conformance",
  "faucet-core",
  "futures",
@@ -5629,6 +5821,28 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "faucet-source-dynamodb"
+version = "1.0.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
+ "faucet-common-dynamodb",
+ "faucet-conformance",
+ "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -5722,6 +5936,33 @@ dependencies = [
  "tonic 0.13.1",
  "tonic-build 0.13.1",
  "tracing",
+]
+
+[[package]]
+name = "faucet-source-iceberg"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "faucet-common-iceberg",
+ "faucet-conformance",
+ "faucet-core",
+ "faucet-sink-iceberg",
+ "futures",
+ "iceberg",
+ "iceberg-catalog-sql",
+ "parquet",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5913,6 +6154,43 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faucet-source-oracle"
+version = "1.0.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "faucet-common-oracle",
+ "faucet-conformance",
+ "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "faucet-source-oracle-cdc"
+version = "1.0.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "faucet-common-oracle",
+ "faucet-conformance",
+ "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "testcontainers",
  "tokio",
  "tracing",
 ]
@@ -6349,10 +6627,13 @@ dependencies = [
  "faucet-common-azure",
  "faucet-common-bigquery",
  "faucet-common-clickhouse",
+ "faucet-common-databricks",
+ "faucet-common-dynamodb",
  "faucet-common-gcs",
  "faucet-common-kafka",
  "faucet-common-kinesis",
  "faucet-common-nats",
+ "faucet-common-oracle",
  "faucet-common-pubsub",
  "faucet-common-rabbitmq",
  "faucet-common-redshift",
@@ -6366,8 +6647,10 @@ dependencies = [
  "faucet-sink-bigquery",
  "faucet-sink-clickhouse",
  "faucet-sink-csv",
+ "faucet-sink-databricks",
  "faucet-sink-delta",
  "faucet-sink-duckdb",
+ "faucet-sink-dynamodb",
  "faucet-sink-elasticsearch",
  "faucet-sink-gcs",
  "faucet-sink-http",
@@ -6379,6 +6662,7 @@ dependencies = [
  "faucet-sink-mssql",
  "faucet-sink-mysql",
  "faucet-sink-nats",
+ "faucet-sink-oracle",
  "faucet-sink-parquet",
  "faucet-sink-postgres",
  "faucet-sink-pubsub",
@@ -6399,10 +6683,12 @@ dependencies = [
  "faucet-source-databricks",
  "faucet-source-delta",
  "faucet-source-duckdb",
+ "faucet-source-dynamodb",
  "faucet-source-elasticsearch",
  "faucet-source-gcs",
  "faucet-source-graphql",
  "faucet-source-grpc",
+ "faucet-source-iceberg",
  "faucet-source-kafka",
  "faucet-source-kinesis",
  "faucet-source-mongodb",
@@ -6412,6 +6698,8 @@ dependencies = [
  "faucet-source-mysql",
  "faucet-source-mysql-cdc",
  "faucet-source-nats",
+ "faucet-source-oracle",
+ "faucet-source-oracle-cdc",
  "faucet-source-parquet",
  "faucet-source-postgres",
  "faucet-source-postgres-cdc",
@@ -9444,7 +9732,7 @@ dependencies = [
  "sha2 0.10.9",
  "socket2 0.6.3",
  "stringprep",
- "strsim",
+ "strsim 0.11.1",
  "take_mut",
  "thiserror 2.0.18",
  "tokio",
@@ -9982,6 +10270,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "odpic-sys"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "920b5474a5128a9f0232df5a0ffc50aaa5b077b29b8b06ab0131985ac82793ed"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10307,6 +10604,33 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "oracle"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db40fe6e4df881b683691ade5ef1f7b1afd52aefa115581f7b92855524d7ec0"
+dependencies = [
+ "cc",
+ "chrono",
+ "odpic-sys",
+ "once_cell",
+ "oracle_procmacro",
+ "paste",
+ "rustversion",
+]
+
+[[package]]
+name = "oracle_procmacro"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad247f3421d57de56a0d0408d3249d4b1048a522be2013656d92f022c3d8af27"
+dependencies = [
+ "darling 0.13.4",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
 
 [[package]]
 name = "ordered-float"
@@ -14087,6 +14411,12 @@ dependencies = [
 
 [[package]]
 name = "strsim"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
+
+[[package]]
+name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
@@ -16120,7 +16450,7 @@ checksum = "5f2ab60e120fd6eaa68d9567f3226e876684639d22a4219b313ff69ec0ccd5ac"
 dependencies = [
  "log",
  "ordered-float 4.6.0",
- "strsim",
+ "strsim 0.11.1",
  "thiserror 1.0.69",
  "wezterm-dynamic-derive",
 ]

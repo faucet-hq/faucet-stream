@@ -52,7 +52,9 @@ test that never talks to a database. The integration gate closes that: code in
 `crates/{source,sink,common,state}/*/src/` (except `config.rs`),
 `cli/src/serve/`, `cli/src/executor.rs`, `cli/src/templates/` and `cli/src/hub/`
 must run in a test against a real backend (a testcontainer, `wiremock`, or an
-emulator). Lines inside `#[cfg(test)]` modules are not counted — they cannot run
+emulator). Lines inside `#[cfg(test)]` modules — inline blocks and whole files
+declared as `#[cfg(test)] mod name;` (and anything nested under them) — are not
+counted — they cannot run
 in an integration binary.
 
 **The escape hatch.** When a change genuinely cannot be tested against a backend

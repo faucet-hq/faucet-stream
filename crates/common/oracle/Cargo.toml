@@ -1,0 +1,34 @@
+[package]
+name = "faucet-common-oracle"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Oracle Database connection, TLS and auth types for the faucet-stream Oracle connectors"
+readme = "README.md"
+keywords = ["oracle", "database", "sql", "etl", "faucet"]
+categories.workspace = true
+
+[dependencies]
+faucet-core.workspace = true
+oracle = { workspace = true, features = ["chrono"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+chrono.workspace = true
+base64.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

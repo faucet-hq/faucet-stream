@@ -531,6 +531,42 @@ pub async fn build_source(
             }
             Ok(Box::new(s))
         }
+        #[cfg(feature = "source-iceberg")]
+        "iceberg" => {
+            let cfg =
+                decode::<faucet_source_iceberg::IcebergSourceConfig>("source", "iceberg", config)?;
+            Ok(Box::new(
+                faucet_source_iceberg::IcebergSource::new(cfg).await?,
+            ))
+        }
+        #[cfg(feature = "source-dynamodb")]
+        "dynamodb" => {
+            let cfg = decode::<faucet_source_dynamodb::DynamoDbSourceConfig>(
+                "source", "dynamodb", config,
+            )?;
+            Ok(Box::new(
+                faucet_source_dynamodb::DynamoDbSource::new(cfg).await?,
+            ))
+        }
+        #[cfg(feature = "source-oracle")]
+        "oracle" => {
+            let cfg =
+                decode::<faucet_source_oracle::OracleSourceConfig>("source", "oracle", config)?;
+            Ok(Box::new(
+                faucet_source_oracle::OracleSource::new(cfg).await?,
+            ))
+        }
+        #[cfg(feature = "source-oracle-cdc")]
+        "oracle-cdc" => {
+            let cfg = decode::<faucet_source_oracle_cdc::OracleCdcSourceConfig>(
+                "source",
+                "oracle-cdc",
+                config,
+            )?;
+            Ok(Box::new(
+                faucet_source_oracle_cdc::OracleCdcSource::new(cfg).await?,
+            ))
+        }
         #[cfg(feature = "source-gcs")]
         "gcs" => {
             let cfg = decode::<faucet_source_gcs::GcsSourceConfig>("source", "gcs", config)?;
@@ -812,6 +848,32 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
                 faucet_sink_azure_blob::AzureBlobSink::new(cfg).await?,
             ))
         }
+        #[cfg(feature = "sink-dynamodb")]
+        "dynamodb" => {
+            let cfg =
+                decode::<faucet_sink_dynamodb::DynamoDbSinkConfig>("sink", "dynamodb", config)?;
+            Ok(Box::new(
+                faucet_sink_dynamodb::DynamoDbSink::new(cfg).await?,
+            ))
+        }
+        #[cfg(feature = "sink-databricks")]
+        "databricks" => {
+            let cfg = decode::<faucet_sink_databricks::DatabricksSinkConfig>(
+                "sink",
+                "databricks",
+                config,
+            )?;
+            let mut s = faucet_sink_databricks::DatabricksSink::new(cfg)?;
+            if let Some(name) = &auth_ref {
+                s = s.with_auth_provider(auth_catalog::resolve(auth, name)?);
+            }
+            Ok(Box::new(s))
+        }
+        #[cfg(feature = "sink-oracle")]
+        "oracle" => {
+            let cfg = decode::<faucet_sink_oracle::OracleSinkConfig>("sink", "oracle", config)?;
+            Ok(Box::new(faucet_sink_oracle::OracleSink::new(cfg).await?))
+        }
         other => Err(unknown(other, "sink", sink_kinds())),
     }
 }
@@ -828,6 +890,7 @@ pub const EXACTLY_ONCE_SOURCE_KINDS: &[&str] = &[
     "mssql-cdc",
     "mongodb-cdc",
     "kafka",
+    "oracle-cdc",
 ];
 
 /// Sink connector kinds that can durably commit a token atomically with data.
@@ -846,6 +909,8 @@ pub const IDEMPOTENT_SINK_KINDS: &[&str] = &[
     "redis",
     "mongodb",
     "spanner",
+    "databricks",
+    "oracle",
 ];
 
 /// Sink kinds that can apply additive/widening DDL via `Sink::evolve_schema`.
@@ -861,6 +926,8 @@ pub const SCHEMA_EVOLUTION_SINK_KINDS: &[&str] = &[
     "elasticsearch",
     "spanner",
     "iceberg",
+    "databricks",
+    "oracle",
 ];
 
 /// Sink kinds that support `write_mode: upsert|delete`. Mirrors each sink's
@@ -875,6 +942,9 @@ pub const UPSERT_SINK_KINDS: &[&str] = &[
     "elasticsearch",
     "bigquery",
     "spanner",
+    "dynamodb",
+    "databricks",
+    "oracle",
 ];
 
 /// Sink kinds that implement scoped cleanup (`Sink::cleanup_scope`, #478) —
@@ -914,6 +984,8 @@ pub const OVERWRITE_SINK_KINDS: &[&str] = &[
     // elasticsearch overwrites via an atomic alias swap (#494) rather than a
     // staging-table swap, but exposes the same begin/commit/abort lifecycle.
     "elasticsearch",
+    "databricks",
+    "oracle",
 ];
 
 /// Whether a sink kind supports `write_mode: overwrite`.
@@ -957,8 +1029,14 @@ pub fn sink_supports_direct_overwrite(kind: &str) -> bool {
 /// (`staging:` blocks, #528). The load SQL/URL generators are unit-tested; the
 /// server-side execution is not exercised in CI (no live warehouse + object
 /// store), same as Redshift/Snowflake/BigQuery.
-pub const STAGED_LOAD_SINK_KINDS: &[&str] =
-    &["redshift", "snowflake", "bigquery", "clickhouse", "mssql"];
+pub const STAGED_LOAD_SINK_KINDS: &[&str] = &[
+    "redshift",
+    "snowflake",
+    "bigquery",
+    "clickhouse",
+    "mssql",
+    "databricks",
+];
 
 /// Whether a sink kind supports staged bulk load. See [`STAGED_LOAD_SINK_KINDS`].
 pub fn sink_supports_staged_load(kind: &str) -> bool {
@@ -980,6 +1058,9 @@ pub const DISCOVER_SOURCE_KINDS: &[&str] = &[
     "spanner",
     "s3",
     "gcs",
+    "iceberg",
+    "dynamodb",
+    "oracle",
 ];
 
 /// Whether a source kind supports `faucet discover` (dataset introspection).
@@ -1481,6 +1562,34 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
             config,
             |c| c.validate(),
         ),
+        #[cfg(feature = "source-iceberg")]
+        "iceberg" => check_with::<faucet_source_iceberg::IcebergSourceConfig, _, _>(
+            "iceberg",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-dynamodb")]
+        "dynamodb" => check_with::<faucet_source_dynamodb::DynamoDbSourceConfig, _, _>(
+            "dynamodb",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-oracle")]
+        "oracle" => check_with::<faucet_source_oracle::OracleSourceConfig, _, _>(
+            "oracle",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "source-oracle-cdc")]
+        "oracle-cdc" => check_with::<faucet_source_oracle_cdc::OracleCdcSourceConfig, _, _>(
+            "oracle-cdc",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "source-gcs")]
         "gcs" => check_with::<faucet_source_gcs::GcsSourceConfig, _, _>("gcs", name, config, |c| {
             c.validate()
@@ -1689,6 +1798,26 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
         "azure-blob" => {
             check::<faucet_sink_azure_blob::AzureBlobSinkConfig>("azure-blob", name, config)
         }
+        #[cfg(feature = "sink-dynamodb")]
+        "dynamodb" => check_with::<faucet_sink_dynamodb::DynamoDbSinkConfig, _, _>(
+            "dynamodb",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-databricks")]
+        "databricks" => check_with::<faucet_sink_databricks::DatabricksSinkConfig, _, _>(
+            "databricks",
+            name,
+            config,
+            |c| c.validate(),
+        ),
+        #[cfg(feature = "sink-oracle")]
+        "oracle" => {
+            check_with::<faucet_sink_oracle::OracleSinkConfig, _, _>("oracle", name, config, |c| {
+                c.validate()
+            })
+        }
         other => Err(unknown(other, "sink", sink_kinds())),
     }
 }
@@ -1760,6 +1889,14 @@ pub fn source_schema(kind: &str) -> CliResult<Value> {
         "delta" => Ok(schema::<faucet_source_delta::DeltaSourceConfig>()),
         #[cfg(feature = "source-databricks")]
         "databricks" => Ok(schema::<faucet_source_databricks::DatabricksSourceConfig>()),
+        #[cfg(feature = "source-iceberg")]
+        "iceberg" => Ok(schema::<faucet_source_iceberg::IcebergSourceConfig>()),
+        #[cfg(feature = "source-dynamodb")]
+        "dynamodb" => Ok(schema::<faucet_source_dynamodb::DynamoDbSourceConfig>()),
+        #[cfg(feature = "source-oracle")]
+        "oracle" => Ok(schema::<faucet_source_oracle::OracleSourceConfig>()),
+        #[cfg(feature = "source-oracle-cdc")]
+        "oracle-cdc" => Ok(schema::<faucet_source_oracle_cdc::OracleCdcSourceConfig>()),
         #[cfg(feature = "source-gcs")]
         "gcs" => Ok(schema::<faucet_source_gcs::GcsSourceConfig>()),
         #[cfg(feature = "source-bigquery")]
@@ -1856,6 +1993,12 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         "clickhouse" => Ok(schema::<faucet_sink_clickhouse::ClickHouseSinkConfig>()),
         #[cfg(feature = "sink-azure-blob")]
         "azure-blob" => Ok(schema::<faucet_sink_azure_blob::AzureBlobSinkConfig>()),
+        #[cfg(feature = "sink-dynamodb")]
+        "dynamodb" => Ok(schema::<faucet_sink_dynamodb::DynamoDbSinkConfig>()),
+        #[cfg(feature = "sink-databricks")]
+        "databricks" => Ok(schema::<faucet_sink_databricks::DatabricksSinkConfig>()),
+        #[cfg(feature = "sink-oracle")]
+        "oracle" => Ok(schema::<faucet_sink_oracle::OracleSinkConfig>()),
         other => Err(unknown(other, "sink", sink_kinds())),
     }
 }
@@ -1982,6 +2125,14 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push(("delta", "Apache Delta Lake source (local FS or S3/Azure/GCS). Streams active data files with time travel and projection pushdown."));
     #[cfg(feature = "source-databricks")]
     v.push(("databricks", "Databricks SQL query source (Statement Execution API). Streams typed query results with chunk pagination and incremental replication."));
+    #[cfg(feature = "source-iceberg")]
+    v.push(("iceberg", "Apache Iceberg table source (REST/Glue/SQL/HMS catalogs). Projection and filter pushdown, snapshot time travel, and incremental snapshot reads."));
+    #[cfg(feature = "source-dynamodb")]
+    v.push(("dynamodb", "Amazon DynamoDB source — parallel Scan, Query, or DynamoDB Streams change capture with resumable shard bookmarks."));
+    #[cfg(feature = "source-oracle")]
+    v.push(("oracle", "Oracle Database query source (ODPI-C session pool). Streams rows with incremental replication, PK-range sharding and discovery; needs Oracle Instant Client at runtime."));
+    #[cfg(feature = "source-oracle-cdc")]
+    v.push(("oracle-cdc", "Oracle CDC source via LogMiner. Committed-transaction change events with SCN bookmarks (exactly-once capable); needs Oracle Instant Client at runtime."));
     #[cfg(feature = "source-gcs")]
     v.push((
         "gcs",
@@ -2105,6 +2256,21 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push((
         "azure-blob",
         "Azure Blob Storage / ADLS Gen2 sink — JSONL files",
+    ));
+    #[cfg(feature = "sink-dynamodb")]
+    v.push((
+        "dynamodb",
+        "Amazon DynamoDB sink — batched writes, upsert/delete by key, conditional writes",
+    ));
+    #[cfg(feature = "sink-databricks")]
+    v.push((
+        "databricks",
+        "Databricks SQL warehouse sink — append/upsert/delete/overwrite into Delta tables, exactly-once, schema evolution, staged COPY INTO",
+    ));
+    #[cfg(feature = "sink-oracle")]
+    v.push((
+        "oracle",
+        "Oracle Database sink — array-bound inserts, MERGE upsert/delete, overwrite, exactly-once, schema evolution (needs Oracle Instant Client at runtime)",
     ));
     v
 }
@@ -2880,6 +3046,109 @@ mod tests {
         }
         // jsonl supports neither upsert nor overwrite.
         assert!(!sink_supports_overwrite("jsonl"));
+    }
+
+    #[test]
+    fn connectors_710_713_capability_allowlists() {
+        use faucet_core::{SinkGuarantee, WriteMode};
+        assert_eq!(
+            sink_supported_write_modes("dynamodb"),
+            &[WriteMode::Append, WriteMode::Upsert, WriteMode::Delete]
+        );
+        assert!(!sink_supports_overwrite("dynamodb"));
+        assert!(!sink_supports_idempotent_writes("dynamodb"));
+        assert!(!sink_supports_schema_evolution("dynamodb"));
+        assert!(!sink_supports_cleanup("dynamodb"));
+        assert_eq!(sink_guarantee("dynamodb"), SinkGuarantee::KeyedUpsert);
+
+        assert_eq!(
+            sink_supported_write_modes("databricks"),
+            &[
+                WriteMode::Append,
+                WriteMode::Upsert,
+                WriteMode::Delete,
+                WriteMode::Overwrite
+            ]
+        );
+        assert!(sink_supports_idempotent_writes("databricks"));
+        assert!(sink_supports_schema_evolution("databricks"));
+        assert!(sink_supports_staged_load("databricks"));
+        assert!(!sink_supports_cleanup("databricks"));
+
+        for k in ["iceberg", "dynamodb"] {
+            assert!(source_supports_discover(k), "{k} discovers");
+            assert!(!source_supports_exactly_once(k), "{k} is not exactly-once");
+        }
+
+        assert!(source_supports_exactly_once("oracle-cdc"));
+        assert!(!source_supports_exactly_once("oracle"));
+        assert!(source_supports_discover("oracle"));
+        assert_eq!(
+            sink_supported_write_modes("oracle"),
+            &[
+                WriteMode::Append,
+                WriteMode::Upsert,
+                WriteMode::Delete,
+                WriteMode::Overwrite
+            ]
+        );
+        assert!(sink_supports_idempotent_writes("oracle"));
+        assert!(sink_supports_schema_evolution("oracle"));
+        assert!(!sink_supports_cleanup("oracle"));
+    }
+
+    #[cfg(feature = "sink-databricks")]
+    #[tokio::test]
+    async fn databricks_registry_sink_builds_with_auth_ref() {
+        assert!(sink_schema("databricks").is_ok());
+        assert!(sink_kinds().contains(&"databricks"));
+        let mut specs = std::collections::HashMap::new();
+        specs.insert(
+            "dbx".to_string(),
+            serde_json::json!({"type": "static", "config": {"token": "abc"}}),
+        );
+        let catalog = auth_catalog::build_auth_catalog(Some(&specs)).expect("catalog");
+        let cfg = serde_json::json!({
+            "workspace_url": "https://x.cloud.databricks.com",
+            "warehouse_id": "w",
+            "auth": { "ref": "dbx" },
+            "schema": "s",
+            "table": "t",
+        });
+        validate_sink_config("databricks", "row", cfg.clone()).expect("valid databricks config");
+        let sink = build_sink("databricks", cfg, &catalog)
+            .await
+            .expect("databricks sink builds");
+        assert_eq!(sink.connector_name(), "databricks");
+        assert!(sink.supports_idempotent_writes());
+    }
+
+    #[cfg(all(
+        feature = "source-iceberg",
+        feature = "source-dynamodb",
+        feature = "sink-dynamodb"
+    ))]
+    #[test]
+    fn iceberg_and_dynamodb_are_registered() {
+        assert!(source_schema("iceberg").is_ok());
+        assert!(source_schema("dynamodb").is_ok());
+        assert!(sink_schema("dynamodb").is_ok());
+        assert!(source_kinds().contains(&"iceberg"));
+        assert!(source_kinds().contains(&"dynamodb"));
+        assert!(sink_kinds().contains(&"dynamodb"));
+        let err = validate_sink_config(
+            "dynamodb",
+            "row",
+            serde_json::json!({"table_name": "t", "write_mode": "overwrite"}),
+        )
+        .expect_err("dynamodb rejects overwrite");
+        assert!(err.to_string().contains("overwrite"), "{err}");
+        validate_source_config(
+            "dynamodb",
+            "row",
+            serde_json::json!({"table_name": "t", "mode": "scan"}),
+        )
+        .expect("scan config is valid");
     }
 
     #[test]

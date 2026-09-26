@@ -1,0 +1,49 @@
+# Mirror APP.ORDERS from Oracle into PostgreSQL: a bulk snapshot, then LogMiner
+# change capture from the SCN captured before the snapshot started.
+# Run with:  faucet mirror cli/examples/oracle_cdc_mirror_to_postgres.yaml
+#
+# Needs `--features source-oracle,source-oracle-cdc,sink-postgres`, Oracle
+# Instant Client on the library path, and a database in ARCHIVELOG mode with
+# supplemental logging on the captured table (see the oracle-cdc README).
+version: 1
+name: orders_oracle_mirror
+
+pipeline:
+  source:
+    type: oracle-cdc
+    config:
+      host: localhost
+      port: 1521
+      service_name: FREEPDB1
+      username: cdc_user
+      password: cdc_user
+      tables: [APP.ORDERS]
+  transforms:
+    - type: cdc_unwrap                   # change envelope → flat row + __op marker
+      config: {}
+  sink:
+    type: postgres
+    config:
+      connection_url: postgres://faucet:faucet@localhost:5432/mirror
+      table_name: orders
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [ID]
+      delete_marker: { field: __op, values: [d] }
+  state:
+    type: file
+    config: { path: ./.faucet-state }
+
+mirror:
+  mode: snapshot_then_cdc
+  continuous: true
+  snapshot:
+    source:
+      type: oracle
+      config:
+        host: localhost
+        port: 1521
+        service_name: FREEPDB1
+        username: app
+        password: app
+        query: "SELECT * FROM APP.ORDERS"

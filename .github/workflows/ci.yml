@@ -201,6 +201,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      # The Oracle connectors (ODPI-C) load Instant Client at runtime; without it
+      # their integration tests skip and the integration-coverage gate fails.
+      - name: Cache Oracle Instant Client
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/oracle/instantclient-basiclite-linuxx64.zip
+          key: oracle-instantclient-basiclite-linuxx64-v1
+      - name: Install Oracle Instant Client
+        run: |
+          set -euo pipefail
+          zip="$HOME/.cache/oracle/instantclient-basiclite-linuxx64.zip"
+          if [ ! -s "$zip" ]; then
+            mkdir -p "$(dirname "$zip")"
+            curl -fsSL --retry 3 -o "$zip" \
+              https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+          fi
+          sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+          if [ ! -e /usr/lib/x86_64-linux-gnu/libaio.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
+            sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+          fi
+          sudo mkdir -p /opt/oracle
+          sudo unzip -qo "$zip" -d /opt/oracle
+          dir="$(ls -d /opt/oracle/instantclient_* | sort -V | tail -1)"
+          echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "Oracle Instant Client installed at $dir"
       - uses: Swatinem/rust-cache@v2
       - name: Run workspace tests
         # Integration tests boot Docker containers via testcontainers, whose
@@ -356,6 +381,11 @@ jobs:
           - source-parquet
           - source-delta
           - source-databricks
+          - source-iceberg
+          - "source-iceberg,source-iceberg-sql"
+          - source-dynamodb
+          - source-oracle
+          - source-oracle-cdc
           - source-gcs
           - source-bigquery
           - source-snowflake
@@ -392,6 +422,10 @@ jobs:
           - sink-pubsub
           - sink-clickhouse
           - sink-azure-blob
+          - sink-dynamodb
+          - sink-databricks
+          - sink-databricks-staging
+          - sink-oracle
           # Kafka extras
           - kafka-schema-registry
           # State-store backends
@@ -679,10 +713,12 @@ jobs:
           # unguarded. Restore the moment upstream yanks 1.2.0 or `deltalake`
           # moves to the `buoyant_kernel` 0.28 line that pairs with it.
           #
-          # The RabbitMQ crates (#561) are new and have no published baseline
-          # yet — cargo-semver-checks can only compare against a crates.io
-          # release. Drop them from this list once release-plz publishes 1.0.0.
-          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq
+          # The RabbitMQ (#561), Oracle (#710), Iceberg source (#711), DynamoDB
+          # (#712) and Databricks sink (#713) crates are new and have no
+          # published baseline yet — cargo-semver-checks can only compare
+          # against a crates.io release. Drop them from this list once
+          # release-plz publishes 1.0.0.
+          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq,faucet-common-oracle,faucet-source-oracle,faucet-source-oracle-cdc,faucet-sink-oracle,faucet-common-iceberg,faucet-source-iceberg,faucet-common-dynamodb,faucet-source-dynamodb,faucet-sink-dynamodb,faucet-common-databricks,faucet-sink-databricks
           # No `package:` — check the whole workspace. Gating only `faucet-core`
           # left 89 crates unguarded, so a genuine removal or signature change in
           # a connector could publish in a minor and break dependents silently
@@ -718,8 +754,20 @@ jobs:
             /usr/local/share/powershell \
             /usr/local/lib/node_modules \
             /usr/local/share/chromium \
-            /opt/microsoft
+            /opt/microsoft \
+            /usr/lib/jvm \
+            /usr/local/julia* \
+            /usr/share/miniconda \
+            /usr/local/share/vcpkg \
+            /usr/share/az_* \
+            /usr/lib/google-cloud-sdk \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/Ruby \
+            /opt/hostedtoolcache/node
           sudo apt-get clean
+          docker image prune -af >/dev/null || true
           df -h /
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -729,6 +777,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      # The Oracle connectors (ODPI-C) load Instant Client at runtime; without it
+      # their integration tests skip and the integration-coverage gate fails.
+      - name: Cache Oracle Instant Client
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/oracle/instantclient-basiclite-linuxx64.zip
+          key: oracle-instantclient-basiclite-linuxx64-v1
+      - name: Install Oracle Instant Client
+        run: |
+          set -euo pipefail
+          zip="$HOME/.cache/oracle/instantclient-basiclite-linuxx64.zip"
+          if [ ! -s "$zip" ]; then
+            mkdir -p "$(dirname "$zip")"
+            curl -fsSL --retry 3 -o "$zip" \
+              https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+          fi
+          sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+          if [ ! -e /usr/lib/x86_64-linux-gnu/libaio.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
+            sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+          fi
+          sudo mkdir -p /opt/oracle
+          sudo unzip -qo "$zip" -d /opt/oracle
+          dir="$(ls -d /opt/oracle/instantclient_* | sort -V | tail -1)"
+          echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "Oracle Instant Client installed at $dir"
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       # Cover unit + integration tests, and keep the integration-only share
@@ -748,6 +821,10 @@ jobs:
       - name: Collect coverage (integration, then unit)
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         env:
+          # Coverage mapping does not need DWARF; dropping debuginfo keeps the
+          # instrumented all-features build within the runner's disk.
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
           IGNORE_RE: '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
         run: |
           retry() {

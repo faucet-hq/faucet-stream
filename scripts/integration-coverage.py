@@ -102,11 +102,59 @@ def _block_end(lines: list[str], start: int) -> int:
     return len(lines) - 1
 
 
+def _parent_module_files(path: Path) -> list[Path]:
+    """Files that can declare the module stored at `path` (`mod <name>;`)."""
+    if path.name in ("lib.rs", "main.rs"):
+        return []
+    if path.name == "mod.rs":
+        name, folder = path.parent.name, path.parent.parent
+    else:
+        name, folder = path.stem, path.parent
+    if folder.name == "src":
+        return [folder / "lib.rs", folder / "main.rs"]
+    return [folder.parent / f"{folder.name}.rs", folder / "mod.rs"]
+
+
+def _declares_test_module(source: str, name: str) -> bool:
+    lines = source.splitlines()
+    decl = re.compile(rf"^\s*(pub(\([^)]*\))?\s+)?mod\s+{re.escape(name)}\s*;")
+    for i, line in enumerate(lines):
+        if not TEST_ATTR.match(line):
+            continue
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or lines[j].strip().startswith("#[")):
+            j += 1
+        if j < len(lines) and decl.match(lines[j]):
+            return True
+    return False
+
+
+def is_test_only_file(rel: str, _depth: int = 0) -> bool:
+    """A file compiled only under `cfg(test)`: its parent module declares it
+    with `#[cfg(test)] mod <name>;`, or the parent itself is test-only.
+    Integration binaries never compile such a file, like an inline test module."""
+    path = Path(rel)
+    name = path.parent.name if path.name == "mod.rs" else path.stem
+    for parent in _parent_module_files(path):
+        try:
+            source = parent.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _declares_test_module(source, name):
+            return True
+        if _depth < 8 and is_test_only_file(str(parent), _depth + 1):
+            return True
+    return False
+
+
 def _source_test_lines(rel: str) -> set[int]:
     try:
-        return test_module_lines(Path(rel).read_text(encoding="utf-8", errors="replace"))
+        source = Path(rel).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return set()
+    if is_test_only_file(rel):
+        return set(range(1, len(source.splitlines()) + 1))
+    return test_module_lines(source)
 
 
 def escape_reason(body: str | None) -> str | None:

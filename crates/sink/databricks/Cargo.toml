@@ -1,0 +1,52 @@
+[package]
+name = "faucet-sink-databricks"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Databricks SQL warehouse sink (COPY INTO, MERGE upsert, overwrite, exactly-once) for the faucet-stream ecosystem"
+readme = "README.md"
+keywords = ["databricks", "sql", "warehouse", "sink", "connector"]
+categories.workspace = true
+
+[features]
+# Cloud staging locations (s3:// / gs:// / abfss://), uploaded through
+# `object_store` with ambient credentials. Unity Catalog volume staging needs
+# no feature.
+staging = ["dep:object_store"]
+
+[dependencies]
+faucet-core.workspace = true
+faucet-common-databricks.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
+reqwest.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+object_store = { workspace = true, optional = true, features = ["aws", "gcp", "azure"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+wiremock = "0.6"
+serde_json.workspace = true
+schemars.workspace = true
+faucet-conformance.workspace = true
+bytes.workspace = true
+object_store.workspace = true
+futures.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides — additive evolution is a
+# MINOR bump (see CLAUDE.md "API-Evolution & Versioning Policy").
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

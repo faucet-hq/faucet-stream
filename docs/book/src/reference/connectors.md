@@ -1,6 +1,6 @@
 # Connector catalog
 
-faucet-stream ships **<!--COUNT:sources-->38<!--/COUNT--> sources** and **<!--COUNT:sinks-->30<!--/COUNT--> sinks**. Each is a Cargo feature
+faucet-stream ships **<!--COUNT:sources-->42<!--/COUNT--> sources** and **<!--COUNT:sinks-->33<!--/COUNT--> sinks**. Each is a Cargo feature
 (`source-<name>` / `sink-<name>`) and an independently published crate. Full API
 docs are on [docs.rs](https://docs.rs/faucet-stream).
 
@@ -33,6 +33,8 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | MySQL CDC | T1 ✅ | `source-mysql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | binlog row events, file/pos or GTID bookmarks |
 | Microsoft SQL Server | T1 ✅ | `source-mssql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query (tiberius), rows as JSON |
 | Microsoft SQL Server CDC | T1 ✅ | `source-mssql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | CDC change tables (`fn_cdc_get_all_changes`), LSN bookmarks, `__op`-normalized |
+| Oracle Database | T1 ✅ | `source-oracle` | ✓ | ✓ | ✗ | ✗ | ✓ | SQL query (ODPI-C), exact `NUMBER`/temporal typing, incremental `:bookmark` replication, PK-range sharding; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
+| Oracle CDC | T1 ✅ | `source-oracle-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | LogMiner over online + archived redo; committed transactions only, SCN bookmarks, `cdc_unwrap`-compatible envelopes; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
 | SQLite | T1 ✅ | `source-sqlite` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL query, rows as JSON |
 | DuckDB | T2 | `source-duckdb` | ✓ | ✗ | ✗ | ✗ | ✗ | SQL query (file or `:memory:`), rows as JSON; blocking-task + channel streaming |
 | AWS SQS | T2 | `source-sqs` | ✓ | ✗ | ✗ | ✗ | ✗ | long-poll ReceiveMessage, delete-after-emit (at-least-once), idle/max-messages termination |
@@ -55,6 +57,8 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | Apache Parquet | T1 ✅ | `source-parquet` | ✓ | ✗ | ✗ | ✗ | ✗ | local/glob/S3, vectorized Arrow reader, projection |
 | Apache Delta Lake | T1 ✅ | `source-delta` | ✓ | ✗ | ✗ | ✗ | ✗ | local FS or S3/Azure/GCS; time travel (version/timestamp), projection pushdown, partition reconstruction |
 | Databricks SQL | T1 ✅ᵐ | `source-databricks` | ✓ | ✓ | ✗ | ✗ | ✗ | Statement Execution API; async poll, chunk pagination, typed decode, incremental `${bookmark}` |
+| Apache Iceberg | T1 ✅ | `source-iceberg` | ✓ | ✓ | ✗ | ✗ | ✓ | REST/Glue/SQL/HMS catalog; Arrow scan with column projection + filter pushdown, snapshot / timestamp time travel, `mode: incremental` reads only snapshots appended since the bookmark; file-task sharding |
+| Amazon DynamoDB | T1 ✅ᵉ | `source-dynamodb` | ✓ | ✓ | ✗ | ✗ | ✓ | `mode: scan` (parallel segments, shardable) / `query` / `streams` (DynamoDB Streams change capture, per-shard sequence bookmarks, `__op` envelope; anchors a [`faucet mirror`](../cookbook/replication.md) handoff) |
 | Amazon Redshift | T1 ✅ | `source-redshift` | ✓ | ✓ | ✗ | ✗ | ✗ | PostgreSQL wire; SQL query, rows as JSON; incremental replication |
 | ClickHouse | T1 ✅ | `source-clickhouse` | ✓ | ✓ | ✗ | ✗ | ✗ | HTTP interface, `FORMAT JSONEachRow` streaming; incremental replication |
 | BigQuery | T1 ✅ᵐ | `source-bigquery` | ✓ | ✗ | ✗ | ✗ | ✓ | `jobs.query` + pageToken pagination |
@@ -101,15 +105,16 @@ individual tap — pair it with a keyed/upsert sink for clean, effectively-once
 > **ᵐ** marks a connector whose battery runs in CI against a **wiremock HTTP
 > mock**, not a live service instance — the `rest`, `graphql`, `xml`,
 > `elasticsearch`, `bigquery`, `snowflake`, and `databricks` sources and the
-> `http` sink. The mock faithfully drives the paging, schema, and error-handling
+> `http` and `databricks` sinks. The mock faithfully drives the paging, schema, and error-handling
 > behavior the checks assert, but it is not an end-to-end test against the real
 > system (no credentialed cloud/service backend runs in CI). **ᵉ** marks a
 > connector whose battery runs against an official **emulator** in Docker — a
 > real implementation, closer to end-to-end than a wiremock but still not the
 > managed service: the Cloud **Spanner** pair (Spanner emulator, gRPC), the
-> **Pub/Sub** source and sink (Pub/Sub emulator, gRPC), and the **Azure Blob**
-> sink (Azurite). Unmarked **T1 ✅** connectors run against a real backend with
-> no emulator caveat — a local filesystem (`delta`, `parquet`, `csv`), or a
+> **Pub/Sub** source and sink (Pub/Sub emulator, gRPC), the **DynamoDB** source
+> and sink (DynamoDB Local), and the **Azure Blob** sink (Azurite). Unmarked **T1 ✅** connectors run against a real backend with
+> no emulator caveat — a local filesystem (`delta`, `parquet`, `csv`, the
+> `iceberg` source over a SQLite catalog + local warehouse), or a
 > testcontainers-launched real server (`postgres`, `mysql`, `mongodb`, `redis`,
 > `clickhouse`, `kafka`, …).
 >
@@ -225,6 +230,7 @@ config this project treats as a defect.
 | ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
 | MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` |
 | Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |
+| Oracle Database | T1 ✅ | `sink-oracle` | ✓ | ✗ | **✓** | **✓** | array DML per page (per-row DLQ), keyed `MERGE` upsert / `DELETE`, `_faucet_commit_token` in the same transaction; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
 | SQLite | T1 ✅ | `sink-sqlite` | ✓ | ✗ | **✓** | **✓** | transaction-wrapped batch |
 | DuckDB | T2 | `sink-duckdb` | ✓ | ✗ | ✗ | ✗ | transaction-wrapped multi-row `INSERT` (JSON column or auto-mapped); append-only |
 | AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
@@ -247,6 +253,8 @@ config this project treats as a defect.
 | Apache Parquet | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | local/S3, schema inference (re-inferred per file on rollover), row/byte rollover |
 | Apache Delta Lake | T1 ✅ | `sink-delta` | ✓ | ✗⁶ | ✗ | ✗ | append-only; local FS or S3/Azure/GCS; schema-inferred table creation, partitioning, one commit per flush |
 | Apache Iceberg | T2 | `sink-iceberg` | ✓ | ✗⁶ | ✗ | **✓** | REST/Glue/SQL/HMS catalog, local + cloud (S3/GCS) warehouses, `fast_append` snapshot, Parquet data files |
+| Amazon DynamoDB | T1 ✅ᵉ | `sink-dynamodb` | ✓ | ✗ | **✓** | ✗ | `BatchWriteItem` (25 items / 16 MiB per request) with unprocessed-item retry, bounded concurrency; `write_mode: upsert\|delete` by the table key; optional `condition_expression` writes (`on_condition_failure`) |
+| Databricks SQL | T1 ✅ᵐ | `sink-databricks` | ✓ | ✗ | **✓** | **✓** | Statement Execution API into a Delta table: multi-row `INSERT` / `MERGE`, or staged `COPY INTO` (Unity Catalog volume, or `s3://`/`gs://`/`abfss://` with the `sink-databricks-staging` feature); per-token idempotent page write + commit-token table for effectively-once |
 
 ⁶ Parquet and Iceberg both handle compression internally at the Parquet column
 level, so the file-level `compression` feature doesn't apply to either.
@@ -257,10 +265,14 @@ Kafka sink uses a transactional producer that writes each page's records plus a
 commit-token record into a compacted side-topic in one Kafka transaction; the
 Snowflake sink runs one multi-statement `BEGIN;INSERT;MERGE;COMMIT` request; the
 Redis sink wraps the page plus a `_faucet_commit_token:<scope>` key in one
-`MULTI`/`EXEC`; the MongoDB sink commits the page plus a watermark document in
+`MULTI`/`EXEC`; the Databricks sink makes each page's write idempotent per token
+(`INSERT … REPLACE WHERE _faucet_scope/_faucet_seq`, or a keyed `MERGE`) and then
+advances a `_faucet_commit_token` Delta table, so a replayed page replaces its
+earlier attempt; the MongoDB sink commits the page plus a watermark document in
 one multi-document transaction (replica set required); the Cloud Spanner sink
 buffers the page's mutations plus a `faucet_commit_token` row in one
-read-write transaction. Sinks configured with
+read-write transaction; the Oracle sink upserts a `_faucet_commit_token`
+row in the page's transaction. Sinks configured with
 `write_mode: upsert` + `key` also reach effectively-once via keyed dedup, with
 any source. See
 [Effectively-once delivery](../cookbook/state.md#effectively-once-delivery).
@@ -268,19 +280,20 @@ any source. See
 delete by `key`) in addition to plain `append`. The SQL sinks require
 column-mapping mode (`auto_map`, or `auto_columns` for mssql) and a
 UNIQUE/PRIMARY KEY on `key`; the
-schemaless sinks (MongoDB, Elasticsearch) map `key` to a match filter / `_id`.
+schemaless sinks (MongoDB, Elasticsearch) map `key` to a match filter / `_id`;
+DynamoDB requires `key` to name the table's partition (+ sort) key; Databricks
+`MERGE`s on `key`.
 Iceberg upsert is not yet supported (a follow-up, blocked on `iceberg-rust`).
 `write_mode: overwrite` (full-refresh: atomically replace the whole
 destination each run) is additionally supported by **PostgreSQL, SQLite, MySQL,
-MSSQL, MongoDB, BigQuery, and Elasticsearch** (via an atomic alias swap — the
-configured `index` must be an alias) — not Spanner. See
+MSSQL, Oracle, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias
+swap — the configured `index` must be an alias) — not Spanner or DynamoDB. See
 [Upsert / mirror tables](../cookbook/upsert.md).
 
-Every sink in this column also supports **scoped cleanup**
-(`complete_for.on_missing: delete` on the source), which deletes destination rows
-inside the declared scope that a run did not write — the only way an incremental sync
-can remove records deleted at the source. The two sets are identical today, so
-there is no separate column; see
+Every sink in this column except **DynamoDB**, **Databricks** and **Oracle** also supports
+**scoped cleanup** (`complete_for.on_missing: delete` on the source), which deletes
+destination rows inside the declared scope that a run did not write — the only way
+an incremental sync can remove records deleted at the source; see
 [Removing records deleted at the source](../cookbook/upsert.md#removing-records-deleted-at-the-source-scoped-cleanup).
 
 ## Arrow columnar (Parquet) fast path
@@ -367,8 +380,10 @@ sinks can actually *act* on it varies:
 | `postgres`, `mysql`, `mssql`, `sqlite`, `bigquery` | **✓ evolve** — in-place additive/widening DDL |
 | `elasticsearch` | **✓ evolve** — can add fields only (existing-field type change is incompatible) |
 | `spanner` | **✓ evolve** — additive columns + NOT NULL relax; base-type widening is not supported by Spanner (use `allow_type_widening: false`) |
+| `oracle` | **✓ evolve** — `ADD` columns, widen integer `NUMBER`s to decimals, relax `NOT NULL` |
+| `databricks` | **✓ evolve** — `ALTER TABLE … ADD COLUMNS`, numeric widening to `DOUBLE` via Delta type widening (tinyint/smallint/int/float), and `DROP NOT NULL`; other widenings are incompatible |
 | `iceberg` | detect-only — `warn`/`ignore`/`fail`/`quarantine` work; `evolve` blocked on upstream `iceberg-rust` (#255) |
-| `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet` | — (schemaless; the `schema:` policy is inert) |
+| `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet`, `dynamodb` | — (schemaless; the `schema:` policy is inert) |
 
 `on_drift: evolve` against a detect-only or schemaless sink is rejected at
 config-load. See [Schema drift](../cookbook/schema-drift.md) for the per-sink
@@ -382,11 +397,15 @@ nuances (e.g. SQLite widening is a no-op; Elasticsearch can only add fields).
 | BigQuery | service-account key (path or inline JSON), application-default credentials |
 | Snowflake | JWT key-pair, OAuth |
 | Cloud Spanner | service-account key (path or inline JSON), application-default credentials |
+| Databricks | personal access token, OAuth bearer, or a shared `auth: { ref }` provider (OAuth2 M2M service principal) |
+| DynamoDB / Kinesis / SQS | AWS default chain, named profile, static access key, assume-role, web identity |
+| Iceberg | REST catalog bearer / OAuth2 credential; Glue / SQL / HMS catalog properties; warehouse object-store credentials via `catalog.properties` |
 | Kafka | SASL (PLAIN/SCRAM) + TLS |
 | WebSocket | none, Bearer token, Custom headers |
 | Elasticsearch | basic, API key, bearer, none |
 | S3 / GCS | cloud SDK credential chains (env, profile, metadata) |
 | SQL databases | connection URL (with embedded credentials / TLS params) |
+| Oracle | username/password with `connect_string` or `host` + `service_name`/`sid`; TLS via wallet (`tls`) |
 
 Inspect any connector's exact auth shape with `faucet schema source <name>` /
 `faucet schema sink <name>`.

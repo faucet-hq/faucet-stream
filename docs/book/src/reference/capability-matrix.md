@@ -7,12 +7,15 @@
 | Sink | Exactly-once (atomic watermark) | Upsert / delete | Schema evolution |
 |---|:---:|:---:|:---:|
 | `bigquery` | ✓ | ✓ | ✓ |
+| `databricks` | ✓ | ✓ | ✓ |
+| `dynamodb` |  | ✓ |  |
 | `elasticsearch` |  | ✓ | ✓ |
 | `iceberg` | ✓ |  | ✓ |
 | `kafka` | ✓ |  |  |
 | `mongodb` | ✓ | ✓ |  |
 | `mssql` | ✓ | ✓ | ✓ |
 | `mysql` | ✓ | ✓ | ✓ |
+| `oracle` | ✓ | ✓ | ✓ |
 | `postgres` | ✓ | ✓ | ✓ |
 | `redis` | ✓ |  |  |
 | `snowflake` | ✓ |  |  |
@@ -24,8 +27,10 @@
 | Source | Exactly-once replay | Dataset discovery |
 |---|:---:|:---:|
 | `bigquery` |  | ✓ |
+| `dynamodb` |  | ✓ |
 | `elasticsearch` |  | ✓ |
 | `gcs` |  | ✓ |
+| `iceberg` |  | ✓ |
 | `kafka` | ✓ |  |
 | `mongodb` |  | ✓ |
 | `mongodb-cdc` | ✓ |  |
@@ -33,6 +38,8 @@
 | `mssql-cdc` | ✓ |  |
 | `mysql` |  | ✓ |
 | `mysql-cdc` | ✓ |  |
+| `oracle` |  | ✓ |
+| `oracle-cdc` | ✓ |  |
 | `postgres` |  | ✓ |
 | `postgres-cdc` | ✓ |  |
 | `s3` |  | ✓ |
@@ -44,10 +51,11 @@
 
 A `delivery: exactly_once` pipeline needs a replayable source **and** an atomic-watermark sink. Every ✓ pair below composes; any other pairing must use the keyed-upsert alternative (`write_mode: upsert` + `key`).
 
-| source ↓ / sink → | `bigquery` | `iceberg` | `kafka` | `mongodb` | `mssql` | `mysql` | `postgres` | `redis` | `snowflake` | `spanner` | `sqlite` |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `kafka` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `mongodb-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `mssql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `mysql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `postgres-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| source ↓ / sink → | `bigquery` | `databricks` | `iceberg` | `kafka` | `mongodb` | `mssql` | `mysql` | `oracle` | `postgres` | `redis` | `snowflake` | `spanner` | `sqlite` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `kafka` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `mongodb-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `mssql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `mysql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `oracle-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `postgres-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

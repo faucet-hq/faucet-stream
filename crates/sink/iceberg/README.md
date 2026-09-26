@@ -336,12 +336,12 @@ sink.flush().await?;
 
 ## How it works
 
-1. `new()` validates the config, builds the configured catalog client, and either creates the table (inferring schema from the first batch) or loads an existing one.
+1. `new()` validates the config, builds the configured catalog client (catalog construction and the warehouse storage-factory selection live in [`faucet-common-iceberg`](https://crates.io/crates/faucet-common-iceberg), shared with [`faucet-source-iceberg`](https://crates.io/crates/faucet-source-iceberg)), and either creates the table (inferring schema from the first batch) or loads an existing one.
 2. `write_batch` shovels JSON → Arrow, buffers into the iceberg-rust rolling writer, and rolls a new Parquet data file when the estimated size crosses `target_file_size_mb`.
 3. `flush()` closes the open data file and commits all buffered files as one snapshot via `Transaction::fast_append`; the catalog client is reused across all calls.
 4. In effectively-once mode the pending `(scope, token)` is merged into that snapshot's summary properties so it commits atomically with the data.
 
-**Arrow / Parquet version note:** this crate links Arrow / Parquet **57** to match `iceberg-rust` 0.9.x, which pins the same major. This does not affect the workspace's other connectors — the Parquet source/sink use Arrow 58, and Cargo resolves both majors simultaneously.
+**Arrow / Parquet version note:** this crate links Arrow / Parquet **58**, the major `iceberg-rust` 0.10 pins — the same major as the rest of the workspace.
 
 ## Lineage dataset URI
 
@@ -356,6 +356,8 @@ sink.flush().await?;
 | `catalog-sql` | no | SQL-backed catalog (also enables `storage-opendal`). |
 | `catalog-hms` | no | Hive Metastore catalog (also enables `storage-opendal`). |
 | `storage-opendal` | no (auto) | OpenDAL S3/GCS/local warehouse storage factory for the non-REST catalogs. Auto-enabled by each non-REST catalog feature. |
+
+Each feature forwards to the same-named feature of `faucet-common-iceberg`, so the sink and `faucet-source-iceberg` gate catalogs identically.
 
 In the CLI/umbrella, the corresponding feature is `sink-iceberg` (REST), with `sink-iceberg-glue` / `sink-iceberg-sql` / `sink-iceberg-hms` forwarding the catalog features.
 
@@ -379,6 +381,7 @@ In the CLI/umbrella, the corresponding feature is `sink-iceberg` (REST), with `s
 - [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
 - [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery)
 - [Configuration grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html)
+- Read Iceberg tables back with [`faucet-source-iceberg`](https://crates.io/crates/faucet-source-iceberg) (same `catalog` block).
 - Related crates: [`faucet-sink-parquet`](https://crates.io/crates/faucet-sink-parquet), [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3), [`faucet-sink-bigquery`](https://crates.io/crates/faucet-sink-bigquery), [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc)
 
 ## License

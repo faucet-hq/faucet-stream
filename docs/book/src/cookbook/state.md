@@ -194,6 +194,14 @@ records and the token atomically inside its own transaction:
 - **MongoDB sink** — one multi-document transaction (replica set required)
   commits the page plus a `{_id: scope, token}` watermark document in the
   `_faucet_commit_token` collection.
+- **Oracle sink** — the page's array DML and a `MERGE` of `(scope, token)` into
+  `_faucet_commit_token` (created beside the target) commit in one transaction.
+- **Databricks sink** — Databricks SQL has no multi-table transaction, so the
+  page write is made idempotent per token instead: an append page is written
+  with one atomic `INSERT … REPLACE WHERE _faucet_scope = … AND _faucet_seq >= …`
+  (an upsert page with its keyed `MERGE`), then the watermark row is `MERGE`d
+  into `_faucet_commit_token`. A crash between the two replays the page under
+  the same sequence, which replaces the earlier attempt's rows.
 
 On the *next run*, the pipeline reads the sink's `last_committed_token` for the
 current scope. The token **embeds the committed page's bookmark**: when the
@@ -210,12 +218,12 @@ Only certain connectors are allowed in an effectively-once (`delivery: exactly_o
 
 | Role | Allowed connectors | Why others are excluded |
 |------|--------------------|------------------------|
-| Source | `postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, `kafka` | The source must emit a complete resume position (bookmark) on every page, over an immutable log, so resuming from a bookmark continues the record stream at exactly that position. Query-based sources (REST, SQL query, etc.) can return different data on replay — the pipeline would silently skip records it never wrote. |
-| Sink | `sqlite`, `postgres`, `mysql`, `mssql`, `iceberg`, `bigquery`, `kafka`, `snowflake`, `redis`, `mongodb`, `spanner` | The sink must be able to commit data and a watermark token atomically in a single transaction or snapshot. Sinks without transaction support cannot provide this guarantee (they can still reach effectively-once via keyed upsert, below). The MongoDB sink requires a replica set (or sharded cluster) — multi-document transactions are unavailable on a standalone server. |
+| Source | `postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, `oracle-cdc`, `kafka` | The source must emit a complete resume position (bookmark) on every page, over an immutable log, so resuming from a bookmark continues the record stream at exactly that position. Query-based sources (REST, SQL query, etc.) can return different data on replay — the pipeline would silently skip records it never wrote. |
+| Sink | `sqlite`, `postgres`, `mysql`, `mssql`, `iceberg`, `bigquery`, `kafka`, `snowflake`, `redis`, `mongodb`, `spanner`, `databricks`, `oracle` | The sink must be able to commit data and a watermark token atomically in a single transaction or snapshot. Sinks without transaction support cannot provide this guarantee (they can still reach effectively-once via keyed upsert, below). The MongoDB sink requires a replica set (or sharded cluster) — multi-document transactions are unavailable on a standalone server. |
 
 **Keyed upsert relaxes the source restriction entirely**: any source feeding an
 upsert-capable sink (`postgres`, `sqlite`, `mysql`, `mssql`, `mongodb`,
-`elasticsearch`, `bigquery`, `spanner`) configured with `write_mode: upsert` + `key` is
+`elasticsearch`, `bigquery`, `spanner`, `dynamodb`, `databricks`, `oracle`) configured with `write_mode: upsert` + `key` is
 accepted under `delivery: exactly_once` and reported as
 `effectively-once (keyed upsert)`. There is no watermark in this mode — the
 idempotence comes from the sink converging on the keyed row.

@@ -162,28 +162,6 @@
         }
       ]
     },
-    "usage": {
-      "description": "Optional cost & usage accounting settings (#704): the pricing table\nestimates are computed from (`pricing_file` / inline `pricing`).\nAccounting itself is always on — every invocation reports records,\nestimated bytes, round trips and connector-reported cost signals; this\nblock only changes the rates the estimate uses. See `faucet schema usage`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/UsageSpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "budget": {
-      "description": "Optional run budget (#703): hard ceilings on what one invocation may\nmove — `max_records`, `max_bytes` (estimated), `max_duration_secs`,\n`allowed_sinks`. A page that would cross a ceiling is refused whole\n(nothing of it lands, the bookmark stays put) and the run fails with\n`budget_exceeded`; the duration ceiling cancels cooperatively at the\nnext page boundary. `faucet run --budget` / a change request's budget\nmerge with it (the stricter wins). See `faucet schema budget`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/BudgetSpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "shard": {
       "description": "Optional source-shard distribution for clustered (Mode B) execution.\nOnly consumed by `faucet serve --cluster`: a run whose source\n[is shardable](faucet_core::Source::is_shardable) is split into\n`shard.count` shards processed concurrently across cluster workers.\nIgnored by `faucet run` and by a non-cluster `serve`, so it is fully\nbackward compatible.",
       "anyOf": [
@@ -306,6 +284,28 @@
       "anyOf": [
         {
           "$ref": "#/$defs/PolicySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "usage": {
+      "description": "Optional cost & usage accounting settings (#704): the pricing table\nestimates are computed from (`pricing_file` / inline `pricing`).\nAccounting itself is always on — every invocation reports records,\nestimated bytes, round trips and connector-reported cost signals; this\nblock only changes the rates the estimate uses. See `faucet schema usage`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UsageSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "budget": {
+      "description": "Optional run budget (#703): hard ceilings on what one invocation may\nmove — `max_records`, `max_bytes` (estimated), `max_duration_secs`,\n`allowed_sinks`. A page that would cross a ceiling is refused whole\n(nothing of it lands, the bookmark stays put) and the run fails with\n`budget_exceeded`; the duration ceiling cancels cooperatively at the\nnext page boundary. `faucet run --budget` / a change request's budget\nmerge with it (the stricter wins). See `faucet schema budget`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BudgetSpec"
         },
         {
           "type": "null"
@@ -9269,45 +9269,45 @@
       ]
     },
     "source_databricks__DatabricksAuth": {
-      "description": "Authentication for the Databricks SQL Statement Execution API.\n\nBoth variants send `Authorization: Bearer <token>` — Databricks accepts a\nPersonal Access Token (PAT) or an OAuth machine-to-machine (M2M) access\ntoken in the same header. Uses the project-wide adjacently-tagged\n`{ type, config }` shape, e.g. `auth: { type: pat, config: { token: … } }`.\nA shared `auth: { ref: <name> }` provider that yields a `Bearer`/`Token`\ncredential maps onto [`DatabricksAuth::Token`].",
+      "description": "Authentication for the Databricks SQL Statement Execution API.\n\nBoth variants send `Authorization: Bearer <token>` — Databricks accepts a\nPersonal Access Token (PAT) or an OAuth machine-to-machine (M2M) access\ntoken in the same header. Uses the project-wide adjacently-tagged\n`{ type, config }` shape, e.g. `auth: { type: pat, config: { token: … } }`.\nA shared `auth: { ref: <name> }` provider that yields a `Bearer`/`Token`\ncredential maps onto [`DatabricksAuth::Token`].\n\nSame shape as [`faucet_common_databricks::DatabricksAuth`] (which the sink\nuses); kept as this crate's own type so its public API is unchanged, and\nconverted with `From` where the shared client needs it.",
       "oneOf": [
         {
           "description": "Databricks Personal Access Token.",
-          "type": "object",
           "properties": {
-            "type": {
-              "type": "string",
-              "const": "pat"
-            },
             "config": {
-              "type": "object",
               "properties": {
                 "token": {
                   "description": "The token string (use `${env:…}` / `${vault:…}` to inject).",
                   "type": "string"
                 }
-              }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "pat",
+              "type": "string"
             }
-          }
+          },
+          "type": "object"
         },
         {
           "description": "A pre-obtained OAuth (M2M) bearer token.",
-          "type": "object",
           "properties": {
-            "type": {
-              "type": "string",
-              "const": "token"
-            },
             "config": {
-              "type": "object",
               "properties": {
                 "token": {
                   "description": "The bearer token string.",
                   "type": "string"
                 }
-              }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "token",
+              "type": "string"
             }
-          }
+          },
+          "type": "object"
         }
       ]
     },
@@ -18956,6 +18956,750 @@
             "type"
           ],
           "additionalProperties": false
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "description": "Configuration for [`DynamoDbSource`](crate::DynamoDbSource).",
+                  "properties": {
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Records per emitted page. `0` is the \"no batching\" sentinel. Default\n1000.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "consistent_read": {
+                      "default": false,
+                      "description": "Strongly consistent reads (table and local secondary indexes only).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "credentials": {
+                      "$ref": "#/$defs/source_dynamodb__DynamoDbCredentials",
+                      "default": {
+                        "type": "default"
+                      },
+                      "description": "AWS credentials. Defaults to the SDK default provider chain."
+                    },
+                    "endpoint_url": {
+                      "description": "Custom endpoint URL (DynamoDB Local, LocalStack, VPC endpoints).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "expression_attribute_names": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "`ExpressionAttributeNames` (`#name` → attribute).",
+                      "type": "object"
+                    },
+                    "expression_attribute_values": {
+                      "additionalProperties": true,
+                      "description": "`ExpressionAttributeValues` (`:value` → plain JSON value).",
+                      "type": "object"
+                    },
+                    "filter_expression": {
+                      "description": "`FilterExpression` applied server-side after the read.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "idle_termination_secs": {
+                      "description": "Streams: stop after this many seconds without a new record. At least\none of `idle_termination_secs` / `max_messages` is required in streams\nmode.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "index_name": {
+                      "description": "Secondary index to scan or query.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "key_condition_expression": {
+                      "description": "`KeyConditionExpression`. Required for `query`, rejected otherwise.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "max_concurrency": {
+                      "default": 8,
+                      "description": "Segments read concurrently. Default 8.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_messages": {
+                      "description": "Streams: stop after this many change records.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "mode": {
+                      "$ref": "#/$defs/source_dynamodb__ReadMode",
+                      "default": "scan",
+                      "description": "`scan` (default), `query`, or `streams`."
+                    },
+                    "on_gap": {
+                      "$ref": "#/$defs/source_dynamodb__OnGap",
+                      "default": "fail",
+                      "description": "Reaction to a bookmark older than the trim horizon."
+                    },
+                    "page_limit": {
+                      "description": "`Limit` per Scan/Query request (items evaluated per call).",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "poll_interval_ms": {
+                      "default": 1000,
+                      "description": "Base wait between `GetRecords` calls per shard, in ms (floored at 200).",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "projection": {
+                      "description": "`ProjectionExpression` — the attributes to return.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "records_per_request": {
+                      "default": 1000,
+                      "description": "`GetRecords` `Limit` per request (1–1000). Default 1000.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "region": {
+                      "description": "AWS region. `None` uses the SDK default chain (env, profile, IMDS).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "retry": {
+                      "$ref": "#/$defs/source_dynamodb__RetryPolicy",
+                      "default": {
+                        "initial_backoff_ms": 100,
+                        "max_backoff_ms": 10000,
+                        "max_retries": 8
+                      },
+                      "description": "Throttle / transient-failure retry policy."
+                    },
+                    "scan_index_forward": {
+                      "default": true,
+                      "description": "Query order: ascending sort key when `true` (default).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "segments": {
+                      "default": 1,
+                      "description": "Parallel scan segments (`TotalSegments`), 1–1000000. Scan only.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "shard_concurrency": {
+                      "default": 4,
+                      "description": "Shards read concurrently. Default 4.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "start_position": {
+                      "$ref": "#/$defs/source_dynamodb__StreamStart",
+                      "default": "trim_horizon",
+                      "description": "Start for shards with no bookmark and no parent that was read."
+                    },
+                    "stream_arn": {
+                      "description": "Stream ARN. Defaults to the table's `LatestStreamArn`. Streams only.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "table_name": {
+                      "description": "Table name.",
+                      "type": "string"
+                    }
+                  },
+                  "title": "DynamoDbSourceConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "dynamodb"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "dynamodb",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "description": "Configuration for the Apache Iceberg source.\n\nReads an Iceberg table through a REST / Glue / SQL / HMS catalog (the same\ncatalog block as the Iceberg sink) with column projection, a pushed-down\nrow filter, time travel, and incremental reads between snapshots.",
+                  "properties": {
+                    "as_of_timestamp": {
+                      "default": null,
+                      "description": "Time travel: read the snapshot that was current at this RFC 3339\ninstant (e.g. `2026-01-31T00:00:00Z`). `mode: full` only.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Arrow batch size (rows per page). `0` emits one page per snapshot read.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "catalog": {
+                      "$ref": "#/$defs/source_iceberg__CatalogConfig",
+                      "description": "Catalog type and connection settings."
+                    },
+                    "columns": {
+                      "default": [],
+                      "description": "Columns to read (projection). Empty reads every column.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "concurrency": {
+                      "default": 4,
+                      "description": "Data files read concurrently.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "filter": {
+                      "default": null,
+                      "description": "Row filter pushed down to the scan, e.g.\n`status = 'active' and (amount >= 10 or vip is not null)`.\n\nOperators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `in (…)`,\n`not in (…)`, `is null`, `is not null`, `starts_with`,\n`not starts_with`, combined with `and` / `or` / `not` and parentheses.\nLiterals are numbers, `'strings'`, `true` / `false`; dates and\ntimestamps are written as strings and typed against the column.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mode": {
+                      "$ref": "#/$defs/source_iceberg__ReadMode",
+                      "default": "full",
+                      "description": "`full` (default) re-reads the table each run; `incremental` reads only\ndata appended since the bookmarked snapshot."
+                    },
+                    "on_expired": {
+                      "$ref": "#/$defs/source_iceberg__OnExpired",
+                      "default": "fail",
+                      "description": "Incremental only: reaction to a bookmarked snapshot that has expired."
+                    },
+                    "on_rewrite": {
+                      "$ref": "#/$defs/source_iceberg__OnRewrite",
+                      "default": "fail",
+                      "description": "Incremental only: reaction to an `overwrite` / `delete` snapshot since\nthe bookmark."
+                    },
+                    "snapshot_id": {
+                      "default": null,
+                      "description": "Time travel: read this snapshot id instead of the current one.\n`mode: full` only; mutually exclusive with `as_of_timestamp`.",
+                      "format": "int64",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "table": {
+                      "description": "Table to read, as `namespace.table` (multi-level namespaces are\ndot-separated: `lake.analytics.events`).",
+                      "type": "string"
+                    }
+                  },
+                  "title": "IcebergSourceConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "iceberg"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "iceberg",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for [`OracleSource`](crate::OracleSource).",
+                  "properties": {
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Records per emitted page, also used as the fetch array size. `0` emits\nthe whole result set as one page. Defaults to [`DEFAULT_BATCH_SIZE`].",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connect_string": {
+                      "description": "Easy Connect (`host:1521/FREEPDB1`), TNS alias, or connect descriptor.\nMutually exclusive with `host`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "external_auth": {
+                      "default": false,
+                      "description": "Authenticate with external credentials (OS authentication or a wallet\nholding the credentials) instead of `username` / `password`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "host": {
+                      "description": "Database host. Mutually exclusive with `connect_string`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "json_columns": {
+                      "description": "Output columns whose text holds JSON (a `JSON_SERIALIZE(...)` or an\n`IS JSON` `VARCHAR2`/`CLOB`); their values are emitted as parsed JSON.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "max_connections": {
+                      "default": 10,
+                      "description": "Maximum pooled sessions. Defaults to 10.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "params": {
+                      "default": [],
+                      "description": "Positional bind values for `:1`…`:n`.",
+                      "items": true,
+                      "type": "array"
+                    },
+                    "password": {
+                      "default": "",
+                      "description": "Password for `username`.",
+                      "type": "string"
+                    },
+                    "port": {
+                      "description": "Listener port. Defaults to 1521 (2484 when `tls.enabled`).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "query": {
+                      "description": "SQL query. Bind [`params`](Self::params) with `:1`, `:2`, …, and the\nincremental cursor with `:bookmark`.",
+                      "type": "string"
+                    },
+                    "replication": {
+                      "$ref": "#/$defs/source_oracle__OracleReplication",
+                      "default": {
+                        "type": "full"
+                      },
+                      "description": "Replication mode. Defaults to [`OracleReplication::Full`]."
+                    },
+                    "service_name": {
+                      "description": "Service name (e.g. a PDB such as `FREEPDB1`). Mutually exclusive with `sid`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "shard": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_oracle__ShardConfig"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional PK-range sharding for clustered execution. Inert outside the\ncluster coordinator."
+                    },
+                    "sid": {
+                      "description": "Legacy SID. Mutually exclusive with `service_name`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "state_key": {
+                      "description": "Explicit state-store key for the bookmark. Derived from the database and\na query fingerprint when unset.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statement_timeout_secs": {
+                      "default": 300,
+                      "description": "Per-round-trip call timeout in seconds (`0` disables). Defaults to 300.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/source_oracle__OracleTls",
+                      "default": {
+                        "enabled": false,
+                        "server_dn_match": true
+                      },
+                      "description": "Transport encryption (TCPS) for the `host` form."
+                    },
+                    "username": {
+                      "default": "",
+                      "description": "Database user. Required unless `external_auth` is set.",
+                      "type": "string"
+                    }
+                  },
+                  "title": "OracleSourceConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "oracle"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "oracle",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for the Oracle LogMiner CDC source.",
+                  "properties": {
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "`0` accumulates every change into one trailing page; otherwise each\ncommitted transaction is its own page. Default [`DEFAULT_BATCH_SIZE`].",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connect_string": {
+                      "description": "Easy Connect (`host:1521/FREEPDB1`), TNS alias, or connect descriptor.\nMutually exclusive with `host`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "external_auth": {
+                      "default": false,
+                      "description": "Authenticate with external credentials (OS authentication or a wallet\nholding the credentials) instead of `username` / `password`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "flush_table": {
+                      "default": "FAUCET_LOGMNR_FLUSH",
+                      "description": "Table the source commits to before each mining window, forcing the log\nwriter to flush redo up to the window's end SCN. Created in the\nconnecting user's schema when missing. Default `FAUCET_LOGMNR_FLUSH`.",
+                      "type": "string"
+                    },
+                    "host": {
+                      "description": "Database host. Mutually exclusive with `connect_string`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "idle_timeout": {
+                      "default": 30,
+                      "description": "End the fetch cycle after this long without a captured change. Default\n30s. A long-running runtime re-invokes the source to keep tailing.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_connections": {
+                      "default": 2,
+                      "description": "Maximum pooled sessions. Default 2.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_scn_window": {
+                      "default": 500000,
+                      "description": "Largest SCN range mined per LogMiner session. Default 500000.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_staged_records": {
+                      "description": "Abort when one in-flight transaction buffers more than this many\nchanges (bounded memory). `None` = unbounded.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "on_unsupported": {
+                      "$ref": "#/$defs/source_oracle-cdc__OnUnsupported",
+                      "default": "fail",
+                      "description": "Handling of changes LogMiner cannot render. Default `fail`."
+                    },
+                    "password": {
+                      "default": "",
+                      "description": "Password for `username`.",
+                      "type": "string"
+                    },
+                    "poll_interval": {
+                      "default": 1,
+                      "description": "Seconds to wait between polls that find nothing new. Default 1s.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "port": {
+                      "description": "Listener port. Defaults to 1521 (2484 when `tls.enabled`).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "service_name": {
+                      "description": "Service name (e.g. a PDB such as `FREEPDB1`). Mutually exclusive with `sid`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "sid": {
+                      "description": "Legacy SID. Mutually exclusive with `service_name`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "start_position": {
+                      "$ref": "#/$defs/source_oracle-cdc__StartPosition",
+                      "default": {
+                        "type": "current"
+                      },
+                      "description": "Start position on a fresh run. Default `current`."
+                    },
+                    "state_key": {
+                      "description": "Explicit state-store key. Derived as `oracle-cdc:<database>:<table>`\n(or a digest of several tables) when unset.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statement_timeout_secs": {
+                      "default": 600,
+                      "description": "Per-round-trip call timeout in seconds (`0` disables). Default 600.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "tables": {
+                      "description": "Tables to capture as `OWNER.TABLE`, in data-dictionary case (usually\nupper case). **Required and non-empty.**",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/source_oracle-cdc__OracleTls",
+                      "default": {
+                        "enabled": false,
+                        "server_dn_match": true
+                      },
+                      "description": "Transport encryption (TCPS) for the `host` form."
+                    },
+                    "username": {
+                      "default": "",
+                      "description": "Database user. Required unless `external_auth` is set.",
+                      "type": "string"
+                    }
+                  },
+                  "title": "OracleCdcSourceConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "oracle-cdc"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "oracle-cdc",
+          "type": "object"
         }
       ]
     },
@@ -22613,6 +23357,533 @@
             "type"
           ],
           "additionalProperties": false
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for the Databricks SQL warehouse sink.\n\nWrites into a Delta table through a SQL warehouse's\n[Statement Execution API](https://docs.databricks.com/api/workspace/statementexecution).\n`write_mode` / `key` / `delete_marker` are flattened in from\n[`WriteSpec`](faucet_core::WriteSpec).",
+                  "properties": {
+                    "auth": {
+                      "$ref": "#/$defs/sink_databricks__AuthSpec",
+                      "description": "Authentication (PAT / OAuth bearer), inline or via a shared `auth: { ref }`\n(use an `oauth2` client-credentials provider for an M2M service principal)."
+                    },
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Rows per `INSERT` / `MERGE` statement on the insert path (`0` = no row\nlimit — statements are then bounded only by `max_statement_bytes`).",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "catalog": {
+                      "description": "Unity Catalog catalog. When unset, the warehouse's default catalog.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "copy_threshold_bytes": {
+                      "default": 1048576,
+                      "description": "`auto` stages a page whose estimated size is at least this many bytes.\nDefault 1 MiB.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "create_table": {
+                      "default": true,
+                      "description": "Create the table from the first page's inferred schema when it does not\nexist. Default `true`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "delete_marker": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_databricks__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional. Upsert only: rows whose `field` matches one of `values` are\ndeletes; all others are upserts. The marker field is stripped from\nupsert rows before writing."
+                    },
+                    "key": {
+                      "default": [],
+                      "description": "Key columns. Required and non-empty for upsert/delete; ignored for append.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "load_method": {
+                      "$ref": "#/$defs/sink_databricks__DatabricksLoadMethod",
+                      "default": "auto",
+                      "description": "Load path. Default `auto`."
+                    },
+                    "max_retries": {
+                      "default": 5,
+                      "description": "Retries on `429` / `503` and on Delta concurrent-write conflicts of\nidempotent statements. Default 5.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_statement_bytes": {
+                      "default": 8388608,
+                      "description": "Upper bound on one statement's SQL text on the insert path; a page is\nsplit into several statements above it. Default 8 MiB (the API accepts\nup to 16 MiB).",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "poll_interval_ms": {
+                      "default": 1000,
+                      "description": "Poll cadence while a statement is queued or running (a serverless\nwarehouse may take a minute to start). Default 1000 ms.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "retry_backoff_ms": {
+                      "default": 1000,
+                      "description": "Base of the exponential retry backoff. Default 1000 ms.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "rollback": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_databricks__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand."
+                    },
+                    "schema": {
+                      "description": "Target schema.",
+                      "type": "string"
+                    },
+                    "staging": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_databricks__DatabricksStagingConfig"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Staging location for `copy_into` / `auto`."
+                    },
+                    "statement_timeout_secs": {
+                      "default": 3600,
+                      "description": "Client deadline for one statement; the statement is cancelled when it\nis exceeded. `0` waits indefinitely. Default 3600 s.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "table": {
+                      "description": "Target table.",
+                      "type": "string"
+                    },
+                    "wait_timeout_secs": {
+                      "default": 50,
+                      "description": "Server-side wait before a statement goes async (`0` or `5`–`50` s).",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "warehouse_id": {
+                      "description": "Target SQL warehouse id.",
+                      "type": "string"
+                    },
+                    "workspace_url": {
+                      "description": "Workspace base URL, e.g. `https://dbc-abc123.cloud.databricks.com`.",
+                      "type": "string"
+                    },
+                    "write_mode": {
+                      "$ref": "#/$defs/sink_databricks__WriteMode",
+                      "default": "append",
+                      "description": "Append (default), upsert, or delete."
+                    }
+                  },
+                  "title": "DatabricksSinkConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "type": {
+              "const": "databricks"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "databricks",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for [`DynamoDbSink`](crate::DynamoDbSink).",
+                  "properties": {
+                    "batch_size": {
+                      "default": 25,
+                      "description": "Items per `BatchWriteItem` request (1–25; `0` means 25). Default 25.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "concurrency": {
+                      "default": 4,
+                      "description": "Concurrent requests. Default 4.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "condition_expression": {
+                      "description": "Optional `ConditionExpression` applied to every put/delete (for\nexample `attribute_not_exists(pk)` to make re-delivery idempotent).\n`BatchWriteItem` cannot carry conditions, so a conditional sink writes\nitem by item.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "credentials": {
+                      "$ref": "#/$defs/sink_dynamodb__DynamoDbCredentials",
+                      "default": {
+                        "type": "default"
+                      },
+                      "description": "AWS credentials. Defaults to the SDK default provider chain."
+                    },
+                    "delete_marker": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_dynamodb__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional. Upsert only: rows whose `field` matches one of `values` are\ndeletes; all others are upserts. The marker field is stripped from\nupsert rows before writing."
+                    },
+                    "endpoint_url": {
+                      "description": "Custom endpoint URL (DynamoDB Local, LocalStack, VPC endpoints).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "expression_attribute_names": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "`ExpressionAttributeNames` for `condition_expression`.",
+                      "type": "object"
+                    },
+                    "expression_attribute_values": {
+                      "additionalProperties": true,
+                      "description": "`ExpressionAttributeValues` (plain JSON) for `condition_expression`.",
+                      "type": "object"
+                    },
+                    "key": {
+                      "default": [],
+                      "description": "Key columns. Required and non-empty for upsert/delete; ignored for append.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "on_condition_failure": {
+                      "$ref": "#/$defs/sink_dynamodb__OnConditionFailure",
+                      "default": "skip",
+                      "description": "What a failed condition means. Default `skip`."
+                    },
+                    "region": {
+                      "description": "AWS region. `None` uses the SDK default chain.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "retry": {
+                      "$ref": "#/$defs/sink_dynamodb__RetryPolicy",
+                      "default": {
+                        "initial_backoff_ms": 100,
+                        "max_backoff_ms": 10000,
+                        "max_retries": 8
+                      },
+                      "description": "Throttle / unprocessed-item retry policy."
+                    },
+                    "rollback": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_dynamodb__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand."
+                    },
+                    "table_name": {
+                      "description": "Table name. The table must exist.",
+                      "type": "string"
+                    },
+                    "write_mode": {
+                      "$ref": "#/$defs/sink_dynamodb__WriteMode",
+                      "default": "append",
+                      "description": "Append (default), upsert, or delete."
+                    }
+                  },
+                  "title": "DynamoDbSinkConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "type": {
+              "const": "dynamodb"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "dynamodb",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for [`OracleSink`](crate::OracleSink).",
+                  "properties": {
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Rows per array-DML execution. `0` sends the whole page at once.\nDefaults to 1000.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "column_mapping": {
+                      "$ref": "#/$defs/sink_oracle__OracleColumnMapping",
+                      "default": {
+                        "on_unknown_field": "warn",
+                        "type": "auto_columns"
+                      },
+                      "description": "How records map onto columns. Defaults to `auto_columns`."
+                    },
+                    "connect_string": {
+                      "description": "Easy Connect (`host:1521/FREEPDB1`), TNS alias, or connect descriptor.\nMutually exclusive with `host`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "create_table": {
+                      "default": true,
+                      "description": "Create the target table when it does not exist. Defaults to `true`.\n\n`json_column` mode creates `(\"ID\" NUMBER GENERATED BY DEFAULT AS IDENTITY\nPRIMARY KEY, <column> CLOB)` up front; `auto_columns` mode infers nullable\ncolumns from the first page (with a `PRIMARY KEY` over `key` for keyed\nwrites).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "delete_marker": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_oracle__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional. Upsert only: rows whose `field` matches one of `values` are\ndeletes; all others are upserts. The marker field is stripped from\nupsert rows before writing."
+                    },
+                    "external_auth": {
+                      "default": false,
+                      "description": "Authenticate with external credentials (OS authentication or a wallet\nholding the credentials) instead of `username` / `password`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "host": {
+                      "description": "Database host. Mutually exclusive with `connect_string`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "identifier_case": {
+                      "$ref": "#/$defs/sink_oracle__IdentifierCase",
+                      "default": "preserve",
+                      "description": "Identifier case rule. Defaults to `preserve`."
+                    },
+                    "key": {
+                      "default": [],
+                      "description": "Key columns. Required and non-empty for upsert/delete; ignored for append.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "max_connections": {
+                      "default": 5,
+                      "description": "Maximum pooled sessions. Defaults to 5.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "password": {
+                      "default": "",
+                      "description": "Password for `username`.",
+                      "type": "string"
+                    },
+                    "port": {
+                      "description": "Listener port. Defaults to 1521 (2484 when `tls.enabled`).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "rollback": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_oracle__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand."
+                    },
+                    "service_name": {
+                      "description": "Service name (e.g. a PDB such as `FREEPDB1`). Mutually exclusive with `sid`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "sid": {
+                      "description": "Legacy SID. Mutually exclusive with `service_name`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statement_timeout_secs": {
+                      "default": 300,
+                      "description": "Per-round-trip call timeout in seconds (`0` disables). Defaults to 300.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "table": {
+                      "description": "Target table, optionally owner-qualified (`APP.EVENTS`).",
+                      "type": "string"
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/sink_oracle__OracleTls",
+                      "default": {
+                        "enabled": false,
+                        "server_dn_match": true
+                      },
+                      "description": "Transport encryption (TCPS) for the `host` form."
+                    },
+                    "username": {
+                      "default": "",
+                      "description": "Database user. Required unless `external_auth` is set.",
+                      "type": "string"
+                    },
+                    "write_mode": {
+                      "$ref": "#/$defs/sink_oracle__WriteMode",
+                      "default": "append",
+                      "description": "Append (default), upsert, or delete."
+                    }
+                  },
+                  "title": "OracleSinkConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "type": {
+              "const": "oracle"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "oracle",
+          "type": "object"
         }
       ]
     },
@@ -22965,6 +24236,1189 @@
           "description": "Route the offending records to the DLQ; the rest of the page is written.",
           "type": "string",
           "const": "quarantine"
+        }
+      ]
+    },
+    "source_dynamodb__DynamoDbCredentials": {
+      "description": "How to authenticate with AWS DynamoDB (and DynamoDB Streams).\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the same shape as the Kinesis and SQS\nconnectors, so one AWS credential block reads identically everywhere.",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, ECS/EKS container credentials, web-identity\ntokens, and EC2 instance profiles — with automatic refresh/rotation.",
+          "properties": {
+            "type": {
+              "const": "default",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "properties": {
+            "config": {
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "profile",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "properties": {
+            "config": {
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "access_key",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "properties": {
+            "config": {
+              "properties": {
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "assume_role",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Web-identity federation (e.g. EKS IRSA). Equivalent to the `default`\nchain, which honors `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` —\nkept as an explicit variant so intent is visible in configs.",
+          "properties": {
+            "type": {
+              "const": "web_identity",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "source_dynamodb__OnGap": {
+      "description": "What to do when the bookmark points before the Streams trim horizon (a\nresume after more than 24 hours, a re-enabled stream, a shard that expired\nbefore it was read).",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Fail the run, naming the shards whose changes are no longer available.",
+          "type": "string"
+        },
+        {
+          "const": "resnapshot",
+          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. Converges on an upsert sink.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_dynamodb__ReadMode": {
+      "description": "What the source reads.",
+      "oneOf": [
+        {
+          "const": "scan",
+          "description": "Full-table `Scan`, optionally parallel (`segments`).",
+          "type": "string"
+        },
+        {
+          "const": "query",
+          "description": "`Query` by `key_condition_expression` (optionally on `index_name`).",
+          "type": "string"
+        },
+        {
+          "const": "streams",
+          "description": "DynamoDB Streams change data capture.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_dynamodb__RetryPolicy": {
+      "additionalProperties": true,
+      "description": "Retry/backoff settings exposed on both connector configs.",
+      "properties": {
+        "initial_backoff_ms": {
+          "default": 100,
+          "description": "Initial backoff in milliseconds (doubled per attempt, jittered).\nDefault 100.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "max_backoff_ms": {
+          "default": 10000,
+          "description": "Backoff ceiling in milliseconds. Default 10000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "max_retries": {
+          "default": 8,
+          "description": "Retries after the first attempt for throttled or transient failures.\nDefault 8.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "source_dynamodb__StreamStart": {
+      "description": "Where a stream shard starts when no bookmark exists for it.",
+      "oneOf": [
+        {
+          "const": "trim_horizon",
+          "description": "Oldest record still retained (up to 24 hours).",
+          "type": "string"
+        },
+        {
+          "const": "latest",
+          "description": "Only changes made after the consumer starts.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_databricks__AuthReference": {
+      "additionalProperties": true,
+      "description": "A `{ ref: <name> }` pointer to a named provider in the top-level `auth:`\ncatalog. The only permitted key is `ref`.",
+      "properties": {
+        "ref": {
+          "description": "Name of the provider in the top-level `auth:` catalog.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_databricks__AuthSpec": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/sink_databricks__DatabricksAuth",
+          "description": "Inline auth, spelled out on the connector."
+        },
+        {
+          "$ref": "#/$defs/sink_databricks__AuthReference",
+          "description": "A reference to a shared provider in the top-level `auth:` catalog."
+        }
+      ],
+      "description": "A connector's `auth:` field: **either** an inline auth definition `A`\n(the `{ type, config }` shape), **or** a `{ ref: <name> }` reference to a\nshared provider defined in the top-level `auth:` catalog.\n\n`ref` is mutually exclusive with inline fields — supplying both is a\ndeserialization error."
+    },
+    "sink_databricks__DatabricksAuth": {
+      "description": "Authentication for the Databricks SQL Statement Execution API.\n\nBoth variants send `Authorization: Bearer <token>` — Databricks accepts a\nPersonal Access Token (PAT) or an OAuth machine-to-machine (M2M) access\ntoken in the same header. Uses the project-wide adjacently-tagged\n`{ type, config }` shape, e.g. `auth: { type: pat, config: { token: … } }`.\nA shared `auth: { ref: <name> }` provider that yields a `Bearer`/`Token`\ncredential maps onto [`DatabricksAuth::Token`] — that is how an OAuth M2M\nservice principal is wired: an `oauth2` client-credentials provider against\n`{workspace_url}/oidc/v1/token` with scope `all-apis`, which refreshes the\ntoken before it expires.",
+      "oneOf": [
+        {
+          "description": "Databricks Personal Access Token.",
+          "properties": {
+            "config": {
+              "properties": {
+                "token": {
+                  "description": "The token string (use `${env:…}` / `${vault:…}` to inject).",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "pat",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "A pre-obtained OAuth (M2M) bearer token.",
+          "properties": {
+            "config": {
+              "properties": {
+                "token": {
+                  "description": "The bearer token string.",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "token",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "sink_databricks__DatabricksLoadMethod": {
+      "description": "How a page is loaded into the table.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Stage the page when `staging` is configured and the page is at least\n`copy_threshold_bytes`; otherwise a multi-row `INSERT` (the default).",
+          "type": "string"
+        },
+        {
+          "const": "insert",
+          "description": "Always a multi-row `INSERT … SELECT … FROM VALUES` through the\nStatement Execution API. No staging location needed.",
+          "type": "string"
+        },
+        {
+          "const": "copy_into",
+          "description": "Always stage the page as Parquet, then `COPY INTO` (append) or read it\nwith `read_files` (upsert / delete / exactly-once). Requires `staging`.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_databricks__DatabricksStagingConfig": {
+      "additionalProperties": true,
+      "description": "Where staged Parquet files are written before the warehouse loads them.",
+      "properties": {
+        "cleanup": {
+          "$ref": "#/$defs/sink_databricks__StagingCleanup",
+          "default": "always",
+          "description": "When staged files are deleted after a load. Default `always`."
+        },
+        "copy_options": {
+          "description": "Extra `COPY_OPTIONS` entries appended verbatim to the append path's\n`COPY INTO`, e.g. `'mergeSchema' = 'false'`. The operator owns their\ncorrectness.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "description": "Staging root. Either a Unity Catalog volume path\n(`/Volumes/<catalog>/<schema>/<volume>[/prefix]`, uploaded through the\nFiles API with the sink's own credentials) or a cloud location the\nwarehouse can read through an external location: `s3://bucket/prefix`,\n`gs://bucket/prefix`, or\n`abfss://container@account.dfs.core.windows.net/prefix`. Cloud locations\nneed the crate's `staging` feature and ambient cloud credentials for the\nupload.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_databricks__DeleteMarker": {
+      "description": "Identifies a record as a delete (vs. an upsert) by a marker field's value.\ne.g. `{ field: \"__op\", values: [\"d\", \"delete\"] }`.",
+      "properties": {
+        "field": {
+          "description": "Field name whose value flags a delete.",
+          "type": "string"
+        },
+        "values": {
+          "description": "Values of `field` that mean \"this row is a delete\".",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "sink_databricks__RollbackWriteSpec": {
+      "additionalProperties": true,
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "properties": {
+        "journal": {
+          "default": false,
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "keep_previous": {
+          "default": false,
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_databricks__StagingCleanup": {
+      "description": "When staged objects are deleted after a load.",
+      "oneOf": [
+        {
+          "const": "always",
+          "description": "Delete staged objects whether the load succeeded or failed (the default —\nkeeps the stage tidy).",
+          "type": "string"
+        },
+        {
+          "const": "on_success",
+          "description": "Delete only after a successful load; leave them on failure for inspection.",
+          "type": "string"
+        },
+        {
+          "const": "never",
+          "description": "Never delete — the caller/operator manages the stage lifecycle.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_databricks__WriteMode": {
+      "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
+      "oneOf": [
+        {
+          "const": "append",
+          "description": "Insert every record (today's behaviour).",
+          "type": "string"
+        },
+        {
+          "const": "upsert",
+          "description": "Insert-or-update by `key`; optionally route delete-marked rows to deletes.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Delete by `key` for every record.",
+          "type": "string"
+        },
+        {
+          "const": "overwrite",
+          "description": "Replace the entire destination with this run's records (truncate-load /\nfull refresh). The old contents are swapped out atomically only after the\nrun completes successfully, so a mid-run failure leaves them intact. No\n`key` is required — it is a whole-dataset operation, not a keyed one.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_dynamodb__DeleteMarker": {
+      "description": "Identifies a record as a delete (vs. an upsert) by a marker field's value.\ne.g. `{ field: \"__op\", values: [\"d\", \"delete\"] }`.",
+      "properties": {
+        "field": {
+          "description": "Field name whose value flags a delete.",
+          "type": "string"
+        },
+        "values": {
+          "description": "Values of `field` that mean \"this row is a delete\".",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "sink_dynamodb__DynamoDbCredentials": {
+      "description": "How to authenticate with AWS DynamoDB (and DynamoDB Streams).\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the same shape as the Kinesis and SQS\nconnectors, so one AWS credential block reads identically everywhere.",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, ECS/EKS container credentials, web-identity\ntokens, and EC2 instance profiles — with automatic refresh/rotation.",
+          "properties": {
+            "type": {
+              "const": "default",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "properties": {
+            "config": {
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "profile",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "properties": {
+            "config": {
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "access_key",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "properties": {
+            "config": {
+              "properties": {
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "type": {
+              "const": "assume_role",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Web-identity federation (e.g. EKS IRSA). Equivalent to the `default`\nchain, which honors `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` —\nkept as an explicit variant so intent is visible in configs.",
+          "properties": {
+            "type": {
+              "const": "web_identity",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "sink_dynamodb__OnConditionFailure": {
+      "description": "What a failed `condition_expression` means.",
+      "oneOf": [
+        {
+          "const": "skip",
+          "description": "Treat the row as already applied (idempotent re-delivery) — default.",
+          "type": "string"
+        },
+        {
+          "const": "fail",
+          "description": "Report the row as failed (routed to the DLQ when one is configured).",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_dynamodb__RetryPolicy": {
+      "additionalProperties": true,
+      "description": "Retry/backoff settings exposed on both connector configs.",
+      "properties": {
+        "initial_backoff_ms": {
+          "default": 100,
+          "description": "Initial backoff in milliseconds (doubled per attempt, jittered).\nDefault 100.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "max_backoff_ms": {
+          "default": 10000,
+          "description": "Backoff ceiling in milliseconds. Default 10000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "max_retries": {
+          "default": 8,
+          "description": "Retries after the first attempt for throttled or transient failures.\nDefault 8.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "sink_dynamodb__RollbackWriteSpec": {
+      "additionalProperties": true,
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "properties": {
+        "journal": {
+          "default": false,
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "keep_previous": {
+          "default": false,
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_dynamodb__WriteMode": {
+      "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
+      "oneOf": [
+        {
+          "const": "append",
+          "description": "Insert every record (today's behaviour).",
+          "type": "string"
+        },
+        {
+          "const": "upsert",
+          "description": "Insert-or-update by `key`; optionally route delete-marked rows to deletes.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Delete by `key` for every record.",
+          "type": "string"
+        },
+        {
+          "const": "overwrite",
+          "description": "Replace the entire destination with this run's records (truncate-load /\nfull refresh). The old contents are swapped out atomically only after the\nrun completes successfully, so a mid-run failure leaves them intact. No\n`key` is required — it is a whole-dataset operation, not a keyed one.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_iceberg__CatalogConfig": {
+      "description": "Iceberg catalog type and its connection settings.\n\nUses serde's internally-tagged enum: the JSON/YAML `type` key selects the\nvariant. Each variant carries the same inner fields (`uri`, `warehouse`,\n`credential`, `properties`); the relevant set differs per catalog type and\nis documented in each variant.\n\n| Variant | Cargo feature required   |\n|---------|--------------------------|\n| `rest`  | `catalog-rest` (default) |\n| `glue`  | `catalog-glue`           |\n| `sql`   | `catalog-sql`            |\n| `hms`   | `catalog-hms`            |",
+      "oneOf": [
+        {
+          "additionalProperties": true,
+          "description": "Apache Iceberg REST catalog. `uri` is the catalog endpoint; `credential`\nbecomes the REST bearer token.",
+          "properties": {
+            "credential": {
+              "default": null,
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "properties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object"
+            },
+            "type": {
+              "const": "rest",
+              "type": "string"
+            },
+            "uri": {
+              "default": null,
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "warehouse": {
+              "default": null,
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "description": "AWS Glue catalog. `warehouse` is the S3 root; AWS credentials are\nsupplied via `properties` or the default AWS credential chain.",
+          "properties": {
+            "credential": {
+              "default": null,
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "properties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object"
+            },
+            "type": {
+              "const": "glue",
+              "type": "string"
+            },
+            "uri": {
+              "default": null,
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "warehouse": {
+              "default": null,
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "description": "SQL-backed catalog (e.g. JDBC/postgres). `uri` is the connection string.",
+          "properties": {
+            "credential": {
+              "default": null,
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "properties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object"
+            },
+            "type": {
+              "const": "sql",
+              "type": "string"
+            },
+            "uri": {
+              "default": null,
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "warehouse": {
+              "default": null,
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        {
+          "additionalProperties": true,
+          "description": "Hive Metastore catalog. `uri` is the Thrift endpoint\n(`thrift://hms:9083`).",
+          "properties": {
+            "credential": {
+              "default": null,
+              "description": "REST bearer token or other catalog-specific credential.\n\nRedacted in `Debug` output — never logged.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "properties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "type": "object"
+            },
+            "type": {
+              "const": "hms",
+              "type": "string"
+            },
+            "uri": {
+              "default": null,
+              "description": "Catalog endpoint URI.\n\nFor REST: `https://catalog.example.com`.\nFor HMS: `thrift://hms:9083`.\nFor SQL: the JDBC/SQLx connection string, e.g. `postgres://…`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "warehouse": {
+              "default": null,
+              "description": "Object-storage warehouse root, e.g. `s3://lake/warehouse`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "source_iceberg__OnExpired": {
+      "description": "What an incremental run does when the bookmarked snapshot (or one between\nit and the current snapshot) has been expired from the table metadata.",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Fail the run with guidance.",
+          "type": "string"
+        },
+        {
+          "const": "full_refresh",
+          "description": "Re-read the current snapshot in full and move the bookmark to it.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_iceberg__OnRewrite": {
+      "description": "What an incremental run does when a snapshot since the bookmark rewrote\nexisting data (`overwrite` / `delete`), or the bookmark is no longer an\nancestor of the current snapshot (a rollback).",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Fail the run with a message naming the snapshot.",
+          "type": "string"
+        },
+        {
+          "const": "full_refresh",
+          "description": "Re-read the current snapshot in full and move the bookmark to it.\nRows already delivered are delivered again — pair with an upsert or\noverwrite sink.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_iceberg__ReadMode": {
+      "description": "How much of the table each run reads.",
+      "oneOf": [
+        {
+          "const": "full",
+          "description": "Read the whole table at the selected snapshot on every run.",
+          "type": "string"
+        },
+        {
+          "const": "incremental",
+          "description": "Read only the data files added by `append` snapshots since the\nbookmarked snapshot. The first run (no bookmark) reads the current\nsnapshot in full; the bookmark is the last processed snapshot id.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_oracle__OracleReplication": {
+      "description": "How the source replicates rows across runs.\n\nSerializes as `{ type: full }` or\n`{ type: incremental, column: \"UPDATED_AT\", initial_value: ... }`.",
+      "oneOf": [
+        {
+          "description": "Every run fetches the full result set (default).",
+          "properties": {
+            "type": {
+              "const": "full",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nPut the `:bookmark` placeholder in the query to push the cursor down to\nthe server (`WHERE UPDATED_AT > :bookmark`); the source also filters\nclient-side as a correctness backstop. `column` names the key exactly\nas it appears in the output — Oracle upper-cases unquoted names.",
+          "properties": {
+            "column": {
+              "description": "Output column holding the replication cursor (e.g. `UPDATED_AT`).",
+              "type": "string"
+            },
+            "initial_value": {
+              "description": "Lower bound used on the first run, before any bookmark is stored."
+            },
+            "type": {
+              "const": "incremental",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "source_oracle__OracleTls": {
+      "description": "TCPS settings applied to a `host`-form connection.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Connect over TCPS. Defaults to `false`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "server_cert_dn": {
+          "description": "Expected server certificate DN, when it differs from the host name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_dn_match": {
+          "default": true,
+          "description": "Verify that the server certificate's DN matches the host. Defaults to `true`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "wallet_location": {
+          "description": "Directory holding the Oracle wallet (`cwallet.sso` / `ewallet.p12`) with\nthe trusted CA and, for mutual TLS, the client certificate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "source_oracle__ShardConfig": {
+      "description": "Primary-key range sharding for clustered (Mode B) execution: each shard runs\n`SELECT * FROM (<query>) WHERE \"<key>\" >= lo AND \"<key>\" < hi`. The key must\nbe an integer-valued output column, named exactly as Oracle reports it.",
+      "properties": {
+        "key": {
+          "description": "Integer output column to range-partition on (quoted as an identifier).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__DeleteMarker": {
+      "description": "Identifies a record as a delete (vs. an upsert) by a marker field's value.\ne.g. `{ field: \"__op\", values: [\"d\", \"delete\"] }`.",
+      "properties": {
+        "field": {
+          "description": "Field name whose value flags a delete.",
+          "type": "string"
+        },
+        "values": {
+          "description": "Values of `field` that mean \"this row is a delete\".",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__IdentifierCase": {
+      "description": "How record keys, `table`, `key` and the JSON column name map onto Oracle\nidentifiers, which are case-sensitive once quoted.",
+      "oneOf": [
+        {
+          "const": "preserve",
+          "description": "Use names exactly as written (default) — `id` addresses a column\ncreated as `\"id\"`.",
+          "type": "string"
+        },
+        {
+          "const": "upper",
+          "description": "Upper-case every name, matching tables created with unquoted\nidentifiers (`CREATE TABLE ORDERS (ID ...)`).",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_oracle__OnUnknownField": {
+      "description": "What to do with record keys that don't match a table column (`auto_columns`).",
+      "oneOf": [
+        {
+          "const": "warn",
+          "description": "Log a one-shot warning and drop the unknown keys (default).",
+          "type": "string"
+        },
+        {
+          "const": "drop",
+          "description": "Silently drop the unknown keys.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Fail the write.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_oracle__OracleColumnMapping": {
+      "description": "How records map onto table columns.",
+      "oneOf": [
+        {
+          "description": "Map top-level JSON keys to same-named columns (default).",
+          "properties": {
+            "on_unknown_field": {
+              "$ref": "#/$defs/sink_oracle__OnUnknownField",
+              "default": "warn",
+              "description": "Handling for keys with no matching column."
+            },
+            "type": {
+              "const": "auto_columns",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Serialize each record to JSON text in a single `CLOB` column.",
+          "properties": {
+            "column": {
+              "description": "Column that receives the JSON text.",
+              "type": "string"
+            },
+            "type": {
+              "const": "json_column",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "sink_oracle__OracleTls": {
+      "description": "TCPS settings applied to a `host`-form connection.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Connect over TCPS. Defaults to `false`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "server_cert_dn": {
+          "description": "Expected server certificate DN, when it differs from the host name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_dn_match": {
+          "default": true,
+          "description": "Verify that the server certificate's DN matches the host. Defaults to `true`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "wallet_location": {
+          "description": "Directory holding the Oracle wallet (`cwallet.sso` / `ewallet.p12`) with\nthe trusted CA and, for mutual TLS, the client certificate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__RollbackWriteSpec": {
+      "additionalProperties": true,
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "properties": {
+        "journal": {
+          "default": false,
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "keep_previous": {
+          "default": false,
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__WriteMode": {
+      "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
+      "oneOf": [
+        {
+          "const": "append",
+          "description": "Insert every record (today's behaviour).",
+          "type": "string"
+        },
+        {
+          "const": "upsert",
+          "description": "Insert-or-update by `key`; optionally route delete-marked rows to deletes.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Delete by `key` for every record.",
+          "type": "string"
+        },
+        {
+          "const": "overwrite",
+          "description": "Replace the entire destination with this run's records (truncate-load /\nfull refresh). The old contents are swapped out atomically only after the\nrun completes successfully, so a mid-run failure leaves them intact. No\n`key` is required — it is a whole-dataset operation, not a keyed one.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_oracle-cdc__OnUnsupported": {
+      "description": "What to do with a change LogMiner cannot render as SQL for a tracked table\n(`UNSUPPORTED` rows, or a *dictionary mismatch* after the table's structure\nchanged since the redo was written).",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Fail the run (default) — never silently drop a change.",
+          "type": "string"
+        },
+        {
+          "const": "skip",
+          "description": "Log a warning and skip the change.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_oracle-cdc__OracleTls": {
+      "description": "TCPS settings applied to a `host`-form connection.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Connect over TCPS. Defaults to `false`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "server_cert_dn": {
+          "description": "Expected server certificate DN, when it differs from the host name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_dn_match": {
+          "default": true,
+          "description": "Verify that the server certificate's DN matches the host. Defaults to `true`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "wallet_location": {
+          "description": "Directory holding the Oracle wallet (`cwallet.sso` / `ewallet.p12`) with\nthe trusted CA and, for mutual TLS, the client certificate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "source_oracle-cdc__StartPosition": {
+      "description": "Where to start mining on a fresh run (no persisted bookmark).",
+      "oneOf": [
+        {
+          "description": "The database's current SCN — only changes committed from now on\n(transactions already open are captured from their start). Default.",
+          "properties": {
+            "type": {
+              "const": "current",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "The oldest SCN still present in the available redo (online + archived).",
+          "properties": {
+            "type": {
+              "const": "earliest",
+              "type": "string"
+            }
+          },
+          "type": "object"
         }
       ]
     },

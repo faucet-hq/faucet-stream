@@ -1,0 +1,46 @@
+[package]
+name = "faucet-common-iceberg"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Apache Iceberg catalog and storage types for the faucet-stream Iceberg connectors"
+readme = "README.md"
+keywords = ["iceberg", "lakehouse", "catalog", "etl", "faucet"]
+categories.workspace = true
+
+[features]
+# No default catalog: each connector's `catalog-*` features forward here, so the
+# source and sink gate catalogs identically.
+default = []
+catalog-rest = ["dep:iceberg-catalog-rest"]
+catalog-glue = ["dep:iceberg-catalog-glue", "storage-opendal"]
+catalog-sql  = ["dep:iceberg-catalog-sql",  "storage-opendal"]
+catalog-hms  = ["dep:iceberg-catalog-hms",  "storage-opendal"]
+storage-opendal = ["dep:iceberg-storage-opendal", "dep:typetag"]
+
+[dependencies]
+faucet-core.workspace = true
+serde = { workspace = true, features = ["derive"] }
+schemars.workspace = true
+iceberg = "0.10.0"
+iceberg-catalog-rest = { version = "0.10.0", optional = true }
+iceberg-catalog-glue = { version = "0.10.0", optional = true }
+iceberg-catalog-sql  = { version = "0.10.0", optional = true }
+iceberg-catalog-hms  = { version = "0.10.0", optional = true }
+iceberg-storage-opendal = { version = "0.10.0", default-features = false, features = ["opendal-s3", "opendal-gcs", "opendal-fs"], optional = true }
+typetag = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"
