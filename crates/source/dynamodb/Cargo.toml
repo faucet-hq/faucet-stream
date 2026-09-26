@@ -12,6 +12,24 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-dynamodb.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars.workspace = true
+aws-sdk-dynamodb.workspace = true
+aws-sdk-dynamodbstreams.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+faucet-conformance.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_yaml = "0.9"
+testcontainers = "0.27"
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true

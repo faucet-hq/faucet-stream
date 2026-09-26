@@ -1047,6 +1047,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-dynamodbstreams"
+version = "1.105.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa698c295599dbbc026fcc4b1a2b140e9954a47c2a0de8b4b30693c31ed9b9a3"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.64.0",
+ "aws-smithy-json 0.63.0",
+ "aws-smithy-observability 0.3.0",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.4.1",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-glue"
 version = "1.145.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4597,7 +4623,17 @@ dependencies = [
 name = "faucet-common-dynamodb"
 version = "1.0.0"
 dependencies = [
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
+ "base64 0.22.1",
  "faucet-core",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5051,7 +5087,20 @@ dependencies = [
 name = "faucet-sink-dynamodb"
 version = "1.0.0"
 dependencies = [
+ "async-trait",
+ "aws-sdk-dynamodb",
+ "faucet-common-dynamodb",
+ "faucet-conformance",
  "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -5708,7 +5757,22 @@ dependencies = [
 name = "faucet-source-dynamodb"
 version = "1.0.0"
 dependencies = [
+ "async-stream",
+ "async-trait",
+ "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
+ "faucet-common-dynamodb",
+ "faucet-conformance",
  "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
