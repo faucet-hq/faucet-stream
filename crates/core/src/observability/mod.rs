@@ -40,7 +40,7 @@ pub use masking::instrumented_apply_masking;
 pub use options::RunStreamOptions;
 #[cfg(feature = "quality")]
 pub use quality::instrumented_apply_quality;
-pub use roundtrip::{RoundtripRecorder, RoundtripSide, describe_roundtrip_metrics};
+pub use roundtrip::{RecorderSlot, RoundtripRecorder, RoundtripSide, describe_roundtrip_metrics};
 pub use state::InstrumentedStateStore;
 pub use strip::strip_type_name;
 pub use timer::DurationGuard;

@@ -21,7 +21,7 @@
 
 use crate::usage::{CostSignal, UsageMeter, UsageSide};
 use metrics::{Label, SharedString, counter, histogram};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Which side of the pipeline a round trip belongs to. Selects the metric
@@ -305,5 +305,55 @@ mod tests {
         let r = RoundtripRecorder::new(RoundtripSide::Source, "p", "r", "kafka");
         let c = r.clone();
         assert_eq!(r.labels_for_test("poll"), c.labels_for_test("poll"));
+    }
+}
+
+/// A connector's slot for the recorder the pipeline installs (#638 / #704).
+///
+/// Connectors keep one of these in their struct and forward
+/// [`set_roundtrip_recorder`](crate::Source::set_roundtrip_recorder) to
+/// [`install`](Self::install); every call site then does
+/// `self.roundtrips.record("get")` without checking whether a pipeline
+/// installed anything. First install wins — the pipeline installs exactly
+/// once per run, and a re-used connector instance keeps the labels it is
+/// already counting under.
+#[derive(Debug, Default)]
+pub struct RecorderSlot(OnceLock<Arc<RoundtripRecorder>>);
+
+impl RecorderSlot {
+    pub const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// Install the pipeline's recorder (no-op when one is already installed).
+    pub fn install(&self, recorder: Arc<RoundtripRecorder>) {
+        let _ = self.0.set(recorder);
+    }
+
+    /// The installed recorder, for handing to a helper that performs I/O on
+    /// the connector's behalf.
+    pub fn recorder(&self) -> Option<Arc<RoundtripRecorder>> {
+        self.0.get().cloned()
+    }
+
+    /// Count one round trip when a recorder is installed.
+    pub fn record(&self, op: &'static str) {
+        if let Some(r) = self.0.get() {
+            r.record(op);
+        }
+    }
+
+    /// Count one timed round trip when a recorder is installed.
+    pub fn record_timed(&self, op: &'static str, elapsed: Duration) {
+        if let Some(r) = self.0.get() {
+            r.record_timed(op, elapsed);
+        }
+    }
+
+    /// Report a backend-measured usage figure when a recorder is installed.
+    pub fn signal(&self, kind: &'static str, unit: &'static str, quantity: f64) {
+        if let Some(r) = self.0.get() {
+            r.signal(kind, unit, quantity);
+        }
     }
 }

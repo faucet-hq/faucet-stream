@@ -35,6 +35,7 @@ pub(crate) struct S3RangeReader {
     bucket: String,
     key: String,
     len: u64,
+    recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
 }
 
 impl S3RangeReader {
@@ -45,7 +46,11 @@ impl S3RangeReader {
         client: &Client,
         bucket: &str,
         key: &str,
+        recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
     ) -> Result<Self, faucet_core::FaucetError> {
+        if let Some(r) = &recorder {
+            r.record("head");
+        }
         let head = client
             .head_object()
             .bucket(bucket)
@@ -73,6 +78,7 @@ impl S3RangeReader {
             bucket: bucket.to_string(),
             key: key.to_string(),
             len,
+            recorder,
         })
     }
 
@@ -86,6 +92,9 @@ impl S3RangeReader {
             return Ok(Bytes::new());
         }
         let header = range_header(&range);
+        if let Some(r) = &self.recorder {
+            r.record("get");
+        }
         let response = self
             .client
             .get_object()

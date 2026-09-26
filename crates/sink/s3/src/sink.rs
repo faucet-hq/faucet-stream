@@ -22,6 +22,9 @@ pub struct S3Sink {
     /// that dominates read time on S3/Athena/Spark. `Mutex` rather than an
     /// atomic because the buffer and its counters must move together.
     open: tokio::sync::Mutex<OpenObject>,
+    /// Round-trip recorder installed by the pipeline (#638 / #704). Op: `put`
+    /// (one per `PutObject`).
+    roundtrips: faucet_core::observability::RecorderSlot,
 }
 
 /// Minimum S3 multipart part size. Every part except the last must be at least
@@ -82,6 +85,7 @@ impl S3Sink {
             config,
             client,
             open,
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
         })
     }
 
@@ -249,6 +253,7 @@ impl S3Sink {
     async fn upload_file(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
         let body = self.encode_body(body)?;
 
+        self.roundtrips.record("put");
         self.client
             .put_object()
             .bucket(&self.config.bucket)
@@ -274,6 +279,7 @@ impl S3Sink {
         let concurrency = self.config.concurrency.max(1);
         futures::stream::iter(prepared)
             .map(|(key, body)| async move {
+                self.roundtrips.record("put");
                 self.client
                     .put_object()
                     .bucket(&self.config.bucket)
@@ -297,6 +303,12 @@ impl S3Sink {
 
 #[async_trait]
 impl faucet_core::Sink for S3Sink {
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.roundtrips.install(recorder);
+    }
     /// Close the open object (#618).
     ///
     /// The pipeline calls `flush` at every bookmark-carrying page and once at
@@ -511,6 +523,7 @@ mod tests {
             config,
             client,
             open,
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
         }
     }
 

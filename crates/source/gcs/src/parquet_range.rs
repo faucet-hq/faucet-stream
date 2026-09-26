@@ -34,6 +34,7 @@ pub(crate) struct GcsRangeReader {
     bucket_path: String,
     key: String,
     len: u64,
+    recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
 }
 
 impl GcsRangeReader {
@@ -44,6 +45,7 @@ impl GcsRangeReader {
         bucket_path: &str,
         key: &str,
         len: u64,
+        recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
     ) -> Result<Self, faucet_core::FaucetError> {
         if len == 0 {
             return Err(faucet_core::FaucetError::Source(format!(
@@ -57,6 +59,7 @@ impl GcsRangeReader {
             bucket_path: bucket_path.to_string(),
             key: key.to_string(),
             len,
+            recorder,
         })
     }
 
@@ -68,6 +71,9 @@ impl GcsRangeReader {
         let wanted = range.end.saturating_sub(range.start);
         if wanted == 0 {
             return Ok(Bytes::new());
+        }
+        if let Some(r) = &self.recorder {
+            r.record("get");
         }
         let resp = self
             .storage
@@ -162,12 +168,13 @@ mod tests {
     #[tokio::test]
     async fn a_zero_length_object_is_refused_by_name() {
         let storage = offline_storage().await;
-        let msg = match GcsRangeReader::open(&storage, "projects/_/buckets/b", "empty.parquet", 0)
-            .await
-        {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("a zero-length object has no Parquet footer to read"),
-        };
+        let msg =
+            match GcsRangeReader::open(&storage, "projects/_/buckets/b", "empty.parquet", 0, None)
+                .await
+            {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("a zero-length object has no Parquet footer to read"),
+            };
         assert!(
             msg.contains("empty.parquet") && msg.contains("footer"),
             "the error must name the object and the reason: {msg}"
@@ -181,9 +188,10 @@ mod tests {
         // it would also be an error — so this doubles as proof no request is
         // made.
         let storage = offline_storage().await;
-        let reader = GcsRangeReader::open(&storage, "projects/_/buckets/b", "o.parquet", 1_024)
-            .await
-            .expect("opens");
+        let reader =
+            GcsRangeReader::open(&storage, "projects/_/buckets/b", "o.parquet", 1_024, None)
+                .await
+                .expect("opens");
         assert_eq!(reader.len(), 1_024);
         assert!(reader.fetch(10..10).await.expect("no request").is_empty());
     }

@@ -47,9 +47,26 @@ const MAX_DISCOVER_SCHEMA_FETCHES: usize = 100;
 pub struct BigQuerySource {
     config: BigQuerySourceConfig,
     client: Client,
+    /// Round-trip recorder installed by the pipeline (#638 / #704). Ops:
+    /// `query` (`jobs.query`), `poll` (`jobs.getQueryResults`), `job`
+    /// (`jobs.get`). Cost signal: `bytes_processed` (bytes) per query.
+    roundtrips: faucet_core::observability::RecorderSlot,
 }
 
 impl BigQuerySource {
+    /// Report the bytes a `jobs.query` response says the query scanned
+    /// (`totalBytesProcessed`, the figure on-demand pricing bills) as a
+    /// `bytes_processed` cost signal (#704).
+    fn signal_bytes_processed(&self, resp: &QueryResponse) {
+        if let Some(b) = resp
+            .total_bytes_processed
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            self.roundtrips.signal("bytes_processed", "bytes", b);
+        }
+    }
+
     /// Create a new BigQuery source from the given configuration.
     ///
     /// Initialises the underlying BigQuery client and exchanges credentials
@@ -59,7 +76,11 @@ impl BigQuerySource {
         faucet_core::validate_batch_size(config.batch_size)?;
         Self::validate_read_api(&config)?;
         let client = build_client(&config.auth).await?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
+        })
     }
 
     /// Validate `read_api` mode: it needs the `arrow` feature and a
@@ -107,18 +128,21 @@ impl BigQuerySource {
     #[cfg(feature = "arrow")]
     pub(crate) async fn query_destination_table(&self) -> Result<String, FaucetError> {
         let req = self.build_query_request(self.config.query.clone(), &[]);
+        self.roundtrips.record("query");
         let initial = self
             .client
             .job()
             .query(&self.config.project_id, req)
             .await
             .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+        self.signal_bytes_processed(&initial);
         let job_ref = initial.job_reference.as_ref().ok_or_else(|| {
             FaucetError::Source("BigQuery jobs.query returned no jobReference".into())
         })?;
         let job_id = job_ref.job_id.as_deref().ok_or_else(|| {
             FaucetError::Source("BigQuery jobs.query returned a jobReference with no jobId".into())
         })?;
+        self.roundtrips.record("job");
         let job = self
             .client
             .job()
@@ -159,7 +183,11 @@ impl BigQuerySource {
     /// [`BigQuerySource::new`], which handles credential loading.
     #[doc(hidden)]
     pub fn from_parts(config: BigQuerySourceConfig, client: Client) -> Self {
-        Self { config, client }
+        Self {
+            config,
+            client,
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
+        }
     }
 
     /// Resolve the final SQL statement and ordered bind values for a given
@@ -467,6 +495,12 @@ fn job_reference(qr: &QueryResponse) -> Result<(String, Option<String>), FaucetE
 
 #[async_trait]
 impl faucet_core::Source for BigQuerySource {
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.roundtrips.install(recorder);
+    }
     fn connector_name(&self) -> &'static str {
         "bigquery"
     }
@@ -515,6 +549,7 @@ impl faucet_core::Source for BigQuerySource {
         req.dry_run = Some(true);
 
         let probe = async {
+            self.roundtrips.record("query");
             match self.client.job().query(&self.config.project_id, req).await {
                 Ok(_) => Ok::<Probe, Probe>(Probe::pass("query", start.elapsed())),
                 Err(e) => Err(Probe::fail_hint(
@@ -544,12 +579,16 @@ impl faucet_core::Source for BigQuerySource {
         let (query, bindings) = self.resolve_query(context);
         let req = self.build_query_request(query, &bindings);
 
+        self.roundtrips.record("query");
+
         let initial = self
             .client
             .job()
             .query(&self.config.project_id, req)
             .await
             .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+
+        self.signal_bytes_processed(&initial);
 
         let fields = schema_fields(&initial);
         let mut all_rows: Vec<Value> = rows_from_response(&initial, &fields);
@@ -570,6 +609,8 @@ impl faucet_core::Source for BigQuerySource {
                 location: job_location.clone(),
                 ..Default::default()
             };
+
+            self.roundtrips.record("poll");
 
             let resp = self
                 .client
@@ -668,12 +709,16 @@ impl faucet_core::Source for BigQuerySource {
             let (query, bindings) = self.resolve_query(context);
             let req = self.build_query_request(query, &bindings);
 
+            self.roundtrips.record("query");
+
             let initial = self
                 .client
                 .job()
                 .query(&self.config.project_id, req)
                 .await
                 .map_err(|e| FaucetError::Source(format!("BigQuery jobs.query failed: {e}")))?;
+
+            self.signal_bytes_processed(&initial);
 
             let mut fields = schema_fields(&initial);
             let mut buffer: Vec<Value> = if batch_size == 0 {
@@ -708,6 +753,8 @@ impl faucet_core::Source for BigQuerySource {
                     location: job_location.clone(),
                     ..Default::default()
                 };
+
+                self.roundtrips.record("poll");
 
                 let resp = self
                     .client
