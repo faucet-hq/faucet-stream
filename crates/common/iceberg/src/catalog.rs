@@ -212,7 +212,6 @@ async fn build_hms(_inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CatalogInner;
 
     #[allow(dead_code)]
     fn empty_inner() -> CatalogInner {
