@@ -6,13 +6,14 @@
 //! Requires Docker (the `google/cloud-sdk:*-emulators` image). Run with:
 //! `cargo test -p faucet-source-pubsub --test integration`.
 //!
-//! A single emulator container is shared across every test in this binary (via
-//! a leaked `OnceCell`), so its mapped port is stable. `PUBSUB_EMULATOR_HOST`
-//! is written exactly once, inside the guarded init — the SDK's
-//! `ClientConfig::default()` (used both by the setup client here and by the
-//! connector's `build_client`) reads that env var and switches to the emulator
-//! environment (no auth). Each test uses distinct topic / subscription names so
-//! they run concurrently against the one emulator without a serialization lock.
+//! Each test starts its own emulator container and holds the handle until it
+//! returns, so the container is stopped and removed when the test ends —
+//! testcontainers-rs has no reaper, so a forgotten handle is a leaked
+//! container. `PUBSUB_EMULATOR_HOST` is process-global (the SDK's
+//! `ClientConfig::default()` — used both by the setup client here and by the
+//! connector's `build_client` — reads it and switches to the emulator
+//! environment, no auth), so the tests are serialized by [`EMULATOR_LOCK`] and
+//! the variable is rewritten under that lock for each test's own port.
 
 use faucet_common_pubsub::PubsubMessage;
 use faucet_core::{CheckContext, Source};
@@ -20,48 +21,53 @@ use faucet_source_pubsub::{
     PubsubConnection, PubsubCredentials, PubsubSource, PubsubSourceConfig, ValueFormat,
 };
 use gcloud_pubsub::client::{Client, ClientConfig};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, MutexGuard};
 
 use testcontainers_modules::google_cloud_sdk_emulators::{CloudSdk, PUBSUB_PORT};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, runners::AsyncRunner};
 
 /// Every topic/subscription is created under this project id; the emulator
 /// accepts any project name. The connector and the setup client must agree, or
 /// they would address different `projects/<id>/…` namespaces.
 const PROJECT: &str = "faucet-test";
 
-/// The shared emulator's `host:port` (127.0.0.1:<mapped 8085>).
-static EMULATOR_HOST: OnceCell<String> = OnceCell::const_new();
+/// Serializes the tests: `PUBSUB_EMULATOR_HOST` is one process-wide variable
+/// and each test's emulator listens on its own mapped port.
+static EMULATOR_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Start (once) the Pub/Sub emulator, publish its host into the process env,
-/// and return `host:port`. The container is intentionally leaked so it lives
-/// for the whole test binary.
-async fn emulator_host() -> &'static str {
-    EMULATOR_HOST
-        .get_or_init(|| async {
-            let container = CloudSdk::pubsub()
-                .start()
-                .await
-                .expect("start pubsub emulator container");
-            let port = container
-                .get_host_port_ipv4(PUBSUB_PORT)
-                .await
-                .expect("pubsub emulator host port");
-            let host = format!("127.0.0.1:{port}");
-            // SAFETY: this write happens exactly once — `get_or_init` serializes
-            // concurrent callers, and no other code reads the env var until
-            // after this future has completed.
-            unsafe {
-                std::env::set_var("PUBSUB_EMULATOR_HOST", &host);
-            }
-            // Keep the container alive for the process lifetime: never run its
-            // `Drop` (which would stop/remove it), so later tests — on their own
-            // per-test runtimes — can keep connecting to it via the host string.
-            std::mem::forget(container);
-            host
-        })
+/// One test's Pub/Sub emulator: the container (stopped + removed on drop),
+/// its `host:port`, and the serialization guard released with it.
+struct Emulator {
+    _container: ContainerAsync<CloudSdk>,
+    host: String,
+    _guard: MutexGuard<'static, ()>,
+}
+
+/// Start an emulator for the calling test and point `PUBSUB_EMULATOR_HOST` at
+/// it. Held for the test's lifetime; dropping it stops the container and lets
+/// the next test start.
+async fn emulator() -> Emulator {
+    let guard = EMULATOR_LOCK.lock().await;
+    let container = CloudSdk::pubsub()
+        .start()
         .await
-        .as_str()
+        .expect("start pubsub emulator container");
+    let port = container
+        .get_host_port_ipv4(PUBSUB_PORT)
+        .await
+        .expect("pubsub emulator host port");
+    let host = format!("127.0.0.1:{port}");
+    // SAFETY: every reader of this variable in the process is one of these
+    // tests, and they hold `EMULATOR_LOCK` while running; nothing reads it
+    // concurrently with this write.
+    unsafe {
+        std::env::set_var("PUBSUB_EMULATOR_HOST", &host);
+    }
+    Emulator {
+        _container: container,
+        host,
+        _guard: guard,
+    }
 }
 
 /// A setup/admin client pointed at the emulator, scoped to `PROJECT`.
@@ -133,7 +139,8 @@ async fn publish(client: &Client, topic_id: &str, messages: Vec<PubsubMessage>) 
 /// and `convert.rs` JSON decoding + attribute mapping.
 #[tokio::test(flavor = "multi_thread")]
 async fn source_json_multipage_attributes_and_check() {
-    let host = emulator_host().await;
+    let emu = emulator().await;
+    let host = emu.host.as_str();
     let client = setup_client().await;
     create_topic_sub(&client, "src-json-t", "src-json-s").await;
     publish(
@@ -190,7 +197,8 @@ async fn source_json_multipage_attributes_and_check() {
 /// `value_format: string` decodes the raw payload as UTF-8.
 #[tokio::test(flavor = "multi_thread")]
 async fn source_value_format_string() {
-    let host = emulator_host().await;
+    let emu = emulator().await;
+    let host = emu.host.as_str();
     let client = setup_client().await;
     create_topic_sub(&client, "src-str-t", "src-str-s").await;
     publish(
@@ -225,7 +233,8 @@ async fn source_value_format_string() {
 /// `value_format: bytes` base64-encodes the raw payload bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn source_value_format_bytes() {
-    let host = emulator_host().await;
+    let emu = emulator().await;
+    let host = emu.host.as_str();
     let client = setup_client().await;
     create_topic_sub(&client, "src-bytes-t", "src-bytes-s").await;
     publish(&client, "src-bytes-t", vec![msg(&[1, 2, 3], &[], "")]).await;
