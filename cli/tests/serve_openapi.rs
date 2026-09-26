@@ -38,6 +38,12 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     ("GET", "/v1/audit"),
     ("POST", "/v1/reload"),
     ("GET", "/v1/whoami"),
+    // Change requests (#703).
+    ("POST", "/v1/changes"),
+    ("GET", "/v1/changes"),
+    ("GET", "/v1/changes/{id}"),
+    ("POST", "/v1/changes/{id}/approve"),
+    ("POST", "/v1/changes/{id}/reject"),
     ("GET", "/healthz"),
     ("GET", "/readyz"),
     ("GET", "/metrics"),
@@ -57,6 +63,8 @@ const ROUTES_CATALOG: &[(&str, &str)] = &[
     ("GET", "/v1/catalog/datasets/{id}"),
     ("POST", "/v1/catalog/datasets/{id}/consumers"),
     ("GET", "/v1/catalog/lineage"),
+    // Cost & usage accounting (#704).
+    ("GET", "/v1/usage"),
     // Local sink output retention (#587).
     ("GET", "/v1/local-outputs"),
     ("DELETE", "/v1/local-outputs/{id}"),
@@ -227,6 +235,8 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
+        require_approval: Vec::new(),
+        approval_expiry_secs: 86_400,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

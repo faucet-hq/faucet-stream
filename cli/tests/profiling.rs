@@ -291,6 +291,8 @@ async fn dry_run_and_limit_do_not_touch_the_baseline() {
         notifier: None,
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage: Default::default(),
+        budget: None,
     };
     faucet_cli::executor::run_expanded(nodes.clone(), opts(true, None))
         .await

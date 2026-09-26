@@ -55,6 +55,11 @@ struct Inner {
     /// The server-wide data-flow policy (`--policy`, #702), when one was given.
     #[cfg(feature = "policy")]
     policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
+    /// Change kinds that need an approved request (`--require-approval`, #703).
+    require_approval: Vec<crate::serve::changes::ChangeKind>,
+    /// Fallback expiry of a pending change request when the approval policy
+    /// sets none (`--approval-expiry-secs`).
+    approval_expiry: Duration,
 }
 
 impl ServerState {
@@ -92,7 +97,37 @@ impl ServerState {
                 templates_sync: RwLock::new(None),
                 #[cfg(feature = "policy")]
                 policy: RwLock::new(None),
+                require_approval: config.require_approval.clone(),
+                approval_expiry: config.approval_expiry,
             }),
+        }
+    }
+
+    /// Whether `kind` actions must go through an approved change request
+    /// (`--require-approval`, #703).
+    pub fn requires_approval(&self, kind: crate::serve::changes::ChangeKind) -> bool {
+        self.inner.require_approval.contains(&kind)
+    }
+
+    /// The change kinds `--require-approval` names.
+    pub fn require_approval(&self) -> &[crate::serve::changes::ChangeKind] {
+        &self.inner.require_approval
+    }
+
+    /// The approval policy (#703): the `approvals:` block of `--auth-config`,
+    /// or the single-principal permissive default for the other auth modes.
+    pub fn approvals(&self) -> crate::serve::changes::ApprovalPolicy {
+        match &self.inner.auth {
+            AuthMode::Rbac(cfg) => cfg.approvals().clone(),
+            _ => crate::serve::changes::ApprovalPolicy::permissive(),
+        }
+    }
+
+    /// How long a pending change request stays approvable.
+    pub fn approval_expiry(&self) -> Duration {
+        match self.approvals().expire_secs {
+            Some(secs) => Duration::from_secs(secs),
+            None => self.inner.approval_expiry,
         }
     }
 
@@ -262,6 +297,8 @@ mod tests {
             templates_sync_path: None,
             policy_path: None,
             callback_allow_hosts: Vec::new(),
+            require_approval: Vec::new(),
+            approval_expiry: std::time::Duration::from_secs(86_400),
         }
     }
 

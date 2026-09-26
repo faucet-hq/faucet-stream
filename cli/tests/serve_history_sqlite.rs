@@ -393,6 +393,8 @@ async fn server_with_sqlite_history_persists_runs() {
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
+        require_approval: Vec::new(),
+        approval_expiry_secs: 86_400,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -1281,4 +1283,83 @@ async fn local_output_backends_agree() {
     let expired = sql.local_output_get(&gone).await.unwrap().unwrap();
     assert!(expired.deleted_at.is_some());
     assert_eq!(expired.deleted_bytes, Some(11));
+}
+
+// ── Cost & usage accounting (#704) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn usage_records_round_trip_filter_and_dedupe() {
+    use faucet_cli::usage::{PricingSpec, RecordIdentity, UsageFilter, build_record};
+    use faucet_core::usage::UsageSnapshot;
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir, "usage.db").await;
+    let now = Utc::now();
+    let mk = |run: &str, pipeline: &str, at: chrono::DateTime<Utc>| {
+        build_record(
+            RecordIdentity {
+                run_id: run,
+                pipeline,
+                row: "default",
+                source_kind: "csv",
+                sink_kind: "jsonl",
+                dataset_id: Some("ds".into()),
+                dataset_uri: Some("file:///out.jsonl".into()),
+            },
+            UsageSnapshot {
+                records_read: 10,
+                records_written: 10,
+                bytes_read: 100,
+                bytes_written: 100,
+                ..Default::default()
+            },
+            250,
+            false,
+            &PricingSpec::default(),
+            at,
+        )
+    };
+    let a = mk("run-a", "p", now - ChronoDuration::hours(2));
+    let b = mk("run-b", "p", now - ChronoDuration::hours(1));
+    let c = mk("run-c", "other", now);
+    for r in [&a, &b, &c] {
+        store.usage_record(r).await.unwrap();
+    }
+    // A retried write of the same (run, row) is a no-op, never a double count.
+    store.usage_record(&a).await.unwrap();
+
+    let all = store.usage_list(&UsageFilter::default()).await.unwrap();
+    assert_eq!(
+        all.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run-c", "run-b", "run-a"],
+        "newest first"
+    );
+    let p_only = store
+        .usage_list(&UsageFilter {
+            pipeline: Some("p".into()),
+            since: Some(now - ChronoDuration::minutes(90)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(p_only.len(), 1);
+    assert_eq!(p_only[0].run_id, "run-b");
+    assert_eq!(p_only[0].usage.records_written, 10);
+    assert_eq!(p_only[0].dataset_id.as_deref(), Some("ds"));
+    let capped = store
+        .usage_list(&UsageFilter {
+            limit: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(capped.len(), 2);
+    let until = store
+        .usage_list(&UsageFilter {
+            until: Some(now - ChronoDuration::minutes(90)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(until.len(), 1);
+    assert_eq!(until[0].run_id, "run-a");
 }

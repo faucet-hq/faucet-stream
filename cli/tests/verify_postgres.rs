@@ -101,6 +101,8 @@ pipeline:
             notifier: None,
             #[cfg(feature = "catalog")]
             catalog: None,
+            usage: Default::default(),
+            budget: None,
         },
     )
     .await

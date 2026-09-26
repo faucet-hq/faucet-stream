@@ -8,6 +8,8 @@ import { renderSchemas } from "./views/schemas.js";
 import { renderTemplates, renderTemplateDetail } from "./views/templates.js";
 import { renderDatasets, renderDatasetDetail } from "./views/datasets.js";
 import { renderLineage } from "./views/lineage.js";
+import { renderUsage } from "./views/usage.js";
+import { renderChanges } from "./views/changes.js";
 import { route } from "./router.js";
 import { loadAccess } from "./access.js";
 
@@ -40,6 +42,8 @@ function wireChrome() {
   document.getElementById("nav-templates").onclick = () => navigate("#/templates");
   document.getElementById("nav-datasets").onclick = () => navigate("#/catalog");
   document.getElementById("nav-lineage").onclick = () => navigate("#/lineage");
+  document.getElementById("nav-usage").onclick = () => navigate("#/usage");
+  document.getElementById("nav-changes").onclick = () => navigate("#/changes");
   // One click always flips what is on screen. `auto` (follow the OS) is the
   // starting state only: cycling through it made the first click a no-op
   // whenever the OS theme matched the next state.
@@ -84,6 +88,9 @@ function registerRoutes() {
   route("#/catalog/:id", renderDatasetDetail);
   route("#/lineage", renderLineage);
   route("#/lineage/:root", renderLineage);
+  route("#/usage", renderUsage);
+  route("#/changes", renderChanges);
+  route("#/changes/:id", renderChanges);
 }
 
 async function main() {

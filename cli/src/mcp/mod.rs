@@ -54,6 +54,26 @@ pub struct McpContext {
     /// so an agent never sees a tool it cannot use.
     #[cfg(feature = "templates")]
     pub templates: Option<crate::templates::TemplateStore>,
+    /// The change-request proposer (#703), when the transport can reach a
+    /// server: `faucet serve --mcp` wires its own state and the caller's
+    /// identity, so `propose_run` / `propose_template` create pending requests
+    /// as that principal. Absent (the stdio transport) = not advertised.
+    pub changes: Option<ChangeProposer>,
+}
+
+/// What the MCP `propose_*` tools need to file a change request (#703).
+#[derive(Clone)]
+pub struct ChangeProposer {
+    pub state: crate::serve::state::ServerState,
+    pub actor: crate::serve::rbac::AuthContext,
+}
+
+impl std::fmt::Debug for ChangeProposer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangeProposer")
+            .field("actor", &self.actor.principal)
+            .finish()
+    }
 }
 
 impl McpContext {
@@ -68,7 +88,16 @@ impl McpContext {
             allow_template_admin: true,
             #[cfg(feature = "templates")]
             templates: None,
+            changes: None,
         }
+    }
+
+    /// Attach a change-request proposer (#703), enabling `propose_run` /
+    /// `propose_template`. The HTTP transport passes it only when the caller
+    /// holds `ChangeRequest`.
+    pub fn with_changes(mut self, proposer: ChangeProposer) -> Self {
+        self.changes = Some(proposer);
+        self
     }
 
     /// Set whether `validate_config` / `preview` are available. The HTTP

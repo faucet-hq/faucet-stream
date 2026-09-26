@@ -52,6 +52,8 @@ fn opts_with_reconcile(reconcile: Option<ReconcileSpec>) -> ExecuteOptions {
         notifier: None,
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage: Default::default(),
+        budget: None,
     }
 }
 

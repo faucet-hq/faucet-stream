@@ -63,6 +63,8 @@
   - [Dashboards & alerts](./cookbook/dashboards.md)
   - [Data Movement Catalog](./cookbook/catalog.md)
   - [Change impact analysis](./cookbook/impact.md)
+  - [Cost & usage accounting](./cookbook/usage.md)
+  - [Change approvals](./cookbook/approvals.md)
 
 # Reference
 

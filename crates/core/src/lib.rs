@@ -16,6 +16,7 @@
 pub mod adaptive;
 pub mod anomaly;
 pub mod auth;
+pub mod budget;
 pub mod check;
 pub mod cleanup;
 #[cfg(feature = "arrow")]
@@ -87,6 +88,7 @@ pub use auth::{
     AuthProvider, AuthReference, AuthSpec, Credential, CredentialPlacement, RequestAuth,
     SharedAuthProvider,
 };
+pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};
 pub use cleanup::{CleanupMode, CleanupPolicy, DEFAULT_MAX_KEYS, SeenKeys};
 #[cfg(feature = "arrow")]

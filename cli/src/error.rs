@@ -503,6 +503,18 @@ pub enum CliError {
     #[error("{violations} data-flow policy violation(s) — nothing was run")]
     PolicyViolations { violations: usize },
 
+    /// A run budget's `allowed_sinks` (#703) does not name the sink a row
+    /// writes to; nothing was run.
+    #[error(
+        "budget: row '{row}' writes to sink {sink}, which budget.allowed_sinks does not allow \
+         (allowed: {allowed})"
+    )]
+    BudgetSinkNotAllowed {
+        row: String,
+        sink: String,
+        allowed: String,
+    },
+
     /// `faucet rollback` was refused because a later run changed keys the run
     /// touched (#706); nothing was changed. `main` maps this to an exit code
     /// equal to the conflict count (clamped to 255).

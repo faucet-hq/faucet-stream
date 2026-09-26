@@ -74,6 +74,9 @@ pub async fn run(args: ReplicateArgs) -> CliResult<()> {
             reconcile: cfg.reconcile.clone(),
             verify: cfg.verify.clone(),
             rollback: cfg.rollback.clone(),
+            usage: crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), path.parent())
+                .map_err(CliError::Config)?,
+            budget: cfg.budget.clone(),
             #[cfg(feature = "notify")]
             notifier,
             #[cfg(feature = "catalog")]

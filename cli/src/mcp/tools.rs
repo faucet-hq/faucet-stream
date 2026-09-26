@@ -189,6 +189,45 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
             });
         }
     }
+    if ctx.changes.is_some() {
+        defs.push(ToolDef {
+            name: "propose_run",
+            description: "Propose a pipeline run as a change request (#703) instead of running it: the server plans it (resolved rows, delivery guarantee, policy verdict, impact) and stores it pending; an approver runs it. Use this when the server requires approval, or whenever a human should review first. Returns the pending request (id, plan summary, approvals needed).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "config": { "type": "string", "description": "The pipeline config (YAML or JSON)." },
+                    "config_format": { "type": "string", "enum": ["yaml", "json"], "description": "Default yaml." },
+                    "name": { "type": "string", "description": "Run name." },
+                    "reason": { "type": "string", "description": "Why — shown to the approvers." },
+                    "budget": { "type": "object", "description": "Ceilings the approved run must honour: max_records, max_bytes, max_duration_secs, allowed_sinks.", "properties": {
+                        "max_records": { "type": "integer" }, "max_bytes": { "type": "integer" },
+                        "max_duration_secs": { "type": "integer" }, "allowed_sinks": { "type": "array", "items": { "type": "string" } } } },
+                    "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "timeout_secs": { "type": "integer" },
+                    "clock": { "type": "string", "description": "RFC 3339 / YYYY-MM-DD run clock for ${now.*}." }
+                },
+                "required": ["config", "reason"]
+            }),
+        });
+        defs.push(ToolDef {
+            name: "propose_template",
+            description: "Propose a template change as a change request (#703): `action: register` files a new template version (the document is validated and planned, nothing is stored until approved); `action: launch` proposes making a version live. An approver executes it. Returns the pending request.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["register", "launch"], "description": "Default register." },
+                    "config": { "type": "string", "description": "register: the template document (YAML or JSON)." },
+                    "id": { "type": "string", "description": "register: explicit template id (derived from name: when omitted). launch: the template id (required)." },
+                    "description": { "type": "string", "description": "register: template description." },
+                    "launch": { "type": "boolean", "description": "register: also launch the new version once registered." },
+                    "version": { "description": "launch: the version to make live (number or channel; default newest).", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                    "reason": { "type": "string", "description": "Why — shown to the approvers." }
+                },
+                "required": ["reason"]
+            }),
+        });
+    }
     defs
 }
 
@@ -219,10 +258,29 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         "run_pipeline" => {
             if !ctx.allow_mutations {
                 Err("run_pipeline is disabled; start the MCP server with --allow-mutations to enable mutating tools".to_string())
+            } else if ctx.changes.as_ref().is_some_and(|c| {
+                c.state
+                    .requires_approval(crate::serve::changes::ChangeKind::Run)
+            }) {
+                Err("this server requires an approved change request for runs (--require-approval run); use propose_run instead".to_string())
             } else {
                 run_pipeline(ctx, args).await
             }
         }
+        "propose_run" => match &ctx.changes {
+            Some(p) => propose_run(p, args).await,
+            None => Err(
+                "propose_run is only available on a server transport (faucet serve --mcp)"
+                    .to_string(),
+            ),
+        },
+        "propose_template" => match &ctx.changes {
+            Some(p) => propose_template(p, args).await,
+            None => Err(
+                "propose_template is only available on a server transport (faucet serve --mcp)"
+                    .to_string(),
+            ),
+        },
         #[cfg(feature = "templates")]
         "list_templates" => list_templates(ctx).await,
         #[cfg(feature = "templates")]
@@ -282,6 +340,106 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         // Redact any resolved secret material that reached an error string.
         Err(msg) => tool_error(crate::secrets::registry::redact(&msg)),
     }
+}
+
+/// The MCP-facing rendering of a change request: everything an agent needs
+/// to tell the human what to approve, without the plan rows' bulk.
+fn render_change(change: &crate::serve::changes::ChangeRequest) -> Result<String, String> {
+    let plan = change.plan.as_ref().map(|p| &p.summary);
+    let value = json!({
+        "change_id": change.id,
+        "kind": change.kind,
+        "status": change.status,
+        "requester": change.requester,
+        "reason": change.reason,
+        "required_approvals": change.required_approvals,
+        "approvals": change.approvals.len(),
+        "expires_at": change.expires_at,
+        "plan": plan,
+        "budget": change.budget,
+        "next": format!(
+            "an approver runs it with POST /v1/changes/{}/approve (or the console's Changes page)",
+            change.id
+        ),
+    });
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
+async fn propose_run(p: &crate::mcp::ChangeProposer, args: &Value) -> Result<String, String> {
+    let config = str_arg(args, "config")?;
+    let reason = str_arg(args, "reason")?;
+    let mut payload = json!({
+        "config": config,
+        "config_format": args.get("config_format").cloned().unwrap_or(json!("yaml")),
+    });
+    for key in ["name", "labels", "timeout_secs", "clock"] {
+        if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+            payload[key] = v.clone();
+        }
+    }
+    let budget = match args.get("budget").filter(|v| !v.is_null()) {
+        Some(v) => Some(serde_json::from_value(v.clone()).map_err(|e| format!("budget: {e}"))?),
+        None => None,
+    };
+    let change = crate::serve::changes::create(
+        &p.state,
+        &p.actor,
+        crate::serve::changes::NewChange {
+            kind: crate::serve::changes::ChangeKind::Run,
+            payload,
+            reason: Some(reason.to_string()),
+            budget,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    render_change(&change)
+}
+
+async fn propose_template(p: &crate::mcp::ChangeProposer, args: &Value) -> Result<String, String> {
+    let reason = str_arg(args, "reason")?;
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("register");
+    let (kind, payload) = match action {
+        "register" => {
+            let config = str_arg(args, "config")?;
+            let mut payload = json!({ "config": config });
+            for key in ["id", "description", "launch"] {
+                if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+                    payload[key] = v.clone();
+                }
+            }
+            (crate::serve::changes::ChangeKind::TemplateRegister, payload)
+        }
+        "launch" => {
+            let id = str_arg(args, "id")?;
+            let mut payload = json!({ "id": id });
+            if let Some(v) = args.get("version").filter(|v| !v.is_null()) {
+                payload["version"] = v.clone();
+            }
+            (crate::serve::changes::ChangeKind::TemplateLaunch, payload)
+        }
+        other => {
+            return Err(format!(
+                "unknown action `{other}` (expected register or launch)"
+            ));
+        }
+    };
+    let change = crate::serve::changes::create(
+        &p.state,
+        &p.actor,
+        crate::serve::changes::NewChange {
+            kind,
+            payload,
+            reason: Some(reason.to_string()),
+            budget: None,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    render_change(&change)
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {

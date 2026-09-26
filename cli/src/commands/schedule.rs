@@ -120,6 +120,8 @@ struct ReloadedBundle {
     reconcile: Option<crate::reconcile::ReconcileSpec>,
     verify: Option<crate::verify::VerifySpec>,
     rollback: Option<crate::rollback::RollbackSpec>,
+    usage: crate::usage::UsageOptions,
+    budget: Option<faucet_core::BudgetSpec>,
     cron: String,
     timezone: String,
 }
@@ -149,6 +151,9 @@ async fn reload_bundle(path: &std::path::Path, profile: Option<&str>) -> CliResu
         reconcile: cfg.reconcile.clone(),
         verify: cfg.verify.clone(),
         rollback: cfg.rollback.clone(),
+        usage: crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), path.parent())
+            .map_err(CliError::Config)?,
+        budget: cfg.budget.clone(),
         cron,
         timezone,
     })
@@ -214,6 +219,8 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
         Some(spec) => Some(spec.to_policy()?),
         None => None,
     };
+    let usage = crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), path.parent())
+        .map_err(CliError::Config)?;
 
     if args.once {
         return run_once(
@@ -227,6 +234,8 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
             &cfg.reconcile,
             &cfg.verify,
             &cfg.rollback,
+            &usage,
+            &cfg.budget,
             #[cfg(feature = "lineage")]
             &lineage,
             #[cfg(feature = "lineage")]
@@ -252,6 +261,8 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
         cfg.reconcile.clone(),
         cfg.verify.clone(),
         cfg.rollback.clone(),
+        usage,
+        cfg.budget.clone(),
         path,
         args.profile,
         #[cfg(feature = "lineage")]
@@ -279,6 +290,8 @@ fn make_opts(
     reconcile: &Option<crate::reconcile::ReconcileSpec>,
     verify: &Option<crate::verify::VerifySpec>,
     rollback: &Option<crate::rollback::RollbackSpec>,
+    usage: &crate::usage::UsageOptions,
+    budget: &Option<faucet_core::BudgetSpec>,
     #[cfg(feature = "lineage")] lineage: &Option<std::sync::Arc<faucet_lineage::LineageEmitter>>,
     #[cfg(feature = "lineage")] lineage_cfg: &Option<faucet_lineage::LineageConfig>,
     #[cfg(feature = "notify")] notifier: &Option<std::sync::Arc<crate::notify::Notifier>>,
@@ -309,6 +322,8 @@ fn make_opts(
         notifier: notifier.clone(),
         #[cfg(feature = "catalog")]
         catalog: catalog.clone(),
+        usage: usage.clone(),
+        budget: budget.clone(),
     }
 }
 
@@ -414,6 +429,8 @@ async fn run_once(
     reconcile: &Option<crate::reconcile::ReconcileSpec>,
     verify: &Option<crate::verify::VerifySpec>,
     rollback: &Option<crate::rollback::RollbackSpec>,
+    usage: &crate::usage::UsageOptions,
+    budget: &Option<faucet_core::BudgetSpec>,
     #[cfg(feature = "lineage")] lineage: &Option<std::sync::Arc<faucet_lineage::LineageEmitter>>,
     #[cfg(feature = "lineage")] lineage_cfg: &Option<faucet_lineage::LineageConfig>,
     #[cfg(feature = "notify")] notifier: &Option<std::sync::Arc<crate::notify::Notifier>>,
@@ -431,6 +448,8 @@ async fn run_once(
         reconcile,
         verify,
         rollback,
+        usage,
+        budget,
         #[cfg(feature = "lineage")]
         lineage,
         #[cfg(feature = "lineage")]
@@ -486,6 +505,8 @@ async fn run_loop(
     mut reconcile: Option<crate::reconcile::ReconcileSpec>,
     mut verify: Option<crate::verify::VerifySpec>,
     mut rollback: Option<crate::rollback::RollbackSpec>,
+    mut usage: crate::usage::UsageOptions,
+    mut budget: Option<faucet_core::BudgetSpec>,
     path: std::path::PathBuf,
     profile: Option<String>,
     #[cfg(feature = "lineage")] lineage: Option<std::sync::Arc<faucet_lineage::LineageEmitter>>,
@@ -564,6 +585,8 @@ async fn run_loop(
                         &reconcile,
                         &verify,
                         &rollback,
+                        &usage,
+                        &budget,
                         #[cfg(feature = "lineage")]
                         &lineage,
                         #[cfg(feature = "lineage")]
@@ -717,6 +740,8 @@ async fn run_loop(
                                 &reconcile,
                                 &verify,
                                 &rollback,
+                                &usage,
+                                &budget,
                                 #[cfg(feature = "lineage")]
                                 &lineage,
                                 #[cfg(feature = "lineage")]
@@ -753,6 +778,8 @@ async fn run_loop(
                         reconcile = b.reconcile;
                         verify = b.verify;
                         rollback = b.rollback;
+                        usage = b.usage;
+                        budget = b.budget;
                         cron = b.cron;
                         timezone = b.timezone;
                         breaker_cooldown = resilience
@@ -871,6 +898,7 @@ mod tests {
                 },
                 error_kind: (i < failures).then_some(InvocationErrorKind::Other),
                 metrics: None,
+                usage: None,
             });
         }
         RunSummary { invocations }
@@ -931,6 +959,7 @@ mod tests {
             error: Some(msg.into()),
             error_kind: kind,
             metrics: None,
+            usage: None,
         }]
     }
 
@@ -1076,6 +1105,8 @@ mod tests {
             &None,
             &None,
             &None,
+            &crate::usage::UsageOptions::default(),
+            &None,
             #[cfg(feature = "lineage")]
             &None,
             #[cfg(feature = "lineage")]
@@ -1115,6 +1146,8 @@ mod tests {
             &None,
             &None,
             &None,
+            &None,
+            &crate::usage::UsageOptions::default(),
             &None,
             #[cfg(feature = "lineage")]
             &None,

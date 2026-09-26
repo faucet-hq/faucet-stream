@@ -27,8 +27,8 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/templates*`, `GET /v1/local-outputs` |
-| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, `POST /v1/doctor`, firing triggers, and deleting local sink outputs |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs` |
+| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, firing triggers, and deleting local sink outputs |
 | `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish) and `GET /v1/audit` |
 
 ```yaml
@@ -42,6 +42,21 @@ principals:
 ```bash
 faucet serve --auth-config auth.yaml
 ```
+
+The same file may carry an `approvals:` block — who may approve which
+[change requests](../cookbook/approvals.md), how many approvals each kind
+needs, whether a requester may approve their own, and how long a request
+stays approvable:
+
+```yaml
+approvals:
+  expire_secs: 86400
+  rules:
+    - { kinds: [run], roles: [operator, admin], min_approvers: 1, self_approve: false }
+    - { kinds: [template_register, template_launch], roles: [admin], min_approvers: 2 }
+```
+
+With no rule for a kind: admins only, one approval, no self-approval.
 
 ### The read / write / admin token trio
 
@@ -83,6 +98,7 @@ someone does.
 | `POST`/`PUT /v1/triggers/{name}` | — | ✓ | ✓ |
 | `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
 | `POST /v1/catalog/datasets/{id}/consumers` | — | ✓ | ✓ |
+| `GET /v1/usage` | ✓ | ✓ | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
 | `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
@@ -92,10 +108,15 @@ someone does.
 | `POST /v1/templates/{id}/versions/{version}/deprecate` | — | — | ✓ |
 | `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | — | ✓ |
 | `GET /v1/whoami` | ✓ | ✓ | ✓ |
+| `GET /v1/changes`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
+| `POST /v1/changes` | — | ✓ | ✓ |
+| `POST /v1/changes/{id}/approve`, `/reject` | — | ✓¹ | ✓¹ |
 | `POST /mcp` | ✓ | ✓ | ✓ |
 | `GET /v1/audit` | — | — | ✓ |
 | `POST /v1/reload` | — | — | ✓ |
 | *any unclassified `/v1` route* | — | — | ✓ |
+
+¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
 
 Three entries are POSTs a **read** token can reach, because they change nothing:
 
@@ -156,6 +177,7 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `GET` | `/v1/catalog/datasets` | `200` | List catalogued datasets (`kind`, `q`, `limit`, `cursor`) — requires the `catalog` build feature |
 | `GET` | `/v1/catalog/datasets/{id}` | `200` | One dataset's detail: schema timeline, volume, edges |
 | `GET` | `/v1/catalog/lineage` | `200` | The lineage edge graph (`root`, `depth`) |
+| `GET` | `/v1/usage` | `200` | Cost & usage report over recorded invocations (`by`, `since`, `until`, `pipeline`, `limit`, `include_records`) — viewer / `UsageRead`; requires the `catalog` build feature |
 | `GET` | `/v1/local-outputs` | `200` | List tracked local sink output files with age + state (`dataset_id`, `pipeline`, `include_expired`, `limit`) — viewer / `LocalOutputRead` |
 | `DELETE` | `/v1/local-outputs/{id}` | `200` | Delete one recorded output file now (operator / `LocalOutputManage`); `404` for an unknown id |
 | `POST` | `/v1/local-outputs/cleanup` | `200` | Bulk clean: `older_than_days` \| `expired` \| `dataset_id` \| `run_id` \| `all`, plus `dry_run` (operator / `LocalOutputManage`) |
@@ -172,6 +194,11 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/templates/sync` | `200` | Pull the `--templates-sync` origins into the registry — `{origin?, dry_run?}`; one report per origin, appends only (admin / `TemplateAdmin`; requires the `templates-sync` feature; `422` when the server has no origins) |
 | `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (admin / `TemplateAdmin`; `templates-sync`) |
 | `GET` | `/v1/whoami` | `200` | The caller's `principal`, `role` and `permissions` (every role / `Identity`) |
+| `POST` | `/v1/changes` | `201` | Propose a [change request](../cookbook/approvals.md) (`kind` = `run` / `template_register` / `template_launch`, `payload`, `reason`, `budget`); planned now, executed on approval — operator / `ChangeRequest` |
+| `GET` | `/v1/changes` | `200` | List change requests (`status`, `kind`, `requester`, `limit`), newest first, plan rows omitted — viewer / `ChangeRead` |
+| `GET` | `/v1/changes/{id}` | `200` | One change request with its plan — viewer / `ChangeRead` |
+| `POST` | `/v1/changes/{id}/approve` | `200` | Approve (`comment`); at quorum re-plans and executes, or marks it `invalidated` — `ChangeApprove`, then the `approvals:` policy |
+| `POST` | `/v1/changes/{id}/reject` | `200` | Reject with a `reason`; the requester may withdraw their own — `ChangeApprove`, then the policy |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |
@@ -345,6 +372,39 @@ it automatically). Viewer-readable under RBAC; requires a build with the
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/v1/catalog/datasets?kind=postgres&limit=20"
+```
+
+### `/v1/changes*` (change requests)
+
+Plan → approve → run: see the [change approvals cookbook](../cookbook/approvals.md)
+for the full flow. `POST /v1/runs` accepts `require_approval` (plus `reason`
+and `budget`); when it is set, or the server runs with
+`--require-approval run`, the 202 body is
+`{ "status": "pending_approval", "change_id": "…", "change": { … } }` instead
+of a run. `budget` on a run or a change request (`max_records`, `max_bytes`,
+`max_duration_secs`, `allowed_sinks`) is merged with the config's own
+`budget:` block, the stricter of each ceiling winning.
+
+A refused approval is a `403` naming the rule (role, named principals,
+self-approval); a request that is not `pending`, or a second approval by the
+same principal, is a `409`. Audited as `change.requested` / `approved` /
+`rejected` / `executed` / `invalidated` / `expired` / `failed`.
+
+### `GET /v1/usage` (cost & usage)
+
+The [cost & usage report](../cookbook/usage.md) over every invocation this
+server has recorded, aggregated by `by=pipeline|row|dataset|sink|day`
+(default `pipeline`) within an optional half-open `since` / `until` window
+(RFC 3339 or `YYYY-MM-DD`) and an optional `pipeline`. `limit` caps the
+invocation records read (newest first, default 5000); `include_records=true`
+returns them alongside the report. Estimates are priced with each run's
+`usage:` table and labelled as such; `hosted_equivalent` is what a per-row-
+priced hosted ELT service would charge for the same rows. `UsageRead`
+(viewer and up); audited `usage.list`; `400` for a bad `by` / timestamp.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/v1/usage?by=day&since=2026-09-01"
 ```
 
 ### Local sink outputs

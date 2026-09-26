@@ -118,6 +118,12 @@ impl ServeError {
     }
 }
 
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code(), self.message())
+    }
+}
+
 impl IntoResponse for ServeError {
     fn into_response(self) -> Response {
         let status = self.status();

@@ -32,7 +32,7 @@ const QUEUE_FULL_RETRY_AFTER_SECS: u64 = 5;
 pub(crate) const RUN_FLUSH_GRACE: Duration = Duration::from_secs(30);
 
 /// `POST /v1/runs` request body.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitRequest {
     pub config: String,
     #[serde(default)]
@@ -65,10 +65,132 @@ pub struct SubmitRequest {
     /// the submission rather than a silent no-op when the run finishes.
     #[serde(default)]
     pub callback: Option<crate::serve::callback::CallbackSpec>,
+    /// Ask for an approved change request (#703) instead of a run: the
+    /// response is the pending request, and the run starts once the
+    /// approvers the server's policy names approve it. Implied by
+    /// `--require-approval run`.
+    #[serde(default)]
+    pub require_approval: bool,
+    /// Why, for the approvers (with `require_approval`).
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Run budget (#703): ceilings merged into the config's own `budget:`
+    /// block (the stricter of each wins), so an approved change never exceeds
+    /// what was agreed.
+    #[serde(default)]
+    pub budget: Option<faucet_core::BudgetSpec>,
+    /// Set in-process by an executing change request, never accepted from a
+    /// client (`skip`): lets the run through the approval gate.
+    #[serde(skip)]
+    pub approved_change: Option<String>,
+}
+
+/// What a gated submission produced (#703).
+#[derive(Debug)]
+pub enum SubmitOutcome {
+    /// The run was accepted (queued / pending in a cluster).
+    Accepted(SubmitResponse),
+    /// The server (or the request) wants approval first: this is the pending
+    /// change request; nothing ran.
+    PendingApproval(Box<crate::serve::changes::ChangeRequest>),
+}
+
+/// The JSON body `POST /v1/runs` / a template trigger answer with when the
+/// submission became a change request instead of a run.
+pub fn pending_approval_body(change: &crate::serve::changes::ChangeRequest) -> serde_json::Value {
+    serde_json::json!({
+        "status": "pending_approval",
+        "change_id": change.id,
+        "change": change,
+    })
+}
+
+/// [`submit`] behind the approval gate (#703): when the server requires
+/// approval for runs, or the request asks for it, a change request is
+/// created instead and returned as `PendingApproval`. An executing change
+/// request marks its submission `approved_change` and passes straight
+/// through.
+pub async fn submit_gated(
+    state: ServerState,
+    req: SubmitRequest,
+    actor: AuthContext,
+) -> Result<SubmitOutcome, ServeError> {
+    let gated = req.approved_change.is_none()
+        && (req.require_approval
+            || state.requires_approval(crate::serve::changes::ChangeKind::Run));
+    if gated {
+        let reason = req.reason.clone();
+        let budget = req.budget.clone();
+        let payload =
+            serde_json::to_value(&req).map_err(|e| ServeError::Internal(e.to_string()))?;
+        let change = crate::serve::changes::create(
+            &state,
+            &actor,
+            crate::serve::changes::NewChange {
+                kind: crate::serve::changes::ChangeKind::Run,
+                payload,
+                reason,
+                budget,
+            },
+        )
+        .await?;
+        return Ok(SubmitOutcome::PendingApproval(Box::new(change)));
+    }
+    Ok(SubmitOutcome::Accepted(submit(state, req, actor).await?))
+}
+
+/// Fold a request-level budget (#703) into the config document, so the
+/// stored body (what a cluster peer re-runs) carries it too. The config's own
+/// `budget:` and the request's merge, the stricter of each ceiling winning.
+pub(crate) fn apply_request_budget(mut req: SubmitRequest) -> Result<SubmitRequest, ServeError> {
+    let Some(extra) = req.budget.take() else {
+        return Ok(req);
+    };
+    extra.validate().map_err(ServeError::BadConfig)?;
+    let mut doc: serde_json::Value = match req.config_format {
+        ConfigFormatWire::Yaml => serde_yaml::from_str(&req.config)
+            .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
+        ConfigFormatWire::Json => serde_json::from_str(&req.config)
+            .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        return Err(ServeError::BadConfig("config must be a mapping".into()));
+    };
+    let merged = match obj.get("budget") {
+        Some(existing) => {
+            let own: faucet_core::BudgetSpec = serde_json::from_value(existing.clone())
+                .map_err(|e| ServeError::BadConfig(format!("budget: {e}")))?;
+            own.merge(&extra)
+        }
+        None => extra,
+    };
+    obj.insert(
+        "budget".to_string(),
+        serde_json::to_value(&merged).map_err(|e| ServeError::Internal(e.to_string()))?,
+    );
+    req.config = serde_json::to_string(&doc).map_err(|e| ServeError::Internal(e.to_string()))?;
+    req.config_format = ConfigFormatWire::Json;
+    Ok(req)
+}
+
+/// Resolve a submitted config's `usage:` pricing (#704). A submitted config
+/// has no filesystem: `pricing_file` is refused (it would read a file on the
+/// server), inline `pricing` overrides apply.
+pub fn usage_options(
+    cfg: &crate::config::PipelineConfig,
+) -> Result<crate::usage::UsageOptions, String> {
+    if cfg.usage.as_ref().is_some_and(|u| u.pricing_file.is_some()) {
+        return Err(
+            "usage.pricing_file is not allowed in a submitted config (it would read a file \
+             on the server); set the rates inline under usage.pricing"
+                .to_string(),
+        );
+    }
+    crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
 }
 
 /// Wire enum mirroring `load::ConfigFormat` with serde rename.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigFormatWire {
     #[default]
@@ -461,6 +583,13 @@ async fn execute_shard(
     // `coop` is the per-shard cancel token registered by `resume_claimed_shard`;
     // a cross-instance cancel (F10), a server shutdown, or a timeout all fire it
     // so the shard's pipeline flushes at its next page boundary.
+    let usage = match usage_options(&cfg) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!(run_id, shard_id, "shard usage: {e}");
+            return false;
+        }
+    };
     let opts = ExecuteOptions {
         pipeline_name,
         // Correlate notifications to the submitted run (#480). Every shard of a
@@ -492,6 +621,8 @@ async fn execute_shard(
         // of the row's; the catalog records whole runs only.
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage,
+        budget: cfg.budget.clone(),
     };
 
     let server_shutdown = state.shutdown_token();
@@ -703,6 +834,9 @@ pub async fn submit(
         });
     }
 
+    // A request-level budget (#703) becomes part of the document before it is
+    // loaded or stored.
+    let req = apply_request_budget(req)?;
     let format: ConfigFormat = req.config_format.into();
     let loaded = load_submission(
         &req.config,
@@ -711,34 +845,7 @@ pub async fn submit(
         server_policy(&state).as_deref(),
     )
     .await?;
-
-    // Data-flow policy (#702): refuse a submission that would move a labelled
-    // column somewhere its rules forbid — before the queue reservation, so a
-    // refusal costs nothing, and audited as `policy.denied`.
-    #[cfg(feature = "policy")]
-    if let Some(spec) = loaded.cfg.policy.as_ref() {
-        let report = crate::policy::evaluate_nodes(spec, &loaded.nodes, &Default::default())
-            .map_err(|e| ServeError::BadConfig(e.to_string()))?;
-        if report.violated() {
-            let merged = serde_json::to_value(&loaded.cfg).unwrap_or(serde_json::Value::Null);
-            let fp = idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
-            crate::policy::record_metrics(loaded.cfg.name.as_deref().unwrap_or("serve"), &report);
-            crate::serve::audit::write(&state, &actor, "policy.denied", None, Some(fp), "denied")
-                .await;
-            return Err(ServeError::Unprocessable {
-                message: format!(
-                    "policy: {} violation(s) — {}",
-                    report.violations,
-                    report
-                        .all_violations()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-                details: serde_json::to_value(&report).ok(),
-            });
-        }
-    }
+    policy_gate(&state, &actor, &loaded).await?;
 
     // At-least-once duplicate-write warning for clustered / source-sharded runs
     // with an append-mode destination (F26/F39).
@@ -924,6 +1031,44 @@ pub async fn submit(
         status: RunStatus::Queued,
         submitted_at,
     })
+}
+
+/// Data-flow policy gate (#702): refuse a submission that would move a
+/// labelled column somewhere its rules forbid — before any queue reservation,
+/// so a refusal costs nothing, and audited as `policy.denied`. Shared by
+/// `submit` and a change request's plan (#703).
+pub(crate) async fn policy_gate(
+    state: &ServerState,
+    actor: &AuthContext,
+    loaded: &LoadedSubmission,
+) -> Result<(), ServeError> {
+    #[cfg(feature = "policy")]
+    if let Some(spec) = loaded.cfg.policy.as_ref() {
+        let report = crate::policy::evaluate_nodes(spec, &loaded.nodes, &Default::default())
+            .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+        if report.violated() {
+            let merged = serde_json::to_value(&loaded.cfg).unwrap_or(serde_json::Value::Null);
+            let fp = idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
+            crate::policy::record_metrics(loaded.cfg.name.as_deref().unwrap_or("serve"), &report);
+            crate::serve::audit::write(state, actor, "policy.denied", None, Some(fp), "denied")
+                .await;
+            return Err(ServeError::Unprocessable {
+                message: format!(
+                    "policy: {} violation(s) — {}",
+                    report.violations,
+                    report
+                        .all_violations()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                details: serde_json::to_value(&report).ok(),
+            });
+        }
+    }
+    #[cfg(not(feature = "policy"))]
+    let _ = (state, actor, loaded);
+    Ok(())
 }
 
 /// The server-wide data-flow policy handed to the submission loader (#702).
@@ -1389,6 +1534,24 @@ async fn execute_run(
         tracing::error!(%run_id, "notifications config invalid, disabling: {e}");
         None
     });
+    // Cost & usage pricing (#704) from the submitted config's `usage:` block.
+    let usage = match usage_options(&cfg) {
+        Ok(u) => u,
+        Err(e) => {
+            finalize(
+                &state,
+                &run_id,
+                started,
+                Terminal::Failed {
+                    reason: format!("usage: {e}"),
+                    records: 0,
+                    invs: Vec::new(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
     let opts = ExecuteOptions {
         pipeline_name,
         // The id returned by `POST /v1/runs`, so a completion notification can be
@@ -1424,6 +1587,8 @@ async fn execute_run(
             sample_records: crate::catalog::DEFAULT_SAMPLE_RECORDS,
             annotations: Vec::new(),
         }),
+        usage,
+        budget: cfg.budget.clone(),
     };
 
     let span = tracing::info_span!("faucet.serve.run", serve_run_id = %run_id);
@@ -1650,6 +1815,7 @@ mod tests {
                 error: None,
                 error_kind: None,
                 metrics: None,
+                usage: None,
             }],
         };
         let (status, reason, records, _, error) = classify_run(Ok(summary)).into_parts();
@@ -1670,6 +1836,7 @@ mod tests {
                 error: Some("boom".into()),
                 error_kind: None,
                 metrics: None,
+                usage: None,
             }],
         };
         let (status, reason, _, _, error) = classify_run(Ok(summary)).into_parts();
@@ -1735,6 +1902,8 @@ mod tests {
             templates_sync_path: None,
             policy_path: None,
             callback_allow_hosts: Vec::new(),
+            require_approval: Vec::new(),
+            approval_expiry: std::time::Duration::from_secs(86_400),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -1766,6 +1935,10 @@ mod tests {
             idempotency_key: Some("k".into()),
             clock: None,
             concurrency: None,
+            require_approval: false,
+            reason: None,
+            budget: None,
+            approved_change: None,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -1818,6 +1991,8 @@ mod tests {
             templates_sync_path: None,
             policy_path: None,
             callback_allow_hosts: Vec::new(),
+            require_approval: Vec::new(),
+            approval_expiry: std::time::Duration::from_secs(86_400),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -1842,6 +2017,10 @@ mod tests {
             idempotency_key: None,
             clock: None,
             concurrency: None,
+            require_approval: false,
+            reason: None,
+            budget: None,
+            approved_change: None,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -1891,6 +2070,8 @@ mod tests {
             templates_sync_path: None,
             policy_path: None,
             callback_allow_hosts: Vec::new(),
+            require_approval: Vec::new(),
+            approval_expiry: std::time::Duration::from_secs(86_400),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(
@@ -2014,6 +2195,8 @@ mod tests {
             templates_sync_path: None,
             policy_path: None,
             callback_allow_hosts: Vec::new(),
+            require_approval: Vec::new(),
+            approval_expiry: std::time::Duration::from_secs(86_400),
         };
         // A backend that is degraded from startup (primary unreachable).
         let history = Arc::new(FallbackHistory::degraded_at_startup(
@@ -2042,6 +2225,10 @@ mod tests {
             idempotency_key: None,
             clock: None,
             concurrency: None,
+            require_approval: false,
+            reason: None,
+            budget: None,
+            approved_change: None,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(
@@ -2111,6 +2298,8 @@ mod tests {
                 templates_sync_path: None,
                 policy_path: None,
                 callback_allow_hosts: Vec::new(),
+                require_approval: Vec::new(),
+                approval_expiry: std::time::Duration::from_secs(86_400),
             };
             ServerState::new(
                 &cfg,

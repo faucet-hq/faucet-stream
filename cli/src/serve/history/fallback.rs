@@ -295,6 +295,33 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Vec<crate::serve::history::catalog::CatalogLineageEdge>, HistoryError> {
         via!(self, p => p.catalog_lineage(root, depth), f => f.catalog_lineage(root, depth))
     }
+    async fn change_upsert(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.change_upsert(change), f => f.change_upsert(change))
+    }
+    async fn change_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::serve::changes::ChangeRequest>, HistoryError> {
+        via!(self, p => p.change_get(id), f => f.change_get(id))
+    }
+    async fn change_list(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
+        via!(self, p => p.change_list(filter), f => f.change_list(filter))
+    }
+    async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
+        via!(self, p => p.usage_record(record), f => f.usage_record(record))
+    }
+    async fn usage_list(
+        &self,
+        filter: &crate::usage::UsageFilter,
+    ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
+        via!(self, p => p.usage_list(filter), f => f.usage_list(filter))
+    }
     async fn local_output_record(
         &self,
         obs: &crate::local_outputs::LocalOutputObservation,

@@ -4,7 +4,7 @@
 use crate::serve::error::ServeError;
 use crate::serve::history::{DeleteOutcome, ListFilter, RunRecord, RunStatus};
 use crate::serve::rbac::AuthContext;
-use crate::serve::runner::{self, ConfigFormatWire, SubmitRequest, SubmitResponse};
+use crate::serve::runner::{self, ConfigFormatWire, SubmitOutcome, SubmitRequest};
 use crate::serve::state::ServerState;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
@@ -34,9 +34,17 @@ pub async fn submit_run(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<SubmitRequest>,
-) -> Result<(StatusCode, Json<SubmitResponse>), ServeError> {
-    let resp = runner::submit(state, req, actor).await?;
-    Ok((StatusCode::ACCEPTED, Json(resp)))
+) -> Result<axum::response::Response, ServeError> {
+    match runner::submit_gated(state, req, actor).await? {
+        SubmitOutcome::Accepted(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
+        // The server (or the caller) wants approval first (#703): the body
+        // is the pending change request, not a run.
+        SubmitOutcome::PendingApproval(change) => Ok((
+            StatusCode::ACCEPTED,
+            Json(runner::pending_approval_body(&change)),
+        )
+            .into_response()),
+    }
 }
 
 /// `GET /v1/runs/{id}` → 200 RunRecord. Fills live `elapsed_secs` for running runs.

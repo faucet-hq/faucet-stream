@@ -867,6 +867,7 @@ fn build_summary(
             error: None,
             error_kind: None,
             metrics: None,
+            usage: None,
         })
         .collect();
     invocations.sort_by(|a, b| a.row_id.cmp(&b.row_id));
@@ -895,6 +896,7 @@ fn build_summary(
             error: Some((*error).to_string()),
             error_kind,
             metrics: None,
+            usage: None,
         });
     }
 

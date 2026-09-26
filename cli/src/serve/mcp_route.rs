@@ -56,6 +56,15 @@ pub async fn handle(
         .with_template_admin(actor.role.grants(Permission::TemplateAdmin));
     #[cfg(feature = "templates")]
     let ctx = ctx.with_templates(state.history());
+    // Change requests (#703): an agent that may submit a run may propose one.
+    let ctx = if actor.role.grants(Permission::ChangeRequest) {
+        ctx.with_changes(crate::mcp::ChangeProposer {
+            state: state.clone(),
+            actor: actor.clone(),
+        })
+    } else {
+        ctx
+    };
     let response = crate::mcp::handle_message(&ctx, &body).await;
 
     // Best-effort audit: record the MCP call under the caller's principal/role.

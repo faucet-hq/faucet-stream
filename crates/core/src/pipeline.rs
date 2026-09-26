@@ -3369,6 +3369,34 @@ mod tests {
 
     // ── StreamPage / batch_size tests ───────────────────────────────────────
 
+    /// The usage meter (#704) sees every record and byte the source yielded
+    /// and the sink accepted, through the instrumented decorators the
+    /// pipeline installs — no connector code involved.
+    #[tokio::test]
+    async fn usage_meter_counts_records_and_bytes_through_the_run() {
+        let records = vec![
+            json!({"id": 1, "name": "alice"}),
+            json!({"id": 2, "name": "bob"}),
+        ];
+        let source = MockSource(records.clone());
+        let sink = MockSink::new();
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        Pipeline::new(&source, &sink)
+            .with_name("p")
+            .with_row("r")
+            .with_usage_meter(Arc::clone(&meter))
+            .run()
+            .await
+            .unwrap();
+        let snap = meter.snapshot();
+        assert_eq!(snap.records_read, 2);
+        assert_eq!(snap.records_written, 2);
+        let bytes = crate::usage::estimate_page_bytes(&records);
+        assert_eq!(snap.bytes_read, bytes);
+        assert_eq!(snap.bytes_written, bytes);
+        assert_eq!(sink.written().len(), 2);
+    }
+
     #[test]
     fn stream_page_constructs() {
         let page = StreamPage {

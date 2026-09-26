@@ -51,6 +51,8 @@ fn args_on(port: u16, token: Option<&str>) -> ServeArgs {
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
+        require_approval: Vec::new(),
+        approval_expiry_secs: 86_400,
     }
 }
 

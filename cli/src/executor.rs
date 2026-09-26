@@ -138,6 +138,15 @@ pub struct ExecuteOptions {
     /// writes a pre-run marker into its state store and hands the sink its
     /// journaling settings, so `faucet rollback --run <id>` can undo it.
     pub rollback: Option<crate::rollback::RollbackSpec>,
+    /// Cost & usage accounting (#704): the resolved pricing every invocation's
+    /// usage record is priced with. Accounting itself is always on; the
+    /// default prices with the shipped list-price table.
+    pub usage: crate::usage::UsageOptions,
+    /// Optional run budget (#703): the effective ceilings for every invocation
+    /// (config `budget:` merged with the caller's — `--budget`, a change
+    /// request — the stricter winning). `allowed_sinks` is checked before
+    /// anything runs; the others by a sink decorator per invocation.
+    pub budget: Option<faucet_core::BudgetSpec>,
     /// Shared OpenLineage emitter, built once from the `lineage:` block. `None`
     /// disables lineage (and adds zero overhead). Gated on the `lineage` feature.
     #[cfg(feature = "lineage")]
@@ -164,6 +173,32 @@ pub struct ExecuteOptions {
     pub catalog: Option<crate::catalog::CatalogHandle>,
 }
 
+/// The plan-time half of a run budget (#703): every source→sink row must
+/// write to a sink the budget's `allowed_sinks` names (by template name or
+/// connector kind). Refused before anything runs, so no row of the run
+/// moves data when one is out of bounds.
+pub fn check_budget_sinks(
+    nodes: &[ExpandedNode],
+    budget: Option<&faucet_core::BudgetSpec>,
+) -> CliResult<()> {
+    let Some(budget) = budget.filter(|b| !b.allowed_sinks.is_empty()) else {
+        return Ok(());
+    };
+    for node in nodes {
+        if matches!(node.role, NodeRole::Discovery { .. }) {
+            continue;
+        }
+        if !budget.sink_allowed(&node.sink_ref, &node.sink.kind) {
+            return Err(CliError::BudgetSinkNotAllowed {
+                row: node.id.clone(),
+                sink: format!("{} ({})", node.sink_ref, node.sink.kind),
+                allowed: budget.allowed_sinks.join(", "),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Grace window granted to in-flight invocations to flush cooperatively after
 /// an `on_error: stop` cancellation, before the remaining tasks are
 /// hard-aborted (the backstop for a sink genuinely stuck mid-write). Bounded so
@@ -185,6 +220,10 @@ pub enum InvocationErrorKind {
     /// run before it started or a rule fired at run time. Serve writes a
     /// `policy.denied` audit entry for it.
     Policy,
+    /// [`FaucetError::BudgetExceeded`] — a run budget ceiling (#703) refused a
+    /// page or cancelled the run. Serve marks the change request / run as
+    /// over budget rather than as a generic failure.
+    BudgetExceeded,
     /// Any other failure. No consumer needs to distinguish these yet, and it
     /// stays separate from `None` (= this outcome was never classified, e.g. a
     /// synthetic placeholder outcome) so the two are never confused.
@@ -248,6 +287,12 @@ pub struct InvocationOutcome {
     /// outcomes the replication / schedule orchestrators build) where no
     /// pipeline actually ran.
     pub metrics: Option<InvocationMetrics>,
+    /// Cost & usage of this invocation (#704): records, estimated bytes, round
+    /// trips, connector-reported cost signals and the priced estimate. Present
+    /// for every source→sink invocation, failed ones included (what a run
+    /// consumed before it failed still cost something); absent for discovery
+    /// rows and synthetic placeholder outcomes.
+    pub usage: Option<crate::usage::UsageRecord>,
 }
 
 /// Classify a failed invocation's typed error (#654 M2).
@@ -262,6 +307,8 @@ pub fn classify_error(err: &CliError) -> InvocationErrorKind {
         CliError::Faucet(FaucetError::CircuitOpen { .. }) => InvocationErrorKind::CircuitOpen,
         CliError::Faucet(FaucetError::PolicyViolation { .. })
         | CliError::PolicyViolations { .. } => InvocationErrorKind::Policy,
+        CliError::Faucet(FaucetError::BudgetExceeded { .. })
+        | CliError::BudgetSinkNotAllowed { .. } => InvocationErrorKind::BudgetExceeded,
         _ => InvocationErrorKind::Other,
     }
 }
@@ -289,6 +336,8 @@ struct PipelineStats {
     records_read: Option<u64>,
     dlq_count: u64,
     bookmark: Option<Value>,
+    /// The sink's dataset URI (credentials redacted), for the usage record.
+    sink_dataset_uri: String,
 }
 
 /// Aggregate outcome of `run_expanded`.
@@ -353,6 +402,7 @@ pub fn run_expanded_boxed(
 }
 
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
+    check_budget_sinks(&nodes, opts.budget.as_ref())?;
     let on_error = opts
         .execution
         .as_ref()
@@ -825,6 +875,7 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         // A panicked task never produced a typed error.
                         error_kind: None,
                         metrics: None,
+                        usage: None,
                     }
                 }
             };
@@ -1167,6 +1218,11 @@ async fn run_unit(
     }
     let needs_capture = capture.is_some();
     let started = std::time::Instant::now();
+    // The invocation's own run id and usage meter (#704) are created here, not
+    // inside `run_one_invocation`, so a failed invocation still gets a usage
+    // record: what it read and wrote before failing cost something too.
+    let run_id = uuid::Uuid::now_v7().to_string();
+    let meter = Arc::new(faucet_core::UsageMeter::default());
     let result = boxed_run_one_invocation(
         &unit.node,
         unit.parent_record.as_deref(),
@@ -1177,11 +1233,26 @@ async fn run_unit(
         cancel,
         suppress_overwrite,
         overwrite_grouped,
+        run_id.clone(),
+        Arc::clone(&meter),
     )
     .await;
     let duration_ms = started.elapsed().as_millis() as u64;
     let row_id = unit.node.id.clone();
     let parent_record_key = unit.parent_record_key.clone();
+    let usage = build_usage_record(
+        &unit.node,
+        opts,
+        &run_id,
+        &meter,
+        duration_ms,
+        result.is_err(),
+        result
+            .as_ref()
+            .ok()
+            .map(|(_, s)| s.sink_dataset_uri.as_str()),
+    )
+    .await;
     // Per-row timing metric: the pipeline already measured `duration_ms`; surface
     // it as a histogram so per-matrix-row time is observable on a scrape, not just
     // in `--output json`.
@@ -1224,18 +1295,90 @@ async fn run_unit(
                     bookmark: stats.bookmark,
                     ..base_metrics()
                 }),
+                usage: Some(usage),
             }
         }
-        Err(e) => InvocationOutcome {
-            row_id,
-            parent_record_key,
-            run_id: None,
-            records_written: 0,
-            error: Some(e.to_string()),
-            error_kind: Some(classify_error(&e)),
-            metrics: Some(base_metrics()),
-        },
+        Err(e) => {
+            if let CliError::Faucet(FaucetError::BudgetExceeded { budget, .. }) = &e {
+                metrics::counter!(
+                    "faucet_budget_exceeded_total",
+                    "pipeline" => opts.pipeline_name.clone(),
+                    "row" => row_id.clone(),
+                    "budget" => budget.clone(),
+                )
+                .increment(1);
+            }
+            InvocationOutcome {
+                row_id,
+                parent_record_key,
+                run_id: Some(run_id),
+                records_written: 0,
+                error: Some(e.to_string()),
+                error_kind: Some(classify_error(&e)),
+                metrics: Some(base_metrics()),
+                usage: Some(usage),
+            }
+        }
     }
+}
+
+/// Freeze an invocation's usage meter into a priced
+/// [`UsageRecord`](crate::usage::UsageRecord) (#704), emit its metrics, and —
+/// when a catalog store is active — persist it (the store behind
+/// `faucet usage` / `GET /v1/usage`). Persisting never fails the run: a store
+/// error is logged and the record still travels on the outcome.
+async fn build_usage_record(
+    node: &ExpandedNode,
+    opts: &ExecuteOptions,
+    run_id: &str,
+    meter: &faucet_core::UsageMeter,
+    duration_ms: u64,
+    failed: bool,
+    sink_dataset_uri: Option<&str>,
+) -> crate::usage::UsageRecord {
+    #[cfg(feature = "catalog")]
+    let (dataset_id, dataset_uri) = match sink_dataset_uri {
+        Some(uri) => {
+            let canonical =
+                crate::catalog::model::canonicalize_uri(uri, &node.sink.config, opts.clock);
+            (
+                Some(crate::serve::history::catalog::dataset_id(&canonical)),
+                Some(canonical),
+            )
+        }
+        None => (None, None),
+    };
+    #[cfg(not(feature = "catalog"))]
+    let (dataset_id, dataset_uri) = (None, sink_dataset_uri.map(str::to_owned));
+    let record = crate::usage::build_record(
+        crate::usage::RecordIdentity {
+            run_id,
+            pipeline: &opts.pipeline_name,
+            row: &node.id,
+            source_kind: &node.source.kind,
+            sink_kind: &node.sink.kind,
+            dataset_id,
+            dataset_uri,
+        },
+        meter.snapshot(),
+        duration_ms,
+        failed,
+        &opts.usage.pricing,
+        chrono::Utc::now(),
+    );
+    crate::usage::metrics::record(&record);
+    #[cfg(feature = "catalog")]
+    if let Some(handle) = &opts.catalog
+        && let Err(e) = handle.store.usage_record(&record).await
+    {
+        tracing::warn!(
+            pipeline = %opts.pipeline_name,
+            row = %node.id,
+            error = %e,
+            "usage: could not persist the invocation's usage record; continuing"
+        );
+    }
+    record
 }
 
 /// [`run_one_invocation`] behind a heap allocation, built in its own
@@ -1261,6 +1404,8 @@ fn boxed_run_one_invocation<'a>(
     cancel: CancellationToken,
     suppress_overwrite: bool,
     overwrite_grouped: bool,
+    run_id: String,
+    meter: Arc<faucet_core::UsageMeter>,
 ) -> futures::future::BoxFuture<'a, CliResult<(Vec<Value>, PipelineStats)>> {
     Box::pin(run_one_invocation(
         node,
@@ -1272,6 +1417,8 @@ fn boxed_run_one_invocation<'a>(
         cancel,
         suppress_overwrite,
         overwrite_grouped,
+        run_id,
+        meter,
     ))
 }
 
@@ -1359,6 +1506,7 @@ async fn run_discovery(
                 error: None,
                 error_kind: None,
                 metrics: Some(metrics(n)),
+                usage: None,
             }
         }
         Err(e) => InvocationOutcome {
@@ -1369,6 +1517,7 @@ async fn run_discovery(
             error: Some(e.to_string()),
             error_kind: Some(classify_error(&e)),
             metrics: Some(metrics(0)),
+            usage: None,
         },
     }
 }
@@ -1574,11 +1723,13 @@ async fn build_pipeline<'a>(
     run_id: &str,
     cleanup_scope: Option<Value>,
     suppress_overwrite: bool,
+    meter: Arc<faucet_core::UsageMeter>,
 ) -> CliResult<Pipeline<'a, dyn Source + 'a, dyn Sink + 'a>> {
     let mut pipeline = Pipeline::new(source, sink)
         .with_name(pipeline_name.to_owned())
         .with_row(row_id.to_owned())
-        .with_run_id(run_id.to_owned());
+        .with_run_id(run_id.to_owned())
+        .with_usage_meter(meter);
     if let Some(store) = state {
         pipeline = pipeline.with_state_store(store);
     }
@@ -1719,10 +1870,12 @@ async fn run_one_invocation(
     cancel: CancellationToken,
     suppress_overwrite: bool,
     overwrite_grouped: bool,
+    run_id: String,
+    meter: Arc<faucet_core::UsageMeter>,
 ) -> CliResult<(Vec<Value>, PipelineStats)> {
-    // Observability identity for this invocation — built once, reused by both
-    // the Pipeline builder and the transform instrumentation.
-    let run_id = uuid::Uuid::now_v7().to_string();
+    // Observability identity for this invocation — created by the caller
+    // (`run_unit`), reused by both the Pipeline builder and the transform
+    // instrumentation.
     // Notification run identity + timing (#480). `run_id` here correlates to the
     // *submission* (serve passes the id it returned from `POST /v1/runs`);
     // `invocation_id` is this row's own id, so a matrix run's notifications are
@@ -1891,8 +2044,25 @@ async fn run_one_invocation(
     } else {
         build_sink(&node.sink.kind, sink_cfg, &opts.auth).await?
     };
-    #[cfg(feature = "catalog")]
-    let sink_dataset_uri = raw_sink.dataset_uri();
+    let sink_dataset_uri = faucet_core::redact_uri_credentials(&raw_sink.dataset_uri());
+    // Run budget (#703): innermost, right around the destination, so the
+    // ceilings count exactly what the sink accepts (post-masking, post-policy
+    // quarantine). A page that would cross `max_records` / `max_bytes` is
+    // refused whole before it is written; `max_duration_secs` cancels the
+    // cooperative token from a timer. `_budget_timer` keeps that timer alive
+    // for the invocation. `allowed_sinks` was checked before anything ran.
+    let (raw_sink, budget_state, _budget_timer): (
+        Box<dyn Sink>,
+        Option<Arc<faucet_core::BudgetState>>,
+        Option<faucet_core::BudgetTimer>,
+    ) = match opts.budget.as_ref().filter(|b| !b.is_empty()) {
+        Some(spec) => {
+            let (s, state, timer) =
+                faucet_core::BudgetSink::wrap(raw_sink, spec.clone(), cancel.clone());
+            (Box::new(s), Some(state), Some(timer))
+        }
+        None => (raw_sink, None, None),
+    };
     let raw_sink: Box<dyn Sink> = match opts.limit {
         Some(n) => Box::new(LimitedSink::wrap(raw_sink, n)),
         None => raw_sink,
@@ -2149,6 +2319,7 @@ async fn run_one_invocation(
         &run_id,
         cleanup_scope,
         suppress_overwrite,
+        Arc::clone(&meter),
     )
     .await?;
     // ── Lineage: START + heartbeat + terminal ────────────────────────────────
@@ -2221,6 +2392,13 @@ async fn run_one_invocation(
     let result: Result<faucet_core::PipelineResult, FaucetError> = match pipeline.run().await {
         Ok(r) => sink.flush().await.map(|_| r),
         Err(e) => Err(e),
+    };
+    // A duration ceiling cancels cooperatively, so the pipeline returns `Ok`
+    // with a partial result; the verdict turns it into the budget failure
+    // (a records / bytes crossing already surfaced as the write error).
+    let result = match (&result, budget_state.as_ref().and_then(|s| s.verdict())) {
+        (Ok(_), Some(verdict)) => Err(verdict.error()),
+        _ => result,
     };
 
     // ── Completeness reconciliation (#502) ───────────────────────────────────
@@ -2700,6 +2878,7 @@ async fn run_one_invocation(
             .map(|d| d.records_dlq as u64)
             .unwrap_or(0),
         bookmark: result.bookmark.clone(),
+        sink_dataset_uri,
     };
 
     let captured = if capture.is_some() {
@@ -2772,6 +2951,11 @@ fn error_event(pipeline: &str, row: &str, err: &FaucetError) -> crate::notify::N
         FaucetError::ContractViolation { message, .. } => {
             NotifyEvent::contract_abort(pipeline, row, message.clone())
         }
+        FaucetError::BudgetExceeded {
+            budget,
+            limit,
+            actual,
+        } => NotifyEvent::budget_exceeded(pipeline, row, budget, *limit, *actual),
         other => {
             NotifyEvent::run_failure(pipeline, row, faucet_error_kind(other), other.to_string())
         }
@@ -2792,6 +2976,7 @@ fn faucet_error_kind(err: &FaucetError) -> &'static str {
         FaucetError::SchemaDrift { .. } => "schema_drift",
         FaucetError::ProfileDrift { .. } => "profile_drift",
         FaucetError::PolicyViolation { .. } => "policy",
+        FaucetError::BudgetExceeded { .. } => "budget_exceeded",
         _ => "error",
     }
 }
@@ -3521,6 +3706,8 @@ mod tests {
             reconcile: None,
             verify: None,
             rollback: None,
+            usage: None,
+            budget: None,
             shard: None,
             replication: None,
             backfill: None,
@@ -3571,6 +3758,8 @@ mod tests {
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -3614,6 +3803,8 @@ mod tests {
             notifier: None,
             #[cfg(feature = "catalog")]
             catalog: None,
+            usage: Default::default(),
+            budget: None,
         }
     }
 
@@ -3789,6 +3980,8 @@ mod tests {
             CancellationToken::new(),
             false,
             false,
+            "size".to_string(),
+            Arc::new(faucet_core::UsageMeter::default()),
         );
         let size = std::mem::size_of_val(&fut);
         drop(fut);
@@ -4117,6 +4310,8 @@ matrix:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -4184,6 +4379,8 @@ matrix:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -4416,6 +4613,8 @@ execution:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -4508,6 +4707,8 @@ pipeline:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -4574,6 +4775,8 @@ matrix:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -4649,6 +4852,8 @@ execution:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -4725,6 +4930,8 @@ matrix:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await
@@ -5010,6 +5217,8 @@ matrix:
             notifier: None,
             #[cfg(feature = "catalog")]
             catalog: None,
+            usage: Default::default(),
+            budget: None,
         }
     }
 
@@ -5716,6 +5925,8 @@ matrix:
                 notifier: None,
                 #[cfg(feature = "catalog")]
                 catalog: None,
+                usage: Default::default(),
+                budget: None,
             },
         )
         .await

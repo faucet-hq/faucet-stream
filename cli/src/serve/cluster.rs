@@ -241,6 +241,8 @@ mod tests {
             templates_sync_path: None,
             policy_path: None,
             callback_allow_hosts: Vec::new(),
+            require_approval: Vec::new(),
+            approval_expiry: std::time::Duration::from_secs(86_400),
         };
         let h = ClusterHandle::from_config(&cfg);
         h.kick();

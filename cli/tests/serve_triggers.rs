@@ -44,6 +44,8 @@ fn test_config() -> ServeConfig {
         templates_sync_path: None,
         policy_path: None,
         callback_allow_hosts: Vec::new(),
+        require_approval: Vec::new(),
+        approval_expiry: std::time::Duration::from_secs(86_400),
     }
 }
 
@@ -430,6 +432,8 @@ async fn spawn_serve_with_triggers(
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
+        require_approval: Vec::new(),
+        approval_expiry_secs: 86_400,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

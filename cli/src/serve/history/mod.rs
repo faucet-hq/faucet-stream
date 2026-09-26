@@ -90,6 +90,10 @@ pub struct InvocationRecord {
     #[serde(default)]
     pub duration_ms: u64,
     pub error: Option<String>,
+    /// Cost & usage of this invocation (#704). Defaulted so records written
+    /// before it existed still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage::UsageRecord>,
 }
 
 impl From<&InvocationOutcome> for InvocationRecord {
@@ -101,6 +105,7 @@ impl From<&InvocationOutcome> for InvocationRecord {
             records_written: o.records_written,
             duration_ms: o.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
             error: o.error.clone(),
+            usage: o.usage.clone(),
         }
     }
 }
@@ -892,6 +897,68 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    // ── Change requests (#703) ───────────────────────────────────────────────
+    //
+    // Plan → approve → run. A request lives in shared history so any cluster
+    // instance may approve or execute it; never purged by run retention (the
+    // audit trail of who approved what outlives the run). Defaulted so a
+    // third-party `RunHistory` impl is unaffected — but a server on such a
+    // backend refuses to create requests rather than silently dropping them.
+
+    /// Insert or replace a change request (by id). Default: unsupported.
+    async fn change_upsert(
+        &self,
+        change: &crate::serve::changes::ChangeRequest,
+    ) -> Result<(), HistoryError> {
+        let _ = change;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support change requests".into(),
+        ))
+    }
+
+    /// One change request by id. Default: `None`.
+    async fn change_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::serve::changes::ChangeRequest>, HistoryError> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Change requests matching `filter`, newest first, at most `filter.limit`
+    /// (backend default when `0`). Default: empty.
+    async fn change_list(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
+        let _ = filter;
+        Ok(Vec::new())
+    }
+
+    // ── Cost & usage accounting (#704) ───────────────────────────────────────
+    //
+    // One row per finished invocation: records, estimated bytes, round trips,
+    // connector cost signals and the priced estimate. Append-only and, like
+    // the catalog, never purged by run retention — a usage report over the
+    // last quarter must not depend on the run-record window. Defaulted inert
+    // so a third-party `RunHistory` impl is unaffected.
+
+    /// Append one invocation's usage record. Default: inert.
+    async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
+        let _ = record;
+        Ok(())
+    }
+
+    /// Usage records matching `filter`, newest first, at most `filter.limit`
+    /// (backend default when `0`). Default: empty.
+    async fn usage_list(
+        &self,
+        filter: &crate::usage::UsageFilter,
+    ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
+        let _ = filter;
+        Ok(Vec::new())
+    }
+
     // ── Pipeline-template registry (#444) ────────────────────────────────────
     //
     // Register-once / trigger-by-id storage for parameterized configs. Defaulted
@@ -1280,6 +1347,7 @@ mod tests {
                 duration_ms: 1_910_000,
                 ..Default::default()
             }),
+            usage: None,
         };
         assert_eq!(InvocationRecord::from(&o).duration_ms, 1_910_000);
         // A record serialized before `duration_ms` existed must still deserialize

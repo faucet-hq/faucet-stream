@@ -134,6 +134,10 @@ pub struct ServeConfig {
     /// Allowlist of hosts a per-run completion callback may target (#481).
     /// Empty = any host except link-local / cloud-metadata addresses.
     pub callback_allow_hosts: Vec<String>,
+    /// Change kinds that need an approved change request (#703).
+    pub require_approval: Vec<crate::serve::changes::ChangeKind>,
+    /// Fallback expiry of a pending change request.
+    pub approval_expiry: Duration,
 }
 
 fn default_max_concurrent() -> usize {
@@ -159,6 +163,25 @@ impl ServeConfig {
             args.write_token.as_deref(),
             args.admin_token.as_deref(),
         )?;
+
+        // `--require-approval` (#703): a comma-separated / repeated list of
+        // change kinds; an unknown kind is a startup error.
+        let mut require_approval: Vec<crate::serve::changes::ChangeKind> = Vec::new();
+        for raw in &args.require_approval {
+            for part in raw.split(',').filter(|p| !p.trim().is_empty()) {
+                let kind: crate::serve::changes::ChangeKind = part
+                    .parse()
+                    .map_err(|e| CliError::Serve(format!("--require-approval: {e}")))?;
+                if !require_approval.contains(&kind) {
+                    require_approval.push(kind);
+                }
+            }
+        }
+        if args.approval_expiry_secs == 0 {
+            return Err(CliError::Serve(
+                "--approval-expiry-secs must be greater than 0".into(),
+            ));
+        }
 
         let auth = if let Some(rbac) = token_trio {
             for token in rbac.tokens() {
@@ -330,6 +353,8 @@ impl ServeConfig {
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
             callback_allow_hosts: args.callback_allow_host,
+            require_approval,
+            approval_expiry: Duration::from_secs(args.approval_expiry_secs),
         })
     }
 }
@@ -378,6 +403,8 @@ mod tests {
             callback_allow_host: Vec::new(),
             mcp: false,
             mcp_allow_mutations: false,
+            require_approval: Vec::new(),
+            approval_expiry_secs: 86_400,
         }
     }
 

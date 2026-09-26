@@ -228,6 +228,8 @@ async fn dry_run_skips_sla_evaluation() {
             notifier: None,
             #[cfg(feature = "catalog")]
             catalog: None,
+            usage: Default::default(),
+            budget: None,
         },
     )
     .await

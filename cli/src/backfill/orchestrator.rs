@@ -82,6 +82,8 @@ pub struct BackfillOptions {
     pub execution: Option<ExecutionSpec>,
     pub auth: AuthCatalog,
     pub resilience: Option<faucet_core::ResiliencePolicy>,
+    /// Cost & usage pricing (#704), applied to every unit's record.
+    pub usage: crate::usage::UsageOptions,
     pub range: BackfillRange,
     /// Max concurrently-running units (≥ 1).
     pub concurrency: usize,
@@ -310,6 +312,10 @@ fn make_opts(
         notifier: None,
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage: opts.usage.clone(),
+        // A backfill is bounded by its window, not a budget; the ceilings a
+        // `budget:` block sets describe the forward sync.
+        budget: None,
     }
 }
 
@@ -710,6 +716,7 @@ pipeline:
             execution: None,
             auth: crate::auth_catalog::AuthCatalog::default(),
             resilience: None,
+            usage: Default::default(),
             range,
             concurrency: 2,
             row: None,

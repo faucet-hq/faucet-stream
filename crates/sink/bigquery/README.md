@@ -499,3 +499,14 @@ failure leaves the previous rows intact.
 to replace only the rows in a half-open `[from, to)` window — the swap becomes
 `BEGIN TRANSACTION; DELETE FROM target WHERE <window>; INSERT … SELECT; COMMIT`,
 leaving out-of-window rows intact (ideal for rolling-window / period-report loads).
+
+## Usage signals (#704)
+
+The sink reports its backend round trips (`insert` streaming requests, `query`
+/ `job` for the exactly-once, upsert and overwrite paths, `load` for the Arrow
+load job) and three cost signals to faucet's usage meter: `bytes_streamed`
+(the payload of each `tabledata.insertAll` request), `bytes_loaded` (the
+bytes of each load job) and `bytes_billed` (`totalBytesBilled` of each query
+job). `faucet run`, `faucet usage` and `GET /v1/usage` price them with the
+`usage.pricing.warehouse.bigquery_*` rates; see the
+[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).

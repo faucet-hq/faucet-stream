@@ -48,6 +48,7 @@ pub mod serve;
 #[cfg(feature = "templates")]
 pub mod template;
 pub mod test;
+pub mod usage;
 pub mod validate;
 pub mod verify;
 
