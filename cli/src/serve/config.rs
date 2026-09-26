@@ -48,6 +48,7 @@ impl AuthMode {
                 principal: "anonymous".to_string(),
                 role: Role::Admin,
                 source_ip: None,
+                tenant: None,
             }),
             AuthMode::Token(expected) => bearer
                 .filter(|t| crate::serve::auth::constant_time_eq(t.as_bytes(), expected.as_bytes()))
@@ -55,6 +56,7 @@ impl AuthMode {
                     principal: "token".to_string(),
                     role: Role::Admin,
                     source_ip: None,
+                    tenant: None,
                 }),
             AuthMode::Rbac(cfg) => bearer.and_then(|t| cfg.authenticate(t)),
         }

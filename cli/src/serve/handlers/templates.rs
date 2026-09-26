@@ -996,6 +996,7 @@ mod tests {
             principal: "tester".into(),
             role: Role::Admin,
             source_ip: None,
+            tenant: None,
         }
     }
 

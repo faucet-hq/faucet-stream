@@ -4,13 +4,12 @@
 //! grants a bounded flush grace before hard-dropping it; the task then finalizes
 //! an authoritative terminal status. See spec §7 + §20.
 
-use crate::auth_catalog::build_auth_catalog;
 use crate::executor::{ExecuteOptions, RunSummary, run_expanded};
 use crate::registry::build_source;
 use crate::serve::error::ServeError;
 use crate::serve::history::{Claim, InvocationRecord, RunRecord, RunStatus};
 use crate::serve::history::{ClaimedShard, ShardInsert};
-use crate::serve::load::{ConfigFormat, LoadedSubmission, load_submission};
+use crate::serve::load::{ConfigFormat, LoadedSubmission, load_submission_scoped};
 use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
 use crate::serve::{idempotency, metrics};
@@ -189,6 +188,60 @@ pub fn usage_options(
     crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
 }
 
+/// Load a submission for a run, scoped to `tenant` when it is set (#709):
+/// the tenant's connections, `${tenant.*}` values and state namespace.
+pub(crate) async fn load_for(
+    state: &ServerState,
+    body: &str,
+    format: ConfigFormat,
+    tenant: Option<&str>,
+) -> Result<LoadedSubmission, ServeError> {
+    let scope = match tenant {
+        None => None,
+        Some(t) => Some(tenant_scope(state, t).await?),
+    };
+    load_submission_scoped(
+        body,
+        format,
+        state.default_base().as_ref(),
+        server_policy(state).as_deref(),
+        scope,
+    )
+    .await
+}
+
+#[cfg(feature = "tenants")]
+async fn tenant_scope(
+    state: &ServerState,
+    tenant: &str,
+) -> Result<std::sync::Arc<crate::serve::load::TenantScope>, ServeError> {
+    crate::serve::tenants::scope(state, tenant)
+        .await
+        .map(std::sync::Arc::new)
+}
+
+#[cfg(not(feature = "tenants"))]
+async fn tenant_scope(
+    _state: &ServerState,
+    tenant: &str,
+) -> Result<std::sync::Arc<crate::serve::load::TenantScope>, ServeError> {
+    Err(ServeError::BadConfig(format!(
+        "run for tenant '{tenant}' refused: this server was built without the `tenants` feature"
+    )))
+}
+
+/// The per-run budget: the config's own `budget:` merged with the tenant's
+/// limits (the stricter of each ceiling).
+fn run_budget(
+    cfg: &crate::config::PipelineConfig,
+    tenant: Option<&crate::serve::load::TenantScope>,
+) -> Option<faucet_core::BudgetSpec> {
+    match (cfg.budget.clone(), tenant.and_then(|t| t.budget.clone())) {
+        (Some(a), Some(b)) => Some(a.merge(&b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Wire enum mirroring `load::ConfigFormat` with serde rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -237,14 +290,7 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             return;
         };
         let format = rec.config_format.unwrap_or_default();
-        let loaded = match load_submission(
-            body,
-            format,
-            state.default_base().as_ref(),
-            server_policy(&state).as_deref(),
-        )
-        .await
-        {
+        let loaded = match load_for(&state, body, format, rec.tenant.as_deref()).await {
             Ok(l) => l,
             Err(e) => {
                 finalize(
@@ -344,7 +390,8 @@ async fn coordinate_sharded_run(
         return Ok(false);
     }
     let node = &loaded.nodes[0];
-    let auth = build_auth_catalog(loaded.cfg.auth.as_ref())
+    let auth = loaded
+        .auth_catalog()
         .map_err(|e| CliError::Internal(format!("auth catalog: {e}")))?;
     let source = build_source(&node.source.kind, node.source.config.clone(), &auth, None).await?;
     if !source.is_shardable() {
@@ -436,14 +483,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             return;
         };
         let format = run.config_format.unwrap_or_default();
-        let loaded = match load_submission(
-            &body,
-            format,
-            state.default_base().as_ref(),
-            server_policy(&state).as_deref(),
-        )
-        .await
-        {
+        let loaded = match load_for(&state, &body, format, run.tenant.as_deref()).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(
@@ -539,16 +579,17 @@ async fn execute_shard(
     concurrency: Option<usize>,
     submitted_at: DateTime<Utc>,
 ) -> bool {
-    let LoadedSubmission { cfg, nodes } = loaded;
-    let pipeline_name = cfg.name.clone().unwrap_or_else(|| "serve".to_string());
-
-    let auth = match build_auth_catalog(cfg.auth.as_ref()) {
+    let auth = match loaded.auth_catalog() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard auth catalog: {e}");
             return false;
         }
     };
+    let LoadedSubmission { cfg, nodes, tenant } = loaded;
+    let pipeline_name = cfg.name.clone().unwrap_or_else(|| "serve".to_string());
+    let state_scope = tenant.as_ref().map(|t| t.state_scope()).unwrap_or_default();
+    let budget = run_budget(&cfg, tenant.as_deref());
     let clock = match resolve_clock(clock_flag.as_deref(), submitted_at) {
         Ok(c) => c,
         Err(e) => {
@@ -600,6 +641,7 @@ async fn execute_shard(
         dry_run: false,
         limit: None,
         state_path_override: None,
+        state_scope,
         shard: Some(shard),
         auth,
         clock,
@@ -622,7 +664,7 @@ async fn execute_shard(
         #[cfg(feature = "catalog")]
         catalog: None,
         usage,
-        budget: cfg.budget.clone(),
+        budget,
     };
 
     let server_shutdown = state.shutdown_token();
@@ -834,17 +876,23 @@ pub async fn submit(
         });
     }
 
+    // A run for a tenant (#709) must be admitted first: the tenant exists and
+    // is not suspended, it is under its concurrency limit (the guard is held
+    // until the run is recorded, so two submissions cannot both take the last
+    // slot on this instance), and its per-run limits join the request budget
+    // so the stored body carries them.
+    #[allow(unused_mut)]
+    let mut req = req;
+    #[cfg(feature = "tenants")]
+    let _admission = match actor.tenant.as_deref() {
+        Some(t) => Some(crate::serve::tenants::admit(&state, t, &mut req).await?),
+        None => None,
+    };
     // A request-level budget (#703) becomes part of the document before it is
     // loaded or stored.
     let req = apply_request_budget(req)?;
     let format: ConfigFormat = req.config_format.into();
-    let loaded = load_submission(
-        &req.config,
-        format,
-        state.default_base().as_ref(),
-        server_policy(&state).as_deref(),
-    )
-    .await?;
+    let loaded = load_for(&state, &req.config, format, actor.tenant.as_deref()).await?;
     policy_gate(&state, &actor, &loaded).await?;
 
     // At-least-once duplicate-write warning for clustered / source-sharded runs
@@ -946,6 +994,7 @@ pub async fn submit(
     );
     rec.doctor_report = doctor_report;
     rec.callback = req.callback.clone();
+    rec.tenant = actor.tenant.clone();
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -975,6 +1024,7 @@ pub async fn submit(
             release_orphaned_claim(&state, &req, &run_id).await;
             return Err(ServeError::Internal(e.to_string()));
         }
+        link_tenant_run(&state, &rec).await?;
         // Release the local queue reservation (cluster runs are bounded by the
         // claim loop + semaphore, not the submit-side queue).
         drop(reservation);
@@ -1000,6 +1050,7 @@ pub async fn submit(
         release_orphaned_claim(&state, &req, &run_id).await;
         return Err(ServeError::Internal(e.to_string()));
     }
+    link_tenant_run(&state, &rec).await?;
 
     let run_token = CancellationToken::new();
     state.registry().register(run_id.clone(), run_token.clone());
@@ -1031,6 +1082,20 @@ pub async fn submit(
         status: RunStatus::Queued,
         submitted_at,
     })
+}
+
+/// Record a tenant run in the run → tenant mapping (#709) so a listing can
+/// filter by tenant. A failure fails the submission: an unmapped tenant run
+/// would be invisible to the tenant's own listing.
+async fn link_tenant_run(state: &ServerState, rec: &RunRecord) -> Result<(), ServeError> {
+    if let Some(t) = &rec.tenant {
+        state
+            .history()
+            .tenant_run_link(&rec.run_id, t)
+            .await
+            .map_err(|e| ServeError::Internal(format!("recording the run's tenant: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Data-flow policy gate (#702): refuse a submission that would move a
@@ -1092,8 +1157,9 @@ pub(crate) async fn run_doctor_first(
     loaded: &LoadedSubmission,
 ) -> Result<serde_json::Value, ServeError> {
     use faucet_core::check::CheckContext;
-    let auth =
-        build_auth_catalog(loaded.cfg.auth.as_ref()).map_err(|e| ServeError::Unprocessable {
+    let auth = loaded
+        .auth_catalog()
+        .map_err(|e| ServeError::Unprocessable {
             message: e.to_string(),
             details: None,
         })?;
@@ -1103,10 +1169,11 @@ pub(crate) async fn run_doctor_first(
     // Same pipeline-name derivation as the run path above, so SLA probes read
     // the state keys the executor writes.
     let pipeline_name = loaded
-        .cfg
-        .name
-        .clone()
-        .unwrap_or_else(|| "serve".to_string());
+        .tenant
+        .as_ref()
+        .map(|t| t.state_scope())
+        .unwrap_or_default()
+        .prefix(loaded.cfg.name.as_deref().unwrap_or("serve"));
     let mut invs = crate::commands::doctor::probe_roots(
         &loaded.nodes,
         &auth,
@@ -1417,7 +1484,10 @@ async fn execute_run(
     from_queue: bool,
 ) {
     let server_shutdown = state.shutdown_token();
-    let LoadedSubmission { cfg, nodes } = loaded;
+    let auth_result = loaded.auth_catalog();
+    let LoadedSubmission { cfg, nodes, tenant } = loaded;
+    let state_scope = tenant.as_ref().map(|t| t.state_scope()).unwrap_or_default();
+    let budget = run_budget(&cfg, tenant.as_deref());
 
     // Queued → running. From here the guard guarantees `mark_finished` (and a
     // gauge refresh) on EVERY exit, including early returns and panics.
@@ -1442,7 +1512,7 @@ async fn execute_run(
 
     // Build execution options (auth/clock failures finalize as Failed).
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| "serve".to_string());
-    let auth = match build_auth_catalog(cfg.auth.as_ref()) {
+    let auth = match auth_result {
         Ok(a) => a,
         Err(e) => {
             finalize(
@@ -1562,6 +1632,7 @@ async fn execute_run(
         dry_run: false,
         limit: None,
         state_path_override: None,
+        state_scope,
         shard: None,
         auth,
         clock,
@@ -1588,7 +1659,7 @@ async fn execute_run(
             annotations: Vec::new(),
         }),
         usage,
-        budget: cfg.budget.clone(),
+        budget,
     };
 
     let span = tracing::info_span!("faucet.serve.run", serve_run_id = %run_id);
@@ -1801,6 +1872,7 @@ mod tests {
             principal: "test".into(),
             role: crate::serve::rbac::Role::Admin,
             source_ip: None,
+            tenant: None,
         }
     }
 
@@ -2314,7 +2386,7 @@ mod tests {
         }
 
         async fn loaded(yaml: &str) -> LoadedSubmission {
-            load_submission(yaml, ConfigFormat::Yaml, None, None)
+            crate::serve::load::load_submission(yaml, ConfigFormat::Yaml, None, None)
                 .await
                 .expect("load submission")
         }

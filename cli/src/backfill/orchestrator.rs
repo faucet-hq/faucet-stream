@@ -293,6 +293,7 @@ fn make_opts(
         dry_run: false,
         limit: None,
         state_path_override: None,
+        state_scope: Default::default(),
         shard: None,
         auth: opts.auth.clone(),
         clock,

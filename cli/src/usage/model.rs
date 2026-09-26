@@ -185,6 +185,9 @@ pub struct UsageRecord {
     pub failed: bool,
     pub usage: UsageSnapshot,
     pub cost: CostEstimate,
+    /// The tenant the invocation ran for (#709).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// `GET /v1/usage` / `faucet usage` filter.
@@ -193,6 +196,8 @@ pub struct UsageFilter {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub pipeline: Option<String>,
+    /// Only invocations run for this tenant (#709).
+    pub tenant: Option<String>,
     /// Records to scan at most (newest first); `0` = backend default.
     pub limit: usize,
 }
@@ -202,8 +207,15 @@ impl UsageFilter {
         self.since.is_none_or(|s| r.recorded_at >= s)
             && self.until.is_none_or(|u| r.recorded_at < u)
             && self.pipeline.as_deref().is_none_or(|p| r.pipeline == p)
+            && self
+                .tenant
+                .as_deref()
+                .is_none_or(|t| r.tenant.as_deref() == Some(t))
     }
 }
+
+/// The `--by tenant` key for invocations not run for a tenant.
+pub const NO_TENANT: &str = "(no tenant)";
 
 /// What `faucet usage --by` groups by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -214,6 +226,7 @@ pub enum GroupBy {
     Dataset,
     Sink,
     Day,
+    Tenant,
 }
 
 impl GroupBy {
@@ -224,6 +237,7 @@ impl GroupBy {
             "dataset" => Some(Self::Dataset),
             "sink" => Some(Self::Sink),
             "day" => Some(Self::Day),
+            "tenant" => Some(Self::Tenant),
             _ => None,
         }
     }
@@ -235,6 +249,7 @@ impl GroupBy {
             Self::Dataset => "dataset",
             Self::Sink => "sink",
             Self::Day => "day",
+            Self::Tenant => "tenant",
         }
     }
 }
@@ -290,6 +305,10 @@ pub fn aggregate(records: &[UsageRecord], by: GroupBy, currency: &str) -> UsageR
                 .unwrap_or_else(|| format!("(uncatalogued) {}::{}", r.pipeline, r.row)),
             GroupBy::Sink => r.sink_kind.clone(),
             GroupBy::Day => r.recorded_at.format("%Y-%m-%d").to_string(),
+            GroupBy::Tenant => r
+                .tenant
+                .clone()
+                .unwrap_or_else(|| NO_TENANT.to_string()),
         };
         let row = groups.entry(key.clone()).or_insert_with(|| empty_row(&key));
         fold(row, r);

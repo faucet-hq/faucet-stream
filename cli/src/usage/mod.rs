@@ -95,6 +95,7 @@ pub fn build_record(
         failed,
         usage,
         cost,
+        tenant: None,
     }
 }
 

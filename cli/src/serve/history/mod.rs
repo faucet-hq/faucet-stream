@@ -15,6 +15,7 @@ pub mod sql;
 #[cfg(feature = "serve-history-sqlite")]
 pub mod sqlite;
 pub mod templates;
+pub mod tenants;
 
 use crate::error::CliResult;
 use crate::executor::InvocationOutcome;
@@ -160,6 +161,11 @@ pub struct RunRecord {
     /// backward-compatible with records written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback: Option<crate::serve::callback::CallbackSpec>,
+    /// The tenant this run was started for (#709). `None` for an ordinary
+    /// run. In the SQL `body` column, and mirrored into `faucet_tenant_runs`
+    /// so a listing can filter by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl RunRecord {
@@ -193,6 +199,7 @@ impl RunRecord {
             attempt: 0,
             replay_of: None,
             callback: None,
+            tenant: None,
         }
     }
 }
@@ -257,6 +264,8 @@ pub struct ListFilter {
     pub until: Option<DateTime<Utc>>,
     pub limit: usize,
     pub cursor: Option<String>,
+    /// Only runs started for this tenant (#709).
+    pub tenant: Option<String>,
 }
 
 /// One page of `list` results, ordered `(submitted_at DESC, run_id DESC)`.
@@ -404,6 +413,9 @@ pub struct AuditEntry {
     pub config_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_ip: Option<String>,
+    /// The tenant the action was taken for (#709).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     /// Outcome: `"ok"` (action performed) or `"denied"` (403 — insufficient role).
     pub result: String,
 }
@@ -413,6 +425,8 @@ pub struct AuditEntry {
 #[derive(Debug, Default, Clone)]
 pub struct AuditFilter {
     pub principal: Option<String>,
+    /// Only actions taken for this tenant (#709).
+    pub tenant: Option<String>,
     pub action: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
@@ -933,6 +947,141 @@ pub trait RunHistory: Send + Sync {
     ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
         let _ = filter;
         Ok(Vec::new())
+    }
+
+    // ── Tenants (#709) ───────────────────────────────────────────────────────
+    //
+    // Multi-tenant embedded integrations: tenants, their sealed connections,
+    // single-use hosted-OAuth sessions, the run → tenant mapping and the
+    // ledger of state keys a tenant's runs used. Never purged by run
+    // retention. Defaulted so a third-party `RunHistory` impl is unaffected —
+    // a server on such a backend refuses to create tenants rather than
+    // silently dropping them.
+
+    /// Insert or replace a tenant (by id). Default: unsupported.
+    async fn tenant_upsert(&self, tenant: &tenants::TenantRecord) -> Result<(), HistoryError> {
+        let _ = tenant;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support tenants".into(),
+        ))
+    }
+
+    /// One tenant by id. Default: `None`.
+    async fn tenant_get(&self, id: &str) -> Result<Option<tenants::TenantRecord>, HistoryError> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Every tenant, ordered by id. Default: empty.
+    async fn tenant_list(&self) -> Result<Vec<tenants::TenantRecord>, HistoryError> {
+        Ok(Vec::new())
+    }
+
+    /// Delete a tenant with its connections, connect sessions, run mappings
+    /// and state ledger. Run records themselves are deleted by the caller
+    /// (a running run must not be removed). Returns whether it existed.
+    /// Default: `false`.
+    async fn tenant_delete(&self, id: &str) -> Result<bool, HistoryError> {
+        let _ = id;
+        Ok(false)
+    }
+
+    /// Insert or replace a connection (by tenant + name). Default: unsupported.
+    async fn connection_upsert(
+        &self,
+        connection: &tenants::ConnectionRecord,
+    ) -> Result<(), HistoryError> {
+        let _ = connection;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support tenant connections".into(),
+        ))
+    }
+
+    /// One connection. Default: `None`.
+    async fn connection_get(
+        &self,
+        tenant: &str,
+        name: &str,
+    ) -> Result<Option<tenants::ConnectionRecord>, HistoryError> {
+        let _ = (tenant, name);
+        Ok(None)
+    }
+
+    /// A tenant's connections, ordered by name. Default: empty.
+    async fn connection_list(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<tenants::ConnectionRecord>, HistoryError> {
+        let _ = tenant;
+        Ok(Vec::new())
+    }
+
+    /// Delete one connection. Returns whether it existed. Default: `false`.
+    async fn connection_delete(&self, tenant: &str, name: &str) -> Result<bool, HistoryError> {
+        let _ = (tenant, name);
+        Ok(false)
+    }
+
+    /// Store a pending connect session, dropping sessions that have already
+    /// expired. Default: unsupported.
+    async fn connect_session_put(
+        &self,
+        session: &tenants::ConnectSession,
+    ) -> Result<(), HistoryError> {
+        let _ = session;
+        Err(HistoryError::Backend(
+            "this run-history backend does not support connect sessions".into(),
+        ))
+    }
+
+    /// Take (read and delete, atomically) the session for an OAuth `state`.
+    /// A second take of the same state returns `None`, so a callback URL can
+    /// be used once. Expiry is the caller's check. Default: `None`.
+    async fn connect_session_take(
+        &self,
+        state: &str,
+    ) -> Result<Option<tenants::ConnectSession>, HistoryError> {
+        let _ = state;
+        Ok(None)
+    }
+
+    /// Record that `run_id` belongs to `tenant`, so a run listing can filter
+    /// by it. Default: inert.
+    async fn tenant_run_link(&self, run_id: &str, tenant: &str) -> Result<(), HistoryError> {
+        let _ = (run_id, tenant);
+        Ok(())
+    }
+
+    /// Record a state key a tenant run used (idempotent). Default: inert.
+    async fn tenant_state_ref_add(
+        &self,
+        state_ref: &tenants::TenantStateRef,
+    ) -> Result<(), HistoryError> {
+        let _ = state_ref;
+        Ok(())
+    }
+
+    /// Every state key recorded for a tenant, ordered by key. Default: empty.
+    async fn tenant_state_refs(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<tenants::TenantStateRef>, HistoryError> {
+        let _ = tenant;
+        Ok(Vec::new())
+    }
+
+    /// Delete a change request by id (tenant deletion, #709). Returns
+    /// whether it existed. Default: `false`.
+    async fn change_delete(&self, id: &str) -> Result<bool, HistoryError> {
+        let _ = id;
+        Ok(false)
+    }
+
+    /// Delete the usage records of these runs (tenant deletion, #709).
+    /// Returns how many were deleted. Default: `0`.
+    async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
+        let _ = run_ids;
+        Ok(0)
     }
 
     // ── Cost & usage accounting (#704) ───────────────────────────────────────

@@ -8,7 +8,8 @@ use crate::serve::error::ServeError;
 use crate::serve::state::ServerState;
 use crate::usage::{GroupBy, UsageFilter, UsageRecord, UsageReport, aggregate};
 use axum::Json;
-use axum::extract::{Query, State};
+use crate::serve::rbac::AuthContext;
+use axum::extract::{Extension, Query, State};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_LIMIT: usize = 5_000;
@@ -23,6 +24,8 @@ pub struct UsageQuery {
     pub until: Option<String>,
     /// Only this pipeline.
     pub pipeline: Option<String>,
+    /// Only invocations run for this tenant (#709).
+    pub tenant: Option<String>,
     /// `pipeline` (default) / `row` / `dataset` / `sink` / `day`.
     pub by: Option<String>,
     /// Most invocation records to read (newest first).
@@ -41,13 +44,14 @@ pub struct UsageResponse {
 
 pub async fn list_usage(
     State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsageResponse>, ServeError> {
     let by = match q.by.as_deref() {
         None => GroupBy::Pipeline,
         Some(s) => GroupBy::parse(s).ok_or_else(|| {
             ServeError::BadConfig(format!(
-                "`by` must be one of pipeline, row, dataset, sink, day (got `{s}`)"
+                "`by` must be one of pipeline, row, dataset, sink, day, tenant (got `{s}`)"
             ))
         })?,
     };
@@ -65,6 +69,7 @@ pub async fn list_usage(
             .transpose()
             .map_err(|e| ServeError::BadConfig(format!("until: {e}")))?,
         pipeline: q.pipeline,
+        tenant: actor.tenant_filter(q.tenant)?,
         limit: q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     };
     let records = state

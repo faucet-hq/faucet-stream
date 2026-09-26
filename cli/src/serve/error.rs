@@ -44,6 +44,8 @@ pub enum ServeError {
     QueueFull {
         retry_after_secs: u64,
     },
+    /// 429 — a per-tenant limit refused the request (#709).
+    TooManyRequests(String),
     /// 503 — a required dependency is temporarily unavailable (e.g. idempotency
     /// can't be honored while the run-history backend is degraded).
     Unavailable(String),
@@ -60,6 +62,7 @@ impl ServeError {
             ServeError::Unprocessable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ServeError::Conflict(_) => StatusCode::CONFLICT,
             ServeError::QueueFull { .. } => StatusCode::TOO_MANY_REQUESTS,
+            ServeError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ServeError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -74,6 +77,7 @@ impl ServeError {
             ServeError::Unprocessable { .. } => "unprocessable",
             ServeError::Conflict(_) => "conflict",
             ServeError::QueueFull { .. } => "queue_full",
+            ServeError::TooManyRequests(_) => "limit_exceeded",
             ServeError::Unavailable(_) => "unavailable",
             ServeError::Internal(_) => "internal",
         }
@@ -88,6 +92,7 @@ impl ServeError {
             ServeError::Unprocessable { message, .. } => message.clone(),
             ServeError::Conflict(m) => m.clone(),
             ServeError::QueueFull { .. } => "run queue is full; retry later".into(),
+            ServeError::TooManyRequests(m) => m.clone(),
             ServeError::Unavailable(m) => m.clone(),
             ServeError::Internal(m) => m.clone(),
         }

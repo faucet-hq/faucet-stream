@@ -211,6 +211,7 @@ async fn dry_run_skips_sla_evaluation() {
             dry_run: true,
             limit: None,
             state_path_override: None,
+            state_scope: Default::default(),
             shard: None,
             auth: Default::default(),
             clock: chrono::Utc::now().fixed_offset(),

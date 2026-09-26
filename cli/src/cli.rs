@@ -424,7 +424,11 @@ pub struct UsageArgs {
     /// Only this pipeline (the config `name`).
     #[arg(long)]
     pub pipeline: Option<String>,
-    /// Group rows by `pipeline` (default), `row`, `dataset`, `sink` or `day`.
+    /// Only invocations run for this tenant (`faucet serve` tenants, #709).
+    #[arg(long)]
+    pub tenant: Option<String>,
+    /// Group rows by `pipeline` (default), `row`, `dataset`, `sink`, `day` or
+    /// `tenant`.
     #[arg(long, default_value = "pipeline")]
     pub by: String,
     /// Most invocation records to read (newest first).

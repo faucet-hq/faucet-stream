@@ -47,9 +47,33 @@ pub async fn submit_run(
     }
 }
 
+/// 404 unless a tenant-scoped principal (#709) owns the run. An unscoped
+/// principal sees every run without a lookup.
+pub(crate) async fn ensure_visible(
+    state: &ServerState,
+    actor: &AuthContext,
+    id: &str,
+) -> Result<(), ServeError> {
+    if actor.tenant.is_none() {
+        return Ok(());
+    }
+    let rec = state
+        .history()
+        .get(id)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .ok_or(ServeError::NotFound)?;
+    if actor.sees_tenant(rec.tenant.as_deref()) {
+        Ok(())
+    } else {
+        Err(ServeError::NotFound)
+    }
+}
+
 /// `GET /v1/runs/{id}` → 200 RunRecord. Fills live `elapsed_secs` for running runs.
 pub async fn get_run(
     State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<RunRecord>, ServeError> {
     let mut rec = state
@@ -58,6 +82,9 @@ pub async fn get_run(
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?
         .ok_or(ServeError::NotFound)?;
+    if !actor.sees_tenant(rec.tenant.as_deref()) {
+        return Err(ServeError::NotFound);
+    }
     if rec.status == RunStatus::Running
         && let Some(started) = rec.started_at
     {
@@ -78,6 +105,7 @@ pub async fn cancel_run(
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ServeError> {
+    ensure_visible(&state, &actor, &id).await?;
     // 1. A live local token (this instance is running/queued it) → cancel now.
     if state.registry().cancel(&id) {
         crate::serve::audit::write(&state, &actor, "run.cancel", Some(id.clone()), None, "ok")
@@ -148,6 +176,7 @@ pub async fn delete_run(
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ServeError> {
+    ensure_visible(&state, &actor, &id).await?;
     match state
         .history()
         .delete(&id)
@@ -195,6 +224,8 @@ pub struct ListQuery {
     pub(crate) until: Option<DateTimeUtcParam>,
     pub limit: Option<usize>,
     pub cursor: Option<String>,
+    /// Only runs started for this tenant (#709).
+    pub tenant: Option<String>,
 }
 
 /// `GET /v1/runs` response body.
@@ -209,7 +240,7 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
 
 impl ListQuery {
-    fn into_filter(self) -> Result<ListFilter, ServeError> {
+    fn into_filter(self, actor: &AuthContext) -> Result<ListFilter, ServeError> {
         // Reject unknown status tokens instead of dropping them: a dropped
         // token leaves the vec empty, and an empty vec means "every status" —
         // a monitoring script that typo'd `?status=faild` would silently
@@ -237,6 +268,7 @@ impl ListQuery {
             until: self.until.map(|p| p.0),
             limit: self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
             cursor: self.cursor,
+            tenant: actor.tenant_filter(self.tenant)?,
         })
     }
 }
@@ -244,11 +276,12 @@ impl ListQuery {
 /// `GET /v1/runs` → 200.
 pub async fn list_runs(
     State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ServeError> {
     let page = state
         .history()
-        .list(&query.into_filter()?)
+        .list(&query.into_filter(&actor)?)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
     let mut runs = page.runs;
@@ -515,6 +548,7 @@ mod tests {
                 principal: "test".into(),
                 role: crate::serve::rbac::Role::Admin,
                 source_ip: None,
+                tenant: None,
             }),
             axum::extract::Path("p1".into()),
         )

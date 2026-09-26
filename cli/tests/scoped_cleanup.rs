@@ -90,6 +90,7 @@ fn opts(name: &str) -> ExecuteOptions {
         dry_run: false,
         limit: None,
         state_path_override: None,
+        state_scope: Default::default(),
         shard: None,
         auth: Default::default(),
         clock: chrono::Utc::now().fixed_offset(),

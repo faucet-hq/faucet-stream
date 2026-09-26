@@ -39,6 +39,7 @@ mod tests {
             principal: "alice".into(),
             role,
             source_ip: None,
+            tenant: None,
         }
     }
 

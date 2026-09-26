@@ -208,6 +208,10 @@ pub struct PrincipalSpec {
     pub name: String,
     pub token: String,
     pub role: Role,
+    /// Confine this principal to one tenant (#709): it reaches only that
+    /// tenant's routes, runs, change requests and usage.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 // Hand-written Debug so a `{:?}` of a spec (or the RbacConfig embedding it) never
@@ -218,6 +222,7 @@ impl std::fmt::Debug for PrincipalSpec {
             .field("name", &self.name)
             .field("token", &"***")
             .field("role", &self.role)
+            .field("tenant", &self.tenant)
             .finish()
     }
 }
@@ -250,9 +255,31 @@ pub struct AuthContext {
     pub principal: String,
     pub role: Role,
     pub source_ip: Option<String>,
+    /// The tenant this principal is confined to (#709); `None` = every tenant.
+    pub tenant: Option<String>,
 }
 
 impl AuthContext {
+    /// The tenant a listing is filtered to (#709): a tenant-scoped principal
+    /// always sees its own tenant — naming another is a 404, so existence
+    /// does not leak — and anyone else sees `requested` (or everything).
+    pub fn tenant_filter(
+        &self,
+        requested: Option<String>,
+    ) -> Result<Option<String>, crate::serve::error::ServeError> {
+        match (&self.tenant, requested) {
+            (Some(own), Some(r)) if &r != own => Err(crate::serve::error::ServeError::NotFound),
+            (Some(own), _) => Ok(Some(own.clone())),
+            (None, r) => Ok(r),
+        }
+    }
+
+    /// Whether this principal may see a record belonging to `tenant`: an
+    /// unscoped principal sees everything, a scoped one only its own.
+    pub fn sees_tenant(&self, tenant: Option<&str>) -> bool {
+        self.tenant.as_deref().is_none_or(|own| tenant == Some(own))
+    }
+
     /// Actor for a server-internal task (the change-request expiry sweep,
     /// #703) — `system:<name>`, an admin for audit attribution.
     pub fn system(name: &str) -> Self {
@@ -260,6 +287,7 @@ impl AuthContext {
             principal: format!("system:{name}"),
             role: Role::Admin,
             source_ip: None,
+            tenant: None,
         }
     }
 
@@ -270,6 +298,7 @@ impl AuthContext {
             principal: format!("trigger:{name}"),
             role: Role::Operator,
             source_ip: None,
+            tenant: None,
         }
     }
 
@@ -281,6 +310,7 @@ impl AuthContext {
             principal: "runtime".to_string(),
             role: Role::Operator,
             source_ip: None,
+            tenant: None,
         }
     }
 }
@@ -338,6 +368,7 @@ impl RbacConfig {
                     name: (*name).to_string(),
                     token: t.to_string(),
                     role: *role,
+                    tenant: None,
                 })
             })
             .collect();
@@ -377,6 +408,11 @@ impl RbacConfig {
                     p.name
                 )));
             }
+            if let Some(t) = &p.tenant {
+                crate::serve::history::tenants::validate_tenant_id(t).map_err(|e| {
+                    CliError::Serve(format!("--auth-config: principal '{}': {e}", p.name))
+                })?;
+            }
             if !seen_names.insert(p.name.clone()) {
                 return Err(CliError::Serve(format!(
                     "--auth-config: duplicate principal name '{}'",
@@ -401,16 +437,17 @@ impl RbacConfig {
     /// is compared (no early return) so the match position doesn't leak via
     /// timing; the matched role/name is returned after the full scan.
     pub fn authenticate(&self, token: &str) -> Option<AuthContext> {
-        let mut matched: Option<(&str, Role)> = None;
+        let mut matched: Option<&PrincipalSpec> = None;
         for p in &self.principals {
             if crate::serve::auth::constant_time_eq(token.as_bytes(), p.token.as_bytes()) {
-                matched = Some((p.name.as_str(), p.role));
+                matched = Some(p);
             }
         }
-        matched.map(|(name, role)| AuthContext {
-            principal: name.to_string(),
-            role,
+        matched.map(|p| AuthContext {
+            principal: p.name.clone(),
+            role: p.role,
             source_ip: None,
+            tenant: p.tenant.clone(),
         })
     }
 

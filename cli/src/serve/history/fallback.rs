@@ -295,6 +295,73 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Vec<crate::serve::history::catalog::CatalogLineageEdge>, HistoryError> {
         via!(self, p => p.catalog_lineage(root, depth), f => f.catalog_lineage(root, depth))
     }
+    async fn tenant_upsert(&self, tenant: &super::tenants::TenantRecord) -> Result<(), HistoryError> {
+        via!(self, p => p.tenant_upsert(tenant), f => f.tenant_upsert(tenant))
+    }
+    async fn tenant_get(&self, id: &str) -> Result<Option<super::tenants::TenantRecord>, HistoryError> {
+        via!(self, p => p.tenant_get(id), f => f.tenant_get(id))
+    }
+    async fn tenant_list(&self) -> Result<Vec<super::tenants::TenantRecord>, HistoryError> {
+        via!(self, p => p.tenant_list(), f => f.tenant_list())
+    }
+    async fn tenant_delete(&self, id: &str) -> Result<bool, HistoryError> {
+        via!(self, p => p.tenant_delete(id), f => f.tenant_delete(id))
+    }
+    async fn connection_upsert(
+        &self,
+        connection: &super::tenants::ConnectionRecord,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.connection_upsert(connection), f => f.connection_upsert(connection))
+    }
+    async fn connection_get(
+        &self,
+        tenant: &str,
+        name: &str,
+    ) -> Result<Option<super::tenants::ConnectionRecord>, HistoryError> {
+        via!(self, p => p.connection_get(tenant, name), f => f.connection_get(tenant, name))
+    }
+    async fn connection_list(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<super::tenants::ConnectionRecord>, HistoryError> {
+        via!(self, p => p.connection_list(tenant), f => f.connection_list(tenant))
+    }
+    async fn connection_delete(&self, tenant: &str, name: &str) -> Result<bool, HistoryError> {
+        via!(self, p => p.connection_delete(tenant, name), f => f.connection_delete(tenant, name))
+    }
+    async fn connect_session_put(
+        &self,
+        session: &super::tenants::ConnectSession,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.connect_session_put(session), f => f.connect_session_put(session))
+    }
+    async fn connect_session_take(
+        &self,
+        state: &str,
+    ) -> Result<Option<super::tenants::ConnectSession>, HistoryError> {
+        via!(self, p => p.connect_session_take(state), f => f.connect_session_take(state))
+    }
+    async fn tenant_run_link(&self, run_id: &str, tenant: &str) -> Result<(), HistoryError> {
+        via!(self, p => p.tenant_run_link(run_id, tenant), f => f.tenant_run_link(run_id, tenant))
+    }
+    async fn tenant_state_ref_add(
+        &self,
+        state_ref: &super::tenants::TenantStateRef,
+    ) -> Result<(), HistoryError> {
+        via!(self, p => p.tenant_state_ref_add(state_ref), f => f.tenant_state_ref_add(state_ref))
+    }
+    async fn tenant_state_refs(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<super::tenants::TenantStateRef>, HistoryError> {
+        via!(self, p => p.tenant_state_refs(tenant), f => f.tenant_state_refs(tenant))
+    }
+    async fn change_delete(&self, id: &str) -> Result<bool, HistoryError> {
+        via!(self, p => p.change_delete(id), f => f.change_delete(id))
+    }
+    async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
+        via!(self, p => p.usage_delete_runs(run_ids), f => f.usage_delete_runs(run_ids))
+    }
     async fn change_upsert(
         &self,
         change: &crate::serve::changes::ChangeRequest,

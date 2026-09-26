@@ -32,6 +32,7 @@ pub const RESERVED_IDS: &[&str] = &[
     "pipeline",
     "now",
     "backfill",
+    "tenant",
     "param",
     "partition",
     "bookmark",
@@ -1712,6 +1713,7 @@ fn check_refs(
             if let Directive::Deferred { id, path } = dir
                 && id != "now"
                 && id != "backfill"
+                && id != crate::tenant_tokens::TENANT_ID
                 && id != "partition"
                 && id != "bookmark"
                 && id != "job_id"
@@ -1819,6 +1821,7 @@ fn collect_deferred(value: &Value, out: &mut Vec<DeferredRef>) {
                 // them, so the CLI must pass them through untouched.
                 if id == "now"
                     || id == "backfill"
+                    || id == crate::tenant_tokens::TENANT_ID
                     || id == "partition"
                     || id == "bookmark"
                     || id == "job_id"

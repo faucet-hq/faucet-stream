@@ -55,6 +55,10 @@ struct Inner {
     /// The server-wide data-flow policy (`--policy`, #702), when one was given.
     #[cfg(feature = "policy")]
     policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
+    /// The tenant runtime (#709): vault key, hosted-OAuth providers,
+    /// admission locks. Replaced once at startup.
+    #[cfg(feature = "tenants")]
+    tenants: RwLock<Arc<crate::serve::tenants::TenantsRuntime>>,
     /// Change kinds that need an approved request (`--require-approval`, #703).
     require_approval: Vec<crate::serve::changes::ChangeKind>,
     /// Fallback expiry of a pending change request when the approval policy
@@ -97,6 +101,8 @@ impl ServerState {
                 templates_sync: RwLock::new(None),
                 #[cfg(feature = "policy")]
                 policy: RwLock::new(None),
+                #[cfg(feature = "tenants")]
+                tenants: RwLock::new(Arc::new(Default::default())),
                 require_approval: config.require_approval.clone(),
                 approval_expiry: config.approval_expiry,
             }),
@@ -129,6 +135,22 @@ impl ServerState {
             Some(secs) => Duration::from_secs(secs),
             None => self.inner.approval_expiry,
         }
+    }
+
+    /// Install the tenant runtime (server startup, #709).
+    #[cfg(feature = "tenants")]
+    pub fn set_tenants(&self, rt: crate::serve::tenants::TenantsRuntime) {
+        *self.inner.tenants.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(rt);
+    }
+
+    /// The tenant runtime.
+    #[cfg(feature = "tenants")]
+    pub fn tenants(&self) -> Arc<crate::serve::tenants::TenantsRuntime> {
+        self.inner
+            .tenants
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Attach the server-wide data-flow policy (server startup, #702).
@@ -348,6 +370,7 @@ mod tests {
             principal: "admin".into(),
             role: crate::serve::rbac::Role::Admin,
             source_ip: None,
+            tenant: None,
         };
         let axum::Json(body) = crate::serve::handlers::reload::reload(
             axum::extract::State(s),

@@ -105,11 +105,17 @@ fn synth_event(kind: &str, pipeline: &str) -> CliResult<NotifyEvent> {
             NotifyEvent::budget_exceeded(pipeline, "", "max_records", 1_000_000, 1_000_500)
                 .with_run(run())
         }
+        "connection_needs_reauth" => NotifyEvent::connection_needs_reauth(
+            pipeline,
+            "synthetic-connection",
+            "the provider rejected the refresh token (HTTP 400 invalid_grant)",
+        ),
         other => {
             return Err(CliError::Config(format!(
                 "unknown --event `{other}` (expected one of: run_failure, run_success, \
                  sla_breach, circuit_open, contract_abort, dlq_threshold, scheduler_stuck, \
-                 profile_drift, change_requested, budget_exceeded)"
+                 profile_drift, change_requested, budget_exceeded, \
+                 connection_needs_reauth)"
             )));
         }
     })

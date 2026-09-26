@@ -29,6 +29,95 @@ pub enum ConfigFormat {
 pub struct LoadedSubmission {
     pub cfg: PipelineConfig,
     pub nodes: Vec<ExpandedNode>,
+    /// The tenant this submission runs for (#709), with what it needs at run
+    /// time. `None` for an ordinary run.
+    pub tenant: Option<std::sync::Arc<TenantScope>>,
+}
+
+impl LoadedSubmission {
+    /// The shared auth-provider catalog for this run: the config's own
+    /// `auth:` block, plus — for a tenant run — the tenant's connections with
+    /// their refresh tokens persisted back to the vault.
+    pub fn auth_catalog(&self) -> crate::error::CliResult<crate::auth_catalog::AuthCatalog> {
+        build_catalog(self.tenant.as_deref(), &self.cfg)
+    }
+}
+
+fn build_catalog(
+    tenant: Option<&TenantScope>,
+    cfg: &PipelineConfig,
+) -> crate::error::CliResult<crate::auth_catalog::AuthCatalog> {
+    match tenant {
+        Some(t) => (t.build_catalog)(cfg.auth.as_ref()),
+        None => crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref()),
+    }
+}
+
+/// Builds the auth catalog for a tenant run from the (connection-injected)
+/// `auth:` block.
+pub type CatalogBuilder = std::sync::Arc<
+    dyn Fn(
+            Option<&std::collections::HashMap<String, Value>>,
+        ) -> crate::error::CliResult<crate::auth_catalog::AuthCatalog>
+        + Send
+        + Sync,
+>;
+
+/// Everything a run started for a tenant needs (#709), assembled by the
+/// `tenants` module and carried from submission to execution.
+pub struct TenantScope {
+    /// What `${tenant.*}` tokens read.
+    pub values: crate::tenant_tokens::TenantValues,
+    /// The tenant's usable connections as `{type, config}` provider specs,
+    /// unsealed; injected into the config's `auth:` catalog (a connection
+    /// shadows a catalog entry of the same name).
+    pub connections: std::collections::BTreeMap<String, Value>,
+    /// Connections that need re-authorization, with why. A run referencing
+    /// one is refused.
+    pub blocked: std::collections::BTreeMap<String, String>,
+    /// Per-run ceilings from the tenant's limits.
+    pub budget: Option<faucet_core::BudgetSpec>,
+    pub build_catalog: CatalogBuilder,
+    /// Records each state key the run uses, for tenant deletion.
+    pub on_state_key: Option<crate::executor::StateKeyHook>,
+}
+
+impl std::fmt::Debug for TenantScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantScope")
+            .field("tenant", &self.values.id)
+            .field("connections", &self.connections.keys().collect::<Vec<_>>())
+            .field("blocked", &self.blocked)
+            .finish()
+    }
+}
+
+impl TenantScope {
+    /// The executor state scope for this tenant's runs.
+    pub fn state_scope(&self) -> crate::executor::StateScope {
+        crate::executor::StateScope {
+            namespace: Some(self.values.id.clone()),
+            on_key: self.on_state_key.clone(),
+        }
+    }
+
+    /// Refuse a submission whose rows reference a connection that needs
+    /// re-authorization.
+    fn check_blocked(&self, nodes: &[ExpandedNode]) -> Result<(), ServeError> {
+        for node in nodes {
+            for config in [&node.source.config, &node.sink.config] {
+                if let Some(name) = crate::auth_catalog::auth_ref(config)
+                    && let Some(why) = self.blocked.get(&name)
+                {
+                    return Err(ServeError::Conflict(format!(
+                        "connection '{name}' of tenant '{}' needs re-authorization ({why});                          reconnect it before running",
+                        self.values.id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Load + merge + expand a submitted config body.
@@ -44,6 +133,19 @@ pub async fn load_submission(
     format: ConfigFormat,
     default_base: Option<&Value>,
     policy: Option<&ServerPolicy>,
+) -> Result<LoadedSubmission, ServeError> {
+    load_submission_scoped(body, format, default_base, policy, None).await
+}
+
+/// [`load_submission`] for a run started for a tenant (#709): binds
+/// `${tenant.*}`, injects the tenant's connections into the `auth:` catalog,
+/// and refuses a row that references a connection needing re-authorization.
+pub async fn load_submission_scoped(
+    body: &str,
+    format: ConfigFormat,
+    default_base: Option<&Value>,
+    policy: Option<&ServerPolicy>,
+    tenant: Option<std::sync::Arc<TenantScope>>,
 ) -> Result<LoadedSubmission, ServeError> {
     // 1. Parse to a Value per the declared format.
     let mut submitted: Value = match format {
@@ -68,6 +170,13 @@ pub async fn load_submission(
         }
         None => submitted,
     };
+
+    // 3a. Bind `${tenant.*}` (#709) — only a tenant run has values for them.
+    crate::tenant_tokens::bind_document(&mut merged, tenant.as_deref().map(|t| &t.values))
+        .map_err(|message| ServeError::Unprocessable {
+            message,
+            details: None,
+        })?;
 
     // 3b. Bind `${param.*}` against the config's own `params:` defaults (#444).
     // A body materialized by the template registry has no `params:` block left,
@@ -120,14 +229,23 @@ pub async fn load_submission(
         .await
         .map_err(|e| ServeError::BadConfig(e.to_string()))?;
 
+    // 5a. A tenant's connections join the auth catalog (#709), after secrets
+    // resolution so an unsealed credential is never scanned for directives.
+    if let Some(t) = &tenant {
+        let catalog = cfg.auth.get_or_insert_with(Default::default);
+        for (name, spec) in &t.connections {
+            catalog.insert(name.clone(), spec.clone());
+        }
+    }
+
     // 5b. Discovery-driven matrix fan-out (#647): a source whose `discovery:` /
     // `odata:` block sets `fan_out` discovers its objects live and generates
     // the matrix before expansion, so a generic template's `objects` param
     // materializes into one row per object at trigger time. This is the one
     // network call in the submit path, so it runs under a hard timeout — a
     // hung upstream describe endpoint must not wedge `POST /v1/runs`.
-    let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())
-        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+    let auth =
+        build_catalog(tenant.as_deref(), &cfg).map_err(|e| ServeError::BadConfig(e.to_string()))?;
     tokio::time::timeout(
         SUBMIT_DISCOVERY_TIMEOUT,
         crate::dynamic_fanout::resolve_dynamic_fanout(&mut cfg, &auth),
@@ -152,7 +270,11 @@ pub async fn load_submission(
         details: None,
     })?;
 
-    Ok(LoadedSubmission { cfg, nodes })
+    if let Some(t) = &tenant {
+        t.check_blocked(&nodes)?;
+    }
+
+    Ok(LoadedSubmission { cfg, nodes, tenant })
 }
 
 #[cfg(test)]
