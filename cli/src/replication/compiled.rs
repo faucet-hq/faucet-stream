@@ -5,7 +5,7 @@ use crate::error::{CliError, CliResult};
 use crate::replication::spec::ReplicationSpec;
 
 const CDC_SOURCES: &str =
-    "postgres-cdc / mysql-cdc / mssql-cdc / mongodb-cdc / dynamodb in `mode: streams`";
+    "postgres-cdc / mysql-cdc / mssql-cdc / mongodb-cdc / oracle-cdc / dynamodb in `mode: streams`";
 
 /// How a mirror's CDC source replays after the snapshot handoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +64,7 @@ impl CompiledReplication {
         if cdc_replay(snap).is_some() {
             return Err(CliError::Config(format!(
                 "mirror.snapshot.source must be a non-CDC bulk source \
-                 (e.g. postgres / mysql / mongodb / dynamodb scan); got CDC source '{}'",
+                 (e.g. postgres / mysql / mongodb / oracle / dynamodb scan); got CDC source '{}'",
                 snap.kind
             )));
         }
@@ -291,6 +291,39 @@ replication:
         let c = cfg(&bad);
         let err = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
         assert!(format!("{err}").contains("non-CDC"), "{err}");
+    }
+
+    const ORACLE: &str = r#"
+version: 1
+name: mirror
+pipeline:
+  source: { type: oracle-cdc, config: { host: db, service_name: ORCLPDB1, username: u, password: p, tables: [APP.ORDERS] } }
+  sink:   { type: postgres, config: { connection_url: "postgres://y", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [ID] } }
+  state:  { type: file, config: { path: ./st } }
+replication:
+  mode: snapshot_then_cdc
+  snapshot:
+    source: { type: oracle, config: { host: db, service_name: ORCLPDB1, username: u, password: p, query: "SELECT * FROM APP.ORDERS" } }
+"#;
+
+    #[cfg(feature = "source-oracle")]
+    #[test]
+    fn accepts_oracle_cdc_with_oracle_snapshot() {
+        let c = cfg(ORACLE);
+        let r = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap();
+        assert_eq!(r.snapshot_source.kind, "oracle");
+    }
+
+    #[test]
+    fn rejects_oracle_cdc_as_snapshot_and_names_it_in_errors() {
+        let bad = ORACLE.replace("source: { type: oracle,", "source: { type: oracle-cdc,");
+        let c = cfg(&bad);
+        let err = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
+        assert!(format!("{err}").contains("non-CDC"), "{err}");
+
+        let c = cfg(&GOOD.replace("postgres-cdc", "postgres"));
+        let err = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
+        assert!(format!("{err}").contains("oracle-cdc"), "{err}");
     }
 
     #[test]

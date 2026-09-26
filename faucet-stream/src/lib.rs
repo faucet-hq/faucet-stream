@@ -43,6 +43,8 @@
 //! | `source-databricks` | Databricks SQL query source (Statement Execution API) |
 //! | `source-iceberg` | Apache Iceberg table source (REST/Glue/SQL/HMS catalogs, time travel, incremental) |
 //! | `source-dynamodb` | Amazon DynamoDB source (scan, query, Streams CDC) |
+//! | `source-oracle` | Oracle Database query source (needs Oracle Instant Client at runtime) |
+//! | `source-oracle-cdc` | Oracle CDC source via LogMiner (needs Oracle Instant Client at runtime) |
 //! | `sink-bigquery` | Google BigQuery streaming insert sink |
 //! | `sink-iceberg` | Apache Iceberg sink (append-only, REST/Glue/SQL/HMS catalogs) |
 //! | `sink-postgres` | PostgreSQL sink (jsonb or auto-mapped columns) |
@@ -69,6 +71,7 @@
 //! | `sink-parquet` | Apache Parquet file sink (local, S3) |
 //! | `encryption` | AES-256-GCM at-rest sealing for file state-store bookmarks and per-line JSONL/DLQ output |
 //! | `sink-dynamodb` | Amazon DynamoDB sink (batched writes, upsert/delete) |
+//! | `sink-oracle` | Oracle Database sink (upsert/overwrite, exactly-once; needs Oracle Instant Client at runtime) |
 //! | `sink-databricks` | Databricks SQL warehouse sink (append/upsert/overwrite, exactly-once) |
 //! | `sink-delta` | Apache Delta Lake sink (append-only; local FS or S3/Azure/GCS) |
 //! | `kafka-schema-registry` | Schema Registry support for Kafka connectors |
@@ -259,6 +262,16 @@ pub mod source {
     #[cfg(feature = "source-dynamodb")]
     pub mod dynamodb {
         pub use faucet_source_dynamodb::*;
+    }
+
+    #[cfg(feature = "source-oracle")]
+    pub mod oracle {
+        pub use faucet_source_oracle::*;
+    }
+
+    #[cfg(feature = "source-oracle-cdc")]
+    pub mod oracle_cdc {
+        pub use faucet_source_oracle_cdc::*;
     }
 
     #[cfg(feature = "source-gcs")]
@@ -458,6 +471,16 @@ pub mod source {
     #[cfg(feature = "source-dynamodb")]
     pub mod dynamodb {
         pub use faucet_source_dynamodb::*;
+    }
+
+    #[cfg(feature = "source-oracle")]
+    pub mod oracle {
+        pub use faucet_source_oracle::*;
+    }
+
+    #[cfg(feature = "source-oracle-cdc")]
+    pub mod oracle_cdc {
+        pub use faucet_source_oracle_cdc::*;
     }
 
     #[cfg(feature = "source-gcs")]
@@ -666,6 +689,11 @@ pub mod sink {
     pub mod databricks {
         pub use faucet_sink_databricks::*;
     }
+
+    #[cfg(feature = "sink-oracle")]
+    pub mod oracle {
+        pub use faucet_sink_oracle::*;
+    }
 }
 
 // ── GCS common types ─────────────────────────────────────────────────────────
@@ -744,6 +772,17 @@ pub mod common_dynamodb {
 #[cfg(any(feature = "source-databricks", feature = "sink-databricks"))]
 pub mod common_databricks {
     pub use faucet_common_databricks::*;
+}
+
+/// Shared Oracle types (connection/TLS config, session pool, SQL helpers,
+/// row decoding), re-exported when any Oracle connector is enabled.
+#[cfg(any(
+    feature = "source-oracle",
+    feature = "source-oracle-cdc",
+    feature = "sink-oracle"
+))]
+pub mod common_oracle {
+    pub use faucet_common_oracle::*;
 }
 
 // ── State-store backends ─────────────────────────────────────────────────────

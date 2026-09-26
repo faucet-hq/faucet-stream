@@ -505,6 +505,27 @@
       "verified": true,
       "tier": "stable",
       "description": "Databricks SQL warehouse sink; append/upsert/delete/overwrite, exactly-once, schema evolution, staged COPY INTO"
+    },
+    {
+      "name": "oracle",
+      "kind": "source",
+      "verified": true,
+      "tier": "stable",
+      "description": "Oracle Database query source (ODPI-C); incremental replication, PK-range sharding, discovery; needs Oracle Instant Client"
+    },
+    {
+      "name": "oracle-cdc",
+      "kind": "source",
+      "verified": true,
+      "tier": "stable",
+      "description": "Oracle CDC via LogMiner; committed-transaction change events, SCN bookmarks, exactly-once; needs Oracle Instant Client"
+    },
+    {
+      "name": "oracle",
+      "kind": "sink",
+      "verified": true,
+      "tier": "stable",
+      "description": "Oracle Database sink; array DML, MERGE upsert/delete, overwrite, exactly-once, schema evolution; needs Oracle Instant Client"
     }
   ]
 }

@@ -51,6 +51,8 @@ source = [
     "source-databricks",
     "source-iceberg",
     "source-dynamodb",
+    "source-oracle",
+    "source-oracle-cdc",
     "source-gcs",
     "source-bigquery",
     "source-snowflake",
@@ -86,6 +88,7 @@ sink = [
     "sink-iceberg",
     "sink-dynamodb",
     "sink-databricks",
+    "sink-oracle",
     "sink-spanner",
     "sink-redshift",
     "sink-pubsub",
@@ -267,6 +270,9 @@ source-iceberg-glue = ["faucet-source-iceberg?/catalog-glue"]
 source-iceberg-sql  = ["faucet-source-iceberg?/catalog-sql"]
 source-iceberg-hms  = ["faucet-source-iceberg?/catalog-hms"]
 source-dynamodb = ["dep:faucet-source-dynamodb", "dep:faucet-common-dynamodb"]
+## Oracle connectors load Oracle Instant Client at runtime (not needed to build).
+source-oracle = ["dep:faucet-source-oracle", "dep:faucet-common-oracle"]
+source-oracle-cdc = ["dep:faucet-source-oracle-cdc", "dep:faucet-common-oracle"]
 source-gcs = ["dep:faucet-source-gcs", "dep:faucet-common-gcs"]
 source-bigquery = ["dep:faucet-source-bigquery", "dep:faucet-common-bigquery"]
 source-snowflake = ["dep:faucet-source-snowflake", "dep:faucet-common-snowflake"]
@@ -321,6 +327,7 @@ sink-dynamodb = ["dep:faucet-sink-dynamodb", "dep:faucet-common-dynamodb"]
 sink-databricks = ["dep:faucet-sink-databricks", "dep:faucet-common-databricks"]
 ## Cloud (s3:// / gs:// / abfss://) staging for the Databricks sink.
 sink-databricks-staging = ["sink-databricks", "faucet-sink-databricks/staging"]
+sink-oracle = ["dep:faucet-sink-oracle", "dep:faucet-common-oracle"]
 
 ## Kafka Schema Registry support (forwarded to kafka crates).
 kafka-schema-registry = [
@@ -414,6 +421,9 @@ faucet-source-databricks = { workspace = true, optional = true }
 faucet-source-iceberg = { workspace = true, optional = true }
 faucet-source-dynamodb = { workspace = true, optional = true }
 faucet-common-dynamodb = { workspace = true, optional = true }
+faucet-source-oracle = { workspace = true, optional = true }
+faucet-source-oracle-cdc = { workspace = true, optional = true }
+faucet-common-oracle = { workspace = true, optional = true }
 faucet-source-gcs = { workspace = true, optional = true }
 faucet-source-bigquery = { workspace = true, optional = true }
 faucet-source-snowflake = { workspace = true, optional = true }
@@ -452,6 +462,7 @@ faucet-sink-azure-blob = { workspace = true, optional = true }
 faucet-sink-dynamodb = { workspace = true, optional = true }
 faucet-sink-databricks = { workspace = true, optional = true }
 faucet-common-databricks = { workspace = true, optional = true }
+faucet-sink-oracle = { workspace = true, optional = true }
 
 faucet-state-redis = { workspace = true, optional = true }
 faucet-state-postgres = { workspace = true, optional = true }

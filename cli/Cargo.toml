@@ -28,7 +28,7 @@ default = ["observability", "source", "sink", "state", "transforms", "compressio
 
 # Everything the default build ships, plus the long-running runtime modes:
 # `schedule` (cron scheduler) and `serve` (HTTP control plane).
-full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-rest-excel", "source-xml-excel", "file-formats"]
+full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "cli-dev", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats"]
 
 # Remote Template Hub catalogs (#677): `--hub github:owner/repo[@ref][/path]`
 # fetches a catalog through the GitHub contents API and caches it locally;
@@ -191,6 +191,10 @@ source-iceberg-glue = ["faucet-source-iceberg?/catalog-glue"]
 source-iceberg-sql = ["faucet-source-iceberg?/catalog-sql"]
 source-iceberg-hms = ["faucet-source-iceberg?/catalog-hms"]
 source-dynamodb = ["dep:faucet-source-dynamodb"]
+# Oracle connectors load Oracle Instant Client at runtime, so they stay out of
+# the `source`/`sink` aggregates (and thus `default` and the prebuilt binaries).
+source-oracle = ["dep:faucet-source-oracle"]
+source-oracle-cdc = ["dep:faucet-source-oracle-cdc"]
 source-gcs = ["dep:faucet-source-gcs"]
 source-bigquery = ["dep:faucet-source-bigquery"]
 source-snowflake = ["dep:faucet-source-snowflake"]
@@ -234,6 +238,7 @@ sink-dynamodb = ["dep:faucet-sink-dynamodb"]
 sink-databricks = ["dep:faucet-sink-databricks"]
 # Cloud (s3:// / gs:// / abfss://) staging for the Databricks sink (#713).
 sink-databricks-staging = ["sink-databricks", "faucet-sink-databricks/staging"]
+sink-oracle = ["dep:faucet-sink-oracle"]
 
 ## Delta Lake cloud object-store backends. Forwarded to whichever delta
 ## connector is enabled via optional-dep (`?`) syntax, so they don't pull the
@@ -520,6 +525,8 @@ faucet-source-delta = { workspace = true, optional = true }
 faucet-source-databricks = { workspace = true, optional = true }
 faucet-source-iceberg = { workspace = true, optional = true }
 faucet-source-dynamodb = { workspace = true, optional = true }
+faucet-source-oracle = { workspace = true, optional = true }
+faucet-source-oracle-cdc = { workspace = true, optional = true }
 faucet-source-gcs = { workspace = true, optional = true }
 faucet-source-bigquery = { workspace = true, optional = true }
 faucet-source-snowflake = { workspace = true, optional = true }
@@ -557,6 +564,7 @@ faucet-sink-clickhouse = { workspace = true, optional = true }
 faucet-sink-azure-blob = { workspace = true, optional = true }
 faucet-sink-dynamodb = { workspace = true, optional = true }
 faucet-sink-databricks = { workspace = true, optional = true }
+faucet-sink-oracle = { workspace = true, optional = true }
 faucet-state-redis = { workspace = true, optional = true }
 faucet-state-postgres = { workspace = true, optional = true }
 faucet-lineage = { workspace = true, optional = true }
