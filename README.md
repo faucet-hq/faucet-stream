@@ -278,6 +278,8 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-source-mysql-cdc`](crates/source/mysql-cdc) | T1 ✅ | MySQL CDC — binlog row events, resumable via file/pos or GTID |
 | [`faucet-source-mssql`](crates/source/mssql) | T1 ✅ | Microsoft SQL Server — streaming queries, incremental replication |
 | [`faucet-source-mssql-cdc`](crates/source/mssql-cdc) | T1 ✅ | Microsoft SQL Server CDC — change tables (`fn_cdc_get_all_changes`), LSN bookmarks, resumable |
+| [`faucet-source-oracle`](crates/source/oracle) | T1 ✅ | Oracle Database — streaming queries, incremental replication, PK-range sharding, discovery (needs Oracle Instant Client) |
+| [`faucet-source-oracle-cdc`](crates/source/oracle-cdc) | T1 ✅ | Oracle CDC — LogMiner, committed transactions only, SCN bookmarks, exactly-once (needs Oracle Instant Client) |
 | [`faucet-source-sqlite`](crates/source/sqlite) | **T1 ✅** | SQLite — run SQL queries, return rows as JSON |
 | [`faucet-source-duckdb`](crates/source/duckdb) | T2 | DuckDB — run SQL against a file or `:memory:` database, stream rows as JSON |
 | [`faucet-source-sqs`](crates/source/sqs) | T2 | AWS SQS — long-poll receive, delete-after-emit (at-least-once), idle/max termination |
@@ -320,6 +322,7 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-sink-postgres`](crates/sink/postgres) | T1 ✅ | PostgreSQL — JSONB or auto-mapped columns; upsert/delete |
 | [`faucet-sink-mysql`](crates/sink/mysql) | T1 ✅ | MySQL — JSON column or auto-mapped columns; upsert/delete |
 | [`faucet-sink-mssql`](crates/sink/mssql) | T1 ✅ | Microsoft SQL Server — JSON or auto-mapped columns, 2100-param split |
+| [`faucet-sink-oracle`](crates/sink/oracle) | T1 ✅ | Oracle Database — array DML; upsert/delete/overwrite, effectively-once, schema evolution (needs Oracle Instant Client) |
 | [`faucet-sink-sqlite`](crates/sink/sqlite) | **T1 ✅** | SQLite — JSON column or auto-mapped columns; upsert/delete; effectively-once |
 | [`faucet-sink-duckdb`](crates/sink/duckdb) | T2 | DuckDB — transaction-wrapped multi-row INSERT (JSON column or auto-mapped); append-only |
 | [`faucet-sink-sqs`](crates/sink/sqs) | T2 | AWS SQS — batched SendMessageBatch with per-entry retry; FIFO group/dedup |
@@ -429,7 +432,7 @@ own service.
 | Runs existing Singer taps | ✓ bridge (experimental) | ✓ native | ✗ | ✗ | ✗ | ✗ |
 | Change data capture | ✓ Postgres / MySQL / Mongo / SQL Server | partial¹ | ✓ | partial | ✗ | ✓ |
 | Incremental + resumable state | ✓ | ✓ | ✓ | partial | n/a | ✓ |
-| Effectively-once delivery³ | ✓ (12 sinks incl. Kafka, Iceberg, BigQuery, Databricks) | ✗ | partial | ✗ | ✗ | ✓ |
+| Effectively-once delivery³ | ✓ (13 sinks incl. Kafka, Iceberg, BigQuery, Databricks, Oracle) | ✗ | partial | ✗ | ✗ | ✓ |
 | Built-in data-quality checks | ✓ native | ✗ | paywalled add-on | ✗ | ✗ | paywalled add-on |
 | Built-in metrics + tracing | ✓ Prometheus + OTLP + `tracing` | partial | ✓ (platform) | ✓ | ✓ | ✓ (hosted) |
 | Self-hosted, no daemon | ✓ run-to-completion | ✓ | ✗ needs platform | usually a service | agent | ✗ SaaS |
@@ -874,9 +877,9 @@ Cargo.toml                    — workspace manifest (<!--COUNT:crates-->106<!--
 crates/
   core/                       — faucet-core: shared types, traits, pipeline, transforms, config
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
-  source/                     — <!--COUNT:sources-->42<!--/COUNT--> source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, singer, duckdb, sqs, nats, rabbitmq, sftp, …)
-  sink/                       — <!--COUNT:sinks-->33<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, …)
-  common/                     — <!--COUNT:common-->21<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, …)
+  source/                     — <!--COUNT:sources-->42<!--/COUNT--> source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, …)
+  sink/                       — <!--COUNT:sinks-->33<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, …)
+  common/                     — <!--COUNT:common-->21<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle)
   state/                      — Redis- and Postgres-backed StateStore backends
   lineage/                    — faucet-lineage: OpenLineage event emission
   transform-sql/              — faucet-transform-sql: embedded DuckDB SQL transform

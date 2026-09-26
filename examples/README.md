@@ -53,6 +53,8 @@ These run immediately after installing the CLI — great for a first smoke test:
 | `kinesis_to_jsonl.yaml` | AWS Kinesis → JSONL with resumable per-shard checkpoints; runs against LocalStack (`docker run -p 4566:4566 -e SERVICES=kinesis localstack/localstack`) |
 | `dynamodb_to_jsonl.yaml` | DynamoDB parallel scan → JSONL with per-segment bookmarks; runs against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`, then set `endpoint_url: http://localhost:8000`) |
 | `dynamodb_mirror_to_postgres.yaml` | `faucet mirror` — DynamoDB scan snapshot, then DynamoDB Streams CDC into a keyed Postgres upsert (DynamoDB Local + the compose `postgres` service) |
+| `oracle_to_postgres.yaml` | Oracle → Postgres incremental copy with keyed upsert; needs `--features source-oracle`, Oracle Instant Client, and an Oracle database (`docker run -p 1521:1521 -e ORACLE_PASSWORD=… gvenzl/oracle-free:23-slim`) |
+| `oracle_cdc_mirror_to_postgres.yaml` | `faucet mirror` — Oracle snapshot, then LogMiner CDC into a keyed Postgres upsert; needs `--features source-oracle,source-oracle-cdc`, Instant Client, ARCHIVELOG + supplemental logging |
 | `iceberg_to_jsonl.yaml` | Apache Iceberg table → JSONL with `mode: incremental` (only snapshots appended since the last run); needs an Iceberg REST catalog (Polaris / Nessie / Lakekeeper) |
 | `spanner_to_jsonl.yaml` | Cloud Spanner → JSONL with incremental `@bookmark` replication; runs against the Spanner emulator (`docker run -p 9010:9010 gcr.io/cloud-spanner-emulator/emulator`) |
 | `backfill_sqlite_to_jsonl.yaml` | `faucet backfill` — replay a date range from a local SQLite table one day per window unit, one JSONL file per unit (`${backfill.*}` tokens, durable `--resume` marker) |

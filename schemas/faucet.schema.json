@@ -19280,6 +19280,389 @@
           ],
           "title": "iceberg",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for [`OracleSource`](crate::OracleSource).",
+                  "properties": {
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Records per emitted page, also used as the fetch array size. `0` emits\nthe whole result set as one page. Defaults to [`DEFAULT_BATCH_SIZE`].",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connect_string": {
+                      "description": "Easy Connect (`host:1521/FREEPDB1`), TNS alias, or connect descriptor.\nMutually exclusive with `host`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "external_auth": {
+                      "default": false,
+                      "description": "Authenticate with external credentials (OS authentication or a wallet\nholding the credentials) instead of `username` / `password`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "host": {
+                      "description": "Database host. Mutually exclusive with `connect_string`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "json_columns": {
+                      "description": "Output columns whose text holds JSON (a `JSON_SERIALIZE(...)` or an\n`IS JSON` `VARCHAR2`/`CLOB`); their values are emitted as parsed JSON.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "max_connections": {
+                      "default": 10,
+                      "description": "Maximum pooled sessions. Defaults to 10.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "params": {
+                      "default": [],
+                      "description": "Positional bind values for `:1`…`:n`.",
+                      "items": true,
+                      "type": "array"
+                    },
+                    "password": {
+                      "default": "",
+                      "description": "Password for `username`.",
+                      "type": "string"
+                    },
+                    "port": {
+                      "description": "Listener port. Defaults to 1521 (2484 when `tls.enabled`).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "query": {
+                      "description": "SQL query. Bind [`params`](Self::params) with `:1`, `:2`, …, and the\nincremental cursor with `:bookmark`.",
+                      "type": "string"
+                    },
+                    "replication": {
+                      "$ref": "#/$defs/source_oracle__OracleReplication",
+                      "default": {
+                        "type": "full"
+                      },
+                      "description": "Replication mode. Defaults to [`OracleReplication::Full`]."
+                    },
+                    "service_name": {
+                      "description": "Service name (e.g. a PDB such as `FREEPDB1`). Mutually exclusive with `sid`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "shard": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_oracle__ShardConfig"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional PK-range sharding for clustered execution. Inert outside the\ncluster coordinator."
+                    },
+                    "sid": {
+                      "description": "Legacy SID. Mutually exclusive with `service_name`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "state_key": {
+                      "description": "Explicit state-store key for the bookmark. Derived from the database and\na query fingerprint when unset.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statement_timeout_secs": {
+                      "default": 300,
+                      "description": "Per-round-trip call timeout in seconds (`0` disables). Defaults to 300.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/source_oracle__OracleTls",
+                      "default": {
+                        "enabled": false,
+                        "server_dn_match": true
+                      },
+                      "description": "Transport encryption (TCPS) for the `host` form."
+                    },
+                    "username": {
+                      "default": "",
+                      "description": "Database user. Required unless `external_auth` is set.",
+                      "type": "string"
+                    }
+                  },
+                  "title": "OracleSourceConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "oracle"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "oracle",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for the Oracle LogMiner CDC source.",
+                  "properties": {
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "`0` accumulates every change into one trailing page; otherwise each\ncommitted transaction is its own page. Default [`DEFAULT_BATCH_SIZE`].",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "connect_string": {
+                      "description": "Easy Connect (`host:1521/FREEPDB1`), TNS alias, or connect descriptor.\nMutually exclusive with `host`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "external_auth": {
+                      "default": false,
+                      "description": "Authenticate with external credentials (OS authentication or a wallet\nholding the credentials) instead of `username` / `password`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "flush_table": {
+                      "default": "FAUCET_LOGMNR_FLUSH",
+                      "description": "Table the source commits to before each mining window, forcing the log\nwriter to flush redo up to the window's end SCN. Created in the\nconnecting user's schema when missing. Default `FAUCET_LOGMNR_FLUSH`.",
+                      "type": "string"
+                    },
+                    "host": {
+                      "description": "Database host. Mutually exclusive with `connect_string`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "idle_timeout": {
+                      "default": 30,
+                      "description": "End the fetch cycle after this long without a captured change. Default\n30s. A long-running runtime re-invokes the source to keep tailing.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_connections": {
+                      "default": 2,
+                      "description": "Maximum pooled sessions. Default 2.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_scn_window": {
+                      "default": 500000,
+                      "description": "Largest SCN range mined per LogMiner session. Default 500000.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "max_staged_records": {
+                      "description": "Abort when one in-flight transaction buffers more than this many\nchanges (bounded memory). `None` = unbounded.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "on_unsupported": {
+                      "$ref": "#/$defs/source_oracle-cdc__OnUnsupported",
+                      "default": "fail",
+                      "description": "Handling of changes LogMiner cannot render. Default `fail`."
+                    },
+                    "password": {
+                      "default": "",
+                      "description": "Password for `username`.",
+                      "type": "string"
+                    },
+                    "poll_interval": {
+                      "default": 1,
+                      "description": "Seconds to wait between polls that find nothing new. Default 1s.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "port": {
+                      "description": "Listener port. Defaults to 1521 (2484 when `tls.enabled`).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "service_name": {
+                      "description": "Service name (e.g. a PDB such as `FREEPDB1`). Mutually exclusive with `sid`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "sid": {
+                      "description": "Legacy SID. Mutually exclusive with `service_name`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "start_position": {
+                      "$ref": "#/$defs/source_oracle-cdc__StartPosition",
+                      "default": {
+                        "type": "current"
+                      },
+                      "description": "Start position on a fresh run. Default `current`."
+                    },
+                    "state_key": {
+                      "description": "Explicit state-store key. Derived as `oracle-cdc:<database>:<table>`\n(or a digest of several tables) when unset.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statement_timeout_secs": {
+                      "default": 600,
+                      "description": "Per-round-trip call timeout in seconds (`0` disables). Default 600.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "tables": {
+                      "description": "Tables to capture as `OWNER.TABLE`, in data-dictionary case (usually\nupper case). **Required and non-empty.**",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/source_oracle-cdc__OracleTls",
+                      "default": {
+                        "enabled": false,
+                        "server_dn_match": true
+                      },
+                      "description": "Transport encryption (TCPS) for the `host` form."
+                    },
+                    "username": {
+                      "default": "",
+                      "description": "Database user. Required unless `external_auth` is set.",
+                      "type": "string"
+                    }
+                  },
+                  "title": "OracleCdcSourceConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "oracle-cdc"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "oracle-cdc",
+          "type": "object"
         }
       ]
     },
@@ -23278,6 +23661,192 @@
           ],
           "title": "dynamodb",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for [`OracleSink`](crate::OracleSink).",
+                  "properties": {
+                    "batch_size": {
+                      "default": 1000,
+                      "description": "Rows per array-DML execution. `0` sends the whole page at once.\nDefaults to 1000.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "column_mapping": {
+                      "$ref": "#/$defs/sink_oracle__OracleColumnMapping",
+                      "default": {
+                        "on_unknown_field": "warn",
+                        "type": "auto_columns"
+                      },
+                      "description": "How records map onto columns. Defaults to `auto_columns`."
+                    },
+                    "connect_string": {
+                      "description": "Easy Connect (`host:1521/FREEPDB1`), TNS alias, or connect descriptor.\nMutually exclusive with `host`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "create_table": {
+                      "default": true,
+                      "description": "Create the target table when it does not exist. Defaults to `true`.\n\n`json_column` mode creates `(\"ID\" NUMBER GENERATED BY DEFAULT AS IDENTITY\nPRIMARY KEY, <column> CLOB)` up front; `auto_columns` mode infers nullable\ncolumns from the first page (with a `PRIMARY KEY` over `key` for keyed\nwrites).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "delete_marker": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_oracle__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional. Upsert only: rows whose `field` matches one of `values` are\ndeletes; all others are upserts. The marker field is stripped from\nupsert rows before writing."
+                    },
+                    "external_auth": {
+                      "default": false,
+                      "description": "Authenticate with external credentials (OS authentication or a wallet\nholding the credentials) instead of `username` / `password`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "host": {
+                      "description": "Database host. Mutually exclusive with `connect_string`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "identifier_case": {
+                      "$ref": "#/$defs/sink_oracle__IdentifierCase",
+                      "default": "preserve",
+                      "description": "Identifier case rule. Defaults to `preserve`."
+                    },
+                    "key": {
+                      "default": [],
+                      "description": "Key columns. Required and non-empty for upsert/delete; ignored for append.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "max_connections": {
+                      "default": 5,
+                      "description": "Maximum pooled sessions. Defaults to 5.",
+                      "format": "uint32",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "password": {
+                      "default": "",
+                      "description": "Password for `username`.",
+                      "type": "string"
+                    },
+                    "port": {
+                      "description": "Listener port. Defaults to 1521 (2484 when `tls.enabled`).",
+                      "format": "uint16",
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "rollback": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_oracle__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand."
+                    },
+                    "service_name": {
+                      "description": "Service name (e.g. a PDB such as `FREEPDB1`). Mutually exclusive with `sid`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "sid": {
+                      "description": "Legacy SID. Mutually exclusive with `service_name`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "statement_timeout_secs": {
+                      "default": 300,
+                      "description": "Per-round-trip call timeout in seconds (`0` disables). Defaults to 300.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "table": {
+                      "description": "Target table, optionally owner-qualified (`APP.EVENTS`).",
+                      "type": "string"
+                    },
+                    "tls": {
+                      "$ref": "#/$defs/sink_oracle__OracleTls",
+                      "default": {
+                        "enabled": false,
+                        "server_dn_match": true
+                      },
+                      "description": "Transport encryption (TCPS) for the `host` form."
+                    },
+                    "username": {
+                      "default": "",
+                      "description": "Database user. Required unless `external_auth` is set.",
+                      "type": "string"
+                    },
+                    "write_mode": {
+                      "$ref": "#/$defs/sink_oracle__WriteMode",
+                      "default": "append",
+                      "description": "Append (default), upsert, or delete."
+                    }
+                  },
+                  "title": "OracleSinkConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "type": {
+              "const": "oracle"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "oracle",
+          "type": "object"
         }
       ]
     },
@@ -24481,6 +25050,338 @@
           "const": "incremental",
           "description": "Read only the data files added by `append` snapshots since the\nbookmarked snapshot. The first run (no bookmark) reads the current\nsnapshot in full; the bookmark is the last processed snapshot id.",
           "type": "string"
+        }
+      ]
+    },
+    "source_oracle__OracleReplication": {
+      "description": "How the source replicates rows across runs.\n\nSerializes as `{ type: full }` or\n`{ type: incremental, column: \"UPDATED_AT\", initial_value: ... }`.",
+      "oneOf": [
+        {
+          "description": "Every run fetches the full result set (default).",
+          "properties": {
+            "type": {
+              "const": "full",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Only rows whose `column` is strictly greater than the stored bookmark\n(or `initial_value` on the first run) are emitted.\n\nPut the `:bookmark` placeholder in the query to push the cursor down to\nthe server (`WHERE UPDATED_AT > :bookmark`); the source also filters\nclient-side as a correctness backstop. `column` names the key exactly\nas it appears in the output — Oracle upper-cases unquoted names.",
+          "properties": {
+            "column": {
+              "description": "Output column holding the replication cursor (e.g. `UPDATED_AT`).",
+              "type": "string"
+            },
+            "initial_value": {
+              "description": "Lower bound used on the first run, before any bookmark is stored."
+            },
+            "type": {
+              "const": "incremental",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "source_oracle__OracleTls": {
+      "description": "TCPS settings applied to a `host`-form connection.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Connect over TCPS. Defaults to `false`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "server_cert_dn": {
+          "description": "Expected server certificate DN, when it differs from the host name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_dn_match": {
+          "default": true,
+          "description": "Verify that the server certificate's DN matches the host. Defaults to `true`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "wallet_location": {
+          "description": "Directory holding the Oracle wallet (`cwallet.sso` / `ewallet.p12`) with\nthe trusted CA and, for mutual TLS, the client certificate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "source_oracle__ShardConfig": {
+      "description": "Primary-key range sharding for clustered (Mode B) execution: each shard runs\n`SELECT * FROM (<query>) WHERE \"<key>\" >= lo AND \"<key>\" < hi`. The key must\nbe an integer-valued output column, named exactly as Oracle reports it.",
+      "properties": {
+        "key": {
+          "description": "Integer output column to range-partition on (quoted as an identifier).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__DeleteMarker": {
+      "description": "Identifies a record as a delete (vs. an upsert) by a marker field's value.\ne.g. `{ field: \"__op\", values: [\"d\", \"delete\"] }`.",
+      "properties": {
+        "field": {
+          "description": "Field name whose value flags a delete.",
+          "type": "string"
+        },
+        "values": {
+          "description": "Values of `field` that mean \"this row is a delete\".",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__IdentifierCase": {
+      "description": "How record keys, `table`, `key` and the JSON column name map onto Oracle\nidentifiers, which are case-sensitive once quoted.",
+      "oneOf": [
+        {
+          "const": "preserve",
+          "description": "Use names exactly as written (default) — `id` addresses a column\ncreated as `\"id\"`.",
+          "type": "string"
+        },
+        {
+          "const": "upper",
+          "description": "Upper-case every name, matching tables created with unquoted\nidentifiers (`CREATE TABLE ORDERS (ID ...)`).",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_oracle__OnUnknownField": {
+      "description": "What to do with record keys that don't match a table column (`auto_columns`).",
+      "oneOf": [
+        {
+          "const": "warn",
+          "description": "Log a one-shot warning and drop the unknown keys (default).",
+          "type": "string"
+        },
+        {
+          "const": "drop",
+          "description": "Silently drop the unknown keys.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Fail the write.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_oracle__OracleColumnMapping": {
+      "description": "How records map onto table columns.",
+      "oneOf": [
+        {
+          "description": "Map top-level JSON keys to same-named columns (default).",
+          "properties": {
+            "on_unknown_field": {
+              "$ref": "#/$defs/sink_oracle__OnUnknownField",
+              "default": "warn",
+              "description": "Handling for keys with no matching column."
+            },
+            "type": {
+              "const": "auto_columns",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "Serialize each record to JSON text in a single `CLOB` column.",
+          "properties": {
+            "column": {
+              "description": "Column that receives the JSON text.",
+              "type": "string"
+            },
+            "type": {
+              "const": "json_column",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "sink_oracle__OracleTls": {
+      "description": "TCPS settings applied to a `host`-form connection.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Connect over TCPS. Defaults to `false`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "server_cert_dn": {
+          "description": "Expected server certificate DN, when it differs from the host name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_dn_match": {
+          "default": true,
+          "description": "Verify that the server certificate's DN matches the host. Defaults to `true`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "wallet_location": {
+          "description": "Directory holding the Oracle wallet (`cwallet.sso` / `ewallet.p12`) with\nthe trusted CA and, for mutual TLS, the client certificate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__RollbackWriteSpec": {
+      "additionalProperties": true,
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "properties": {
+        "journal": {
+          "default": false,
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "keep_previous": {
+          "default": false,
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_oracle__WriteMode": {
+      "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
+      "oneOf": [
+        {
+          "const": "append",
+          "description": "Insert every record (today's behaviour).",
+          "type": "string"
+        },
+        {
+          "const": "upsert",
+          "description": "Insert-or-update by `key`; optionally route delete-marked rows to deletes.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Delete by `key` for every record.",
+          "type": "string"
+        },
+        {
+          "const": "overwrite",
+          "description": "Replace the entire destination with this run's records (truncate-load /\nfull refresh). The old contents are swapped out atomically only after the\nrun completes successfully, so a mid-run failure leaves them intact. No\n`key` is required — it is a whole-dataset operation, not a keyed one.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_oracle-cdc__OnUnsupported": {
+      "description": "What to do with a change LogMiner cannot render as SQL for a tracked table\n(`UNSUPPORTED` rows, or a *dictionary mismatch* after the table's structure\nchanged since the redo was written).",
+      "oneOf": [
+        {
+          "const": "fail",
+          "description": "Fail the run (default) — never silently drop a change.",
+          "type": "string"
+        },
+        {
+          "const": "skip",
+          "description": "Log a warning and skip the change.",
+          "type": "string"
+        }
+      ]
+    },
+    "source_oracle-cdc__OracleTls": {
+      "description": "TCPS settings applied to a `host`-form connection.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Connect over TCPS. Defaults to `false`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "server_cert_dn": {
+          "description": "Expected server certificate DN, when it differs from the host name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_dn_match": {
+          "default": true,
+          "description": "Verify that the server certificate's DN matches the host. Defaults to `true`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "wallet_location": {
+          "description": "Directory holding the Oracle wallet (`cwallet.sso` / `ewallet.p12`) with\nthe trusted CA and, for mutual TLS, the client certificate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "source_oracle-cdc__StartPosition": {
+      "description": "Where to start mining on a fresh run (no persisted bookmark).",
+      "oneOf": [
+        {
+          "description": "The database's current SCN — only changes committed from now on\n(transactions already open are captured from their start). Default.",
+          "properties": {
+            "type": {
+              "const": "current",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        {
+          "description": "The oldest SCN still present in the available redo (online + archived).",
+          "properties": {
+            "type": {
+              "const": "earliest",
+              "type": "string"
+            }
+          },
+          "type": "object"
         }
       ]
     }

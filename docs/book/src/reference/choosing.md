@@ -210,6 +210,22 @@ SQL query (joins/aggregates/filters) → `databricks`.
 **Rule of thumb:** high-volume append into a lake path → `delta`; a governed
 Unity Catalog table, keyed upserts, or exactly-once → `databricks`.
 
+## Oracle: query source vs. LogMiner CDC
+
+- **`source-oracle`** — runs SQL and streams rows; incremental via a bookmark
+  column pushed down with `:bookmark`. Misses hard deletes.
+- **`source-oracle-cdc`** — mines the redo logs with LogMiner and emits every
+  committed insert/update/delete, resumable by SCN and exactly-once capable
+  (ARCHIVELOG mode + supplemental logging required). Pair it with
+  `faucet mirror` (an `oracle` snapshot, then CDC) for a full mirror.
+- **`sink-oracle`** — array DML with `upsert` / `delete` / `overwrite`,
+  exactly-once, and schema evolution.
+
+All three load **Oracle Instant Client** at runtime, so they are not in the
+default build or the prebuilt binaries — enable them with
+`--features "source-oracle,source-oracle-cdc,sink-oracle"` (or `full`) and see
+[Installation](../getting-started/installation.md#oracle-instant-client).
+
 ## Amazon DynamoDB
 
 - **`source-dynamodb`** — `mode: scan` for full-table extracts (parallel

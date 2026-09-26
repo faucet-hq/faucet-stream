@@ -186,10 +186,11 @@ per-process and would lose the marker on restart, breaking resume). See the
 ### `pipeline.source` must be CDC, `pipeline.sink` should upsert
 
 The main pipeline source must be one of the capture-capable CDC connectors —
-`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, or `dynamodb` in
-`mode: streams` — and the snapshot source must be a **non-CDC** bulk reader
-(e.g. `postgres` / `mysql` / `mongodb` running a query, or `dynamodb` in
-`mode: scan`). Both are checked at config-load time. The sink should use
+`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, `oracle-cdc`, or
+`dynamodb` in `mode: streams` — and the snapshot source must be a **non-CDC**
+bulk reader (e.g. `postgres` / `mysql` / `mongodb` / `oracle` running a query,
+or `dynamodb` in `mode: scan`). For `oracle-cdc` the captured position is the
+current SCN; the database must be in ARCHIVELOG mode with supplemental logging. Both are checked at config-load time. The sink should use
 `write_mode: upsert` for a true mirror; an append sink validates with a warning
 (see above).
 

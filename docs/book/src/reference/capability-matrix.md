@@ -15,6 +15,7 @@
 | `mongodb` | ✓ | ✓ |  |
 | `mssql` | ✓ | ✓ | ✓ |
 | `mysql` | ✓ | ✓ | ✓ |
+| `oracle` | ✓ | ✓ | ✓ |
 | `postgres` | ✓ | ✓ | ✓ |
 | `redis` | ✓ |  |  |
 | `snowflake` | ✓ |  |  |
@@ -37,6 +38,8 @@
 | `mssql-cdc` | ✓ |  |
 | `mysql` |  | ✓ |
 | `mysql-cdc` | ✓ |  |
+| `oracle` |  | ✓ |
+| `oracle-cdc` | ✓ |  |
 | `postgres` |  | ✓ |
 | `postgres-cdc` | ✓ |  |
 | `s3` |  | ✓ |
@@ -48,10 +51,11 @@
 
 A `delivery: exactly_once` pipeline needs a replayable source **and** an atomic-watermark sink. Every ✓ pair below composes; any other pairing must use the keyed-upsert alternative (`write_mode: upsert` + `key`).
 
-| source ↓ / sink → | `bigquery` | `databricks` | `iceberg` | `kafka` | `mongodb` | `mssql` | `mysql` | `postgres` | `redis` | `snowflake` | `spanner` | `sqlite` |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `kafka` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `mongodb-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `mssql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `mysql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `postgres-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| source ↓ / sink → | `bigquery` | `databricks` | `iceberg` | `kafka` | `mongodb` | `mssql` | `mysql` | `oracle` | `postgres` | `redis` | `snowflake` | `spanner` | `sqlite` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `kafka` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `mongodb-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `mssql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `mysql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `oracle-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `postgres-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

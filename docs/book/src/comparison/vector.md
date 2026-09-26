@@ -17,7 +17,7 @@ They're cousins, not competitors: reach for Vector for **telemetry**, faucet-str
 - **Domain: databases, SaaS, and warehouses — not telemetry.** faucet connects Postgres, MySQL, MongoDB, Kafka, S3/GCS, BigQuery, Snowflake, Iceberg, Delta, and more, as source→sink pipelines. Vector's sources/sinks are observability-oriented (log shippers, metrics stores, trace backends).
 - **Change data capture.** faucet does engine-level CDC (Postgres / MySQL / Mongo) with resumable state. Vector has no database CDC — it isn't an ELT tool.
 - **Governance in the movement path.** Data-quality checks, versioned data contracts, PII masking (before any sink sees a row), schema-drift policy, column-level lineage (OpenLineage) + a data-movement catalog, and freshness/volume SLAs — native and zero-config.
-- **Effectively-once delivery.** Per-page commit tokens commit atomically with the data, so a resumed run drops duplicates — across 12 sinks (SQL, Kafka, Iceberg, BigQuery, Snowflake, Spanner, Databricks, MongoDB, Redis).
+- **Effectively-once delivery.** Per-page commit tokens commit atomically with the data, so a resumed run drops duplicates — across 13 sinks (SQL, Oracle, Kafka, Iceberg, BigQuery, Snowflake, Spanner, Databricks, MongoDB, Redis).
 - **Embeddable.** Compile the same engine into your own Rust service via the typed `Source` / `Sink` traits.
 
 ## Where Vector is the better choice

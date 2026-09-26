@@ -33,6 +33,8 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | MySQL CDC | T1 ✅ | `source-mysql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | binlog row events, file/pos or GTID bookmarks |
 | Microsoft SQL Server | T1 ✅ | `source-mssql` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | SQL query (tiberius), rows as JSON |
 | Microsoft SQL Server CDC | T1 ✅ | `source-mssql-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | CDC change tables (`fn_cdc_get_all_changes`), LSN bookmarks, `__op`-normalized |
+| Oracle Database | T1 ✅ | `source-oracle` | ✓ | ✓ | ✗ | ✗ | ✓ | SQL query (ODPI-C), exact `NUMBER`/temporal typing, incremental `:bookmark` replication, PK-range sharding; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
+| Oracle CDC | T1 ✅ | `source-oracle-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | LogMiner over online + archived redo; committed transactions only, SCN bookmarks, `cdc_unwrap`-compatible envelopes; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
 | SQLite | T1 ✅ | `source-sqlite` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL query, rows as JSON |
 | DuckDB | T2 | `source-duckdb` | ✓ | ✗ | ✗ | ✗ | ✗ | SQL query (file or `:memory:`), rows as JSON; blocking-task + channel streaming |
 | AWS SQS | T2 | `source-sqs` | ✓ | ✗ | ✗ | ✗ | ✗ | long-poll ReceiveMessage, delete-after-emit (at-least-once), idle/max-messages termination |
@@ -228,6 +230,7 @@ config this project treats as a defect.
 | ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
 | MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` |
 | Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |
+| Oracle Database | T1 ✅ | `sink-oracle` | ✓ | ✗ | **✓** | **✓** | array DML per page (per-row DLQ), keyed `MERGE` upsert / `DELETE`, `_faucet_commit_token` in the same transaction; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
 | SQLite | T1 ✅ | `sink-sqlite` | ✓ | ✗ | **✓** | **✓** | transaction-wrapped batch |
 | DuckDB | T2 | `sink-duckdb` | ✓ | ✗ | ✗ | ✗ | transaction-wrapped multi-row `INSERT` (JSON column or auto-mapped); append-only |
 | AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
@@ -268,7 +271,8 @@ advances a `_faucet_commit_token` Delta table, so a replayed page replaces its
 earlier attempt; the MongoDB sink commits the page plus a watermark document in
 one multi-document transaction (replica set required); the Cloud Spanner sink
 buffers the page's mutations plus a `faucet_commit_token` row in one
-read-write transaction. Sinks configured with
+read-write transaction; the Oracle sink upserts a `_faucet_commit_token`
+row in the page's transaction. Sinks configured with
 `write_mode: upsert` + `key` also reach effectively-once via keyed dedup, with
 any source. See
 [Effectively-once delivery](../cookbook/state.md#effectively-once-delivery).
@@ -282,11 +286,11 @@ DynamoDB requires `key` to name the table's partition (+ sort) key; Databricks
 Iceberg upsert is not yet supported (a follow-up, blocked on `iceberg-rust`).
 `write_mode: overwrite` (full-refresh: atomically replace the whole
 destination each run) is additionally supported by **PostgreSQL, SQLite, MySQL,
-MSSQL, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias
+MSSQL, Oracle, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias
 swap — the configured `index` must be an alias) — not Spanner or DynamoDB. See
 [Upsert / mirror tables](../cookbook/upsert.md).
 
-Every sink in this column except **DynamoDB** and **Databricks** also supports
+Every sink in this column except **DynamoDB**, **Databricks** and **Oracle** also supports
 **scoped cleanup** (`complete_for.on_missing: delete` on the source), which deletes
 destination rows inside the declared scope that a run did not write — the only way
 an incremental sync can remove records deleted at the source; see
@@ -376,6 +380,7 @@ sinks can actually *act* on it varies:
 | `postgres`, `mysql`, `mssql`, `sqlite`, `bigquery` | **✓ evolve** — in-place additive/widening DDL |
 | `elasticsearch` | **✓ evolve** — can add fields only (existing-field type change is incompatible) |
 | `spanner` | **✓ evolve** — additive columns + NOT NULL relax; base-type widening is not supported by Spanner (use `allow_type_widening: false`) |
+| `oracle` | **✓ evolve** — `ADD` columns, widen integer `NUMBER`s to decimals, relax `NOT NULL` |
 | `databricks` | **✓ evolve** — `ALTER TABLE … ADD COLUMNS`, numeric widening to `DOUBLE` via Delta type widening (tinyint/smallint/int/float), and `DROP NOT NULL`; other widenings are incompatible |
 | `iceberg` | detect-only — `warn`/`ignore`/`fail`/`quarantine` work; `evolve` blocked on upstream `iceberg-rust` (#255) |
 | `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet`, `dynamodb` | — (schemaless; the `schema:` policy is inert) |
@@ -400,6 +405,7 @@ nuances (e.g. SQLite widening is a no-op; Elasticsearch can only add fields).
 | Elasticsearch | basic, API key, bearer, none |
 | S3 / GCS | cloud SDK credential chains (env, profile, metadata) |
 | SQL databases | connection URL (with embedded credentials / TLS params) |
+| Oracle | username/password with `connect_string` or `host` + `service_name`/`sid`; TLS via wallet (`tls`) |
 
 Inspect any connector's exact auth shape with `faucet schema source <name>` /
 `faucet schema sink <name>`.

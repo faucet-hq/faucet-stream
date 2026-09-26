@@ -131,11 +131,12 @@ Not every sink can evolve, and a schemaless sink has no schema to diverge from.
 | `elasticsearch` | ✅ | ✅ (add fields only) |
 | `spanner` | ✅ | ✅ (add + NOT NULL relax; no base-type widening) |
 | `iceberg` | ✅ | ✅ (add columns only) |
+| `oracle` | ✅ | ✅ (add, integer→decimal widening, NOT NULL relax) |
 | `databricks` | ✅ | ✅ (add columns, numeric widening to `DOUBLE`, NOT NULL relax) |
 | `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet`, `dynamodb` | — (inert) | — |
 
-- **Evolvable** (nine sinks): postgres, mysql, mssql, sqlite, bigquery,
-  elasticsearch, spanner, iceberg, databricks. They implement in-place additive DDL.
+- **Evolvable** (ten sinks): postgres, mysql, mssql, sqlite, bigquery,
+  elasticsearch, spanner, iceberg, databricks, oracle. They implement in-place additive DDL.
 - **Iceberg** adds new columns via iceberg-rust 0.10.0's `update_schema`
   action (issue #255). It is **additive-only**: `update_schema` exposes
   `add_column` but no in-place type promotion or nullability relaxation, so a
