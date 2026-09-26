@@ -6,6 +6,7 @@ use crate::observability::labels::Labels;
 use crate::observability::timer::DurationGuard;
 use crate::pipeline::StreamPage;
 use crate::traits::{Sink, Source};
+use crate::usage::{UsageMeter, estimate_page_bytes};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures_core::Stream;
@@ -47,6 +48,8 @@ pub struct InstrumentedSource<'a, S: Source + ?Sized> {
     /// Precomputed `pipeline` / `row` / `connector` labels, cloned per call.
     base_labels: Vec<Label>,
     page_index: Arc<AtomicUsize>,
+    /// The run's usage meter (#704); `None` = count nothing beyond metrics.
+    meter: Option<Arc<UsageMeter>>,
 }
 
 impl<'a, S: Source + ?Sized> InstrumentedSource<'a, S> {
@@ -64,7 +67,14 @@ impl<'a, S: Source + ?Sized> InstrumentedSource<'a, S> {
             connector,
             base_labels,
             page_index: Arc::new(AtomicUsize::new(0)),
+            meter: None,
         }
+    }
+
+    /// Tally records and estimated bytes into a run's usage meter (#704).
+    pub fn with_meter(mut self, meter: Arc<UsageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     fn metric_labels(&self) -> Vec<Label> {
@@ -179,6 +189,7 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         let labels = self.labels.clone();
         let connector = self.connector.clone();
         let page_index = Arc::clone(&self.page_index);
+        let meter = self.meter.clone();
         let metric_labels = self.metric_labels();
         let pipeline = self.labels.pipeline.clone();
         let row = self.labels.row.clone();
@@ -228,6 +239,12 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
                         counter!("faucet_source_pages_total", metric_labels.clone()).increment(1);
                         counter!("faucet_source_records_total", metric_labels.clone())
                             .increment(page.records.len() as u64);
+                        if let Some(m) = &meter {
+                            let bytes = estimate_page_bytes(&page.records);
+                            counter!("faucet_source_bytes_total", metric_labels.clone())
+                                .increment(bytes);
+                            m.add_read(page.records.len() as u64, bytes);
+                        }
                         // Close the timing window BEFORE yielding: in an
                         // `async_stream` the timer local persists across the
                         // yield, so dropping it at scope-exit would fold the
@@ -295,6 +312,8 @@ pub struct InstrumentedSink<'a, S: Sink + ?Sized> {
     connector: SharedString,
     /// Precomputed `pipeline` / `row` / `connector` labels, cloned per call.
     base_labels: Vec<Label>,
+    /// The run's usage meter (#704); `None` = count nothing beyond metrics.
+    meter: Option<Arc<UsageMeter>>,
 }
 
 impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
@@ -311,7 +330,15 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
             labels,
             connector,
             base_labels,
+            meter: None,
         }
+    }
+
+    /// Tally accepted records and estimated bytes into a run's usage meter
+    /// (#704).
+    pub fn with_meter(mut self, meter: Arc<UsageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     fn metric_labels(&self) -> Vec<Label> {
@@ -322,6 +349,21 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
         let mut l = self.metric_labels();
         l.push(Label::new("kind", SharedString::const_str(kind)));
         l
+    }
+
+    /// Count `accepted` records of `records` as written; when the sink
+    /// accepted a prefix, only that prefix's estimated size is attributed.
+    fn meter_written(&self, records: &[Value], accepted: usize) {
+        let Some(m) = &self.meter else {
+            return;
+        };
+        let bytes = if accepted >= records.len() {
+            estimate_page_bytes(records)
+        } else {
+            estimate_page_bytes(&records[..accepted])
+        };
+        counter!("faucet_sink_bytes_total", self.metric_labels()).increment(bytes);
+        m.add_written(accepted as u64, bytes);
     }
 }
 
@@ -422,6 +464,7 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
             Ok(Ok(n)) => {
                 counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
                 counter!("faucet_sink_records_total", metric_labels.clone()).increment(n as u64);
+                self.meter_written(records, n);
                 Ok(n)
             }
             Ok(Err(e)) => {
@@ -483,6 +526,16 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
                 counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
                 counter!("faucet_sink_records_total", metric_labels.clone())
                     .increment(success_count as u64);
+                if let Some(m) = &self.meter {
+                    let bytes: u64 = outcomes
+                        .iter()
+                        .zip(records.iter())
+                        .filter(|(o, _)| o.is_ok())
+                        .map(|(_, r)| crate::usage::estimate_json_bytes(r))
+                        .sum();
+                    counter!("faucet_sink_bytes_total", metric_labels.clone()).increment(bytes);
+                    m.add_written(success_count as u64, bytes);
+                }
                 Ok(outcomes)
             }
             Ok(Err(e)) => {
@@ -600,9 +653,12 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        self.inner
+        let n = self
+            .inner
             .write_batch_idempotent(records, scope, token)
-            .await
+            .await?;
+        self.meter_written(records, n);
+        Ok(n)
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
@@ -717,6 +773,7 @@ pub(crate) mod source_tests {
             connector: SharedString::const_str("unknown"),
             base_labels: Vec::new(),
             page_index: Arc::new(AtomicUsize::new(0)),
+            meter: None,
         };
         assert_eq!(
             Source::connector_name(&wrapped),
@@ -1051,6 +1108,7 @@ mod sink_tests {
             labels: labels(),
             connector: SharedString::const_str("unknown"),
             base_labels: Vec::new(),
+            meter: None,
         };
         assert_eq!(
             Sink::connector_name(&wrapped),

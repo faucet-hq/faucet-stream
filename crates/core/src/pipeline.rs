@@ -141,6 +141,10 @@ pub struct Pipeline<'a, So: Source + ?Sized, Si: Sink + ?Sized> {
     resilience: Option<crate::resilience::ResiliencePolicy>,
     schema_drift: Option<crate::drift::SchemaDriftPolicy>,
     cleanup: Option<std::sync::Arc<crate::cleanup::CleanupPolicy>>,
+    /// Usage meter (#704): records / estimated bytes / round trips / cost
+    /// signals tallied by the observability decorators and the round-trip
+    /// recorders. `None` = no counting beyond metrics.
+    usage_meter: Option<Arc<crate::usage::UsageMeter>>,
     /// When `true`, `run()` skips the overwrite begin/commit/abort lifecycle
     /// even for an overwrite-configured sink — an external caller (the CLI
     /// executor) owns that lifecycle so it can run it **once per destination
@@ -161,20 +165,27 @@ pub(crate) fn install_roundtrip_recorders(
     sink: &dyn Sink,
     pipeline: &str,
     row: &str,
+    meter: Option<&Arc<crate::usage::UsageMeter>>,
 ) {
     use crate::observability::{RoundtripRecorder, RoundtripSide};
-    source.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
+    let mut src = RoundtripRecorder::new(
         RoundtripSide::Source,
         pipeline.to_string(),
         row.to_string(),
         source.connector_name(),
-    )));
-    sink.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
+    );
+    let mut snk = RoundtripRecorder::new(
         RoundtripSide::Sink,
         pipeline.to_string(),
         row.to_string(),
         sink.connector_name(),
-    )));
+    );
+    if let Some(m) = meter {
+        src = src.with_meter(Arc::clone(m));
+        snk = snk.with_meter(Arc::clone(m));
+    }
+    source.set_roundtrip_recorder(Arc::new(src));
+    sink.set_roundtrip_recorder(Arc::new(snk));
 }
 
 impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
@@ -200,6 +211,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             resilience: None,
             schema_drift: None,
             cleanup: None,
+            usage_meter: None,
             suppress_overwrite_lifecycle: false,
         }
     }
@@ -336,6 +348,14 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// Attach a usage meter (#704): the run's records, estimated bytes,
+    /// backend round trips and cost signals accumulate there for accounting
+    /// and budgets. Without one, nothing is counted beyond the metrics.
+    pub fn with_usage_meter(mut self, meter: Arc<crate::usage::UsageMeter>) -> Self {
+        self.usage_meter = Some(meter);
+        self
+    }
+
     /// Run the pipeline in streaming mode.
     ///
     /// 1. Loads the stored bookmark and pushes it to the source (if a state
@@ -366,15 +386,25 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         let obs_labels = Labels::new(name.clone(), row.clone(), run_id.clone());
 
         // Wrap source, sink, state-store.
-        let wrapped_source = InstrumentedSource::new(self.source, obs_labels.clone());
-        let wrapped_sink = InstrumentedSink::new(self.sink, obs_labels.clone());
+        let mut wrapped_source = InstrumentedSource::new(self.source, obs_labels.clone());
+        let mut wrapped_sink = InstrumentedSink::new(self.sink, obs_labels.clone());
+        if let Some(m) = &self.usage_meter {
+            wrapped_source = wrapped_source.with_meter(Arc::clone(m));
+            wrapped_sink = wrapped_sink.with_meter(Arc::clone(m));
+        }
 
         // Hand each connector a pre-labelled round-trip recorder (#638). Done
         // here because the pipeline is the only place that knows the
         // pipeline/row/connector trio every other metric carries; the
         // decorators forward it down to the connector that does the I/O. A
         // connector that never records emits nothing.
-        install_roundtrip_recorders(&wrapped_source, &wrapped_sink, &name, &row);
+        install_roundtrip_recorders(
+            &wrapped_source,
+            &wrapped_sink,
+            &name,
+            &row,
+            self.usage_meter.as_ref(),
+        );
         let wrapped_state_store: Option<Arc<dyn StateStore>> = self.state_store.as_ref().map(|s| {
             Arc::new(InstrumentedStateStore::new(
                 Arc::clone(s),

@@ -68,6 +68,7 @@ pub mod transform;
 pub mod transforming_source;
 #[cfg(feature = "transform-tree-flatten")]
 pub mod tree;
+pub mod usage;
 pub mod util;
 pub mod verify;
 pub mod window;
@@ -210,6 +211,7 @@ pub use transform::{KeyCaseMode, KeyCollision};
 pub use transforming_source::TransformingSource;
 #[cfg(feature = "transform-tree-flatten")]
 pub use tree::{AncestorsSpec, ColumnsSpec, CompiledTreeFlatten, TreeFlattenSpec};
+pub use usage::{CostSignal, UsageMeter, UsageSide, UsageSnapshot, estimate_json_bytes};
 pub use util::redact_uri_credentials;
 pub use verify::{IntegrityCheck, LengthCheck, VerifyingReader};
 pub use window::{

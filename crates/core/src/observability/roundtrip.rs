@@ -19,7 +19,9 @@
 //! consistent with the rest, and — unlike a tokio task-local — the `Arc`
 //! survives `tokio::spawn`, which the S3 and Parquet fan-out paths rely on.
 
+use crate::usage::{CostSignal, UsageMeter, UsageSide};
 use metrics::{Label, SharedString, counter, histogram};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Which side of the pipeline a round trip belongs to. Selects the metric
@@ -60,6 +62,19 @@ pub struct RoundtripRecorder {
     side: RoundtripSide,
     /// `pipeline` / `row` / `connector`, resolved once by the pipeline.
     base: Vec<Label>,
+    /// The run's usage meter (#704), when one is attached: every round trip
+    /// and cost signal is tallied there as well as emitted as a metric.
+    meter: Option<Arc<UsageMeter>>,
+    connector: SharedString,
+}
+
+impl RoundtripSide {
+    fn usage_side(self) -> UsageSide {
+        match self {
+            Self::Source => UsageSide::Source,
+            Self::Sink => UsageSide::Sink,
+        }
+    }
 }
 
 impl RoundtripRecorder {
@@ -70,13 +85,45 @@ impl RoundtripRecorder {
         row: impl Into<SharedString>,
         connector: impl Into<SharedString>,
     ) -> Self {
+        let connector: SharedString = connector.into();
         Self {
             side,
             base: vec![
                 Label::new("pipeline", pipeline.into()),
                 Label::new("row", row.into()),
-                Label::new("connector", connector.into()),
+                Label::new("connector", connector.clone()),
             ],
+            meter: None,
+            connector,
+        }
+    }
+
+    /// Also tally into a run's usage meter (#704).
+    pub fn with_meter(mut self, meter: Arc<UsageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
+    /// Report a backend-measured usage figure (#704) — BigQuery's bytes
+    /// billed for a job, the payload size of a streaming insert, a
+    /// warehouse's credits. Emitted as
+    /// `faucet_cost_signals_total{pipeline,row,connector,kind,unit}` (the
+    /// quantity rounded to a whole unit) and, when a meter is attached, kept
+    /// verbatim for the run's usage record. `kind` and `unit` are a closed
+    /// set per connector, documented in its README.
+    pub fn signal(&self, kind: &'static str, unit: &'static str, quantity: f64) {
+        let mut labels = self.base.clone();
+        labels.push(Label::new("kind", SharedString::const_str(kind)));
+        labels.push(Label::new("unit", SharedString::const_str(unit)));
+        counter!("faucet_cost_signals_total", labels).increment(quantity.max(0.0).round() as u64);
+        if let Some(m) = &self.meter {
+            m.add_signal(CostSignal {
+                kind: kind.to_string(),
+                unit: unit.to_string(),
+                quantity,
+                side: self.side.usage_side(),
+                connector: self.connector.to_string(),
+            });
         }
     }
 
@@ -87,6 +134,9 @@ impl RoundtripRecorder {
     /// A retried call is a real round trip and must be counted again.
     pub fn record(&self, op: &'static str) {
         counter!(self.side.counter_name(), self.labels_for(op)).increment(1);
+        if let Some(m) = &self.meter {
+            m.add_roundtrip(self.side.usage_side(), op);
+        }
     }
 
     /// Count one round trip and record how long it took.
@@ -94,6 +144,9 @@ impl RoundtripRecorder {
         let labels = self.labels_for(op);
         counter!(self.side.counter_name(), labels.clone()).increment(1);
         histogram!(self.side.histogram_name(), labels).record(elapsed.as_secs_f64());
+        if let Some(m) = &self.meter {
+            m.add_roundtrip(self.side.usage_side(), op);
+        }
     }
 
     fn labels_for(&self, op: &'static str) -> Vec<Label> {
@@ -117,6 +170,10 @@ impl RoundtripRecorder {
 /// Register descriptions for both sides' counters and histograms. Called once
 /// by `install_observability`.
 pub fn describe_roundtrip_metrics() {
+    metrics::describe_counter!(
+        "faucet_cost_signals_total",
+        "Backend-reported usage a connector measured during a run (BigQuery bytes billed, streamed payload bytes, …), by kind and unit"
+    );
     metrics::describe_counter!(
         "faucet_source_roundtrips_total",
         "Calls a source made to its upstream backend, by connector-defined op"
