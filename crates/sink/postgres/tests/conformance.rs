@@ -58,6 +58,7 @@ async fn fresh_sink() -> (ContainerAsync<Postgres>, String, PostgresSink) {
         rollback: None,
     };
     let sink = PostgresSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     (container, url, sink)
 }
 

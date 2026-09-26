@@ -252,6 +252,13 @@ impl AzureBlobSinkConfig {
     }
 }
 
+impl AzureBlobSinkConfig {
+    /// What a failed batch write leaves behind (#737): each object upload is atomic, but one batch can span several objects.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +400,11 @@ mod tests {
         assert_eq!(opts.excel.header_row, 2);
         assert_eq!(opts.xml.record_element, "row");
         assert_eq!(opts.xml.root_element, "rows");
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: AzureBlobSinkConfig = serde_json::from_value(serde_json::json!({"container": "c", "account": "a", "prefix": "p/", "auth": {"type": "sas_token", "config": {"sas_token": "sv=x"}}})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

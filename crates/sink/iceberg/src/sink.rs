@@ -596,6 +596,10 @@ pub(crate) async fn delete_data_files(file_io: &FileIO, paths: &[String]) -> (us
 
 #[async_trait]
 impl faucet_core::Sink for IcebergSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn connector_name(&self) -> &'static str {
         "iceberg"
     }

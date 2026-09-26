@@ -225,6 +225,7 @@ async fn batch_size_zero_writes_single_statement() {
     let sink = RedshiftSink::new(insert_config(port, "events", 0))
         .await
         .expect("sink builds");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     let records: Vec<Value> = (1..=4).map(|i| json!({"id": i, "name": "r"})).collect();
 
     assert_eq!(sink.write_batch(&records).await.expect("write"), 4);

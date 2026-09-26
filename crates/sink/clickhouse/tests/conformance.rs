@@ -77,6 +77,7 @@ fn conformance_config_schema_valid() {
 fn conformance_connector_name_nonempty() {
     let sink =
         ClickHouseSink::new(ClickHouseSinkConfig::new("http://127.0.0.1:1", "t")).expect("sink");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     assert_connector_name_nonempty_value(sink.connector_name(), sink.connector_name());
 }
 

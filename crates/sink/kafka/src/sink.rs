@@ -209,6 +209,10 @@ fn build_sr_client(
 
 #[async_trait]
 impl Sink for KafkaSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn dataset_uri(&self) -> String {
         use crate::config::KafkaSinkTopic;
         let topic = match &self.config.topic {

@@ -74,3 +74,11 @@ cargo test -p faucet-sink-pubsub
 ```
 
 License: MIT OR Apache-2.0.
+
+## Batch atomicity
+
+What a failed write leaves behind (#737): **per-row** — every publish reports its own outcome; there is no batch-level error. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).

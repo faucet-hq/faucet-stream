@@ -183,6 +183,13 @@ impl SftpSinkConfig {
     }
 }
 
+impl SftpSinkConfig {
+    /// What a failed batch write leaves behind (#737): each file is atomic, but one batch can span several files.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +314,11 @@ mod tests {
         assert_eq!(both.max_records_per_file, Some(10));
         assert_eq!(both.max_bytes_per_file, Some(4096));
         assert_eq!(both.file_extension, ".csv");
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: SftpSinkConfig = serde_json::from_value(serde_json::json!({"host": "sftp.example.com", "username": "user", "type": "password", "config": {"password": "secret"}, "path": "/upload"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

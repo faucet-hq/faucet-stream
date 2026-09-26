@@ -50,6 +50,7 @@ async fn conformance_connector_name_nonempty() {
     .expect("sink config parse");
 
     let sink = IcebergSink::new(cfg).await.expect("IcebergSink::new");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     faucet_conformance::assert_connector_name_nonempty_value(
         sink.connector_name(),
         sink.connector_name(),

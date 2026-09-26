@@ -142,6 +142,13 @@ impl CsvSinkConfig {
     }
 }
 
+impl CsvSinkConfig {
+    /// What a failed batch write leaves behind (#737): records are written to the file one by one.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +239,12 @@ mod tests {
     fn on_unknown_field_builder_sets_policy() {
         let config = CsvSinkConfig::new("/tmp/out.csv").on_unknown_field(OnUnknownField::Error);
         assert_eq!(config.on_unknown_field, OnUnknownField::Error);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: CsvSinkConfig =
+            serde_json::from_value(serde_json::json!({"path": "/tmp/out.csv"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

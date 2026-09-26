@@ -127,6 +127,13 @@ impl StdoutSinkConfig {
     }
 }
 
+impl StdoutSinkConfig {
+    /// What a failed batch write leaves behind (#737): records are written one by one.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +218,11 @@ mod tests {
     fn batch_size_defaults_when_missing_in_json() {
         let c: StdoutSinkConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(c.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: StdoutSinkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

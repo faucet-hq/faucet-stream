@@ -135,6 +135,17 @@ impl SqliteSinkConfig {
     }
 }
 
+impl SqliteSinkConfig {
+    /// What a failed batch write leaves behind (#737): each chunk is one transaction; keyed writes are one transaction.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.write.dedups_by_key() || self.batch_size == 0 {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +274,18 @@ mod tests {
                 .with_create_table(false)
                 .create_table
         );
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: SqliteSinkConfig = serde_json::from_value(
+            serde_json::json!({"database_url": "sqlite::memory:", "table_name": "events", "column_mapping": {"json": {"column": "data"}}}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: SqliteSinkConfig = serde_json::from_value(serde_json::json!({"database_url": "sqlite::memory:", "table_name": "events", "column_mapping": {"json": {"column": "data"}}, "batch_size": 0})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        let c: SqliteSinkConfig = serde_json::from_value(serde_json::json!({"database_url": "sqlite::memory:", "table_name": "events", "column_mapping": {"json": {"column": "data"}}, "write_mode": "upsert", "key": ["id"]})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

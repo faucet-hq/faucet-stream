@@ -24,6 +24,7 @@ fn conformance_config_schema_valid() {
 #[test]
 fn conformance_connector_name_nonempty() {
     let sink = HttpSink::new(HttpSinkConfig::new("http://127.0.0.1:1/ingest"));
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     faucet_conformance::assert_connector_name_nonempty_value(
         sink.connector_name(),
         sink.connector_name(),

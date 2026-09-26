@@ -285,6 +285,10 @@ impl DeltaSink {
 
 #[async_trait]
 impl faucet_core::Sink for DeltaSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(DeltaSinkConfig))
             .expect("schema serialization")

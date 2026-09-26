@@ -429,6 +429,14 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [`faucet-source-bigquery`](https://crates.io/crates/faucet-source-bigquery) — the matching BigQuery query source.
 - [`faucet-common-bigquery`](https://crates.io/crates/faucet-common-bigquery) — shared `BigQueryCredentials` + client builder.
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **per-row** with `batch_size: 0` (one `insertAll` per write), **atomic** for `write_mode: upsert|delete`, otherwise **best-effort** — keyed writes run as one transaction; an append issues one insertAll per chunk, so only an unchunked batch keeps an outer error clean. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

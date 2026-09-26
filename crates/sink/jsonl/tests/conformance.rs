@@ -22,6 +22,7 @@ fn count_lines(path: &std::path::Path) -> usize {
 #[test]
 fn conformance_config_schema_valid() {
     let sink = JsonlSink::new(JsonlSinkConfig::new("/tmp/does-not-matter.jsonl"));
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     faucet_conformance::assert_config_schema_valid_value(
         &sink.config_schema(),
         sink.connector_name(),

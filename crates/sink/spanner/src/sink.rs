@@ -895,6 +895,10 @@ async fn run_cleanup_txn(
 
 #[async_trait]
 impl faucet_core::Sink for SpannerSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(SpannerSinkConfig))
             .expect("schema serialization")

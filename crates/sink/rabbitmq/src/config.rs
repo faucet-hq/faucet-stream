@@ -186,6 +186,13 @@ impl RabbitMqSinkConfig {
     }
 }
 
+impl RabbitMqSinkConfig {
+    /// What a failed batch write leaves behind (#737): publishes and confirms run per group.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +310,14 @@ mod tests {
     #[test]
     fn schema_compiles() {
         let _ = schemars::schema_for!(RabbitMqSinkConfig);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: RabbitMqSinkConfig = serde_json::from_value(
+            serde_json::json!({"url": "amqp://broker", "exchange": "events"}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

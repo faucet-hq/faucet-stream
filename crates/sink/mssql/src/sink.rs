@@ -1079,6 +1079,10 @@ const TRANSIENT_RETRY_BASE: Duration = Duration::from_millis(50);
 
 #[async_trait]
 impl Sink for MssqlSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);

@@ -342,6 +342,14 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 - [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [faucet-source-parquet](https://crates.io/crates/faucet-source-parquet) · [faucet-sink-s3](https://crates.io/crates/faucet-sink-s3)
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **best-effort** — rows stream into an open file that may roll over mid-batch. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

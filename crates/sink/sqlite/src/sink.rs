@@ -882,6 +882,10 @@ impl SqliteSink {
 
 #[async_trait]
 impl faucet_core::Sink for SqliteSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn connector_name(&self) -> &'static str {
         "sqlite"
     }
