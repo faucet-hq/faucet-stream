@@ -5,18 +5,58 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Apache Iceberg table source for the faucet-stream ecosystem"
+description = "Apache Iceberg table source for the faucet-stream ecosystem — projection, pushdown, time travel, incremental snapshot reads"
 readme = "README.md"
 keywords = ["iceberg", "lakehouse", "source", "etl", "connector"]
 categories.workspace = true
 
+[features]
+default = ["catalog-rest"]
+# Catalog clients are shared with the sink through faucet-common-iceberg, so
+# both connectors gate catalogs identically.
+catalog-rest = ["faucet-common-iceberg/catalog-rest"]
+catalog-glue = ["faucet-common-iceberg/catalog-glue", "storage-opendal"]
+catalog-sql  = ["faucet-common-iceberg/catalog-sql",  "storage-opendal"]
+catalog-hms  = ["faucet-common-iceberg/catalog-hms",  "storage-opendal"]
+storage-opendal = ["faucet-common-iceberg/storage-opendal"]
+# Opt-in Arrow columnar fast path (#375): emit `ColumnarPage`s so an
+# `iceberg → parquet` / warehouse chain skips `Value` materialization.
+arrow = ["faucet-core/arrow"]
+
 [dependencies]
 faucet-core.workspace = true
+faucet-common-iceberg.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+schemars.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+futures.workspace = true
+chrono.workspace = true
+iceberg = "0.10.0"
+arrow = "58"
+arrow-json = "58"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tempfile = "3"
+serde_json.workspace = true
+schemars.workspace = true
+faucet-conformance.workspace = true
+faucet-sink-iceberg = { workspace = true, features = ["catalog-sql"] }
+iceberg-catalog-sql = "0.10.0"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "any"] }
+parquet = { version = "58", features = ["async"] }
+uuid.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+# API-stability (cargo-semver-checks) lint overrides — additive config
+# evolution is a MINOR bump by declared contract (CLAUDE.md).
 [package.metadata.cargo-semver-checks.lints]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
