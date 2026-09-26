@@ -471,6 +471,23 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
         .await;
     assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
     assert_eq!(list[0]["id"], proposed["change_id"]);
+    // A proposal whose config cannot be planned comes back as a tool error
+    // carrying the server error's `code: message` rendering.
+    let (_, bad) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+                "name": "propose_run",
+                "arguments": { "config": "{ not yaml", "reason": "broken" }
+            }}),
+        )
+        .await;
+    assert_eq!(bad["result"]["isError"], true, "{bad}");
+    let msg = bad["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(msg.contains(": "), "{msg}");
     // A viewer's MCP session is not offered the tool at all.
     let (_, tools) = api
         .post(
