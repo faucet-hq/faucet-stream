@@ -1,0 +1,32 @@
+# Incrementally export an Apache Iceberg table to JSON Lines.
+# The first run reads the current snapshot in full; later runs read only the
+# data files appended by snapshots committed since the bookmarked snapshot id.
+#
+# Run with:  faucet run cli/examples/iceberg_to_jsonl.yaml
+# Prereqs:   an Iceberg REST catalog at http://localhost:8181 (Polaris, Nessie,
+#            Lakekeeper, …) whose warehouse holds `analytics.events`.
+# Non-REST catalogs (glue / sql / hms) need the `source-iceberg-<catalog>` feature.
+version: 1
+name: iceberg_to_jsonl
+
+pipeline:
+  source:
+    type: iceberg
+    config:
+      catalog:
+        type: rest
+        uri: "http://localhost:8181"
+        warehouse: "s3://warehouse/"
+      table: analytics.events
+      columns: [id, ts, user_id, amount]   # projection pushdown
+      filter: "amount > 0"                  # predicate pushdown
+      mode: incremental
+      on_rewrite: full_refresh              # an overwrite/delete snapshot re-reads the table
+  sink:
+    type: jsonl
+    config:
+      path: ./out/iceberg_events.jsonl
+      append: true
+  state:
+    type: file
+    config: { path: ./.faucet-state }

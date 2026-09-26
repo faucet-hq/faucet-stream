@@ -170,9 +170,11 @@ Delta and Iceberg are the two open lakehouse table formats; faucet ships a sink
   transaction log lives beside the data in the table directory — so a bare
   `table_uri` on local FS or S3/Azure/GCS is enough. Append-only today;
   time-travel reads via `version`/`timestamp`.
-- **`sink-iceberg`** — the **Iceberg** format, registered in a catalog (REST,
-  Glue, SQL, or HMS). Choose it when your platform is Iceberg-native or you need
-  a shared catalog across engines.
+- **`sink-iceberg` / `source-iceberg`** — the **Iceberg** format, registered in
+  a catalog (REST, Glue, SQL, or HMS). Choose it when your platform is
+  Iceberg-native or you need a shared catalog across engines. The source adds
+  filter pushdown, snapshot/timestamp time travel, and `mode: incremental`,
+  which reads only the snapshots appended since the last run.
 
 **Rule of thumb:** landing data for Databricks, or you want a catalog-free Delta
 table → `delta`; an Iceberg-native platform or shared catalog → `iceberg`.
@@ -192,10 +194,33 @@ Two ways to read from Databricks — pick by whether you want a **table** or a
   must be running (and billed) for the duration.
 
 **Rule of thumb:** whole table, cheapest + fastest → `delta`; the result of a
-SQL query (joins/aggregates/filters) → `databricks`. There is deliberately no
-Databricks *sink* over the SQL API — the write path is the Delta Lake sink (a
-warehouse `INSERT`/`MERGE` sink would be slow, INSERT-bound, and force billed
-compute).
+SQL query (joins/aggregates/filters) → `databricks`.
+
+## Writing to Databricks: Delta sink vs. Databricks SQL sink
+
+- **`sink-delta`** — writes Delta files straight to object storage. No warehouse
+  is billed, but it is append-only and bypasses Unity Catalog governance.
+- **`sink-databricks`** — writes through a running **SQL Warehouse**, so Unity
+  Catalog permissions, lineage and table features apply. It supports
+  `write_mode: upsert | delete | overwrite`, `delivery: exactly_once`, and
+  `schema: { on_drift: evolve }`; large pages are staged and loaded with
+  `COPY INTO` (a Unity Catalog volume, or cloud storage with the
+  `sink-databricks-staging` feature).
+
+**Rule of thumb:** high-volume append into a lake path → `delta`; a governed
+Unity Catalog table, keyed upserts, or exactly-once → `databricks`.
+
+## Amazon DynamoDB
+
+- **`source-dynamodb`** — `mode: scan` for full-table extracts (parallel
+  segments; shardable across `faucet serve --cluster` workers), `mode: query`
+  for one partition / index slice, and `mode: streams` for change capture from
+  DynamoDB Streams. `faucet mirror` pairs a scan snapshot with a streams CDC
+  pipeline; because Streams replays its retained window rather than an exact
+  position, the mirror requires a keyed `write_mode: upsert` sink.
+- **`sink-dynamodb`** — batched `BatchWriteItem` with `write_mode: upsert |
+  delete` keyed on the table's primary key. Pair it with any source and
+  `delivery: exactly_once` to get effectively-once through keyed dedup.
 
 ## Still unsure?
 

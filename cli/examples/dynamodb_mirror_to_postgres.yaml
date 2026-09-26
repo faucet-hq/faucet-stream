@@ -1,0 +1,45 @@
+# Mirror a DynamoDB table into PostgreSQL: parallel-scan snapshot, then
+# DynamoDB Streams change capture.
+# Run with:  faucet mirror cli/examples/dynamodb_mirror_to_postgres.yaml
+#
+# Enable a NEW_AND_OLD_IMAGES stream on the table before the first run. Streams
+# replays its retained window from each shard's trim horizon after the snapshot,
+# so the sink must be a keyed upsert (faucet validate rejects anything else).
+version: 1
+name: orders_dynamo_mirror
+
+pipeline:
+  source:
+    type: dynamodb
+    config:
+      table_name: orders
+      region: us-east-1
+      mode: streams
+      idle_termination_secs: 30          # each CDC run ends after 30 s idle; `continuous` starts the next
+  transforms:
+    - type: cdc_unwrap                   # change envelope → flat row + __op marker
+      config: {}
+  sink:
+    type: postgres
+    config:
+      connection_url: postgres://faucet:faucet@localhost:5432/mirror
+      table_name: orders
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [order_id]
+      delete_marker: { field: __op, values: [d] }
+  state:
+    type: file
+    config: { path: ./.faucet-state }
+
+mirror:
+  mode: snapshot_then_cdc
+  continuous: true
+  snapshot:
+    source:
+      type: dynamodb
+      config:
+        table_name: orders
+        region: us-east-1
+        mode: scan
+        segments: 4

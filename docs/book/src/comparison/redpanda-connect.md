@@ -20,7 +20,7 @@ Worth stating precisely, because it's a real adoption consideration: Benthos was
 
 - **Batch/ELT is the home turf.** Incremental + resumable replication, snapshot→CDC handoff, and first-class warehouse sinks (BigQuery, Snowflake, Iceberg, Delta) — the job faucet is built for.
 - **Governance in the movement path.** Data-quality checks, versioned data contracts, PII masking (before any sink sees a row), schema-drift policy, column-level lineage (OpenLineage) + a catalog, and freshness/volume SLAs — native and zero-config.
-- **Effectively-once delivery.** Per-page commit tokens commit atomically with the data, so a resumed run drops duplicates — across 11 sinks (SQL, Kafka, Iceberg, BigQuery, Snowflake, Spanner, MongoDB, Redis).
+- **Effectively-once delivery.** Per-page commit tokens commit atomically with the data, so a resumed run drops duplicates — across 12 sinks (SQL, Kafka, Iceberg, BigQuery, Snowflake, Spanner, Databricks, MongoDB, Redis).
 - **Uniform permissive licensing.** MIT / Apache-2.0 throughout — no per-component enterprise gate to audit.
 
 ## Where Redpanda Connect is the better choice
@@ -37,11 +37,11 @@ Straight with you — for its core job it's excellent:
 |---|---|---|
 | Language / runtime | Rust, single binary | Go, single binary |
 | Orientation | discrete runs to completion | continuous stream processing |
-| Connectors | <!--COUNT:connectors-->68<!--/COUNT--> source/sink, ETL/CDC/warehouse | hundreds of components/processors |
+| Connectors | <!--COUNT:connectors-->75<!--/COUNT--> source/sink, ETL/CDC/warehouse | hundreds of components/processors |
 | Change data capture | ✓ engine-level | some CDC inputs (several enterprise-gated) |
 | Warehouse / ELT sinks | ✓ BigQuery, Snowflake, Iceberg, Delta, … | more messaging/stream-oriented |
 | Governance in-path (quality / contracts / masking / lineage / SLA) | ✓ native | ✗ |
-| Effectively-once delivery | ✓ (11 sinks incl. Kafka, Iceberg, BigQuery) | ✗ |
+| Effectively-once delivery | ✓ (12 sinks incl. Kafka, Iceberg, BigQuery, Databricks) | ✗ |
 | Embeddable as a library | ✓ (Rust) | ✓ (Go) |
 | License | MIT / Apache-2.0 | Apache-2.0 + source-available enterprise |
 

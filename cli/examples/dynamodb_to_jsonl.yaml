@@ -1,0 +1,26 @@
+# Parallel-scan an Amazon DynamoDB table to JSON Lines.
+# Items are converted to plain JSON (numbers stay numbers, sets become arrays);
+# the scan bookmarks each segment, so an interrupted run resumes where it stopped.
+#
+# Run with:  faucet run cli/examples/dynamodb_to_jsonl.yaml
+# Credentials come from the AWS default chain (env, profile, instance role).
+# For DynamoDB Local set `endpoint_url: http://localhost:8000`.
+version: 1
+name: dynamodb_to_jsonl
+
+pipeline:
+  source:
+    type: dynamodb
+    config:
+      table_name: orders
+      region: us-east-1
+      mode: scan
+      segments: 8            # parallel scan segments
+      max_concurrency: 4     # segments read at once
+  sink:
+    type: jsonl
+    config:
+      path: ./out/dynamodb_orders.jsonl
+  state:
+    type: file
+    config: { path: ./.faucet-state }

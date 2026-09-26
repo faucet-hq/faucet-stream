@@ -51,6 +51,9 @@ These run immediately after installing the CLI — great for a first smoke test:
 | `rest_to_jsonl_with_vault.yaml` | Vault KV v2 secret injected as a Bearer token via `${vault:…#field}`; requires `VAULT_ADDR` + `VAULT_TOKEN` and `--features secrets-vault` |
 | `websocket_to_jsonl.yaml` | none (live public WS endpoint — Binance BTC/USDT trade stream, no auth) |
 | `kinesis_to_jsonl.yaml` | AWS Kinesis → JSONL with resumable per-shard checkpoints; runs against LocalStack (`docker run -p 4566:4566 -e SERVICES=kinesis localstack/localstack`) |
+| `dynamodb_to_jsonl.yaml` | DynamoDB parallel scan → JSONL with per-segment bookmarks; runs against DynamoDB Local (`docker run -p 8000:8000 amazon/dynamodb-local`, then set `endpoint_url: http://localhost:8000`) |
+| `dynamodb_mirror_to_postgres.yaml` | `faucet mirror` — DynamoDB scan snapshot, then DynamoDB Streams CDC into a keyed Postgres upsert (DynamoDB Local + the compose `postgres` service) |
+| `iceberg_to_jsonl.yaml` | Apache Iceberg table → JSONL with `mode: incremental` (only snapshots appended since the last run); needs an Iceberg REST catalog (Polaris / Nessie / Lakekeeper) |
 | `spanner_to_jsonl.yaml` | Cloud Spanner → JSONL with incremental `@bookmark` replication; runs against the Spanner emulator (`docker run -p 9010:9010 gcr.io/cloud-spanner-emulator/emulator`) |
 | `backfill_sqlite_to_jsonl.yaml` | `faucet backfill` — replay a date range from a local SQLite table one day per window unit, one JSONL file per unit (`${backfill.*}` tokens, durable `--resume` marker) |
 | `scheduled_nightly.yaml` | `faucet schedule` — CSV→JSONL pipeline on a nightly cron at 02:00 Pacific; demonstrates timezone, overlap_policy, and max_consecutive_failures |
@@ -122,6 +125,11 @@ files as each config shows:
 `csv_to_bigquery.yaml`, `graphql_to_bigquery.yaml`, `mysql_to_bigquery.yaml`,
 `postgres_to_bigquery.yaml`, `rest_to_bigquery.yaml`, `s3_to_bigquery.yaml`,
 `mysql_to_snowflake.yaml`, `postgres_to_snowflake.yaml`, `s3_to_snowflake.yaml`.
+
+Databricks needs a workspace, a SQL warehouse and a token (`DATABRICKS_TOKEN`):
+`databricks_to_jsonl.yaml` (query source) and `postgres_to_databricks_upsert.yaml`
+(`MERGE` upserts into a Unity Catalog Delta table, staged through a volume, with
+`schema: { on_drift: evolve }`).
 
 ## OTLP / OpenTelemetry export
 

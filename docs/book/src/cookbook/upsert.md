@@ -29,7 +29,7 @@ the top level of the sink's `config`, alongside `table_name` etc.):
 
 ## Supported sinks and their native primitives
 
-Eight sinks support `upsert`/`delete`; every other sink is append-only.
+Ten sinks support `upsert`/`delete`; every other sink is append-only.
 
 | Sink | Requires | Native primitive |
 |------|----------|------------------|
@@ -41,6 +41,8 @@ Eight sinks support `upsert`/`delete`; every other sink is append-only.
 | `elasticsearch` | — (schemaless) | `_bulk` `index` / `delete`, `key` → `_id` |
 | `bigquery` | a defined table schema + `key` columns | in-place `MERGE … USING UNNEST(@payload)` (no staging table) |
 | `spanner` | `key` must equal the table's primary-key columns | `InsertOrUpdate` / `Delete` mutations (mutations always address the PK) |
+| `dynamodb` | `key` must name the table's partition key (+ sort key) | `BatchWriteItem` `PutRequest` / `DeleteRequest`, last-write-wins per key within a page |
+| `databricks` | a Delta table (created for you with `create_table: true`) + `key` columns | `MERGE INTO … USING (VALUES …)` (or a staged `COPY INTO` temp table for large pages) |
 
 The **SQL sinks require column-mapping mode** — `column_mapping: auto_map`
 (postgres/mysql/sqlite) or `auto_columns` (mssql). The single-JSONB-column blob
@@ -163,14 +165,14 @@ state store or watermark is required for this mechanism (state is still
 recommended so re-runs are incremental).
 
 The **atomic-watermark** mechanism additionally composes with upsert on the
-four SQL sinks (`postgres`, `mysql`, `mssql`, `sqlite`), **BigQuery**, and
-**MongoDB** (replica set required): the sink commits the upserted/deleted rows
+four SQL sinks (`postgres`, `mysql`, `mssql`, `sqlite`), **BigQuery**,
+**Databricks** and **MongoDB** (replica set required): the sink commits the upserted/deleted rows
 **and** the monotonic commit token in a single transaction, so a crash-and-resume
 never re-applies or skips a batch — the mirror stays exactly consistent with
 the source even across restarts. Its requirements, checked at config-load time:
 
 1. a positional-replay source (`postgres-cdc` / `mysql-cdc` / `mongodb-cdc` / `kafka`),
-2. an idempotent sink (`postgres` / `mysql` / `mssql` / `sqlite` / `bigquery` / `mongodb`),
+2. an idempotent sink (`postgres` / `mysql` / `mssql` / `sqlite` / `bigquery` / `databricks` / `mongodb`),
 3. a **durable** `state:` block (not `memory`), and
 4. **no** `dlq:` block (incompatible with the atomic-watermark path in this version —
    a missing/null-key row therefore fails the batch rather than being routed aside).
@@ -271,8 +273,9 @@ they are never deleted even though they did not reach the destination.
 
 ### Supported sinks
 
-All eight upsert-capable sinks: `postgres`, `mysql`, `mssql`, `sqlite`,
-`mongodb`, `elasticsearch`, `bigquery`, `spanner`. The SQL sinks require
+Eight of the ten upsert-capable sinks: `postgres`, `mysql`, `mssql`, `sqlite`,
+`mongodb`, `elasticsearch`, `bigquery`, `spanner` (not `dynamodb` or
+`databricks`). The SQL sinks require
 column-mapping mode (`auto_map` / `auto_columns`) — a single JSON payload column
 has no columns to predicate on.
 
@@ -335,6 +338,7 @@ types you add after the first run survive every refresh. With
 | `mongodb` | load a `{collection}__faucet_ovw` staging collection, then atomic `renameCollection(dropTarget: true)` (needs the rename privilege; unsupported on sharded collections) |
 | `bigquery` | **bucket-free** — load a `LIKE` temp table via the query API, then `BEGIN TRANSACTION; TRUNCATE; INSERT … SELECT; COMMIT` (preserves the target's partitioning/clustering); no GCS staging bucket required |
 | `elasticsearch` | index into a fresh physical index `{index}-faucet-ovw-…` (mappings copied from the current target), then an atomic `POST /_aliases` swap repoints the read alias and the old index is dropped |
+| `databricks` | load a `CREATE TABLE … LIKE` staging Delta table, then one atomic `INSERT OVERWRITE target SELECT * FROM staging` + `DROP` (a first run renames staging into place) |
 
 **Elasticsearch requires `index` to be an alias** (not a concrete index): the
 overwrite swaps the alias atomically, so a reader never sees a half-replaced

@@ -131,10 +131,11 @@ Not every sink can evolve, and a schemaless sink has no schema to diverge from.
 | `elasticsearch` | ✅ | ✅ (add fields only) |
 | `spanner` | ✅ | ✅ (add + NOT NULL relax; no base-type widening) |
 | `iceberg` | ✅ | ✅ (add columns only) |
-| `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet` | — (inert) | — |
+| `databricks` | ✅ | ✅ (add columns, numeric widening to `DOUBLE`, NOT NULL relax) |
+| `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet`, `dynamodb` | — (inert) | — |
 
-- **Evolvable** (eight sinks): postgres, mysql, mssql, sqlite, bigquery,
-  elasticsearch, spanner, iceberg. They implement in-place additive DDL.
+- **Evolvable** (nine sinks): postgres, mysql, mssql, sqlite, bigquery,
+  elasticsearch, spanner, iceberg, databricks. They implement in-place additive DDL.
 - **Iceberg** adds new columns via iceberg-rust 0.10.0's `update_schema`
   action (issue #255). It is **additive-only**: `update_schema` exposes
   `add_column` but no in-place type promotion or nullability relaxation, so a
@@ -158,6 +159,11 @@ Not every sink can evolve, and a schemaless sink has no schema to diverge from.
   type (e.g. INT64→FLOAT64), so a base-type widening fails with guidance to set
   `allow_type_widening: false` (classifying it incompatible instead). DDL runs
   as a bounded long-running operation via the admin API.
+- **Databricks** — `ALTER TABLE … ADD COLUMNS` for new columns and `ALTER COLUMN
+  … DROP NOT NULL` for relaxation. A numeric widening from
+  `tinyint`/`smallint`/`int`/`float` to `DOUBLE` enables Delta type widening
+  (`delta.enableTypeWidening`) and alters the column in place; any other
+  widening fails with a typed error naming the column.
 
 ## Composition rules
 

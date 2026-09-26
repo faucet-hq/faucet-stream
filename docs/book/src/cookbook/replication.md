@@ -186,10 +186,23 @@ per-process and would lose the marker on restart, breaking resume). See the
 ### `pipeline.source` must be CDC, `pipeline.sink` should upsert
 
 The main pipeline source must be one of the capture-capable CDC connectors —
-`postgres-cdc`, `mysql-cdc`, or `mongodb-cdc` — and the snapshot source must be a
-**non-CDC** bulk reader (e.g. `postgres` / `mysql` / `mongodb` running a query).
-Both are checked at config-load time. The sink should use `write_mode: upsert`
-for a true mirror; an append sink validates with a warning (see above).
+`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`, or `dynamodb` in
+`mode: streams` — and the snapshot source must be a **non-CDC** bulk reader
+(e.g. `postgres` / `mysql` / `mongodb` running a query, or `dynamodb` in
+`mode: scan`). Both are checked at config-load time. The sink should use
+`write_mode: upsert` for a true mirror; an append sink validates with a warning
+(see above).
+
+### DynamoDB requires a keyed sink
+
+DynamoDB Streams has no replayable position to capture: `faucet mirror` anchors
+the CDC phase at every shard's trim horizon, so the change stream replays its
+whole retained window (up to 24 hours) over the snapshot. That converges only
+through keyed writes, so a `dynamodb` streams mirror **requires** the sink to use
+`write_mode: upsert` with a non-empty `key` (an append sink is rejected, not
+warned). Enable a `NEW_AND_OLD_IMAGES` stream on the table before
+the snapshot starts, and pair the source with a `cdc_unwrap` transform so the
+`__op` marker reaches the sink's `delete_marker`.
 
 ### Postgres requires a permanent slot
 

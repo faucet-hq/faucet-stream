@@ -89,6 +89,8 @@ listing, never a data scan.
 | `spanner` | base tables (default schema) | `INFORMATION_SCHEMA.COLUMNS` | — | `query` |
 | `s3` | common prefixes under the configured prefix (one delimiter listing; falls back to per-object entries) | — | — | `prefix` |
 | `gcs` | same as s3 | — | — | `prefix` (objects: `object_keys`) |
+| `iceberg` | tables in every catalog namespace (nested namespaces walked) | the table's current Iceberg schema | snapshot summary `total-records` | `table` |
+| `dynamodb` | tables (`ListTables`) | key attributes only (`DescribeTable` key schema — DynamoDB is schemaless beyond the key) | `ItemCount` | `table_name` |
 | `rest` + `odata:` | OData entity sets (from `$metadata` EDMX) | EDM property types | — | `odata.entity` |
 | `rest` + `discovery:` | whatever the recipe's listing endpoint returns | per-dataset describe request (optional) | — | `emit.config` (templated; + optional sink `table_id` / `sink_ref`) |
 
