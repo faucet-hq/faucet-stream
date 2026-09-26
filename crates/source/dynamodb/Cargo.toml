@@ -1,0 +1,23 @@
+[package]
+name = "faucet-source-dynamodb"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Amazon DynamoDB source (parallel scan, query, Streams CDC) for the faucet-stream ecosystem"
+readme = "README.md"
+keywords = ["dynamodb", "aws", "cdc", "source", "connector"]
+categories.workspace = true
+
+[dependencies]
+faucet-core.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

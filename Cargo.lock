@@ -4563,6 +4563,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-common-databricks"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
+]
+
+[[package]]
 name = "faucet-common-delta"
 version = "1.0.6"
 dependencies = [
@@ -4576,6 +4583,13 @@ dependencies = [
  "serde_json",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "faucet-common-dynamodb"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
 ]
 
 [[package]]
@@ -4603,6 +4617,13 @@ dependencies = [
  "tokio",
  "urlencoding",
  "wiremock",
+]
+
+[[package]]
+name = "faucet-common-iceberg"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
 ]
 
 [[package]]
@@ -4673,6 +4694,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "faucet-common-oracle"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
 ]
 
 [[package]]
@@ -4953,6 +4981,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-sink-databricks"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
+]
+
+[[package]]
 name = "faucet-sink-delta"
 version = "1.1.5"
 dependencies = [
@@ -4987,6 +5022,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "faucet-sink-dynamodb"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
 ]
 
 [[package]]
@@ -5219,6 +5261,13 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "faucet-sink-oracle"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
 ]
 
 [[package]]
@@ -5632,6 +5681,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-source-dynamodb"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
+]
+
+[[package]]
 name = "faucet-source-elasticsearch"
 version = "1.4.1"
 dependencies = [
@@ -5722,6 +5778,13 @@ dependencies = [
  "tonic 0.13.1",
  "tonic-build 0.13.1",
  "tracing",
+]
+
+[[package]]
+name = "faucet-source-iceberg"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
 ]
 
 [[package]]
@@ -5915,6 +5978,20 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "faucet-source-oracle"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
+]
+
+[[package]]
+name = "faucet-source-oracle-cdc"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
 ]
 
 [[package]]
