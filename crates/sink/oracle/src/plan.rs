@@ -155,9 +155,11 @@ pub(crate) fn clamp_fraction(s: &str) -> String {
 }
 
 /// Encode one record value as the text bound for a column of `kind`.
-/// `Ok(None)` binds SQL `NULL`; `Err` names why the value cannot be stored.
+/// `Ok(None)` binds SQL `NULL` — also for `""`, which Oracle stores as `NULL`
+/// anyway (and a zero-length `CLOB` bind is rejected); `Err` names why the
+/// value cannot be stored.
 pub(crate) fn value_to_text(v: &Value, kind: BindKind) -> Result<Option<String>, String> {
-    if v.is_null() {
+    if v.is_null() || v.as_str() == Some("") {
         return Ok(None);
     }
     let text = match (kind, v) {
@@ -358,12 +360,13 @@ pub(crate) fn ignoring(ddl: &str, codes: &[i32]) -> String {
     )
 }
 
-/// Oracle type for a planned column. Key text is bounded (`CLOB` cannot be
+/// Oracle type for a planned column. Doubles are IEEE `BINARY_DOUBLE` (a
+/// `NUMBER` cannot hold 1e300 or 1e-300); key text is bounded (`CLOB` cannot be
 /// indexed); other text is `CLOB` so no value is ever truncated.
 pub(crate) fn column_type(t: SqlBaseType, is_key: bool) -> &'static str {
     match t {
         SqlBaseType::Integer => "NUMBER(19)",
-        SqlBaseType::Double => "NUMBER",
+        SqlBaseType::Double => "BINARY_DOUBLE",
         SqlBaseType::Boolean => "NUMBER(1)",
         SqlBaseType::Text | SqlBaseType::Json if is_key => "VARCHAR2(1000 CHAR)",
         SqlBaseType::Text | SqlBaseType::Json => "CLOB",
@@ -692,6 +695,7 @@ mod tests {
         use BindKind::*;
         let t = |v: Value, k| value_to_text(&v, k);
         assert_eq!(t(Value::Null, Text), Ok(None));
+        assert_eq!(t(json!(""), Clob), Ok(None));
         assert_eq!(t(json!(true), Number), Ok(Some("1".into())));
         assert_eq!(t(json!(false), Number), Ok(Some("0".into())));
         assert_eq!(t(json!(12), Number), Ok(Some("12".into())));
@@ -793,10 +797,7 @@ mod tests {
         assert!(sql.contains("\"SKU\" VARCHAR2(1000 CHAR)"), "{sql}");
         assert!(sql.contains("\"QTY\" NUMBER(19)"), "{sql}");
         assert!(sql.contains("\"OK\" NUMBER(1)"), "{sql}");
-        assert!(
-            sql.contains("\"P\" NUMBER,") || sql.contains("\"P\" NUMBER)"),
-            "{sql}"
-        );
+        assert!(sql.contains("\"P\" BINARY_DOUBLE"), "{sql}");
         assert!(sql.contains("\"DOC\" CLOB"), "{sql}");
         assert!(sql.ends_with("PRIMARY KEY (\"SKU\"))"), "{sql}");
         let unkeyed = create_table_sql("\"T\"", &planned, &[]).unwrap();

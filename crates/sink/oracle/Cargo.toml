@@ -23,6 +23,7 @@ tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 faucet-conformance.workspace = true
+faucet-source-oracle.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 serde_json.workspace = true
 schemars.workspace = true

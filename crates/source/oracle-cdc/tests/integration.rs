@@ -79,13 +79,10 @@ async fn open_txn(conn: &OracleConnectionConfig, sql: &'static str) -> oracle::C
 
 #[tokio::test(flavor = "multi_thread")]
 async fn oracle_logminer_cdc_end_to_end() {
-    let t0 = std::time::Instant::now();
     let Some((container, conn)) = common::start_oracle().await else {
         return;
     };
-    eprintln!("container up after {:?}", t0.elapsed());
     common::enable_logminer(&container, &conn).await;
-    eprintln!("archivelog on after {:?}", t0.elapsed());
     common::exec(
         &conn,
         &[
@@ -121,6 +118,12 @@ async fn oracle_logminer_cdc_end_to_end() {
         .unwrap();
     assert_eq!(report.failed_count(), 0, "{report:?}");
 
+    assert!(source.config_schema()["properties"]["tables"].is_object());
+    assert!(
+        source.dataset_uri().ends_with("?tables=FAUCET.CDC_T"),
+        "{}",
+        source.dataset_uri()
+    );
     let anchor = source
         .capture_resume_position()
         .await
@@ -166,7 +169,6 @@ async fn oracle_logminer_cdc_end_to_end() {
 
     source.apply_start_bookmark(anchor.clone()).await.unwrap();
     let (records, bookmark, pages) = drain(&source).await;
-    eprintln!("first drain done after {:?}", t0.elapsed());
     assert_eq!(
         dml_ops(&records),
         vec!["i:1", "i:2", "u:1", "d:2", "i:3", "i:4"],
@@ -282,6 +284,44 @@ async fn oracle_logminer_cdc_end_to_end() {
     let (records, bookmark, _) = drain(&fresh).await;
     assert!(records.is_empty(), "{records:#?}");
     assert!(bookmark.is_some());
+
+    // Mining from the CDB root registers the log files itself (non-PDB path).
+    let out = common::sysdba(
+        &container,
+        "CREATE USER C##CDC IDENTIFIED BY cdcpw CONTAINER=ALL;
+GRANT CREATE SESSION, CREATE TABLE, UNLIMITED TABLESPACE, LOGMINING, SELECT ANY TRANSACTION, SELECT_CATALOG_ROLE, EXECUTE_CATALOG_ROLE TO C##CDC CONTAINER=ALL;",
+    )
+    .await;
+    assert!(out.contains("Grant succeeded"), "{out}");
+    let root =
+        OracleConnectionConfig::new("127.0.0.1", conn.port.unwrap(), "FREE", "C##CDC", "cdcpw");
+    common::exec(
+        &root,
+        &[
+            "CREATE TABLE RT (ID NUMBER PRIMARY KEY, V VARCHAR2(10))",
+            "ALTER TABLE RT ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS",
+        ],
+    )
+    .await;
+    let mut root_cfg = cfg(&root);
+    root_cfg.tables = vec!["C##CDC.RT".into()];
+    let root_src = OracleCdcSource::new(root_cfg).await.expect("root source");
+    let anchor = root_src.capture_resume_position().await.unwrap().unwrap();
+    common::exec(
+        &root,
+        &[
+            "INSERT INTO RT VALUES (1, 'r')",
+            "UPDATE RT SET V = 's' WHERE ID = 1",
+        ],
+    )
+    .await;
+    root_src.apply_start_bookmark(anchor).await.unwrap();
+    let (records, _, _) = drain(&root_src).await;
+    let ops: Vec<String> = records
+        .iter()
+        .map(|r| format!("{}:{}", r["op"].as_str().unwrap(), r["after"]["V"]))
+        .collect();
+    assert_eq!(ops, vec!["i:\"s\""], "{records:#?}");
 
     // Misconfiguration is reported up front.
     let missing = OracleCdcSource::new(OracleCdcSourceConfig {

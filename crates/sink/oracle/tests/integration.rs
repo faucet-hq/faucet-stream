@@ -57,6 +57,8 @@ async fn oracle_sink_end_to_end() {
     let flags = common::query_strings(&conn, "SELECT TO_CHAR(OK) FROM EVENTS ORDER BY ID").await;
     assert_eq!(flags, vec![Some("1".into()), None]);
     assert_eq!(sink.write_batch(&[]).await.unwrap(), 0);
+    assert!(sink.write_batch_partial(&[]).await.unwrap().is_empty());
+    assert!(sink.config_schema()["properties"]["table"].is_object());
     assert_eq!(sink.connector_name(), "oracle");
     assert!(sink.dataset_uri().ends_with("?table=EVENTS"));
 

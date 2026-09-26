@@ -170,31 +170,6 @@ impl OracleSource {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn query_error_hints_native_json() {
-        let e = query_error("DPI-xxxx: unsupported Oracle type JSON");
-        assert!(e.to_string().contains("JSON_SERIALIZE"), "{e}");
-        let e = query_error("ORA-00942: table or view does not exist");
-        assert!(!e.to_string().contains("JSON_SERIALIZE"), "{e}");
-    }
-
-    #[test]
-    fn owned_binds_convert_to_driver_values() {
-        for b in [
-            OwnedBind::Null,
-            OwnedBind::Int(1),
-            OwnedBind::Float(1.5),
-            OwnedBind::Text("x".into()),
-        ] {
-            let _ = as_tosql(&b);
-        }
-    }
-}
-
 #[async_trait]
 impl Source for OracleSource {
     async fn fetch_with_context(
@@ -398,5 +373,30 @@ impl Source for OracleSource {
         }
         *self.applied_shard.lock().expect("shard mutex") = bounds;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_error_hints_native_json() {
+        let e = query_error("DPI-xxxx: unsupported Oracle type JSON");
+        assert!(e.to_string().contains("JSON_SERIALIZE"), "{e}");
+        let e = query_error("ORA-00942: table or view does not exist");
+        assert!(!e.to_string().contains("JSON_SERIALIZE"), "{e}");
+    }
+
+    #[test]
+    fn owned_binds_convert_to_driver_values() {
+        for b in [
+            OwnedBind::Null,
+            OwnedBind::Int(1),
+            OwnedBind::Float(1.5),
+            OwnedBind::Text("x".into()),
+        ] {
+            let _ = as_tosql(&b);
+        }
     }
 }

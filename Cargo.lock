@@ -5315,6 +5315,7 @@ dependencies = [
  "faucet-common-oracle",
  "faucet-conformance",
  "faucet-core",
+ "faucet-source-oracle",
  "schemars 1.2.1",
  "serde",
  "serde_json",

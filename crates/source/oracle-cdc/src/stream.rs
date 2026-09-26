@@ -50,9 +50,13 @@ fn src_err(context: &str, e: &faucet_common_oracle::oracle::Error) -> FaucetErro
 
 /// A LogMiner start failure; a missing log (ORA-01291) is lost redo.
 fn start_error(e: &faucet_common_oracle::oracle::Error, from: u64, to: u64) -> FaucetError {
-    match faucet_common_oracle::ora_code(e) {
+    classify_start_error(faucet_common_oracle::ora_code(e), &e.to_string(), from, to)
+}
+
+fn classify_start_error(code: Option<i32>, message: &str, from: u64, to: u64) -> FaucetError {
+    match code {
         Some(1291) => FaucetError::Source(missing_redo_message(from, to)),
-        _ => src_err("start LogMiner", e),
+        _ => FaucetError::Source(format!("oracle start LogMiner: {message}")),
     }
 }
 
@@ -591,5 +595,15 @@ mod tests {
             vec!["A".to_string(), "T".to_string()]
         );
         assert!(missing_redo_message(1, 2).contains("SCN 1..=2"));
+        assert!(
+            classify_start_error(Some(1291), "x", 3, 4)
+                .to_string()
+                .contains("SCN 3..=4")
+        );
+        let other = classify_start_error(Some(1017), "ORA-01017", 3, 4).to_string();
+        assert!(
+            other.contains("ORA-01017") && !other.contains("ARCHIVELOG"),
+            "{other}"
+        );
     }
 }

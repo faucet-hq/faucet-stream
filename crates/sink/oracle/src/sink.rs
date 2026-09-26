@@ -416,10 +416,10 @@ impl Inner {
         let rows = conn
             .query_as::<String>(&token_select_sql(&self.token_table), &[&scope])
             .map_err(|e| sink_err("watermark read", &e))?;
-        for r in rows {
-            return Ok(Some(r.map_err(|e| sink_err("watermark read", &e))?));
-        }
-        Ok(None)
+        rows.into_iter()
+            .next()
+            .transpose()
+            .map_err(|e| sink_err("watermark read", &e))
     }
 
     fn write_token(&self, conn: &Connection, scope: &str, token: &str) -> Result<(), FaucetError> {

@@ -105,7 +105,7 @@ pub(crate) fn flush_sql(table: &str) -> String {
 /// Whether the session must register log files itself: a PDB mines per PDB
 /// (21c+), locating logs automatically; a non-CDB or the root does not.
 pub(crate) fn needs_logfiles(cdb: &str, container: &str) -> bool {
-    !(cdb.eq_ignore_ascii_case("YES") && !container.eq_ignore_ascii_case("CDB$ROOT"))
+    !cdb.eq_ignore_ascii_case("YES") || container.eq_ignore_ascii_case("CDB$ROOT")
 }
 
 /// Database-level supplemental logging flags (`V$DATABASE`).

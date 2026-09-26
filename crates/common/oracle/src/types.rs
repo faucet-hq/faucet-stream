@@ -462,7 +462,7 @@ pub fn iso_to_oracle_interval(iso: &str, day_to_second: bool) -> Option<String> 
 /// Decode an even-length hex string.
 pub fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
     let t = text.trim();
-    if t.len() % 2 != 0 {
+    if !t.len().is_multiple_of(2) {
         return None;
     }
     (0..t.len())

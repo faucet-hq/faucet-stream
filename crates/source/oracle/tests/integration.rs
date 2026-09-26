@@ -127,6 +127,27 @@ async fn oracle_query_source_end_to_end() {
         3
     );
 
+    assert!(source.config_schema()["properties"]["query"].is_object());
+    assert!(
+        source.dataset_uri().starts_with("oracle://127.0.0.1:"),
+        "{}",
+        source.dataset_uri()
+    );
+    assert_eq!(
+        source.state_key(),
+        None,
+        "full replication keeps no bookmark"
+    );
+    let mut text_key = OracleSourceConfig::new(conn.clone(), "SELECT NAME FROM T_TYPES");
+    text_key.shard = Some(ShardConfig { key: "NAME".into() });
+    let err = OracleSource::new(text_key)
+        .await
+        .unwrap()
+        .enumerate_shards(2)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("integer-valued"), "{err}");
+
     // Discovery and the preflight probe.
     let ds = source.discover().await.expect("discover");
     let t = ds

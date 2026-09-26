@@ -128,3 +128,17 @@ pub async fn enable_logminer(
     )
     .await;
 }
+
+/// Run a SQL*Plus script as SYSDBA in the CDB root; returns its output.
+pub async fn sysdba(container: &ContainerAsync<GenericImage>, script: &str) -> String {
+    use testcontainers::core::ExecCommand;
+    let cmd = format!(
+        "printf '%s\\n' \"{}\" | sqlplus -s / as sysdba",
+        script.replace('"', "\\\"")
+    );
+    let mut out = container
+        .exec(ExecCommand::new(["bash", "-c", cmd.as_str()]))
+        .await
+        .expect("exec sqlplus");
+    String::from_utf8(out.stdout_to_vec().await.unwrap_or_default()).unwrap_or_default()
+}

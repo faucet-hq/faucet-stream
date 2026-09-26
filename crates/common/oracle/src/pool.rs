@@ -189,7 +189,9 @@ mod tests {
     #[tokio::test]
     async fn connect_pool_fails_cleanly_without_a_server() {
         let cfg = OracleConnectionConfig::new("127.0.0.1", 1, "NOPE", "u", "p");
-        let err = connect_pool(&cfg, 1).await.err().expect("must fail");
+        let Err(err) = connect_pool(&cfg, 1).await else {
+            panic!("must fail");
+        };
         assert!(matches!(err, FaucetError::Config(_)), "{err}");
     }
 }
