@@ -740,7 +740,7 @@ async function renderHealth(host, id) {
     r = await api(`/v1/status?template=${encodeURIComponent(id)}`);
   } catch (e) {
     host.innerHTML = `<div class="health-head"><h2 class="tpl-h2">Health</h2></div>
-      <p class="tpl-desc">Health is unavailable for the live version: ${escapeHtml(e.message)}</p>`;
+      <p class="tpl-desc">Health is unavailable for the live version — ${escapeHtml(String(e.message).split(" — ")[0])}.</p>`;
     return;
   }
   const rows = r.rows

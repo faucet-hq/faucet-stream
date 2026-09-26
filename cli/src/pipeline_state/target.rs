@@ -122,6 +122,16 @@ impl PipelineTarget {
                 dlq: node.dlq,
             });
         }
+        // `faucet mirror` runs the root as `cdc` after a one-time `snapshot`.
+        if cfg.replication.is_some()
+            && let Some(root) = rows.iter_mut().find(|r| r.role == RowRole::Root)
+        {
+            root.id = "cdc".to_string();
+            let mut snapshot = root.clone();
+            snapshot.id = "snapshot".to_string();
+            snapshot.atomic_watermark = false;
+            rows.push(snapshot);
+        }
         Ok(Self {
             pipeline: pipeline.to_string(),
             topology: false,
@@ -245,6 +255,26 @@ pipeline:
         assert_eq!(t.rows[0].role, RowRole::TopologySink);
         assert!(t.rows[1].overwrite);
         assert_eq!(t.rows[1].sink_kind, "sqlite");
+    }
+
+    #[test]
+    fn mirror_configs_name_their_rows_like_the_orchestrator() {
+        let cfg = parse(
+            r#"version: 1
+name: m
+pipeline:
+  source: { type: postgres-cdc, config: { connection_url: "postgres://u@h/d", slot_name: s, publication: p } }
+  sink: { type: jsonl, config: { path: out.jsonl } }
+  state: { type: file, config: { path: ./state } }
+mirror:
+  mode: snapshot_then_cdc
+  snapshot:
+    source: { type: postgres, config: { connection_url: "postgres://u@h/d", query: "SELECT 1" } }
+"#,
+        );
+        let t = PipelineTarget::resolve(&cfg, "m").unwrap();
+        let ids: Vec<_> = t.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["cdc", "snapshot"]);
     }
 
     #[test]

@@ -327,3 +327,44 @@ catalog: {{ url: "{catalog_url}" }}
         r.notes
     );
 }
+
+#[cfg(feature = "state-postgres")]
+#[tokio::test]
+async fn an_unreachable_state_backend_is_reported_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.csv"), "id\n1\n").unwrap();
+    let text = format!(
+        r#"version: 1
+name: down
+pipeline:
+  source: {{ type: csv, config: {{ path: {input} }} }}
+  sink: {{ type: jsonl, config: {{ path: {out} }} }}
+  state: {{ type: postgres, config: {{ url: "not-a-postgres-url" }} }}
+"#,
+        input = s(&dir.path().join("in.csv")),
+        out = s(&dir.path().join("out.jsonl")),
+    );
+    let cfg = dir.path().join("down.yaml");
+    std::fs::write(&cfg, &text).unwrap();
+    // The run itself fails on the state store; the markers are skipped, not fatal.
+    let summary = faucet_cli::run_from_yaml_str(&text).await.unwrap();
+    assert!(summary.had_failures());
+    let r = faucet_cli::commands::status::build(&args(&cfg))
+        .await
+        .unwrap();
+    assert_eq!(r.rows[0].health, Health::Unknown);
+    assert!(
+        r.state
+            .note
+            .as_deref()
+            .unwrap_or("")
+            .contains("unreachable"),
+        "{:?}",
+        r.state
+    );
+    let err = run(&["status", &s(&cfg)]).await.unwrap_err();
+    assert!(
+        matches!(err, CliError::StatusUnhealthy { code: 1, .. }),
+        "{err}"
+    );
+}

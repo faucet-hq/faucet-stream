@@ -430,11 +430,11 @@ pipeline:
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        409,
-        "{}",
-        resp.text().await.unwrap()
+    assert_eq!(resp.status().as_u16(), 409);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("is in flight"),
+        "the run history refused it: {body}"
     );
     // Status reports the run in flight.
     let report: Value = client

@@ -189,6 +189,9 @@ pub fn usage_options(
     crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
 }
 
+/// Run label naming the pipeline (`cfg.name`, else `serve`) a run belongs to.
+pub const LABEL_PIPELINE: &str = "pipeline";
+
 /// Wire enum mirroring `load::ConfigFormat` with serde rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -937,10 +940,20 @@ pub async fn submit(
     }
 
     let submitted_at = Utc::now();
+    // The pipeline a run belongs to, whatever the run is named — what
+    // `faucet status` / `/v1/state` look runs up by (#732, #735).
+    let mut labels = req.labels.clone();
+    labels.entry(LABEL_PIPELINE.to_string()).or_insert_with(|| {
+        loaded
+            .cfg
+            .name
+            .clone()
+            .unwrap_or_else(|| "serve".to_string())
+    });
     let mut rec = RunRecord::queued(
         run_id.clone(),
         req.name.clone(),
-        req.labels.clone(),
+        labels,
         req.idempotency_key.clone(),
         submitted_at,
     );

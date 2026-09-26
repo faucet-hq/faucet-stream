@@ -220,6 +220,45 @@ mod tests {
         })
     }
 
+    struct OneWrite {
+        inner: MemoryStateStore,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[faucet_core::async_trait]
+    impl StateStore for OneWrite {
+        async fn get(&self, k: &str) -> Result<Option<Value>, FaucetError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: &Value) -> Result<(), FaucetError> {
+            if self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                return Err(FaucetError::State("gone".into()));
+            }
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), FaucetError> {
+            self.inner.delete(k).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_renewal_keeps_the_run_going() {
+        let store: Arc<dyn StateStore> = Arc::new(OneWrite {
+            inner: MemoryStateStore::new(),
+            writes: Default::default(),
+        });
+        let g = acquire_every(Arc::clone(&store), "p::r", "r", Duration::from_millis(2))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(read(store.as_ref(), "p::r").await.unwrap().is_some());
+        g.release().await;
+    }
+
     #[tokio::test]
     async fn store_errors_never_fail_the_run() {
         assert!(

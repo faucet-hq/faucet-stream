@@ -37,6 +37,15 @@ pub fn from_records(records: &[RunRecord]) -> (Vec<HistoryRun>, Vec<String>) {
     (runs, active)
 }
 
+/// Whether a run record belongs to `pipeline`: its `pipeline` label (set by
+/// `faucet serve` on submit), else its run name.
+pub fn belongs_to(r: &RunRecord, pipeline: &str) -> bool {
+    match r.labels.get(crate::serve::runner::LABEL_PIPELINE) {
+        Some(p) => p == pipeline,
+        None => r.name.as_deref() == Some(pipeline),
+    }
+}
+
 /// Read the recent runs recorded under `pipeline`.
 pub async fn read(
     store: &dyn RunHistory,
@@ -44,13 +53,17 @@ pub async fn read(
 ) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
     let page = store
         .list(&ListFilter {
-            name: Some(pipeline.to_string()),
             limit: HISTORY_LIMIT,
             ..Default::default()
         })
         .await
         .map_err(|e| e.to_string())?;
-    Ok(from_records(&page.runs))
+    let mine: Vec<RunRecord> = page
+        .runs
+        .into_iter()
+        .filter(|r| belongs_to(r, pipeline))
+        .collect();
+    Ok(from_records(&mine))
 }
 
 #[cfg(test)]
@@ -100,6 +113,15 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].error.as_deref(), Some("boom"));
         assert_eq!(runs[1].run_id, "r1");
+    }
+
+    #[test]
+    fn runs_belong_by_label_then_name() {
+        let mut r = record("x", RunStatus::Completed, vec![]);
+        assert!(belongs_to(&r, "p"), "named p, no label");
+        r.labels.insert("pipeline".into(), "q".into());
+        assert!(!belongs_to(&r, "p"));
+        assert!(belongs_to(&r, "q"));
     }
 
     #[tokio::test]

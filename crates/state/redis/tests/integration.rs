@@ -151,9 +151,16 @@ async fn from_connection_and_namespace_isolation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_by_prefix_and_atomic_batch() {
     let (_container, url) = start_redis().await;
-    let store = RedisStateStore::connect(&url, "ns1")
-        .await
-        .expect("connect");
+    // The published port can lag the container's readiness on some hosts.
+    let mut store = None;
+    for _ in 0..50 {
+        if let Ok(s) = RedisStateStore::connect(&url, "ns1").await {
+            store = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let store = store.expect("connect");
     let other = RedisStateStore::connect(&url, "ns2")
         .await
         .expect("connect");

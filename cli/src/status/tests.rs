@@ -244,6 +244,16 @@ async fn children_aggregate_under_their_parent() {
     assert_eq!(a.children[0].failed, 1);
     assert_eq!(a.health, Health::Failed);
     assert!(render::render(&r).contains("children 'kid': 2 bookmark(s), 1 failed"));
+    // A child invocation in flight makes the children `running`.
+    let g = crate::pipeline_state::lease::acquire(Arc::clone(&store), "orders::kid::2", "c")
+        .await
+        .unwrap();
+    put_outcome(store.as_ref(), "orders::kid::1", vec![ev(1, None)]).await;
+    let r = assemble(&t, Ok(&s), &inputs(&auth)).await.unwrap();
+    assert_eq!(r.rows[0].children[0].worst, Health::Running);
+    g.release().await;
+    let r = assemble(&t, Ok(&s), &inputs(&auth)).await.unwrap();
+    assert_eq!(r.rows[0].children[0].worst, Health::Ok);
     let mut inp = inputs(&auth);
     inp.row = Some("kid");
     let r = assemble(&t, Ok(&s), &inp).await.unwrap();

@@ -105,7 +105,22 @@ pub fn classify(pipeline: &str, key: &str) -> Option<ClassifiedKey> {
             return Some(pipeline_level(KeyKind::BackfillMarker(join(&segs[1..]))));
         }
         "backfill" if segs.len() > 1 => {
-            return Some(pipeline_level(KeyKind::BackfillUnit(join(&segs[1..]))));
+            // A unit's own run markers hang off `{name}::backfill::{unit}`.
+            let (unit_end, kind) = match segs.last() {
+                Some(&STATUS_SUFFIX) if segs.len() > 2 => (segs.len() - 1, Some(KeyKind::Status)),
+                Some(&LEASE_SUFFIX) if segs.len() > 2 => (segs.len() - 1, Some(KeyKind::Lease)),
+                _ => (segs.len(), None),
+            };
+            let unit = join(&segs[1..unit_end]);
+            return Some(match kind {
+                Some(kind) => ClassifiedKey {
+                    key: key.to_string(),
+                    row: None,
+                    sub: Some(unit),
+                    kind,
+                },
+                None => pipeline_level(KeyKind::BackfillUnit(unit)),
+            });
         }
         _ => {}
     }
@@ -186,6 +201,13 @@ mod tests {
             c("orders::backfill::2026-09-01").kind,
             KeyKind::BackfillUnit("2026-09-01".into())
         );
+        let k = c("orders::backfill::u1::__status__");
+        assert_eq!(
+            (k.row, k.sub.as_deref(), k.kind),
+            (None, Some("u1"), KeyKind::Status)
+        );
+        let k = c("orders::backfill::u1::__lease__");
+        assert_eq!(k.kind, KeyKind::Lease);
         // A row literally named `backfill` with no unit is still a row.
         assert_eq!(c("orders::backfill").kind, KeyKind::Bookmark);
     }
