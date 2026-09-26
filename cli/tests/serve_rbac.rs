@@ -70,6 +70,9 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        vault_key: None,
+        vault_previous_key: Vec::new(),
+        connect_providers: None,
     }
 }
 

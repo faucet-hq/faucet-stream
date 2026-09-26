@@ -100,6 +100,29 @@ pub async fn require_auth(
         None => ctx.role == Role::Admin,
     };
 
+    // A tenant-scoped principal (#709) reaches only its own tenant's routes
+    // and the tenant-filtered reads; another tenant's route is a 404.
+    if allowed && let Some(scoped) = ctx.tenant.clone() {
+        match matched.as_deref().map(|mp| {
+            rbac::tenant_scope_decision(&method, mp, req.uri().path(), &scoped)
+        }) {
+            Some(rbac::TenantScopeDecision::Allow) => {}
+            Some(rbac::TenantScopeDecision::NotFound) => return Err(ServeError::NotFound),
+            Some(rbac::TenantScopeDecision::Deny) | None => {
+                let action = matched
+                    .as_deref()
+                    .map(|mp| rbac::audit_action(&method, mp))
+                    .unwrap_or("unknown");
+                audit::write(&state, &ctx, action, None, None, "denied").await;
+                return Err(ServeError::Forbidden(format!(
+                    "principal '{}' is confined to tenant '{scoped}' and may not perform \
+                     this action",
+                    ctx.principal
+                )));
+            }
+        }
+    }
+
     if !allowed {
         let action = matched
             .as_deref()

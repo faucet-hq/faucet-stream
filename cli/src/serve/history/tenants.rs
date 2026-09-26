@@ -211,9 +211,56 @@ pub struct TenantStateRef {
     pub spec: Option<String>,
 }
 
+/// Which tenants a fan-out or a scheduled trigger targets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum TenantSelector {
+    /// `"all"` — every tenant that is not suspended.
+    All(String),
+    /// Named tenants.
+    Named(Vec<String>),
+}
+
+impl TenantSelector {
+    /// Validate the selector's shape.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            TenantSelector::All(s) if s == "all" => Ok(()),
+            TenantSelector::All(s) => Err(format!(
+                "tenants must be \"all\" or a list of tenant ids (got \"{s}\")"
+            )),
+            TenantSelector::Named(ids) if ids.is_empty() => {
+                Err("tenants must name at least one tenant".into())
+            }
+            TenantSelector::Named(ids) => ids.iter().try_for_each(|id| validate_tenant_id(id)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_shapes_validate() {
+        let all: TenantSelector = serde_json::from_value(serde_json::json!("all")).unwrap();
+        assert!(all.validate().is_ok());
+        let named: TenantSelector = serde_json::from_value(serde_json::json!(["a", "b"])).unwrap();
+        assert!(named.validate().is_ok());
+        assert!(
+            TenantSelector::All("every".into())
+                .validate()
+                .unwrap_err()
+                .contains("\"all\"")
+        );
+        assert!(
+            TenantSelector::Named(vec![])
+                .validate()
+                .unwrap_err()
+                .contains("at least one")
+        );
+        assert!(TenantSelector::Named(vec!["Bad".into()]).validate().is_err());
+    }
 
     #[test]
     fn tenant_ids_are_slugs() {

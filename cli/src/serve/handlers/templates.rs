@@ -653,7 +653,7 @@ pub async fn deprecate_version(
 
 /// `POST /v1/templates/{id}/runs` request body. Everything after `params`/`env`
 /// mirrors `POST /v1/runs`, because the run is submitted through the same path.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TriggerBody {
     /// Values for the template's declared `params:`.
     #[serde(default)]

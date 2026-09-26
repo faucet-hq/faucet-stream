@@ -1714,6 +1714,19 @@ pub struct ServeArgs {
     /// `--auth-config` `approvals.expire_secs` does not say. Default 24h.
     #[arg(long, default_value_t = 86_400)]
     pub approval_expiry_secs: u64,
+    /// Key that seals tenant connection credentials at rest (#709,
+    /// AES-256-GCM). Prefer the env var (avoids `ps` leakage). Without it the
+    /// server refuses to store or open tenant connections.
+    #[arg(long, env = "FAUCET_VAULT_KEY", hide_env_values = true)]
+    pub vault_key: Option<String>,
+    /// A previous vault key, tried when opening credentials sealed before a
+    /// rotation (never used to seal). Repeatable.
+    #[arg(long = "vault-previous-key", value_name = "KEY")]
+    pub vault_previous_key: Vec<String>,
+    /// Hosted OAuth connect providers (#709): a YAML/JSON file of
+    /// authorization-code providers tenants can connect through.
+    #[arg(long, value_name = "PATH")]
+    pub connect_providers: Option<PathBuf>,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless

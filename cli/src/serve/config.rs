@@ -140,6 +140,27 @@ pub struct ServeConfig {
     pub require_approval: Vec<crate::serve::changes::ChangeKind>,
     /// Fallback expiry of a pending change request.
     pub approval_expiry: Duration,
+    /// The tenant connection vault key and its rotation predecessors (#709).
+    pub vault: Option<VaultKeys>,
+    /// Path to a `--connect-providers` file (#709).
+    pub connect_providers_path: Option<PathBuf>,
+}
+
+/// The vault key (`--vault-key`) and previous keys (`--vault-previous-key`).
+/// `Debug` never prints key material.
+#[derive(Clone)]
+pub struct VaultKeys {
+    pub key: String,
+    pub previous: Vec<String>,
+}
+
+impl std::fmt::Debug for VaultKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultKeys")
+            .field("key", &"***")
+            .field("previous", &format!("[{} keys]", self.previous.len()))
+            .finish()
+    }
 }
 
 fn default_max_concurrent() -> usize {
@@ -357,6 +378,17 @@ impl ServeConfig {
             callback_allow_hosts: args.callback_allow_host,
             require_approval,
             approval_expiry: Duration::from_secs(args.approval_expiry_secs),
+            vault: args.vault_key.filter(|k| !k.is_empty()).map(|key| {
+                crate::secrets::registry::register(&key);
+                for k in &args.vault_previous_key {
+                    crate::secrets::registry::register(k);
+                }
+                VaultKeys {
+                    key,
+                    previous: args.vault_previous_key.clone(),
+                }
+            }),
+            connect_providers_path: args.connect_providers,
         })
     }
 }
@@ -407,6 +439,9 @@ mod tests {
             mcp_allow_mutations: false,
             require_approval: Vec::new(),
             approval_expiry_secs: 86_400,
+            vault_key: None,
+            vault_previous_key: Vec::new(),
+            connect_providers: None,
         }
     }
 

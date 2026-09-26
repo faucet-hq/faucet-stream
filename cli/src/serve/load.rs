@@ -102,16 +102,25 @@ impl TenantScope {
     }
 
     /// Refuse a submission whose rows reference a connection that needs
-    /// re-authorization.
-    fn check_blocked(&self, nodes: &[ExpandedNode]) -> Result<(), ServeError> {
+    /// re-authorization, or a provider neither the tenant nor the config has.
+    fn check_refs(&self, cfg: &PipelineConfig, nodes: &[ExpandedNode]) -> Result<(), ServeError> {
         for node in nodes {
             for config in [&node.source.config, &node.sink.config] {
-                if let Some(name) = crate::auth_catalog::auth_ref(config)
-                    && let Some(why) = self.blocked.get(&name)
-                {
+                let Some(name) = crate::auth_catalog::auth_ref(config) else {
+                    continue;
+                };
+                if let Some(why) = self.blocked.get(&name) {
                     return Err(ServeError::Conflict(format!(
-                        "connection '{name}' of tenant '{}' needs re-authorization ({why});                          reconnect it before running",
+                        "connection '{name}' of tenant '{}' needs re-authorization ({why}); \
+                         reconnect it before running",
                         self.values.id
+                    )));
+                }
+                if !cfg.auth.as_ref().is_some_and(|a| a.contains_key(&name)) {
+                    return Err(ServeError::Conflict(format!(
+                        "tenant '{}' has no connection '{name}' (row '{}' references it); \
+                         create it with POST /v1/tenants/{}/connections or a connect flow",
+                        self.values.id, node.id, self.values.id
                     )));
                 }
             }
@@ -271,7 +280,7 @@ pub async fn load_submission_scoped(
     })?;
 
     if let Some(t) = &tenant {
-        t.check_blocked(&nodes)?;
+        t.check_refs(&cfg, &nodes)?;
     }
 
     Ok(LoadedSubmission { cfg, nodes, tenant })

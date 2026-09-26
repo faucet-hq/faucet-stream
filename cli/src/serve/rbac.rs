@@ -91,11 +91,21 @@ pub enum Permission {
     /// `reject`, #703) — operator+ to reach the route; the `approvals:`
     /// policy in `--auth-config` then decides per kind who counts.
     ChangeApprove,
+    /// Read tenants and their connections' state (`GET /v1/tenants*`,
+    /// `GET /v1/connect/providers`, #709) — viewer+. Credentials are never
+    /// returned.
+    TenantRead,
+    /// Create, update, suspend and delete tenants (#709) — admin-only:
+    /// deleting a tenant removes its runs, state and connections.
+    TenantAdmin,
+    /// Store, replace and delete a tenant's connections and start hosted
+    /// OAuth connect flows (#709) — operator+.
+    ConnectionManage,
 }
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 22] = [
+    pub const ALL: [Permission; 25] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -118,6 +128,9 @@ impl Permission {
         Permission::ChangeRead,
         Permission::ChangeRequest,
         Permission::ChangeApprove,
+        Permission::TenantRead,
+        Permission::TenantAdmin,
+        Permission::ConnectionManage,
     ];
 }
 
@@ -154,6 +167,7 @@ impl Role {
                         | Plan
                         | UsageRead
                         | ChangeRead
+                        | TenantRead
                 )
             }
             Role::Operator => {
@@ -177,6 +191,8 @@ impl Role {
                         | ChangeRead
                         | ChangeRequest
                         | ChangeApprove
+                        | TenantRead
+                        | ConnectionManage
                 )
             }
             Role::Admin => true,
@@ -531,11 +547,87 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::POST, "/v1/templates/{id}/publish") => Some(TemplateAdmin),
         (&Method::POST, "/v1/reload") => Some(Reload),
         (&Method::GET, "/v1/whoami") => Some(Identity),
+        // Tenants (#709). Reading is viewer+; connections and connect flows
+        // are operator+; the tenant lifecycle is admin-only; a tenant run or a
+        // fan-out starts runs, so `RunWrite`.
+        (&Method::GET, "/v1/tenants") => Some(TenantRead),
+        (&Method::POST, "/v1/tenants") => Some(TenantAdmin),
+        (&Method::GET, "/v1/tenants/{tenant}") => Some(TenantRead),
+        (&Method::PATCH, "/v1/tenants/{tenant}") => Some(TenantAdmin),
+        (&Method::DELETE, "/v1/tenants/{tenant}") => Some(TenantAdmin),
+        (&Method::GET, "/v1/tenants/{tenant}/connections") => Some(TenantRead),
+        (&Method::POST, "/v1/tenants/{tenant}/connections") => Some(ConnectionManage),
+        (&Method::GET, "/v1/tenants/{tenant}/connections/{name}") => Some(TenantRead),
+        (&Method::PUT, "/v1/tenants/{tenant}/connections/{name}") => Some(ConnectionManage),
+        (&Method::DELETE, "/v1/tenants/{tenant}/connections/{name}") => Some(ConnectionManage),
+        (&Method::POST, "/v1/tenants/{tenant}/connect/{provider}") => Some(ConnectionManage),
+        (&Method::POST, "/v1/tenants/{tenant}/runs") => Some(RunWrite),
+        (&Method::POST, "/v1/tenants/{tenant}/templates/{id}/runs") => Some(RunWrite),
+        (&Method::POST, "/v1/templates/{id}/fanout") => Some(RunWrite),
+        (&Method::GET, "/v1/connect/providers") => Some(TenantRead),
         // MCP endpoint (#420): baseline access needs only a read scope (Viewer+);
         // the mutating `run_pipeline` tool is separately gated on RunWrite inside
         // the handler.
         (&Method::POST, "/mcp") => Some(SchemaRead),
         _ => None,
+    }
+}
+
+/// What a tenant-scoped principal (#709) may do with a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantScopeDecision {
+    Allow,
+    /// A global or administrative route.
+    Deny,
+    /// Another tenant's route — answered as if it did not exist.
+    NotFound,
+}
+
+/// The tenant a `/v1/tenants/{tenant}/…` request path names.
+pub fn path_tenant(path: &str) -> Option<&str> {
+    path.strip_prefix("/v1/tenants/")?
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether a principal confined to `scoped` may make this request. Runs,
+/// change requests and usage are filtered or ownership-checked by their
+/// handlers; every global administrative route is denied.
+pub fn tenant_scope_decision(
+    method: &Method,
+    matched_path: &str,
+    path: &str,
+    scoped: &str,
+) -> TenantScopeDecision {
+    use TenantScopeDecision::*;
+    if matched_path.starts_with("/v1/tenants/{tenant}") {
+        if path_tenant(path) != Some(scoped) {
+            return NotFound;
+        }
+        return match (method, matched_path) {
+            (&Method::PATCH | &Method::DELETE, "/v1/tenants/{tenant}") => Deny,
+            _ => Allow,
+        };
+    }
+    match (method, matched_path) {
+        (_, "/v1/whoami")
+        | (_, "/v1/runs")
+        | (_, "/v1/runs/{id}")
+        | (_, "/v1/runs/{id}/cancel")
+        | (_, "/v1/runs/{id}/logs")
+        | (&Method::GET, "/v1/schemas")
+        | (&Method::GET, "/v1/schemas/{kind}/{name}")
+        | (&Method::GET, "/v1/templates")
+        | (&Method::GET, "/v1/templates/{id}")
+        | (_, "/v1/changes")
+        | (_, "/v1/changes/{id}")
+        | (_, "/v1/changes/{id}/approve")
+        | (_, "/v1/changes/{id}/reject")
+        | (&Method::GET, "/v1/usage")
+        | (&Method::GET, "/v1/tenants")
+        | (&Method::GET, "/v1/connect/providers") => Allow,
+        _ => Deny,
     }
 }
 
@@ -590,6 +682,21 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/templates/{id}/publish") => "template.publish",
         (&Method::POST, "/v1/reload") => "config.reload",
         (&Method::GET, "/v1/whoami") => "whoami",
+        (&Method::GET, "/v1/tenants") => "tenant.list",
+        (&Method::POST, "/v1/tenants") => "tenant.create",
+        (&Method::GET, "/v1/tenants/{tenant}") => "tenant.get",
+        (&Method::PATCH, "/v1/tenants/{tenant}") => "tenant.update",
+        (&Method::DELETE, "/v1/tenants/{tenant}") => "tenant.delete",
+        (&Method::GET, "/v1/tenants/{tenant}/connections") => "connection.list",
+        (&Method::POST, "/v1/tenants/{tenant}/connections") => "connection.upsert",
+        (&Method::GET, "/v1/tenants/{tenant}/connections/{name}") => "connection.get",
+        (&Method::PUT, "/v1/tenants/{tenant}/connections/{name}") => "connection.upsert",
+        (&Method::DELETE, "/v1/tenants/{tenant}/connections/{name}") => "connection.delete",
+        (&Method::POST, "/v1/tenants/{tenant}/connect/{provider}") => "connect.start",
+        (&Method::POST, "/v1/tenants/{tenant}/runs") => "run.submit",
+        (&Method::POST, "/v1/tenants/{tenant}/templates/{id}/runs") => "template.run",
+        (&Method::POST, "/v1/templates/{id}/fanout") => "template.fanout",
+        (&Method::GET, "/v1/connect/providers") => "connect.providers",
         (&Method::POST, "/mcp") => "mcp",
         _ => "unknown",
     }
@@ -604,7 +711,78 @@ mod tests {
             name: name.into(),
             token: token.into(),
             role,
+            tenant: None,
         }
+    }
+
+    #[test]
+    fn tenant_scoped_principals_reach_only_their_tenant() {
+        use TenantScopeDecision::*;
+        let d = |m: Method, mp: &str, p: &str| tenant_scope_decision(&m, mp, p, "acme");
+        assert_eq!(path_tenant("/v1/tenants/acme/runs"), Some("acme"));
+        assert_eq!(path_tenant("/v1/tenants/acme"), Some("acme"));
+        assert_eq!(path_tenant("/v1/tenants/"), None);
+        assert_eq!(path_tenant("/v1/runs"), None);
+        assert_eq!(
+            d(Method::POST, "/v1/tenants/{tenant}/runs", "/v1/tenants/acme/runs"),
+            Allow
+        );
+        assert_eq!(
+            d(Method::GET, "/v1/tenants/{tenant}", "/v1/tenants/acme"),
+            Allow
+        );
+        assert_eq!(
+            d(Method::POST, "/v1/tenants/{tenant}/runs", "/v1/tenants/other/runs"),
+            NotFound
+        );
+        assert_eq!(
+            d(Method::DELETE, "/v1/tenants/{tenant}", "/v1/tenants/acme"),
+            Deny
+        );
+        assert_eq!(
+            d(Method::PATCH, "/v1/tenants/{tenant}", "/v1/tenants/acme"),
+            Deny
+        );
+        assert_eq!(d(Method::POST, "/v1/runs", "/v1/runs"), Allow);
+        assert_eq!(d(Method::GET, "/v1/usage", "/v1/usage"), Allow);
+        assert_eq!(d(Method::GET, "/v1/templates/{id}", "/v1/templates/x"), Allow);
+        assert_eq!(d(Method::POST, "/v1/templates", "/v1/templates"), Deny);
+        assert_eq!(d(Method::POST, "/v1/tenants", "/v1/tenants"), Deny);
+        assert_eq!(d(Method::GET, "/v1/audit", "/v1/audit"), Deny);
+        assert_eq!(
+            d(Method::POST, "/v1/templates/{id}/fanout", "/v1/templates/x/fanout"),
+            Deny
+        );
+    }
+
+    #[test]
+    fn tenant_filters_and_visibility() {
+        let scoped = AuthContext {
+            principal: "p".into(),
+            role: Role::Operator,
+            source_ip: None,
+            tenant: Some("acme".into()),
+        };
+        assert_eq!(scoped.tenant_filter(None).unwrap(), Some("acme".into()));
+        assert_eq!(
+            scoped.tenant_filter(Some("acme".into())).unwrap(),
+            Some("acme".into())
+        );
+        assert!(scoped.tenant_filter(Some("other".into())).is_err());
+        assert!(scoped.sees_tenant(Some("acme")));
+        assert!(!scoped.sees_tenant(Some("other")));
+        assert!(!scoped.sees_tenant(None));
+        let global = AuthContext {
+            tenant: None,
+            ..scoped
+        };
+        assert_eq!(global.tenant_filter(None).unwrap(), None);
+        assert_eq!(
+            global.tenant_filter(Some("x".into())).unwrap(),
+            Some("x".into())
+        );
+        assert!(global.sees_tenant(None));
+        assert!(global.sees_tenant(Some("x")));
     }
 
     #[test]

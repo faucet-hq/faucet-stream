@@ -1810,6 +1810,7 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
         match state.history().finalize_owned(&rec).await {
             Ok(true) => {
                 metrics::record_run_finished(status, reason);
+                record_tenant_run(&rec);
                 // Only the instance that won the owner-fenced write fires the
                 // callback, so a reclaimed run cannot deliver twice (#481).
                 crate::serve::callback::fire(&rec).await;
@@ -1831,8 +1832,19 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
             );
         }
         metrics::record_run_finished(status, reason);
+        record_tenant_run(&rec);
         crate::serve::callback::fire(&rec).await;
     }
+}
+
+/// Count a finished tenant run (#709).
+fn record_tenant_run(rec: &RunRecord) {
+    #[cfg(feature = "tenants")]
+    if let Some(t) = &rec.tenant {
+        crate::serve::tenants::metrics::record_run(t, rec.status.as_str());
+    }
+    #[cfg(not(feature = "tenants"))]
+    let _ = rec;
 }
 
 /// Finalize a run that was cancelled / hit shutdown while still QUEUED (before
@@ -1976,6 +1988,8 @@ mod tests {
             callback_allow_hosts: Vec::new(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
+            vault: None,
+            connect_providers_path: None,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2065,6 +2079,8 @@ mod tests {
             callback_allow_hosts: Vec::new(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
+            vault: None,
+            connect_providers_path: None,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         let state = ServerState::new(
@@ -2144,6 +2160,8 @@ mod tests {
             callback_allow_hosts: Vec::new(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
+            vault: None,
+            connect_providers_path: None,
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
         ServerState::new(
@@ -2269,6 +2287,8 @@ mod tests {
             callback_allow_hosts: Vec::new(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
+            vault: None,
+            connect_providers_path: None,
         };
         // A backend that is degraded from startup (primary unreachable).
         let history = Arc::new(FallbackHistory::degraded_at_startup(
@@ -2372,6 +2392,8 @@ mod tests {
                 callback_allow_hosts: Vec::new(),
                 require_approval: Vec::new(),
                 approval_expiry: std::time::Duration::from_secs(86_400),
+                vault: None,
+                connect_providers_path: None,
             };
             ServerState::new(
                 &cfg,

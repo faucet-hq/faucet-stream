@@ -240,6 +240,9 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        vault_key: None,
+        vault_previous_key: Vec::new(),
+        connect_providers: None,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
