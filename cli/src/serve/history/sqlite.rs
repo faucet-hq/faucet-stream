@@ -285,6 +285,7 @@ mod shard_tests {
                 run_id: Some(format!("r-{id}")),
                 config_fingerprint: Some("fp".into()),
                 source_ip: Some("127.0.0.1".into()),
+                tenant: None,
                 result: result.into(),
             };
         h.record_audit(&entry("1", "alice", "run.submit", "ok", 3))

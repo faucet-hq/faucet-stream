@@ -18,6 +18,8 @@ const MAX_LIMIT: usize = 1000;
 pub struct AuditQuery {
     pub principal: Option<String>,
     pub action: Option<String>,
+    /// Only actions taken for this tenant (#709).
+    pub tenant: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
     pub limit: Option<usize>,
@@ -44,6 +46,7 @@ pub async fn list_audit(
 ) -> Result<Json<AuditListResponse>, ServeError> {
     let filter = AuditFilter {
         principal: query.principal,
+        tenant: query.tenant,
         action: query.action,
         since: query
             .since

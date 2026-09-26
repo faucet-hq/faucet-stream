@@ -3903,54 +3903,59 @@
       "description": "The lifecycle / health events a rule can subscribe to.",
       "oneOf": [
         {
+          "const": "run_failure",
           "description": "A pipeline run (or its final flush) failed.",
-          "type": "string",
-          "const": "run_failure"
+          "type": "string"
         },
         {
+          "const": "run_success",
           "description": "A pipeline run completed successfully.",
-          "type": "string",
-          "const": "run_success"
+          "type": "string"
         },
         {
+          "const": "sla_breach",
           "description": "A post-run SLA check was violated (staleness / min_rows / volume).",
-          "type": "string",
-          "const": "sla_breach"
+          "type": "string"
         },
         {
+          "const": "circuit_open",
           "description": "The resilience circuit breaker tripped open.",
-          "type": "string",
-          "const": "circuit_open"
+          "type": "string"
         },
         {
+          "const": "contract_abort",
           "description": "A data contract breach aborted the run (`on_breach: fail`).",
-          "type": "string",
-          "const": "contract_abort"
+          "type": "string"
         },
         {
+          "const": "dlq_threshold",
           "description": "A run routed rows to the dead-letter queue at/over the configured\nthreshold.",
-          "type": "string",
-          "const": "dlq_threshold"
+          "type": "string"
         },
         {
+          "const": "scheduler_stuck",
           "description": "The cron scheduler appears stuck (no heartbeat / consecutive-failure\nexit). Emitted by `faucet schedule`.",
-          "type": "string",
-          "const": "scheduler_stuck"
+          "type": "string"
         },
         {
+          "const": "profile_drift",
           "description": "A column's learned profile drifted from its baseline (#708), under\n`profiling.on_drift: notify` or `fail`. One event per finding.",
-          "type": "string",
-          "const": "profile_drift"
+          "type": "string"
         },
         {
+          "const": "change_requested",
           "description": "A change request was proposed and awaits approval (#703). Emitted\nthrough the proposed config's own `notifications:` block, so the\nchannels it names are the approvers'.",
-          "type": "string",
-          "const": "change_requested"
+          "type": "string"
         },
         {
+          "const": "budget_exceeded",
           "description": "A run crossed a `budget:` ceiling (#703) and was stopped.",
-          "type": "string",
-          "const": "budget_exceeded"
+          "type": "string"
+        },
+        {
+          "const": "connection_needs_reauth",
+          "description": "A tenant connection's grant was revoked and it needs re-authorization\n(#709). Emitted through the tenant's own `notifications:`.",
+          "type": "string"
         }
       ]
     },

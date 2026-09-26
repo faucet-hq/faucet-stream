@@ -56,6 +56,38 @@ type DiscoveredDims = Arc<Mutex<HashMap<String, crate::discovery_matrix::Dim>>>;
 type CollectedDims = Arc<Mutex<HashMap<String, crate::discovery_matrix::CollectedDim>>>;
 use tokio_util::sync::CancellationToken;
 
+/// Called with the store spec and key of every state key an invocation uses.
+pub type StateKeyHook = Arc<dyn Fn(&crate::config::StateStoreSpec, &str) + Send + Sync>;
+
+/// Where a run's state keys live (#709). A tenant run sets `namespace` to the
+/// tenant id so its keys read `{tenant}::{pipeline}::{row}`, and `on_key` so
+/// the server can delete exactly those keys when the tenant is deleted.
+#[derive(Clone, Default)]
+pub struct StateScope {
+    pub namespace: Option<String>,
+    pub on_key: Option<StateKeyHook>,
+}
+
+impl std::fmt::Debug for StateScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateScope")
+            .field("namespace", &self.namespace)
+            .field("on_key", &self.on_key.is_some())
+            .finish()
+    }
+}
+
+impl StateScope {
+    /// The first segments of every state key: `{namespace}::{pipeline}` or
+    /// just the pipeline name.
+    pub fn prefix(&self, pipeline_name: &str) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{ns}::{pipeline_name}"),
+            None => pipeline_name.to_string(),
+        }
+    }
+}
+
 /// Knobs passed to [`run_expanded`].
 pub struct ExecuteOptions {
     /// Pipeline name — used in log lines and as the first segment of every
@@ -94,6 +126,9 @@ pub struct ExecuteOptions {
     pub limit: Option<usize>,
     /// `--state-path PATH` — overrides the `file` state-store path.
     pub state_path_override: Option<PathBuf>,
+    /// Tenant state isolation (#709): prefixes every state key and reports
+    /// each key a run uses. Empty for every runtime but a tenant run.
+    pub state_scope: StateScope,
     /// Clustered Mode B (#230): narrow this run's single source to one shard
     /// before streaming, and suffix its state key with the shard id so resume is
     /// per-shard. `None` (the default) runs the whole source unchanged. Only set
@@ -595,7 +630,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             match &node.role {
                 NodeRole::Root => {
                     let uses_state = node.state.is_some() || opts.state_path_override.is_some();
-                    let state_key = build_state_key(&opts.pipeline_name, &node.id, None);
+                    let state_key = build_state_key(
+                        &opts.state_scope.prefix(&opts.pipeline_name),
+                        &node.id,
+                        None,
+                    );
                     validate_unit_state_key(&node.id, uses_state, &state_key)?;
                     units.push(Unit {
                         node: node.clone(),
@@ -610,7 +649,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         // One-level discovery (#501): one invocation; run_unit
                         // intercepts it to enumerate the dimension. State is
                         // unused, so the key is a placeholder.
-                        let state_key = build_state_key(&opts.pipeline_name, &node.id, None);
+                        let state_key = build_state_key(
+                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            &node.id,
+                            None,
+                        );
                         units.push(Unit {
                             node: node.clone(),
                             parent_record: None,
@@ -631,8 +674,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         for ctx in crate::discovery_matrix::cartesian(&resolved) {
                             let suffix =
                                 crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                            let state_key =
-                                build_state_key(&opts.pipeline_name, &node.id, Some(&suffix));
+                            let state_key = build_state_key(
+                                &opts.state_scope.prefix(&opts.pipeline_name),
+                                &node.id,
+                                Some(&suffix),
+                            );
                             units.push(Unit {
                                 node: node.clone(),
                                 parent_record: None,
@@ -674,8 +720,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         crate::discovery_matrix::inject_collected(&mut ctx, &collected_dims);
                         let suffix =
                             crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                        let state_key =
-                            build_state_key(&opts.pipeline_name, &node.id, Some(&suffix));
+                        let state_key = build_state_key(
+                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            &node.id,
+                            Some(&suffix),
+                        );
                         validate_unit_state_key(&node.id, uses_state, &state_key)?;
                         if !seen_keys.insert(state_key.clone()) {
                             return Err(CliError::DuplicateStateKey {
@@ -713,8 +762,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             .as_ref()
                             .map(value_to_string_brief)
                             .unwrap_or_else(|| "(missing)".to_string());
-                        let state_key =
-                            build_state_key(&opts.pipeline_name, &node.id, Some(&pk_string));
+                        let state_key = build_state_key(
+                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            &node.id,
+                            Some(&pk_string),
+                        );
                         validate_unit_state_key(&node.id, uses_state, &state_key)?;
                         if !seen_keys.insert(state_key.clone()) {
                             return Err(CliError::DuplicateStateKey {
@@ -1350,7 +1402,7 @@ async fn build_usage_record(
     };
     #[cfg(not(feature = "catalog"))]
     let (dataset_id, dataset_uri) = (None, sink_dataset_uri.map(str::to_owned));
-    let record = crate::usage::build_record(
+    let mut record = crate::usage::build_record(
         crate::usage::RecordIdentity {
             run_id,
             pipeline: &opts.pipeline_name,
@@ -1366,6 +1418,7 @@ async fn build_usage_record(
         &opts.usage.pricing,
         chrono::Utc::now(),
     );
+    record.tenant = opts.state_scope.namespace.clone();
     crate::usage::metrics::record(&record);
     #[cfg(feature = "catalog")]
     if let Some(handle) = &opts.catalog
@@ -1941,6 +1994,8 @@ async fn run_one_invocation(
     // connector (#282).
     reject_unresolved_backfill_tokens(&source_cfg, "source")?;
     reject_unresolved_backfill_tokens(&sink_cfg, "sink")?;
+    crate::tenant_tokens::reject_unbound(&source_cfg, "source")?;
+    crate::tenant_tokens::reject_unbound(&sink_cfg, "sink")?;
 
     // Rollback (#706): a real root run of an undo-capable sink is journaled.
     // The sink gets its per-run settings through its flattened `WriteSpec`;
@@ -2196,6 +2251,12 @@ async fn run_one_invocation(
         Some(shard) => format!("{state_key}::{}", shard.id),
         None => state_key.to_owned(),
     };
+    if let (Some(hook), Some(spec), Some(_)) = (&opts.state_scope.on_key, &node.state, &state)
+        && !opts.dry_run
+        && opts.limit.is_none()
+    {
+        hook(spec, &effective_state_key);
+    }
     // Rollback (#706): record what the bookmark and watermark were before this
     // run writes, so undoing it can rewind them. Never fails the run — a run
     // whose marker could not be written is simply not undoable.
@@ -3741,6 +3802,7 @@ mod tests {
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -3786,6 +3848,7 @@ mod tests {
             dry_run: false,
             limit: None,
             state_path_override: None,
+            state_scope: Default::default(),
             shard: None,
             auth: Default::default(),
             clock: chrono::Utc::now().fixed_offset(),
@@ -4293,6 +4356,7 @@ matrix:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -4362,6 +4426,7 @@ matrix:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -4596,6 +4661,7 @@ execution:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -4690,6 +4756,7 @@ pipeline:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -4758,6 +4825,7 @@ matrix:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -4835,6 +4903,7 @@ execution:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -4913,6 +4982,7 @@ matrix:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),
@@ -5200,6 +5270,7 @@ matrix:
             dry_run: false,
             limit: None,
             state_path_override: None,
+            state_scope: Default::default(),
             shard: None,
             auth: Default::default(),
             clock: chrono::Utc::now().fixed_offset(),
@@ -5776,6 +5847,13 @@ matrix:
     fn build_state_key_with_and_without_parent() {
         assert_eq!(build_state_key("pipe", "row", None), "pipe::row");
         assert_eq!(build_state_key("pipe", "row", Some("k")), "pipe::row::k");
+        let scope = StateScope {
+            namespace: Some("acme".into()),
+            on_key: None,
+        };
+        assert_eq!(scope.prefix("pipe"), "acme::pipe");
+        assert_eq!(StateScope::default().prefix("pipe"), "pipe");
+        assert!(format!("{scope:?}").contains("acme"));
     }
 
     #[test]
@@ -5908,6 +5986,7 @@ matrix:
                 dry_run: false,
                 limit: None,
                 state_path_override: None,
+                state_scope: Default::default(),
                 shard: None,
                 auth: Default::default(),
                 clock: chrono::Utc::now().fixed_offset(),

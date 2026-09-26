@@ -19,6 +19,8 @@ pub mod webhook;
 pub mod object_arrival;
 #[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
 pub mod queue_depth;
+#[cfg(feature = "schedule")]
+pub mod schedule;
 
 use crate::error::{CliError, CliResult};
 use crate::serve::state::ServerState;
@@ -84,12 +86,13 @@ pub async fn load_triggers(path: &std::path::Path) -> CliResult<CompiledTriggers
     // the process CWD, consistent with `!include`/`extends` path semantics.
     if let Some(base_dir) = path.parent() {
         for trigger in &mut file.triggers {
-            if let spec::PipelineRef::Path(ref p) = trigger.config {
+            if let Some(spec::PipelineRef::Path(ref p)) = trigger.config {
                 let p_path = std::path::Path::new(p);
                 if p_path.is_relative() {
                     let resolved = base_dir.join(p_path);
-                    trigger.config =
-                        spec::PipelineRef::Path(resolved.to_string_lossy().into_owned());
+                    trigger.config = Some(spec::PipelineRef::Path(
+                        resolved.to_string_lossy().into_owned(),
+                    ));
                 }
             }
         }
@@ -108,7 +111,8 @@ pub fn spawn_watchers(
         not(any(
             feature = "triggers-object-store",
             feature = "triggers-redis",
-            feature = "triggers-kafka"
+            feature = "triggers-kafka",
+            feature = "schedule"
         )),
         allow(unused_variables)
     )]
@@ -118,7 +122,8 @@ pub fn spawn_watchers(
         not(any(
             feature = "triggers-object-store",
             feature = "triggers-redis",
-            feature = "triggers-kafka"
+            feature = "triggers-kafka",
+            feature = "schedule"
         )),
         allow(unused_mut)
     )]
@@ -127,7 +132,8 @@ pub fn spawn_watchers(
         not(any(
             feature = "triggers-object-store",
             feature = "triggers-redis",
-            feature = "triggers-kafka"
+            feature = "triggers-kafka",
+            feature = "schedule"
         )),
         allow(unused_variables)
     )]
@@ -207,6 +213,30 @@ pub fn spawn_watchers(
             spec::TriggerKind::ObjectArrival { .. } => {}
             #[cfg(not(any(feature = "triggers-redis", feature = "triggers-kafka")))]
             spec::TriggerKind::QueueDepth { .. } => {}
+            #[cfg(feature = "schedule")]
+            spec::TriggerKind::Schedule { cron, timezone } => {
+                match compiled::compile_schedule(t.name(), cron, timezone) {
+                    Ok(sched) => {
+                        let w = schedule::ScheduleWatcher::new(
+                            std::sync::Arc::new(t.clone()),
+                            sched,
+                            chrono::Utc::now(),
+                        );
+                        handles.push(tokio::spawn(watcher::run_supervised(
+                            w,
+                            state.clone(),
+                            health.clone(),
+                            shutdown.clone(),
+                        )));
+                        active += 1;
+                    }
+                    Err(e) => {
+                        tracing::error!(trigger = t.name(), error = %e, "invalid schedule; skipping watcher")
+                    }
+                }
+            }
+            #[cfg(not(feature = "schedule"))]
+            spec::TriggerKind::Schedule { .. } => {}
         }
     }
     metrics::active(active);
@@ -250,7 +280,7 @@ mod tests {
 
         // The compiled trigger's config path must be absolute (starts with base_dir).
         match &compiled.triggers[0].spec.config {
-            crate::serve::triggers::spec::PipelineRef::Path(p) => {
+            Some(crate::serve::triggers::spec::PipelineRef::Path(p)) => {
                 let abs = std::path::Path::new(p);
                 assert!(abs.is_absolute(), "expected absolute path, got: {p}");
                 assert!(

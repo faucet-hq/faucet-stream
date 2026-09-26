@@ -70,6 +70,9 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        vault_key: None,
+        vault_previous_key: Vec::new(),
+        connect_providers: None,
     }
 }
 
@@ -359,6 +362,24 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
     v.extend([
         (Method::POST, "/v1/templates/sync"),
         (Method::POST, "/v1/templates/{id}/publish"),
+    ]);
+    #[cfg(feature = "tenants")]
+    v.extend([
+        (Method::GET, "/v1/tenants"),
+        (Method::POST, "/v1/tenants"),
+        (Method::GET, "/v1/tenants/{tenant}"),
+        (Method::PATCH, "/v1/tenants/{tenant}"),
+        (Method::DELETE, "/v1/tenants/{tenant}"),
+        (Method::GET, "/v1/tenants/{tenant}/connections"),
+        (Method::POST, "/v1/tenants/{tenant}/connections"),
+        (Method::GET, "/v1/tenants/{tenant}/connections/{name}"),
+        (Method::PUT, "/v1/tenants/{tenant}/connections/{name}"),
+        (Method::DELETE, "/v1/tenants/{tenant}/connections/{name}"),
+        (Method::POST, "/v1/tenants/{tenant}/connect/{provider}"),
+        (Method::POST, "/v1/tenants/{tenant}/runs"),
+        (Method::POST, "/v1/tenants/{tenant}/templates/{id}/runs"),
+        (Method::POST, "/v1/templates/{id}/fanout"),
+        (Method::GET, "/v1/connect/providers"),
     ]);
     v
 }

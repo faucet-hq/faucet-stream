@@ -27,9 +27,9 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs` |
-| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, firing triggers, and deleting local sink outputs |
-| `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish) and `GET /v1/audit` |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
+| `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete) and `GET /v1/audit` |
 
 ```yaml
 # auth.yaml
@@ -57,6 +57,19 @@ approvals:
 ```
 
 With no rule for a kind: admins only, one approval, no self-approval.
+
+A principal may carry `tenant: <id>` to confine it to one tenant
+([embedded integrations](../cookbook/embedded-integrations.md)). It reaches
+only `/v1/tenants/<its id>/…`, its own runs, change requests and usage (lists
+are filtered; another tenant's run or route is a `404`, so existence does not
+leak), the schema catalog, template reads and `GET /v1/whoami`. Every global
+administrative route is a `403`, and a plain `POST /v1/runs` runs for its
+tenant.
+
+```yaml
+principals:
+  - { name: acme-backend, token: "${env:ACME_TOKEN}", role: operator, tenant: acme }
+```
 
 ### The read / write / admin token trio
 
@@ -111,6 +124,10 @@ someone does.
 | `GET /v1/changes`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
 | `POST /v1/changes` | — | ✓ | ✓ |
 | `POST /v1/changes/{id}/approve`, `/reject` | — | ✓¹ | ✓¹ |
+| `GET /v1/tenants`, `/v1/tenants/{tenant}`, `/v1/tenants/{tenant}/connections[/{name}]`, `GET /v1/connect/providers` | ✓ | ✓ | ✓ |
+| `POST /v1/tenants/{tenant}/connections`, `PUT`/`DELETE …/connections/{name}`, `POST …/connect/{provider}` | — | ✓ | ✓ |
+| `POST /v1/tenants/{tenant}/runs`, `…/templates/{id}/runs`, `POST /v1/templates/{id}/fanout` | — | ✓ | ✓ |
+| `POST /v1/tenants`, `PATCH`/`DELETE /v1/tenants/{tenant}` | — | — | ✓ |
 | `POST /mcp` | ✓ | ✓ | ✓ |
 | `GET /v1/audit` | — | — | ✓ |
 | `POST /v1/reload` | — | — | ✓ |
@@ -199,6 +216,16 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `GET` | `/v1/changes/{id}` | `200` | One change request with its plan — viewer / `ChangeRead` |
 | `POST` | `/v1/changes/{id}/approve` | `200` | Approve (`comment`); at quorum re-plans and executes, or marks it `invalidated` — `ChangeApprove`, then the `approvals:` policy |
 | `POST` | `/v1/changes/{id}/reject` | `200` | Reject with a `reason`; the requester may withdraw their own — `ChangeApprove`, then the policy |
+| `GET`/`POST` | `/v1/tenants` | `200`/`201` | List / create [tenants](../cookbook/embedded-integrations.md) (`tenants` feature) — viewer / `TenantRead`, admin / `TenantAdmin` |
+| `GET`/`PATCH`/`DELETE` | `/v1/tenants/{tenant}` | `200` | Read, update (`name`, `labels`, `limits`, `notifications`, `suspended`) or delete a tenant with everything faucet holds for it |
+| `GET`/`POST` | `/v1/tenants/{tenant}/connections` | `200`/`201` | List (never credentials) / store a sealed connection `{name, provider: {type, config}}` — operator / `ConnectionManage` |
+| `GET`/`PUT`/`DELETE` | `/v1/tenants/{tenant}/connections/{name}` | `200`/`204` | Read, replace (reconnect) or delete one connection |
+| `POST` | `/v1/tenants/{tenant}/connect/{provider}` | `200` | Start a hosted OAuth flow — `{connection, redirect}` → `{authorize_url, expires_at}` |
+| `GET` | `/v1/connect/callback` | `303` | OAuth redirect target (unauthenticated; the single-use `state` is the credential) |
+| `GET` | `/v1/connect/providers` | `200` | The `--connect-providers` providers |
+| `POST` | `/v1/tenants/{tenant}/runs` | `202` | A `POST /v1/runs` body, run as the tenant — operator / `RunWrite` |
+| `POST` | `/v1/tenants/{tenant}/templates/{id}/runs` | `202` | A template trigger, run as the tenant — operator / `RunWrite` |
+| `POST` | `/v1/templates/{id}/fanout` | `200` | Trigger a template once per tenant (`tenants: "all" \| [ids]`, `concurrency`) — operator / `RunWrite` |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |
@@ -390,10 +417,26 @@ self-approval); a request that is not `pending`, or a second approval by the
 same principal, is a `409`. Audited as `change.requested` / `approved` /
 `rejected` / `executed` / `invalidated` / `expired` / `failed`.
 
+### `/v1/tenants*` (multi-tenant embedded integrations)
+
+See the [embedded integrations cookbook](../cookbook/embedded-integrations.md).
+A run for a tenant resolves `auth: { ref }` against the tenant's connections
+first, binds `${tenant.id}` / `${tenant.name}` / `${tenant.labels.<key>}`,
+namespaces its state keys `{tenant}::{pipeline}::{row}`, carries `tenant` on
+its run record, usage, audit entries and change requests, and is held to the
+tenant's `limits` — `429` (`limit_exceeded`) at `max_concurrent_runs`; the
+per-run ceilings join the run's budget. A suspended tenant, or a row that
+references a missing connection or one that needs re-authorization, is a
+`409`. `GET /v1/runs`, `/v1/changes`, `/v1/usage` and `/v1/audit` accept
+`tenant=`; `GET /v1/usage?by=tenant` groups by it. Storing connections needs
+the server's `--vault-key`; without it those routes answer `503`. Audited as
+`tenant.*`, `connection.*` (`connection.needs_reauth` when a grant is revoked)
+and `connect.start` / `connect.complete`.
+
 ### `GET /v1/usage` (cost & usage)
 
 The [cost & usage report](../cookbook/usage.md) over every invocation this
-server has recorded, aggregated by `by=pipeline|row|dataset|sink|day`
+server has recorded, aggregated by `by=pipeline|row|dataset|sink|day|tenant`
 (default `pipeline`) within an optional half-open `since` / `until` window
 (RFC 3339 or `YYYY-MM-DD`) and an optional `pipeline`. `limit` caps the
 invocation records read (newest first, default 5000); `include_records=true`
@@ -886,5 +929,9 @@ Every error is a JSON `ApiError`:
 series: `faucet_serve_requests_total{method,path,status}`,
 `faucet_serve_request_duration_seconds{method,path}`, `faucet_serve_runs_queued`,
 `faucet_serve_runs_in_flight`, `faucet_serve_runs_total{status,reason}`,
-`faucet_serve_idempotency_hits_total`, and `faucet_serve_history_degraded`. See
+`faucet_serve_idempotency_hits_total`, and `faucet_serve_history_degraded`.
+With the `tenants` feature: `faucet_serve_tenant_runs_total{tenant,outcome}`,
+`faucet_serve_tenant_limit_rejections_total{tenant,limit}`,
+`faucet_serve_connections{status}` and
+`faucet_serve_connect_flows_total{provider,outcome}`. See
 [Observability](../operations/observability.md).

@@ -48,6 +48,7 @@ impl AuthMode {
                 principal: "anonymous".to_string(),
                 role: Role::Admin,
                 source_ip: None,
+                tenant: None,
             }),
             AuthMode::Token(expected) => bearer
                 .filter(|t| crate::serve::auth::constant_time_eq(t.as_bytes(), expected.as_bytes()))
@@ -55,6 +56,7 @@ impl AuthMode {
                     principal: "token".to_string(),
                     role: Role::Admin,
                     source_ip: None,
+                    tenant: None,
                 }),
             AuthMode::Rbac(cfg) => bearer.and_then(|t| cfg.authenticate(t)),
         }
@@ -138,6 +140,27 @@ pub struct ServeConfig {
     pub require_approval: Vec<crate::serve::changes::ChangeKind>,
     /// Fallback expiry of a pending change request.
     pub approval_expiry: Duration,
+    /// The tenant connection vault key and its rotation predecessors (#709).
+    pub vault: Option<VaultKeys>,
+    /// Path to a `--connect-providers` file (#709).
+    pub connect_providers_path: Option<PathBuf>,
+}
+
+/// The vault key (`--vault-key`) and previous keys (`--vault-previous-key`).
+/// `Debug` never prints key material.
+#[derive(Clone)]
+pub struct VaultKeys {
+    pub key: String,
+    pub previous: Vec<String>,
+}
+
+impl std::fmt::Debug for VaultKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultKeys")
+            .field("key", &"***")
+            .field("previous", &format!("[{} keys]", self.previous.len()))
+            .finish()
+    }
 }
 
 fn default_max_concurrent() -> usize {
@@ -355,6 +378,17 @@ impl ServeConfig {
             callback_allow_hosts: args.callback_allow_host,
             require_approval,
             approval_expiry: Duration::from_secs(args.approval_expiry_secs),
+            vault: args.vault_key.filter(|k| !k.is_empty()).map(|key| {
+                crate::secrets::registry::register(&key);
+                for k in &args.vault_previous_key {
+                    crate::secrets::registry::register(k);
+                }
+                VaultKeys {
+                    key,
+                    previous: args.vault_previous_key.clone(),
+                }
+            }),
+            connect_providers_path: args.connect_providers,
         })
     }
 }
@@ -363,6 +397,28 @@ impl ServeConfig {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    #[test]
+    fn vault_keys_parse_and_never_print() {
+        let mut a = base_args();
+        a.no_auth = true;
+        a.vault_key = Some("sekrit-vault-key".into());
+        a.vault_previous_key = vec!["old-key".into()];
+        a.connect_providers = Some("p.yaml".into());
+        let cfg = ServeConfig::from_args(a).unwrap();
+        let v = cfg.vault.as_ref().unwrap();
+        assert_eq!((v.key.as_str(), v.previous.len()), ("sekrit-vault-key", 1));
+        let dbg = format!("{v:?}");
+        assert!(!dbg.contains("sekrit") && dbg.contains("1 keys"), "{dbg}");
+        assert_eq!(
+            cfg.connect_providers_path.as_deref(),
+            Some(std::path::Path::new("p.yaml"))
+        );
+        let mut empty = base_args();
+        empty.no_auth = true;
+        empty.vault_key = Some(String::new());
+        assert!(ServeConfig::from_args(empty).unwrap().vault.is_none());
+    }
 
     fn base_args() -> crate::cli::ServeArgs {
         crate::cli::ServeArgs {
@@ -405,6 +461,9 @@ mod tests {
             mcp_allow_mutations: false,
             require_approval: Vec::new(),
             approval_expiry_secs: 86_400,
+            vault_key: None,
+            vault_previous_key: Vec::new(),
+            connect_providers: None,
         }
     }
 
@@ -454,6 +513,7 @@ mod tests {
             name: "bob".into(),
             token: "viewer-tok".into(),
             role: Role::Viewer,
+            tenant: None,
         }])
         .unwrap();
         let mode = AuthMode::Rbac(Arc::new(cfg));
@@ -488,6 +548,7 @@ mod tests {
             name: "x".into(),
             token: "supersecretrbac".into(),
             role: Role::Admin,
+            tenant: None,
         }])
         .unwrap();
         let s = format!("{:?}", AuthMode::Rbac(Arc::new(cfg)));

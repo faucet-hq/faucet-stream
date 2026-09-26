@@ -243,6 +243,8 @@ mod tests {
             callback_allow_hosts: Vec::new(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
+            vault: None,
+            connect_providers_path: None,
         };
         let h = ClusterHandle::from_config(&cfg);
         h.kick();

@@ -694,6 +694,7 @@ async fn run_repair(
             dry_run: inputs.dry_run,
             limit: None,
             state_path_override: None,
+            state_scope: Default::default(),
             shard: None,
             auth: inputs.auth.clone(),
             clock: inputs.clock,

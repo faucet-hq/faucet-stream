@@ -8,6 +8,7 @@ import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
 import { escapeHtml, fmtInt } from "../utils.js";
 import { fmtTime } from "./runs.js";
+import { withTenant } from "../tenant.js";
 
 const STATUSES = ["pending", "approved", "executed", "rejected", "invalidated", "expired", "failed"];
 
@@ -69,6 +70,7 @@ export async function renderChanges(container, params = {}) {
     list.innerHTML = `<tr><td colspan="6" class="empty">loading…</td></tr>`;
     const p = new URLSearchParams();
     if (status) p.set("status", status);
+    withTenant(p);
     let rows;
     try {
       rows = await api(`/v1/changes?${p}`);

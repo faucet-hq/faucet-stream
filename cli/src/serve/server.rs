@@ -33,7 +33,12 @@ pub fn build_router(
     // `/v1` routes guarded by the bearer middleware via `route_layer` (only runs
     // for matched routes; OPTIONS preflight is allowed through inside the layer).
     #[cfg_attr(
-        not(any(feature = "triggers", feature = "catalog", feature = "templates")),
+        not(any(
+            feature = "triggers",
+            feature = "catalog",
+            feature = "templates",
+            feature = "tenants"
+        )),
         allow(unused_mut)
     )]
     let mut api = Router::new()
@@ -146,6 +151,49 @@ pub fn build_router(
                 );
         }
     }
+    // Multi-tenant embedded integrations (#709).
+    #[cfg(feature = "tenants")]
+    {
+        use crate::serve::handlers::tenants;
+        api = api
+            .route(
+                "/v1/tenants",
+                post(tenants::create_tenant).get(tenants::list_tenants),
+            )
+            .route(
+                "/v1/tenants/{tenant}",
+                get(tenants::get_tenant)
+                    .patch(tenants::patch_tenant)
+                    .delete(tenants::delete_tenant),
+            )
+            .route(
+                "/v1/tenants/{tenant}/connections",
+                get(tenants::list_connections).post(tenants::create_connection),
+            )
+            .route(
+                "/v1/tenants/{tenant}/connections/{name}",
+                get(tenants::get_connection)
+                    .put(tenants::put_connection)
+                    .delete(tenants::delete_connection),
+            )
+            .route(
+                "/v1/tenants/{tenant}/connect/{provider}",
+                post(tenants::start_connect),
+            )
+            .route(
+                "/v1/tenants/{tenant}/runs",
+                post(tenants::submit_tenant_run),
+            )
+            .route(
+                "/v1/tenants/{tenant}/templates/{id}/runs",
+                post(tenants::trigger_tenant_template),
+            )
+            .route("/v1/templates/{id}/fanout", post(tenants::fanout_template))
+            .route(
+                "/v1/connect/providers",
+                get(tenants::list_connect_providers),
+            );
+    }
     // MCP endpoint (#420): mounted only with `--mcp`. Placed on `api` so it
     // inherits the bearer-auth + RBAC route-layer below; the per-request
     // mutation gate additionally requires the caller's `RunWrite` scope.
@@ -179,6 +227,14 @@ pub fn build_router(
             .collect();
         CorsLayer::new().allow_origin(AllowOrigin::list(origins))
     };
+
+    // The hosted-OAuth callback is public: the provider redirects a browser
+    // here, and the single-use `state` parameter is the credential (#709).
+    #[cfg(feature = "tenants")]
+    let public = public.route(
+        "/v1/connect/callback",
+        get(crate::serve::handlers::tenants::connect_callback),
+    );
 
     #[cfg_attr(not(feature = "serve-ui"), allow(unused_mut))]
     let mut router = public.merge(api);
@@ -564,6 +620,38 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         ));
     }
 
+    // Tenants (#709): the vault key and the hosted-OAuth providers, both
+    // validated before the listener opens.
+    #[cfg(feature = "tenants")]
+    let tenants_runtime = {
+        let vault = match &config.vault {
+            Some(v) => Some(
+                crate::serve::tenants::vault::Vault::new(&v.key, &v.previous)
+                    .map_err(CliError::Serve)?,
+            ),
+            None => None,
+        };
+        let providers = match &config.connect_providers_path {
+            Some(path) => crate::serve::tenants::connect::ConnectProviders::load(path)
+                .map_err(CliError::Serve)?,
+            None => Default::default(),
+        };
+        if vault.is_none() && !providers.names().is_empty() {
+            return Err(CliError::Serve(
+                "--connect-providers needs --vault-key (or FAUCET_VAULT_KEY): a connect \
+                 flow stores the tenant's grant sealed under it"
+                    .into(),
+            ));
+        }
+        crate::serve::tenants::TenantsRuntime::new(vault, providers)
+    };
+    #[cfg(not(feature = "tenants"))]
+    if config.vault.is_some() || config.connect_providers_path.is_some() {
+        return Err(CliError::Serve(
+            "--vault-key / --connect-providers require a build with the `tenants` feature".into(),
+        ));
+    }
+
     let shutdown = CancellationToken::new();
     let state = ServerState::new(
         &config,
@@ -579,6 +667,12 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     if let Some(p) = policy {
         tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
         state.set_policy(p);
+    }
+    #[cfg(feature = "tenants")]
+    {
+        crate::serve::tenants::metrics::describe();
+        state.set_tenants(tenants_runtime);
+        crate::serve::tenants::metrics::refresh_connection_gauges(&state).await;
     }
     // Attach the origins, pull each once so the registry is populated before
     // the listener opens, then start the periodic pulls. A network failure on

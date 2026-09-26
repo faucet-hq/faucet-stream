@@ -151,7 +151,9 @@ Three stages resolve placeholders:
   Secret-manager directives (see below) run as the final load-time stage.
 - **Trigger time:** `${param.NAME}` resolves against the top-level [`params:`](#params)
   block, bound from `--param` / an HTTP `params` object before the config is
-  parsed.
+  parsed. `${tenant.id}` / `${tenant.name}` / `${tenant.labels.KEY}` bind in a
+  run `faucet serve` starts for a [tenant](../cookbook/embedded-integrations.md)
+  (see below).
 - **Runtime:** `${row_id.dotted.path}` tokens are resolved per parent record in
   DAG runs. `${now.*}` tokens are resolved per invocation at run time (see
   below).
@@ -208,6 +210,22 @@ same semantics as `${row_id.path}` tokens. For SQL sources that interpolate
 `${now.*}` into a query string, prefer the connector's bind-parameter path
 (`substitute_context_bind_params`) over raw text substitution to avoid
 injection risk.
+
+### `${tenant.*}` — tenant values
+
+In a run started for a tenant (`POST /v1/tenants/{tenant}/runs`, a tenant
+template trigger, a fan-out, or a trigger with `tenants:`), `faucet serve`
+binds these anywhere in the document before it is loaded:
+
+| Token | Value |
+|-------|-------|
+| `${tenant.id}` | The tenant id |
+| `${tenant.name}` | The tenant's display name (its id when it has none) |
+| `${tenant.labels.<key>}` | One of the tenant's labels; a missing label is an error |
+
+Anywhere else — `faucet run`, a plain `POST /v1/runs` — a `${tenant.*}` token
+is refused with an error naming why, never passed to a connector as literal
+text. `tenant` is a reserved matrix row id.
 
 ### Secrets-manager directives
 

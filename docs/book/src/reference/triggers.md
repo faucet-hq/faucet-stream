@@ -22,17 +22,31 @@ triggers:
   - name: <string>          # unique; used in metrics, idempotency keys, webhook path
     enabled: true           # optional; default true — set false to disable without deleting
     config: <path|inline>   # pipeline config: a file path string OR an inline pipeline doc
+    template:               # …or a registered template instead of `config` (exactly one)
+      id: <template id>
+      version: stable       # optional: a number or a channel
+      params: {}            # optional; string values may use ${trigger.*}
+      sink: <sink template> # optional: for a source template
+      overlay: <overlay id> # optional deployment overlay
+    tenants: all            # optional: `all` or [tenant ids] — one run per tenant
     run:                    # optional run-shaping
       name: <template>      # run name; supports {name}, {object_key}, {bucket}, etc.
       labels: {}            # static labels merged with the auto-derived trigger labels
       timeout_secs: null    # per-run timeout in seconds
-    type: <trigger type>    # required; one of object_arrival, webhook, queue_depth
+    type: <trigger type>    # required; one of object_arrival, webhook, queue_depth, schedule
     # … type-specific fields below
 ```
 
 The `config:` field accepts either a **path string** (resolved **relative to the
 triggers file**, not the process CWD) or an **inline pipeline document**
-(`{ pipeline: … }`).
+(`{ pipeline: … }`). `template:` runs a registered
+[template](../cookbook/templates.md) instead (needs the `templates` feature).
+`tenants:` fans each fire out to one run per tenant, each run **as** that
+tenant — its connections, `${tenant.*}` values, state namespace and limits
+([embedded integrations](../cookbook/embedded-integrations.md); needs the
+`tenants` feature). Each tenant's idempotency key is the trigger's key
+suffixed `:<tenant>`; a tenant that is suspended, at its limit, or missing a
+connection is skipped and logged.
 
 The triggers file is **validated strictly at load time**: an unknown or
 misspelled field on a trigger entry (e.g. `debounce_sec` for `debounce_secs`) or
@@ -195,6 +209,35 @@ Redis requires the `triggers-redis` feature; Kafka requires `triggers-kafka`.
 **Idempotency key:** `trig:<name>:edge:<monotonic_edge_ordinal>` — the
 ordinal increments on each rising edge, producing a unique key per fire.
 
+### `schedule`
+
+Fires on a cron schedule, evaluated with the same compiler as
+[`faucet schedule`](../cookbook/scheduling.md) (5 or 6 fields,
+timezone- and DST-correct). Needs the `schedule` feature.
+
+```yaml
+type: schedule
+cron: "0 2 * * *"           # 5 fields, or 6 with seconds first
+timezone: Europe/Berlin     # IANA name; default UTC
+```
+
+A tick whose fire fails (queue full, a store error) is retried with the
+watcher's backoff until it commits; a server that was down across several
+ticks fires one catch-up run, not a backlog.
+
+**`${trigger.*}` tokens:**
+
+| Token | Value |
+|-------|-------|
+| `${trigger.name}` | The trigger's `name` field |
+| `${trigger.type}` | `schedule` |
+| `${trigger.fired_at}` | ISO 8601 timestamp when the trigger fired |
+| `${trigger.tick}` | The scheduled instant (RFC 3339, UTC) |
+
+**Idempotency key:** `trig:<name>:<tick>` (`…:<tick>:<tenant>` with
+`tenants:`) — derived from the scheduled tick, so every cluster instance
+computes the same key and one run goes through per tick.
+
 ## Labels on enqueued runs
 
 Every trigger-fired run receives these automatic labels (visible in
@@ -203,7 +246,8 @@ Every trigger-fired run receives these automatic labels (visible in
 | Label | Value |
 |-------|-------|
 | `faucet.trigger.name` | Trigger name |
-| `faucet.trigger.type` | Trigger type (`object_arrival`, `webhook`, `queue_depth`) |
+| `faucet.trigger.type` | Trigger type (`object_arrival`, `webhook`, `queue_depth`, `schedule`) |
+| `faucet.trigger.tick` | The scheduled tick (`schedule` only) |
 
 Additional labels can be added per trigger via `run.labels:`.
 
@@ -265,6 +309,9 @@ No additional coordination is required.
 | `triggers-object-store` | `object_arrival` watcher (S3/GCS listing) |
 | `triggers-redis` | `queue_depth` watcher backed by Redis |
 | `triggers-kafka` | `queue_depth` watcher backed by Kafka consumer-group lag |
+| `schedule` (with `triggers`) | the `schedule` trigger type |
+| `templates` (with `triggers`) | `template:` on a trigger |
+| `tenants` (with `triggers`) | `tenants:` on a trigger |
 
 All four are included in `full` and none are in `default`.
 

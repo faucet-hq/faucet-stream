@@ -98,6 +98,26 @@ const ROUTES_TEMPLATES_SYNC: &[(&str, &str)] = &[
     ("POST", "/v1/templates/{id}/publish"),
 ];
 
+#[cfg(feature = "tenants")]
+const ROUTES_TENANTS: &[(&str, &str)] = &[
+    ("GET", "/v1/tenants"),
+    ("POST", "/v1/tenants"),
+    ("GET", "/v1/tenants/{tenant}"),
+    ("PATCH", "/v1/tenants/{tenant}"),
+    ("DELETE", "/v1/tenants/{tenant}"),
+    ("GET", "/v1/tenants/{tenant}/connections"),
+    ("POST", "/v1/tenants/{tenant}/connections"),
+    ("GET", "/v1/tenants/{tenant}/connections/{name}"),
+    ("PUT", "/v1/tenants/{tenant}/connections/{name}"),
+    ("DELETE", "/v1/tenants/{tenant}/connections/{name}"),
+    ("POST", "/v1/tenants/{tenant}/connect/{provider}"),
+    ("POST", "/v1/tenants/{tenant}/runs"),
+    ("POST", "/v1/tenants/{tenant}/templates/{id}/runs"),
+    ("POST", "/v1/templates/{id}/fanout"),
+    ("GET", "/v1/connect/providers"),
+    ("GET", "/v1/connect/callback"),
+];
+
 /// Returns the full canonical route set for the current feature configuration.
 fn canonical_routes() -> BTreeSet<(String, String)> {
     #[allow(unused_mut)]
@@ -119,6 +139,10 @@ fn canonical_routes() -> BTreeSet<(String, String)> {
     }
     #[cfg(feature = "templates-sync")]
     for (m, p) in ROUTES_TEMPLATES_SYNC {
+        set.insert((m.to_string(), p.to_string()));
+    }
+    #[cfg(feature = "tenants")]
+    for (m, p) in ROUTES_TENANTS {
         set.insert((m.to_string(), p.to_string()));
     }
     set
@@ -148,6 +172,14 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         if path.starts_with("/v1/catalog")
             || path.starts_with("/v1/local-outputs")
             || path == "/v1/usage"
+        {
+            continue;
+        }
+        // …and the `tenants` feature's routes (#709).
+        #[cfg(not(feature = "tenants"))]
+        if path.starts_with("/v1/tenants")
+            || path.starts_with("/v1/connect/")
+            || path.ends_with("/fanout")
         {
             continue;
         }
@@ -240,6 +272,9 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        vault_key: None,
+        vault_previous_key: Vec::new(),
+        connect_providers: None,
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

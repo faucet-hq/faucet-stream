@@ -25,6 +25,8 @@ pub mod registry;
 pub mod runner;
 pub mod server;
 pub mod state;
+#[cfg(feature = "tenants")]
+pub mod tenants;
 #[cfg(test)]
 pub mod test_support;
 #[cfg(feature = "triggers")]

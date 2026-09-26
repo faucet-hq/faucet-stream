@@ -34,6 +34,12 @@ pub enum TriggerEvent {
         /// Rising-edge ordinal (so re-arm + re-cross → distinct run).
         edge: u64,
     },
+    /// A cron tick (#709).
+    Schedule {
+        /// The scheduled instant (RFC 3339) — not the wall-clock fire time,
+        /// so every cluster instance derives the same idempotency key.
+        tick: String,
+    },
 }
 
 impl TriggerEvent {
@@ -42,6 +48,7 @@ impl TriggerEvent {
             TriggerEvent::Object { .. } | TriggerEvent::ObjectBatch { .. } => "object_arrival",
             TriggerEvent::Webhook { .. } => "webhook",
             TriggerEvent::QueueDepth { .. } => "queue_depth",
+            TriggerEvent::Schedule { .. } => "schedule",
         }
     }
 
@@ -98,6 +105,10 @@ impl TriggerEvent {
                 "depth" => Some(depth.to_string()),
                 _ => None,
             },
+            TriggerEvent::Schedule { tick } => match token {
+                "tick" => Some(tick.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -112,6 +123,27 @@ pub fn substitute(
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
+    substitute_with(text, event, name, fired_at, yaml_escape)
+}
+
+/// [`substitute`] without YAML quoting — for a value that is not spliced
+/// into a document (a template param).
+pub fn substitute_plain(
+    text: &str,
+    event: &TriggerEvent,
+    name: &str,
+    fired_at: &str,
+) -> Result<String, String> {
+    substitute_with(text, event, name, fired_at, str::to_string)
+}
+
+fn substitute_with(
+    text: &str,
+    event: &TriggerEvent,
+    name: &str,
+    fired_at: &str,
+    escape: fn(&str) -> String,
+) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${trigger.") {
@@ -122,7 +154,7 @@ pub fn substitute(
         };
         let token = &after[8..end]; // after "trigger."
         match event.lookup(token, name, fired_at) {
-            Some(v) => out.push_str(&yaml_escape(&v)),
+            Some(v) => out.push_str(&escape(&v)),
             None => {
                 return Err(format!(
                     "unknown `${{trigger.{token}}}` token for {} trigger '{name}'",
@@ -162,6 +194,7 @@ pub fn idempotency_key(name: &str, event: &TriggerEvent) -> String {
         TriggerEvent::ObjectBatch { watermark, .. } => format!("trig:{name}:{watermark}"),
         TriggerEvent::Webhook { idem, .. } => idem.clone(),
         TriggerEvent::QueueDepth { edge, .. } => format!("trig:{name}:edge:{edge}"),
+        TriggerEvent::Schedule { tick } => format!("trig:{name}:{tick}"),
     }
 }
 
@@ -185,6 +218,9 @@ pub fn labels(name: &str, event: &TriggerEvent) -> BTreeMap<String, String> {
         }
         TriggerEvent::Webhook { method, .. } => {
             m.insert("faucet.trigger.method".into(), method.clone());
+        }
+        TriggerEvent::Schedule { tick } => {
+            m.insert("faucet.trigger.tick".into(), tick.clone());
         }
     }
     m
@@ -213,6 +249,28 @@ pub fn render_name(template: &str, event: &TriggerEvent, name: &str, fired_at: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_events_substitute_label_and_key_by_tick() {
+        let e = TriggerEvent::Schedule {
+            tick: "2026-09-26T02:00:00Z".into(),
+        };
+        assert_eq!(e.type_label(), "schedule");
+        assert_eq!(
+            substitute_plain("since=${trigger.tick}", &e, "n", "f").unwrap(),
+            "since=2026-09-26T02:00:00Z"
+        );
+        assert_eq!(
+            substitute("t: ${trigger.tick}", &e, "n", "f").unwrap(),
+            "t: \"2026-09-26T02:00:00Z\""
+        );
+        assert!(substitute_plain("${trigger.depth}", &e, "n", "f").is_err());
+        assert_eq!(idempotency_key("n", &e), "trig:n:2026-09-26T02:00:00Z");
+        assert_eq!(
+            labels("n", &e)["faucet.trigger.tick"],
+            "2026-09-26T02:00:00Z"
+        );
+    }
 
     fn obj() -> TriggerEvent {
         TriggerEvent::Object {

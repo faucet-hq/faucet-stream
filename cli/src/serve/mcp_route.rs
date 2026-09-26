@@ -89,6 +89,7 @@ mod tests {
             principal: "tester".into(),
             role,
             source_ip: None,
+            tenant: None,
         }
     }
 

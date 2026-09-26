@@ -44,6 +44,8 @@ pub enum ServeError {
     QueueFull {
         retry_after_secs: u64,
     },
+    /// 429 — a per-tenant limit refused the request (#709).
+    TooManyRequests(String),
     /// 503 — a required dependency is temporarily unavailable (e.g. idempotency
     /// can't be honored while the run-history backend is degraded).
     Unavailable(String),
@@ -60,6 +62,7 @@ impl ServeError {
             ServeError::Unprocessable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ServeError::Conflict(_) => StatusCode::CONFLICT,
             ServeError::QueueFull { .. } => StatusCode::TOO_MANY_REQUESTS,
+            ServeError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ServeError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -74,6 +77,7 @@ impl ServeError {
             ServeError::Unprocessable { .. } => "unprocessable",
             ServeError::Conflict(_) => "conflict",
             ServeError::QueueFull { .. } => "queue_full",
+            ServeError::TooManyRequests(_) => "limit_exceeded",
             ServeError::Unavailable(_) => "unavailable",
             ServeError::Internal(_) => "internal",
         }
@@ -88,6 +92,7 @@ impl ServeError {
             ServeError::Unprocessable { message, .. } => message.clone(),
             ServeError::Conflict(m) => m.clone(),
             ServeError::QueueFull { .. } => "run queue is full; retry later".into(),
+            ServeError::TooManyRequests(m) => m.clone(),
             ServeError::Unavailable(m) => m.clone(),
             ServeError::Internal(m) => m.clone(),
         }
@@ -196,6 +201,10 @@ mod tests {
             ServeError::Conflict("x".into()).status(),
             StatusCode::CONFLICT
         );
+        let limit = ServeError::TooManyRequests("tenant acme at its limit".into());
+        assert_eq!(limit.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limit.api_error().error.code, "limit_exceeded");
+        assert_eq!(limit.api_error().error.message, "tenant acme at its limit");
         assert_eq!(
             ServeError::QueueFull {
                 retry_after_secs: 5

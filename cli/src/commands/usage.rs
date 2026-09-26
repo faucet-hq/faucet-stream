@@ -31,7 +31,7 @@ pub fn report_currency(records: &[crate::usage::UsageRecord]) -> String {
 pub async fn run(args: UsageArgs) -> CliResult<()> {
     let by = GroupBy::parse(&args.by).ok_or_else(|| {
         CliError::Config(format!(
-            "--by `{}` is not one of pipeline, row, dataset, sink, day",
+            "--by `{}` is not one of pipeline, row, dataset, sink, day, tenant",
             args.by
         ))
     })?;
@@ -48,6 +48,7 @@ pub async fn run(args: UsageArgs) -> CliResult<()> {
             .map(parse_when)
             .transpose()
             .map_err(|e| CliError::Config(format!("--until: {e}")))?,
+        tenant: args.tenant.clone(),
         pipeline: args.pipeline.clone(),
         limit: args.limit,
     };
@@ -110,6 +111,7 @@ mod tests {
             since: since.map(str::to_string),
             until: Some("2099-01-01".into()),
             pipeline: None,
+            tenant: None,
             by: by.into(),
             limit: 10,
         };

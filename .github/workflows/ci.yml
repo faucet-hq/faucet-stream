@@ -456,6 +456,8 @@ jobs:
           # Template hosting + sync from remote origins (CLI-only; implies templates)
           - templates-sync
           - templates-sync-object-store
+          # Multi-tenant embedded integrations (CLI-only; implies serve, templates, encryption, notify)
+          - tenants
           # Remote Template Hub catalogs (CLI-only, #677)
           - hub-remote
           # Notification / incident routing (CLI-only)
@@ -495,7 +497,7 @@ jobs:
           # Secrets, schedule, serve, catalog, templates, and triggers features
           # live in faucet-cli (CLI layer), not in the faucet-stream umbrella
           # crate. Route accordingly.
-          if [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == templates* || "${{ matrix.feature }}" == "hub-remote" || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
+          if [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == templates* || "${{ matrix.feature }}" == "tenants" || "${{ matrix.feature }}" == "hub-remote" || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
             cargo check -p faucet-cli --no-default-features --features ${{ matrix.feature }}
           else
             cargo check -p faucet-stream --no-default-features --features ${{ matrix.feature }}
