@@ -33,6 +33,7 @@ cargo install faucet-cli --no-default-features \
 | `faucet verify <config> [--row R] [--repair] [--allow-delete] [--dry-run] [--json]` | Prove a destination matches its source **by content** (#701): rows matched on the sink's `key` (or `verify.key`), key ranges compared by digest — inside the database when both sides are the same SQL backend, so matching ranges ship no rows — bisected down to the differing keys (`missing_in_dest` / `extra_in_dest` / `changed` / `duplicate`). `--repair` re-syncs exactly those keys through the row's sink (`write_mode: upsert`; deletes only with `--allow-delete`). Exit code = differing keys. A top-level `verify:` block runs the same check after every run. |
 | `faucet profiling show\|reset <config> [--row R] [--column C] [--full] [--json]` | Inspect or re-baseline the learned column profiles a config's `profiling:` block keeps in its `state:` store (#708): `show` prints per root row the baseline depth, the latest run's per-column statistics and drift findings; `reset` forgets the history (or one column's) so the next `min_history` runs learn the new normal. |
 | `faucet rollback <config> --run <id> [--row R] [--dry-run] [--force]` · `--list` | Undo a run (#706): delete the rows it appended (by `_faucet_run_id`), restore the journaled before-images of the keys it upserted, or swap back the table it overwrote — then rewind the row's bookmark and exactly-once watermark so the next run re-reads what was undone. Needs a top-level `rollback:` block (journal + kept previous table + pre-run marker in a durable `state:`) on a postgres / sqlite / mysql column-mode sink. A key a later run changed is a conflict that blocks the rollback unless `--force`. `faucet run` prints each row's run id. |
+| `faucet usage [--since W] [--until W] [--by pipeline\|row\|dataset\|sink\|day] [--pipeline P] [--json]` · `faucet run --max-records N --max-bytes B --max-duration-secs S --allowed-sink X` | Cost & usage accounting (#704) and run budgets (#703). Every invocation is metered — records, estimated bytes, backend round trips, connector cost signals (BigQuery bytes billed, S3/GCS requests) — priced against the `usage:` rate table (shipped defaults = public list prices, all overridable) and compared to a per-row-priced hosted ELT equivalent; estimates are labelled as estimates and a connector that reports nothing is *compute not reported*, never zero. `faucet run` prints a usage line per row, `--output json` and serve run records carry the record, `faucet usage` / `GET /v1/usage` / the console's Usage page aggregate the `catalog:` store. A `budget:` block (or the run flags) puts hard ceilings on one invocation: the page that would cross `max_records` / `max_bytes` is refused whole (bookmark untouched), `max_duration_secs` cancels at the next page boundary, `allowed_sinks` refuses before anything runs. Requires the `catalog` build feature for `faucet usage`. |
 | `faucet list` | List every compiled-in source, sink, transform, and state-store backend, each with its conformance maturity tier. |
 | `faucet conformance [name] [--kind K] [--json] [--min-tier T]` | Score connectors against the SDK contract, print a scorecard + maturity tier (Stable/Experimental/Beta/Draft) and capability badges. `--min-tier` exits non-zero as an opt-in CI gate. |
 | `faucet preview <config> --limit N` | Run only the source side and emit the first N records to stdout as JSONL. |
@@ -428,6 +429,17 @@ tracks — and it is off by default because it returns file contents over HTTP.
 
 See the [web console guide](https://faucet-hq.github.io/faucet-stream/cookbook/web-console.html)
 for the full walkthrough.
+
+#### Change approvals (`--require-approval`)
+
+`POST /v1/changes` stores a proposed `run` / `template_register` /
+`template_launch` with its plan and runs it only once the approvers named by
+the `approvals:` block of `--auth-config` approve it (#703). faucet re-plans
+at approval and refuses to run a change whose plan moved underneath the
+approver (`invalidated`). `faucet serve --require-approval run` turns every
+`POST /v1/runs` and template trigger into a pending request; the MCP
+`propose_run` / `propose_template` tools let agents file requests. See the
+[approvals cookbook](../docs/book/src/cookbook/approvals.md).
 
 ### `faucet mcp` / `faucet serve --mcp`
 
@@ -1192,6 +1204,30 @@ Browse with `faucet catalog datasets|show|lineage`, `GET /v1/catalog/*` on
 `faucet serve`, or the web console's Datasets / Lineage views.
 `faucet schema catalog` prints the block's JSON Schema. Full model:
 [Data Movement Catalog](https://faucet-hq.github.io/faucet-stream/cookbook/catalog.html).
+
+### `usage:` / `budget:` (optional)
+
+Cost & usage accounting (#704) is always on — every invocation reports
+records, estimated bytes, backend round trips and connector cost signals,
+priced against the `usage:` rate table (shipped defaults = public list prices;
+override `currency`, `egress_per_gb`, `object_storage.*`, `warehouse.*`,
+`hosted_elt_per_million_rows` inline or via `pricing_file`). `faucet run`
+prints a usage line per row, `--output json` carries the record, and with a
+`catalog:` store `faucet usage --by pipeline|row|dataset|sink|day` aggregates
+across runs. A `budget:` block sets hard ceilings on one invocation
+(`max_records`, `max_bytes`, `max_duration_secs`, `allowed_sinks`, #703): the
+page that would cross a ceiling is refused whole and the run fails with
+`budget_exceeded`; `faucet run --max-records/--max-bytes/--max-duration-secs/
+--allowed-sink` merge with it (stricter wins). See the
+[usage cookbook](../docs/book/src/cookbook/usage.md).
+
+```yaml
+usage:
+  pricing: { currency: EUR, egress_per_gb: 0.09 }
+budget:
+  max_records: 1000000
+  allowed_sinks: [warehouse]
+```
 
 ### `params:` (optional)
 

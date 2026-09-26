@@ -45,6 +45,8 @@ pipeline:
         <label>timeout (s) <input id="o-timeout" type="number" /></label>
         <label><input id="o-doctor" type="checkbox" /> doctor first</label>
         <label>idempotency key <input id="o-idem" /></label>
+        <label data-perm="change_request"><input id="o-approval" type="checkbox" /> request approval</label>
+        <label data-perm="change_request">reason <input id="o-reason" placeholder="why — shown to approvers" /></label>
       </fieldset>
       <div class="submit-actions">
         <button id="btn-check" class="btn-ghost" data-perm="doctor">Check (doctor)</button>
@@ -253,6 +255,10 @@ pipeline:
     if (timeout) body.timeout_secs = Number(timeout);
     if (container.querySelector("#o-doctor").checked) body.doctor_first = true;
     if (idem) body.idempotency_key = idem;
+    const approval = container.querySelector("#o-approval");
+    if (approval && approval.checked) body.require_approval = true;
+    const reason = container.querySelector("#o-reason");
+    if (reason && reason.value.trim()) body.reason = reason.value.trim();
     return body;
   }
 
@@ -271,6 +277,13 @@ pipeline:
   container.querySelector("#btn-run").onclick = async () => {
     try {
       const resp = await api("/v1/runs", { method: "POST", body: requestBody() });
+      // Approval first (#703): the server (or the option) turned the run into
+      // a change request — go to it instead of a run.
+      if (resp.status === "pending_approval") {
+        toast(`change request ${resp.change_id} awaits approval`);
+        navigate(`#/changes/${resp.change_id}`);
+        return;
+      }
       toast(`run ${resp.run_id} ${resp.status}`);
       navigate(`#/runs/${resp.run_id}`);
     } catch (e) {

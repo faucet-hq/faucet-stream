@@ -3,6 +3,7 @@ pub mod audit;
 pub mod backfill;
 #[cfg(feature = "catalog")]
 pub mod catalog;
+pub mod changes;
 pub mod dlq;
 pub mod doctor;
 pub mod health;
@@ -17,5 +18,7 @@ pub mod runs;
 pub mod schemas;
 #[cfg(feature = "templates")]
 pub mod templates;
+#[cfg(feature = "catalog")]
+pub mod usage;
 pub mod verify;
 pub mod whoami;

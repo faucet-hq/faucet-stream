@@ -94,11 +94,22 @@ fn synth_event(kind: &str, pipeline: &str) -> CliResult<NotifyEvent> {
             "synthetic profile drift: null_rate 0.4 vs baseline mean 0",
         )
         .with_run(run()),
+        "change_requested" => NotifyEvent::change_requested(
+            pipeline,
+            "change-synthetic",
+            "run",
+            "synthetic-requester",
+            "synthetic change request",
+        ),
+        "budget_exceeded" => {
+            NotifyEvent::budget_exceeded(pipeline, "", "max_records", 1_000_000, 1_000_500)
+                .with_run(run())
+        }
         other => {
             return Err(CliError::Config(format!(
                 "unknown --event `{other}` (expected one of: run_failure, run_success, \
                  sla_breach, circuit_open, contract_abort, dlq_threshold, scheduler_stuck, \
-                 profile_drift)"
+                 profile_drift, change_requested, budget_exceeded)"
             )));
         }
     })
@@ -151,6 +162,7 @@ mod tests {
             "contract_abort",
             "dlq_threshold",
             "profile_drift",
+            "budget_exceeded",
         ] {
             let e = synth_event(kind, "p").unwrap();
             let run = e
@@ -165,5 +177,12 @@ mod tests {
         }
         // No owning invocation in production either — faithful null shape.
         assert!(synth_event("scheduler_stuck", "p").unwrap().run.is_none());
+    }
+
+    #[test]
+    fn synth_change_requested_names_the_synthetic_request() {
+        let e = synth_event("change_requested", "p").unwrap();
+        assert_eq!(e.kind, crate::notify::EventKind::ChangeRequested);
+        assert!(e.message.contains("synthetic change request"));
     }
 }

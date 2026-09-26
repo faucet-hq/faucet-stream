@@ -16,6 +16,7 @@
 pub mod adaptive;
 pub mod anomaly;
 pub mod auth;
+pub mod budget;
 pub mod check;
 pub mod cleanup;
 #[cfg(feature = "arrow")]
@@ -68,6 +69,7 @@ pub mod transform;
 pub mod transforming_source;
 #[cfg(feature = "transform-tree-flatten")]
 pub mod tree;
+pub mod usage;
 pub mod util;
 pub mod verify;
 pub mod window;
@@ -86,6 +88,7 @@ pub use auth::{
     AuthProvider, AuthReference, AuthSpec, Credential, CredentialPlacement, RequestAuth,
     SharedAuthProvider,
 };
+pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};
 pub use cleanup::{CleanupMode, CleanupPolicy, DEFAULT_MAX_KEYS, SeenKeys};
 #[cfg(feature = "arrow")]
@@ -210,6 +213,7 @@ pub use transform::{KeyCaseMode, KeyCollision};
 pub use transforming_source::TransformingSource;
 #[cfg(feature = "transform-tree-flatten")]
 pub use tree::{AncestorsSpec, ColumnsSpec, CompiledTreeFlatten, TreeFlattenSpec};
+pub use usage::{CostSignal, UsageMeter, UsageSide, UsageSnapshot, estimate_json_bytes};
 pub use util::redact_uri_credentials;
 pub use verify::{IntegrityCheck, LengthCheck, VerifyingReader};
 pub use window::{

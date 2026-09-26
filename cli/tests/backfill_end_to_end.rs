@@ -34,6 +34,7 @@ fn opts(range: BackfillRange) -> BackfillOptions {
         execution: None,
         auth: faucet_cli::auth_catalog::AuthCatalog::default(),
         resilience: None,
+        usage: Default::default(),
         range,
         // SQLite serializes writers at the file level, so parallel units
         // against one destination file would contend — run sequentially.

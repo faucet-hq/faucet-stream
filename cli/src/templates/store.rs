@@ -6,7 +6,7 @@
 
 use crate::error::{CliError, CliResult};
 use crate::hub::TemplateKind;
-use crate::params::{self, BindMode, SuppliedParams};
+use crate::params::{self, BindMode, ParamsSpec, SuppliedParams};
 use crate::serve::config::HistoryBackendSpec;
 use crate::serve::history::templates::{
     DeprecationRecord, TemplateDraft, TemplateId, TemplateRecord, TemplateState, TemplateStatus,
@@ -112,7 +112,20 @@ pub fn parse_body(body: &str, format: ConfigFormat) -> CliResult<Value> {
 /// constructing a single connector. Node arity in topology mode is validated
 /// when the graph is built, i.e. at trigger time, because building it requires
 /// live connectors that a placeholder-bound config must not create.
-pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<TemplateRecord> {
+/// What [`register`] establishes before it writes anything: the parsed
+/// document, its declared params, kind, derived id, and — for a complete
+/// pipeline — the validated config. [`preview_register`] (#703) exposes it
+/// without registering.
+struct Prelude {
+    doc: Value,
+    declared: ParamsSpec,
+    kind: TemplateKind,
+    name: Option<String>,
+    id: TemplateId,
+    pipeline: Option<crate::config::PipelineConfig>,
+}
+
+async fn register_prelude(store: &TemplateStore, req: &RegisterRequest) -> CliResult<Prelude> {
     let doc = parse_body(&req.body, req.format)?;
     if !doc.is_object() {
         return Err(CliError::Config(
@@ -130,6 +143,7 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
     // Dispatch on `kind:`. A kind-less document is the pre-#571 full-pipeline
     // template: still accepted, as `pipeline`, but deprecated — the hub kinds
     // are the model (RFC 0008).
+    let mut pipeline_cfg: Option<crate::config::PipelineConfig> = None;
     let detected = crate::hub::detect_kind(&doc);
     let (kind, name) = match detected {
         Some(TemplateKind::SourceTemplate) => {
@@ -162,7 +176,9 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
                 );
             }
             let cfg = validate_pipeline_body(&doc)?;
-            (TemplateKind::Pipeline, cfg.name.clone())
+            let pipeline_name = cfg.name.clone();
+            pipeline_cfg = Some(cfg);
+            (TemplateKind::Pipeline, pipeline_name)
         }
     };
 
@@ -213,6 +229,64 @@ pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<
     for tag in &req.tags {
         reject_derived(*tag)?;
     }
+
+    Ok(Prelude {
+        doc,
+        declared,
+        kind,
+        name,
+        id,
+        pipeline: pipeline_cfg,
+    })
+}
+
+/// What registering `req` would do (#703): the id and kind it resolves to,
+/// the version it would follow, and — for a complete pipeline — one plan
+/// report per root row. Validates exactly as [`register`] does; writes nothing.
+#[derive(Debug)]
+pub struct RegisterPreview {
+    pub id: String,
+    pub kind: TemplateKind,
+    /// The newest version already registered under this id, if any.
+    pub previous_version: Option<u32>,
+    pub rows: Vec<crate::commands::plan::PlanReport>,
+}
+
+pub async fn preview_register(
+    store: &TemplateStore,
+    req: &RegisterRequest,
+) -> CliResult<RegisterPreview> {
+    let prelude = register_prelude(store, req).await?;
+    let previous_version = store
+        .template_get(prelude.id.as_str(), None)
+        .await
+        .map_err(|e| CliError::Internal(format!("template registry read: {e}")))?
+        .map(|r| r.version);
+    let rows = match &prelude.pipeline {
+        Some(cfg) => crate::expand::expand(cfg)?
+            .iter()
+            .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
+            .map(crate::commands::plan::build_plan_report)
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(RegisterPreview {
+        id: prelude.id.as_str().to_string(),
+        kind: prelude.kind,
+        previous_version,
+        rows,
+    })
+}
+
+pub async fn register(store: &TemplateStore, req: RegisterRequest) -> CliResult<TemplateRecord> {
+    let Prelude {
+        doc,
+        declared,
+        kind,
+        name,
+        id,
+        ..
+    } = register_prelude(store, &req).await?;
 
     // A description describes the *template*, not the build, so carry the previous
     // version's forward when the caller omits one. Without this, a deploy that

@@ -32,10 +32,22 @@ paths:
             schema: { $ref: "#/components/schemas/SubmitRequest" }
       responses:
         "202":
-          description: Run queued (or an idempotency replay of an existing run).
+          description: >
+            Run queued (or an idempotency replay of an existing run). When the
+            server requires approval for runs (`--require-approval run`) or the
+            request sets `require_approval`, nothing runs: the body is
+            `{ status: "pending_approval", change_id, change }` (#703).
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SubmitResponse" }
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/SubmitResponse" }
+                  - type: object
+                    required: [status, change_id, change]
+                    properties:
+                      status: { type: string, enum: [pending_approval] }
+                      change_id: { type: string }
+                      change: { $ref: "#/components/schemas/ChangeRequest" }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
@@ -701,6 +713,177 @@ paths:
                     items: { $ref: "#/components/schemas/CatalogLineageEdge" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
+  /v1/changes:
+    post:
+      summary: Propose a change request
+      description: >
+        Plan → approve → run (#703). Stores a proposed action — `run` (a
+        `POST /v1/runs` body), `template_register` (a `POST /v1/templates` body)
+        or `template_launch` (`{ id, version? }`) — with the plan computed now
+        (one `faucet plan` report per root row, a material fingerprint, a
+        summary), the requester, and an optional budget the approved run must
+        honour. Nothing happens until the approvers named by the `approvals:`
+        block of `--auth-config` approve it. Requires `ChangeRequest`
+        (operator). A data-flow policy violation is a 422.
+      operationId: createChange
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, payload]
+              properties:
+                kind: { type: string, enum: [run, template_register, template_launch] }
+                payload: { type: object, description: "The proposed action, verbatim." }
+                reason: { type: string, description: "Why — shown to the approvers." }
+                budget: { $ref: "#/components/schemas/BudgetSpec" }
+      responses:
+        "201":
+          description: The pending request, plan included.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the `ChangeRequest` permission }
+        "422": { $ref: "#/components/responses/Error" }
+    get:
+      summary: List change requests
+      description: Newest first, plan rows omitted. Requires `ChangeRead` (viewer).
+      operationId: listChanges
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: status, in: query, required: false, schema: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] } }
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch] } }
+        - { name: requester, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 2000 } }
+      responses:
+        "200":
+          description: The requests.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+  /v1/changes/{id}:
+    get:
+      summary: Get a change request
+      description: The full record, plan rows included. A pending request past its window is marked expired on read. Requires `ChangeRead` (viewer).
+      operationId: getChange
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/changes/{id}/approve:
+    post:
+      summary: Approve a change request
+      description: >
+        Records the approval. Below the quorum the request stays `pending`; at
+        the quorum it is re-planned — a material difference from the reviewed
+        plan marks it `invalidated` and runs nothing — and then executed
+        (`executed` with `run_id` / `template`, or `failed` with `error`). The
+        run is submitted as the requester with the approved budget merged in.
+        Requires `ChangeApprove` (operator); the approval policy may refuse
+        with a 403 that names the rule (role, named principals,
+        self-approval).
+      operationId: approveChange
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                comment: { type: string }
+      responses:
+        "200":
+          description: The updated request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The request is not pending, or this approver already approved }
+  /v1/changes/{id}/reject:
+    post:
+      summary: Reject a change request
+      description: Rejects a pending request with a reason. The requester may reject (withdraw) their own. Requires `ChangeApprove` (operator), then the approval policy.
+      operationId: rejectChange
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: The rejected request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The request is not pending }
+  /v1/usage:
+    get:
+      summary: Cost & usage report
+      description: >
+        Records, estimated bytes, round trips, connector-reported cost signals
+        and priced estimates for the invocations this server has recorded,
+        aggregated by pipeline / row / dataset / sink / day. Estimates use the
+        pricing table of each run's `usage:` block (public list prices by
+        default) and are labelled as estimates; `hosted_equivalent` is what a
+        per-row-priced hosted ELT service would charge for the same rows.
+        Requires the `UsageRead` permission (viewer). Requires the `catalog`
+        Cargo feature.
+      operationId: listUsage
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: string }, description: "RFC 3339 or YYYY-MM-DD; invocations recorded at or after it." }
+        - { name: until, in: query, required: false, schema: { type: string }, description: "RFC 3339 or YYYY-MM-DD; invocations recorded before it." }
+        - { name: pipeline, in: query, required: false, schema: { type: string }, description: "Only this pipeline." }
+        - { name: by, in: query, required: false, schema: { type: string, enum: [pipeline, row, dataset, sink, day], default: pipeline } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 5000, maximum: 50000 }, description: "Most invocation records to read (newest first)." }
+        - { name: include_records, in: query, required: false, schema: { type: boolean, default: false }, description: "Also return the raw records the report was built from." }
+      responses:
+        "200":
+          description: The aggregated report (and, on request, the records).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [report]
+                properties:
+                  report: { $ref: "#/components/schemas/UsageReport" }
+                  records:
+                    type: array
+                    items: { $ref: "#/components/schemas/UsageRecord" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the `UsageRead` permission }
   /v1/local-outputs:
     get:
       summary: List local sink outputs
@@ -1668,6 +1851,9 @@ components:
         clock: { type: string, format: date-time, description: "Override the ${now.*} clock (backfills)." }
         concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
         callback: { $ref: "#/components/schemas/CallbackSpec" }
+        require_approval: { type: boolean, default: false, description: "Ask for an approved change request (#703) instead of a run; implied by `--require-approval run`. The 202 body is then `{ status: pending_approval, change_id, change }`." }
+        reason: { type: string, description: "Why, for the approvers (with require_approval)." }
+        budget: { $ref: "#/components/schemas/BudgetSpec" }
       example:
         name: orders_to_warehouse
         config_format: yaml
@@ -2107,6 +2293,161 @@ components:
         last_records: 1
         column_lineage:
           key: value
+    BudgetSpec:
+      type: object
+      description: Hard ceilings on one invocation (#703). A page that would cross `max_records` / `max_bytes` is refused whole; `max_duration_secs` cancels at the next page boundary; `allowed_sinks` refuses before anything runs.
+      properties:
+        max_records: { type: integer, minimum: 1 }
+        max_bytes: { type: integer, minimum: 1, description: "Estimated serialized bytes written." }
+        max_duration_secs: { type: integer, minimum: 1 }
+        allowed_sinks: { type: array, items: { type: string }, description: "Sink template names or connector kinds." }
+    ChangeRequest:
+      type: object
+      description: A proposed action awaiting (or past) approval (#703).
+      required: [id, kind, status, requester, requester_role, payload, required_approvals, created_at, updated_at, expires_at]
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [run, template_register, template_launch] }
+        status: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] }
+        requester: { type: string }
+        requester_role: { type: string, enum: [viewer, operator, admin] }
+        reason: { type: string }
+        payload: { type: object, description: "The proposed action, verbatim; secrets are never resolved into it." }
+        plan:
+          type: object
+          required: [material, summary]
+          properties:
+            material: { type: string, description: "Hash of the material part of the plan; execution recomputes it and a difference invalidates the approval." }
+            rows: { type: array, items: { type: object }, description: "One plan report per root row (omitted in listings)." }
+            summary: { type: object }
+        budget: { $ref: "#/components/schemas/BudgetSpec" }
+        required_approvals: { type: integer }
+        approvals:
+          type: array
+          items:
+            type: object
+            required: [principal, role, at]
+            properties:
+              principal: { type: string }
+              role: { type: string, enum: [viewer, operator, admin] }
+              at: { type: string, format: date-time }
+              comment: { type: string }
+        rejection:
+          type: object
+          properties:
+            principal: { type: string }
+            at: { type: string, format: date-time }
+            reason: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        run_id: { type: string, description: "The run an executed `run` request started." }
+        template:
+          type: object
+          properties:
+            id: { type: string }
+            version: { type: integer }
+        error: { type: string, description: "Why execution failed or the approval was invalidated." }
+    CostSignal:
+      type: object
+      description: A backend-reported usage figure a connector learned during the run (BigQuery `bytes_billed`, a streaming insert's payload size, …).
+      required: [kind, unit, quantity, side, connector]
+      properties:
+        kind: { type: string, description: "`bytes_billed`, `bytes_processed`, `bytes_streamed`, `bytes_loaded`, … (a closed set per connector)." }
+        unit: { type: string, description: "`bytes`, `credits`, `requests`, …" }
+        quantity: { type: number }
+        side: { type: string, enum: [source, sink] }
+        connector: { type: string, description: "Connector kind that reported it." }
+    UsageSnapshot:
+      type: object
+      description: What one invocation consumed, as the pipeline measured it.
+      required: [records_read, records_written, bytes_read, bytes_written]
+      properties:
+        records_read: { type: integer, description: "Records the source yielded." }
+        records_written: { type: integer, description: "Records the sink accepted." }
+        bytes_read: { type: integer, description: "Estimated serialized bytes read (a JSON-shaped estimate, not wire bytes)." }
+        bytes_written: { type: integer, description: "Estimated serialized bytes the sink accepted." }
+        source_roundtrips:
+          type: object
+          description: Source backend calls by op (`page`, `get`, `list`, …).
+          additionalProperties: { type: integer }
+        sink_roundtrips:
+          type: object
+          description: Sink backend calls by op (`insert`, `put`, `merge`, …).
+          additionalProperties: { type: integer }
+        signals:
+          type: array
+          items: { $ref: "#/components/schemas/CostSignal" }
+    CostEstimate:
+      type: object
+      description: The priced view of a `UsageSnapshot` — an estimate, in the deployment's configured currency.
+      required: [currency, total, lines, hosted_equivalent]
+      properties:
+        currency: { type: string }
+        total: { type: number, description: "Sum of `lines[].amount`." }
+        lines:
+          type: array
+          items:
+            type: object
+            required: [item, quantity, unit, rate, amount]
+            properties:
+              item: { type: string, description: "`bigquery_bytes_billed`, `s3_requests_read`, `egress`, …" }
+              quantity: { type: number }
+              unit: { type: string }
+              rate: { type: number, description: "In `currency` per `unit`." }
+              amount: { type: number }
+        not_reported:
+          type: array
+          description: Connector kinds in the run that reported no cost signal, so their backend compute is not in `total`.
+          items: { type: string }
+        hosted_equivalent: { type: number, description: "What a per-row-priced hosted ELT service would have charged for the records written." }
+    UsageRecord:
+      type: object
+      description: One invocation's usage, priced.
+      required: [run_id, pipeline, row, source_kind, sink_kind, recorded_at, duration_ms, failed, usage, cost]
+      properties:
+        run_id: { type: string }
+        pipeline: { type: string }
+        row: { type: string }
+        source_kind: { type: string }
+        sink_kind: { type: string }
+        dataset_id: { type: string, description: "Catalog id of the sink dataset, when known." }
+        dataset_uri: { type: string }
+        recorded_at: { type: string, format: date-time }
+        duration_ms: { type: integer }
+        failed: { type: boolean, description: "The invocation failed; what it consumed before failing is still counted." }
+        usage: { $ref: "#/components/schemas/UsageSnapshot" }
+        cost: { $ref: "#/components/schemas/CostEstimate" }
+    UsageRow:
+      type: object
+      required: [key, runs, failed_runs, records_read, records_written, bytes_read, bytes_written, duration_ms, roundtrips, cost, hosted_equivalent]
+      properties:
+        key: { type: string, description: "The group: pipeline name, row id, dataset id, sink kind or day." }
+        runs: { type: integer }
+        failed_runs: { type: integer }
+        records_read: { type: integer }
+        records_written: { type: integer }
+        bytes_read: { type: integer }
+        bytes_written: { type: integer }
+        duration_ms: { type: integer }
+        roundtrips: { type: integer }
+        cost: { type: number }
+        hosted_equivalent: { type: number }
+        not_reported: { type: array, items: { type: string } }
+    UsageReport:
+      type: object
+      description: An aggregation over a window, plus the total row.
+      required: [by, currency, records, rows, total]
+      properties:
+        by: { type: string, enum: [pipeline, row, dataset, sink, day] }
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        currency: { type: string }
+        records: { type: integer, description: "Invocation records aggregated." }
+        rows:
+          type: array
+          items: { $ref: "#/components/schemas/UsageRow" }
+        total: { $ref: "#/components/schemas/UsageRow" }
     LocalOutput:
       type: object
       description: >

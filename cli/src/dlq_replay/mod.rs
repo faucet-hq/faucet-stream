@@ -236,6 +236,8 @@ pub async fn replay(
             // dataset. Deliberately not catalogued.
             #[cfg(feature = "catalog")]
             catalog: None,
+            usage: Default::default(),
+            budget: None,
         },
     )
     .await?;

@@ -150,6 +150,24 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<faucet_core::PolicySpec>,
 
+    /// Optional cost & usage accounting settings (#704): the pricing table
+    /// estimates are computed from (`pricing_file` / inline `pricing`).
+    /// Accounting itself is always on — every invocation reports records,
+    /// estimated bytes, round trips and connector-reported cost signals; this
+    /// block only changes the rates the estimate uses. See `faucet schema usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage::UsageSpec>,
+
+    /// Optional run budget (#703): hard ceilings on what one invocation may
+    /// move — `max_records`, `max_bytes` (estimated), `max_duration_secs`,
+    /// `allowed_sinks`. A page that would cross a ceiling is refused whole
+    /// (nothing of it lands, the bookmark stays put) and the run fails with
+    /// `budget_exceeded`; the duration ceiling cancels cooperatively at the
+    /// next page boundary. `faucet run --budget` / a change request's budget
+    /// merge with it (the stricter wins). See `faucet schema budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<faucet_core::BudgetSpec>,
+
     /// Optional completeness reconciliation (#502): after a successful root run,
     /// compare rows written against an authoritative count probe and **fail the
     /// run** on a shortfall beyond tolerance — a silent-truncation guard,

@@ -1,0 +1,38 @@
+# Cost & usage accounting (#704) + a run budget (#703).
+#
+# Every invocation is metered (records, estimated bytes, backend round trips,
+# connector cost signals) and priced against the `usage:` table below; the
+# `catalog:` store keeps the records so `faucet usage` can aggregate them:
+#
+#   faucet run   cli/examples/csv_to_jsonl_with_usage_budget.yaml
+#   faucet usage --config cli/examples/csv_to_jsonl_with_usage_budget.yaml --by day
+#
+# The `budget:` block refuses the page that would take the run past
+# `max_records` (nothing of it lands; the bookmark stays put) and cancels a run
+# that outlives `max_duration_secs` at its next page boundary.
+version: 1
+name: csv_to_jsonl_with_usage_budget
+
+pipeline:
+  source:
+    type: csv
+    config:
+      path: ./data/countries.csv
+  sink:
+    type: jsonl
+    config:
+      path: ./out/countries_with_usage.jsonl
+
+catalog:
+  url: sqlite:./out/faucet-catalog.db
+
+usage:
+  pricing:
+    currency: USD
+    egress_per_gb: 0.09
+    hosted_elt_per_million_rows: 15
+
+budget:
+  max_records: 100000
+  max_duration_secs: 600
+  allowed_sinks: [jsonl]

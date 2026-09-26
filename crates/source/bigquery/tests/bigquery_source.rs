@@ -116,13 +116,29 @@ async fn fetch_all_returns_rows_when_first_response_is_complete() {
             "jobComplete": true,
             "schema": schema_two_cols(),
             "jobReference": {"projectId": PROJECT_ID, "jobId": "job-1"},
+            "totalBytesProcessed": "2048",
             "rows": rows(0, 3),
         })))
         .mount(&server)
         .await;
 
     let (src, _f) = build_source(&server, default_config()).await;
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    src.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "bigquery",
+        )
+        .with_meter(meter.clone()),
+    ));
     let rows = src.fetch_all().await.unwrap();
+    let usage = meter.snapshot();
+    assert_eq!(usage.source_roundtrips.get("query"), Some(&1));
+    assert_eq!(usage.signals.len(), 1);
+    assert_eq!(usage.signals[0].kind, "bytes_processed");
+    assert_eq!(usage.signals[0].quantity, 2048.0);
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], json!({"id": 0, "name": "name-0"}));
     assert_eq!(rows[2], json!({"id": 2, "name": "name-2"}));

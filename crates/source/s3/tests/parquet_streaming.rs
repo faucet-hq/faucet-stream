@@ -172,7 +172,22 @@ async fn the_ranged_reader_yields_exactly_what_the_buffered_reader_did() {
     let (_c, endpoint) = start_minio().await;
     seed(&endpoint, "cmp.parquet", parquet_bytes(20_000, 1_000, 40)).await;
 
-    let streamed = collect_ids(&build_source(&endpoint, config(500)).await, 500).await;
+    let ranged = build_source(&endpoint, config(500)).await;
+    let meter = Arc::new(faucet_core::UsageMeter::new());
+    ranged.set_roundtrip_recorder(Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "s3",
+        )
+        .with_meter(meter.clone()),
+    ));
+    let streamed = collect_ids(&ranged, 500).await;
+    let ops = meter.snapshot().source_roundtrips;
+    assert!(ops.get("list").is_some_and(|n| *n >= 1), "{ops:?}");
+    assert!(ops.get("head").is_some_and(|n| *n >= 1), "{ops:?}");
+    assert!(ops.get("get").is_some_and(|n| *n >= 1), "{ops:?}");
     let buffered = collect_ids(
         &build_source(&endpoint, config(500).verify_checksum(true)).await,
         500,

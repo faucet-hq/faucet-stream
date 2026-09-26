@@ -118,6 +118,12 @@ impl ServeError {
     }
 }
 
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code(), self.message())
+    }
+}
+
 impl IntoResponse for ServeError {
     fn into_response(self) -> Response {
         let status = self.status();
@@ -230,5 +236,11 @@ mod tests {
             resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
             "7"
         );
+    }
+
+    #[test]
+    fn display_is_code_then_message() {
+        let e = ServeError::Conflict("busy".into());
+        assert_eq!(e.to_string(), format!("{}: {}", e.code(), e.message()));
     }
 }

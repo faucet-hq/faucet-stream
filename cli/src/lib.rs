@@ -13,6 +13,7 @@
 
 pub mod auth_catalog;
 pub mod backfill;
+pub mod budget;
 #[cfg(feature = "catalog")]
 pub mod catalog;
 pub mod chunking;
@@ -79,6 +80,7 @@ pub mod topology;
 pub mod transforms;
 #[cfg(feature = "cli-tui")]
 pub mod tui;
+pub mod usage;
 pub mod verify;
 pub mod vocabulary;
 
@@ -251,6 +253,8 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         Command::Notify(args) => commands::notify::run(args).await,
         #[cfg(feature = "catalog")]
         Command::Catalog(args) => commands::catalog::run(args).await,
+        #[cfg(feature = "catalog")]
+        Command::Usage(args) => commands::usage::run(args).await,
         #[cfg(feature = "templates")]
         Command::Template(args) => commands::template::run(args).await,
         Command::Completions(args) => commands::completions::run(args.shell),
@@ -377,6 +381,9 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
             notifier: None,
             #[cfg(feature = "catalog")]
             catalog,
+            usage: usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
+                .map_err(CliError::Config)?,
+            budget: cfg.budget.clone(),
         },
     )
     .await

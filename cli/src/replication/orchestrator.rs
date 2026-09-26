@@ -33,6 +33,10 @@ pub struct ReplicationOptions {
     pub verify: Option<crate::verify::VerifySpec>,
     /// Run rollback settings (#706), forwarded to every phase.
     pub rollback: Option<crate::rollback::RollbackSpec>,
+    /// Cost & usage pricing (#704), forwarded to every phase.
+    pub usage: crate::usage::UsageOptions,
+    /// Run budget (#703), forwarded to every phase.
+    pub budget: Option<faucet_core::BudgetSpec>,
     /// Optional notifier (#280), shared across both phases' runs.
     #[cfg(feature = "notify")]
     pub notifier: Option<std::sync::Arc<crate::notify::Notifier>>,
@@ -117,6 +121,8 @@ fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> Ex
         notifier: opts.notifier.clone(),
         #[cfg(feature = "catalog")]
         catalog: opts.catalog.clone(),
+        usage: opts.usage.clone(),
+        budget: opts.budget.clone(),
     }
 }
 
@@ -452,6 +458,7 @@ pipeline:
                 error: Some("connection refused".into()),
                 error_kind: None,
                 metrics: None,
+                usage: None,
             }],
         };
         let err = phase_failure(&summary, "snapshot");
@@ -477,6 +484,7 @@ pipeline:
                 error: None,
                 error_kind: None,
                 metrics: None,
+                usage: None,
             }],
         };
         let err = phase_failure(&summary, "CDC");

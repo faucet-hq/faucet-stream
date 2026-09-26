@@ -1731,3 +1731,60 @@ select {
 .whoami-role { padding: 1px 7px; border-radius: 999px; font-size: 0.68rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; background: var(--brand-tint); color: var(--brand); }
 .whoami[data-role="viewer"] .whoami-role { background: color-mix(in srgb, var(--ink-faint) 16%, transparent); color: var(--ink-dim); }
 @media (max-width: 720px) { .whoami-name { display: none; } }
+
+/* ── Usage (#704) ─────────────────────────────────────────────────────────── */
+.usage-filters .usage-by { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--ink-faint); }
+.usage-filters #u-pipeline { flex: 1 1 auto; min-width: 90px; }
+.usage-summary { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 14px 0 10px; font-size: 0.86rem; color: var(--ink-faint); }
+.usage-summary .usage-stat b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.usage-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.usage-table thead th {
+  position: sticky; top: 56px; z-index: 15; background: var(--surface);
+  text-align: right; font-size: 0.68rem; letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--ink-faint); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.usage-table thead th:first-child, .usage-table td.usage-key { text-align: left; }
+.usage-table tbody td, .usage-table tfoot td {
+  padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: right;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.usage-table td.usage-key { max-width: 360px; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+.usage-table tfoot .usage-total td { font-weight: 700; border-top: 2px solid var(--border-strong); border-bottom: none; background: var(--surface-2); }
+.usage-table td.empty { text-align: center; }
+.usage-nr { display: inline-block; margin-left: 8px; font-size: 0.68rem; font-weight: 500; color: var(--queued); border: 1px solid color-mix(in srgb, var(--queued) 40%, transparent); border-radius: 999px; padding: 1px 7px; vertical-align: middle; }
+.usage-failed { color: var(--fail); font-size: 0.78rem; }
+.usage-note { margin-top: 14px; font-size: 0.8rem; color: var(--ink-faint); max-width: 70ch; }
+.usage-note code { font-size: 0.78rem; }
+
+/* ── Changes (#703) ───────────────────────────────────────────────────────── */
+.chg-table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 12px; }
+.chg-table thead th {
+  position: sticky; top: 56px; z-index: 15; background: var(--surface);
+  text-align: left; font-size: 0.68rem; letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--ink-faint); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--border);
+}
+.chg-table tbody td { padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.chg-tr { cursor: pointer; }
+.chg-tr:hover td { background: color-mix(in srgb, var(--ink-faint) 8%, transparent); }
+.chg-tr.chg-selected td { background: var(--brand-tint); }
+.chg-summary { max-width: 520px; }
+.chg-reason { color: var(--ink-faint); font-size: 0.82rem; margin-top: 3px; }
+.chg-detail { margin-top: 22px; padding: 18px 22px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.chg-detail-head { display: flex; align-items: center; gap: 12px; }
+.chg-detail-head h2 { margin: 0; font-size: 1.05rem; flex: 1 1 auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chg-meta { color: var(--ink-faint); font-size: 0.82rem; margin: 8px 0 0; }
+.chg-reason-big { margin: 12px 0 0; font-size: 0.95rem; }
+.chg-error { margin: 12px 0 0; color: var(--fail); }
+.chg-detail h3 { font-size: 0.72rem; letter-spacing: 0.07em; text-transform: uppercase; color: var(--ink-faint); margin: 18px 0 8px; }
+.chg-plan { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+.chg-plan th { text-align: left; font-weight: 600; color: var(--ink-faint); padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.chg-plan td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.chg-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 32px; }
+.chg-kvs { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.chg-kv b { font-weight: 600; margin-right: 4px; }
+.chg-muted { color: var(--ink-faint); }
+.chg-approvals { margin: 0; padding-left: 18px; }
+.chg-approvals li { margin: 2px 0; }
+.chg-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.chg-actions input { flex: 1 1 180px; min-width: 140px; }

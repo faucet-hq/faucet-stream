@@ -289,6 +289,28 @@
           "type": "null"
         }
       ]
+    },
+    "usage": {
+      "description": "Optional cost & usage accounting settings (#704): the pricing table\nestimates are computed from (`pricing_file` / inline `pricing`).\nAccounting itself is always on — every invocation reports records,\nestimated bytes, round trips and connector-reported cost signals; this\nblock only changes the rates the estimate uses. See `faucet schema usage`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UsageSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "budget": {
+      "description": "Optional run budget (#703): hard ceilings on what one invocation may\nmove — `max_records`, `max_bytes` (estimated), `max_duration_secs`,\n`allowed_sinks`. A page that would cross a ceiling is refused whole\n(nothing of it lands, the bookmark stays put) and the run fails with\n`budget_exceeded`; the duration ceiling cancels cooperatively at the\nnext page boundary. `faucet run --budget` / a change request's budget\nmerge with it (the stricter wins). See `faucet schema budget`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BudgetSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -3919,6 +3941,16 @@
           "description": "A column's learned profile drifted from its baseline (#708), under\n`profiling.on_drift: notify` or `fail`. One event per finding.",
           "type": "string",
           "const": "profile_drift"
+        },
+        {
+          "description": "A change request was proposed and awaits approval (#703). Emitted\nthrough the proposed config's own `notifications:` block, so the\nchannels it names are the approvers'.",
+          "type": "string",
+          "const": "change_requested"
+        },
+        {
+          "description": "A run crossed a `budget:` ceiling (#703) and was stopped.",
+          "type": "string",
+          "const": "budget_exceeded"
         }
       ]
     },
@@ -25384,6 +25416,166 @@
           "type": "object"
         }
       ]
+    },
+    "UsageSpec": {
+      "description": "The `usage:` block.",
+      "type": "object",
+      "properties": {
+        "pricing_file": {
+          "description": "A YAML/JSON file holding a [`PricingSpec`], merged under the inline\n`pricing:` (inline wins). Relative to the working directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing": {
+          "description": "Inline pricing overrides. Any field left unset keeps the shipped\ndefault.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PricingOverrides"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PricingOverrides": {
+      "description": "The inline / file form of [`PricingSpec`]: every field optional.",
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "egress_per_gb": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "object_storage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObjectStorageOverrides"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "warehouse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WarehouseOverrides"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hosted_elt_per_million_rows": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ObjectStorageOverrides": {
+      "type": "object",
+      "properties": {
+        "read_per_1k_requests": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "write_per_1k_requests": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "WarehouseOverrides": {
+      "type": "object",
+      "properties": {
+        "bigquery_per_tib_scanned": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "bigquery_streaming_per_gib": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "snowflake_per_credit": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BudgetSpec": {
+      "description": "A run budget.",
+      "type": "object",
+      "properties": {
+        "max_records": {
+          "description": "Most records the sink may accept. A page that would cross it is\nrefused whole and the run fails with `budget_exceeded`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_bytes": {
+          "description": "Most estimated serialized bytes the sink may accept (same estimate as\nusage accounting). Refused whole at the page that would cross it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_duration_secs": {
+          "description": "Longest an invocation may run. Past it the run is cancelled\ncooperatively (stops at the next page boundary, flushes) and fails\nwith `budget_exceeded`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "allowed_sinks": {
+          "description": "Sink template names (`pipeline.sinks.*` keys) and/or connector kinds a\nrow may write to. Empty = any. Checked before anything runs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

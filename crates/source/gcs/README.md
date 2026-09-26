@@ -420,3 +420,11 @@ cluster coordinator a run reads every object, unchanged.
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
+
+## Usage signals (#704)
+
+Every object listing page (`list`), object read (`get`, one per object or
+per ranged read) and metadata read (`head`) is reported to faucet's usage
+meter as a source round trip and priced as a GCS class-B request
+(`usage.pricing.object_storage.read_per_1k_requests`); see the
+[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).

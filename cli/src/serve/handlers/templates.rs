@@ -50,7 +50,7 @@ fn store(state: &ServerState) -> TemplateStore {
 // ── POST /v1/templates ──────────────────────────────────────────────────────
 
 /// `POST /v1/templates` request body.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterBody {
     /// Registry id. Derived from the config's `name:` when omitted.
     #[serde(default)]
@@ -714,6 +714,15 @@ pub struct TriggerBody {
     /// reporting to its own endpoint.
     #[serde(default)]
     pub callback: Option<crate::serve::callback::CallbackSpec>,
+    /// Ask for an approved change request (#703) instead of a run.
+    #[serde(default)]
+    pub require_approval: bool,
+    /// Why, for the approvers (with `require_approval`).
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Run budget (#703), merged with the materialized config's own.
+    #[serde(default)]
+    pub budget: Option<faucet_core::BudgetSpec>,
 }
 
 /// A trigger's `overlay`: a registered deployment id, or an inline document.
@@ -786,8 +795,36 @@ pub async fn trigger_template(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
-    Json(mut body): Json<TriggerBody>,
-) -> Result<(StatusCode, Json<TriggerResponse>), ServeError> {
+    Json(body): Json<TriggerBody>,
+) -> Result<axum::response::Response, ServeError> {
+    use axum::response::IntoResponse;
+    match trigger_template_outcome(state, actor, id, body).await? {
+        TriggerOutcome::Run(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
+        // Approval first (#703): the trigger became a change request.
+        TriggerOutcome::PendingApproval(change) => Ok((
+            StatusCode::ACCEPTED,
+            Json(runner::pending_approval_body(&change)),
+        )
+            .into_response()),
+    }
+}
+
+/// What a trigger produced: a run, or (under `--require-approval run` / an
+/// explicit `require_approval`) a pending change request (#703).
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum TriggerOutcome {
+    Run(TriggerResponse),
+    PendingApproval(Box<crate::serve::changes::ChangeRequest>),
+}
+
+/// The trigger logic behind `POST /v1/templates/{id}/runs`.
+pub async fn trigger_template_outcome(
+    state: ServerState,
+    actor: AuthContext,
+    id: String,
+    mut body: TriggerBody,
+) -> Result<TriggerOutcome, ServeError> {
     let overlay = body.overlay_choice();
     let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
     // Resolve through the registry: a channel needs a lookup, and an unpinned
@@ -892,8 +929,18 @@ pub async fn trigger_template(
         clock: body.clock,
         concurrency: body.concurrency,
         callback: body.callback,
+        require_approval: body.require_approval,
+        reason: body.reason,
+        budget: body.budget,
+        approved_change: None,
     };
-    let run = runner::submit(state.clone(), req, actor.clone()).await?;
+    let run = match runner::submit_gated(state.clone(), req, actor.clone()).await? {
+        runner::SubmitOutcome::Accepted(run) => run,
+        // Approval first (#703): the trigger became a change request.
+        runner::SubmitOutcome::PendingApproval(change) => {
+            return Ok(TriggerOutcome::PendingApproval(change));
+        }
+    };
     // `submit` already recorded `run.submit`; this second entry attributes the
     // *trigger* specifically, and its `run_id` links to the run record whose
     // `template` / `template_version` labels name the version used.
@@ -906,27 +953,38 @@ pub async fn trigger_template(
         "ok",
     )
     .await;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(TriggerResponse {
-            run,
-            template_id: materialized.template_id,
-            template_version: materialized.version,
-            sink_template: materialized.sink_id,
-            sink_template_version: materialized.sink_version,
-            streams: materialized.streams,
-            overlay: materialized.overlay_id,
-            overlay_version: materialized.overlay_version,
-            overlay_contributes: materialized.overlay_contributes,
-            warnings: materialized.warnings,
-            params: materialized.params_redacted,
-            deprecated,
-        }),
-    ))
+    Ok(TriggerOutcome::Run(TriggerResponse {
+        run,
+        template_id: materialized.template_id,
+        template_version: materialized.version,
+        sink_template: materialized.sink_id,
+        sink_template_version: materialized.sink_version,
+        streams: materialized.streams,
+        overlay: materialized.overlay_id,
+        overlay_version: materialized.overlay_version,
+        overlay_contributes: materialized.overlay_contributes,
+        warnings: materialized.warnings,
+        params: materialized.params_redacted,
+        deprecated,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
+    /// The pre-#703 handler shape the tests were written against: a run, as
+    /// `(status, body)`; a pending change request is a test failure.
+    async fn trigger_pair(
+        State(state): State<ServerState>,
+        Extension(actor): Extension<AuthContext>,
+        Path(id): Path<String>,
+        Json(body): Json<TriggerBody>,
+    ) -> Result<(StatusCode, Json<TriggerResponse>), ServeError> {
+        match trigger_template_outcome(state, actor, id, body).await? {
+            TriggerOutcome::Run(r) => Ok((StatusCode::ACCEPTED, Json(r))),
+            TriggerOutcome::PendingApproval(c) => panic!("unexpected pending change {}", c.id),
+        }
+    }
+
     use super::*;
     use crate::serve::history::AuditFilter;
     use crate::serve::rbac::Role;
@@ -1169,7 +1227,7 @@ write_mode_aliases:
         assert_eq!(sinks.templates[0].id, "local-jsonl");
 
         // Without a sink the source template is unprocessable, naming the field.
-        let err = trigger_template(
+        let err = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("acme-exports".into()),
@@ -1185,7 +1243,7 @@ write_mode_aliases:
         }
 
         // A pipeline template refuses one.
-        let err = trigger_template(
+        let err = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("tpl-demo".into()),
@@ -1205,7 +1263,7 @@ write_mode_aliases:
         }
 
         // The pairing runs: provenance carries both halves and the stream plan.
-        let (code, resp) = trigger_template(
+        let (code, resp) = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("acme-exports".into()),
@@ -1239,7 +1297,7 @@ write_mode_aliases:
             "kind: deployment\nname: ops\nstate: { type: memory }\n".into(),
         )
         .await;
-        let (_, resp) = trigger_template(
+        let (_, resp) = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("acme-exports".into()),
@@ -1267,7 +1325,7 @@ write_mode_aliases:
             "overlay": { "execution": { "max_concurrent": 1 } }
         }))
         .unwrap();
-        let (_, resp) = trigger_template(
+        let (_, resp) = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("acme-exports".into()),
@@ -1355,12 +1413,58 @@ write_mode_aliases:
     }
 
     #[tokio::test]
+    async fn a_trigger_under_require_approval_becomes_a_change_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::serve::test_support::test_config();
+        cfg.require_approval = vec![crate::serve::changes::ChangeKind::Run];
+        let state = crate::serve::test_support::state_from(&cfg);
+        register_demo(&state, &dir.path().join("o.jsonl")).await;
+        let resp = trigger_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(TriggerBody {
+                params: [("tag".to_string(), json!("alpha"))].into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trigger");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "pending_approval", "{v}");
+        assert!(v["change_id"].is_string());
+
+        let ok = trigger_template(
+            State(test_state_with(&dir).await),
+            Extension(actor()),
+            Path("tpl-demo".into()),
+            Json(TriggerBody {
+                params: [("tag".to_string(), json!("beta"))].into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("trigger");
+        assert_eq!(ok.status(), StatusCode::ACCEPTED);
+    }
+
+    async fn test_state_with(dir: &tempfile::TempDir) -> ServerState {
+        let state = test_state();
+        register_demo(&state, &dir.path().join("o2.jsonl")).await;
+        state
+    }
+
+    #[tokio::test]
     async fn trigger_binds_params_and_stamps_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state();
         register_demo(&state, &dir.path().join("o.jsonl")).await;
 
-        let (code, resp) = trigger_template(
+        let (code, resp) = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("tpl-demo".into()),
@@ -1411,7 +1515,7 @@ write_mode_aliases:
         // Registered but NOT launched — the work-in-progress state.
         register_demo_opts(&state, &dir.path().join("o.jsonl"), false).await;
 
-        let err = trigger_template(
+        let err = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("tpl-demo".into()),
@@ -1431,7 +1535,7 @@ write_mode_aliases:
         }
 
         // …but an explicit selector runs it, so a draft is testable.
-        let resp = trigger_template(
+        let resp = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("tpl-demo".into()),
@@ -1459,7 +1563,7 @@ write_mode_aliases:
         let trigger = |version: Option<VersionSelector>| {
             let state = state.clone();
             async move {
-                trigger_template(
+                trigger_pair(
                     State(state),
                     Extension(actor()),
                     Path("tpl-demo".into()),
@@ -1547,7 +1651,7 @@ write_mode_aliases:
 
         // Existing callers keep working — retiring must not hard-break them — but
         // the response says so, so the deprecation cannot pass unnoticed.
-        let resp = trigger_template(
+        let resp = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("tpl-demo".into()),
@@ -1627,7 +1731,7 @@ write_mode_aliases:
         );
 
         // A pinned run of it still starts, and says why it should not.
-        let resp = trigger_template(
+        let resp = trigger_pair(
             State(state.clone()),
             Extension(actor()),
             Path("tpl-demo".into()),
@@ -1830,7 +1934,7 @@ write_mode_aliases:
         .await
         .expect("register");
 
-        let err = trigger_template(
+        let err = trigger_pair(
             State(state),
             Extension(actor()),
             Path("tpl-secret".into()),
@@ -1877,7 +1981,7 @@ write_mode_aliases:
         .await
         .expect("register");
 
-        let err = trigger_template(
+        let err = trigger_pair(
             State(state),
             Extension(actor()),
             Path("tpl-env".into()),

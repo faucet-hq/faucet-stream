@@ -610,6 +610,8 @@ pub const DEPLOYMENT_BLOCKS: &[&str] = &[
     "execution",
     "delivery",
     "schedule",
+    "usage",
+    "budget",
 ];
 
 /// Per-stream operational overrides in a deployment overlay.
@@ -685,6 +687,12 @@ pub struct DeploymentTemplate {
     /// → top-level `policy` (#702).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<Value>,
+    /// → top-level `usage` (#704): the pricing table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+    /// → top-level `budget` (#703): run ceilings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Value>,
     /// → top-level `resilience`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resilience: Option<Value>,
@@ -806,6 +814,8 @@ impl DeploymentTemplate {
             ("sla", &self.sla),
             ("profiling", &self.profiling),
             ("policy", &self.policy),
+            ("usage", &self.usage),
+            ("budget", &self.budget),
             ("resilience", &self.resilience),
             ("execution", &self.execution),
             ("delivery", &self.delivery),

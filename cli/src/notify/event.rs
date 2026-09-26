@@ -254,6 +254,55 @@ impl NotifyEvent {
         .with("metric", Value::String(metric.to_string()))
     }
 
+    /// A change request awaiting approval (#703): `change_id` / `kind` name it,
+    /// `requester` / `reason` say who wants what.
+    pub fn change_requested(
+        pipeline: impl Into<String>,
+        change_id: &str,
+        kind: &str,
+        requester: &str,
+        reason: &str,
+    ) -> Self {
+        let p = pipeline.into();
+        Self::base(
+            EventKind::ChangeRequested,
+            Severity::Info,
+            p.clone(),
+            "",
+            format!("Change request on `{p}` awaits approval ({kind})"),
+            if reason.is_empty() {
+                format!("{requester} proposed a {kind} change ({change_id}); approve or reject it in the console or through POST /v1/changes/{change_id}/approve")
+            } else {
+                format!("{requester} proposed a {kind} change ({change_id}): {reason}")
+            },
+        )
+        .with("change_id", Value::String(change_id.to_string()))
+        .with("change_kind", Value::String(kind.to_string()))
+        .with("requester", Value::String(requester.to_string()))
+    }
+
+    /// A run stopped by a `budget:` ceiling (#703).
+    pub fn budget_exceeded(
+        pipeline: impl Into<String>,
+        row: impl Into<String>,
+        budget: &str,
+        limit: u64,
+        actual: u64,
+    ) -> Self {
+        let p = pipeline.into();
+        Self::base(
+            EventKind::BudgetExceeded,
+            Severity::Error,
+            p.clone(),
+            row,
+            format!("Pipeline `{p}` exceeded its {budget} budget"),
+            format!("{budget}: limit {limit}, would have reached {actual}; the run stopped at the page boundary and nothing past the ceiling was written"),
+        )
+        .with("budget", Value::String(budget.to_string()))
+        .with("limit", Value::from(limit))
+        .with("actual", Value::from(actual))
+    }
+
     pub fn circuit_open(
         pipeline: impl Into<String>,
         row: impl Into<String>,
@@ -411,5 +460,15 @@ mod redaction_tests {
         // Non-string details pass through untouched.
         let ev = NotifyEvent::run_success("p", "row", 7);
         assert_eq!(ev.details["records_written"], Value::from(7u64));
+    }
+
+    #[test]
+    fn change_requested_names_the_request_with_or_without_a_reason() {
+        let with = NotifyEvent::change_requested("p", "c1", "run", "bob", "nightly load");
+        assert_eq!(with.kind, EventKind::ChangeRequested);
+        assert!(with.message.contains("nightly load"));
+        let without = NotifyEvent::change_requested("p", "c1", "run", "bob", "");
+        assert!(without.message.contains("/v1/changes/c1/approve"));
+        assert_eq!(EventKind::ChangeRequested.as_str(), "change_requested");
     }
 }

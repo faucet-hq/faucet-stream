@@ -41,6 +41,8 @@ fn opts(name: &str, concurrency: Option<usize>) -> ExecuteOptions {
         notifier: None,
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage: Default::default(),
+        budget: None,
     }
 }
 

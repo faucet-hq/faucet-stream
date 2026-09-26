@@ -775,6 +775,29 @@ cwd when omitted. `annotate` is the one write: it sets a dataset's owners
 consumers named in that call; `--replace` drops the unlisted) — what
 [`plan --impact`](#plan) names. The others are read-only.
 
+## `usage`
+
+*(requires the `catalog` build feature)*
+
+```bash
+faucet usage [--config PATH] [--since WHEN] [--until WHEN] [--pipeline NAME] \
+             [--by pipeline|row|dataset|sink|day] [--limit N] [--json]
+```
+
+Aggregate the cost & usage records (#704) a config's `catalog:` store has
+accumulated: runs, rows in / out, estimated bytes, duration, backend
+requests, the priced estimate and the hosted per-row equivalent, one row per
+group plus a total. `--since` / `--until` take RFC 3339 or `YYYY-MM-DD`
+(half-open window). Estimates use each run's `usage:` pricing table; a
+connector that reported no cost signal is marked *compute not reported*.
+`faucet run --output json` carries the same record per row under `usage`, and
+`run`'s text summary prints one usage line per invocation. See the
+[usage cookbook](../cookbook/usage.md).
+
+`faucet run` also takes the run-budget flags `--max-records N`,
+`--max-bytes BYTES`, `--max-duration-secs SECS` and `--allowed-sink SINK`
+(repeatable), merged with the config's `budget:` block (#703).
+
 ## `template`
 
 *(requires the `templates` build feature — included in `full`)*
@@ -1092,6 +1115,8 @@ Selected flags (`faucet serve --help` for the full list):
 | `--preview-default-rows <n>` | Rows a preview loads when the request omits `row_count_to_load` — the soft cap (default `500`; env `FAUCET_SERVE_PREVIEW_DEFAULT_ROWS`). `0` = the whole dataset by default. |
 | `--preview-max-rows <n>` | Ceiling on one preview's rows — the hard cap (default `5000`; env `FAUCET_SERVE_PREVIEW_MAX_ROWS`). A larger `row_count_to_load` is clamped to it, never honoured. **`0` lifts the ceiling**, which is what makes `row_count_to_load=all` load an entire dataset. |
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
+| `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`. Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. |
+| `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
 | `--callback-allow-host <host>` | Restrict per-run completion callbacks to these hosts. Repeatable. Unset = any host except link-local / cloud-metadata addresses, which are always refused unless named here. See [Completion callbacks](./http-api.md#completion-callbacks). |
 
 ### Optional embedded web console (`serve-ui`)

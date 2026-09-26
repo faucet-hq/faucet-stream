@@ -454,3 +454,11 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 ## Observability
 
 Metrics emitted by this source are labelled `connector="s3"`.
+
+## Usage signals (#704)
+
+Every `ListObjectsV2` page (`list`), `GetObject` (`get`, one per object or
+per ranged read) and `HeadObject` (`head`) is reported to faucet's usage meter
+as a source round trip and priced as an S3 read request
+(`usage.pricing.object_storage.read_per_1k_requests`); see the
+[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).

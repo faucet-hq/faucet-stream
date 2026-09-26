@@ -19,7 +19,9 @@
 //! consistent with the rest, and — unlike a tokio task-local — the `Arc`
 //! survives `tokio::spawn`, which the S3 and Parquet fan-out paths rely on.
 
+use crate::usage::{CostSignal, UsageMeter, UsageSide};
 use metrics::{Label, SharedString, counter, histogram};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Which side of the pipeline a round trip belongs to. Selects the metric
@@ -60,6 +62,19 @@ pub struct RoundtripRecorder {
     side: RoundtripSide,
     /// `pipeline` / `row` / `connector`, resolved once by the pipeline.
     base: Vec<Label>,
+    /// The run's usage meter (#704), when one is attached: every round trip
+    /// and cost signal is tallied there as well as emitted as a metric.
+    meter: Option<Arc<UsageMeter>>,
+    connector: SharedString,
+}
+
+impl RoundtripSide {
+    fn usage_side(self) -> UsageSide {
+        match self {
+            Self::Source => UsageSide::Source,
+            Self::Sink => UsageSide::Sink,
+        }
+    }
 }
 
 impl RoundtripRecorder {
@@ -70,13 +85,45 @@ impl RoundtripRecorder {
         row: impl Into<SharedString>,
         connector: impl Into<SharedString>,
     ) -> Self {
+        let connector: SharedString = connector.into();
         Self {
             side,
             base: vec![
                 Label::new("pipeline", pipeline.into()),
                 Label::new("row", row.into()),
-                Label::new("connector", connector.into()),
+                Label::new("connector", connector.clone()),
             ],
+            meter: None,
+            connector,
+        }
+    }
+
+    /// Also tally into a run's usage meter (#704).
+    pub fn with_meter(mut self, meter: Arc<UsageMeter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
+    /// Report a backend-measured usage figure (#704) — BigQuery's bytes
+    /// billed for a job, the payload size of a streaming insert, a
+    /// warehouse's credits. Emitted as
+    /// `faucet_cost_signals_total{pipeline,row,connector,kind,unit}` (the
+    /// quantity rounded to a whole unit) and, when a meter is attached, kept
+    /// verbatim for the run's usage record. `kind` and `unit` are a closed
+    /// set per connector, documented in its README.
+    pub fn signal(&self, kind: &'static str, unit: &'static str, quantity: f64) {
+        let mut labels = self.base.clone();
+        labels.push(Label::new("kind", SharedString::const_str(kind)));
+        labels.push(Label::new("unit", SharedString::const_str(unit)));
+        counter!("faucet_cost_signals_total", labels).increment(quantity.max(0.0).round() as u64);
+        if let Some(m) = &self.meter {
+            m.add_signal(CostSignal {
+                kind: kind.to_string(),
+                unit: unit.to_string(),
+                quantity,
+                side: self.side.usage_side(),
+                connector: self.connector.to_string(),
+            });
         }
     }
 
@@ -87,6 +134,9 @@ impl RoundtripRecorder {
     /// A retried call is a real round trip and must be counted again.
     pub fn record(&self, op: &'static str) {
         counter!(self.side.counter_name(), self.labels_for(op)).increment(1);
+        if let Some(m) = &self.meter {
+            m.add_roundtrip(self.side.usage_side(), op);
+        }
     }
 
     /// Count one round trip and record how long it took.
@@ -94,6 +144,9 @@ impl RoundtripRecorder {
         let labels = self.labels_for(op);
         counter!(self.side.counter_name(), labels.clone()).increment(1);
         histogram!(self.side.histogram_name(), labels).record(elapsed.as_secs_f64());
+        if let Some(m) = &self.meter {
+            m.add_roundtrip(self.side.usage_side(), op);
+        }
     }
 
     fn labels_for(&self, op: &'static str) -> Vec<Label> {
@@ -118,6 +171,10 @@ impl RoundtripRecorder {
 /// by `install_observability`.
 pub fn describe_roundtrip_metrics() {
     metrics::describe_counter!(
+        "faucet_cost_signals_total",
+        "Backend-reported usage a connector measured during a run (BigQuery bytes billed, streamed payload bytes, …), by kind and unit"
+    );
+    metrics::describe_counter!(
         "faucet_source_roundtrips_total",
         "Calls a source made to its upstream backend, by connector-defined op"
     );
@@ -140,6 +197,33 @@ pub fn describe_roundtrip_metrics() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metered_recorders_feed_the_usage_meter_through_a_slot() {
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        for side in [RoundtripSide::Source, RoundtripSide::Sink] {
+            let slot = RecorderSlot::new();
+            slot.record("get");
+            slot.record_timed("get", Duration::from_millis(1));
+            slot.signal("bytes_billed", "bytes", 10.0);
+            assert!(slot.recorder().is_none());
+            slot.install(Arc::new(
+                RoundtripRecorder::new(side, "p", "r", "c").with_meter(meter.clone()),
+            ));
+            slot.record("get");
+            slot.record_timed("put", Duration::from_millis(2));
+            slot.signal("bytes_billed", "bytes", 1024.4);
+            assert!(slot.recorder().is_some());
+        }
+        let snap = meter.snapshot();
+        assert_eq!(snap.source_roundtrips["get"], 1);
+        assert_eq!(snap.source_roundtrips["put"], 1);
+        assert_eq!(snap.sink_roundtrips["get"], 1);
+        assert_eq!(snap.signals.len(), 2);
+        assert_eq!(snap.signals[0].kind, "bytes_billed");
+        assert_eq!(snap.signals[0].connector, "c");
+        assert_eq!(snap.signals[1].side, crate::usage::UsageSide::Sink);
+    }
 
     #[test]
     fn side_selects_the_metric_names() {
@@ -248,5 +332,55 @@ mod tests {
         let r = RoundtripRecorder::new(RoundtripSide::Source, "p", "r", "kafka");
         let c = r.clone();
         assert_eq!(r.labels_for_test("poll"), c.labels_for_test("poll"));
+    }
+}
+
+/// A connector's slot for the recorder the pipeline installs (#638 / #704).
+///
+/// Connectors keep one of these in their struct and forward
+/// [`set_roundtrip_recorder`](crate::Source::set_roundtrip_recorder) to
+/// [`install`](Self::install); every call site then does
+/// `self.roundtrips.record("get")` without checking whether a pipeline
+/// installed anything. First install wins — the pipeline installs exactly
+/// once per run, and a re-used connector instance keeps the labels it is
+/// already counting under.
+#[derive(Debug, Default)]
+pub struct RecorderSlot(OnceLock<Arc<RoundtripRecorder>>);
+
+impl RecorderSlot {
+    pub const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// Install the pipeline's recorder (no-op when one is already installed).
+    pub fn install(&self, recorder: Arc<RoundtripRecorder>) {
+        let _ = self.0.set(recorder);
+    }
+
+    /// The installed recorder, for handing to a helper that performs I/O on
+    /// the connector's behalf.
+    pub fn recorder(&self) -> Option<Arc<RoundtripRecorder>> {
+        self.0.get().cloned()
+    }
+
+    /// Count one round trip when a recorder is installed.
+    pub fn record(&self, op: &'static str) {
+        if let Some(r) = self.0.get() {
+            r.record(op);
+        }
+    }
+
+    /// Count one timed round trip when a recorder is installed.
+    pub fn record_timed(&self, op: &'static str, elapsed: Duration) {
+        if let Some(r) = self.0.get() {
+            r.record_timed(op, elapsed);
+        }
+    }
+
+    /// Report a backend-measured usage figure when a recorder is installed.
+    pub fn signal(&self, kind: &'static str, unit: &'static str, quantity: f64) {
+        if let Some(r) = self.0.get() {
+            r.signal(kind, unit, quantity);
+        }
     }
 }

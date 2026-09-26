@@ -42,6 +42,8 @@ fn opts(name: &str, cfg: &PipelineConfig) -> ExecuteOptions {
         notifier: None,
         #[cfg(feature = "catalog")]
         catalog: None,
+        usage: Default::default(),
+        budget: None,
     }
 }
 

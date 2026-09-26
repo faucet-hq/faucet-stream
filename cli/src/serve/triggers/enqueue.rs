@@ -80,6 +80,10 @@ pub fn build_submit_request(
         // exists for the opposite case: an external caller submitting a run and
         // naming its own endpoint.
         callback: None,
+        require_approval: false,
+        reason: None,
+        budget: None,
+        approved_change: None,
     }
 }
 

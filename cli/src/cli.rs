@@ -203,6 +203,11 @@ pub enum Command {
     /// store — datasets, schema timelines, volume/freshness, lineage.
     #[cfg(feature = "catalog")]
     Catalog(CatalogArgs),
+    /// Report cost & usage (#704) — records, estimated bytes, round trips,
+    /// connector cost signals and priced estimates — from a config's
+    /// `catalog:` store, grouped by pipeline / row / dataset / sink / day.
+    #[cfg(feature = "catalog")]
+    Usage(UsageArgs),
     /// Register a parameterized config once, then trigger runs by id + params.
     /// The registry is shared with `faucet serve` — point both at the same
     /// store URL and templates registered here are triggerable over HTTP.
@@ -401,6 +406,30 @@ pub struct CompletionsArgs {
 pub struct CatalogArgs {
     #[command(subcommand)]
     pub command: CatalogCommand,
+}
+
+/// `faucet usage` (#704).
+#[cfg(feature = "catalog")]
+#[derive(Debug, Parser)]
+pub struct UsageArgs {
+    #[command(flatten)]
+    pub common: CatalogConfigArgs,
+    /// Only invocations recorded at or after this instant (RFC 3339, or a
+    /// `YYYY-MM-DD` date at midnight UTC).
+    #[arg(long, value_name = "WHEN")]
+    pub since: Option<String>,
+    /// Only invocations recorded before this instant (RFC 3339 or date).
+    #[arg(long, value_name = "WHEN")]
+    pub until: Option<String>,
+    /// Only this pipeline (the config `name`).
+    #[arg(long)]
+    pub pipeline: Option<String>,
+    /// Group rows by `pipeline` (default), `row`, `dataset`, `sink` or `day`.
+    #[arg(long, default_value = "pipeline")]
+    pub by: String,
+    /// Most invocation records to read (newest first).
+    #[arg(long, default_value_t = 5000)]
+    pub limit: usize,
 }
 
 /// `faucet catalog` subcommands.
@@ -1669,6 +1698,18 @@ pub struct ServeArgs {
     /// build with the `policy` feature.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<std::path::PathBuf>,
+    /// Require an approved change request (#703) before these kinds of
+    /// actions happen: `run` (`POST /v1/runs` and template triggers answer
+    /// with a pending change request instead of a run; backfills are
+    /// refused), `template_register`, `template_launch`. Repeatable or
+    /// comma-separated. Who may approve is the `approvals:` block of
+    /// `--auth-config`.
+    #[arg(long = "require-approval", value_name = "KIND")]
+    pub require_approval: Vec<String>,
+    /// How long a pending change request stays approvable (seconds) when the
+    /// `--auth-config` `approvals.expire_secs` does not say. Default 24h.
+    #[arg(long, default_value_t = 86_400)]
+    pub approval_expiry_secs: u64,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless
@@ -1771,6 +1812,23 @@ pub struct RunArgs {
     /// a labelled column may reach. Violations are reported and refuse a run.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<PathBuf>,
+    /// Run budget (#703): refuse the page that would take an invocation past
+    /// this many records written (the stricter of this and the config's
+    /// `budget.max_records` applies).
+    #[arg(long, value_name = "N")]
+    pub max_records: Option<u64>,
+    /// Run budget: refuse the page that would take an invocation past this
+    /// many estimated bytes written.
+    #[arg(long, value_name = "BYTES")]
+    pub max_bytes: Option<u64>,
+    /// Run budget: cancel an invocation (cooperatively, at its next page
+    /// boundary) once it has run this long.
+    #[arg(long, value_name = "SECS")]
+    pub max_duration_secs: Option<u64>,
+    /// Run budget: only these sink templates / connector kinds may be written
+    /// to (repeatable). Checked before anything runs.
+    #[arg(long = "allowed-sink", value_name = "SINK")]
+    pub allowed_sinks: Vec<String>,
     /// Show a live full-screen terminal UI (per-invocation throughput, errors,
     /// DLQ counts, bookmark age) while the pipeline runs. Requires a binary
     /// built with the `cli-tui` feature and a real terminal on stdout —
@@ -2125,6 +2183,11 @@ pub enum SchemaTarget {
     Verify,
     /// JSON Schema for the top-level `rollback:` (undoable runs) block.
     Rollback,
+    /// The top-level `usage:` block (#704): the pricing table cost estimates
+    /// are computed from.
+    Usage,
+    /// The top-level `budget:` block (#703): run ceilings.
+    Budget,
     /// JSON Schema for the `mirror:` (snapshot→CDC) block; `replication` is
     /// the pre-#670 name, still accepted.
     #[command(name = "mirror", alias = "replication")]
