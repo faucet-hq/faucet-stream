@@ -405,7 +405,8 @@ returns the `StatusReport` behind [`faucet status`](cli.md#status): per row,
 the SLA history, and this server's run history — each tagged with its
 `source`), `bookmark` and `bookmark_age_secs`, `exactly_once`
 (`state_seq`, and with `probe=true` the sink's watermark, `agreement` and which
-side the next run `trusted`), `dlq` backlog, `sla` verdicts, `profiling`,
+side the next run `trusted`), `overwrite_staging` (`state` present / absent /
+unknown, `verified` only with `probe=true`), `dlq` backlog, `sla` verdicts, `profiling`,
 `rollback`, `children`, the `resume` sentence, and per-field `errors`. The
 top-level `health` / `exit_code` are the worst row's. A run in flight on this
 server shows as `running` — every submitted run carries a `pipeline` label

@@ -1378,6 +1378,11 @@ impl Sink for MssqlSink {
         Ok(())
     }
 
+    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(Some(self.table_exists(&self.staging_literal()).await?))
+    }
+
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
     /// behind. Best-effort — the destination was never touched (on a first run
     /// it was never created).

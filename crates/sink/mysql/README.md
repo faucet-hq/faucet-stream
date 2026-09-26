@@ -427,6 +427,9 @@ mid-run failure leaves the previous rows intact. No `key` is needed; a missing t
 first run (staged from the first page, then renamed into place at commit — a
 failed first run leaves no table) when `create_table: true`.
 
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table (or the `<table>__faucet_ovw_old` an interrupted `RENAME` swap leaves) read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+
 ## Rollback (`faucet rollback`, #706)
 
 With a top-level `rollback:` block in the pipeline config, every run of this

@@ -68,9 +68,14 @@ What each row reports:
   noted as not countable here.
 - **SLA** — staleness against `max_staleness_secs`, the last run's volume
   against `min_rows_per_run` and the learned baseline.
-- **profiling** drift in the latest run, **rollback** markers (undoable runs),
-  and a possible leftover **overwrite staging** table after a failed
-  `write_mode: overwrite` run.
+- **profiling** drift in the latest run and **rollback** markers (undoable runs).
+- **overwrite staging** (`write_mode: overwrite` rows) — with `--probe` the
+  sink is asked whether its `…__faucet_ovw` staging table / collection exists
+  (postgres, sqlite, mysql, mssql, mongodb, bigquery): `present` means a
+  crashed or aborted overwrite left it behind (the row is degraded; the next
+  overwrite run replaces it), `absent` means clean, `unknown` means the sink
+  could not tell or could not be reached. Without `--probe`, a failed last run
+  shows `unknown` labelled *unverified*.
 - **children** — a child row's per-parent invocations fold under their parent
   as a bookmark count, failed invocations and the worst health.
 - **running** — a live run lease (pid / host / since). An *expired* lease

@@ -368,3 +368,67 @@ pipeline:
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn probe_detects_leftover_overwrite_staging_until_a_rerun_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("in.csv"), "id,name\n1,x\n2,y\n").unwrap();
+    let db = dir.path().join("ovw.db");
+    let text = format!(
+        r#"version: 1
+name: ovw
+pipeline:
+  source: {{ type: csv, config: {{ path: {input} }} }}
+  sink: {{ type: sqlite, config: {{ database_url: "sqlite://{db}?mode=rwc", table_name: t, column_mapping: auto_map, create_table: true, write_mode: overwrite }} }}
+  state: {{ type: file, config: {{ path: {state} }} }}
+"#,
+        input = s(&dir.path().join("in.csv")),
+        db = s(&db),
+        state = s(&dir.path().join("state")),
+    );
+    let cfg = dir.path().join("ovw.yaml");
+    std::fs::write(&cfg, &text).unwrap();
+    let summary = faucet_cli::run_from_yaml_str(&text).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+
+    // A crashed overwrite leaves its staging table behind.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", s(&db)))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE t__faucet_ovw (id INTEGER, name TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let mut a = args(&cfg);
+    a.probe = true;
+    let r = faucet_cli::commands::status::build(&a).await.unwrap();
+    let sg = r.rows[0].overwrite_staging.as_ref().expect("probed");
+    assert_eq!((sg.state, sg.verified), ("present", true));
+    assert_eq!(
+        r.rows[0].health,
+        Health::Degraded,
+        "{:?}",
+        r.rows[0].reasons
+    );
+    let err = run(&["status", &s(&cfg), "--probe"]).await.unwrap_err();
+    assert!(
+        matches!(err, CliError::StatusUnhealthy { code: 1, .. }),
+        "{err}"
+    );
+    // Without --probe nothing is claimed: the last run succeeded.
+    let r = faucet_cli::commands::status::build(&args(&cfg))
+        .await
+        .unwrap();
+    assert!(r.rows[0].overwrite_staging.is_none());
+
+    // A successful rerun replaces the staging and swaps it in.
+    let summary = faucet_cli::run_from_yaml_str(&text).await.unwrap();
+    assert!(!summary.had_failures(), "{summary:?}");
+    let r = faucet_cli::commands::status::build(&a).await.unwrap();
+    let sg = r.rows[0].overwrite_staging.as_ref().expect("probed");
+    assert_eq!((sg.state, sg.verified), ("absent", true));
+    assert_eq!(r.rows[0].health, Health::Ok);
+    run(&["status", &s(&cfg), "--probe"]).await.unwrap();
+}

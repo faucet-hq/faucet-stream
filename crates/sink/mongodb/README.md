@@ -335,3 +335,6 @@ are staged into `{collection}__faucet_ovw` and published with an atomic
 `renameCollection(dropTarget: true)` only after the run succeeds, so a mid-run
 failure leaves the previous documents intact. No `key` is needed. Requires the
 `renameCollection` privilege and is unsupported on sharded collections.
+
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<collection>__faucet_ovw` collection read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.

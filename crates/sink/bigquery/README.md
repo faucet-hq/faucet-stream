@@ -500,6 +500,9 @@ to replace only the rows in a half-open `[from, to)` window — the swap becomes
 `BEGIN TRANSACTION; DELETE FROM target WHERE <window>; INSERT … SELECT; COMMIT`,
 leaving out-of-window rows intact (ideal for rolling-window / period-report loads).
 
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+
 ## Usage signals (#704)
 
 The sink reports its backend round trips (`insert` streaming requests, `query`

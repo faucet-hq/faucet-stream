@@ -3372,7 +3372,14 @@ components:
           properties:
             undoable_runs: { type: integer }
             newest: { type: string }
-        overwrite_staging: { type: string }
+        overwrite_staging:
+          type: object
+          description: Overwrite staging left behind by a crashed or aborted overwrite run
+          properties:
+            state: { type: string, enum: [present, absent, unknown] }
+            verified: { type: boolean, description: "true when the sink was probed (`probe`); false for the unverified hint after a failed run" }
+            object: { type: string }
+            note: { type: string }
         resume: { type: string, description: What the next run reads from, in words }
         resume_bookmark: {}
         children:

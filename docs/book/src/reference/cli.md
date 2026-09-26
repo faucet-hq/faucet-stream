@@ -789,7 +789,10 @@ invocations, worst health). **Exit code:** `0` healthy (`ok` / `running` /
 Nagios-style check. Each field is read independently: an unreachable state
 backend or DLQ is reported on its row, never failing the command. `--probe`
 reads each exactly-once row's committed sink watermark (read-only) and says
-whether it agrees with the state store and which side the next run trusts.
+whether it agrees with the state store and which side the next run trusts, and
+asks each `write_mode: overwrite` row's sink whether its `…__faucet_ovw` staging
+object exists (`present` / `absent` / `unknown`; without `--probe` a failed
+overwrite run is reported as an *unverified* `unknown`).
 The `--json` document is the `StatusReport` schema in
 [`docs/openapi.yaml`](http-api.md#pipeline-status-and-state). See the
 [state and status cookbook](../cookbook/state-and-status.md).

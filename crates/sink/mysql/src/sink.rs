@@ -1266,6 +1266,15 @@ impl faucet_core::Sink for MysqlSink {
         Ok(())
     }
 
+    /// Probe for the `<table>__faucet_ovw` staging table, or the
+    /// `<table>__faucet_ovw_old` a swap interrupted mid-`RENAME` leaves (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(Some(
+            self.table_exists(&self.staging_table_name()).await?
+                || self.table_exists(&self.old_table_name()).await?,
+        ))
+    }
+
     /// Drop the staging (and any old) table so a failed/cancelled overwrite
     /// leaves nothing behind. Best-effort — the destination was never touched.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {

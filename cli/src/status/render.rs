@@ -209,7 +209,7 @@ fn details(r: &RowStatus, now: DateTime<Utc>) -> Vec<String> {
         ));
     }
     if let Some(o) = &r.overwrite_staging {
-        marks.push(o.clone());
+        marks.push(format!("overwrite staging: {} — {}", o.state, o.note));
     }
     for c in &r.children {
         marks.push(format!(

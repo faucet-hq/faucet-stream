@@ -1732,3 +1732,27 @@ async fn append_creates_table_when_missing_under_the_default_load_path() {
         "the default append must not fall back to streaming inserts"
     );
 }
+
+#[tokio::test]
+async fn staging_probe_reports_present_and_absent() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_staging_present(&server).await;
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(true));
+
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{TABLE_ID}__faucet_ovw"
+        )))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {"code": 404, "message": "Not found: Table",
+                      "errors": [{"reason": "notFound", "message": "Not found: Table"}]}
+        })))
+        .mount(&server)
+        .await;
+    let (sink, _sa) = build_sink(&server, config_overwrite()).await;
+    assert_eq!(sink.overwrite_staging_exists().await.unwrap(), Some(false));
+}

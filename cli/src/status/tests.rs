@@ -299,13 +299,38 @@ async fn overwrite_failures_flag_possible_staging() {
     put_outcome(store.as_ref(), "o::row-0", vec![ev(10, Some("boom"))]).await;
     let auth = AuthCatalog::new();
     let r = assemble(&t, Ok(&s), &inputs(&auth)).await.unwrap();
-    assert!(
-        r.rows[0]
-            .overwrite_staging
-            .as_ref()
-            .unwrap()
-            .contains("t__faucet_ovw")
-    );
+    let sg = r.rows[0].overwrite_staging.as_ref().unwrap();
+    assert_eq!((sg.state, sg.verified), ("unknown", false));
+    assert_eq!(sg.object, "t__faucet_ovw");
+    assert!(sg.note.contains("unverified"));
+    assert!(render::render(&r).contains("overwrite staging: unknown"));
+
+    // --probe asks the sink: a fresh database holds no staging.
+    let dir = tempfile::tempdir().unwrap();
+    let mut probed = t.clone();
+    probed.rows[0].sink_config["database_url"] = serde_json::json!(format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("x.db").display()
+    ));
+    probed.rows[0].sink_config["column_mapping"] = serde_json::json!("auto_map");
+    let mut inp = inputs(&auth);
+    inp.probe = true;
+    let r = assemble(&probed, Ok(&s), &inp).await.unwrap();
+    let sg = r.rows[0].overwrite_staging.as_ref().unwrap();
+    assert_eq!((sg.state, sg.verified), ("absent", true), "{}", sg.note);
+    // A sink that cannot be built, or cannot tell, is unknown.
+    let mut broken = probed.clone();
+    broken.rows[0].sink_kind = "nope".into();
+    let r = assemble(&broken, Ok(&s), &inp).await.unwrap();
+    let sg = r.rows[0].overwrite_staging.as_ref().unwrap();
+    assert_eq!(sg.state, "unknown");
+    assert!(sg.note.contains("probe failed"));
+    let mut silent = probed.clone();
+    silent.rows[0].sink_kind = "stdout".into();
+    silent.rows[0].sink_config = serde_json::json!({});
+    let r = assemble(&silent, Ok(&s), &inp).await.unwrap();
+    let sg = r.rows[0].overwrite_staging.as_ref().unwrap();
+    assert!(sg.note.contains("cannot report"), "{}", sg.note);
 }
 
 #[tokio::test]

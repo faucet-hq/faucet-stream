@@ -426,6 +426,9 @@ needed; a missing target is created by the first run
 run leaves no table) when `create_table: true`. Works in both `auto_map` and JSON
 column modes.
 
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+
 ## Rollback (`faucet rollback`, #706)
 
 With a top-level `rollback:` block in the pipeline config, every run of this

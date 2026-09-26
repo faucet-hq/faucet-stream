@@ -464,6 +464,9 @@ to replace only the rows in a half-open `[from, to)` window — the swap becomes
 `DELETE FROM target WHERE <window>; INSERT … SELECT` in one transaction, leaving
 out-of-window rows intact.
 
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.
+
 ## Rollback (`faucet rollback`, #706)
 
 With a top-level `rollback:` block in the pipeline config, every run of this

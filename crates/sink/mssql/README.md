@@ -400,3 +400,6 @@ swapped in one transaction (`DELETE` + `INSERT` over the explicit non-IDENTITY
 column list + `DROP`) only after the run succeeds, so a mid-run failure leaves
 the previous rows intact. No `key` is needed; the target table must already
 exist.
+
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.

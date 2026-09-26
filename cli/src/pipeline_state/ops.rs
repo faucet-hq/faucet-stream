@@ -385,7 +385,7 @@ pub async fn probe_watermark(
     })
 }
 
-async fn build_row_sink(
+pub(crate) async fn build_row_sink(
     row: &RowTarget,
     auth: &AuthCatalog,
 ) -> CliResult<Box<dyn faucet_core::Sink>> {

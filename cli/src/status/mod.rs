@@ -140,6 +140,18 @@ pub struct ProfilingStatus {
     pub drift: usize,
 }
 
+/// What is known about a row's overwrite staging object.
+#[derive(Debug, Clone, Serialize)]
+pub struct StagingStatus {
+    /// `present` / `absent` / `unknown`.
+    pub state: &'static str,
+    /// Whether the sink was asked (`--probe`); otherwise an unverified hint.
+    pub verified: bool,
+    /// The staging object's name.
+    pub object: String,
+    pub note: String,
+}
+
 /// Undoable runs kept for `faucet rollback`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RollbackStatus {
@@ -191,8 +203,9 @@ pub struct RowStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profiling: Option<ProfilingStatus>,
     pub rollback: RollbackStatus,
+    /// Overwrite staging left behind by a crashed or aborted overwrite run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub overwrite_staging: Option<String>,
+    pub overwrite_staging: Option<StagingStatus>,
     /// What the next run reads from, in words.
     pub resume: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,6 +422,70 @@ async fn rollback_status(
             RollbackStatus::default()
         }
     }
+}
+
+/// Probe (with `--probe`) or infer the row's overwrite staging state.
+async fn staging_status(
+    row: &RowTarget,
+    failing: bool,
+    inputs: &StatusInputs<'_>,
+) -> Option<StagingStatus> {
+    let table = ["table_name", "table", "collection", "table_id"]
+        .iter()
+        .find_map(|k| row.sink_config.get(*k).and_then(Value::as_str))
+        .unwrap_or("<target>");
+    let object = format!(
+        "{table}{}",
+        faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
+    );
+    if !inputs.probe {
+        return failing.then(|| StagingStatus {
+            state: "unknown",
+            verified: false,
+            note: format!(
+                "unverified: the last run failed mid-overwrite, so staging `{object}` may have \
+                 been left behind — pass --probe to check"
+            ),
+            object,
+        });
+    }
+    let probed = match crate::pipeline_state::ops::build_row_sink(row, inputs.auth).await {
+        Ok(sink) => sink
+            .overwrite_staging_exists()
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let (state, note) = match probed {
+        Ok(Some(true)) => (
+            "present",
+            format!(
+                "staging `{object}` exists — a crashed or aborted overwrite left it behind; the \
+                 next overwrite run replaces it"
+            ),
+        ),
+        Ok(Some(false)) => ("absent", format!("no staging `{object}` left behind")),
+        Ok(None) => (
+            "unknown",
+            format!(
+                "the `{}` sink cannot report its overwrite staging",
+                row.sink_kind
+            ),
+        ),
+        Err(e) => (
+            "unknown",
+            format!(
+                "staging probe failed: {}",
+                crate::secrets::registry::redact(&e)
+            ),
+        ),
+    };
+    Some(StagingStatus {
+        state,
+        verified: state != "unknown",
+        object,
+        note,
+    })
 }
 
 async fn children_status(
@@ -758,15 +835,8 @@ async fn row_status(
         }
     }
 
-    if row.overwrite && facts.outcomes.failing() {
-        let table = ["table_name", "table", "collection", "table_id"]
-            .iter()
-            .find_map(|k| row.sink_config.get(*k).and_then(Value::as_str))
-            .unwrap_or("<target>");
-        st.overwrite_staging = Some(format!(
-            "the last run failed mid-overwrite; staging `{table}{}` may have been left behind",
-            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX
-        ));
+    if row.overwrite {
+        st.overwrite_staging = staging_status(row, facts.outcomes.failing(), inputs).await;
     }
 
     for child in target
@@ -828,6 +898,11 @@ fn finish(mut st: RowStatus, failing: bool, inputs: &StatusInputs<'_>) -> RowSta
             && eo.agreement == Agreement::StateAhead
         {
             degraded.push("the state store is ahead of the sink's exactly-once watermark — the sink lost or rewound committed pages".into());
+        }
+        if let Some(sg) = &st.overwrite_staging
+            && sg.state == "present"
+        {
+            degraded.push(sg.note.clone());
         }
         if st
             .reasons

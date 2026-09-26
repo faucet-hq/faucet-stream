@@ -2312,6 +2312,11 @@ impl faucet_core::Sink for BigQuerySink {
         self.run_ddl(format!("DROP TABLE IF EXISTS {temp}")).await
     }
 
+    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(Some(self.table_exists(&self.overwrite_temp_id()).await?))
+    }
+
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing
     /// behind. Best-effort — the destination was never touched.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
