@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-s3-v1.4.1...faucet-sink-s3-v1.5.0) - 2026-09-26
+
+### Features
+
+- Change requests (plan → approve → run), run budgets, and cost & usage accounting ([#730](https://github.com/faucet-hq/faucet-stream/pull/730))
+- Deployment overlays, template version deprecation, first-run tables, one-meaning vocabulary ([#693](https://github.com/faucet-hq/faucet-stream/pull/693))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
+### Testing
+
+- Pull MinIO from quay.io — the Docker Hub repository was withdrawn ([#653](https://github.com/faucet-hq/faucet-stream/pull/653))
+
 ## [1.4.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-s3-v1.4.0...faucet-sink-s3-v1.4.1) - 2026-08-23
 
 ### Miscellaneous

@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-mysql-v1.7.0...faucet-sink-mysql-v1.8.0) - 2026-09-26
+
+### Bug Fixes
+
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Features
+
+- Content verification (`faucet verify`) and run rollback (`faucet rollback`) ([#725](https://github.com/faucet-hq/faucet-stream/pull/725))
+- Deployment overlays, template version deprecation, first-run tables, one-meaning vocabulary ([#693](https://github.com/faucet-hq/faucet-stream/pull/693))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
+### Testing
+
+- Finish the reliability program — drift matrix, fidelity pairs, container faults ([#663](https://github.com/faucet-hq/faucet-stream/pull/663))
+
 ## [1.7.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-mysql-v1.6.0...faucet-sink-mysql-v1.7.0) - 2026-08-23
 
 ### Features

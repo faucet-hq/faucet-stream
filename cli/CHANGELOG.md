@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.13.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.12.0...faucet-cli-v1.13.0) - 2026-09-26
+
+### Bug Fixes
+
+- *(hub)* An unchanged template is the newest version whatever commit index.json names ([#689](https://github.com/faucet-hq/faucet-stream/pull/689))
+- SQLite write-lock contention, topology cooldown, LPT dispatch, JSON logs (issue audit #580+) ([#667](https://github.com/faucet-hq/faucet-stream/pull/667))
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+- *(serve)* Bound the unlimited preview path; refuse external outputs ([#643](https://github.com/faucet-hq/faucet-stream/pull/643))
+- *(serve-ui)* Wider schemas page, no timestamp wrap, single-dash tz label ([#607](https://github.com/faucet-hq/faucet-stream/pull/607))
+- *(serve-ui)* Repair templates UI — actions row, search, sortable header ([#598](https://github.com/faucet-hq/faucet-stream/pull/598))
+
+### Documentation
+
+- *(hub)* Examples use full owner/name template ids ([#690](https://github.com/faucet-hq/faucet-stream/pull/690))
+- *(hub)* Stars are discussion upvotes ([#687](https://github.com/faucet-hq/faucet-stream/pull/687))
+- Add the canonical verb registry and finish the coverage-policy change ([#655](https://github.com/faucet-hq/faucet-stream/pull/655))
+
+### Features
+
+- Oracle (source, LogMiner CDC, sink), Iceberg source, DynamoDB (source + Streams CDC, sink) and Databricks sink ([#739](https://github.com/faucet-hq/faucet-stream/pull/739))
+- *(serve)* Multi-tenant embedded integrations — tenants, sealed connections, hosted OAuth, fan-out ([#738](https://github.com/faucet-hq/faucet-stream/pull/738))
+- Change requests (plan → approve → run), run budgets, and cost & usage accounting ([#730](https://github.com/faucet-hq/faucet-stream/pull/730))
+- Data-flow policies (`policy:` / `--policy`) and change impact analysis (`plan --impact`)
+- Learned column profiles with drift detection (`profiling:`) ([#726](https://github.com/faucet-hq/faucet-stream/pull/726))
+- Content verification (`faucet verify`) and run rollback (`faucet rollback`) ([#725](https://github.com/faucet-hq/faucet-stream/pull/725))
+- *(templates)* Admin-only template lifecycle with a role-aware console, per-version deprecation, and cross-hub composition ([#700](https://github.com/faucet-hq/faucet-stream/pull/700))
+- RabbitMQ connector pair, GCS emulator suites in CI, integration-coverage gate, sectioned trigger form ([#699](https://github.com/faucet-hq/faucet-stream/pull/699))
+- Deployment overlays, template version deprecation, first-run tables, one-meaning vocabulary ([#693](https://github.com/faucet-hq/faucet-stream/pull/693))
+- *(hub)* Trust signals for templates — stars, freshness, issues; hub list --sort ([#686](https://github.com/faucet-hq/faucet-stream/pull/686))
+- *(hub)* The official template set is the faucet-hq namespace ([#684](https://github.com/faucet-hq/faucet-stream/pull/684))
+- *(hub)* Owner-scoped template ids (owner/name), catalog versions with @stable/@newest/@N ([#683](https://github.com/faucet-hq/faucet-stream/pull/683))
+- *(hub)* Hosted Template Hub — remote --hub catalogs, hub sync origins, registry matrix ([#681](https://github.com/faucet-hq/faucet-stream/pull/681))
+- *(templates)* Kind-aware registry — source × sink templates compose at trigger time (RFC 0008) ([#680](https://github.com/faucet-hq/faucet-stream/pull/680))
+- *(cli)* Template Hub — source/sink-split templates composed at run time
+- *(templates)* Host + sync pipeline templates from remote origins (RFC 0006)
+- *(core)* Run governance on the columnar fast path ([#673](https://github.com/faucet-hq/faucet-stream/pull/673))
+- Arrow-columnar REST→BigQuery, vectorized transforms, lighter lineage UX ([#672](https://github.com/faucet-hq/faucet-stream/pull/672))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+- Generic REST discovery, partitioned typed OData, byte-passthrough loads + BigQuery/serve upgrades ([#650](https://github.com/faucet-hq/faucet-stream/pull/650))
+- *(serve,serve-ui)* Source-backed dataset preview for local sink outputs ([#642](https://github.com/faucet-hq/faucet-stream/pull/642))
+- *(serve)* Retention GC for local sink outputs + Datasets-page cleanup controls ([#596](https://github.com/faucet-hq/faucet-stream/pull/596))
+- *(serve-ui)* Timezone selector, templates sort/filter, inline-markdown descriptions + polish ([#603](https://github.com/faucet-hq/faucet-stream/pull/603))
+- *(serve-ui)* Themed date picker, dropdown chevrons, and schema/template polish ([#601](https://github.com/faucet-hq/faucet-stream/pull/601))
+
+### Testing
+
+- Cover the three pure decisions that were only reachable through I/O ([#659](https://github.com/faucet-hq/faucet-stream/pull/659))
+
 ## [1.12.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.11.0...faucet-cli-v1.12.0) - 2026-08-24
 
 ### Features

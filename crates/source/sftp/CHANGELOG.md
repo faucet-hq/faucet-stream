@@ -7,6 +7,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-sftp-v1.1.1...faucet-source-sftp-v1.2.0) - 2026-09-26
+
+### Bug Fixes
+
+- Three inert config knobs — connector config validation, delta target_file_size, object-store concurrency ([#665](https://github.com/faucet-hq/faucet-stream/pull/665))
+
+### Features
+
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.1.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-sftp-v1.1.0...faucet-source-sftp-v1.1.1) - 2026-08-23
 
 ### Miscellaneous

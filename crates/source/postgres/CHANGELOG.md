@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-v1.7.1...faucet-source-postgres-v1.8.0) - 2026-09-26
+
+### Bug Fixes
+
+- Three reliability bugs — overwrite bookmark ordering, kafka headers, source error typing ([#664](https://github.com/faucet-hq/faucet-stream/pull/664))
+
+### Features
+
+- Content verification (`faucet verify`) and run rollback (`faucet rollback`) ([#725](https://github.com/faucet-hq/faucet-stream/pull/725))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
+### Testing
+
+- Finish the reliability program — drift matrix, fidelity pairs, container faults ([#663](https://github.com/faucet-hq/faucet-stream/pull/663))
+
 ## [1.7.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-postgres-v1.7.0...faucet-source-postgres-v1.7.1) - 2026-08-23
 
 ### Miscellaneous
