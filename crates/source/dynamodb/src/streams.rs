@@ -4,6 +4,7 @@
 use crate::config::DynamoDbSourceConfig;
 use crate::envelope::record_to_envelope;
 use crate::lineage::{ShardInfo, StartAt};
+use crate::sched::Lease;
 use aws_sdk_dynamodbstreams::Client as StreamsClient;
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use faucet_common_dynamodb::{ErrorClass, classify_error, sdk_error_parts};
@@ -104,7 +105,12 @@ pub(crate) async fn acquire_iterator(
     }
 }
 
-/// Events a shard worker sends to the consumer loop.
+/// Consecutive non-empty `GetRecords` batches one slice may read before the
+/// shard goes back to the queue, so busy shards cannot starve the others.
+pub(crate) const MAX_BATCHES_PER_SLICE: usize = 8;
+
+/// Events a slice worker sends to the consumer loop. Every slice ends with
+/// exactly one of `Yielded`, `Done` or `Failed`, after its `Records`.
 #[derive(Debug)]
 pub(crate) enum ShardEvent {
     /// Envelopes paired with their sequence numbers, in shard order.
@@ -112,6 +118,8 @@ pub(crate) enum ShardEvent {
         shard_id: String,
         records: Vec<(String, Value)>,
     },
+    /// The shard is still open: requeue it after `delay`.
+    Yielded { lease: Lease, delay: Duration },
     /// Closed shard fully drained.
     Done { shard_id: String },
     /// Unrecoverable failure.
@@ -121,37 +129,47 @@ pub(crate) enum ShardEvent {
     },
 }
 
-/// Read one shard until it closes, the consumer stops, or retries run out.
-pub(crate) async fn run_shard(
+/// Read one bounded slice of a shard: up to [`MAX_BATCHES_PER_SLICE`]
+/// batches, ending early when the shard is caught up (requeued after the poll
+/// interval), throttled (requeued after a backoff) or closed.
+pub(crate) async fn read_slice(
     client: StreamsClient,
     config: DynamoDbSourceConfig,
     stream_arn: String,
-    shard_id: String,
-    start: StartAt,
+    mut lease: Lease,
     tx: tokio::sync::mpsc::Sender<ShardEvent>,
 ) {
+    let shard_id = lease.shard_id.clone();
     let fail = |shard_id: String, error: FaucetError| ShardEvent::Failed { shard_id, error };
-    let poll = config.poll_interval();
-    let mut position = start;
-    let mut iterator = match acquire_iterator(&client, &stream_arn, &shard_id, &position).await {
-        Ok(IteratorOutcome::Ready(it)) => it,
-        Ok(IteratorOutcome::Trimmed) => {
-            let error = gap_error(&shard_id);
-            let _ = tx.send(fail(shard_id, error)).await;
-            return;
+    if lease.iterator.is_none() {
+        match acquire_iterator(&client, &stream_arn, &shard_id, &lease.position).await {
+            Ok(IteratorOutcome::Ready(it)) => lease.iterator = it,
+            Ok(IteratorOutcome::Trimmed) => {
+                let _ = tx.send(fail(shard_id.clone(), gap_error(&shard_id))).await;
+                return;
+            }
+            Err(error) => {
+                let _ = tx.send(fail(shard_id, error)).await;
+                return;
+            }
         }
-        Err(error) => {
-            let _ = tx.send(fail(shard_id, error)).await;
-            return;
-        }
-    };
+    }
     let mut attempts = 0u32;
-    let mut throttles = 0u32;
+    let mut batches = 0usize;
     loop {
-        let Some(current) = iterator.clone() else {
+        let Some(current) = lease.iterator.clone() else {
             let _ = tx.send(ShardEvent::Done { shard_id }).await;
             return;
         };
+        if batches >= MAX_BATCHES_PER_SLICE {
+            let _ = tx
+                .send(ShardEvent::Yielded {
+                    lease,
+                    delay: Duration::ZERO,
+                })
+                .await;
+            return;
+        }
         match client
             .get_records()
             .shard_iterator(&current)
@@ -161,7 +179,8 @@ pub(crate) async fn run_shard(
         {
             Ok(out) => {
                 attempts = 0;
-                throttles = 0;
+                lease.throttles = 0;
+                batches += 1;
                 let mut decoded = Vec::with_capacity(out.records().len());
                 for r in out.records() {
                     match record_to_envelope(r, &shard_id, &config.table_name) {
@@ -174,7 +193,7 @@ pub(crate) async fn run_shard(
                 }
                 let empty = decoded.is_empty();
                 if let Some((seq, _)) = decoded.last() {
-                    position = StartAt::After(seq.clone());
+                    lease.position = StartAt::After(seq.clone());
                 }
                 if !empty
                     && tx
@@ -187,23 +206,26 @@ pub(crate) async fn run_shard(
                 {
                     return;
                 }
-                iterator = out.next_shard_iterator().map(str::to_string);
-                if empty && iterator.is_some() {
-                    tokio::time::sleep(poll).await;
+                lease.iterator = out.next_shard_iterator().map(str::to_string);
+                if empty && lease.iterator.is_some() {
+                    let delay = config.poll_interval();
+                    let _ = tx.send(ShardEvent::Yielded { lease, delay }).await;
+                    return;
                 }
             }
             Err(e) => {
                 let (code, message) = sdk_error_parts(&e);
                 match code.as_deref() {
                     Some("ExpiredIteratorException") => {
-                        match acquire_iterator(&client, &stream_arn, &shard_id, &position).await {
+                        match acquire_iterator(&client, &stream_arn, &shard_id, &lease.position)
+                            .await
+                        {
                             Ok(IteratorOutcome::Ready(it)) => {
-                                iterator = it;
+                                lease.iterator = it;
                                 continue;
                             }
                             Ok(IteratorOutcome::Trimmed) => {
-                                let error = gap_error(&shard_id);
-                                let _ = tx.send(fail(shard_id, error)).await;
+                                let _ = tx.send(fail(shard_id.clone(), gap_error(&shard_id))).await;
                                 return;
                             }
                             Err(error) => {
@@ -213,17 +235,20 @@ pub(crate) async fn run_shard(
                         }
                     }
                     Some("TrimmedDataAccessException") => {
-                        let error = gap_error(&shard_id);
-                        let _ = tx.send(fail(shard_id, error)).await;
+                        let _ = tx.send(fail(shard_id.clone(), gap_error(&shard_id))).await;
                         return;
                     }
                     _ => {}
                 }
                 match classify_error(code.as_deref()) {
                     ErrorClass::Throttle => {
-                        let delay = config.retry.delay(throttles).min(MAX_THROTTLE_BACKOFF);
-                        throttles = throttles.saturating_add(1);
-                        tokio::time::sleep(delay).await;
+                        let delay = config
+                            .retry
+                            .delay(lease.throttles)
+                            .min(MAX_THROTTLE_BACKOFF);
+                        lease.throttles = lease.throttles.saturating_add(1);
+                        let _ = tx.send(ShardEvent::Yielded { lease, delay }).await;
+                        return;
                     }
                     ErrorClass::Transient if attempts < config.retry.max_retries => {
                         let delay = config.retry.delay(attempts);
@@ -305,22 +330,42 @@ mod tests {
             "SequenceNumber": seq, "SizeBytes": 3, "StreamViewType": "NEW_AND_OLD_IMAGES"}})
     }
 
-    async fn run(server: &MockServer, config: DynamoDbSourceConfig) -> Vec<ShardEvent> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        run_shard(
-            streams(&server.uri()),
-            config,
-            "arn".into(),
-            "s1".into(),
-            StartAt::TrimHorizon,
-            tx,
-        )
-        .await;
+    /// Drive a shard slice by slice (requeueing without sleeping) until it
+    /// finishes; returns the non-`Yielded` events and the number of slices.
+    async fn drive(
+        server: &MockServer,
+        config: DynamoDbSourceConfig,
+        max_slices: usize,
+    ) -> (Vec<ShardEvent>, usize) {
+        let mut lease = Lease::new("s1", StartAt::TrimHorizon);
         let mut out = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            out.push(ev);
+        for slice in 1..=max_slices {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            read_slice(
+                streams(&server.uri()),
+                config.clone(),
+                "arn".into(),
+                lease.clone(),
+                tx,
+            )
+            .await;
+            let mut next = None;
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    ShardEvent::Yielded { lease: l, .. } => next = Some(l),
+                    other => out.push(other),
+                }
+            }
+            match next {
+                Some(l) => lease = l,
+                None => return (out, slice),
+            }
         }
-        out
+        (out, max_slices)
+    }
+
+    async fn run(server: &MockServer, config: DynamoDbSourceConfig) -> Vec<ShardEvent> {
+        drive(server, config, 20).await.0
     }
 
     #[tokio::test]
@@ -470,14 +515,52 @@ mod tests {
         .await;
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        run_shard(
+        read_slice(
             streams(&server.uri()),
             cfg(),
             "arn".into(),
-            "s1".into(),
-            StartAt::Latest,
+            Lease::new("s1", StartAt::Latest),
             tx,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn busy_shards_yield_after_a_bounded_slice() {
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(
+            &server,
+            RECORDS,
+            ok(json!({"Records": [record("1")], "NextShardIterator": "it"})),
+            20,
+        )
+        .await;
+        on(&server, RECORDS, ok(json!({"Records": []})), 1).await;
+        let (events, slices) = drive(&server, cfg(), 10).await;
+        assert!(
+            slices >= 3,
+            "20 batches take at least three slices, got {slices}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ShardEvent::Records { .. }))
+                .count(),
+            20
+        );
+        assert!(matches!(events.last(), Some(ShardEvent::Done { .. })));
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({})), 1).await;
+        let (events, _) = drive(&server, cfg(), 2).await;
+        assert!(matches!(events[..], [ShardEvent::Done { .. }]));
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(&server, ITER, ok(json!({})), 1).await;
+        on(&server, RECORDS, err(400, "ExpiredIteratorException"), 1).await;
+        let (events, _) = drive(&server, cfg(), 2).await;
+        assert!(matches!(events[..], [ShardEvent::Done { .. }]));
     }
 }

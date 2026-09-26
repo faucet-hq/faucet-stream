@@ -38,7 +38,7 @@ source:
 | `on_gap` | `fail` | `fail` or `resnapshot` (see below) |
 | `poll_interval_ms` | `1000` | Per-shard wait when caught up (floored at 200) |
 | `records_per_request` | `1000` | `GetRecords` `Limit` (1–1000) |
-| `shard_concurrency` | `4` | Shards read at once — keep ≥ the number of open shards |
+| `shard_concurrency` | `4` | Shards read at once; every readable shard still gets turns |
 | `idle_termination_secs` / `max_messages` | — | Streams: at least one is required so a run terminates |
 | `retry` | `{max_retries: 8, initial_backoff_ms: 100, max_backoff_ms: 10000}` | Throttle / transient retry |
 | `batch_size` | `1000` | Records per page; `0` = one page |
@@ -80,6 +80,11 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
 
 - **Ordering** — a child shard is read only after its parent is drained; when a
   shard closes the stream is re-described to pick up its children.
+- **Scheduling** — a pool of `shard_concurrency` workers rotates over every
+  readable shard: a worker reads a bounded slice of a shard (up to 8 batches, or
+  until it is caught up or throttled), hands it back, and takes the next one. A
+  caught-up shard is polled again after `poll_interval_ms`, a throttled one after
+  a backoff, so more open shards than workers never stalls any of them.
 - **Bookmarks** — every page carries `{stream_arn, shards: {id: seq}, finished}`
   (state key `dynamodb-streams:<table>`). A shard opened but not yet read is
   recorded with an empty sequence and resumes from its trim horizon, so nothing

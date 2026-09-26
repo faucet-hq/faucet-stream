@@ -23,6 +23,7 @@ mod discover;
 mod envelope;
 mod lineage;
 mod scan;
+mod sched;
 mod state;
 mod stream;
 mod streams;

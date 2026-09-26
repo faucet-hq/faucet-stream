@@ -196,6 +196,7 @@ async fn streams_cdc_captures_changes_and_resumes() {
     cfg.mode = ReadMode::Streams;
     cfg.idle_termination_secs = Some(3);
     cfg.batch_size = 2;
+    cfg.shard_concurrency = 1;
     let source = DynamoDbSource::new(cfg.clone()).await.unwrap();
     let capture = source.capture_resume_position().await.unwrap().unwrap();
     assert!(

@@ -7,8 +7,9 @@ use crate::config::{DynamoDbSourceConfig, OnGap, ReadMode};
 use crate::envelope::snapshot_envelope;
 use crate::lineage::{Planner, capture_bookmark, detect_gaps, ids_and_parents, start_for};
 use crate::scan::{ScanEvent, expressions, run_segment};
+use crate::sched::Scheduler;
 use crate::state::{ScanBookmark, SegmentCursor, StreamBookmark, state_key};
-use crate::streams::{IteratorOutcome, ShardEvent, acquire_iterator, describe_shards, run_shard};
+use crate::streams::{IteratorOutcome, ShardEvent, acquire_iterator, describe_shards, read_slice};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::TableDescription;
 use aws_sdk_dynamodbstreams::Client as StreamsClient;
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type PageStream<'a> = Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>>;
 
@@ -58,6 +59,14 @@ pub(crate) fn plan_segment_shards(total: u32) -> Vec<ShardSpec> {
             )
         })
         .collect()
+}
+
+/// Sleep until `at`, or forever when there is nothing to wait for.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t.into()).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn chunk_size(batch_size: usize) -> usize {
@@ -280,55 +289,62 @@ impl DynamoDbSource {
             bm.stream_arn = Some(arn.clone());
             let (ids, parents) = ids_and_parents(&described);
             bm.prune_finished(&ids, &parents);
-            let mut planner = Planner::new(described, &bm.finished);
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<ShardEvent>(16);
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.shard_concurrency));
-            let mut handles = Vec::new();
-            let mut active = 0usize;
-            let mut to_spawn = planner.ready();
+            let mut sched = Scheduler::new(
+                Planner::new(described, &bm.finished),
+                self.config.shard_concurrency,
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ShardEvent>(64);
+            let mut workers = tokio::task::JoinSet::new();
             let idle = self.config.idle_termination_secs.map(Duration::from_secs);
             let max_messages = self.config.max_messages;
             let mut buffer: Vec<Value> = Vec::new();
             let mut total = 0usize;
             let mut failure: Option<FaucetError> = None;
-
-            'consume: loop {
-                for id in std::mem::take(&mut to_spawn) {
+            let mut last_record = Instant::now();
+            let admit = |sched: &mut Scheduler, bm: &mut StreamBookmark| {
+                let now = Instant::now();
+                for id in sched.ready() {
                     let start = start_for(
                         bm.shards.get(&id).map(String::as_str),
-                        planner.parent_known(&id),
+                        sched.planner().parent_known(&id),
                         self.config.start_position,
                     );
-                    planner.start(&id);
                     bm.open(&id);
-                    active += 1;
-                    let sem = semaphore.clone();
-                    let client = self.streams.clone();
-                    let config = self.config.clone();
-                    let arn = arn.clone();
-                    let tx = tx.clone();
-                    handles.push(tokio::spawn(async move {
-                        let _permit = sem.acquire_owned().await.expect("semaphore closed");
-                        run_shard(client, config, arn, id, start, tx).await;
-                    }));
+                    sched.admit(&id, start, now);
                 }
-                if active == 0 {
+            };
+            admit(&mut sched, &mut bm);
+
+            'consume: loop {
+                while workers.try_join_next().is_some() {}
+                let now = Instant::now();
+                let idle_deadline = idle.map(|w| last_record + w);
+                if idle_deadline.is_some_and(|d| now >= d) {
+                    tracing::info!(table = %self.config.table_name,
+                        "dynamodb streams: idle termination");
                     break 'consume;
                 }
-                let event = match idle {
-                    Some(window) => match tokio::time::timeout(window, rx.recv()).await {
-                        Ok(ev) => ev,
-                        Err(_) => {
-                            tracing::info!(table = %self.config.table_name,
-                                idle_secs = window.as_secs(), "dynamodb streams: idle termination");
-                            break 'consume;
-                        }
-                    },
-                    None => rx.recv().await,
+                for lease in sched.dispatch(now) {
+                    workers.spawn(read_slice(
+                        self.streams.clone(),
+                        self.config.clone(),
+                        arn.clone(),
+                        lease,
+                        tx.clone(),
+                    ));
+                }
+                if sched.is_idle() {
+                    break 'consume;
+                }
+                let wakeup = sched.next_wakeup();
+                let event = tokio::select! {
+                    ev = rx.recv() => ev,
+                    _ = sleep_until(wakeup) => continue 'consume,
+                    _ = sleep_until(idle_deadline) => continue 'consume,
                 };
                 match event {
                     Some(ShardEvent::Records { shard_id, records }) => {
+                        last_record = Instant::now();
                         for (sequence, record) in records {
                             buffer.push(record);
                             total += 1;
@@ -348,18 +364,20 @@ impl DynamoDbSource {
                             }
                         }
                     }
+                    Some(ShardEvent::Yielded { lease, delay }) => {
+                        sched.yielded(lease, Instant::now() + delay);
+                    }
                     Some(ShardEvent::Done { shard_id }) => {
-                        active -= 1;
                         bm.finish(&shard_id);
-                        planner.finish(&shard_id);
-                        if !planner.has_children(&shard_id) {
+                        sched.finished(&shard_id);
+                        if !sched.planner().has_children(&shard_id) {
                             match describe_shards(&self.streams, &arn).await {
-                                Ok(fresh) => planner.merge(fresh),
+                                Ok(fresh) => sched.planner().merge(fresh),
                                 Err(e) => tracing::warn!(error = %e,
                                     "dynamodb streams: shard refresh failed"),
                             }
                         }
-                        to_spawn = planner.ready();
+                        admit(&mut sched, &mut bm);
                     }
                     Some(ShardEvent::Failed { shard_id, error }) => {
                         tracing::error!(shard = %shard_id, error = %error,
@@ -371,9 +389,7 @@ impl DynamoDbSource {
                 }
             }
             rx.close();
-            for h in handles {
-                h.abort();
-            }
+            workers.abort_all();
             if let Some(error) = failure {
                 Err(error)?;
             }
@@ -838,5 +854,128 @@ mod tests {
             .unwrap();
         let e = source.fetch_all().await.unwrap_err().to_string();
         assert!(e.contains("trimmed past sequence 5"), "{e}");
+    }
+
+    async fn mock_shard(server: &MockServer, id: &str, open: bool) {
+        use wiremock::matchers::{body_partial_json, header, method};
+        use wiremock::{Mock, ResponseTemplate};
+        let respond = |body: Value| {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(body.to_string())
+        };
+        Mock::given(method("POST"))
+            .and(header(
+                "x-amz-target",
+                "DynamoDBStreams_20120810.GetShardIterator",
+            ))
+            .and(body_partial_json(json!({"ShardId": id})))
+            .respond_with(respond(json!({"ShardIterator": format!("it-{id}")})))
+            .mount(server)
+            .await;
+        let mut page = json!({"Records": [{"eventID": id, "eventName": "INSERT", "dynamodb": {
+            "Keys": {"pk": {"S": id}}, "NewImage": {"pk": {"S": id}}, "SequenceNumber": "1"}}]});
+        if open {
+            page["NextShardIterator"] = json!(format!("it-{id}"));
+        }
+        Mock::given(method("POST"))
+            .and(header(
+                "x-amz-target",
+                "DynamoDBStreams_20120810.GetRecords",
+            ))
+            .and(body_partial_json(
+                json!({"ShardIterator": format!("it-{id}")}),
+            ))
+            .respond_with(respond(page))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_stream(server: &MockServer, shards: Value) {
+        on(
+            server,
+            "DynamoDBStreams_20120810.DescribeStream",
+            ok(json!({"StreamDescription": {"Shards": shards}})),
+            100,
+        )
+        .await;
+    }
+
+    fn one_worker() -> DynamoDbSourceConfig {
+        let mut cfg = streams_config();
+        cfg.stream_arn = Some("arn".into());
+        cfg.shard_concurrency = 1;
+        cfg.max_messages = Some(60);
+        cfg.batch_size = 0;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn one_worker_rotates_over_every_busy_shard() {
+        let server = MockServer::start().await;
+        mock_stream(
+            &server,
+            json!([{"ShardId": "a"}, {"ShardId": "b"}, {"ShardId": "c"}]),
+        )
+        .await;
+        for id in ["a", "b", "c"] {
+            mock_shard(&server, id, true).await;
+        }
+        let source = mock_source(&server.uri(), one_worker());
+        let records = source.fetch_all().await.unwrap();
+        assert_eq!(records.len(), 60);
+        for id in ["a", "b", "c"] {
+            let n = records.iter().filter(|r| r["shard_id"] == id).count();
+            assert!(n >= 8, "shard {id} starved: {n} records");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_worker_reads_children_after_parents_drain() {
+        let server = MockServer::start().await;
+        mock_stream(
+            &server,
+            json!([{"ShardId": "p"}, {"ShardId": "child", "ParentShardId": "p"}, {"ShardId": "other"}]),
+        )
+        .await;
+        mock_shard(&server, "p", false).await;
+        mock_shard(&server, "child", true).await;
+        mock_shard(&server, "other", true).await;
+        let source = mock_source(&server.uri(), one_worker());
+        let records = source.fetch_all().await.unwrap();
+        let first = |id: &str| records.iter().position(|r| r["shard_id"] == id);
+        assert_eq!(records.iter().filter(|r| r["shard_id"] == "p").count(), 1);
+        assert!(first("child").unwrap() > first("p").unwrap());
+        assert!(first("other").is_some());
+    }
+
+    #[tokio::test]
+    async fn idle_streams_terminate_and_empty_streams_end() {
+        let server = MockServer::start().await;
+        mock_stream(&server, json!([{"ShardId": "q"}])).await;
+        on(
+            &server,
+            "DynamoDBStreams_20120810.GetShardIterator",
+            ok(json!({"ShardIterator": "it"})),
+            1,
+        )
+        .await;
+        on(
+            &server,
+            "DynamoDBStreams_20120810.GetRecords",
+            ok(json!({"Records": [], "NextShardIterator": "it"})),
+            100,
+        )
+        .await;
+        let mut cfg = one_worker();
+        cfg.max_messages = None;
+        cfg.idle_termination_secs = Some(1);
+        let source = mock_source(&server.uri(), cfg.clone());
+        assert!(source.fetch_all().await.unwrap().is_empty());
+
+        let server = MockServer::start().await;
+        mock_stream(&server, json!([])).await;
+        let source = mock_source(&server.uri(), cfg);
+        assert!(source.fetch_all().await.unwrap().is_empty());
     }
 }
