@@ -297,19 +297,39 @@ mod tests {
     #[test]
     fn config_template_tenants_and_schedule_are_validated() {
         let base = "version: 1\ntriggers:\n  - name: t\n    type: webhook\n";
-        assert!(compile_err(&format!("{base}    config: ./x.yaml\n    template: {{ id: a }}\n")).contains("both"));
+        assert!(
+            compile_err(&format!(
+                "{base}    config: ./x.yaml\n    template: {{ id: a }}\n"
+            ))
+            .contains("both")
+        );
         assert!(compile_err(base).contains("needs a `config` or a `template`"));
-        assert!(compile_err(&format!("{base}    template: {{ id: \" \" }}\n")).contains("template id is empty"));
-        assert!(compile_err(&format!("{base}    config: ./x.yaml\n    tenants: every\n")).contains("\"all\""));
+        assert!(
+            compile_err(&format!("{base}    template: {{ id: \" \" }}\n"))
+                .contains("template id is empty")
+        );
+        assert!(
+            compile_err(&format!("{base}    config: ./x.yaml\n    tenants: every\n"))
+                .contains("\"all\"")
+        );
         let ok = CompiledTriggers::compile(file(&format!(
             "{base}    template: {{ id: tpl }}\n    tenants: all\n"
         )))
         .unwrap();
         assert!(ok.triggers[0].spec.template.is_some());
-        let sched = "version: 1\ntriggers:\n  - name: s\n    type: schedule\n    config: ./x.yaml\n";
-        assert!(compile_err(&format!("{sched}    cron: \"not a cron\"\n")).contains("invalid cron"));
-        assert!(compile_err(&format!("{sched}    cron: \"* * * * *\"\n    timezone: Mars/Base\n")).contains("timezone"));
-        let c = CompiledTriggers::compile(file(&format!("{sched}    cron: \"0 * * * *\"\n"))).unwrap();
+        let sched =
+            "version: 1\ntriggers:\n  - name: s\n    type: schedule\n    config: ./x.yaml\n";
+        assert!(
+            compile_err(&format!("{sched}    cron: \"not a cron\"\n")).contains("invalid cron")
+        );
+        assert!(
+            compile_err(&format!(
+                "{sched}    cron: \"* * * * *\"\n    timezone: Mars/Base\n"
+            ))
+            .contains("timezone")
+        );
+        let c =
+            CompiledTriggers::compile(file(&format!("{sched}    cron: \"0 * * * *\"\n"))).unwrap();
         assert_eq!(c.triggers[0].kind_label(), "schedule");
         assert!(c.triggers[0].webhook_path.is_none());
     }

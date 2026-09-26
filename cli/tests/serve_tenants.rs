@@ -424,7 +424,11 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     // An operator-level route outside the tenant's scope is refused for the
     // scoped principal even though its role would allow it.
     let (code, err) = api
-        .post("acme-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": "all"}))
+        .post(
+            "acme-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            json!({"tenants": "all"}),
+        )
         .await;
     assert_eq!(code, 403, "{err}");
     assert!(err.to_string().contains("confined to tenant"), "{err}");
@@ -708,10 +712,17 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     assert_eq!(code, 400);
     let (code, _) = api.get("admin-tok", "/v1/tenants/ghost/connections").await;
     assert_eq!(code, 404);
-    let (code, _) = api.get("admin-tok", "/v1/tenants/acme/connections/ghost").await;
+    let (code, _) = api
+        .get("admin-tok", "/v1/tenants/acme/connections/ghost")
+        .await;
     assert_eq!(code, 404);
     let (code, _) = api
-        .send(reqwest::Method::DELETE, "op-tok", "/v1/tenants/acme/connections/ghost", None)
+        .send(
+            reqwest::Method::DELETE,
+            "op-tok",
+            "/v1/tenants/acme/connections/ghost",
+            None,
+        )
         .await;
     assert_eq!(code, 404);
     let (code, _) = api
@@ -723,10 +734,20 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         .await;
     assert_eq!(code, 201);
     let (code, _) = api
-        .send(reqwest::Method::DELETE, "op-tok", "/v1/tenants/acme/connections/scratch", None)
+        .send(
+            reqwest::Method::DELETE,
+            "op-tok",
+            "/v1/tenants/acme/connections/scratch",
+            None,
+        )
         .await;
     assert_eq!(code, 204);
-    let resp = api.client.get(format!("{}/v1/connect/callback", api.base)).send().await.unwrap();
+    let resp = api
+        .client
+        .get(format!("{}/v1/connect/callback", api.base))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 400, "a callback without state");
     let (_, started) = api
         .post(
@@ -736,24 +757,49 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         )
         .await;
     let url = reqwest::Url::parse(started["authorize_url"].as_str().unwrap()).unwrap();
-    let st = url.query_pairs().find(|(k, _)| k == "state").unwrap().1.into_owned();
+    let st = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
     let resp = api
         .client
         .get(format!("{}/v1/connect/callback?state={st}", api.base))
         .send()
         .await
         .unwrap();
-    assert!(resp.headers()["location"].to_str().unwrap().contains("error=missing_code"));
+    assert!(
+        resp.headers()["location"]
+            .to_str()
+            .unwrap()
+            .contains("error=missing_code")
+    );
     let (_, fan) = api
-        .post("op-tok", "/v1/templates/no-such-template/fanout", json!({"tenants": ["acme"]}))
+        .post(
+            "op-tok",
+            "/v1/templates/no-such-template/fanout",
+            json!({"tenants": ["acme"]}),
+        )
         .await;
     assert_eq!(fan["results"][0]["status"], "failed", "{fan}");
     let (_, fan) = api
-        .post("op-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": ["globex"]}))
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            json!({"tenants": ["globex"]}),
+        )
         .await;
-    assert_eq!(fan["results"][0]["status"], "skipped", "a suspended tenant: {fan}");
+    assert_eq!(
+        fan["results"][0]["status"], "skipped",
+        "a suspended tenant: {fan}"
+    );
     let (code, _) = api
-        .post("op-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": []}))
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            json!({"tenants": []}),
+        )
         .await;
     assert_eq!(code, 400);
 
@@ -876,4 +922,48 @@ async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
         assert!(done, "no scheduled run completed for {t}");
         assert!(lines(&out.join(format!("out-{t}.jsonl"))) >= 1);
     }
+}
+
+/// `max_concurrent_runs` refuses a submission over the limit with 429.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_over_its_concurrency_limit_is_refused_with_429() {
+    let dir = tempfile::tempdir().unwrap();
+    let slow = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slow"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 1}]))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&slow)
+        .await;
+    let api = spawn(dir.path(), None, &slow.uri()).await;
+    let (code, t) = api
+        .post(
+            "admin-tok",
+            "/v1/tenants",
+            json!({"id": "busy", "limits": {"max_concurrent_runs": 1}}),
+        )
+        .await;
+    assert_eq!(code, 201, "{t}");
+    let config = format!(
+        "version: 1\nname: busy-sync\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: \"{}\"\n      path: /slow\n  sink:\n    type: jsonl\n    config:\n      path: \"{}\"\n",
+        slow.uri(),
+        dir.path().join("busy.jsonl").display()
+    );
+    let (code, first) = api
+        .post("op-tok", "/v1/tenants/busy/runs", json!({"config": config}))
+        .await;
+    assert_eq!(code, 202, "{first}");
+    let (code, err) = api
+        .post("op-tok", "/v1/tenants/busy/runs", json!({"config": config}))
+        .await;
+    assert_eq!(code, 429, "{err}");
+    assert_eq!(err["error"]["code"], "limit_exceeded", "{err}");
+    let run_id = first["run_id"].as_str().unwrap();
+    let (code, _) = api
+        .post("admin-tok", &format!("/v1/runs/{run_id}/cancel"), json!({}))
+        .await;
+    assert!(code == 202 || code == 200, "cancel returned {code}");
 }

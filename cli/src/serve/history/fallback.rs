@@ -635,6 +635,7 @@ mod tests {
             run_id: None,
             template: None,
             error: None,
+            tenant: None,
         }
     }
 

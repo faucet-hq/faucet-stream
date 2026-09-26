@@ -410,7 +410,10 @@ mod tests {
         assert_eq!((v.key.as_str(), v.previous.len()), ("sekrit-vault-key", 1));
         let dbg = format!("{v:?}");
         assert!(!dbg.contains("sekrit") && dbg.contains("1 keys"), "{dbg}");
-        assert_eq!(cfg.connect_providers_path.as_deref(), Some(std::path::Path::new("p.yaml")));
+        assert_eq!(
+            cfg.connect_providers_path.as_deref(),
+            Some(std::path::Path::new("p.yaml"))
+        );
         let mut empty = base_args();
         empty.no_auth = true;
         empty.vault_key = Some(String::new());

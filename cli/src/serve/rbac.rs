@@ -779,7 +779,10 @@ mod tests {
         p.tenant = Some("acme".into());
         assert!(format!("{p:?}").contains("acme"));
         let cfg = RbacConfig::new(vec![p]).unwrap();
-        assert_eq!(cfg.authenticate("tok").unwrap().tenant.as_deref(), Some("acme"));
+        assert_eq!(
+            cfg.authenticate("tok").unwrap().tenant.as_deref(),
+            Some("acme")
+        );
     }
 
     #[test]

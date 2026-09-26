@@ -358,7 +358,11 @@ mod tests {
         use FireOutcome::*;
         assert!(matches!(combine(vec![Enqueued("a".into())]), Enqueued(ref id) if id == "a"));
         assert!(matches!(
-            combine(vec![Enqueued("a".into()), Dropped("queue_full"), Error("e".into())]),
+            combine(vec![
+                Enqueued("a".into()),
+                Dropped("queue_full"),
+                Error("e".into())
+            ]),
             Dropped("queue_full")
         ));
         assert!(matches!(
@@ -397,7 +401,10 @@ mod tests {
         assert_eq!(b.params["since"], "2026-01-01T00:00:00Z");
         assert_eq!(b.params["n"], 5);
         assert_eq!(b.name.as_deref(), Some("hook@2026-01-01T00:00:00Z"));
-        assert_eq!(b.idempotency_key.as_deref(), Some("trig:hook:2026-01-01T00:00:00Z"));
+        assert_eq!(
+            b.idempotency_key.as_deref(),
+            Some("trig:hook:2026-01-01T00:00:00Z")
+        );
         assert_eq!(b.labels["faucet.trigger.type"], "schedule");
         assert_eq!(b.sink.as_deref(), Some("wh"));
         assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay.is_some());
@@ -405,7 +412,11 @@ mod tests {
             version: Some("latest".into()),
             ..tpl.clone()
         };
-        assert!(template_body(&c, &bad, &e, "now").unwrap_err().contains("version"));
+        assert!(
+            template_body(&c, &bad, &e, "now")
+                .unwrap_err()
+                .contains("version")
+        );
         let bad_token = TemplateTrigger {
             params: std::collections::BTreeMap::from([(
                 "x".to_string(),
@@ -444,13 +455,26 @@ mod tests {
             "acme".into(),
             "ghost".into(),
         ]));
-        assert_eq!(fire_targets(&state, &c).await.unwrap(), vec![Some("acme".into())]);
-        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::All("all".into()));
+        assert_eq!(
+            fire_targets(&state, &c).await.unwrap(),
+            vec![Some("acme".into())]
+        );
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::All(
+            "all".into(),
+        ));
         let event = TriggerEvent::Schedule { tick: "t".into() };
         let out = fire(&state, &c, event.clone(), "now").await;
-        assert!(matches!(out, FireOutcome::Error(ref e) if e.contains("missing.yaml")), "{out:?}");
-        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::Named(vec!["ghost".into()]));
-        assert!(matches!(fire(&state, &c, event, "now").await, FireOutcome::Coalesced));
+        assert!(
+            matches!(out, FireOutcome::Error(ref e) if e.contains("missing.yaml")),
+            "{out:?}"
+        );
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::Named(vec![
+            "ghost".into(),
+        ]));
+        assert!(matches!(
+            fire(&state, &c, event, "now").await,
+            FireOutcome::Coalesced
+        ));
     }
     use crate::serve::triggers::spec::{RunTemplate, TriggerKind, TriggerSpec};
 

@@ -1249,6 +1249,7 @@ mod tests {
             principal: name.into(),
             role: Role::Admin,
             source_ip: None,
+            tenant: None,
         }
     }
 
@@ -1277,6 +1278,7 @@ mod tests {
             run_id: None,
             template: None,
             error: None,
+            tenant: None,
         }
     }
 

@@ -1396,6 +1396,7 @@ async fn change_requests_round_trip_and_filter() {
             run_id: None,
             template: None,
             error: None,
+            tenant: None,
         }
     };
     store
@@ -1434,6 +1435,7 @@ async fn change_requests_round_trip_and_filter() {
         status,
         kind,
         requester: requester.map(str::to_string),
+        tenant: None,
         limit,
     };
     let got = store

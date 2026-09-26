@@ -111,6 +111,7 @@ mod tests {
             since: since.map(str::to_string),
             until: Some("2099-01-01".into()),
             pipeline: None,
+            tenant: None,
             by: by.into(),
             limit: 10,
         };
