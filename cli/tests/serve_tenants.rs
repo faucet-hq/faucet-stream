@@ -34,6 +34,7 @@ fn serve_args(
     dir: &std::path::Path,
     history: Option<String>,
     providers: std::path::PathBuf,
+    triggers: Option<std::path::PathBuf>,
 ) -> faucet_cli::cli::ServeArgs {
     let auth_path = dir.join("auth.yaml");
     std::fs::write(&auth_path, AUTH_CONFIG).unwrap();
@@ -69,7 +70,7 @@ fn serve_args(
         cluster: false,
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
-        triggers: None,
+        triggers,
         templates_sync: None,
         policy: None,
         callback_allow_host: Vec::new(),
@@ -118,6 +119,15 @@ impl Api {
 }
 
 async fn spawn(dir: &std::path::Path, history: Option<String>, idp: &str) -> Api {
+    spawn_with(dir, history, idp, None).await
+}
+
+async fn spawn_with(
+    dir: &std::path::Path,
+    history: Option<String>,
+    idp: &str,
+    triggers: Option<std::path::PathBuf>,
+) -> Api {
     let providers = dir.join("providers.yaml");
     std::fs::write(
         &providers,
@@ -128,7 +138,8 @@ async fn spawn(dir: &std::path::Path, history: Option<String>, idp: &str) -> Api
     .unwrap();
     let port = free_port();
     let mut config =
-        faucet_cli::serve::ServeConfig::from_args(serve_args(port, dir, history, providers)).unwrap();
+        faucet_cli::serve::ServeConfig::from_args(serve_args(port, dir, history, providers, triggers))
+            .unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
         let _ = faucet_cli::serve::run_server(
@@ -586,4 +597,65 @@ async fn tenants_end_to_end_in_memory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tenants_end_to_end_on_sqlite() {
     scenario(|dir| Some(format!("sqlite:{}", dir.join("history.db").display()))).await;
+}
+
+/// A `schedule` trigger with `tenants: all` runs a template once per tenant
+/// per tick, each run keyed by the tick and the tenant.
+#[cfg(all(feature = "triggers", feature = "schedule"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&data)
+        .await;
+    let out = dir.path().join("out");
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&out).unwrap();
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(
+        &triggers,
+        "version: 1\ntriggers:\n  - name: every-second\n    type: schedule\n    cron: \"* * * * * *\"\n    template: { id: tenant-sync }\n    tenants: all\n",
+    )
+    .unwrap();
+    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", Some(triggers)).await;
+    for t in ["acme", "globex"] {
+        let (code, _) = api.post("admin-tok", "/v1/tenants", json!({"id": t})).await;
+        assert_eq!(code, 201);
+        let (code, _) = api
+            .post(
+                "op-tok",
+                &format!("/v1/tenants/{t}/connections"),
+                json!({"name": "api", "provider": {"type": "static", "config": {"token": "t"}}}),
+            )
+            .await;
+        assert_eq!(code, 201);
+    }
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": template(&data.uri(), &out, &state_dir), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    for t in ["acme", "globex"] {
+        let mut done = false;
+        for _ in 0..400 {
+            let (_, page) = api.get("admin-tok", &format!("/v1/runs?tenant={t}")).await;
+            if page["runs"].as_array().unwrap().iter().any(|r| {
+                r["status"] == "completed"
+                    && r["labels"]["faucet.trigger.name"] == "every-second"
+                    && r["labels"]["faucet.trigger.tick"].is_string()
+            }) {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(done, "no scheduled run completed for {t}");
+        assert!(lines(&out.join(format!("out-{t}.jsonl"))) >= 1);
+    }
 }
