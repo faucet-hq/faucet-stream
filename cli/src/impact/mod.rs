@@ -1228,6 +1228,99 @@ mod tests {
         assert!(r.notes.iter().any(|n| n.contains("opaque")));
     }
 
+    #[tokio::test]
+    async fn planned_schema_comes_from_lineage_when_the_chain_is_analysable() {
+        let store = seed().await;
+        let n = node(
+            "  transforms:\n    - type: rename_field\n      config: { fields: { email: contact } }\n",
+        );
+        let r = analyze(
+            &store,
+            ImpactInputs {
+                pipeline: "a",
+                node: &n,
+                planned_schema: None,
+                depth: 5,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.planned_from, PlannedFrom::Lineage);
+        assert_eq!(
+            r.delta.renamed,
+            vec![RenamedColumn {
+                from: "email".into(),
+                to: "contact".into()
+            }]
+        );
+        assert!(r.is_breaking());
+        assert_eq!(Severity::Breaking.as_str(), "breaking");
+        assert_eq!(Severity::Additive.as_str(), "additive");
+        assert_eq!(Severity::Unknown.as_str(), "unknown");
+        assert_eq!(Severity::None.as_str(), "none");
+    }
+
+    #[test]
+    fn schema_delta_folds_a_rename_op_and_render_lists_every_change_kind() {
+        let cur = schema(&[("a", "integer"), ("b", "string"), ("c", "integer")]);
+        let plan = schema(&[("x", "integer"), ("b", "string"), ("c", "string")]);
+        let d = schema_delta(
+            &cur,
+            &plan,
+            &[ColumnOp::Rename(vec![("a".into(), "x".into())])],
+        );
+        assert!(d.added.is_empty() && d.removed.is_empty());
+        assert_eq!(d.renamed[0].from, "a");
+        assert_eq!(d.retyped[0].column, "c");
+        let r = ImpactReport {
+            pipeline: "a".into(),
+            row: "row-0".into(),
+            dataset: Some(SinkDataset {
+                id: "d".into(),
+                uri: "file:///a.jsonl".into(),
+                last_run_id: "run".into(),
+            }),
+            planned_from: PlannedFrom::Sample,
+            delta: d,
+            severity: Severity::Breaking,
+            affected: vec![AffectedDataset {
+                id: "b".into(),
+                uri: "file:///b.jsonl".into(),
+                pipeline: "b".into(),
+                row: "row-0".into(),
+                depth: 1,
+                severity: Severity::Breaking,
+                opaque: true,
+                columns: vec![
+                    AffectedColumn {
+                        column: "x".into(),
+                        change: ColumnChange::Renamed { to: "y".into() },
+                        reads: vec!["x".into()],
+                    },
+                    AffectedColumn {
+                        column: "c".into(),
+                        change: ColumnChange::Retyped {
+                            from: "integer".into(),
+                            to: "string".into(),
+                        },
+                        reads: vec![],
+                    },
+                ],
+                contract: None,
+                owners: vec![],
+                consumers: vec![],
+            }],
+            owners: vec![],
+            notes: vec![],
+        };
+        let text = render_human(&r);
+        assert!(text.contains("~c:integer→string"), "{text}");
+        assert!(text.contains("a→x"), "{text}");
+        assert!(text.contains("opaque path"), "{text}");
+        assert!(text.contains("renamed to y"), "{text}");
+        assert!(text.contains("retyped integer→string"), "{text}");
+    }
+
     #[test]
     fn push_schema_types_follow_single_origins() {
         let src = schema(&[("a", "integer"), ("b", "string")]);

@@ -275,7 +275,10 @@ pub async fn plan_node(
 
     #[cfg(feature = "policy")]
     let mut policy_input_schema: Option<Value> = None;
-    #[cfg_attr(not(feature = "catalog"), allow(unused_variables, unused_mut))]
+    #[cfg_attr(
+        not(feature = "catalog"),
+        allow(unused_variables, unused_mut, unused_assignments)
+    )]
     let mut planned_output_schema: Option<Value> = None;
     if let Some((input, source_label)) = opts.sample {
         let input_records = input.len();

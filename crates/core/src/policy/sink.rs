@@ -412,15 +412,16 @@ mod tests {
         Arc::new(CompiledPolicy::compile(&spec).unwrap())
     }
 
+    struct Fwd(Arc<Capture>);
+    #[async_trait]
+    impl Sink for Fwd {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.0.write_batch(records).await
+        }
+    }
+
     fn sink(policy: Arc<CompiledPolicy>, residency: &str) -> (PolicySink, Arc<Capture>) {
         let cap = Arc::new(Capture(Mutex::new(Vec::new())));
-        struct Fwd(Arc<Capture>);
-        #[async_trait]
-        impl Sink for Fwd {
-            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-                self.0.write_batch(records).await
-            }
-        }
         let facts = SinkFacts {
             id: "default".into(),
             kind: "jsonl".into(),
@@ -534,5 +535,121 @@ mod tests {
         assert!(s.readback_source().is_none());
         assert!(!s.is_overwrite());
         assert!(s.local_outputs().await.is_empty());
+    }
+
+    /// Every capability the decorator does not own is the inner sink's answer
+    /// (defaults here, since `Fwd` overrides only `write_batch`) — so a
+    /// policy-wrapped upsert / exactly-once / overwrite sink keeps working.
+    #[tokio::test]
+    async fn every_forwarded_capability_reaches_the_inner_sink() {
+        use crate::cleanup::SeenKeys;
+        use crate::drift::SchemaEvolution;
+        use crate::idempotency::SinkGuarantee;
+        use crate::observability::{RoundtripRecorder, RoundtripSide};
+        use crate::rollback::{RollbackMode, RollbackOptions};
+        use crate::write_mode::WriteMode;
+        let (s, cap) = sink(policy("fail"), "eu");
+        assert!(!s.connector_name().is_empty());
+        assert!(!s.dataset_uri().is_empty());
+        assert_eq!(s.sink_guarantee(), SinkGuarantee::AtLeastOnce);
+        assert!(!s.write_batch_is_replay_safe());
+        assert!(!s.dedups_by_key());
+        assert_eq!(s.supported_write_modes(), &[WriteMode::Append]);
+        assert!(s.last_committed_token("scope").await.unwrap().is_none());
+        assert!(!s.supports_schema_evolution());
+        assert!(
+            s.evolve_schema(&SchemaEvolution {
+                additions: Vec::new(),
+                widenings: Vec::new(),
+                relax_nullability: Vec::new(),
+            })
+            .await
+            .is_err(),
+            "the inner sink cannot evolve, so neither can the wrapper"
+        );
+        assert!(!s.supports_cleanup());
+        assert!(!s.supports_staged_load());
+        assert!(
+            s.cleanup_scope(&BTreeMap::new(), &SeenKeys::new())
+                .await
+                .is_err()
+        );
+        // The overwrite lifecycle is the inner sink's: `Fwd` is append-only,
+        // so each step answers exactly as an unwrapped `Fwd` would.
+        let plain = Fwd(Arc::new(Capture(Mutex::new(Vec::new()))));
+        assert_eq!(
+            s.begin_overwrite().await.is_ok(),
+            plain.begin_overwrite().await.is_ok()
+        );
+        assert_eq!(
+            s.commit_overwrite().await.is_ok(),
+            plain.commit_overwrite().await.is_ok()
+        );
+        assert_eq!(
+            s.abort_overwrite().await.is_ok(),
+            plain.abort_overwrite().await.is_ok()
+        );
+        assert!(!s.supports_rollback());
+        assert!(
+            s.rollback_run(
+                "run",
+                &RollbackOptions {
+                    run_id_column: "_faucet_run_id".into(),
+                    mode: RollbackMode::Append,
+                    force: false,
+                    dry_run: true,
+                },
+            )
+            .await
+            .is_err()
+        );
+        let _ = s.forget_run("run").await;
+        let _ = s.rewind_commit_token("scope", None).await;
+        s.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
+            RoundtripSide::Sink,
+            "p",
+            "r",
+            "jsonl",
+        )));
+        let _ = s.check(&crate::check::CheckContext::default()).await;
+        // The idempotent write path screens too, then forwards.
+        assert_eq!(
+            s.write_batch_idempotent(&[json!({"email": "a@b.io"})], "s", "t")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(cap.0.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn columnar_pages_are_screened_whole() {
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as A;
+        let batch = RecordBatch::try_new(
+            A::new(Schema::new(vec![Field::new(
+                "email",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![A::new(StringArray::from(vec!["a@b.io", "c@d.io"]))],
+        )
+        .unwrap();
+        let (s, cap) = sink(policy("fail"), "eu");
+        assert!(!s.supports_columnar());
+        assert_eq!(s.write_batch_columnar(&batch).await.unwrap(), 2);
+        assert_eq!(cap.0.lock().unwrap().len(), 2);
+        // A non-compliant sink refuses the whole batch — a columnar page has
+        // no per-row channel to quarantine through.
+        let (s, cap) = sink(policy("quarantine"), "us");
+        let err = s.write_batch_columnar(&batch).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("columnar pages cannot be partially quarantined"),
+            "{err}"
+        );
+        assert!(cap.0.lock().unwrap().is_empty());
     }
 }

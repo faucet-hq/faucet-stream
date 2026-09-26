@@ -62,7 +62,7 @@ contract = ["faucet-core/contract"]
 masking = ["faucet-core/masking"]
 # Data-flow policies (#702): classification-driven residency / destination
 # rules enforced before any data moves (`policy:` / `--policy`, `faucet policy`).
-policy = ["faucet-core/policy", "masking", "dep:regex"]
+policy = ["faucet-core/policy", "masking", "lineage", "dep:regex"]
 
 # Encryption at rest (#207): the `encryption:` block on the `file` state store
 # (AES-256-GCM bookmark files) and on the jsonl sink (per-line sealing — the

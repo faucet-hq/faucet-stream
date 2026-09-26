@@ -651,6 +651,149 @@ pipeline:
         assert_eq!(report.violations, 1);
     }
 
+    fn topology_cfg(extra_nodes: &str, extra: &str) -> PipelineConfig {
+        PipelineConfig::from_text(
+            &format!(
+                r#"version: 1
+name: p
+pipeline:
+  contract:
+    version: "1"
+    fields:
+      - {{ name: id, type: integer }}
+      - {{ name: email, type: string }}
+      - {{ name: amount_cents, type: integer }}
+  sources:
+    a: {{ type: csv, config: {{ path: /tmp/a.csv }} }}
+  sinks:
+    o:
+      type: jsonl
+      config: {{ path: /tmp/o.jsonl }}
+      attributes: {{ residency: us, environment: prod }}
+  nodes:
+    s: {{ kind: source, ref: a }}
+    w: {{ kind: sink, ref: o }}
+    x: {{ kind: sink, type: stdout, config: {{}} }}
+{extra_nodes}  edges:
+    - {{ from: s, to: w }}
+    - {{ from: s, to: x }}
+{extra}
+"#
+            ),
+            Path::new("p.yaml"),
+        )
+        .unwrap()
+    }
+
+    /// A node graph gets one verdict per sink node, from the contract's
+    /// columns and each node's resolved sink template; an inline-typed sink
+    /// node without a template has no attributes.
+    #[test]
+    fn topology_configs_are_evaluated_per_sink_node() {
+        let cfg = topology_cfg("", "");
+        let report = evaluate_topology(&policy(), &cfg).unwrap();
+        let rows: Vec<(&str, &str, &str, usize)> = report
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.row.as_str(),
+                    r.sink.as_str(),
+                    r.sink_kind.as_str(),
+                    r.violations.len(),
+                )
+            })
+            .collect();
+        // `w` (jsonl, us, prod) trips both rules; `x` (stdout, no attributes)
+        // only the residency requirement.
+        assert_eq!(
+            rows,
+            vec![("w", "o", "jsonl", 2), ("x", "default", "stdout", 1)],
+            "{report:?}"
+        );
+        assert_eq!(report.violations, 3);
+        assert!(
+            report
+                .rows
+                .iter()
+                .all(|r| r.column_source == ColumnSource::Contract)
+        );
+        assert!(report.rows.iter().all(|r| !r.opaque));
+        assert!(report.rows[1].attributes.is_empty());
+        let text = render_human(&report);
+        assert!(text.contains("no attributes"), "{text}");
+        assert!(text.contains("from the contract"), "{text}");
+
+        // A transform node makes the graph opaque: every labelled input is
+        // carried conservatively rather than pushed through the chain.
+        let cfg = topology_cfg(
+            "    t: { kind: transform, transforms: [{ type: flatten, config: {} }] }\n",
+            "",
+        );
+        let report = evaluate_topology(&policy(), &cfg).unwrap();
+        assert!(report.rows.iter().all(|r| r.opaque), "{report:?}");
+        assert!(report.rows[0].columns.iter().all(|c| c.conservative));
+
+        // A masking rule scoped to the node's sink satisfies the mask option.
+        let cfg = topology_cfg(
+            "",
+            "  masking:\n    rules:\n      - name: m\n        match: { fields: [email] }\n        action: { type: hash }\n        applies_to: [w]\n",
+        );
+        let report = evaluate_topology(&policy(), &cfg).unwrap();
+        let w = &report.rows[0];
+        assert_eq!(w.row, "w");
+        let email = w.columns.iter().find(|c| c.name == "email").unwrap();
+        assert_eq!(email.masked.as_deref(), Some("hash"));
+        let x = &report.rows[1];
+        assert!(
+            x.columns
+                .iter()
+                .find(|c| c.name == "email")
+                .unwrap()
+                .masked
+                .is_none()
+        );
+
+        // An uncompilable policy fails closed.
+        let bad: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "field_pattern": "("}],
+            "rules": []
+        }))
+        .unwrap();
+        assert!(evaluate_topology(&bad, &cfg).is_err());
+    }
+
+    #[test]
+    fn doctor_probes_report_each_static_violation() {
+        let cfg = mk_cfg(
+            "  contract:\n    version: \"1\"\n    fields:\n      - { name: email, type: string }\n",
+        );
+        let nodes = expand(&cfg).unwrap();
+        let probes = doctor_probes(&policy(), &nodes[0]);
+        assert_eq!(probes.len(), 1);
+        assert!(matches!(
+            probes[0].status,
+            faucet_core::ProbeStatus::Fail { .. }
+        ));
+        let clean: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "fields": ["email"]}],
+            "rules": [{"name": "r", "when": {"label": "pii"}, "require": {"residency": ["us"]}}]
+        }))
+        .unwrap();
+        let probes = doctor_probes(&clean, &nodes[0]);
+        assert!(matches!(probes[0].status, faucet_core::ProbeStatus::Pass));
+        let bad: PolicySpec = serde_json::from_value(json!({
+            "classifications": [{"label": "pii", "field_pattern": "("}],
+            "rules": []
+        }))
+        .unwrap();
+        let probes = doctor_probes(&bad, &nodes[0]);
+        assert!(matches!(
+            probes[0].status,
+            faucet_core::ProbeStatus::Fail { .. }
+        ));
+    }
+
     #[test]
     fn opaque_transforms_carry_labels_conservatively() {
         let cfg = mk_cfg(
