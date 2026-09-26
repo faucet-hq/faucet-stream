@@ -76,11 +76,11 @@ pub mod sla;
 pub mod state;
 #[cfg(feature = "templates")]
 pub mod templates;
+pub mod tenant_tokens;
 pub mod topology;
 pub mod transforms;
 #[cfg(feature = "cli-tui")]
 pub mod tui;
-pub mod tenant_tokens;
 pub mod usage;
 pub mod verify;
 pub mod vocabulary;

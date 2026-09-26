@@ -487,10 +487,17 @@ mod tests {
         };
         let mut scoped = global();
         scoped.tenant = Some("acme".into());
-        assert_eq!(q(None).into_filter(&scoped).unwrap().tenant.as_deref(), Some("acme"));
+        assert_eq!(
+            q(None).into_filter(&scoped).unwrap().tenant.as_deref(),
+            Some("acme")
+        );
         assert!(q(Some("globex")).into_filter(&scoped).is_err());
         assert_eq!(
-            q(Some("globex")).into_filter(&global()).unwrap().tenant.as_deref(),
+            q(Some("globex"))
+                .into_filter(&global())
+                .unwrap()
+                .tenant
+                .as_deref(),
             Some("globex")
         );
     }
@@ -557,7 +564,10 @@ mod tests {
             cursor: None,
             tenant: None,
         };
-        assert_eq!(q.into_filter(&global()).unwrap().status, vec![RunStatus::Failed]);
+        assert_eq!(
+            q.into_filter(&global()).unwrap().status,
+            vec![RunStatus::Failed]
+        );
     }
 
     #[tokio::test]

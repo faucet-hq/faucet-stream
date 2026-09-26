@@ -87,7 +87,11 @@ mod tests {
         assert!(Vault::new("", &[]).unwrap_err().contains("vault key"));
         let v = Vault::new("k", &[]).unwrap();
         assert!(v.open("%%%").unwrap_err().contains("base64"));
-        assert!(v.open_str(&v.seal(&json!(1))).unwrap_err().contains("not a string"));
+        assert!(
+            v.open_str(&v.seal(&json!(1)))
+                .unwrap_err()
+                .contains("not a string")
+        );
         let not_json = base64::engine::general_purpose::STANDARD.encode(v.enc.encrypt(b"{"));
         assert!(v.open(&not_json).unwrap_err().contains("not JSON"));
         assert_eq!(format!("{v:?}"), "Vault { .. }");

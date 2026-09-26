@@ -630,7 +630,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
             match &node.role {
                 NodeRole::Root => {
                     let uses_state = node.state.is_some() || opts.state_path_override.is_some();
-                    let state_key = build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), &node.id, None);
+                    let state_key = build_state_key(
+                        &opts.state_scope.prefix(&opts.pipeline_name),
+                        &node.id,
+                        None,
+                    );
                     validate_unit_state_key(&node.id, uses_state, &state_key)?;
                     units.push(Unit {
                         node: node.clone(),
@@ -645,7 +649,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         // One-level discovery (#501): one invocation; run_unit
                         // intercepts it to enumerate the dimension. State is
                         // unused, so the key is a placeholder.
-                        let state_key = build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), &node.id, None);
+                        let state_key = build_state_key(
+                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            &node.id,
+                            None,
+                        );
                         units.push(Unit {
                             node: node.clone(),
                             parent_record: None,
@@ -666,8 +674,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         for ctx in crate::discovery_matrix::cartesian(&resolved) {
                             let suffix =
                                 crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                            let state_key =
-                                build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), &node.id, Some(&suffix));
+                            let state_key = build_state_key(
+                                &opts.state_scope.prefix(&opts.pipeline_name),
+                                &node.id,
+                                Some(&suffix),
+                            );
                             units.push(Unit {
                                 node: node.clone(),
                                 parent_record: None,
@@ -709,8 +720,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                         crate::discovery_matrix::inject_collected(&mut ctx, &collected_dims);
                         let suffix =
                             crate::discovery_matrix::tuple_state_key_suffix(&resolved, &ctx);
-                        let state_key =
-                            build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), &node.id, Some(&suffix));
+                        let state_key = build_state_key(
+                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            &node.id,
+                            Some(&suffix),
+                        );
                         validate_unit_state_key(&node.id, uses_state, &state_key)?;
                         if !seen_keys.insert(state_key.clone()) {
                             return Err(CliError::DuplicateStateKey {
@@ -748,8 +762,11 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
                             .as_ref()
                             .map(value_to_string_brief)
                             .unwrap_or_else(|| "(missing)".to_string());
-                        let state_key =
-                            build_state_key(&opts.state_scope.prefix(&opts.pipeline_name), &node.id, Some(&pk_string));
+                        let state_key = build_state_key(
+                            &opts.state_scope.prefix(&opts.pipeline_name),
+                            &node.id,
+                            Some(&pk_string),
+                        );
                         validate_unit_state_key(&node.id, uses_state, &state_key)?;
                         if !seen_keys.insert(state_key.clone()) {
                             return Err(CliError::DuplicateStateKey {

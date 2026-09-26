@@ -90,15 +90,27 @@ struct Api {
 }
 
 impl Api {
-    async fn send(&self, m: reqwest::Method, token: &str, p: &str, body: Option<Value>) -> (u16, Value) {
-        let mut req = self.client.request(m, format!("{}{p}", self.base)).bearer_auth(token);
+    async fn send(
+        &self,
+        m: reqwest::Method,
+        token: &str,
+        p: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut req = self
+            .client
+            .request(m, format!("{}{p}", self.base))
+            .bearer_auth(token);
         if let Some(b) = body {
             req = req.json(&b);
         }
         let r = req.send().await.unwrap();
         let status = r.status().as_u16();
         let text = r.text().await.unwrap();
-        (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
     }
     async fn post(&self, token: &str, p: &str, body: Value) -> (u16, Value) {
         self.send(reqwest::Method::POST, token, p, Some(body)).await
@@ -137,9 +149,10 @@ async fn spawn_with(
     )
     .unwrap();
     let port = free_port();
-    let mut config =
-        faucet_cli::serve::ServeConfig::from_args(serve_args(port, dir, history, providers, triggers))
-            .unwrap();
+    let mut config = faucet_cli::serve::ServeConfig::from_args(serve_args(
+        port, dir, history, providers, triggers,
+    ))
+    .unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
         let _ = faucet_cli::serve::run_server(
@@ -194,7 +207,9 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     Mock::given(method("GET"))
         .and(path("/items"))
         .and(header("authorization", "Bearer acme-secret-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}, {"id": 2}]})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}, {"id": 2}]})),
+        )
         .mount(&data)
         .await;
     Mock::given(method("GET"))
@@ -237,18 +252,30 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         .await;
     assert_eq!(code, 201, "{t}");
     assert_eq!(t["limits"]["max_records_per_run"], 100);
-    let (code, _) = api.post("admin-tok", "/v1/tenants", json!({"id": "globex"})).await;
+    let (code, _) = api
+        .post("admin-tok", "/v1/tenants", json!({"id": "globex"}))
+        .await;
     assert_eq!(code, 201);
-    let (code, _) = api.post("admin-tok", "/v1/tenants", json!({"id": "acme"})).await;
+    let (code, _) = api
+        .post("admin-tok", "/v1/tenants", json!({"id": "acme"}))
+        .await;
     assert_eq!(code, 409);
-    let (code, _) = api.post("admin-tok", "/v1/tenants", json!({"id": "Bad Id"})).await;
+    let (code, _) = api
+        .post("admin-tok", "/v1/tenants", json!({"id": "Bad Id"}))
+        .await;
     assert_eq!(code, 400);
     let (code, _) = api
-        .post("admin-tok", "/v1/tenants", json!({"id": "z", "limits": {"max_concurrent_runs": 0}}))
+        .post(
+            "admin-tok",
+            "/v1/tenants",
+            json!({"id": "z", "limits": {"max_concurrent_runs": 0}}),
+        )
         .await;
     assert_eq!(code, 400);
     // An operator may not create tenants.
-    let (code, _) = api.post("op-tok", "/v1/tenants", json!({"id": "nope"})).await;
+    let (code, _) = api
+        .post("op-tok", "/v1/tenants", json!({"id": "nope"}))
+        .await;
     assert_eq!(code, 403);
 
     // ── Connections ────────────────────────────────────────────────────────
@@ -287,9 +314,15 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         .await;
     assert_eq!(code, 400);
     let (_, listed) = api.get("admin-tok", "/v1/tenants/acme/connections").await;
-    assert!(!listed.to_string().contains("acme-secret-token"), "{listed}");
+    assert!(
+        !listed.to_string().contains("acme-secret-token"),
+        "{listed}"
+    );
     let (_, detail) = api.get("admin-tok", "/v1/tenants/acme").await;
-    assert!(!detail.to_string().contains("acme-secret-token"), "{detail}");
+    assert!(
+        !detail.to_string().contains("acme-secret-token"),
+        "{detail}"
+    );
     assert_eq!(detail["connections"][0]["name"], "api");
 
     // ── A template run for a tenant ────────────────────────────────────────
@@ -304,7 +337,11 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     let id = reg["id"].as_str().unwrap().to_string();
 
     let (code, r) = api
-        .post("op-tok", &format!("/v1/tenants/acme/templates/{id}/runs"), json!({}))
+        .post(
+            "op-tok",
+            &format!("/v1/tenants/acme/templates/{id}/runs"),
+            json!({}),
+        )
         .await;
     assert_eq!(code, 202, "{r}");
     let rec = api.wait_run(r["run_id"].as_str().unwrap()).await;
@@ -319,7 +356,11 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
 
     // ── Fan-out across every tenant ────────────────────────────────────────
     let (code, fan) = api
-        .post("op-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": "all"}))
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            json!({"tenants": "all"}),
+        )
         .await;
     assert_eq!(code, 200, "{fan}");
     let results = fan["results"].as_array().unwrap();
@@ -360,7 +401,13 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
 
     // ── Tenant-scoped principal ────────────────────────────────────────────
     let (_, mine) = api.get("acme-tok", "/v1/runs").await;
-    assert!(mine["runs"].as_array().unwrap().iter().all(|r| r["tenant"] == "acme"));
+    assert!(
+        mine["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["tenant"] == "acme")
+    );
     let (_, page) = api.get("admin-tok", "/v1/runs?tenant=globex").await;
     let globex_run = page["runs"][0]["run_id"].as_str().unwrap().to_string();
     let (code, _) = api.get("acme-tok", &format!("/v1/runs/{globex_run}")).await;
@@ -374,10 +421,17 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     assert_eq!(tenants.as_array().unwrap().len(), 1);
     let (code, _) = api.get("acme-tok", "/v1/audit").await;
     assert_eq!(code, 403);
-    let (code, _) = api.post("acme-tok", "/v1/tenants", json!({"id": "x"})).await;
+    let (code, _) = api
+        .post("acme-tok", "/v1/tenants", json!({"id": "x"}))
+        .await;
     assert_eq!(code, 403);
     let (code, _) = api
-        .send(reqwest::Method::DELETE, "acme-tok", "/v1/tenants/acme", None)
+        .send(
+            reqwest::Method::DELETE,
+            "acme-tok",
+            "/v1/tenants/acme",
+            None,
+        )
         .await;
     assert_eq!(code, 403);
     // A plain submission by a scoped principal runs for its tenant.
@@ -397,7 +451,11 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
 
     // `${tenant.*}` is refused outside a tenant run.
     let (code, err) = api
-        .post("op-tok", "/v1/runs", json!({"config": template(&data.uri(), &out, &state_dir)}))
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": template(&data.uri(), &out, &state_dir)}),
+        )
         .await;
     assert_eq!(code, 422, "{err}");
     assert!(err.to_string().contains("tenant"), "{err}");
@@ -428,27 +486,46 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         .await;
     assert_eq!(code, 200, "{started}");
     let authorize = reqwest::Url::parse(started["authorize_url"].as_str().unwrap()).unwrap();
-    let q: std::collections::BTreeMap<String, String> = authorize.query_pairs().into_owned().collect();
+    let q: std::collections::BTreeMap<String, String> =
+        authorize.query_pairs().into_owned().collect();
     assert_eq!(q["code_challenge_method"], "S256");
-    assert_eq!(q["redirect_uri"], "https://faucet.example/v1/connect/callback");
+    assert_eq!(
+        q["redirect_uri"],
+        "https://faucet.example/v1/connect/callback"
+    );
     let state = q["state"].clone();
     let resp = api
         .client
-        .get(format!("{}/v1/connect/callback?code=abc&state={state}", api.base))
+        .get(format!(
+            "{}/v1/connect/callback?code=abc&state={state}",
+            api.base
+        ))
         .send()
         .await
         .unwrap();
     assert!(resp.status().is_redirection(), "{}", resp.status());
     let location = resp.headers()["location"].to_str().unwrap().to_string();
-    assert_eq!(location, "https://app.example/done?connection=crm&status=ok");
+    assert_eq!(
+        location,
+        "https://app.example/done?connection=crm&status=ok"
+    );
     let resp = api
         .client
-        .get(format!("{}/v1/connect/callback?code=abc&state={state}", api.base))
+        .get(format!(
+            "{}/v1/connect/callback?code=abc&state={state}",
+            api.base
+        ))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 400, "a connect session is single-use");
-    let (_, crm) = api.get("admin-tok", "/v1/tenants/acme/connections/crm").await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "a connect session is single-use"
+    );
+    let (_, crm) = api
+        .get("admin-tok", "/v1/tenants/acme/connections/crm")
+        .await;
     assert_eq!(crm["provider_type"], "oauth2_refresh");
     assert_eq!(crm["connect_provider"], "crm");
     assert!(!crm.to_string().contains("rt-granted"));
@@ -461,28 +538,47 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         )
         .await;
     let url = reqwest::Url::parse(started["authorize_url"].as_str().unwrap()).unwrap();
-    let st = url.query_pairs().find(|(k, _)| k == "state").unwrap().1.into_owned();
+    let st = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
     let resp = api
         .client
-        .get(format!("{}/v1/connect/callback?error=access_denied&state={st}", api.base))
+        .get(format!(
+            "{}/v1/connect/callback?error=access_denied&state={st}",
+            api.base
+        ))
         .send()
         .await
         .unwrap();
-    assert!(resp.headers()["location"].to_str().unwrap().contains("status=error&error=access_denied"));
+    assert!(
+        resp.headers()["location"]
+            .to_str()
+            .unwrap()
+            .contains("status=error&error=access_denied")
+    );
 
     // ── Re-auth: the refresh is refused, the connection is flagged ─────────
     let crm_config = template(&data.uri(), &out, &state_dir)
         .replace("name: tenant-sync", "name: crm-sync")
         .replace("ref: api", "ref: crm");
     let (code, r) = api
-        .post("op-tok", "/v1/tenants/acme/runs", json!({"config": crm_config}))
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/runs",
+            json!({"config": crm_config}),
+        )
         .await;
     assert_eq!(code, 202, "{r}");
     let rec = api.wait_run(r["run_id"].as_str().unwrap()).await;
     assert_eq!(rec["status"], "failed", "{rec}");
     let mut flagged = Value::Null;
     for _ in 0..200 {
-        let (_, c) = api.get("admin-tok", "/v1/tenants/acme/connections/crm").await;
+        let (_, c) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
         if c["status"] == "needs_reauth" {
             flagged = c;
             break;
@@ -491,7 +587,11 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
     }
     assert_eq!(flagged["status"], "needs_reauth", "{flagged}");
     let (code, err) = api
-        .post("op-tok", "/v1/tenants/acme/runs", json!({"config": crm_config}))
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/runs",
+            json!({"config": crm_config}),
+        )
         .await;
     assert_eq!(code, 409, "{err}");
     assert!(err.to_string().contains("re-authorization"), "{err}");
@@ -528,14 +628,26 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         .await;
     assert_eq!(code, 200);
     let (code, _) = api
-        .post("op-tok", &format!("/v1/tenants/globex/templates/{id}/runs"), json!({}))
+        .post(
+            "op-tok",
+            &format!("/v1/tenants/globex/templates/{id}/runs"),
+            json!({}),
+        )
         .await;
     assert_eq!(code, 409);
     let (_, fan) = api
-        .post("op-tok", &format!("/v1/templates/{id}/fanout"), json!({"tenants": "all"}))
+        .post(
+            "op-tok",
+            &format!("/v1/templates/{id}/fanout"),
+            json!({"tenants": "all"}),
+        )
         .await;
     assert!(
-        fan["results"].as_array().unwrap().iter().all(|r| r["tenant"] != "globex"),
+        fan["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["tenant"] != "globex"),
         "a suspended tenant is not fanned out to: {fan}"
     );
     for res in fan["results"].as_array().unwrap() {
@@ -553,37 +665,64 @@ async fn scenario(history: impl Fn(&std::path::Path) -> Option<String>) {
         .await;
     assert_eq!(t["limits"]["max_records_per_run"], 1);
     let (_, r) = api
-        .post("op-tok", &format!("/v1/tenants/acme/templates/{id}/runs"), json!({}))
+        .post(
+            "op-tok",
+            &format!("/v1/tenants/acme/templates/{id}/runs"),
+            json!({}),
+        )
         .await;
     let rec = api.wait_run(r["run_id"].as_str().unwrap()).await;
-    assert_eq!(rec["status"], "failed", "the tenant budget stops the run: {rec}");
+    assert_eq!(
+        rec["status"], "failed",
+        "the tenant budget stops the run: {rec}"
+    );
     assert!(rec.to_string().to_lowercase().contains("budget"), "{rec}");
 
     // ── Audit carries the tenant ───────────────────────────────────────────
-    let (_, audit) = api.get("admin-tok", "/v1/audit?tenant=acme&limit=500").await;
+    let (_, audit) = api
+        .get("admin-tok", "/v1/audit?tenant=acme&limit=500")
+        .await;
     let actions: Vec<&str> = audit["entries"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|e| e["action"].as_str())
         .collect();
-    for a in ["tenant.create", "connection.upsert", "connect.start", "connect.complete", "connection.needs_reauth"] {
+    for a in [
+        "tenant.create",
+        "connection.upsert",
+        "connect.start",
+        "connect.complete",
+        "connection.needs_reauth",
+    ] {
         assert!(actions.contains(&a), "{a} missing from {actions:?}");
     }
 
     // ── Delete cascade ─────────────────────────────────────────────────────
     let (code, report) = api
-        .send(reqwest::Method::DELETE, "admin-tok", "/v1/tenants/acme", None)
+        .send(
+            reqwest::Method::DELETE,
+            "admin-tok",
+            "/v1/tenants/acme",
+            None,
+        )
         .await;
     assert_eq!(code, 200, "{report}");
     assert!(report["runs"].as_u64().unwrap() >= 4, "{report}");
-    assert!(report["state_keys_deleted"].as_u64().unwrap() >= 1, "{report}");
+    assert!(
+        report["state_keys_deleted"].as_u64().unwrap() >= 1,
+        "{report}"
+    );
     let (code, _) = api.get("admin-tok", "/v1/tenants/acme").await;
     assert_eq!(code, 404);
     let (_, page) = api.get("admin-tok", "/v1/runs?tenant=acme").await;
     assert!(page["runs"].as_array().unwrap().is_empty());
     let (_, conns) = api.get("admin-tok", "/v1/tenants/globex/connections").await;
-    assert_eq!(conns.as_array().unwrap().len(), 1, "another tenant is untouched");
+    assert_eq!(
+        conns.as_array().unwrap().len(),
+        1,
+        "another tenant is untouched"
+    );
     let (code, providers) = api.get("admin-tok", "/v1/connect/providers").await;
     assert_eq!(code, 200);
     assert_eq!(providers[0]["name"], "crm");

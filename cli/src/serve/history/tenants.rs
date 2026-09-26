@@ -259,7 +259,11 @@ mod tests {
                 .unwrap_err()
                 .contains("at least one")
         );
-        assert!(TenantSelector::Named(vec!["Bad".into()]).validate().is_err());
+        assert!(
+            TenantSelector::Named(vec!["Bad".into()])
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
@@ -275,7 +279,11 @@ mod tests {
         );
         assert!(validate_tenant_id("").unwrap_err().contains("empty"));
         assert!(validate_tenant_id("-x").unwrap_err().contains("start with"));
-        assert!(validate_tenant_id("Acme").unwrap_err().contains("start with"));
+        assert!(
+            validate_tenant_id("Acme")
+                .unwrap_err()
+                .contains("start with")
+        );
         assert!(validate_tenant_id("a.b").unwrap_err().contains("'.'"));
         assert!(
             validate_connection_name("a/b")

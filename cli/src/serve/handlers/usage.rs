@@ -5,10 +5,10 @@
 
 use crate::commands::usage::{parse_when, report_currency};
 use crate::serve::error::ServeError;
+use crate::serve::rbac::AuthContext;
 use crate::serve::state::ServerState;
 use crate::usage::{GroupBy, UsageFilter, UsageRecord, UsageReport, aggregate};
 use axum::Json;
-use crate::serve::rbac::AuthContext;
 use axum::extract::{Extension, Query, State};
 use serde::{Deserialize, Serialize};
 

@@ -391,8 +391,7 @@ async fn plan_run(
     req: &SubmitRequest,
 ) -> Result<ChangePlan, ServeError> {
     let format: crate::serve::load::ConfigFormat = req.config_format.into();
-    let loaded =
-        runner::load_for(state, &req.config, format, actor.tenant.as_deref()).await?;
+    let loaded = runner::load_for(state, &req.config, format, actor.tenant.as_deref()).await?;
     runner::policy_gate(state, actor, &loaded).await?;
     let auth = loaded
         .auth_catalog()

@@ -295,10 +295,16 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Vec<crate::serve::history::catalog::CatalogLineageEdge>, HistoryError> {
         via!(self, p => p.catalog_lineage(root, depth), f => f.catalog_lineage(root, depth))
     }
-    async fn tenant_upsert(&self, tenant: &super::tenants::TenantRecord) -> Result<(), HistoryError> {
+    async fn tenant_upsert(
+        &self,
+        tenant: &super::tenants::TenantRecord,
+    ) -> Result<(), HistoryError> {
         via!(self, p => p.tenant_upsert(tenant), f => f.tenant_upsert(tenant))
     }
-    async fn tenant_get(&self, id: &str) -> Result<Option<super::tenants::TenantRecord>, HistoryError> {
+    async fn tenant_get(
+        &self,
+        id: &str,
+    ) -> Result<Option<super::tenants::TenantRecord>, HistoryError> {
         via!(self, p => p.tenant_get(id), f => f.tenant_get(id))
     }
     async fn tenant_list(&self) -> Result<Vec<super::tenants::TenantRecord>, HistoryError> {

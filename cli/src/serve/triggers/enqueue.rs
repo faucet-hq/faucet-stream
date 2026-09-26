@@ -106,7 +106,10 @@ pub async fn fire(
         }
     };
     if targets.is_empty() {
-        tracing::info!(trigger = compiled.name(), "trigger fired with no tenants to run for");
+        tracing::info!(
+            trigger = compiled.name(),
+            "trigger fired with no tenants to run for"
+        );
         return FireOutcome::Coalesced;
     }
     let mut outcomes = Vec::with_capacity(targets.len());
@@ -167,10 +170,9 @@ async fn fire_targets(
     };
     #[cfg(feature = "tenants")]
     {
-        let (run, skipped) =
-            crate::serve::handlers::tenants::resolve_tenants(state, selector)
-                .await
-                .map_err(|e| e.api_error().error.message)?;
+        let (run, skipped) = crate::serve::handlers::tenants::resolve_tenants(state, selector)
+            .await
+            .map_err(|e| e.api_error().error.message)?;
         for s in skipped {
             tracing::info!(
                 trigger = compiled.name(),
@@ -274,15 +276,13 @@ pub fn template_body(
     }
     let mut params = std::collections::BTreeMap::new();
     for (k, v) in &tpl.params {
-        let v = match v {
-            serde_json::Value::String(s) => serde_json::Value::String(context::substitute_plain(
-                s,
-                event,
-                compiled.name(),
-                fired_at,
-            )?),
-            other => other.clone(),
-        };
+        let v =
+            match v {
+                serde_json::Value::String(s) => serde_json::Value::String(
+                    context::substitute_plain(s, event, compiled.name(), fired_at)?,
+                ),
+                other => other.clone(),
+            };
         params.insert(k.clone(), v);
     }
     let name = compiled.name();

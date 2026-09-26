@@ -135,9 +135,7 @@ impl ConnectProvider {
         }
         self.allowed_redirects.iter().any(|allowed| {
             redirect.strip_prefix(allowed.as_str()).is_some_and(|rest| {
-                rest.is_empty()
-                    || allowed.ends_with('/')
-                    || rest.starts_with(['/', '?', '#'])
+                rest.is_empty() || allowed.ends_with('/') || rest.starts_with(['/', '?', '#'])
             })
         })
     }
@@ -394,10 +392,7 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         .providers
         .get(&session.provider)
         .ok_or_else(|| format!("provider '{}' is no longer configured", session.provider))?;
-    let vault = rt
-        .vault
-        .as_ref()
-        .ok_or("this server has no vault key")?;
+    let vault = rt.vault.as_ref().ok_or("this server has no vault key")?;
     let verifier = vault.open_str(&session.sealed_verifier)?;
     let tokens = exchange(provider, code, &verifier).await?;
     let refresh_token = tokens
@@ -477,7 +472,10 @@ async fn exchange(provider: &ConnectProvider, code: &str, verifier: &str) -> Res
         .await
         .map_err(|e| format!("token request: {e}"))?;
     let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("token response: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("token response: {e}"))?;
     if !status.is_success() {
         return Err(format!(
             "token request failed (HTTP {}): {body}",
@@ -521,7 +519,10 @@ mod tests {
     #[test]
     fn authorize_url_carries_pkce_state_and_scopes() {
         let p = provider();
-        assert_eq!(p.callback_uri(), "https://faucet.example/v1/connect/callback");
+        assert_eq!(
+            p.callback_uri(),
+            "https://faucet.example/v1/connect/callback"
+        );
         let url = reqwest::Url::parse(&p.authorize_url("st", "ch").unwrap()).unwrap();
         let q: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(q["response_type"], "code");
@@ -531,7 +532,10 @@ mod tests {
         assert_eq!(q["code_challenge_method"], "S256");
         assert_eq!(q["scope"], "read offline");
         assert_eq!(q["prompt"], "consent");
-        assert_eq!(q["redirect_uri"], "https://faucet.example/v1/connect/callback");
+        assert_eq!(
+            q["redirect_uri"],
+            "https://faucet.example/v1/connect/callback"
+        );
         let bare = ConnectProvider {
             scopes: Vec::new(),
             ..provider()
@@ -613,7 +617,11 @@ mod tests {
         assert_eq!(ps.get("crm").unwrap().scope_separator, " ");
         assert!(ConnectProviders::load(&dir.path().join("missing")).is_err());
         std::fs::write(&path, "version: [").unwrap();
-        assert!(ConnectProviders::load(&path).unwrap_err().contains("parsing"));
+        assert!(
+            ConnectProviders::load(&path)
+                .unwrap_err()
+                .contains("parsing")
+        );
     }
 
     #[test]

@@ -156,11 +156,20 @@ fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, S
             c.name, c.tenant
         ))
     })?;
-    if let Some(provider) = c.connect_provider.as_deref().and_then(|p| rt.providers.get(p))
+    if let Some(provider) = c
+        .connect_provider
+        .as_deref()
+        .and_then(|p| rt.providers.get(p))
         && let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut)
     {
-        cfg.insert("token_url".into(), Value::String(provider.token_url.clone()));
-        cfg.insert("client_id".into(), Value::String(provider.client_id.clone()));
+        cfg.insert(
+            "token_url".into(),
+            Value::String(provider.token_url.clone()),
+        );
+        cfg.insert(
+            "client_id".into(),
+            Value::String(provider.client_id.clone()),
+        );
         cfg.insert(
             "client_secret".into(),
             Value::String(provider.client_secret.clone()),
@@ -176,9 +185,16 @@ fn is_secret_key(key: &str) -> bool {
     if k.ends_with("_url") || k == "client_id" || k == "token_type" {
         return false;
     }
-    ["secret", "token", "password", "key", "credential", "assertion"]
-        .iter()
-        .any(|needle| k.contains(needle))
+    [
+        "secret",
+        "token",
+        "password",
+        "key",
+        "credential",
+        "assertion",
+    ]
+    .iter()
+    .any(|needle| k.contains(needle))
 }
 
 /// Register every credential-looking string in a provider spec for redaction.
@@ -186,7 +202,9 @@ pub fn register_secrets(value: &Value) {
     fn walk(v: &Value, secret: bool) {
         match v {
             Value::String(s) if secret && !s.is_empty() => crate::secrets::registry::register(s),
-            Value::Object(m) => m.iter().for_each(|(k, v)| walk(v, secret || is_secret_key(k))),
+            Value::Object(m) => m
+                .iter()
+                .for_each(|(k, v)| walk(v, secret || is_secret_key(k))),
             Value::Array(a) => a.iter().for_each(|v| walk(v, secret)),
             _ => {}
         }
@@ -258,9 +276,7 @@ fn state_key_hook(state: ServerState, tenant: String) -> crate::executor::StateK
             Some(v) => Some(v.seal(&spec_value)),
             // Without a vault only a store with no credentials in its spec is
             // kept; any other key is reported, not deleted, on tenant delete.
-            None if matches!(spec.kind.as_str(), "file" | "memory") => {
-                Some(spec_value.to_string())
-            }
+            None if matches!(spec.kind.as_str(), "file" | "memory") => Some(spec_value.to_string()),
             None => None,
         };
         let state_ref = TenantStateRef {
@@ -531,7 +547,12 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
         tracing::warn!(tenant, connection = name, error = %e, "could not mark the connection needs_reauth");
         return;
     }
-    tracing::warn!(tenant, connection = name, reason, "tenant connection needs re-authorization");
+    tracing::warn!(
+        tenant,
+        connection = name,
+        reason,
+        "tenant connection needs re-authorization"
+    );
     metrics::refresh_connection_gauges(state).await;
     let mut actor = AuthContext::system("tenants");
     actor.tenant = Some(tenant.to_string());
@@ -647,14 +668,12 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
     }
 
     let rt = state.tenants();
-    for r in history
-        .tenant_state_refs(tenant)
-        .await
-        .map_err(store_err)?
-    {
+    for r in history.tenant_state_refs(tenant).await.map_err(store_err)? {
         match delete_state_key(rt.vault.as_deref(), &r).await {
             Ok(()) => report.state_keys_deleted += 1,
-            Err(why) => report.state_keys_not_deleted.push(format!("{}: {why}", r.key)),
+            Err(why) => report
+                .state_keys_not_deleted
+                .push(format!("{}: {why}", r.key)),
         }
     }
 
@@ -719,11 +738,15 @@ mod tests {
         assert!(is_revoked(&e(
             "OAuth2 token request failed (HTTP 400): {\"error\":\"invalid_grant\"}"
         )));
-        assert!(is_revoked(&e("OAuth2 token request failed (HTTP 401): nope")));
+        assert!(is_revoked(&e(
+            "OAuth2 token request failed (HTTP 401): nope"
+        )));
         assert!(!is_revoked(&e(
             "OAuth2 token request failed (HTTP 400): {\"error\":\"invalid_request\"}"
         )));
-        assert!(!is_revoked(&e("OAuth2 token request failed (HTTP 503): down")));
+        assert!(!is_revoked(&e(
+            "OAuth2 token request failed (HTTP 503): down"
+        )));
         assert!(!is_revoked(&FaucetError::Config("(HTTP 401)".into())));
     }
 
@@ -769,7 +792,10 @@ mod tests {
         let v = Vault::new("k", &[]).unwrap();
         let spec = serde_json::json!({"type": "file", "config": {"path": "/tmp/x"}});
         let sealed = format!("sealed:{}", v.seal(&spec));
-        assert_eq!(decode_state_spec(Some(&v), Some(&sealed)).unwrap().kind, "file");
+        assert_eq!(
+            decode_state_spec(Some(&v), Some(&sealed)).unwrap().kind,
+            "file"
+        );
         assert!(
             decode_state_spec(None, Some(&sealed))
                 .unwrap_err()

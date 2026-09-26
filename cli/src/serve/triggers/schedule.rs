@@ -32,7 +32,11 @@ pub struct ScheduleWatcher {
 impl ScheduleWatcher {
     /// Start watching from `now`: the first tick is the next occurrence
     /// strictly after it.
-    pub fn new(compiled: Arc<CompiledTrigger>, schedule: CompiledSchedule, now: DateTime<Utc>) -> Self {
+    pub fn new(
+        compiled: Arc<CompiledTrigger>,
+        schedule: CompiledSchedule,
+        now: DateTime<Utc>,
+    ) -> Self {
         let next = schedule.next_after(now);
         Self {
             compiled,
@@ -80,7 +84,9 @@ impl Watcher for ScheduleWatcher {
             return Ok(true);
         }
         match outcome {
-            FireOutcome::Dropped(reason) => Err(format!("tick {tick} dropped ({reason}); retrying")),
+            FireOutcome::Dropped(reason) => {
+                Err(format!("tick {tick} dropped ({reason}); retrying"))
+            }
             FireOutcome::Error(e) => Err(format!("tick {tick}: {e}")),
             FireOutcome::Enqueued(_) | FireOutcome::Coalesced => unreachable!("committed above"),
         }
@@ -108,8 +114,8 @@ mod tests {
             },
             webhook_path: None,
         });
-        let schedule = crate::serve::triggers::compiled::compile_schedule("nightly", cron, "UTC")
-            .unwrap();
+        let schedule =
+            crate::serve::triggers::compiled::compile_schedule("nightly", cron, "UTC").unwrap();
         ScheduleWatcher::new(compiled, schedule, now)
     }
 

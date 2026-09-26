@@ -180,13 +180,19 @@ pub fn build_router(
                 "/v1/tenants/{tenant}/connect/{provider}",
                 post(tenants::start_connect),
             )
-            .route("/v1/tenants/{tenant}/runs", post(tenants::submit_tenant_run))
+            .route(
+                "/v1/tenants/{tenant}/runs",
+                post(tenants::submit_tenant_run),
+            )
             .route(
                 "/v1/tenants/{tenant}/templates/{id}/runs",
                 post(tenants::trigger_tenant_template),
             )
             .route("/v1/templates/{id}/fanout", post(tenants::fanout_template))
-            .route("/v1/connect/providers", get(tenants::list_connect_providers));
+            .route(
+                "/v1/connect/providers",
+                get(tenants::list_connect_providers),
+            );
     }
     // MCP endpoint (#420): mounted only with `--mcp`. Placed on `api` so it
     // inherits the bearer-auth + RBAC route-layer below; the per-request

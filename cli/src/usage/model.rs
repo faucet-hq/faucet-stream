@@ -306,10 +306,7 @@ pub fn aggregate(records: &[UsageRecord], by: GroupBy, currency: &str) -> UsageR
                 .unwrap_or_else(|| format!("(uncatalogued) {}::{}", r.pipeline, r.row)),
             GroupBy::Sink => r.sink_kind.clone(),
             GroupBy::Day => r.recorded_at.format("%Y-%m-%d").to_string(),
-            GroupBy::Tenant => r
-                .tenant
-                .clone()
-                .unwrap_or_else(|| NO_TENANT.to_string()),
+            GroupBy::Tenant => r.tenant.clone().unwrap_or_else(|| NO_TENANT.to_string()),
         };
         let row = groups.entry(key.clone()).or_insert_with(|| empty_row(&key));
         fold(row, r);
@@ -384,7 +381,10 @@ mod tests {
         );
         assert_eq!(est.total, 0.0);
         assert!(est.total.is_sign_positive());
-        assert_eq!(serde_json::to_value(&est).unwrap()["total"], serde_json::json!(0.0));
+        assert_eq!(
+            serde_json::to_value(&est).unwrap()["total"],
+            serde_json::json!(0.0)
+        );
     }
 
     fn snap(written: u64, bytes: u64) -> UsageSnapshot {

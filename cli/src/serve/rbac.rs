@@ -724,7 +724,11 @@ mod tests {
         assert_eq!(path_tenant("/v1/tenants/"), None);
         assert_eq!(path_tenant("/v1/runs"), None);
         assert_eq!(
-            d(Method::POST, "/v1/tenants/{tenant}/runs", "/v1/tenants/acme/runs"),
+            d(
+                Method::POST,
+                "/v1/tenants/{tenant}/runs",
+                "/v1/tenants/acme/runs"
+            ),
             Allow
         );
         assert_eq!(
@@ -732,7 +736,11 @@ mod tests {
             Allow
         );
         assert_eq!(
-            d(Method::POST, "/v1/tenants/{tenant}/runs", "/v1/tenants/other/runs"),
+            d(
+                Method::POST,
+                "/v1/tenants/{tenant}/runs",
+                "/v1/tenants/other/runs"
+            ),
             NotFound
         );
         assert_eq!(
@@ -745,12 +753,19 @@ mod tests {
         );
         assert_eq!(d(Method::POST, "/v1/runs", "/v1/runs"), Allow);
         assert_eq!(d(Method::GET, "/v1/usage", "/v1/usage"), Allow);
-        assert_eq!(d(Method::GET, "/v1/templates/{id}", "/v1/templates/x"), Allow);
+        assert_eq!(
+            d(Method::GET, "/v1/templates/{id}", "/v1/templates/x"),
+            Allow
+        );
         assert_eq!(d(Method::POST, "/v1/templates", "/v1/templates"), Deny);
         assert_eq!(d(Method::POST, "/v1/tenants", "/v1/tenants"), Deny);
         assert_eq!(d(Method::GET, "/v1/audit", "/v1/audit"), Deny);
         assert_eq!(
-            d(Method::POST, "/v1/templates/{id}/fanout", "/v1/templates/x/fanout"),
+            d(
+                Method::POST,
+                "/v1/templates/{id}/fanout",
+                "/v1/templates/x/fanout"
+            ),
             Deny
         );
     }

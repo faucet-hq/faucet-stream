@@ -159,8 +159,15 @@ pub async fn create_tenant(
         created_by: actor.principal.clone(),
     };
     history.tenant_upsert(&rec).await.map_err(store_err)?;
-    crate::serve::audit::write(&state, &for_tenant(&actor, &rec.id), "tenant.create", None, None, "ok")
-        .await;
+    crate::serve::audit::write(
+        &state,
+        &for_tenant(&actor, &rec.id),
+        "tenant.create",
+        None,
+        None,
+        "ok",
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(view(&state, rec).await?)))
 }
 
@@ -231,8 +238,20 @@ pub async fn patch_tenant(
     }
     check_fields(&rec.limits, &rec.notifications)?;
     rec.updated_at = Utc::now();
-    state.history().tenant_upsert(&rec).await.map_err(store_err)?;
-    crate::serve::audit::write(&state, &for_tenant(&actor, &tenant), action, None, None, "ok").await;
+    state
+        .history()
+        .tenant_upsert(&rec)
+        .await
+        .map_err(store_err)?;
+    crate::serve::audit::write(
+        &state,
+        &for_tenant(&actor, &tenant),
+        action,
+        None,
+        None,
+        "ok",
+    )
+    .await;
     Ok(Json(view(&state, rec).await?))
 }
 
@@ -242,8 +261,15 @@ pub async fn delete_tenant(
     Path(tenant): Path<String>,
 ) -> Result<Json<tenants::DeleteReport>, ServeError> {
     let report = tenants::delete_tenant(&state, &tenant).await?;
-    crate::serve::audit::write(&state, &for_tenant(&actor, &tenant), "tenant.delete", None, None, "ok")
-        .await;
+    crate::serve::audit::write(
+        &state,
+        &for_tenant(&actor, &tenant),
+        "tenant.delete",
+        None,
+        None,
+        "ok",
+    )
+    .await;
     Ok(Json(report))
 }
 
@@ -289,7 +315,10 @@ async fn store_connection(
         .map_err(|e| ServeError::BadConfig(format!("provider: {e}")))?;
     tenants::register_secrets(&provider);
     let history = state.history();
-    let existing = history.connection_get(tenant, name).await.map_err(store_err)?;
+    let existing = history
+        .connection_get(tenant, name)
+        .await
+        .map_err(store_err)?;
     if must_be_new && existing.is_some() {
         return Err(ServeError::Conflict(format!(
             "tenant '{tenant}' already has a connection '{name}' (use PUT to replace it)"
@@ -310,8 +339,15 @@ async fn store_connection(
     };
     history.connection_upsert(&rec).await.map_err(store_err)?;
     tenants::metrics::refresh_connection_gauges(state).await;
-    crate::serve::audit::write(state, &for_tenant(actor, tenant), "connection.upsert", None, None, "ok")
-        .await;
+    crate::serve::audit::write(
+        state,
+        &for_tenant(actor, tenant),
+        "connection.upsert",
+        None,
+        None,
+        "ok",
+    )
+    .await;
     Ok(rec)
 }
 
@@ -379,8 +415,15 @@ pub async fn delete_connection(
         return Err(ServeError::NotFound);
     }
     tenants::metrics::refresh_connection_gauges(&state).await;
-    crate::serve::audit::write(&state, &for_tenant(&actor, &tenant), "connection.delete", None, None, "ok")
-        .await;
+    crate::serve::audit::write(
+        &state,
+        &for_tenant(&actor, &tenant),
+        "connection.delete",
+        None,
+        None,
+        "ok",
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -415,9 +458,7 @@ pub struct ProviderView {
     pub scopes: Vec<String>,
 }
 
-pub async fn list_connect_providers(
-    State(state): State<ServerState>,
-) -> Json<Vec<ProviderView>> {
+pub async fn list_connect_providers(State(state): State<ServerState>) -> Json<Vec<ProviderView>> {
     let rt = state.tenants();
     Json(
         rt.providers
@@ -575,7 +616,11 @@ pub async fn fan_out(
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut set = tokio::task::JoinSet::new();
     for tenant in targets {
-        let permit = sem.clone().acquire_owned().await.expect("semaphore not closed");
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore not closed");
         let state = state.clone();
         let actor = for_tenant(actor, &tenant);
         let id = template_id.to_string();
@@ -604,7 +649,9 @@ pub async fn fan_out(
                     change_id: Some(c.id.clone()),
                     reason: None,
                 },
-                Err(e) if is_skip(&e) => FanoutResult::skipped(&tenant, e.api_error().error.message),
+                Err(e) if is_skip(&e) => {
+                    FanoutResult::skipped(&tenant, e.api_error().error.message)
+                }
                 Err(e) => FanoutResult {
                     tenant,
                     status: "failed".into(),
@@ -633,8 +680,15 @@ pub async fn fanout_template(
 ) -> Result<Json<FanoutResponse>, ServeError> {
     let fanout_id = uuid::Uuid::now_v7().to_string();
     let results = fan_out(&state, &actor, &id, body, &fanout_id).await?;
-    crate::serve::audit::write(&state, &actor, "template.fanout", None, Some(fanout_id.clone()), "ok")
-        .await;
+    crate::serve::audit::write(
+        &state,
+        &actor,
+        "template.fanout",
+        None,
+        Some(fanout_id.clone()),
+        "ok",
+    )
+    .await;
     Ok(Json(FanoutResponse {
         fanout_id,
         template_id: id,
@@ -652,6 +706,9 @@ mod tests {
         assert!(is_skip(&ServeError::TooManyRequests("x".into())));
         assert!(!is_skip(&ServeError::BadConfig("x".into())));
         let s = FanoutResult::skipped("a", "why");
-        assert_eq!((s.status.as_str(), s.reason.as_deref()), ("skipped", Some("why")));
+        assert_eq!(
+            (s.status.as_str(), s.reason.as_deref()),
+            ("skipped", Some("why"))
+        );
     }
 }

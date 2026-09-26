@@ -140,7 +140,11 @@ impl ServerState {
     /// Install the tenant runtime (server startup, #709).
     #[cfg(feature = "tenants")]
     pub fn set_tenants(&self, rt: crate::serve::tenants::TenantsRuntime) {
-        *self.inner.tenants.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(rt);
+        *self
+            .inner
+            .tenants
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Arc::new(rt);
     }
 
     /// The tenant runtime.
