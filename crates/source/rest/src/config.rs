@@ -2,6 +2,7 @@
 
 use crate::auth::Auth;
 use crate::pagination::PaginationStyle;
+pub use crate::retry::RetryMatcher;
 use faucet_core::AuthSpec;
 use faucet_core::{OnMissingKey, ReplicationBind, ReplicationKey, ReplicationMethod};
 use reqwest::{
@@ -203,6 +204,16 @@ pub struct RestStreamConfig {
     /// these codes are treated as empty pages (no records, no further pages).
     #[serde(default)]
     pub tolerated_http_errors: Vec<u16>,
+    /// Non-2xx responses to treat as throttling and retry with backoff, for
+    /// APIs that signal a rate limit with a 4xx other than 429 plus an error
+    /// code in the body (e.g. HTTP 400 with `error.code` 17 / 80004). A
+    /// matching response counts as a rate-limit response
+    /// (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`)
+    /// and is retried up to `max_retries` times in a row before the original
+    /// error is surfaced. Checked before `tolerated_http_errors`. Applies to
+    /// data pages, `async_job` requests and discovery requests.
+    #[serde(default)]
+    pub retry_on_response: Vec<RetryMatcher>,
 
     // ── Replication ───────────────────────────────────────────────────────────
     /// `full_table` (default) re-reads everything each run; `incremental`
@@ -726,6 +737,7 @@ impl Default for RestStreamConfig {
             max_retries: 3,
             retry_backoff: Duration::from_secs(1),
             tolerated_http_errors: Vec::new(),
+            retry_on_response: Vec::new(),
             replication_method: ReplicationMethod::FullTable,
             replication_key: None,
             start_replication_value: None,
@@ -779,6 +791,9 @@ impl RestStreamConfig {
         if let Some(key) = &self.replication_key {
             ReplicationKey::parse(key)
                 .map_err(|e| faucet_core::FaucetError::Config(format!("rest: {e}")))?;
+        }
+        for (i, m) in self.retry_on_response.iter().enumerate() {
+            m.validate(i)?;
         }
         if !self.csv_null_values.is_empty() {
             let csv_decode = self.decode.iter().any(|s| {

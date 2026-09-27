@@ -174,6 +174,33 @@ WARN pipeline=orders row=default source spent 2460.0s of a 3600.0s run (68%) wai
 The [`FaucetSourceThrottled`](./dashboards.md) alert fires when a row spends
 more than a quarter of 15 minutes rate-limited.
 
+### Throttling signalled in an error body (`retry_on_response`)
+
+Some APIs rate-limit with a 4xx other than `429` and put the reason in the body
+— the Meta Marketing API answers HTTP 400 with `error.code` 17 (user limit) or
+80004 (ad-account limit). The `rest` source's `retry_on_response` turns those
+into throttling instead of a failed run:
+
+```yaml
+source:
+  type: rest
+  config:
+    # …
+    retry_on_response:
+      - status: [400, 403]
+        body_path: $.error.code
+        values: [17, 80004, 4, 32, 613]
+        backoff_secs: 60        # optional; else Retry-After, else retry_backoff
+```
+
+A matching response is counted exactly like a `429` in the metrics above and
+retried after the wait; a non-matching error fails as before. Rules are checked
+before `tolerated_http_errors`, apply to data pages, `async_job` submit / poll /
+fetch requests and discovery requests, and after `max_retries` consecutive
+matches the original error (status and body) is surfaced, so a permanent error
+that happens to match still fails. A `header:` condition (present, or equal to
+one of `values`) covers APIs that flag throttling in a header instead.
+
 Other sources with their own throttle handling — `databricks`, `dynamodb`,
 `kinesis` — do not report through these metrics yet. A connector (including a
 third-party one) opts in through the round-trip recorder the pipeline installs:

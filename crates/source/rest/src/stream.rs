@@ -80,6 +80,8 @@ pub struct RestStream {
     replication_key: Option<ReplicationKey>,
     /// Set once the missing-key warning has been logged (once per instance).
     missing_key_warned: std::sync::atomic::AtomicBool,
+    /// Consecutive `retry_on_response` matches (#756); reset by any success.
+    matcher_hits: std::sync::atomic::AtomicU32,
 }
 
 /// A bookmark or window bind rendered for the current request (#513/#527/#748).
@@ -526,7 +528,53 @@ impl RestStream {
             roundtrips: std::sync::OnceLock::new(),
             replication_key,
             missing_key_warned: std::sync::atomic::AtomicBool::new(false),
+            matcher_hits: std::sync::atomic::AtomicU32::new(0),
         })
+    }
+
+    /// Map a non-2xx response to a rate limit when a `retry_on_response` rule
+    /// matches (#756). `None` surfaces the original error: no rule matched, or
+    /// `max_retries` consecutive matches were already retried.
+    fn classify_retry_response(
+        &self,
+        status: u16,
+        headers: &HeaderMap,
+        body: &str,
+    ) -> Option<FaucetError> {
+        let m = crate::retry::matcher::find_match(
+            &self.config.retry_on_response,
+            status,
+            headers,
+            body,
+        )?;
+        let hits = self
+            .matcher_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if hits >= self.retry_policy.max_attempts.saturating_sub(1) {
+            self.reset_matcher_hits();
+            tracing::warn!(
+                status,
+                "retry_on_response matched {hits} consecutive time(s); retries exhausted, \
+                 surfacing the error"
+            );
+            return None;
+        }
+        let retry_after = headers
+            .contains_key(reqwest::header::RETRY_AFTER)
+            .then(|| parse_retry_after(headers));
+        let wait =
+            crate::retry::matcher::matched_wait(m, retry_after, self.retry_policy.base, hits);
+        tracing::warn!(
+            status,
+            ?wait,
+            "response matched retry_on_response; treating as throttling"
+        );
+        Some(FaucetError::RateLimited(wait))
+    }
+
+    fn reset_matcher_hits(&self) {
+        self.matcher_hits
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Count (and warn once about) records that lacked the replication key.
@@ -1638,6 +1686,21 @@ impl RestStream {
         // transient network blip fatal to a 30-minute bulk job.
         let resp = req.send().await.map_err(FaucetError::Http)?;
         let status = resp.status();
+        if !status.is_success() && !self.config.retry_on_response.is_empty() {
+            let headers = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            if let Some(e) = self.classify_retry_response(status.as_u16(), &headers, &text) {
+                return Err(e);
+            }
+            return Err(FaucetError::HttpStatus {
+                status: status.as_u16(),
+                url: url.to_string(),
+                body: format!("async_job: {url} returned HTTP {}", status.as_u16()),
+            });
+        }
+        if status.is_success() {
+            self.reset_matcher_hits();
+        }
         if !status.is_success() {
             return Err(FaucetError::HttpStatus {
                 status: status.as_u16(),
@@ -2342,6 +2405,22 @@ impl RestStream {
             return Err(FaucetError::RateLimited(wait));
         }
 
+        // #756: throttling signalled by another status + a body/header marker.
+        // Checked before `tolerated_http_errors`; the body read here is reused
+        // for the error below.
+        if !status.is_success() && !self.config.retry_on_response.is_empty() {
+            let headers = resp.headers().clone();
+            let resp_url = redact_error_url(resp.url(), &self.config.auth);
+            let text = resp.text().await.unwrap_or_default();
+            if let Some(e) = self.classify_retry_response(status.as_u16(), &headers, &text) {
+                return Err(e);
+            }
+            if is_first_page && self.config.tolerated_http_errors.contains(&status.as_u16()) {
+                return Ok((Value::Array(vec![]), HeaderMap::new()));
+            }
+            return Err(http_status_error(status.as_u16(), resp_url, text));
+        }
+
         // Tolerated errors: treat as an empty page ONLY on the first request,
         // where they legitimately mean "this resource is absent/empty". Mid-
         // pagination, an empty page makes every pagination style read "last
@@ -2375,20 +2454,9 @@ impl RestStream {
             // any 4xx/5xx (audit #321 L2).
             let resp_url = redact_error_url(resp.url(), &self.config.auth);
             let body_text = resp.text().await.unwrap_or_default();
-            // Truncate very long error bodies to avoid bloating logs/errors.
-            let truncated = if body_text.len() > 1024 {
-                // Find a safe UTF-8 boundary at or before 1024 bytes.
-                let end = body_text.floor_char_boundary(1024);
-                format!("{}...(truncated)", &body_text[..end])
-            } else {
-                body_text
-            };
-            return Err(FaucetError::HttpStatus {
-                status: status.as_u16(),
-                url: resp_url,
-                body: truncated,
-            });
+            return Err(http_status_error(status.as_u16(), resp_url, body_text));
         }
+        self.reset_matcher_hits();
 
         let mut resp_headers = resp.headers().clone();
         if let Ok(v) = reqwest::header::HeaderValue::from_str(resp.url().as_str()) {
@@ -2482,6 +2550,18 @@ fn redact_error_url(url: &reqwest::Url, auth: &AuthSpec<Auth>) -> String {
 /// **or** an HTTP-date; we honour both. An HTTP-date in the past yields a zero
 /// wait (retry now). Falls back to 60 s only when the header is absent or in
 /// neither form.
+/// A non-2xx data-page error carrying the server's message, truncated to keep
+/// logs bounded.
+fn http_status_error(status: u16, url: String, body: String) -> FaucetError {
+    let body = if body.len() > 1024 {
+        let end = body.floor_char_boundary(1024);
+        format!("{}...(truncated)", &body[..end])
+    } else {
+        body
+    };
+    FaucetError::HttpStatus { status, url, body }
+}
+
 fn parse_retry_after(headers: &HeaderMap) -> Duration {
     const DEFAULT: Duration = Duration::from_secs(60);
     let Some(raw) = headers
@@ -3054,6 +3134,20 @@ impl RestStream {
     /// Authed GET for a discovery probe, returning the response body as text.
     /// Shared by the OData `$metadata` and Salesforce `/sobjects` paths.
     async fn discover_get_text(&self, url: &str, what: &str) -> Result<String, FaucetError> {
+        if self.config.retry_on_response.is_empty() {
+            return self.discover_get_text_once(url, what).await;
+        }
+        // Only a `retry_on_response` match (a rate limit) is retried here.
+        retry::execute_with_retry_recorded(
+            0,
+            self.retry_policy.base,
+            self.roundtrips.get().cloned(),
+            || self.discover_get_text_once(url, what),
+        )
+        .await
+    }
+
+    async fn discover_get_text_once(&self, url: &str, what: &str) -> Result<String, FaucetError> {
         // Static config headers (#539) form the base; auth is applied on top.
         let mut headers = self.static_headers.clone();
         for (k, v) in self.metadata_headers(url).await?.iter() {
@@ -3069,11 +3163,19 @@ impl RestStream {
             .map_err(|e| FaucetError::Source(format!("rest: {what} request failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
+            if !self.config.retry_on_response.is_empty() {
+                let headers = resp.headers().clone();
+                let text = resp.text().await.unwrap_or_default();
+                if let Some(e) = self.classify_retry_response(status.as_u16(), &headers, &text) {
+                    return Err(e);
+                }
+            }
             return Err(FaucetError::Source(format!(
                 "rest: {what} returned HTTP {}",
                 status.as_u16()
             )));
         }
+        self.reset_matcher_hits();
         resp.text()
             .await
             .map_err(|e| FaucetError::Source(format!("rest: reading {what} failed: {e}")))
