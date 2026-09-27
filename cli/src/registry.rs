@@ -901,8 +901,10 @@ pub const LAG_SOURCE_KINDS: &[&str] = &[
     "mysql-cdc",
     "mssql-cdc",
     "mongodb-cdc",
+    "oracle-cdc",
     "kafka",
     "kinesis",
+    "dynamodb",
 ];
 
 /// See [`LAG_SOURCE_KINDS`].

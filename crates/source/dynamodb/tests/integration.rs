@@ -211,7 +211,14 @@ async fn streams_cdc_captures_changes_and_resumes() {
         .unwrap();
     assert_eq!(report.failed_count(), 0, "{report:?}");
 
-    assert_eq!(source.lag().await.unwrap(), None);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    source.apply_start_bookmark(capture.clone()).await.unwrap();
+    let pending = source
+        .lag()
+        .await
+        .unwrap()
+        .expect("probe lag from the bookmark");
+    assert!(pending.seconds.unwrap() > 0.0, "{pending:?}");
     let (records, bookmarks) = drain(&source).await;
     let ops: Vec<&str> = records.iter().map(|r| r["op"].as_str().unwrap()).collect();
     assert_eq!(ops, vec!["c", "c", "c", "u", "d"]);
@@ -225,6 +232,10 @@ async fn streams_cdc_captures_changes_and_resumes() {
     assert_eq!(records[4]["document_key"], json!({"pk": "o2"}));
     assert!(bookmarks.iter().all(Option::is_some));
     let bookmark = bookmarks.last().unwrap().clone().unwrap();
+    let probe = DynamoDbSource::new(cfg.clone()).await.unwrap();
+    probe.apply_start_bookmark(bookmark.clone()).await.unwrap();
+    let caught_up = probe.lag().await.unwrap().expect("probe lag at the head");
+    assert_eq!(caught_up.seconds, Some(0.0), "{caught_up:?}");
 
     // Resume: only changes after the bookmark.
     client

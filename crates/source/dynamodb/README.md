@@ -106,13 +106,19 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
 
 In `mode: streams`, `Source::lag` (#733) reports **seconds**: now minus the
 `ApproximateCreationDateTime` of the newest record read from each open shard,
-the largest across shards. DynamoDB Streams exposes no head position, so a
-shard whose last `GetRecords` came back empty counts as caught up (zero) rather
-than aging while quiet, and nothing is reported until this run has read a shard
-(so `faucet status --probe` shows no lag for a streams row). The pipeline polls
-it on the first page, at most every 15 s after, and when the run ends,
-exporting `faucet_source_lag_seconds{pipeline,row,connector}`; `sla.max_lag_seconds`
-turns the end-of-run value into an SLA. `scan` and `query` modes report no lag.
+the largest across shards. Before this run has read anything — `faucet status
+--probe`, `faucet doctor`, the start of a run — it peeks each open shard from
+the bookmark instead: `GetShardIterator` at the bookmarked sequence (or where a
+run would start for a shard with no entry) and one `GetRecords` with
+`Limit: 1`; the first record's `ApproximateCreationDateTime` is the age of the
+oldest unconsumed change. Stream reads are non-destructive, so the probe
+consumes nothing. DynamoDB Streams exposes no head position, so a shard with
+nothing to read counts as caught up (zero) rather than aging while quiet. The
+pipeline polls it on the first page, at most every 15 s after, and when the run
+ends, exporting `faucet_source_lag_seconds{pipeline,row,connector}`;
+`sla.max_lag_seconds` turns it into an SLA. A failed probe is logged once and
+reported as no lag — it never fails a run. `scan` and `query` modes report no
+lag.
 
 ## Discovery and preflight
 

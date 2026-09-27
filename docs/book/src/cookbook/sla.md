@@ -94,7 +94,7 @@ sla:
 | `kafka` | events | each partition's high watermark minus the next offset to read, summed |
 | `kinesis` | seconds | `MillisBehindLatest` from `GetRecords`, worst shard |
 | `oracle-cdc` | seconds | commit time of the current SCN minus that of the captured `commit_scn` (`SCN_TO_TIMESTAMP`); nothing when the position is older than the SCN-to-time mapping (ORA-08181) |
-| `dynamodb` (`mode: streams`) | seconds | now minus the `ApproximateCreationDateTime` of the newest record read from each open shard, worst shard; a shard whose last read was empty counts as caught up. Reported only once this run has read a shard, so `--probe` shows none |
+| `dynamodb` (`mode: streams`) | seconds | now minus the `ApproximateCreationDateTime` of the newest record read from each open shard, worst shard — or, before any, of the oldest unconsumed record at the bookmark (one `Limit: 1` read per open shard); a shard with nothing to read counts as caught up |
 
 The pipeline asks on the first page, at most every 15 s while pages flow, and
 once when the run ends; the gauges `faucet_source_lag_bytes`,

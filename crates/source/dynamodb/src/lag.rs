@@ -1,11 +1,39 @@
-//! Streams-mode source lag (#733): the age of the newest record each open
-//! shard has handed to the pipeline. DynamoDB Streams exposes no head
-//! position, so a shard that returned an empty `GetRecords` counts as
-//! caught up (zero) rather than aging while it is quiet.
+//! Streams-mode source lag (#733). While a run reads, the age of the newest
+//! record each open shard has handed to the pipeline; before that (a probe,
+//! or the start of a run), the age of the oldest unconsumed record at the
+//! bookmark, read with one `Limit: 1` `GetRecords` per open shard. A shard
+//! with nothing to read counts as caught up (zero).
 
 use std::collections::HashMap;
 
 use faucet_core::SourceLag;
+
+use crate::config::StreamStart;
+use crate::lineage::{ShardInfo, StartAt, start_for};
+use crate::state::StreamBookmark;
+
+/// Where to peek for each open shard when probing from a bookmark: finished
+/// shards are skipped, the rest start where a run would. Pure.
+pub(crate) fn probe_starts(
+    bm: &StreamBookmark,
+    described: &[ShardInfo],
+    start: StreamStart,
+) -> Vec<(String, StartAt)> {
+    let known = |id: &str| bm.finished.contains(id) || described.iter().any(|s| s.id == id);
+    described
+        .iter()
+        .filter(|s| !bm.finished.contains(&s.id))
+        .map(|s| {
+            let parent_known = s.parent.as_deref().is_some_and(known);
+            let at = start_for(
+                bm.shards.get(&s.id).map(String::as_str),
+                parent_known,
+                start,
+            );
+            (s.id.clone(), at)
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ShardLag {
@@ -81,6 +109,41 @@ mod tests {
         assert_eq!(t.lag(10_000), Some(SourceLag::seconds(0.5)));
         t.close("b");
         assert_eq!(t.lag(10_000), None);
+    }
+
+    #[test]
+    fn probe_starts_follow_the_bookmark() {
+        let shard = |id: &str, parent: Option<&str>| ShardInfo {
+            id: id.into(),
+            parent: parent.map(str::to_string),
+        };
+        let described = vec![
+            shard("done", None),
+            shard("read", None),
+            shard("opened", None),
+            shard("child", Some("done")),
+            shard("new", None),
+        ];
+        let mut bm = StreamBookmark::default();
+        bm.finish("done");
+        bm.advance("read", "42");
+        bm.open("opened");
+        let starts = probe_starts(&bm, &described, StreamStart::Latest);
+        assert_eq!(
+            starts,
+            vec![
+                ("read".to_string(), StartAt::After("42".into())),
+                ("opened".to_string(), StartAt::TrimHorizon),
+                ("child".to_string(), StartAt::TrimHorizon),
+                ("new".to_string(), StartAt::Latest),
+            ]
+        );
+        let fresh = probe_starts(
+            &StreamBookmark::default(),
+            &[shard("a", None)],
+            StreamStart::TrimHorizon,
+        );
+        assert_eq!(fresh, vec![("a".to_string(), StartAt::TrimHorizon)]);
     }
 
     #[test]
