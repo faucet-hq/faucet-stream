@@ -219,6 +219,31 @@ pub fn resolve(
     }))
 }
 
+/// The sink config one mirrored table would get, for offline validation of a
+/// multi-table mirror (`faucet validate` has no catalog to discover): the
+/// destination rendered for a placeholder table keyed on `id`.
+pub fn sample_sink_config(
+    spec: &TablesSpec,
+    sink_kind: &str,
+    sink_template: &Value,
+    upsert_capable: bool,
+) -> Option<Value> {
+    let sample = DatasetDescriptor::new("sample_schema.sample_table", "table", json!({}))
+        .with_primary_key(vec!["id".to_string()]);
+    match resolve(
+        spec,
+        sink_kind,
+        sink_template,
+        &json!({}),
+        upsert_capable,
+        None,
+        &sample,
+    ) {
+        Resolution::Mirror(plan) => Some(plan.sink_config),
+        Resolution::Refused(_) => None,
+    }
+}
+
 /// Two tables whose plans would write the same destination, or share a node
 /// id, cannot both be mirrored. Returns `(kept, refused-with-reason)`.
 pub fn refuse_collisions(plans: Vec<TablePlan>) -> (Vec<TablePlan>, Vec<(String, String)>) {
@@ -267,7 +292,12 @@ pub fn cdc_config_for(kind: &str, base: &Value, tables: &[String]) -> Value {
         "oracle-cdc" => {
             obj.insert("tables".into(), json!(tables));
         }
-        "mssql-cdc" => {
+        "mssql-cdc"
+            if obj
+                .get("capture_instances")
+                .and_then(Value::as_array)
+                .is_none_or(|a| a.is_empty()) =>
+        {
             let instances: Vec<String> = tables
                 .iter()
                 .map(|t| {
@@ -549,6 +579,15 @@ mod tests {
     }
 
     #[test]
+    fn sample_sink_config_renders_a_placeholder_table() {
+        let cfg =
+            sample_sink_config(&spec(), "postgres", &json!({"connection_url": "x"}), true).unwrap();
+        assert_eq!(cfg["table_name"], "sample_table");
+        assert_eq!(cfg["key"], json!(["id"]));
+        assert!(sample_sink_config(&spec(), "jsonl", &json!({}), false).is_none());
+    }
+
+    #[test]
     fn colliding_destinations_and_ids_are_refused() {
         let plan = |name: &str, table: &str, id: &str| TablePlan {
             name: name.into(),
@@ -589,6 +628,12 @@ mod tests {
                 &["dbo.Orders".into(), "Items".into()]
             )["capture_instances"],
             json!(["dbo_Orders", "dbo_Items"])
+        );
+        let named = json!({"capture_instances": ["custom_ci"]});
+        assert_eq!(
+            cdc_config_for("mssql-cdc", &named, &tables),
+            named,
+            "explicit instances are kept"
         );
         assert_eq!(
             cdc_config_for("dynamodb", &json!({"mode": "streams"}), &["t1".into()])["table_name"],

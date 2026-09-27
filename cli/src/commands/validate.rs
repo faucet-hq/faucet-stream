@@ -277,7 +277,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         })
         .collect();
 
-    let nodes = expand(&cfg)?;
+    let mut nodes = expand(&cfg)?;
 
     if !unprobed.is_empty() && !args.json {
         println!(
@@ -291,7 +291,23 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
     // Validate the replication block (snapshot source / CDC source / state) so
     // `faucet validate` catches misconfiguration without running.
     if let Some(spec) = &cfg.replication {
-        crate::replication::compiled::CompiledReplication::compile(spec, &cfg)?;
+        let compiled = crate::replication::compiled::CompiledReplication::compile(spec, &cfg)?;
+        // A multi-table mirror's sink template names no table; check the
+        // per-table config a discovered table would get (#731).
+        if let Some(tables) = &compiled.tables {
+            for node in nodes.iter_mut() {
+                let upsert = crate::registry::sink_supported_write_modes(&node.sink.kind)
+                    .contains(&faucet_core::WriteMode::Upsert);
+                if let Some(sample) = crate::replication::tables::sample_sink_config(
+                    &tables.spec,
+                    &node.sink.kind,
+                    &node.sink.config,
+                    upsert,
+                ) {
+                    node.sink.config = sample;
+                }
+            }
+        }
         if !args.json {
             println!("replication: mode={:?} — valid", spec.mode);
         }

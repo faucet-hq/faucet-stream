@@ -3415,6 +3415,24 @@
           "description": "After the snapshot completes, keep streaming CDC until SIGTERM/SIGINT.\nWhen `false`, drain CDC once and exit (useful for tests / batch runs).",
           "type": "boolean",
           "default": true
+        },
+        "tables": {
+          "description": "Mirror a **set of tables** over one change stream (#731) instead of the\nsingle table `pipeline.source` / `snapshot.source` describe. The table\nset comes from the snapshot source's `discover()`, filtered by these\nglobs; each table gets its own snapshot → CDC handoff, state key and\ndestination.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TablesSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "per_table": {
+          "description": "Per-table overrides keyed by the discovered table name (e.g.\n`public.orders`). Requires `tables`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/TableOverride"
+          }
         }
       },
       "additionalProperties": false,
@@ -3438,8 +3456,22 @@
       "type": "object",
       "properties": {
         "source": {
-          "description": "Bulk-read source connector (e.g. `postgres` running `SELECT * FROM t`).",
+          "description": "Bulk-read source connector (e.g. `postgres` running `SELECT * FROM t`).\nIn a multi-table mirror this is the connection template: discovery\nruns against it and each table's selection is merged over it.",
           "$ref": "#/$defs/ConnectorSpec"
+        },
+        "concurrency": {
+          "description": "Tables snapshotted in parallel (multi-table mirror only).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 4
+        },
+        "shards": {
+          "description": "Split each table's snapshot into this many primary-key ranges read in\nparallel (multi-table mirror only; needs a single-column integer key\nand a source that supports `shard:`). `0` / `1` reads the table whole.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
         }
       },
       "additionalProperties": false,
@@ -28188,6 +28220,163 @@
           "const": "zstd"
         }
       ]
+    },
+    "TablesSpec": {
+      "description": "The table set of a multi-table mirror (`mirror.tables`, #731).",
+      "type": "object",
+      "properties": {
+        "include": {
+          "description": "Globs (`*` any run, `?` one character) over the discovered table names.\nDefault `[\"*\"]` — every table the snapshot source discovers.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "*"
+          ]
+        },
+        "exclude": {
+          "description": "Globs removing tables from `include`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "new_tables": {
+          "description": "What to do with a matching table created after the mirror started.",
+          "$ref": "#/$defs/NewTables",
+          "default": "follow"
+        },
+        "discover_interval_secs": {
+          "description": "How often (seconds) to re-run discovery to notice created and dropped\ntables. A change record for an unknown matching table also triggers\nit. `0` disables the periodic check.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
+        },
+        "without_primary_key": {
+          "description": "A table with no primary key: `refuse` it (reported in status, never\nmirrored) or mirror it `append`-only.",
+          "$ref": "#/$defs/WithoutPrimaryKey",
+          "default": "refuse"
+        },
+        "destination": {
+          "description": "Sink-config patch that points the destination at one table, merged over\n`pipeline.sink.config`. String values may use `{table}` (the full\ndiscovered name), `{table_name}` (its last segment) and `{schema}`\n(everything before the last `.`). Defaults per sink kind\n(`table_name: \"{table_name}\"` for SQL sinks, `table_id` for BigQuery,\n`collection` for MongoDB, `index` for Elasticsearch)."
+        },
+        "on_table_error": {
+          "description": "A table whose pipeline keeps failing: `pause` it (explicit status, the\nrest of the stream continues, re-snapshotted after\n`retry_paused_secs`) or `fail` the whole mirror.",
+          "$ref": "#/$defs/OnTableError",
+          "default": "pause"
+        },
+        "max_table_failures": {
+          "description": "Consecutive failed stream cycles before a table is paused.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 3
+        },
+        "retry_paused_secs": {
+          "description": "Seconds before a paused table is re-snapshotted and rejoins. `0` keeps\nit paused until the mirror restarts.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
+        },
+        "lag_warning_secs": {
+          "description": "A table whose last applied change is older than this (seconds) while\nothers advance is reported as lagging and logged as a warning — it is\nholding the shared stream's resume position back.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
+        }
+      },
+      "additionalProperties": false
+    },
+    "NewTables": {
+      "description": "`mirror.tables.new_tables`.",
+      "oneOf": [
+        {
+          "description": "Snapshot a newly created matching table at the current position, then\nroute its changes (default).",
+          "type": "string",
+          "const": "follow"
+        },
+        {
+          "description": "Mirror only the tables that matched when the mirror first started.",
+          "type": "string",
+          "const": "ignore"
+        }
+      ]
+    },
+    "WithoutPrimaryKey": {
+      "description": "`mirror.tables.without_primary_key`.",
+      "oneOf": [
+        {
+          "description": "Do not mirror the table; report it as `refused` (default).",
+          "type": "string",
+          "const": "refuse"
+        },
+        {
+          "description": "Mirror it with `write_mode: append` (updates and deletes append rows).",
+          "type": "string",
+          "const": "append"
+        }
+      ]
+    },
+    "OnTableError": {
+      "description": "`mirror.tables.on_table_error`.",
+      "oneOf": [
+        {
+          "description": "Pause the failing table and keep mirroring the rest (default).",
+          "type": "string",
+          "const": "pause"
+        },
+        {
+          "description": "Stop the whole mirror with the table's error.",
+          "type": "string",
+          "const": "fail"
+        }
+      ]
+    },
+    "TableOverride": {
+      "description": "One entry of `mirror.per_table`.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Upsert key; defaults to the discovered primary key.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "write_mode": {
+          "description": "Destination write mode (`append` / `upsert` / `delete`); defaults to\nthe sink template's, else `upsert` on a keyed table.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sink": {
+          "description": "Extra sink-config patch for this table (merged after `destination`)."
+        },
+        "snapshot": {
+          "description": "Snapshot-source config patch for this table (merged after the\ndiscovered selection, e.g. a narrower `query`)."
+        },
+        "schema_drift": {
+          "description": "Schema-drift policy for this table, replacing the top-level `schema:`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SchemaDriftSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }
