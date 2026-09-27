@@ -52,7 +52,11 @@ hub id is `<owner>/<name>`). The templates shipped here are the official
    literal, never a private hostname or placeholder value.
 3. Declare every stream with its `write` preference and `primary_keys`; use
    `parent` for per-record fan-out and `sources:` + `source.ref` for a second
-   endpoint family.
+   endpoint family. A child (`parent:`) stream never lands on a sink that
+   replaces its output per invocation (the `jsonl` template), and its
+   `overwrite` is satisfied only natively, never through an alias — list a
+   keyed fallback (`write: [overwrite, upsert]`) for sinks without a native
+   overwrite.
 4. Run the checks that CI runs:
 
 ```bash

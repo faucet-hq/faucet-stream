@@ -213,10 +213,11 @@ pub struct Cell {
 pub fn cell(source: &SourceTemplate, sink: &SinkTemplate) -> Cell {
     let supported = crate::registry::sink_supported_write_modes(&sink.sink.kind);
     let aliases = sink.aliases();
+    let truncates = sink.truncates_per_invocation();
     let mut streams = Vec::new();
     let mut incompatible = Vec::new();
     for s in &source.streams {
-        match resolve_mode(s, &sink.sink.kind, supported, &aliases) {
+        match resolve_mode(s, &sink.sink.kind, supported, &aliases, truncates) {
             Ok(p) => streams.push(p),
             Err(e) => incompatible.push(e),
         }

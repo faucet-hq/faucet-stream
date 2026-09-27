@@ -1518,7 +1518,41 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         }
     }
     check_file_sink_paths(&out)?;
+    check_truncating_fan_out(&out)?;
     Ok(out)
+}
+
+/// A row that runs once per parent record (or discovered tuple) must not write
+/// a truncating file sink at a fixed path (#752): every invocation would
+/// replace the output, keeping only the last parent's rows. Backstop for
+/// hand-written configs and deployment overlays; the Template Hub composer
+/// refuses the pairing earlier.
+fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
+    for n in nodes {
+        let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
+        if !fans_out {
+            continue;
+        }
+        let Some(path) = crate::registry::sink_truncating_path(&n.sink.kind, &n.sink.config) else {
+            continue;
+        };
+        let per_invocation = path
+            .match_indices("${")
+            .any(|(i, _)| !path[i + 2..].starts_with("now."));
+        if !per_invocation {
+            let fix = match n.sink.kind.as_str() {
+                "parquet" => "write to a directory destination or set a rollover cap",
+                _ => "set `append: true`",
+            };
+            return Err(CliError::Config(format!(
+                "row '{}' runs once per parent record but its {} sink replaces '{path}' on every \
+                 invocation, so only the last parent's rows would survive — {fix}, or put a \
+                 per-parent token (e.g. `${{parent.id}}`) in the path",
+                n.id, n.sink.kind
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Local file sinks must not share a path (#743): two writers renaming onto
@@ -4038,6 +4072,50 @@ pipeline:
     on_drift: evolve
 "#);
         assert!(expand(&c).is_ok());
+    }
+
+    /// #752: a child row writing a truncating file sink at a fixed path would
+    /// keep only the last parent's rows — refused at load time.
+    #[test]
+    fn truncating_child_sink_at_a_fixed_path_is_refused() {
+        let yaml = |kind: &str, sink: &str| {
+            format!(
+                "version: 1\nname: t\npipeline:\n  source: {{ type: csv, config: {{ path: p.csv }} }}\n  \
+                 sink: {{ type: jsonl, config: {{ path: parents.jsonl }} }}\nmatrix:\n  - id: p\n  \
+                 - id: c\n    parent: p\n    sink: {{ type: {kind}, config: {sink} }}\n"
+            )
+        };
+        let err = expand(&cfg(&yaml("jsonl", "{ path: out/lines.jsonl }")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row 'c' runs once per parent record"), "{err}");
+        assert!(err.contains("set `append: true`"), "{err}");
+
+        let err = expand(&cfg(&yaml(
+            "parquet",
+            "{ destination: { type: local_path, path: out/lines.parquet } }",
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("rollover cap"), "{err}");
+
+        let err = expand(&cfg(&yaml("csv", "{ path: \"out/${now.date}.csv\" }")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("csv sink replaces"), "{err}");
+
+        for ok in [
+            ("jsonl", "{ path: out/lines.jsonl, append: true }"),
+            ("jsonl", "{ path: \"out/lines-${p.id}.jsonl\" }"),
+            ("csv", "{ path: \"out/${p.id}.csv\" }"),
+            (
+                "parquet",
+                "{ destination: { type: local_path, path: out/ } }",
+            ),
+            ("stdout", "{}"),
+        ] {
+            assert!(expand(&cfg(&yaml(ok.0, ok.1))).is_ok(), "{ok:?}");
+        }
     }
 }
 

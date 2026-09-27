@@ -131,6 +131,34 @@ be one the connector supports, an alias for a natively supported mode is
 refused as redundant, and keyed modes (`upsert`, `delete`) cannot be aliased —
 only a sink that dedups by key can honour them.
 
+### Child streams and truncating sinks
+
+A child stream (`parent:`) runs once **per parent record** into the same
+destination. On a sink that replaces its output on every invocation — `jsonl`
+/ `csv` with `append: false`, a fixed-path `parquet` file, a `file` sink in
+`mode: overwrite` — every parent's invocation would wipe the previous one's
+rows, leaving only the last parent's. So the composer refuses:
+
+- a child stream on a truncating sink, whatever mode it asks for; and
+- a child stream's `overwrite` satisfied through an alias (`overwrite: append`)
+  on any sink.
+
+A **native** overwrite (postgres, sqlite, mysql, mssql, mongodb, bigquery) is
+allowed: the executor stages it once for all of a row's invocations and swaps
+once. When a child stream lists several modes, a refused one falls through to
+the next (`write: [overwrite, upsert]` → `upsert`); if none remains the pairing
+fails with the stream named:
+
+```text
+child stream 'bill_lines' (parent: bills) cannot satisfy overwrite via append on sink 'jsonl':
+each parent invocation would replace the output, keeping only the last parent's rows
+```
+
+`faucet validate` / `run` apply the same rule to hand-written configs and to
+deployment overlays: a `parent:` or `fan_out:` row whose truncating file sink
+writes one fixed path (no `${parent.*}`-style token; `${now.*}` does not count)
+is refused. Set `append: true`, or put a per-parent token in the path.
+
 ## Composition and the compatibility matrix
 
 `faucet run --source X --sink Y` (and `faucet validate --source X --sink Y`,
