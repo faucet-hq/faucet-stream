@@ -686,6 +686,8 @@ rdkafka = { workspace = true, optional = true }
 # back to `None` elsewhere), so the dep is target-gated to keep Windows building.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Cyrus SASL for the kafka trigger / lineage transport; sasl2-sys is unix-only.
+rdkafka = { workspace = true, optional = true, features = ["sasl"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

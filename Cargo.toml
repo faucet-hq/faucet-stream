@@ -353,7 +353,9 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 schemars = "1.2.1"
 futures = "0.3"
 async-stream = "0.3"
-rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored", "sasl"] }
+# `sasl` (Cyrus SASL, for GSSAPI) is added per crate on unix only: sasl2-sys
+# cannot build on Windows. PLAIN / SCRAM / OAUTHBEARER are built into librdkafka.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
 apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
 # ORC reader (#719). Arrow-native; pinned to the arrow-58 line like parquet.
 orc-rust = { version = "0.8", default-features = false }
