@@ -248,6 +248,16 @@ always re-applied. A server that does *not* echo its filter into the link
 degrades to over-fetching on page 2+, which the client-side incremental filter
 then trims — never to data loss. Header / body / path binds are unaffected.
 
+Relative links are resolved per RFC 3986 against the URL of the request that
+returned them: root-relative (`/services/data/v60.0/query/01g…-2000`, Salesforce
+`nextRecordsUrl`), path-relative (`page2`), protocol-relative (`//host/p`) and
+query-only (`?page=2`) links all work, and the loop guard compares resolved
+URLs. A link to a different host is followed (logged at debug) with the same
+credentials, since it came from the authenticated API; an unparseable link
+fails the run naming the path and the value. `async_job` URLs that already
+carry the `base_url` path prefix (`/services/data/v60.0/jobs/…` under
+`base_url: https://x/services/data/v60.0`) no longer duplicate it.
+
 A POST-search API whose filter sits deep in the body (HubSpot CRM search) takes
 the bookmark through a JSON Pointer. The value is written after any
 `${parent.*}` substitution, on the first request and on every paginated one:
