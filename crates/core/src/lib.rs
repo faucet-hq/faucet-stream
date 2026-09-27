@@ -121,7 +121,10 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
 pub use error::FaucetError;
-pub use file_format::{CsvOptions, ExcelOptions, FileFormat, FormatOptions, XmlOptions};
+pub use file_format::{
+    AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, ExcelOptions, FileFormat, FileInput,
+    FormatOptions, OrcOptions, XmlOptions,
+};
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,
     SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,

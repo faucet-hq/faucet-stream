@@ -348,7 +348,9 @@ schemars = "1.2.1"
 futures = "0.3"
 async-stream = "0.3"
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored", "sasl"] }
-apache-avro = { version = "0.21", default-features = false, features = ["snappy"] }
+apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
+# ORC reader (#719). Arrow-native; pinned to the arrow-58 line like parquet.
+orc-rust = { version = "0.8", default-features = false }
 jsonschema = { version = "0.46", default-features = false }
 lru = "0.18"
 # Observability fixture. `metrics` and `tracing` are core deps because they are
