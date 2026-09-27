@@ -2280,7 +2280,11 @@ pub struct BackfillArgs {
 
 /// `faucet replicate` arguments.
 #[derive(Debug, Parser)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct ReplicateArgs {
+    /// `status` — show the mirror's per-table state instead of running it.
+    #[command(subcommand)]
+    pub action: Option<MirrorAction>,
     /// Path to a `.yaml`, `.yml`, or `.json` pipeline config with a
     /// `replication:` block. If omitted, auto-discover
     /// `faucet.yaml` / `.yml` / `.json` in cwd.
@@ -2294,6 +2298,34 @@ pub struct ReplicateArgs {
     pub no_env_file: bool,
     /// Select a named overlay from the config's `profiles:` block and deep-merge
     /// it over the composed base. Overrides the `FAUCET_PROFILE` env var.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
+}
+
+/// `faucet mirror <action>`.
+#[derive(Debug, Subcommand)]
+pub enum MirrorAction {
+    /// Per-table phase, snapshot progress, change counts, committed position,
+    /// lag and last error, read from the mirror's state store (#731).
+    Status(MirrorStatusArgs),
+}
+
+/// `faucet mirror status` arguments.
+#[derive(Debug, Parser)]
+pub struct MirrorStatusArgs {
+    /// Path to the mirror's config. If omitted, auto-discover
+    /// `faucet.yaml` / `.yml` / `.json` in cwd.
+    pub config: Option<PathBuf>,
+    /// Emit the status as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file to load for `${env:VAR}` interpolation.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Select a named overlay from the config's `profiles:` block.
     #[arg(long, env = "FAUCET_PROFILE")]
     pub profile: Option<String>,
 }

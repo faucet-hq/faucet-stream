@@ -95,7 +95,10 @@ fn phase_failure(summary: &crate::executor::RunSummary, phase: &str) -> CliError
 }
 
 /// Build a fresh `ExecuteOptions` for one phase run.
-fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> ExecuteOptions {
+pub(crate) fn make_opts(
+    opts: &ReplicationOptions,
+    cancel: Option<CancellationToken>,
+) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
         pipeline_name: opts.pipeline_name.clone(),
@@ -146,6 +149,9 @@ pub async fn run_replication(
     compiled: &CompiledReplication,
     opts: ReplicationOptions,
 ) -> CliResult<()> {
+    if compiled.tables.is_some() {
+        return crate::replication::multi::run_multi(cfg, compiled, opts).await;
+    }
     // expand() runs the generic gates (exactly-once, write_mode×sink). With no
     // matrix (enforced by CompiledReplication) there is exactly one node.
     let mut nodes = expand(cfg)?;

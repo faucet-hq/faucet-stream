@@ -1,0 +1,901 @@
+//! Multi-table mirror orchestration (#731): discover the table set, snapshot
+//! each table from a position captured just before it, and stream every
+//! snapshotted table from one shared change stream — picking up created
+//! tables, retiring dropped ones, and pausing a table whose pipeline keeps
+//! failing instead of stalling the rest.
+
+use crate::config::{ConnectorSpec, PipelineConfig};
+use crate::error::{CliError, CliResult};
+use crate::executor::{RunSummary, build_state_key, run_expanded};
+use crate::expand::{ExpandedNode, expand};
+use crate::registry::build_source;
+use crate::replication::compiled::{CompiledReplication, CompiledTables};
+use crate::replication::feed::{self, LiveStats};
+use crate::replication::multi_state::{
+    self, FailureAction, MirrorState, TablePhase, due_for_snapshot, reconcile_discovery,
+};
+use crate::replication::orchestrator::{
+    ReplicationOptions, build_snapshot_node, make_opts, spawn_cancel_on_signal,
+};
+use crate::replication::spec::{NewTables, OnTableError};
+use crate::replication::state::marker_key;
+use crate::replication::tables::{self, Resolution, Router, TablePlan};
+use chrono::Utc;
+use faucet_core::{DeliveryMode, Source, StateStore};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Notify;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+
+/// How often live progress is written to the marker during a stream cycle.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+/// Delay before a failed snapshot is retried.
+const SNAPSHOT_RETRY: Duration = Duration::from_secs(30);
+
+struct Shared {
+    cfg: PipelineConfig,
+    tables: CompiledTables,
+    snapshot: ConnectorSpec,
+    cdc: ConnectorSpec,
+    sink_kind: String,
+    continuous: bool,
+    opts: ReplicationOptions,
+    store: Arc<dyn StateStore>,
+    marker_key: String,
+    state: tokio::sync::Mutex<MirrorState>,
+    plans: std::sync::Mutex<BTreeMap<String, TablePlan>>,
+    live: LiveStats,
+}
+
+impl Shared {
+    fn plan(&self, table: &str) -> CliResult<TablePlan> {
+        self.plans
+            .lock()
+            .ok()
+            .and_then(|p| p.get(table).cloned())
+            .ok_or_else(|| CliError::Internal(format!("mirror: no plan for table '{table}'")))
+    }
+
+    fn table_state_key(&self, plan: &TablePlan) -> String {
+        build_state_key(&self.opts.pipeline_name, &plan.id, None)
+    }
+
+    /// Fold live counters into the marker and write it.
+    async fn persist(&self) -> CliResult<()> {
+        let mut state = self.state.lock().await;
+        let deltas = self
+            .live
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        for (table, delta) in deltas {
+            if let Some(t) = state.tables.get_mut(&table) {
+                t.changes += delta.changes;
+                if delta.last_applied_at > t.last_applied_at {
+                    t.last_applied_at = delta.last_applied_at;
+                }
+            }
+        }
+        state.updated_at = Utc::now();
+        let value = state.to_value()?;
+        drop(state);
+        self.store.put(&self.marker_key, &value).await?;
+        Ok(())
+    }
+
+    /// The per-table node: the CDC pipeline expanded against this table's sink
+    /// config, so every generic gate (write mode, exactly-once, drift) runs per
+    /// table.
+    fn table_node(&self, plan: &TablePlan) -> CliResult<ExpandedNode> {
+        let mut cfg = self.cfg.clone();
+        cfg.replication = None;
+        if let Some(sink) = cfg.pipeline.sink.as_mut() {
+            sink.config = plan.sink_config.clone();
+        }
+        if plan.schema_drift.is_some() {
+            cfg.pipeline.schema = plan.schema_drift.clone();
+        }
+        let mut node = expand(&cfg)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CliError::Internal("mirror: expand produced no node".into()))?;
+        node.id = plan.id.clone();
+        Ok(node)
+    }
+
+    fn snapshot_node(&self, plan: &TablePlan, cdc_node: &ExpandedNode) -> ExpandedNode {
+        let mut spec = self.snapshot.clone();
+        spec.config = plan.snapshot_config.clone();
+        let mut node = build_snapshot_node(cdc_node, spec);
+        node.id = format!("{}::snapshot", plan.id);
+        node
+    }
+
+    /// Tables currently sharing the change stream with `table` (for scoping
+    /// the capture connection).
+    async fn stream_mates(&self, table: &str) -> Vec<String> {
+        if self.tables.cdc_kind == "dynamodb" {
+            return vec![table.to_string()];
+        }
+        let state = self.state.lock().await;
+        let mut out: BTreeSet<String> = state
+            .tables
+            .iter()
+            .filter(|(_, t)| {
+                matches!(
+                    t.phase,
+                    TablePhase::Active | TablePhase::Snapshotting | TablePhase::Pending
+                )
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        out.insert(table.to_string());
+        out.into_iter().collect()
+    }
+
+    async fn build_cdc(&self, group: &[String]) -> CliResult<Box<dyn Source>> {
+        build_source(
+            &self.cdc.kind,
+            tables::cdc_config_for(&self.cdc.kind, &self.cdc.config, group),
+            &self.opts.auth,
+            None,
+        )
+        .await
+    }
+
+    fn router(&self, active: &[String], known: BTreeSet<String>) -> Router {
+        Router {
+            active: active.iter().cloned().collect(),
+            known,
+            qualifier: tables::db_qualifier(&self.snapshot.kind, &self.snapshot.config),
+            follow: (self.tables.spec.new_tables == NewTables::Follow)
+                .then(|| self.tables.spec.clone()),
+        }
+    }
+}
+
+/// Resolve the table set: discover, filter, plan, and validate each table's
+/// pipeline. Refusals carry the reason shown in status.
+async fn discover(shared: &Shared) -> CliResult<BTreeMap<String, Resolution>> {
+    let source = build_source(
+        &shared.snapshot.kind,
+        shared.snapshot.config.clone(),
+        &shared.opts.auth,
+        None,
+    )
+    .await?;
+    let descriptors = source.discover().await?;
+    let upsert_capable = crate::registry::sink_supported_write_modes(&shared.sink_kind)
+        .contains(&faucet_core::WriteMode::Upsert);
+    let sink_template = shared
+        .cfg
+        .pipeline
+        .sink
+        .as_ref()
+        .map(|s| s.config.clone())
+        .unwrap_or(Value::Null);
+    let mut out: BTreeMap<String, Resolution> = BTreeMap::new();
+    let mut plans = Vec::new();
+    for d in descriptors
+        .iter()
+        .filter(|d| tables::selected(&shared.tables.spec, &d.name))
+    {
+        match tables::resolve(
+            &shared.tables.spec,
+            &shared.sink_kind,
+            &sink_template,
+            &shared.snapshot.config,
+            upsert_capable,
+            shared.tables.per_table.get(&d.name),
+            d,
+        ) {
+            Resolution::Mirror(plan) => plans.push(*plan),
+            refused @ Resolution::Refused(_) => {
+                out.insert(d.name.clone(), refused);
+            }
+        }
+    }
+    for name in shared.tables.per_table.keys() {
+        if !descriptors.iter().any(|d| &d.name == name) {
+            tracing::warn!(table = %name, "mirror.per_table names a table discovery did not report");
+        }
+    }
+    let (kept, collisions) = tables::refuse_collisions(plans);
+    for (name, reason) in collisions {
+        out.insert(name, Resolution::Refused(reason));
+    }
+    let mut accepted = BTreeMap::new();
+    for plan in kept {
+        let verdict = if shared.tables.cdc_kind == "dynamodb" && plan.key.is_empty() {
+            Err("DynamoDB Streams replays a retained window; only a keyed upsert converges".into())
+        } else {
+            shared
+                .table_node(&plan)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        match verdict {
+            Ok(()) => {
+                accepted.insert(plan.name.clone(), plan.clone());
+                out.insert(plan.name.clone(), Resolution::Mirror(Box::new(plan)));
+            }
+            Err(reason) => {
+                out.insert(plan.name.clone(), Resolution::Refused(reason));
+            }
+        }
+    }
+    if let Ok(mut p) = shared.plans.lock() {
+        p.extend(accepted);
+    }
+    Ok(out)
+}
+
+/// Seed `plan`'s state key at `position`, keeping the exactly-once sequence so
+/// the sink's watermark stays monotonic across a re-snapshot.
+async fn seed_position(
+    shared: &Shared,
+    plan: &TablePlan,
+    source: &dyn Source,
+    position: &Value,
+) -> CliResult<()> {
+    let key = shared.table_state_key(plan);
+    let data = if shared.cfg.delivery == DeliveryMode::ExactlyOnce {
+        let seq = match shared.store.get(&key).await? {
+            Some(stored) => faucet_core::unwrap_state(&stored).1,
+            None => 0,
+        };
+        faucet_core::wrap_state(Some(position), seq)
+    } else {
+        position.clone()
+    };
+    let stored = faucet_core::state_version::wrap_versioned(
+        source.connector_name(),
+        source.state_schema(),
+        &data,
+    );
+    shared.store.put(&key, &stored).await?;
+    Ok(())
+}
+
+fn summary_rows(summary: &RunSummary) -> u64 {
+    summary
+        .invocations
+        .iter()
+        .map(|i| i.records_written as u64)
+        .sum()
+}
+
+fn summary_error(summary: &RunSummary) -> Option<String> {
+    summary.had_failures().then(|| {
+        summary
+            .invocations
+            .iter()
+            .find_map(|i| i.error.clone())
+            .unwrap_or_else(|| "unknown error".to_string())
+    })
+}
+
+/// Snapshot one table. `Ok(true)` = done and active, `Ok(false)` = interrupted
+/// by shutdown (redone on the next run).
+async fn snapshot_table(
+    shared: Arc<Shared>,
+    table: String,
+    cancel: CancellationToken,
+) -> CliResult<bool> {
+    let plan = shared.plan(&table)?;
+    let mates = shared.stream_mates(&table).await;
+    let cdc = shared.build_cdc(&mates).await?;
+    let position = cdc.capture_resume_position().await?.ok_or_else(|| {
+        CliError::Config(format!(
+            "mirror: source '{}' does not support position capture",
+            shared.cdc.kind
+        ))
+    })?;
+    seed_position(&shared, &plan, cdc.as_ref(), &position).await?;
+    drop(cdc);
+
+    let cdc_node = shared.table_node(&plan)?;
+    let snap = shared.snapshot_node(&plan, &cdc_node);
+    let shards = plan_shards(&shared, &plan, &snap).await?;
+    {
+        let mut state = shared.state.lock().await;
+        multi_state::mark_snapshot_started(
+            &mut state,
+            &table,
+            position,
+            shards.len() as u64,
+            Utc::now(),
+        );
+    }
+    shared.persist().await?;
+    tracing::info!(pipeline = %shared.opts.pipeline_name, table = %table, shards = shards.len(), "mirror: snapshotting table");
+
+    let mut runs = JoinSet::new();
+    for shard in shards {
+        let mut node = snap.clone();
+        let mut opts = make_opts(&shared.opts, Some(cancel.clone()));
+        if let Some(spec) = shard {
+            node.source.config = spec.0;
+            opts.shard = Some(spec.1);
+        }
+        runs.spawn(async move { run_expanded(vec![node], opts).await });
+    }
+    let mut failure: Option<String> = None;
+    while let Some(joined) = runs.join_next().await {
+        let outcome = joined.map_err(|e| CliError::Internal(format!("snapshot task: {e}")))?;
+        match outcome {
+            Ok(summary) => match summary_error(&summary) {
+                Some(e) => failure = failure.or(Some(e)),
+                None => {
+                    let mut state = shared.state.lock().await;
+                    multi_state::mark_shard_done(
+                        &mut state,
+                        &table,
+                        summary_rows(&summary),
+                        Utc::now(),
+                    );
+                }
+            },
+            Err(e) => failure = failure.or(Some(e.to_string())),
+        }
+    }
+    if let Some(e) = failure {
+        return Err(CliError::Internal(format!(
+            "snapshot of '{table}' failed: {e}"
+        )));
+    }
+    if cancel.is_cancelled() {
+        return Ok(false);
+    }
+    {
+        let mut state = shared.state.lock().await;
+        multi_state::mark_snapshot_done(&mut state, &table, Utc::now());
+    }
+    shared.persist().await?;
+    tracing::info!(pipeline = %shared.opts.pipeline_name, table = %table, "mirror: snapshot complete; table joins the stream");
+    Ok(true)
+}
+
+type ShardRun = Option<(Value, faucet_core::ShardSpec)>;
+
+/// Split a table's snapshot into primary-key ranges when `snapshot.shards`
+/// asks for it and the key is a single column the source can shard on.
+async fn plan_shards(
+    shared: &Shared,
+    plan: &TablePlan,
+    snap: &ExpandedNode,
+) -> CliResult<Vec<ShardRun>> {
+    if shared.tables.shards <= 1 || plan.key.len() != 1 {
+        return Ok(vec![None]);
+    }
+    let mut config = snap.source.config.clone();
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert("shard".into(), json!({ "key": plan.key[0] }));
+    }
+    let source = build_source(&snap.source.kind, config.clone(), &shared.opts.auth, None).await?;
+    if !source.is_shardable() {
+        return Ok(vec![None]);
+    }
+    let specs = source.enumerate_shards(shared.tables.shards).await?;
+    Ok(specs
+        .into_iter()
+        .map(|s| Some((config.clone(), s)))
+        .collect())
+}
+
+/// What one stream cycle did.
+#[derive(Default)]
+struct CycleResult {
+    tables: BTreeMap<String, Result<(), String>>,
+    new_tables: BTreeSet<String>,
+    source_error: Option<String>,
+}
+
+/// Stream every active table for one cycle (one shared stream per group).
+async fn run_cycle(
+    shared: &Arc<Shared>,
+    active: Vec<String>,
+    cancel: CancellationToken,
+) -> CycleResult {
+    let known: BTreeSet<String> = shared.state.lock().await.tables.keys().cloned().collect();
+    let groups = tables::stream_groups(&shared.tables.cdc_kind, &active);
+    let mut runs = JoinSet::new();
+    for group in groups {
+        let shared = shared.clone();
+        let known = known.clone();
+        let cancel = cancel.clone();
+        runs.spawn(async move { run_group(shared, group, known, cancel).await });
+    }
+    let mut out = CycleResult::default();
+    while let Some(joined) = runs.join_next().await {
+        match joined {
+            Ok(group) => {
+                out.tables.extend(group.tables);
+                out.new_tables.extend(group.new_tables);
+                if group.source_error.is_some() {
+                    out.source_error = group.source_error;
+                }
+            }
+            Err(e) => out.source_error = Some(format!("stream task: {e}")),
+        }
+    }
+    out
+}
+
+async fn run_group(
+    shared: Arc<Shared>,
+    group: Vec<String>,
+    known: BTreeSet<String>,
+    cancel: CancellationToken,
+) -> CycleResult {
+    let mut out = CycleResult::default();
+    let source: Arc<dyn Source> = match shared.build_cdc(&group).await {
+        Ok(s) => Arc::from(s),
+        Err(e) => {
+            out.source_error = Some(e.to_string());
+            return out;
+        }
+    };
+    let mut feeds = Vec::new();
+    let mut runs: JoinSet<(String, Result<(), String>)> = JoinSet::new();
+    let mut streamed = Vec::new();
+    for table in &group {
+        let node = shared.plan(table).and_then(|plan| shared.table_node(&plan));
+        let mut node = match node {
+            Ok(n) => n,
+            Err(e) => {
+                out.tables.insert(table.clone(), Err(e.to_string()));
+                continue;
+            }
+        };
+        let (feed, channel) = feed::channel(table, source.clone());
+        node.source_override = Some(crate::dlq_replay::reader::SourceOverride::new(Box::new(
+            channel,
+        )));
+        feeds.push(feed);
+        streamed.push(table.clone());
+        let opts = make_opts(&shared.opts, None);
+        let name = table.clone();
+        runs.spawn(async move {
+            let result = match run_expanded(vec![node], opts).await {
+                Ok(summary) => summary_error(&summary).map_or(Ok(()), Err),
+                Err(e) => Err(e.to_string()),
+            };
+            (name, result)
+        });
+    }
+    let router = shared.router(&streamed, known);
+    let demux = feed::run_demux(source, feeds, router, cancel, shared.live.clone()).await;
+    while let Some(joined) = runs.join_next().await {
+        match joined {
+            Ok((table, result)) => {
+                out.tables.insert(table, result);
+            }
+            Err(e) => out.source_error = Some(format!("table task: {e}")),
+        }
+    }
+    match demux {
+        Ok(d) => {
+            out.new_tables = d.new_tables;
+            for table in d.dead {
+                out.tables
+                    .entry(table)
+                    .or_insert_with(|| Err("the table's pipeline stopped".into()));
+            }
+        }
+        Err(e) => out.source_error = Some(e.to_string()),
+    }
+    out
+}
+
+/// Run a multi-table mirror until SIGTERM (continuous) or until every table is
+/// snapshotted and the stream has drained once (one-shot).
+pub async fn run_multi(
+    cfg: &PipelineConfig,
+    compiled: &CompiledReplication,
+    opts: ReplicationOptions,
+) -> CliResult<()> {
+    let tables_cfg = compiled
+        .tables
+        .clone()
+        .ok_or_else(|| CliError::Internal("mirror: not a multi-table mirror".into()))?;
+    let state_spec = cfg
+        .pipeline
+        .state
+        .as_ref()
+        .ok_or_else(|| CliError::Config("mirror requires a state store".into()))?;
+    let store = crate::state::build_state_store(state_spec).await?;
+    let marker_key = marker_key(&opts.pipeline_name);
+    let state = match store.get(&marker_key).await? {
+        Some(v) => MirrorState::from_value(v)?,
+        None => MirrorState::new(Utc::now()),
+    };
+    let cdc = cfg
+        .pipeline
+        .source
+        .clone()
+        .ok_or_else(|| CliError::Config("mirror requires pipeline.source".into()))?;
+    let sink_kind = cfg
+        .pipeline
+        .sink
+        .as_ref()
+        .map(|s| s.kind.clone())
+        .ok_or_else(|| CliError::Config("mirror requires pipeline.sink".into()))?;
+    let shared = Arc::new(Shared {
+        cfg: cfg.clone(),
+        tables: tables_cfg,
+        snapshot: compiled.snapshot_source.clone(),
+        cdc,
+        sink_kind,
+        continuous: compiled.continuous,
+        opts,
+        store,
+        marker_key,
+        state: tokio::sync::Mutex::new(state),
+        plans: Default::default(),
+        live: Default::default(),
+    });
+    let cancel = CancellationToken::new();
+    spawn_cancel_on_signal(cancel.clone());
+    drive(shared, cancel).await
+}
+
+struct Driver {
+    shared: Arc<Shared>,
+    cancel: CancellationToken,
+    joined: Arc<Notify>,
+    snapshots: JoinSet<(String, CliResult<bool>)>,
+    running: BTreeSet<String>,
+    retry_at: HashMap<String, Instant>,
+    warned_lag: BTreeSet<String>,
+}
+
+impl Driver {
+    fn spawn_due(&mut self, due: Vec<String>) {
+        let now = Instant::now();
+        for table in due {
+            if self.running.len() >= self.shared.tables.concurrency {
+                break;
+            }
+            if self.running.contains(&table)
+                || self.retry_at.get(&table).is_some_and(|at| *at > now)
+            {
+                continue;
+            }
+            self.running.insert(table.clone());
+            let shared = self.shared.clone();
+            let cancel = self.cancel.clone();
+            self.snapshots.spawn(async move {
+                let r = snapshot_table(shared, table.clone(), cancel).await;
+                (table, r)
+            });
+        }
+    }
+
+    async fn on_snapshot(&mut self, table: String, result: CliResult<bool>) -> CliResult<()> {
+        self.running.remove(&table);
+        match result {
+            Ok(true) => {
+                self.retry_at.remove(&table);
+                self.joined.notify_one();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::error!(pipeline = %self.shared.opts.pipeline_name, table = %table, error = %msg, "mirror: table snapshot failed");
+                let action = {
+                    let mut state = self.shared.state.lock().await;
+                    multi_state::record_failure(
+                        &mut state,
+                        &table,
+                        &msg,
+                        self.shared.tables.spec.max_table_failures,
+                        Utc::now(),
+                    )
+                };
+                self.retry_at
+                    .insert(table.clone(), Instant::now() + SNAPSHOT_RETRY);
+                self.shared.persist().await?;
+                self.check_fail(&table, action, &msg)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_fail(&self, table: &str, action: FailureAction, msg: &str) -> CliResult<()> {
+        if action == FailureAction::Paused {
+            if self.shared.tables.spec.on_table_error == OnTableError::Fail {
+                return Err(CliError::Internal(format!(
+                    "mirror: table '{table}' failed {} times: {msg}",
+                    self.shared.tables.spec.max_table_failures
+                )));
+            }
+            tracing::warn!(pipeline = %self.shared.opts.pipeline_name, table = %table, error = %msg, "mirror: table paused; the rest of the stream continues");
+        }
+        Ok(())
+    }
+
+    async fn reap_finished(&mut self) -> CliResult<()> {
+        while let Some(joined) = self.snapshots.try_join_next() {
+            let (table, result) =
+                joined.map_err(|e| CliError::Internal(format!("snapshot task: {e}")))?;
+            self.on_snapshot(table, result).await?;
+        }
+        Ok(())
+    }
+
+    async fn wait_snapshots(&mut self) -> CliResult<()> {
+        while let Some(joined) = self.snapshots.join_next().await {
+            let (table, result) =
+                joined.map_err(|e| CliError::Internal(format!("snapshot task: {e}")))?;
+            self.on_snapshot(table, result).await?;
+        }
+        Ok(())
+    }
+
+    async fn rediscover(&mut self) -> CliResult<()> {
+        match discover(&self.shared).await {
+            Ok(resolved) => {
+                let follow = self.shared.tables.spec.new_tables == NewTables::Follow;
+                let diff = {
+                    let mut state = self.shared.state.lock().await;
+                    reconcile_discovery(&mut state, &resolved, follow, Utc::now())
+                };
+                for t in &diff.added {
+                    tracing::info!(pipeline = %self.shared.opts.pipeline_name, table = %t, "mirror: table added");
+                }
+                for t in &diff.dropped {
+                    tracing::warn!(pipeline = %self.shared.opts.pipeline_name, table = %t, "mirror: table dropped at the source; no longer routed (destination left untouched)");
+                }
+                for t in &diff.refused {
+                    let reason = match resolved.get(t) {
+                        Some(Resolution::Refused(r)) => r.clone(),
+                        _ => String::new(),
+                    };
+                    tracing::error!(pipeline = %self.shared.opts.pipeline_name, table = %t, reason = %reason, "mirror: table refused");
+                }
+                self.shared.persist().await
+            }
+            Err(e) if self.shared.state.lock().await.discovered_at.is_none() => Err(e),
+            Err(e) => {
+                tracing::warn!(pipeline = %self.shared.opts.pipeline_name, error = %e, "mirror: discovery failed; keeping the current table set");
+                Ok(())
+            }
+        }
+    }
+
+    async fn apply_cycle(&mut self, result: &CycleResult) -> CliResult<usize> {
+        let now = Utc::now();
+        let mut ok = 0;
+        let mut failures = Vec::new();
+        {
+            let mut state = self.shared.state.lock().await;
+            for (table, r) in &result.tables {
+                match r {
+                    Ok(()) => {
+                        ok += 1;
+                        multi_state::record_success(&mut state, table, now);
+                    }
+                    Err(msg) => {
+                        let action = multi_state::record_failure(
+                            &mut state,
+                            table,
+                            msg,
+                            self.shared.tables.spec.max_table_failures,
+                            now,
+                        );
+                        failures.push((table.clone(), action, msg.clone()));
+                    }
+                }
+            }
+        }
+        self.shared.persist().await?;
+        for (table, action, msg) in failures {
+            tracing::warn!(pipeline = %self.shared.opts.pipeline_name, table = %table, error = %msg, "mirror: table cycle failed");
+            self.check_fail(&table, action, &msg)?;
+        }
+        let lagging = {
+            let state = self.shared.state.lock().await;
+            multi_state::lagging(&state, self.shared.tables.spec.lag_warning_secs, now)
+        };
+        let lagging_names: BTreeSet<String> = lagging.iter().map(|(n, _)| n.clone()).collect();
+        for (table, secs) in lagging {
+            if self.warned_lag.insert(table.clone()) {
+                tracing::warn!(pipeline = %self.shared.opts.pipeline_name, table = %table, lag_secs = secs, "mirror: table is lagging and holds the shared stream's resume position back");
+            }
+        }
+        self.warned_lag.retain(|t| lagging_names.contains(t));
+        Ok(ok)
+    }
+}
+
+async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> {
+    let mut d = Driver {
+        shared,
+        cancel,
+        joined: Arc::new(Notify::new()),
+        snapshots: JoinSet::new(),
+        running: BTreeSet::new(),
+        retry_at: HashMap::new(),
+        warned_lag: BTreeSet::new(),
+    };
+    let interval = d.shared.tables.spec.discover_interval_secs;
+    let continuous = d.shared.continuous;
+    let retry_paused = if continuous {
+        d.shared.tables.spec.retry_paused_secs
+    } else {
+        0
+    };
+    let mut rediscover = true;
+    let mut next_discovery = Instant::now();
+    let mut backoff = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+    let result: CliResult<()> = async {
+        loop {
+            if d.cancel.is_cancelled() {
+                break;
+            }
+            if rediscover || (interval > 0 && Instant::now() >= next_discovery) {
+                d.rediscover().await?;
+                rediscover = false;
+                next_discovery = Instant::now() + Duration::from_secs(interval.max(1));
+            }
+            d.reap_finished().await?;
+            let due = {
+                let state = d.shared.state.lock().await;
+                due_for_snapshot(&state, retry_paused, Utc::now())
+            };
+            d.spawn_due(due.clone());
+
+            if !continuous && (!d.snapshots.is_empty() || !due.is_empty()) {
+                if d.snapshots.is_empty() {
+                    let wait = d
+                        .retry_at
+                        .values()
+                        .min()
+                        .map(|at| at.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::from_secs(1));
+                    tokio::select! {
+                        biased;
+                        _ = d.cancel.cancelled() => break,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                } else {
+                    d.wait_snapshots().await?;
+                }
+                continue;
+            }
+
+            let active = d.shared.state.lock().await.in_phase(TablePhase::Active);
+            if !active.is_empty() {
+                let cycle_cancel = d.cancel.child_token();
+                let watcher = {
+                    let joined = d.joined.clone();
+                    let token = cycle_cancel.clone();
+                    let until = (continuous && interval > 0).then_some(next_discovery);
+                    tokio::spawn(async move {
+                        let discovery = async {
+                            match until {
+                                Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                                None => std::future::pending().await,
+                            }
+                        };
+                        tokio::select! {
+                            _ = joined.notified() => {}
+                            _ = discovery => {}
+                            _ = token.cancelled() => {}
+                        }
+                        token.cancel();
+                    })
+                };
+                let ticker = {
+                    let shared = d.shared.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(PROGRESS_INTERVAL).await;
+                            if let Err(e) = shared.persist().await {
+                                tracing::warn!(error = %e, "mirror: progress write failed");
+                            }
+                        }
+                    })
+                };
+                let cycle = run_cycle(&d.shared, active, cycle_cancel.clone()).await;
+                let interrupted = cycle_cancel.is_cancelled();
+                watcher.abort();
+                ticker.abort();
+                let ok = d.apply_cycle(&cycle).await?;
+                if !cycle.new_tables.is_empty() {
+                    tracing::info!(pipeline = %d.shared.opts.pipeline_name, tables = ?cycle.new_tables, "mirror: new tables seen on the stream; re-discovering");
+                    rediscover = true;
+                }
+                let failed = cycle.source_error.is_some() || (ok == 0 && !cycle.tables.is_empty());
+                if let Some(e) = &cycle.source_error {
+                    if !continuous {
+                        return Err(CliError::Internal(format!("mirror CDC phase failed: {e}")));
+                    }
+                    tracing::warn!(pipeline = %d.shared.opts.pipeline_name, error = %e, backoff_secs = backoff.as_secs(), "mirror: stream cycle failed; resuming from the tables' positions after backoff");
+                }
+                if failed && continuous {
+                    tokio::select! {
+                        biased;
+                        _ = d.cancel.cancelled() => break,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                } else {
+                    backoff = Duration::from_secs(1);
+                }
+                if !continuous && !interrupted && !rediscover && d.snapshots.is_empty() {
+                    let due = {
+                        let state = d.shared.state.lock().await;
+                        due_for_snapshot(&state, retry_paused, Utc::now())
+                    };
+                    if due.is_empty() {
+                        break;
+                    }
+                }
+            } else if !d.snapshots.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = d.cancel.cancelled() => break,
+                    _ = d.joined.notified() => {}
+                    Some(joined) = d.snapshots.join_next() => {
+                        let (table, result) = joined
+                            .map_err(|e| CliError::Internal(format!("snapshot task: {e}")))?;
+                        d.on_snapshot(table, result).await?;
+                    }
+                }
+            } else {
+                if !continuous {
+                    break;
+                }
+                let wait = if interval > 0 {
+                    next_discovery.saturating_duration_since(Instant::now())
+                } else {
+                    Duration::from_secs(60)
+                };
+                tokio::select! {
+                    biased;
+                    _ = d.cancel.cancelled() => break,
+                    _ = tokio::time::sleep(wait.max(Duration::from_millis(100))) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    d.cancel.cancel();
+    let drained = d.wait_snapshots().await;
+    d.shared.persist().await?;
+    result.and(drained)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summaries_fold_rows_and_errors() {
+        let ok = RunSummary {
+            invocations: vec![crate::executor::InvocationOutcome {
+                row_id: "t".into(),
+                parent_record_key: None,
+                run_id: None,
+                records_written: 4,
+                error: None,
+                error_kind: None,
+                metrics: None,
+                usage: None,
+            }],
+        };
+        assert_eq!(summary_rows(&ok), 4);
+        assert_eq!(summary_error(&ok), None);
+        let mut bad = ok;
+        bad.invocations[0].error = Some("boom".into());
+        assert_eq!(summary_error(&bad), Some("boom".into()));
+    }
+}

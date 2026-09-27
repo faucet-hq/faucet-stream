@@ -789,7 +789,7 @@ fn has_glob(s: &str) -> bool {
 
 /// Minimal `*` (any run, incl. empty) / `?` (exactly one char) glob matcher.
 /// Sufficient for row-id selection; no character classes or escaping.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     // Iterative backtracking match.
