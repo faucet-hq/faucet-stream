@@ -65,6 +65,10 @@ pub fn build_router(
             get(state_h::get_status).post(state_h::post_status),
         )
         .route(
+            "/v1/mirror/{name}",
+            get(state_h::get_mirror).post(state_h::post_mirror),
+        )
+        .route(
             "/v1/state/{pipeline}/{row}",
             get(state_h::get_state)
                 .put(state_h::put_state)

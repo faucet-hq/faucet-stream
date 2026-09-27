@@ -41,6 +41,9 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     // Pipeline health + durable state (#732, #735).
     ("GET", "/v1/status"),
     ("POST", "/v1/status"),
+    // Multi-table mirror status (#731).
+    ("GET", "/v1/mirror/{name}"),
+    ("POST", "/v1/mirror/{name}"),
     ("GET", "/v1/state/{pipeline}/{row}"),
     ("PUT", "/v1/state/{pipeline}/{row}"),
     ("DELETE", "/v1/state/{pipeline}/{row}"),

@@ -282,6 +282,50 @@ pub async fn post_status(
     status_for(&state, &actor, req).await
 }
 
+// ── /v1/mirror/{name} ───────────────────────────────────────────────────────
+
+/// Per-table status of the mirror `name` (#731), read from its state store —
+/// the mirror may run in this server or in a separate `faucet mirror` process.
+async fn mirror_for(
+    state: &ServerState,
+    actor: &AuthContext,
+    name: &str,
+    src: &ConfigSource,
+) -> Result<Json<crate::replication::status::MirrorStatus>, ServeError> {
+    let (cfg, pipeline) = resolve(state, src).await?;
+    if pipeline != name {
+        return Err(ServeError::Unprocessable {
+            message: format!("the config names pipeline '{pipeline}', not mirror '{name}'"),
+            details: None,
+        });
+    }
+    let report = crate::replication::status::read_status(&cfg, name)
+        .await
+        .map_err(cli_to_serve)?;
+    crate::serve::audit::write(state, actor, "mirror.status", None, None, name).await;
+    Ok(Json(report))
+}
+
+/// `GET /v1/mirror/{name}?config=…|template=…`.
+pub async fn get_mirror(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(q): Query<SourceQuery>,
+) -> Result<Json<crate::replication::status::MirrorStatus>, ServeError> {
+    mirror_for(&state, &actor, &name, &q.source()).await
+}
+
+/// `POST /v1/mirror/{name}` — the same, with the config in a JSON body.
+pub async fn post_mirror(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Json(src): Json<ConfigSource>,
+) -> Result<Json<crate::replication::status::MirrorStatus>, ServeError> {
+    mirror_for(&state, &actor, &name, &src).await
+}
+
 // ── /v1/state/{pipeline}/{row} ──────────────────────────────────────────────
 
 async fn target_for(
