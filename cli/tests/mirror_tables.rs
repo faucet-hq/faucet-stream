@@ -604,3 +604,228 @@ async fn a_failing_table_pauses_without_stalling_the_rest_then_resyncs() {
     verify_table(&url, &state, "shop.bad", "mirror_bad", "id").await;
     verify_table(&url, &state, "shop.good", "mirror_good", "id").await;
 }
+
+fn with(yaml: &str, replacements: &[(&str, &str)]) -> String {
+    replacements.iter().fold(yaml.to_string(), |y, (from, to)| {
+        assert!(y.contains(from), "config has no `{from}`");
+        y.replace(from, to)
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_shot_refusals_the_fail_policy_and_a_broken_stream() {
+    let (_pg, url) = start_postgres().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Two tables collide on one destination (the first keeps it) and one has
+    // no key.
+    sql(
+        &url,
+        "CREATE SCHEMA x; CREATE SCHEMA y; \
+         CREATE TABLE x.dup (id int8 PRIMARY KEY); \
+         CREATE TABLE y.dup (id int8 PRIMARY KEY); \
+         CREATE TABLE x.logs (msg text);",
+    )
+    .await;
+    let st1 = dir.path().join("st1");
+    let refused = with(
+        &config(
+            &url,
+            &st1,
+            false,
+            "at_least_once",
+            "  per_table:\n    x.nope: {}\n",
+        ),
+        &[(r#"include: ["shop.*"]"#, r#"include: ["x.*", "y.*"]"#)],
+    );
+    run(&refused).await;
+    let m = marker(&st1).await.expect("marker");
+    assert_eq!(m.in_phase(TablePhase::Refused).len(), 2, "{:?}", m.tables);
+    let collided = &m.tables["y.dup"];
+    assert!(
+        collided
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("same destination"),
+        "{collided:?}"
+    );
+
+    // Nothing mirrorable at all: a one-shot run ends, a continuous one idles.
+    sql(&url, "CREATE SCHEMA z; CREATE TABLE z.logs (msg text);").await;
+    let st0 = dir.path().join("st0");
+    let nothing = with(
+        &config(&url, &st0, false, "at_least_once", ""),
+        &[(r#"include: ["shop.*"]"#, r#"include: ["z.*"]"#)],
+    );
+    run(&nothing).await;
+    let m = marker(&st0).await.expect("marker");
+    assert_eq!(m.in_phase(TablePhase::Refused), vec!["z.logs".to_string()]);
+    let idle = spawn_run(&with(
+        &nothing,
+        &[("continuous: false", "continuous: true")],
+    ));
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!idle.is_finished(), "a continuous mirror waits for tables");
+    idle.abort();
+    let _ = idle.await;
+
+    // `on_table_error: fail`: a snapshot that cannot be written fails the run.
+    sql(
+        &url,
+        "CREATE SCHEMA shop; \
+         CREATE TABLE shop.orders (id int8 PRIMARY KEY, v text); \
+         INSERT INTO shop.orders VALUES (1, 'not a number'); \
+         CREATE TABLE public.mirror_orders (id int8 PRIMARY KEY, v int8); \
+         CREATE PUBLICATION shop_pub FOR TABLES IN SCHEMA shop;",
+    )
+    .await;
+    let st2 = dir.path().join("st2");
+    let failing = config(
+        &url,
+        &st2,
+        false,
+        "at_least_once",
+        "    on_table_error: fail\n    max_table_failures: 1\n",
+    );
+    let (cfg, compiled) = load(&failing);
+    let err = run_replication(&cfg, &compiled, options())
+        .await
+        .expect_err("the failing table fails the run");
+    assert!(err.to_string().contains("failed 1 times"), "{err}");
+    let m = marker(&st2).await.expect("marker");
+    assert_eq!(m.tables["shop.orders"].phase, TablePhase::Paused);
+
+    // A stream that breaks fails a one-shot run and backs off in a continuous one.
+    sql(
+        &url,
+        "CREATE SCHEMA s3; CREATE TABLE s3.t (id int8 PRIMARY KEY, v int8); \
+         INSERT INTO s3.t VALUES (1, 1); \
+         CREATE PUBLICATION p3 FOR TABLE s3.t;",
+    )
+    .await;
+    let st3 = dir.path().join("st3");
+    let streaming = with(
+        &config(&url, &st3, false, "at_least_once", ""),
+        &[
+            (r#"include: ["shop.*"]"#, r#"include: ["s3.*"]"#),
+            ("shop_pub", "p3"),
+            ("shop_slot", "s3_slot"),
+        ],
+    );
+    run(&streaming).await;
+    sql(&url, "DROP PUBLICATION p3; INSERT INTO s3.t VALUES (2, 2);").await;
+    let (cfg, compiled) = load(&streaming);
+    let err = run_replication(&cfg, &compiled, options())
+        .await
+        .expect_err("a broken stream fails a one-shot mirror");
+    assert!(err.to_string().contains("CDC phase failed"), "{err}");
+    let retrying = spawn_run(&with(
+        &streaming,
+        &[("continuous: false", "continuous: true")],
+    ));
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        !retrying.is_finished(),
+        "a continuous mirror backs off and retries"
+    );
+    retrying.abort();
+    let _ = retrying.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sharded_snapshots_and_a_re_sync_under_exactly_once() {
+    let (_pg, url) = start_postgres().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    sql(
+        &url,
+        "CREATE SCHEMA shop; \
+         CREATE TABLE shop.big (id int8 PRIMARY KEY, v int8); \
+         CREATE TABLE shop.pre (id int8 PRIMARY KEY, v int8); \
+         CREATE PUBLICATION shop_pub FOR TABLES IN SCHEMA shop; \
+         INSERT INTO shop.big SELECT g, g FROM generate_series(1, 300) g; \
+         INSERT INTO shop.pre SELECT g, g FROM generate_series(1, 50) g; \
+         CREATE TABLE public.mirror_pre (id int8 PRIMARY KEY, v int8); \
+         INSERT INTO public.mirror_pre VALUES (999, 0);",
+    )
+    .await;
+    // `big` has no destination yet: its first range creates it keyed, then the
+    // rest follow. `pre` exists: it is emptied atomically, then the ranges fill it.
+    let yaml = with(
+        &config(
+            &url,
+            &state,
+            true,
+            "exactly_once",
+            "    max_table_failures: 1\n    retry_paused_secs: 2\n",
+        ),
+        &[
+            (
+                "    concurrency: 1\n",
+                "    concurrency: 2\n    shards: 3\n",
+            ),
+            ("discover_interval_secs: 2", "discover_interval_secs: 0"),
+        ],
+    );
+    let handle = spawn_run(&yaml);
+    wait_for("both tables active", Duration::from_secs(120), async || {
+        marker(&state)
+            .await
+            .is_some_and(|m| m.in_phase(TablePhase::Active).len() == 2)
+    })
+    .await;
+    assert_eq!(
+        count(&url, "SELECT count(*) FROM mirror_pre WHERE id = 999").await,
+        0,
+        "a sharded snapshot empties an existing destination first"
+    );
+
+    // A change the destination rejects pauses `pre`; its re-sync cannot clear
+    // the destination while the constraint stands, so the snapshot fails too.
+    sql(
+        &url,
+        "ALTER TABLE public.mirror_pre ADD CONSTRAINT small CHECK (v < 1000); \
+         INSERT INTO shop.pre VALUES (51, 5000);",
+    )
+    .await;
+    wait_for(
+        "pre's re-sync snapshot failed",
+        Duration::from_secs(90),
+        async || {
+            marker(&state).await.is_some_and(|m| {
+                m.tables
+                    .get("shop.pre")
+                    .is_some_and(|t| t.snapshot.attempts >= 2 && t.phase == TablePhase::Paused)
+            })
+        },
+    )
+    .await;
+    sql(&url, "ALTER TABLE public.mirror_pre DROP CONSTRAINT small;").await;
+    wait_for("pre re-synced", Duration::from_secs(120), async || {
+        marker(&state).await.is_some_and(|m| {
+            m.tables
+                .get("shop.pre")
+                .is_some_and(|t| t.phase == TablePhase::Active && t.snapshot.attempts >= 3)
+        })
+    })
+    .await;
+    sql(
+        &url,
+        "INSERT INTO shop.pre VALUES (52, 52); UPDATE shop.big SET v = 0 WHERE id = 7;",
+    )
+    .await;
+    wait_for(
+        "changes after the re-sync",
+        Duration::from_secs(60),
+        async || {
+            count(&url, "SELECT count(*) FROM mirror_pre").await == 52
+                && count(&url, "SELECT count(*) FROM mirror_big WHERE v = 0").await == 1
+        },
+    )
+    .await;
+    handle.abort();
+    let _ = handle.await;
+    verify_table(&url, &state, "shop.big", "mirror_big", "id").await;
+    verify_table(&url, &state, "shop.pre", "mirror_pre", "id").await;
+}
