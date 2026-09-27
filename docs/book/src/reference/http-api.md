@@ -27,7 +27,7 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status`, `GET`/`POST /v1/mirror/{name}`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
 | `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
 | `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete), pipeline state (`/v1/state/{pipeline}/{row}`) and `GET /v1/audit` |
 
@@ -113,6 +113,7 @@ someone does.
 | `POST /v1/catalog/datasets/{id}/consumers` | — | ✓ | ✓ |
 | `GET /v1/usage` | ✓ | ✓ | ✓ |
 | `GET`/`POST /v1/status` | ✓ | ✓ | ✓ |
+| `GET`/`POST /v1/mirror/{name}` | ✓ | ✓ | ✓ |
 | `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` | — | — | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
@@ -215,6 +216,7 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (admin / `TemplateAdmin`; `templates-sync`) |
 | `GET` | `/v1/whoami` | `200` | The caller's `principal`, `role` and `permissions` (every role / `Identity`) |
 | `GET` / `POST` | `/v1/status` | `200` | [Pipeline health](#pipeline-status-and-state) per row, from an inline `config` or a registered `template` (viewer / `StatusRead`) |
+| `GET` / `POST` | `/v1/mirror/{name}` | `200` | [Per-table mirror status](#mirror-status) from the mirror's state store (viewer / `StatusRead`) |
 | `GET` | `/v1/state/{pipeline}/{row}` | `200` | A row's bookmark, envelope sequence and markers (admin / `StateAdmin`) |
 | `PUT` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Move the row's bookmark (admin / `StateAdmin`); `409` while a run holds the row |
 | `DELETE` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Reset the row so its next run re-syncs (admin / `StateAdmin`); `409` while a run holds the row |
@@ -475,6 +477,27 @@ is named the same way, and its pipeline name must equal `{pipeline}`. A
 mutation answers `409` while the row's run lease is live or this server has a
 run of the pipeline in flight, unless `force`. Every call is admin-only and
 audited (`state.get` / `state.set` / `state.reset`; status as `status`).
+
+### Mirror status
+
+`GET /v1/mirror/{name}` (and `POST` with the config in a JSON body) returns the
+report behind [`faucet mirror status`](cli.md#mirror): `mode` (`tables` /
+`single`), a `summary` (tables per phase, how many are lagging) and one entry per
+table — `phase` (`pending` / `snapshotting` / `active` / `paused` / `dropped` /
+`refused`), `snapshot` (`rows`, `estimated_rows`, `shards_done` /
+`shards_total`, `percent`, `attempts`), `changes`, the committed `position`,
+`lag_secs` / `lagging`, `consecutive_failures`, `last_error`, `key` and
+`write_mode`. It is read from the mirror's state store, so it answers whether
+the mirror runs in this server or in a separate `faucet mirror` process. Name
+the config with `config` or `template` as for `/v1/status`; its `name:` must
+equal `{name}` (else `422`), and a mirror that has not started is a `422`.
+Viewer-readable (`StatusRead`); audited as `mirror.status`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" --get \
+  --data-urlencode "config@shop_mirror.yaml" http://localhost:8080/v1/mirror/shop_mirror \
+  | jq '.tables[] | {table, phase, lag_secs, last_error}'
+```
 
 ### `/v1/tenants*` (multi-tenant embedded integrations)
 

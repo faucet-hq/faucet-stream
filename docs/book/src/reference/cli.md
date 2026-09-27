@@ -37,7 +37,7 @@ JSON-RPC stream.
 | `faucet dev <config> --sample <f>` | Watch + re-run a sample on save with a live diff (`cli-dev`). |
 | `faucet doctor [config]` | Probe every connector (auth/network/permissions) and print a checklist. |
 | `faucet test <specs…>` | Run fixture-based offline pipeline tests from one or more spec files. |
-| `faucet mirror [config]` | Bulk-snapshot a table, then hand off to CDC for a gap-free mirror. |
+| `faucet mirror [config]` | Bulk-snapshot a table (or every table matching `mirror.tables`), then hand off to CDC for a gap-free mirror. `faucet mirror status` shows per-table progress. |
 | `faucet schedule [config]` | Run a pipeline on a cron schedule (long-running foreground process). |
 | `faucet serve` | Run a long-running HTTP control plane: submit / poll / cancel pipeline runs over REST. |
 | `faucet completions <shell>` | Print a shell tab-completion script (bash / zsh / fish / powershell / elvish). |
@@ -1082,7 +1082,16 @@ faucet mirror                               # auto-discover faucet.yaml in cwd
 faucet mirror pipeline.yaml --env-file prod.env
 faucet mirror pipeline.yaml --no-env-file
 faucet mirror app.yaml --profile prod       # apply a named profile overlay
+faucet mirror status pipeline.yaml          # per-table phase / progress / lag / last error
+faucet mirror status pipeline.yaml --json
 ```
+
+`faucet mirror status` reads the mirror's state store (it does not connect to
+the source) and prints one line per table — phase, snapshot progress, change
+records routed, lag and the last error; `--json` emits the same report as
+[`GET /v1/mirror/{name}`](http-api.md#mirror-status). With a
+[`mirror.tables`](config.md#multi-table-mirror-mirrortables) block one
+`faucet mirror` replicates a whole set of tables over one change stream.
 
 Bulk-snapshots a database table and then hands off to **change-data-capture from
 a position captured *before* the snapshot**, producing a true mirror (no gap, no

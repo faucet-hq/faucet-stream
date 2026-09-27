@@ -244,3 +244,114 @@ not effectively-once-capable), but that is harmless — re-running the snapshot 
 idempotent under upsert. The standard effectively-once hard requirements still apply
 to the CDC pipeline (CDC source, idempotent SQL sink, a `state:` block, and no
 `dlq:` block).
+
+## Mirroring a set of tables
+
+A 40-table database does not need 40 configs, 40 replication slots and 40
+snapshot phases. Add a `tables:` block and one `faucet mirror` replicates every
+table that matches, over **one change stream** (one Postgres slot, one MySQL
+binlog reader, one MongoDB change stream, one SQL Server / Oracle capture
+connection). The complete example is
+[`cli/examples/postgres_mirror_tables.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/postgres_mirror_tables.yaml):
+
+```yaml
+name: shop_mirror
+pipeline:
+  source:                                  # ONE CDC connection for every table
+    type: postgres-cdc
+    config: { connection_url: "postgres://…/shop", slot_name: shop_mirror_slot, publication_name: shop_pub }
+  transforms:
+    - { type: cdc_unwrap, config: {} }
+  sink:                                    # template: the table is filled in per table
+    type: postgres
+    config: { connection_url: "postgres://…/analytics", schema: shop_mirror, column_mapping: auto_map,
+              delete_marker: { field: __op, values: [d] } }
+  state: { type: file, config: { path: ./.faucet-state } }
+mirror:
+  mode: snapshot_then_cdc
+  snapshot:
+    source:                                # discovery runs here; each table's selection is merged over it
+      type: postgres
+      config: { connection_url: "postgres://…/shop", query: "SELECT 1" }
+    concurrency: 4                         # tables snapshotted in parallel
+    shards: 8                              # primary-key ranges per table snapshot
+  tables:
+    include: ["shop.*"]
+    exclude: ["shop.audit_*"]
+    new_tables: follow                     # snapshot tables created later, then stream them
+    destination: { table_name: "{table_name}" }
+  per_table:
+    shop.orders: { schema_drift: { on_drift: evolve } }
+```
+
+**The table set** comes from the snapshot source's
+[`discover()`](./discover.md), filtered by `include` / `exclude` globs. Each
+table is keyed on its discovered **primary key** (override with
+`per_table.<table>.key`). A table with no primary key is **refused** — reported
+in status, never mirrored without a key — unless you set
+`without_primary_key: append` (updates and deletes then append rows).
+`destination` is merged over the sink config per table; `{table}`,
+`{table_name}` and `{schema}` are filled in. SQL sinks, BigQuery, MongoDB and
+Elasticsearch have a default (`table_name` / `table` / `table_id` /
+`collection` / `index` = `{table_name}`); file sinks need one.
+
+**How one stream serves many tables.** Every table runs as its own pipeline —
+its own sink, write mode, drift policy, DLQ and **its own state key**
+`{name}::{table}` — fed by a demultiplexer that reads the change stream once and
+routes each record by the table it belongs to. A table commits a stream
+position only after its own sink has flushed. The stream resumes from the
+**earliest** position any table has committed (so a slot never releases WAL a
+table still needs), and each table skips the changes it already applied. Under
+`delivery: exactly_once` each table's watermark is scoped to its own state key,
+so exactly-once composes per table.
+
+**Per-table handoff.** Each table's snapshot starts from a stream position
+captured just before it and recorded as that table's join point; the stream
+keeps that position until the table joins, and replays everything after it over
+the snapshot (keyed upsert makes the overlap idempotent). On sinks that support
+[overwrite](./upsert.md#overwrite-full-refresh) a re-snapshot replaces the
+destination atomically, so a redo never leaves rows the source no longer has.
+
+| Event | What happens |
+|---|---|
+| Crash mid-snapshot of one table | Only that table redoes its snapshot on restart; finished tables keep streaming from their positions. |
+| Crash mid-stream | Every table resumes from its own committed position — no gap, no duplicate. |
+| Table created at the source (`new_tables: follow`) | A change record for an unknown matching table, or the periodic discovery (`discover_interval_secs`, default 300), adds it: it snapshots at the current position and joins the stream. |
+| Table dropped at the source | It is marked `dropped` and no longer routed. Its destination table is **never** dropped. |
+| A table's sink keeps failing | After `max_table_failures` failed cycles (default 3) it is `paused` with its error in status; the rest of the stream continues and is not held back. After `retry_paused_secs` (default 300) it is re-snapshotted and rejoins. `on_table_error: fail` stops the whole mirror instead. |
+| A table lags | A table whose last applied change is older than `lag_warning_secs` is flagged `lagging` in status and logged — it is holding the stream's resume position (and the slot's WAL) back. |
+| DDL on a mirrored table | Routed through that table's [schema-drift](./schema-drift.md) policy (`per_table.<table>.schema_drift` overrides the top-level one). |
+
+**Status.** `faucet mirror status <config>` (or `--json`, or
+[`GET /v1/mirror/{name}`](../reference/http-api.md#mirror-status)) reads the
+mirror's state store and shows, per table: phase (`pending` / `snapshotting` /
+`active` / `paused` / `dropped` / `refused`), snapshot progress, change records
+routed, committed position, lag and last error:
+
+```text
+mirror shop_mirror (41 tables: 38 active, 1 paused, 1 refused, 1 snapshotting)
+  TABLE            PHASE          SNAPSHOT     CHANGES     LAG  NOTE
+  shop.orders      active             100%   1,204,511      3s
+  shop.events      snapshotting        62%           0       -
+  shop.logs        refused               -           0       -  table 'shop.logs' has no primary key — …
+  shop.payments    paused             100%      88,120     14m  Sink error: …
+```
+
+Per-source notes:
+
+- **Postgres** — the publication decides what the slot streams; use
+  `FOR TABLES IN SCHEMA …` or `FOR ALL TABLES` so `new_tables: follow` sees new
+  tables.
+- **MySQL** — discovery names tables without the database; the binlog's
+  `database.table` names are matched to the snapshot connection's database.
+  Scope the binlog reader with `include_tables` when the server hosts others.
+- **MongoDB** — `scope: { type: database }` (a single collection scope cannot
+  mirror a set); keys default to `_id`.
+- **SQL Server** — list the tables' capture instances in `capture_instances`;
+  left empty, they are derived as `{schema}_{table}` (SQL Server's default
+  capture-instance name).
+- **Oracle** — the LogMiner `tables:` list is set to the mirrored set.
+- **DynamoDB** — each table has its own stream, so each table gets its own
+  stream reader (DynamoDB has no connection-wide stream); keyed upsert is
+  required.
+
