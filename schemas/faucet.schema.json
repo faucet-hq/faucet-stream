@@ -21354,6 +21354,144 @@
           "additionalProperties": false
         },
         {
+          "additionalProperties": false,
+          "properties": {
+            "attributes": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "description": "Configuration for the Singer target bridge sink.\n\nRuns an external [Singer](https://www.singer.io/) target executable and\nfeeds it faucet records as one Singer stream (`SCHEMA` / `RECORD` /\n`STATE`, plus `ACTIVATE_VERSION` for `write_mode: overwrite`).",
+                  "properties": {
+                    "_activate_version": {
+                      "default": null,
+                      "description": "Internal: the table version for `write_mode: overwrite`, shared by\nevery writer of a run. Injected by the `faucet` CLI (the run clock in\nmilliseconds); library callers may leave it unset (a millisecond\ntimestamp is chosen on first use).",
+                      "format": "int64",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "args": {
+                      "default": [],
+                      "description": "Extra arguments appended after faucet's own `--config <file>` flag.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "delete_marker": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_singer__DeleteMarker"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Optional. Upsert only: rows whose `field` matches one of `values` are\ndeletes; all others are upserts. The marker field is stripped from\nupsert rows before writing."
+                    },
+                    "env": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "default": {},
+                      "description": "Extra environment variables for the target process.",
+                      "type": "object"
+                    },
+                    "flush_on": {
+                      "$ref": "#/$defs/sink_singer__FlushOn",
+                      "default": "exit",
+                      "description": "When written records count as persisted: `exit` (default) closes the\ntarget at every flush and waits for a clean exit; `state` keeps it\nrunning and waits for it to echo a `STATE`."
+                    },
+                    "flush_timeout_secs": {
+                      "default": 600,
+                      "description": "How long a flush waits for the target to echo `STATE` (or to exit, with\n`flush_on: exit`) before failing. Default 600.",
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
+                    "key": {
+                      "default": [],
+                      "description": "Key columns. Required and non-empty for upsert/delete; ignored for append.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "key_properties": {
+                      "default": null,
+                      "description": "`key_properties` for the `SCHEMA` message. Defaults to `key` under\n`write_mode: upsert`, else empty.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": [
+                        "array",
+                        "null"
+                      ]
+                    },
+                    "rollback": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_singer__RollbackWriteSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Runtime rollback settings (#706): the run id to journal under, the\nrun-id column, and whether to journal before-images / keep a replaced\ntable. Injected per invocation by the CLI when a config has a\ntop-level `rollback:` block — not meant to be written by hand."
+                    },
+                    "schema": {
+                      "default": null,
+                      "description": "The JSON Schema sent in the stream's `SCHEMA` message. When unset the\n`faucet` CLI uses the pipeline's `contract:` (as JSON Schema) if one is\ndeclared; otherwise the schema is inferred from the records and a new\n`SCHEMA` is sent whenever a page widens it."
+                    },
+                    "stream": {
+                      "default": null,
+                      "description": "The Singer stream name records are sent under. The `faucet` CLI fills\nit from the matrix row id (or the pipeline name for a single-row\nconfig) when unset; Template Hub sink templates set it to `${stream}`.\nLibrary callers default to `faucet`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "target_command": {
+                      "description": "The target executable to run (looked up on `PATH`, or an absolute\npath), e.g. `target-jsonl` or `/opt/targets/target-postgres`.",
+                      "type": "string"
+                    },
+                    "target_config": {
+                      "default": {},
+                      "description": "The target's configuration object. Written to a private (0600) temp\nfile passed as `--config`; its string values are scrubbed from the\ntarget's echoed stderr."
+                    },
+                    "write_mode": {
+                      "$ref": "#/$defs/sink_singer__WriteMode",
+                      "default": "append",
+                      "description": "Append (default), upsert, or delete."
+                    }
+                  },
+                  "title": "SingerSinkConfig",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "type": {
+              "const": "singer"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "singer",
+          "type": "object"
+        },
+        {
           "type": "object",
           "title": "s3",
           "properties": {
@@ -25613,6 +25751,94 @@
         }
       },
       "additionalProperties": false
+    },
+    "sink_singer__RollbackWriteSpec": {
+      "additionalProperties": true,
+      "description": "Runtime rollback settings the executor hands a sink through its\n[`WriteSpec`](crate::write_mode::WriteSpec) (`rollback:` field). Not user\nconfig: the top-level `rollback:` block decides these, and the CLI injects\nthem per invocation.",
+      "properties": {
+        "journal": {
+          "default": false,
+          "description": "Record before-images of every upserted / deleted key.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "keep_previous": {
+          "default": false,
+          "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "run_id": {
+          "description": "The run id this invocation writes under.",
+          "type": "string"
+        },
+        "run_id_column": {
+          "description": "The destination column carrying the run id (stamped by the metadata\ndecorator).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "sink_singer__DeleteMarker": {
+      "description": "Identifies a record as a delete (vs. an upsert) by a marker field's value.\ne.g. `{ field: \"__op\", values: [\"d\", \"delete\"] }`.",
+      "properties": {
+        "field": {
+          "description": "Field name whose value flags a delete.",
+          "type": "string"
+        },
+        "values": {
+          "description": "Values of `field` that mean \"this row is a delete\".",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "sink_singer__FlushOn": {
+      "description": "When the sink treats written records as durably persisted by the target.\n\nMost Singer targets (including the Meltano SDK ones) emit `STATE` only when\nthey drain their buffers — usually at end of input — so `exit` is the\ndefault: it works with every target.",
+      "oneOf": [
+        {
+          "const": "exit",
+          "description": "Send a `STATE`, close the target's stdin and wait for a successful exit;\nthe next write starts a fresh target process (default).",
+          "type": "string"
+        },
+        {
+          "const": "state",
+          "description": "Keep one long-lived target: send a `STATE` and wait for the target to\necho it back — the Singer contract for \"everything before this state is\npersisted\". For targets that echo `STATE` as soon as the preceding\nrecords are persisted.",
+          "type": "string"
+        }
+      ]
+    },
+    "sink_singer__WriteMode": {
+      "description": "Write semantics for a sink. Serialized snake_case. Default `Append`.",
+      "oneOf": [
+        {
+          "const": "append",
+          "description": "Insert every record (today's behaviour).",
+          "type": "string"
+        },
+        {
+          "const": "upsert",
+          "description": "Insert-or-update by `key`; optionally route delete-marked rows to deletes.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Delete by `key` for every record.",
+          "type": "string"
+        },
+        {
+          "const": "overwrite",
+          "description": "Replace the entire destination with this run's records (truncate-load /\nfull refresh). The old contents are swapped out atomically only after the\nrun completes successfully, so a mid-run failure leaves them intact. No\n`key` is required — it is a whole-dataset operation, not a keyed one.",
+          "type": "string"
+        }
+      ]
     }
   }
 }
