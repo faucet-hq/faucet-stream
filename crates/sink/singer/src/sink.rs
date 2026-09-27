@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(s.config().stream_name(), "orders");
         let schema = s.config_schema();
         assert!(schema["properties"]["target_command"].is_object());
-        assert!(schema["properties"].get("_activate_version").is_none());
+        assert!(schema["properties"]["_activate_version"].is_object());
     }
 
     #[test]

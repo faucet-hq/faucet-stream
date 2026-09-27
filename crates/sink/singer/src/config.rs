@@ -90,11 +90,11 @@ pub struct SingerSinkConfig {
     #[serde(flatten)]
     pub write: WriteSpec,
 
-    /// Table version for `write_mode: overwrite`, shared by every writer of a
-    /// run. Injected by the `faucet` CLI; library callers may leave it unset
-    /// (a millisecond timestamp is chosen on first use).
+    /// Internal: the table version for `write_mode: overwrite`, shared by
+    /// every writer of a run. Injected by the `faucet` CLI (the run clock in
+    /// milliseconds); library callers may leave it unset (a millisecond
+    /// timestamp is chosen on first use).
     #[serde(default, rename = "_activate_version")]
-    #[schemars(skip)]
     pub activate_version: Option<i64>,
 }
 
