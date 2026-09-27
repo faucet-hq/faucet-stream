@@ -6,8 +6,12 @@ use crate::config::{
 };
 use async_trait::async_trait;
 use base64::Engine as _;
+use faucet_core::replication::{filter_incremental_path, max_replication_value_path, max_value};
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
-use faucet_core::{AuthSpec, Credential, FaucetError, SharedAuthProvider, Stream, StreamPage};
+use faucet_core::{
+    AuthSpec, Credential, FaucetError, ReplicationKey, ReplicationMethod, SharedAuthProvider,
+    Stream, StreamPage,
+};
 use jsonpath_rust::JsonPath;
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -34,6 +38,9 @@ pub struct GraphqlStream {
     retry_policy: faucet_core::RetryPolicy,
     /// Round-trip / throttling recorder installed by the pipeline (#638, #734).
     roundtrips: faucet_core::observability::RecorderSlot,
+    /// Bookmark restored by the pipeline before a run (#751); wins over
+    /// `start_replication_value`.
+    runtime_start: std::sync::Mutex<Option<Value>>,
 }
 
 /// Attach a mutual-TLS client identity to the HTTP client builder (#495). Only
@@ -159,6 +166,7 @@ impl GraphqlStream {
                 retry_on: faucet_core::RetryClassSet::default(),
             },
             roundtrips: faucet_core::observability::RecorderSlot::new(),
+            runtime_start: std::sync::Mutex::new(None),
         })
     }
 
@@ -188,77 +196,61 @@ impl GraphqlStream {
     }
 
     /// Fetch all records, merging parent context values into GraphQL variables.
+    /// Drains the same page stream the pipeline uses, so pagination and
+    /// incremental filtering behave identically.
     async fn fetch_all_with_context(
         &self,
         context: &std::collections::HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
+        use futures::StreamExt as _;
+        let mut pages = self.stream_pages_inner(context);
         let mut all_records = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut offset = 0usize;
-        let mut pages_fetched = 0usize;
-        let mut warned_unresolved_has_next = false;
-        let mut cursor_guard = CursorGuard::new();
-
-        loop {
-            if let Some(max) = self.config.max_pages
-                && pages_fetched >= max
-            {
-                tracing::warn!("max pages ({max}) reached");
-                break;
-            }
-
-            let body = self.execute_query(&cursor, offset, context).await?;
-            let records = self.extract_records(&body)?;
-            let records_in_page = records.len();
-            all_records.extend(records);
-            pages_fetched += 1;
-
-            // Check pagination.
-            match &self.config.pagination {
-                Some(GraphqlPaginationSpec::Cursor(pag)) => {
-                    let (step, unresolved) = decide_next_page(&body, pag, cursor.as_deref());
-                    if unresolved && !warned_unresolved_has_next {
-                        tracing::warn!(
-                            path = %pag.has_next_page_path,
-                            "GraphQL has_next_page path did not resolve to a boolean; \
-                             deferring to cursor presence to decide pagination"
-                        );
-                        warned_unresolved_has_next = true;
-                    }
-                    match step {
-                        PageStep::Stop => break,
-                        PageStep::StopLoop => {
-                            tracing::warn!("cursor loop detected, stopping pagination");
-                            break;
-                        }
-                        PageStep::Advance(next) => {
-                            if cursor_guard.is_repeat(&next) {
-                                tracing::warn!(
-                                    "cursor cycle detected (cursor already seen), stopping pagination"
-                                );
-                                break;
-                            }
-                            cursor = Some(next);
-                        }
-                    }
-                }
-                Some(GraphqlPaginationSpec::Offset(off)) => {
-                    if offset_should_continue(records_in_page, off) {
-                        offset += off.page_size;
-                    } else {
-                        break;
-                    }
-                }
-                None => break,
-            }
+        while let Some(page) = pages.next().await {
+            all_records.extend(page?.records);
         }
-
-        tracing::info!(
-            records = all_records.len(),
-            pages = pages_fetched,
-            "GraphQL fetch complete"
-        );
+        tracing::info!(records = all_records.len(), "GraphQL fetch complete");
         Ok(all_records)
+    }
+
+    fn is_incremental(&self) -> bool {
+        self.config.replication_method == ReplicationMethod::Incremental
+    }
+
+    /// The bookmark this run starts from: the restored one, else the
+    /// configured `start_replication_value`.
+    fn start_bookmark(&self) -> Option<Value> {
+        let restored = self
+            .runtime_start
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|p| p.into_inner().clone());
+        restored.or_else(|| self.config.start_replication_value.clone())
+    }
+
+    /// Set the `replication_bind` variable from `start` (#751).
+    fn bind_bookmark(&self, variables: &mut Value, start: &Value) -> Result<(), FaucetError> {
+        let Some(bind) = &self.config.replication_bind else {
+            return Ok(());
+        };
+        let formatted = faucet_core::format_bookmark(start, bind.format)?;
+        let rendered = bind
+            .template
+            .replace(faucet_core::replication::BIND_PLACEHOLDER, &formatted);
+        let value = bind.value_type.to_value(&rendered)?;
+        if variables.is_null() {
+            *variables = Value::Object(Default::default());
+        }
+        let var = bind.variable.trim();
+        if var.starts_with('/') {
+            faucet_core::set_body_pointer(variables, var, value)
+        } else if let Value::Object(map) = variables {
+            map.insert(var.to_string(), value);
+            Ok(())
+        } else {
+            Err(FaucetError::Config(
+                "GraphQL source: `replication_bind` needs `variables` to be an object".into(),
+            ))
+        }
     }
 
     /// Execute a single GraphQL query, merging parent context into variables.
@@ -271,8 +263,12 @@ impl GraphqlStream {
         cursor: &Option<String>,
         offset: usize,
         context: &std::collections::HashMap<String, Value>,
+        start: Option<&Value>,
     ) -> Result<Value, FaucetError> {
         let mut variables = self.config.variables.clone();
+        if let Some(start) = start {
+            self.bind_bookmark(&mut variables, start)?;
+        }
 
         // Merge parent context values into GraphQL variables.
         if !context.is_empty()
@@ -434,11 +430,10 @@ impl GraphqlStream {
     /// `batch_size = 0` omits it so the upstream uses its own default page
     /// size and emits a single page.
     ///
-    /// Bookmarks are always `None` — the GraphQL source has no
-    /// incremental-replication mode today. The
-    /// [`bookmark_emitted`-style trailing-checkpoint](https://github.com/faucet-hq/faucet-stream/commit/e6fdca5)
-    /// guard from the REST source is preserved structurally so any future
-    /// incremental mode picks it up without re-deriving the pattern.
+    /// In incremental mode the bookmark (the running max of `replication_key`,
+    /// never below the start bookmark) rides only the final page, or a
+    /// trailing empty page when `max_pages` truncates; full-table runs carry
+    /// no bookmark.
     fn stream_pages_inner(
         &self,
         context: &std::collections::HashMap<String, Value>,
@@ -452,11 +447,17 @@ impl GraphqlStream {
             let mut cursor_guard = CursorGuard::new();
             let mut pages_fetched = 0usize;
             let mut warned_unresolved_has_next = false;
-            // No incremental replication today — `running_max` stays `None`.
-            // The structure mirrors the REST source so a future replication
-            // mode can plug into the same scaffolding without reworking the
-            // bookmark guard.
-            let running_max: Option<Value> = None;
+            // Incremental replication (#751): filter each page against the
+            // start bookmark and carry the running max, emitted only on the
+            // final page so a crash between pages never skips rows.
+            let incremental = self.is_incremental();
+            let start = if incremental { self.start_bookmark() } else { None };
+            let key = match (incremental, &self.config.replication_key) {
+                (true, Some(k)) => Some(ReplicationKey::parse(k)?),
+                _ => None,
+            };
+            let mut running_max: Option<Value> = start.clone();
+            let mut missing_keys = 0usize;
             let mut bookmark_emitted = false;
 
             loop {
@@ -467,10 +468,30 @@ impl GraphqlStream {
                     break;
                 }
 
-                let body = self.execute_query(&cursor, offset, &owned_context).await?;
-                let records = self.extract_records(&body)?;
+                let body = self
+                    .execute_query(&cursor, offset, &owned_context, start.as_ref())
+                    .await?;
+                let mut records = self.extract_records(&body)?;
                 let records_in_page = records.len();
                 pages_fetched += 1;
+                if let Some(key) = &key {
+                    if let Some(start) = &start {
+                        let filtered = filter_incremental_path(
+                            records,
+                            key,
+                            start,
+                            self.config.on_missing_key,
+                        )?;
+                        missing_keys += filtered.missing;
+                        records = filtered.records;
+                    }
+                    if let Some(page_max) = max_replication_value_path(&records, key) {
+                        running_max = Some(match running_max.take() {
+                            Some(prev) => max_value(prev, page_max.clone()),
+                            None => page_max.clone(),
+                        });
+                    }
+                }
 
                 // Advance pagination state BEFORE yielding the current page,
                 // so the bookmark is only attached on the final page.
@@ -519,8 +540,7 @@ impl GraphqlStream {
                     // Intermediate page — bookmark stays `None`.
                     yield StreamPage { records, bookmark: None };
                 } else {
-                    // Final page — attach the consolidated bookmark (always
-                    // `None` until incremental mode lands).
+                    // Final page — attach the consolidated bookmark.
                     bookmark_emitted = running_max.is_some();
                     yield StreamPage {
                         records,
@@ -533,9 +553,6 @@ impl GraphqlStream {
             // Trailing checkpoint: if the loop exited (e.g. via `max_pages`
             // truncation) without carrying the bookmark on a real page, emit
             // one empty page carrying it so the pipeline persists progress.
-            // No-op today because `running_max` is always `None`, but kept so
-            // a future incremental mode inherits the guard from the REST
-            // source's regression fix (commit e6fdca5).
             if !bookmark_emitted && running_max.is_some() {
                 yield StreamPage {
                     records: Vec::new(),
@@ -543,6 +560,12 @@ impl GraphqlStream {
                 };
             }
 
+            if missing_keys > 0 {
+                tracing::warn!(
+                    missing = missing_keys,
+                    "incremental replication: {missing_keys} record(s) lacked the replication_key"
+                );
+            }
             tracing::info!(
                 pages = pages_fetched,
                 batch_size = self.config.batch_size,
@@ -577,6 +600,34 @@ impl faucet_core::Source for GraphqlStream {
 
     fn connector_name(&self) -> &'static str {
         "graphql"
+    }
+
+    /// Resumable when replicating incrementally (#751): an explicit
+    /// `state_key`, else one derived from the endpoint so two sources sharing
+    /// a store never resume from each other's bookmark.
+    fn state_key(&self) -> Option<String> {
+        self.config.state_key.clone().or_else(|| {
+            (self.is_incremental() && self.config.replication_key.is_some()).then(|| {
+                format!(
+                    "graphql:{:016x}",
+                    faucet_core::shard::shard_hash(&format!(
+                        "{}\n{}\n{}",
+                        faucet_core::Source::dataset_uri(self),
+                        self.config.query,
+                        self.config.variables
+                    ))
+                )
+            })
+        })
+    }
+
+    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        let mut guard = self
+            .runtime_start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(bookmark);
+        Ok(())
     }
 
     fn set_roundtrip_recorder(
@@ -1436,5 +1487,58 @@ mod mtls_tests {
         let mut bad = pem();
         bad.client_identity_pkcs12 = Some("/x.p12".into());
         assert!(cfg(bad).validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod replication_tests {
+    use super::*;
+
+    fn bound(variables: Value, bind: Value) -> Result<Value, FaucetError> {
+        let mut c = GraphqlStreamConfig::new("https://x/graphql", "{ a }").variables(variables);
+        c.replication_method = ReplicationMethod::Incremental;
+        c.replication_key = Some("updatedAt".into());
+        c.replication_bind = Some(serde_json::from_value(bind).unwrap());
+        let stream = GraphqlStream::new(c.clone());
+        let mut vars = c.variables.clone();
+        stream.bind_bookmark(&mut vars, &json!(1_767_225_600))?;
+        Ok(vars)
+    }
+
+    #[test]
+    fn bind_bookmark_targets() {
+        let v = bound(
+            json!({}),
+            json!({ "variable": "since", "format": "iso8601" }),
+        )
+        .unwrap();
+        assert_eq!(v, json!({ "since": "2026-01-01T00:00:00Z" }));
+        let v = bound(
+            json!(null),
+            json!({ "variable": "since", "value_type": "number" }),
+        )
+        .unwrap();
+        assert_eq!(v, json!({ "since": 1_767_225_600 }));
+        let v = bound(
+            json!({ "filter": { "gte": "x" } }),
+            json!({ "variable": "/filter/gte", "template": ">=${bookmark}", "format": "date" }),
+        )
+        .unwrap();
+        assert_eq!(v, json!({ "filter": { "gte": ">=2026-01-01" } }));
+        assert!(bound(json!([1]), json!({ "variable": "since" })).is_err());
+        assert!(bound(json!({}), json!({ "variable": "/missing/deep" })).is_err());
+    }
+
+    #[test]
+    fn full_table_sources_are_not_resumable_without_a_state_key() {
+        use faucet_core::Source as _;
+        let c = GraphqlStreamConfig::new("https://x/graphql", "{ a }");
+        assert_eq!(GraphqlStream::new(c.clone()).state_key(), None);
+        let mut keyed = c;
+        keyed.state_key = Some("orders".into());
+        assert_eq!(
+            GraphqlStream::new(keyed).state_key().as_deref(),
+            Some("orders")
+        );
     }
 }

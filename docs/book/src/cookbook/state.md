@@ -56,6 +56,64 @@ created. `window` binds accept the same `path` / `value_type`, so GA4-style
 `name` or `path`, configure a JSON object `body`, and don't point two binds at
 the same location — all three are checked at load time.
 
+### Incremental GraphQL
+
+GraphQL APIs are synced incrementally two ways.
+
+**The `graphql` source** takes the same `replication_method` /
+`replication_key` / `on_missing_key` / `start_replication_value` / `state_key`
+fields as `rest`, and its `replication_bind` names a GraphQL **variable** — a
+top-level name, or a JSON Pointer into `variables`:
+
+```yaml
+source:
+  type: graphql
+  config:
+    query: |
+      query($after: String, $first: Int, $query: String) {
+        orders(first: $first, after: $after, query: $query) {
+          edges { node { id updatedAt } } pageInfo { hasNextPage endCursor }
+        }
+      }
+    variables: { query: "updated_at:>2020-01-01T00:00:00Z" }   # first run
+    records_path: "$.data.orders.edges[*].node"
+    pagination:
+      has_next_page_path: "$.data.orders.pageInfo.hasNextPage"
+      cursor_path: "$.data.orders.pageInfo.endCursor"
+    replication_method: incremental
+    replication_key: updatedAt                # dot path / JSON Pointer also accepted
+    replication_bind:
+      variable: query                         # or /filter/updatedAt/gte
+      template: "updated_at:>${bookmark}"
+      format: iso8601
+```
+
+The bookmark is written only after the last cursor page (a crash mid-run
+re-reads rather than skipping rows), the client-side filter stays on as a
+safety net, and a GraphQL `errors[]` response fails the run before any
+bookmark is stored. When the bookmark lands inside a query-language string, as
+above, escaping it is the template's job.
+
+**GraphQL through the `rest` source** pages too: `CursorInBody.body_cursor_field`
+(and `OffsetInBody`'s `offset_field` / `limit_field`) accept a JSON Pointer, so
+the cursor lands in `variables`:
+
+```yaml
+source:
+  type: rest
+  config:
+    method: POST
+    body: { query: "query($after: String) { … }", variables: {} }
+    records_path: "$.data.orders.edges[*].node"
+    pagination:
+      type: CursorInBody
+      next_token_path: "$.data.orders.pageInfo.endCursor"
+      body_cursor_field: /variables/after
+```
+
+Combine it with a `replication_bind` of `into: body, path: /variables/since`
+for incremental reads.
+
 ### Records without the key
 
 A record whose key is missing or `null` is **kept** by default — dropping it

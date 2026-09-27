@@ -14561,6 +14561,46 @@
                         }
                       ],
                       "default": null
+                    },
+                    "replication_method": {
+                      "description": "`full_table` (default) re-reads everything each run; `incremental`\nfilters on [`replication_key`](Self::replication_key) and emits a\nbookmark on the final page so the next run resumes (#751).",
+                      "$ref": "#/$defs/source_graphql__ReplicationMethod",
+                      "default": {
+                        "type": "FullTable"
+                      }
+                    },
+                    "replication_key": {
+                      "description": "Field used for incremental replication bookmarking: a top-level field\n(`updatedAt`), a dot path into nested objects (`node.updatedAt`), or a\nJSON Pointer (`/node/updatedAt`). Must resolve to one value per record.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "on_missing_key": {
+                      "description": "What to do with a record whose `replication_key` is missing or `null`\nonce a start bookmark exists: `keep` (default), `drop`, or `fail`.",
+                      "$ref": "#/$defs/source_graphql__OnMissingKey",
+                      "default": "keep"
+                    },
+                    "start_replication_value": {
+                      "description": "Initial bookmark used when no stored bookmark exists: records whose\n`replication_key` is not greater than it are filtered out, and a\n`replication_bind` renders it into the request."
+                    },
+                    "state_key": {
+                      "description": "Identifier the pipeline persists this stream's bookmark under. Derived\nfrom the endpoint when unset and replicating incrementally.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "replication_bind": {
+                      "description": "Bind the bookmark into a GraphQL variable (see [`GraphqlReplicationBind`]).\nRequires `replication_method: incremental` + `replication_key`.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_graphql__GraphqlReplicationBind"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
                   "title": "GraphqlStreamConfig",
@@ -28377,6 +28417,122 @@
         }
       },
       "additionalProperties": false
+    },
+    "source_graphql__ReplicationMethod": {
+      "description": "Determines how records are replicated from the source.",
+      "oneOf": [
+        {
+          "description": "All records are fetched on every run (default).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "FullTable"
+            }
+          }
+        },
+        {
+          "description": "Only records where the `replication_key` field is strictly greater than\nthe stored bookmark (`start_replication_value`) are kept.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "Incremental"
+            }
+          }
+        }
+      ]
+    },
+    "source_graphql__OnMissingKey": {
+      "description": "What to do with a record whose replication key is missing or `null` (#747).",
+      "oneOf": [
+        {
+          "description": "Keep the record, count it, and warn (default): dropping it would be\nsilent data loss.",
+          "type": "string",
+          "const": "keep"
+        },
+        {
+          "description": "Drop the record (counted and warned, never silent).",
+          "type": "string",
+          "const": "drop"
+        },
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "fail"
+        }
+      ]
+    },
+    "source_graphql__GraphqlReplicationBind": {
+      "description": "Binds the stored bookmark into a GraphQL **variable** (#751), so the server\nreturns only newer records. The client-side `replication_key` filter stays\nactive as a safety net.\n\n```yaml\nreplication_bind:\n  variable: since                    # or a JSON Pointer: /filter/updatedAt/gte\n  template: \"updated_at:>${bookmark}\"\n  format: iso8601\n```",
+      "type": "object",
+      "properties": {
+        "variable": {
+          "description": "The variable to set: a top-level variable name (`since`), or an RFC 6901\nJSON Pointer into `variables` (`/filter/updatedAt/gte`) that resolves to\nan existing value or to a new key of an existing object.",
+          "type": "string"
+        },
+        "template": {
+          "description": "Template rendered with `${bookmark}` replaced by the formatted bookmark.\nDefaults to the bare `${bookmark}`. When the bookmark sits inside a\nquery-language string (Shopify `query: \"updated_at:>…\"`), escaping is\nthe template author's job.",
+          "type": "string",
+          "default": "${bookmark}"
+        },
+        "format": {
+          "description": "How to format the bookmark before substitution.",
+          "$ref": "#/$defs/source_graphql__BindFormat",
+          "default": "raw"
+        },
+        "value_type": {
+          "description": "JSON type of the variable: `string` (default) or `number`.",
+          "$ref": "#/$defs/source_graphql__BindValueType",
+          "default": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_graphql__BindFormat": {
+      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork.",
+      "oneOf": [
+        {
+          "description": "Emit the scalar verbatim (string as-is, number as its decimal form).\nThe default; no timestamp parsing.",
+          "type": "string",
+          "const": "raw"
+        },
+        {
+          "description": "RFC 3339 / ISO-8601 UTC timestamp, e.g. `2024-06-01T00:00:00Z`.",
+          "type": "string",
+          "const": "iso8601"
+        },
+        {
+          "description": "Unix epoch **seconds** (integer).",
+          "type": "string",
+          "const": "epoch_s"
+        },
+        {
+          "description": "Unix epoch **milliseconds** (integer).",
+          "type": "string",
+          "const": "epoch_ms"
+        },
+        {
+          "description": "Calendar date `YYYY-MM-DD` (UTC).",
+          "type": "string",
+          "const": "date"
+        }
+      ]
+    },
+    "source_graphql__BindValueType": {
+      "description": "The JSON type a body-target bind writes (#748).",
+      "oneOf": [
+        {
+          "description": "A JSON string (default).",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A JSON number (e.g. an `epoch_ms` bookmark an API requires unquoted).",
+          "type": "string",
+          "const": "number"
+        }
+      ]
     }
   }
 }
