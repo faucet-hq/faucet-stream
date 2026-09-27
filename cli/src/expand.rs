@@ -1176,7 +1176,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let keyed_upsert_configured = matches!(
             mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        );
+        ) && crate::registry::UPSERT_SINK_KINDS
+            .contains(&merged_sink.kind.as_str());
         let guarantee_inputs = faucet_core::GuaranteeInputs {
             replay: crate::registry::source_replay_guarantee(&merged_source.kind),
             sink_atomic: crate::registry::sink_supports_idempotent_writes(&merged_sink.kind),

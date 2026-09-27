@@ -58,6 +58,7 @@
 //! | `sink-nats` | NATS sink |
 //! | `sink-rabbitmq` | RabbitMQ (AMQP 0.9.1) publish sink |
 //! | `sink-sftp` | SFTP sink |
+//! | `sink-singer` | Singer target bridge sink (runs a Singer target executable) |
 
 //! | `sink-s3` | AWS S3 file sink |
 //! | `sink-mongodb` | MongoDB insert sink |
@@ -593,6 +594,11 @@ pub mod sink {
     #[cfg(feature = "sink-sftp")]
     pub mod sftp {
         pub use faucet_sink_sftp::*;
+    }
+
+    #[cfg(feature = "sink-singer")]
+    pub mod singer {
+        pub use faucet_sink_singer::*;
     }
 
     #[cfg(feature = "sink-s3")]

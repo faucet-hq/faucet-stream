@@ -125,6 +125,7 @@ sink = [
     "sink-nats",
     "sink-rabbitmq",
     "sink-sftp",
+    "sink-singer",
     "sink-s3",
     "sink-mongodb",
     "sink-redis",
@@ -215,6 +216,7 @@ sink-sqs = ["dep:faucet-sink-sqs", "dep:faucet-common-sqs"]
 sink-nats = ["dep:faucet-sink-nats", "dep:faucet-common-nats"]
 sink-rabbitmq = ["dep:faucet-sink-rabbitmq", "dep:faucet-common-rabbitmq"]
 sink-sftp = ["dep:faucet-sink-sftp", "dep:faucet-common-sftp"]
+sink-singer = ["dep:faucet-sink-singer"]
 sink-s3 = ["dep:faucet-sink-s3"]
 sink-mongodb = ["dep:faucet-sink-mongodb"]
 sink-redis = ["dep:faucet-sink-redis"]
@@ -550,6 +552,7 @@ faucet-sink-sqs = { workspace = true, optional = true }
 faucet-sink-nats = { workspace = true, optional = true }
 faucet-sink-rabbitmq = { workspace = true, optional = true }
 faucet-sink-sftp = { workspace = true, optional = true }
+faucet-sink-singer = { workspace = true, optional = true }
 faucet-sink-s3 = { workspace = true, optional = true }
 faucet-sink-mongodb = { workspace = true, optional = true }
 faucet-sink-redis = { workspace = true, optional = true }
