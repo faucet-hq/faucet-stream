@@ -87,7 +87,9 @@ pub fn build_submit_request(
     }
 }
 
-/// Resolve + submit. `fired_at` is RFC3339 (caller-stamped).
+/// Resolve + submit. `fired_at` is RFC3339 (caller-stamped). With
+/// `tenants:` the fire fans out to one run per tenant (#709), each keyed
+/// `…:<tenant>` so a replayed fire never doubles a tenant's run.
 pub async fn fire(
     state: &ServerState,
     compiled: &CompiledTrigger,
@@ -96,36 +98,153 @@ pub async fn fire(
 ) -> FireOutcome {
     let kind = compiled.kind_label();
     metrics::fired(compiled.name(), kind);
+    let targets = match fire_targets(state, compiled).await {
+        Ok(t) => t,
+        Err(e) => {
+            metrics::error(compiled.name(), kind);
+            return FireOutcome::Error(e);
+        }
+    };
+    if targets.is_empty() {
+        tracing::info!(
+            trigger = compiled.name(),
+            "trigger fired with no tenants to run for"
+        );
+        return FireOutcome::Coalesced;
+    }
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for tenant in targets {
+        let outcome = fire_one(state, compiled, &event, fired_at, tenant.as_deref()).await;
+        if let (Some(t), FireOutcome::Error(e)) = (&tenant, &outcome) {
+            tracing::warn!(trigger = compiled.name(), tenant = %t, error = %e, "tenant fire failed");
+        }
+        outcomes.push(outcome);
+    }
+    combine(outcomes)
+}
 
-    let text =
-        match resolve_config_text(&compiled.spec.config, &event, compiled.name(), fired_at).await {
-            Ok(t) => t,
-            Err(e) => {
-                metrics::error(compiled.name(), kind);
-                return FireOutcome::Error(e);
-            }
-        };
-    let req = build_submit_request(compiled, &event, text, fired_at);
-    // True idempotency replays (same key + same payload) return Ok from submit
-    // and are counted as Enqueued here; the serve-layer
-    // faucet_serve_idempotency_hits_total captures them. A Conflict (same key,
-    // different payload hash) is treated as a committed no-op (Coalesced) so a
-    // polling watcher does not retry the same event forever.
-    // Trigger-originated (non-HTTP) submission → attribute the audit record to
-    // the trigger (`trigger:<name>`).
-    let actor = crate::serve::rbac::AuthContext::trigger(compiled.name());
-    match runner::submit(state.clone(), req, actor).await {
-        Ok(resp) => {
+/// Fold per-tenant outcomes into one: any drop wins (a poller must retry;
+/// the per-tenant keys make the retry replay-safe), then any error, else
+/// the enqueued run ids.
+pub fn combine(outcomes: Vec<FireOutcome>) -> FireOutcome {
+    if outcomes.len() == 1 {
+        return outcomes.into_iter().next().expect("one outcome");
+    }
+    if let Some(reason) = outcomes.iter().find_map(|o| match o {
+        FireOutcome::Dropped(r) => Some(*r),
+        _ => None,
+    }) {
+        return FireOutcome::Dropped(reason);
+    }
+    let errors: Vec<String> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            FireOutcome::Error(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+    if !errors.is_empty() {
+        return FireOutcome::Error(errors.join("; "));
+    }
+    let ids: Vec<String> = outcomes
+        .into_iter()
+        .filter_map(|o| match o {
+            FireOutcome::Enqueued(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    if ids.is_empty() {
+        FireOutcome::Coalesced
+    } else {
+        FireOutcome::Enqueued(ids.join(","))
+    }
+}
+
+/// `[None]` for an ordinary trigger; the resolved tenant ids for a fan-out.
+async fn fire_targets(
+    state: &ServerState,
+    compiled: &CompiledTrigger,
+) -> Result<Vec<Option<String>>, String> {
+    let Some(selector) = &compiled.spec.tenants else {
+        return Ok(vec![None]);
+    };
+    #[cfg(feature = "tenants")]
+    {
+        let (run, skipped) = crate::serve::handlers::tenants::resolve_tenants(state, selector)
+            .await
+            .map_err(|e| e.api_error().error.message)?;
+        for s in skipped {
+            tracing::info!(
+                trigger = compiled.name(),
+                tenant = %s.tenant,
+                reason = s.reason.as_deref().unwrap_or(""),
+                "tenant skipped"
+            );
+        }
+        Ok(run.into_iter().map(Some).collect())
+    }
+    #[cfg(not(feature = "tenants"))]
+    {
+        let _ = (state, selector);
+        Err("`tenants:` needs a build with the `tenants` feature".into())
+    }
+}
+
+async fn fire_one(
+    state: &ServerState,
+    compiled: &CompiledTrigger,
+    event: &TriggerEvent,
+    fired_at: &str,
+    tenant: Option<&str>,
+) -> FireOutcome {
+    let kind = compiled.kind_label();
+    let mut actor = crate::serve::rbac::AuthContext::trigger(compiled.name());
+    actor.tenant = tenant.map(str::to_string);
+    let idem = |key: String| match tenant {
+        Some(t) => format!("{key}:{t}"),
+        None => key,
+    };
+    let result = match (&compiled.spec.config, &compiled.spec.template) {
+        (Some(config), _) => {
+            let text = match resolve_config_text(config, event, compiled.name(), fired_at).await {
+                Ok(t) => t,
+                Err(e) => {
+                    metrics::error(compiled.name(), kind);
+                    return FireOutcome::Error(e);
+                }
+            };
+            let mut req = build_submit_request(compiled, event, text, fired_at);
+            req.idempotency_key = req.idempotency_key.map(idem);
+            runner::submit(state.clone(), req, actor)
+                .await
+                .map(|r| r.run_id)
+        }
+        (None, Some(tpl)) => {
+            submit_template(state, compiled, tpl, event, fired_at, actor, idem).await
+        }
+        (None, None) => Err(crate::serve::error::ServeError::BadConfig(
+            "trigger has neither config nor template".into(),
+        )),
+    };
+    // True idempotency replays (same key + same payload) return Ok and are
+    // counted as Enqueued; a Conflict (same key, different payload — or, for
+    // a tenant, a connection that is missing or needs re-authorization) is a
+    // committed no-op so a polling watcher does not retry the same event.
+    match result {
+        Ok(run_id) => {
             metrics::enqueued(compiled.name());
-            FireOutcome::Enqueued(resp.run_id)
+            FireOutcome::Enqueued(run_id)
         }
         Err(crate::serve::error::ServeError::QueueFull { .. }) => {
             metrics::dropped(compiled.name(), "queue_full");
             FireOutcome::Dropped("queue_full")
         }
-        Err(crate::serve::error::ServeError::Conflict(_)) => {
-            // Idempotency conflict (same key, different payload) — treat as a
-            // committed no-op so a poll doesn't retry forever.
+        Err(crate::serve::error::ServeError::TooManyRequests(_)) => {
+            metrics::dropped(compiled.name(), "tenant_limit");
+            FireOutcome::Dropped("tenant_limit")
+        }
+        Err(crate::serve::error::ServeError::Conflict(m)) => {
+            tracing::info!(trigger = compiled.name(), reason = %m, "trigger fire coalesced");
             metrics::coalesced(compiled.name());
             FireOutcome::Coalesced
         }
@@ -136,9 +255,227 @@ pub async fn fire(
     }
 }
 
+/// Build the template trigger body for one fire.
+#[cfg(feature = "templates")]
+pub fn template_body(
+    compiled: &CompiledTrigger,
+    tpl: &super::spec::TemplateTrigger,
+    event: &TriggerEvent,
+    fired_at: &str,
+) -> Result<crate::serve::handlers::templates::TriggerBody, String> {
+    fn selector(
+        field: &str,
+        v: &Option<String>,
+    ) -> Result<Option<crate::serve::history::templates::VersionSelector>, String> {
+        v.as_ref()
+            .map(|s| {
+                serde_json::from_value(serde_json::Value::String(s.clone()))
+                    .map_err(|e| format!("template {field} '{s}': {e}"))
+            })
+            .transpose()
+    }
+    let mut params = std::collections::BTreeMap::new();
+    for (k, v) in &tpl.params {
+        let v =
+            match v {
+                serde_json::Value::String(s) => serde_json::Value::String(
+                    context::substitute_plain(s, event, compiled.name(), fired_at)?,
+                ),
+                other => other.clone(),
+            };
+        params.insert(k.clone(), v);
+    }
+    let name = compiled.name();
+    let mut labels = context::labels(name, event);
+    labels.extend(compiled.spec.run.labels.clone());
+    Ok(crate::serve::handlers::templates::TriggerBody {
+        params,
+        version: selector("version", &tpl.version)?,
+        sink: tpl.sink.clone(),
+        sink_version: selector("sink_version", &tpl.sink_version)?,
+        overlay: tpl
+            .overlay
+            .as_ref()
+            .map(|o| crate::serve::handlers::templates::OverlayRef::Id(o.clone())),
+        overlay_version: selector("overlay_version", &tpl.overlay_version)?,
+        name: Some(
+            compiled
+                .spec
+                .run
+                .name
+                .as_deref()
+                .map(|t| context::render_name(t, event, name, fired_at))
+                .unwrap_or_else(|| name.to_string()),
+        ),
+        labels,
+        timeout_secs: compiled.spec.run.timeout_secs,
+        idempotency_key: Some(context::idempotency_key(name, event)),
+        ..Default::default()
+    })
+}
+
+#[cfg(feature = "templates")]
+async fn submit_template(
+    state: &ServerState,
+    compiled: &CompiledTrigger,
+    tpl: &super::spec::TemplateTrigger,
+    event: &TriggerEvent,
+    fired_at: &str,
+    actor: crate::serve::rbac::AuthContext,
+    idem: impl Fn(String) -> String,
+) -> Result<String, crate::serve::error::ServeError> {
+    use crate::serve::handlers::templates::{TriggerOutcome, trigger_template_outcome};
+    let mut body = template_body(compiled, tpl, event, fired_at)
+        .map_err(crate::serve::error::ServeError::BadConfig)?;
+    body.idempotency_key = body.idempotency_key.map(idem);
+    match trigger_template_outcome(state.clone(), actor, tpl.id.clone(), body).await? {
+        TriggerOutcome::Run(r) => Ok(r.run.run_id),
+        TriggerOutcome::PendingApproval(c) => Ok(format!("change:{}", c.id)),
+    }
+}
+
+#[cfg(not(feature = "templates"))]
+async fn submit_template(
+    _state: &ServerState,
+    _compiled: &CompiledTrigger,
+    _tpl: &super::spec::TemplateTrigger,
+    _event: &TriggerEvent,
+    _fired_at: &str,
+    _actor: crate::serve::rbac::AuthContext,
+    _idem: impl Fn(String) -> String,
+) -> Result<String, crate::serve::error::ServeError> {
+    Err(crate::serve::error::ServeError::BadConfig(
+        "a template trigger needs a build with the `templates` feature".into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combine_prefers_drops_then_errors_then_ids() {
+        use FireOutcome::*;
+        assert!(matches!(combine(vec![Enqueued("a".into())]), Enqueued(ref id) if id == "a"));
+        assert!(matches!(
+            combine(vec![
+                Enqueued("a".into()),
+                Dropped("queue_full"),
+                Error("e".into())
+            ]),
+            Dropped("queue_full")
+        ));
+        assert!(matches!(
+            combine(vec![Enqueued("a".into()), Error("x".into()), Error("y".into())]),
+            Error(ref e) if e == "x; y"
+        ));
+        assert!(matches!(
+            combine(vec![Enqueued("a".into()), Coalesced, Enqueued("b".into())]),
+            Enqueued(ref ids) if ids == "a,b"
+        ));
+        assert!(matches!(combine(vec![Coalesced, Coalesced]), Coalesced));
+    }
+
+    #[cfg(feature = "templates")]
+    #[test]
+    fn template_bodies_carry_params_labels_and_the_tick_key() {
+        use crate::serve::triggers::spec::TemplateTrigger;
+        let mut c = compiled_webhook();
+        c.spec.run.name = Some("{name}@{tick}".into());
+        let tpl = TemplateTrigger {
+            id: "crm".into(),
+            version: Some("3".into()),
+            params: std::collections::BTreeMap::from([
+                ("since".to_string(), serde_json::json!("${trigger.tick}")),
+                ("n".to_string(), serde_json::json!(5)),
+            ]),
+            sink: Some("wh".into()),
+            sink_version: Some("stable".into()),
+            overlay: Some("prod".into()),
+            overlay_version: None,
+        };
+        let e = TriggerEvent::Schedule {
+            tick: "2026-01-01T00:00:00Z".into(),
+        };
+        let b = template_body(&c, &tpl, &e, "now").unwrap();
+        assert_eq!(b.params["since"], "2026-01-01T00:00:00Z");
+        assert_eq!(b.params["n"], 5);
+        assert_eq!(b.name.as_deref(), Some("hook@2026-01-01T00:00:00Z"));
+        assert_eq!(
+            b.idempotency_key.as_deref(),
+            Some("trig:hook:2026-01-01T00:00:00Z")
+        );
+        assert_eq!(b.labels["faucet.trigger.type"], "schedule");
+        assert_eq!(b.sink.as_deref(), Some("wh"));
+        assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay.is_some());
+        let bad = TemplateTrigger {
+            version: Some("latest".into()),
+            ..tpl.clone()
+        };
+        assert!(
+            template_body(&c, &bad, &e, "now")
+                .unwrap_err()
+                .contains("version")
+        );
+        let bad_token = TemplateTrigger {
+            params: std::collections::BTreeMap::from([(
+                "x".to_string(),
+                serde_json::json!("${trigger.nope}"),
+            )]),
+            ..tpl
+        };
+        assert!(template_body(&c, &bad_token, &e, "now").is_err());
+    }
+
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_tenant_fan_out_fires_once_per_tenant_and_skips_missing_ones() {
+        let state = crate::serve::test_support::test_state();
+        let now = chrono::Utc::now();
+        for id in ["acme", "globex"] {
+            state
+                .history()
+                .tenant_upsert(&crate::serve::history::tenants::TenantRecord {
+                    id: id.into(),
+                    name: None,
+                    labels: Default::default(),
+                    limits: Default::default(),
+                    notifications: Vec::new(),
+                    suspended: false,
+                    created_at: now,
+                    updated_at: now,
+                    created_by: "t".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let mut c = compiled_webhook();
+        c.spec.config = Some(PipelineRef::Path("/definitely/missing.yaml".into()));
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::Named(vec![
+            "acme".into(),
+            "ghost".into(),
+        ]));
+        assert_eq!(
+            fire_targets(&state, &c).await.unwrap(),
+            vec![Some("acme".into())]
+        );
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::All(
+            "all".into(),
+        ));
+        let event = TriggerEvent::Schedule { tick: "t".into() };
+        let out = fire(&state, &c, event.clone(), "now").await;
+        assert!(
+            matches!(out, FireOutcome::Error(ref e) if e.contains("missing.yaml")),
+            "{out:?}"
+        );
+        c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::Named(vec![
+            "ghost".into(),
+        ]));
+        assert!(matches!(
+            fire(&state, &c, event, "now").await,
+            FireOutcome::Coalesced
+        ));
+    }
     use crate::serve::triggers::spec::{RunTemplate, TriggerKind, TriggerSpec};
 
     fn compiled_webhook() -> CompiledTrigger {
@@ -146,7 +483,9 @@ mod tests {
             spec: TriggerSpec {
                 name: "hook".into(),
                 enabled: true,
-                config: PipelineRef::Path("/tmp/x.yaml".into()),
+                config: Some(PipelineRef::Path("/tmp/x.yaml".into())),
+                template: None,
+                tenants: None,
                 run: RunTemplate {
                     name: Some("{name}:{object_key}".into()),
                     labels: Default::default(),

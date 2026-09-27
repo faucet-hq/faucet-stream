@@ -9,7 +9,7 @@ see the top-level [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ## Workspace shape
 
-faucet-stream is a Cargo workspace of <!--COUNT:crates-->95<!--/COUNT--> crates. They fall into four layers,
+faucet-stream is a Cargo workspace of <!--COUNT:crates-->106<!--/COUNT--> crates. They fall into four layers,
 and the dependency direction only ever flows downward:
 
 ```mermaid

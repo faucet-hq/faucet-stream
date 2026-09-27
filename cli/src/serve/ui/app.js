@@ -10,6 +10,8 @@ import { renderDatasets, renderDatasetDetail } from "./views/datasets.js";
 import { renderLineage } from "./views/lineage.js";
 import { renderUsage } from "./views/usage.js";
 import { renderChanges } from "./views/changes.js";
+import { renderTenants } from "./views/tenants.js";
+import { loadTenants } from "./tenant.js";
 import { route } from "./router.js";
 import { loadAccess } from "./access.js";
 
@@ -44,6 +46,7 @@ function wireChrome() {
   document.getElementById("nav-lineage").onclick = () => navigate("#/lineage");
   document.getElementById("nav-usage").onclick = () => navigate("#/usage");
   document.getElementById("nav-changes").onclick = () => navigate("#/changes");
+  document.getElementById("nav-tenants").onclick = () => navigate("#/tenants");
   // One click always flips what is on screen. `auto` (follow the OS) is the
   // starting state only: cycling through it made the first click a no-op
   // whenever the OS theme matched the next state.
@@ -91,6 +94,8 @@ function registerRoutes() {
   route("#/usage", renderUsage);
   route("#/changes", renderChanges);
   route("#/changes/:id", renderChanges);
+  route("#/tenants", renderTenants);
+  route("#/tenants/:id", renderTenants);
 }
 
 async function main() {
@@ -100,6 +105,7 @@ async function main() {
   // If the server requires auth and we have no valid token, prompt first.
   if (!(await authOk())) openTokenModal();
   await loadAccess();
+  await loadTenants(refresh);
   startRouter(document.getElementById("view"));
 }
 main();

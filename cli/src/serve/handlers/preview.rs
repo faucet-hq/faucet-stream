@@ -348,6 +348,7 @@ mod tests {
             principal: "bob".into(),
             role: crate::serve::rbac::Role::Viewer,
             source_ip: None,
+            tenant: None,
         }
     }
 

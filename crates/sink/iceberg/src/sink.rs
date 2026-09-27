@@ -61,13 +61,13 @@ use iceberg::{Catalog, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::catalog::build_catalog;
 use crate::config::{IcebergSinkConfig, PartitionField};
 use crate::schema::{
     arrow_to_iceberg_schema, arrow_to_json_schema, iceberg_to_arrow_schema, infer_arrow_schema,
     json_to_record_batch,
 };
 use crate::writer::{TableWriter, compression_from_str};
+use faucet_common_iceberg::build_catalog;
 
 // ── Interior state ────────────────────────────────────────────────────────────
 
@@ -132,7 +132,7 @@ impl IcebergSink {
         // among the other config checks, before any catalog I/O.
         config.validate()?;
 
-        let catalog = build_catalog(&config.catalog).await?;
+        let catalog = build_catalog(&(&config.catalog).into()).await?;
 
         let preloaded: Option<Table> = if !config.create_if_missing {
             // `create_if_missing = false`: load now so a missing table is caught

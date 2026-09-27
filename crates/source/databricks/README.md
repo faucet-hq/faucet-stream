@@ -9,9 +9,9 @@ typed JSON objects.
 This is the **query-results** read path for Databricks — joins, aggregates,
 filtered extracts. For full-table lakehouse scans and the **write** path, use
 the Delta Lake connectors ([`faucet-source-delta`](https://crates.io/crates/faucet-source-delta)
-/ [`faucet-sink-delta`](https://crates.io/crates/faucet-sink-delta)); a warehouse
-`INSERT`/`MERGE` sink is intentionally not provided (slow, INSERT-bound, and
-forces billed compute).
+/ [`faucet-sink-delta`](https://crates.io/crates/faucet-sink-delta)). To load
+*into* a Databricks SQL warehouse (Unity Catalog permissions, `COPY INTO`,
+`MERGE`, exactly-once), use [`faucet-sink-databricks`](https://crates.io/crates/faucet-sink-databricks).
 
 ## Highlights
 
@@ -23,6 +23,14 @@ forces billed compute).
 - **Incremental replication** — a bookmark column + a `${bookmark}` token bound
   as a server-side named parameter, plus a client-side filter backstop.
 - **Bearer auth** (PAT / OAuth M2M), inline or via the shared `auth:` catalog.
+  The auth and Statement Execution API client live in
+  [`faucet-common-databricks`](https://crates.io/crates/faucet-common-databricks)
+  (shared with the sink). This crate keeps its own `DatabricksAuth` (same wire
+  shape, converted with `From`) so its public API is unchanged.
+- **Warm-up tolerant** — a submit refused with `429`/`503` (a serverless
+  warehouse starting) is retried with backoff honouring `Retry-After`, polls
+  retry transient `5xx`, and a `401` makes a shared provider mint a fresh token
+  once.
 - **Arrow-native fetch** — behind the `arrow` feature, `arrow_native: true`
   fetches results as `EXTERNAL_LINKS` + `ARROW_STREAM` and decodes each chunk
   as an Arrow IPC stream, enabling the columnar fast path and skipping the

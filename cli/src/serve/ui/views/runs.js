@@ -3,6 +3,7 @@ import { navigate } from "../router.js";
 import { escapeHtml, fmtInt, fmtDuration, fmtCompact } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { formatTs } from "../tz.js";
+import { withTenant } from "../tenant.js";
 
 // Every RunStatus the API accepts — pending/sharded appear in cluster mode.
 const STATUSES = ["queued", "pending", "running", "sharded", "completed", "failed", "cancelled"];
@@ -73,6 +74,7 @@ export async function renderRuns(container) {
     if (filters.until) p.set("until", new Date(filters.until).toISOString());
     p.set("limit", "50");
     if (cursor) p.set("cursor", cursor);
+    withTenant(p);
     return p.toString();
   }
 

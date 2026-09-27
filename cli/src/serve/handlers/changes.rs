@@ -42,12 +42,15 @@ pub struct ListQuery {
     pub status: Option<String>,
     pub kind: Option<String>,
     pub requester: Option<String>,
+    /// Only requests for this tenant (#709).
+    pub tenant: Option<String>,
     pub limit: Option<usize>,
 }
 
 /// `GET /v1/changes` → newest first, plan rows omitted.
 pub async fn list_changes(
     State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<ChangeRequest>>, ServeError> {
     let status = q
@@ -66,17 +69,32 @@ pub async fn list_changes(
         status,
         kind,
         requester: q.requester,
+        tenant: actor.tenant_filter(q.tenant)?,
         limit: q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     };
     Ok(Json(changes::list(&state, &filter).await?))
 }
 
+/// A change request the principal may see, or 404 (#709).
+async fn visible_change(
+    state: &ServerState,
+    actor: &AuthContext,
+    id: &str,
+) -> Result<ChangeRequest, ServeError> {
+    let change = changes::get(state, id).await?;
+    if !actor.sees_tenant(change.tenant.as_deref()) {
+        return Err(ServeError::NotFound);
+    }
+    Ok(change)
+}
+
 /// `GET /v1/changes/{id}` → the full record, plan included.
 pub async fn get_change(
     State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<ChangeRequest>, ServeError> {
-    Ok(Json(changes::get(&state, &id).await?))
+    Ok(Json(visible_change(&state, &actor, &id).await?))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -96,6 +114,7 @@ pub async fn approve_change(
     body: Option<Json<ApproveBody>>,
 ) -> Result<Json<ChangeRequest>, ServeError> {
     let comment = body.and_then(|b| b.0.comment);
+    visible_change(&state, &actor, &id).await?;
     Ok(Json(changes::approve(&state, &actor, &id, comment).await?))
 }
 
@@ -115,6 +134,7 @@ pub async fn reject_change(
     if body.reason.trim().is_empty() {
         return Err(ServeError::BadConfig("a rejection needs a reason".into()));
     }
+    visible_change(&state, &actor, &id).await?;
     Ok(Json(
         changes::reject(&state, &actor, &id, body.reason).await?,
     ))

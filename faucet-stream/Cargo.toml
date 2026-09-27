@@ -49,6 +49,10 @@ source = [
     "source-parquet",
     "source-delta",
     "source-databricks",
+    "source-iceberg",
+    "source-dynamodb",
+    "source-oracle",
+    "source-oracle-cdc",
     "source-gcs",
     "source-bigquery",
     "source-snowflake",
@@ -82,6 +86,9 @@ sink = [
     "sink-delta",
     "sink-gcs",
     "sink-iceberg",
+    "sink-dynamodb",
+    "sink-databricks",
+    "sink-oracle",
     "sink-spanner",
     "sink-redshift",
     "sink-pubsub",
@@ -177,6 +184,7 @@ arrow = [
     "faucet-source-gcs?/arrow",
     "faucet-sink-gcs?/arrow",
     "faucet-source-databricks?/arrow",
+    "faucet-source-iceberg?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can
     # reach the BigQuery Parquet load without materializing `Value`.
     "faucet-source-rest?/arrow",
@@ -217,7 +225,7 @@ transform-wasm = ["dep:faucet-transform-wasm"]
 ## syntax, so this flag never pulls the connector itself).
 encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption"]
 ## Every connector and state backend.
-full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "source-xml-excel", "file-formats"]
+full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-xml-excel", "file-formats"]
 
 ## Individual source connectors.
 source-rest = ["dep:faucet-source-rest"]
@@ -255,7 +263,16 @@ source-kafka = ["dep:faucet-source-kafka", "dep:faucet-common-kafka"]
 source-kinesis = ["dep:faucet-source-kinesis", "dep:faucet-common-kinesis"]
 source-parquet = ["dep:faucet-source-parquet"]
 source-delta = ["dep:faucet-source-delta"]
-source-databricks = ["dep:faucet-source-databricks"]
+source-databricks = ["dep:faucet-source-databricks", "dep:faucet-common-databricks"]
+source-iceberg = ["dep:faucet-source-iceberg"]
+## Forward optional catalog features to the iceberg source via optional-dep syntax.
+source-iceberg-glue = ["faucet-source-iceberg?/catalog-glue"]
+source-iceberg-sql  = ["faucet-source-iceberg?/catalog-sql"]
+source-iceberg-hms  = ["faucet-source-iceberg?/catalog-hms"]
+source-dynamodb = ["dep:faucet-source-dynamodb", "dep:faucet-common-dynamodb"]
+## Oracle connectors load Oracle Instant Client at runtime (not needed to build).
+source-oracle = ["dep:faucet-source-oracle", "dep:faucet-common-oracle"]
+source-oracle-cdc = ["dep:faucet-source-oracle-cdc", "dep:faucet-common-oracle"]
 source-gcs = ["dep:faucet-source-gcs", "dep:faucet-common-gcs"]
 source-bigquery = ["dep:faucet-source-bigquery", "dep:faucet-common-bigquery"]
 source-snowflake = ["dep:faucet-source-snowflake", "dep:faucet-common-snowflake"]
@@ -306,6 +323,11 @@ sink-pubsub = ["dep:faucet-sink-pubsub", "dep:faucet-common-pubsub"]
 sink-clickhouse = ["dep:faucet-sink-clickhouse", "dep:faucet-common-clickhouse"]
 sink-clickhouse-staging = ["sink-clickhouse", "faucet-sink-clickhouse/staging"]
 sink-azure-blob = ["dep:faucet-sink-azure-blob", "dep:faucet-common-azure"]
+sink-dynamodb = ["dep:faucet-sink-dynamodb", "dep:faucet-common-dynamodb"]
+sink-databricks = ["dep:faucet-sink-databricks", "dep:faucet-common-databricks"]
+## Cloud (s3:// / gs:// / abfss://) staging for the Databricks sink.
+sink-databricks-staging = ["sink-databricks", "faucet-sink-databricks/staging"]
+sink-oracle = ["dep:faucet-sink-oracle", "dep:faucet-common-oracle"]
 
 ## Kafka Schema Registry support (forwarded to kafka crates).
 kafka-schema-registry = [
@@ -396,6 +418,12 @@ faucet-source-elasticsearch = { workspace = true, optional = true }
 faucet-source-parquet = { workspace = true, optional = true }
 faucet-source-delta = { workspace = true, optional = true }
 faucet-source-databricks = { workspace = true, optional = true }
+faucet-source-iceberg = { workspace = true, optional = true }
+faucet-source-dynamodb = { workspace = true, optional = true }
+faucet-common-dynamodb = { workspace = true, optional = true }
+faucet-source-oracle = { workspace = true, optional = true }
+faucet-source-oracle-cdc = { workspace = true, optional = true }
+faucet-common-oracle = { workspace = true, optional = true }
 faucet-source-gcs = { workspace = true, optional = true }
 faucet-source-bigquery = { workspace = true, optional = true }
 faucet-source-snowflake = { workspace = true, optional = true }
@@ -431,6 +459,10 @@ faucet-sink-redshift = { workspace = true, optional = true }
 faucet-sink-pubsub = { workspace = true, optional = true }
 faucet-sink-clickhouse = { workspace = true, optional = true }
 faucet-sink-azure-blob = { workspace = true, optional = true }
+faucet-sink-dynamodb = { workspace = true, optional = true }
+faucet-sink-databricks = { workspace = true, optional = true }
+faucet-common-databricks = { workspace = true, optional = true }
+faucet-sink-oracle = { workspace = true, optional = true }
 
 faucet-state-redis = { workspace = true, optional = true }
 faucet-state-postgres = { workspace = true, optional = true }

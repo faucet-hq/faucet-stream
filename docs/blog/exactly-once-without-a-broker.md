@@ -137,5 +137,5 @@ Kill it mid-run. Restart it. Count the rows. They'll be right.
 ---
 
 *faucet-stream is an MIT/Apache-2.0 Rust library + CLI for moving data between
-<!--COUNT:sources-->38<!--/COUNT--> sources and <!--COUNT:sinks-->30<!--/COUNT--> sinks. [Docs](https://faucet-hq.github.io/faucet-stream/) ·
+<!--COUNT:sources-->42<!--/COUNT--> sources and <!--COUNT:sinks-->33<!--/COUNT--> sinks. [Docs](https://faucet-hq.github.io/faucet-stream/) ·
 [GitHub](https://github.com/faucet-hq/faucet-stream).*

@@ -53,6 +53,9 @@ fn args_on(port: u16, token: Option<&str>) -> ServeArgs {
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
         approval_expiry_secs: 86_400,
+        vault_key: None,
+        vault_previous_key: Vec::new(),
+        connect_providers: None,
     }
 }
 

@@ -147,7 +147,9 @@ mod tests {
             spec: TriggerSpec {
                 name: name.into(),
                 enabled: true,
-                config: PipelineRef::Path("x.yaml".into()),
+                config: Some(PipelineRef::Path("x.yaml".into())),
+                template: None,
+                tenants: None,
                 run: RunTemplate::default(),
                 kind: TriggerKind::Webhook {
                     methods: vec!["POST".into()],

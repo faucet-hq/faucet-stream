@@ -13,6 +13,9 @@ pub struct WhoAmI {
     pub principal: String,
     pub role: Role,
     pub permissions: Vec<Permission>,
+    /// The tenant this principal is confined to (#709).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl WhoAmI {
@@ -21,6 +24,7 @@ impl WhoAmI {
             principal: actor.principal.clone(),
             role: actor.role,
             permissions: actor.role.permissions(),
+            tenant: actor.tenant.clone(),
         }
     }
 }
@@ -39,6 +43,7 @@ mod tests {
             principal: "alice".into(),
             role,
             source_ip: None,
+            tenant: None,
         }
     }
 

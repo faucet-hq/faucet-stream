@@ -206,6 +206,7 @@ mod tests {
             principal: principal.into(),
             role,
             source_ip: None,
+            tenant: None,
         }
     }
 

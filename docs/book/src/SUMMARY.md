@@ -66,6 +66,7 @@
   - [Change impact analysis](./cookbook/impact.md)
   - [Cost & usage accounting](./cookbook/usage.md)
   - [Change approvals](./cookbook/approvals.md)
+  - [Embedded integrations (multi-tenant)](./cookbook/embedded-integrations.md)
 
 # Reference
 

@@ -75,6 +75,9 @@ pub enum EventKind {
     ChangeRequested,
     /// A run crossed a `budget:` ceiling (#703) and was stopped.
     BudgetExceeded,
+    /// A tenant connection's grant was revoked and it needs re-authorization
+    /// (#709). Emitted through the tenant's own `notifications:`.
+    ConnectionNeedsReauth,
 }
 
 impl EventKind {
@@ -91,6 +94,7 @@ impl EventKind {
             EventKind::ProfileDrift => "profile_drift",
             EventKind::ChangeRequested => "change_requested",
             EventKind::BudgetExceeded => "budget_exceeded",
+            EventKind::ConnectionNeedsReauth => "connection_needs_reauth",
         }
     }
 }

@@ -1,0 +1,35 @@
+# Upsert a PostgreSQL table into a Databricks Unity Catalog Delta table through a
+# SQL warehouse (Statement Execution API — no JDBC/ODBC driver).
+# Small pages are MERGEd directly; pages over `copy_threshold_bytes` are staged
+# as Parquet in the Unity Catalog volume and loaded with MERGE … read_files().
+#
+# Run with:  DATABRICKS_TOKEN=… faucet run cli/examples/postgres_to_databricks_upsert.yaml
+# Cloud staging locations (s3:// / gs:// / abfss://) need the
+# `sink-databricks-staging` feature; /Volumes/… paths need nothing extra.
+version: 1
+name: postgres_to_databricks
+
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://faucet:faucet@localhost:5432/shop
+      query: "SELECT order_id, customer_id, status, total, updated_at FROM orders"
+  sink:
+    type: databricks
+    config:
+      workspace_url: https://dbc-00000000-0000.cloud.databricks.com
+      warehouse_id: 0123456789abcdef
+      catalog: main
+      schema: sales
+      table: orders
+      auth:
+        type: pat
+        config:
+          token: ${env:DATABRICKS_TOKEN}
+      staging:
+        location: /Volumes/main/sales/faucet_stage
+      write_mode: upsert
+      key: [order_id]
+  schema:
+    on_drift: evolve                     # add new source columns to the Delta table

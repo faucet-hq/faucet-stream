@@ -19,6 +19,8 @@ pub mod schemas;
 pub mod state;
 #[cfg(feature = "templates")]
 pub mod templates;
+#[cfg(feature = "tenants")]
+pub mod tenants;
 #[cfg(feature = "catalog")]
 pub mod usage;
 pub mod verify;

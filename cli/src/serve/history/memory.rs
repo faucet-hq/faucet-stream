@@ -7,6 +7,7 @@ use super::catalog::{
     CatalogListFilter, CatalogSchemaVersion, CatalogStatsPoint, CatalogUpdate,
 };
 use super::templates;
+use super::tenants;
 use super::{
     AuditEntry, AuditFilter, Claim, DeleteOutcome, HistoryError, ListFilter, ListPage,
     RUN_LOG_TRUNCATED_SEQ, RunHistory, RunLogLine, RunLogPage, RunRecord,
@@ -47,6 +48,15 @@ struct CatalogState {
     profiles: std::collections::HashMap<String, Vec<super::catalog::CatalogProfileRecord>>,
 }
 
+/// The in-memory tenant tables (#709).
+#[derive(Default)]
+struct TenantState {
+    tenants: BTreeMap<String, tenants::TenantRecord>,
+    connections: BTreeMap<(String, String), tenants::ConnectionRecord>,
+    sessions: std::collections::HashMap<String, tenants::ConnectSession>,
+    state_refs: BTreeMap<(String, String), tenants::TenantStateRef>,
+}
+
 pub struct MemoryHistory {
     runs: DashMap<String, RunRecord>,
     idem: DashMap<String, IdemEntry>,
@@ -81,11 +91,19 @@ pub struct MemoryHistory {
     usage: Mutex<VecDeque<crate::usage::UsageRecord>>,
     /// Change requests (#703) by id.
     changes: Mutex<BTreeMap<String, crate::serve::changes::ChangeRequest>>,
+    /// Tenants, connections, connect sessions and the state ledger (#709).
+    tenants: Mutex<TenantState>,
     /// Retention window for idempotency claims (separate from run retention).
     idem_retention: Duration,
 }
 
 impl MemoryHistory {
+    fn tenant_state(&self) -> Result<std::sync::MutexGuard<'_, TenantState>, HistoryError> {
+        self.tenants
+            .lock()
+            .map_err(|_| HistoryError::Backend("tenants lock poisoned".into()))
+    }
+
     pub fn new(idem_retention: Duration) -> Self {
         Self {
             runs: DashMap::new(),
@@ -101,6 +119,7 @@ impl MemoryHistory {
             local_outputs: Mutex::new(BTreeMap::new()),
             usage: Mutex::new(VecDeque::new()),
             changes: Mutex::new(BTreeMap::new()),
+            tenants: Mutex::new(TenantState::default()),
             idem_retention,
         }
     }
@@ -180,6 +199,12 @@ impl RunHistory for MemoryHistory {
             })
             .filter(|r| filter.since.is_none_or(|t| r.submitted_at >= t))
             .filter(|r| filter.until.is_none_or(|t| r.submitted_at <= t))
+            .filter(|r| {
+                filter
+                    .tenant
+                    .as_deref()
+                    .is_none_or(|t| r.tenant.as_deref() == Some(t))
+            })
             .collect();
         // (submitted_at DESC, run_id DESC)
         rows.sort_by(|a, b| {
@@ -264,6 +289,12 @@ impl RunHistory for MemoryHistory {
             .iter()
             .filter(|e| filter.principal.as_deref().is_none_or(|p| e.principal == p))
             .filter(|e| filter.action.as_deref().is_none_or(|a| e.action == a))
+            .filter(|e| {
+                filter
+                    .tenant
+                    .as_deref()
+                    .is_none_or(|t| e.tenant.as_deref() == Some(t))
+            })
             .filter(|e| filter.since.is_none_or(|t| e.timestamp >= t))
             .filter(|e| filter.until.is_none_or(|t| e.timestamp <= t))
             .cloned()
@@ -571,6 +602,135 @@ impl RunHistory for MemoryHistory {
     }
 
     // ── Change requests (#703) ───────────────────────────────────────────────
+
+    async fn tenant_upsert(&self, tenant: &tenants::TenantRecord) -> Result<(), HistoryError> {
+        self.tenant_state()?
+            .tenants
+            .insert(tenant.id.clone(), tenant.clone());
+        Ok(())
+    }
+
+    async fn tenant_get(&self, id: &str) -> Result<Option<tenants::TenantRecord>, HistoryError> {
+        Ok(self.tenant_state()?.tenants.get(id).cloned())
+    }
+
+    async fn tenant_list(&self) -> Result<Vec<tenants::TenantRecord>, HistoryError> {
+        Ok(self.tenant_state()?.tenants.values().cloned().collect())
+    }
+
+    async fn tenant_delete(&self, id: &str) -> Result<bool, HistoryError> {
+        let mut st = self.tenant_state()?;
+        let existed = st.tenants.remove(id).is_some();
+        st.connections.retain(|(t, _), _| t != id);
+        st.sessions.retain(|_, s| s.tenant != id);
+        st.state_refs.retain(|(t, _), _| t != id);
+        Ok(existed)
+    }
+
+    async fn connection_upsert(
+        &self,
+        connection: &tenants::ConnectionRecord,
+    ) -> Result<(), HistoryError> {
+        self.tenant_state()?.connections.insert(
+            (connection.tenant.clone(), connection.name.clone()),
+            connection.clone(),
+        );
+        Ok(())
+    }
+
+    async fn connection_get(
+        &self,
+        tenant: &str,
+        name: &str,
+    ) -> Result<Option<tenants::ConnectionRecord>, HistoryError> {
+        Ok(self
+            .tenant_state()?
+            .connections
+            .get(&(tenant.to_string(), name.to_string()))
+            .cloned())
+    }
+
+    async fn connection_list(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<tenants::ConnectionRecord>, HistoryError> {
+        Ok(self
+            .tenant_state()?
+            .connections
+            .iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, c)| c.clone())
+            .collect())
+    }
+
+    async fn connection_delete(&self, tenant: &str, name: &str) -> Result<bool, HistoryError> {
+        Ok(self
+            .tenant_state()?
+            .connections
+            .remove(&(tenant.to_string(), name.to_string()))
+            .is_some())
+    }
+
+    async fn connect_session_put(
+        &self,
+        session: &tenants::ConnectSession,
+    ) -> Result<(), HistoryError> {
+        let now = Utc::now();
+        let mut st = self.tenant_state()?;
+        st.sessions.retain(|_, s| s.expires_at > now);
+        st.sessions.insert(session.state.clone(), session.clone());
+        Ok(())
+    }
+
+    async fn connect_session_take(
+        &self,
+        state: &str,
+    ) -> Result<Option<tenants::ConnectSession>, HistoryError> {
+        Ok(self.tenant_state()?.sessions.remove(state))
+    }
+
+    async fn tenant_state_ref_add(
+        &self,
+        state_ref: &tenants::TenantStateRef,
+    ) -> Result<(), HistoryError> {
+        self.tenant_state()?
+            .state_refs
+            .entry((state_ref.tenant.clone(), state_ref.key.clone()))
+            .or_insert_with(|| state_ref.clone());
+        Ok(())
+    }
+
+    async fn tenant_state_refs(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<tenants::TenantStateRef>, HistoryError> {
+        Ok(self
+            .tenant_state()?
+            .state_refs
+            .iter()
+            .filter(|((t, _), _)| t == tenant)
+            .map(|(_, r)| r.clone())
+            .collect())
+    }
+
+    async fn change_delete(&self, id: &str) -> Result<bool, HistoryError> {
+        Ok(self
+            .changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?
+            .remove(id)
+            .is_some())
+    }
+
+    async fn usage_delete_runs(&self, run_ids: &[String]) -> Result<usize, HistoryError> {
+        let mut rows = self
+            .usage
+            .lock()
+            .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
+        let before = rows.len();
+        rows.retain(|r| !run_ids.contains(&r.run_id));
+        Ok(before - rows.len())
+    }
 
     async fn change_upsert(
         &self,
@@ -1283,6 +1443,7 @@ mod tests {
                 run_id: None,
                 config_fingerprint: None,
                 source_ip: None,
+                tenant: None,
                 result: result.into(),
             };
         h.record_audit(&entry(

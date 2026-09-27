@@ -93,6 +93,52 @@ class TestModuleLinesTests(unittest.TestCase):
     def test_unreadable_file_has_no_test_lines(self):
         self.assertEqual(ic._source_test_lines("does/not/exist.rs"), set())
 
+    def _tree(self, files):
+        root = Path(tempfile.mkdtemp())
+        for rel, body in files.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(body)
+        return root
+
+    def test_a_cfg_test_file_module_is_test_only(self):
+        root = self._tree({
+            "c/src/lib.rs": "mod sink;\n#[cfg(test)]\nmod test_support;\n",
+            "c/src/sink.rs": "pub fn a() {}\n",
+            "c/src/test_support.rs": "pub fn helper() {}\nfn two() {}\n",
+        })
+        self.assertTrue(ic.is_test_only_file(str(root / "c/src/test_support.rs")))
+        self.assertFalse(ic.is_test_only_file(str(root / "c/src/sink.rs")))
+        self.assertEqual(ic._source_test_lines(str(root / "c/src/test_support.rs")), {1, 2})
+        self.assertEqual(ic._source_test_lines(str(root / "c/src/sink.rs")), set())
+
+    def test_attributes_between_cfg_test_and_the_declaration_are_skipped(self):
+        root = self._tree({
+            "c/src/lib.rs": "#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod fixtures;\n",
+            "c/src/fixtures.rs": "fn f() {}\n",
+        })
+        self.assertTrue(ic.is_test_only_file(str(root / "c/src/fixtures.rs")))
+
+    def test_nested_modules_under_a_test_only_parent_are_test_only(self):
+        root = self._tree({
+            "c/src/lib.rs": "#[cfg(test)]\nmod mocks;\nmod real;\n",
+            "c/src/mocks/mod.rs": "mod http;\n",
+            "c/src/mocks/http.rs": "fn h() {}\n",
+            "c/src/real.rs": "mod inner;\n",
+            "c/src/real/inner.rs": "fn i() {}\n",
+        })
+        self.assertTrue(ic.is_test_only_file(str(root / "c/src/mocks/mod.rs")))
+        self.assertTrue(ic.is_test_only_file(str(root / "c/src/mocks/http.rs")))
+        self.assertFalse(ic.is_test_only_file(str(root / "c/src/real/inner.rs")))
+        self.assertFalse(ic.is_test_only_file(str(root / "c/src/lib.rs")))
+
+    def test_cfg_test_on_another_module_does_not_leak(self):
+        root = self._tree({
+            "c/src/lib.rs": "#[cfg(test)]\nmod tests;\nmod sink;\n",
+            "c/src/sink.rs": "fn s() {}\n",
+        })
+        self.assertFalse(ic.is_test_only_file(str(root / "c/src/sink.rs")))
+
 
 class EvaluateTests(unittest.TestCase):
     def test_test_module_lines_are_not_counted(self):

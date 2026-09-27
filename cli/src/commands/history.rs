@@ -186,6 +186,7 @@ mod tests {
             attempt: 0,
             replay_of: None,
             callback: None,
+            tenant: None,
         }
     }
 

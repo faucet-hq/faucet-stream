@@ -8,7 +8,7 @@ A **repeatable, per-release** playbook so publicity is routine, not heroic. Wher
 account. Keep the copy consistent across channels: consistency compounds recognition.
 
 > **Single source of truth:** the canonical pitch and the connector count live in the root
-> [`README.md`](../../README.md) hero (currently **<!--COUNT:connectors-->68<!--/COUNT--> connectors — <!--COUNT:sources-->38<!--/COUNT--> sources / <!--COUNT:sinks-->30<!--/COUNT--> sinks**).
+> [`README.md`](../../README.md) hero (currently **<!--COUNT:connectors-->75<!--/COUNT--> connectors — <!--COUNT:sources-->42<!--/COUNT--> sources / <!--COUNT:sinks-->33<!--/COUNT--> sinks**).
 > Copy from there; don't invent variants. If the count changed this release, update the
 > templates below in the same PR.
 
@@ -66,7 +66,7 @@ DB→DB move, **~96×** as the CSV→JSONL upper bound — never the ~96× alone
 ### Elevator pitch (one-liner — use everywhere)
 
 > **faucet-stream** — the fast, config-driven way to move data in Rust. A data-movement
-> platform with <!--COUNT:connectors-->68<!--/COUNT--> source and sink connectors for ETL, CDC, and streaming, run from a YAML
+> platform with <!--COUNT:connectors-->75<!--/COUNT--> source and sink connectors for ETL, CDC, and streaming, run from a YAML
 > file by a single binary or embedded as a Rust library.
 
 ### Release thread (X / Bluesky / Mastodon / LinkedIn)
@@ -83,7 +83,7 @@ DB→DB move, **~96×** as the CSV→JSONL upper bound — never the ~96× alone
 
 ### This Week in Rust
 
-> **faucet-stream vX.Y.Z** — a config-driven data-movement platform for Rust: <!--COUNT:connectors-->68<!--/COUNT--> connectors,
+> **faucet-stream vX.Y.Z** — a config-driven data-movement platform for Rust: <!--COUNT:connectors-->75<!--/COUNT--> connectors,
 > a `faucet` CLI that runs pipelines from YAML, and an embeddable library, with streaming,
 > Postgres CDC, dead-letter queues, and built-in Prometheus/tracing. This release:
 > <one-line highlight>.

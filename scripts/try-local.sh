@@ -54,7 +54,7 @@ SERVE_PORT=8899
 # console + persistent history + lineage + catalog. Pure-Rust deps only, so it
 # builds in a few minutes with no cmake / DuckDB / librdkafka. `--full` swaps in
 # the everything build (Kafka, gRPC, cloud, DuckDB SQL — needs cmake, ~15-30min).
-LIGHT_FEATURES="source-csv,source-sqlite,source-parquet,sink-jsonl,sink-csv,sink-stdout,sink-sqlite,sink-parquet,transforms,quality,contract,masking,serve,serve-ui,serve-history-sqlite,lineage,catalog,schedule,triggers,templates"
+LIGHT_FEATURES="source-csv,source-sqlite,source-parquet,sink-jsonl,sink-csv,sink-stdout,sink-sqlite,sink-parquet,transforms,quality,contract,masking,serve,serve-ui,serve-history-sqlite,lineage,catalog,schedule,triggers,templates,tenants"
 BUILD_FEATURES="$LIGHT_FEATURES"
 
 while [ $# -gt 0 ]; do
@@ -137,7 +137,7 @@ launch_ui() {
   # Use --clean to reset the whole workspace (including this DB).
   hdr "Starting the web console on ${base}"
   # Run from DEMO_DIR so submitted configs' ./data and ./out paths resolve.
-  ( cd "$DEMO_DIR" && exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" \
+  ( cd "$DEMO_DIR" && FAUCET_VAULT_KEY="${FAUCET_VAULT_KEY:-local-demo-vault-key}" exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" \
       --no-auth --history "sqlite:./faucet-meta.db" --preview-local-outputs ) >"${DEMO_DIR}/serve.log" 2>&1 &
   SERVE_PID=$!
   trap 'echo; info "Stopping web console (pid '"$SERVE_PID"')"; stop_serve; exit 0' INT TERM
@@ -203,6 +203,20 @@ launch_ui() {
     # A demo catalog big enough to show the Templates list, its filters and the
     # compatibility grid at volume: 10 source + 10 sink templates across several
     # owners and lifecycle states. Idempotent — existing ids are left alone.
+    # Two tenants with a stored connection each (#709), so the Tenants page and
+    # the tenant switcher have something to show. Idempotent: a repeat create
+    # is a 409 and ignored.
+    if curl -sf "${base}/v1/tenants" >/dev/null 2>&1; then
+      info "Seeding demo tenants…"
+      curl -s -o /dev/null -X POST "${base}/v1/tenants" -H 'content-type: application/json' \
+        -d '{"id":"acme","name":"Acme Corp","labels":{"region":"eu"},"limits":{"max_concurrent_runs":3,"max_records_per_run":1000000}}'
+      curl -s -o /dev/null -X POST "${base}/v1/tenants" -H 'content-type: application/json' \
+        -d '{"id":"globex","name":"Globex"}'
+      for t in acme globex; do
+        curl -s -o /dev/null -X POST "${base}/v1/tenants/${t}/connections" -H 'content-type: application/json' \
+          -d '{"name":"crm","provider":{"type":"static","config":{"token":"demo-token"}}}'
+      done
+    fi
     info "Seeding the demo template catalog…"
     python3 "${REPO_ROOT}/scripts/demo_catalog.py" "${base}" || info "  (demo catalog seeding reported failures — continuing)"
   else
@@ -226,6 +240,8 @@ launch_ui() {
   echo "                  ${BOLD}versions page${RESET} where you assign channels (prod, staging, …),"
   echo "                  Launch / Roll back / Deprecate, and trigger a run from a typed"
   echo "                  form generated from the template's params."
+  echo "    • Tenants   — customers this server runs pipelines for, their limits and"
+  echo "                  sealed connections; the top-bar switcher scopes Runs/Usage/Changes"
   echo "    • Submit    — build/paste a new config and run it live"
   echo "    • Schemas   — browse every connector's config schema"
   echo

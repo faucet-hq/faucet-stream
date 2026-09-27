@@ -33,8 +33,10 @@ connector, transforms, quality checks, contracts, masking, compression) plus
 `serve` (with the embedded web console), `schedule`, `lineage`, and `templates`
 (the pipeline template registry — note that a registry surviving a restart also
 needs a `serve-history-*` backend). Not included — build from source for these:
-`transform-sql` (embedded DuckDB), `otel`, `triggers`, `catalog`, and the
-`serve-history-*` backends.
+`transform-sql` (embedded DuckDB), `otel`, `triggers`, `catalog`, the
+`serve-history-*` backends, and the Oracle connectors (`source-oracle`,
+`source-oracle-cdc`, `sink-oracle`), which need Oracle Instant Client at runtime
+(see [Oracle Instant Client](#oracle-instant-client)).
 
 > **macOS Gatekeeper:** the binaries are not currently notarized. If macOS
 > blocks the downloaded binary, clear the quarantine attribute:
@@ -50,8 +52,10 @@ cargo install faucet-cli                     # the default feature set
 cargo install faucet-cli --features full     # everything (DuckDB, otel, triggers, …)
 ```
 
-This gives you a `faucet` binary with **every** first-party connector compiled in,
-so it can run any of the published example configs out of the box.
+This gives you a `faucet` binary with every first-party connector compiled in
+except the three Oracle connectors, which are opt-in because they load Oracle
+Instant Client at runtime: `cargo install faucet-cli --features
+"source-oracle,source-oracle-cdc,sink-oracle"` (they are also part of `full`).
 
 ### Choose your build (feature flags)
 
@@ -113,5 +117,25 @@ You can also depend on individual connector crates directly
   current MSRV).
 - Some connectors link native libraries — the Kafka connectors build
   `librdkafka` and need `cmake` and a C toolchain available at compile time.
+
+### Oracle Instant Client
+
+The Oracle connectors (`source-oracle`, `source-oracle-cdc`, `sink-oracle`) are
+built on the `oracle` crate (ODPI-C), which compiles without any Oracle software
+but **loads Oracle Instant Client at runtime**. Install the Basic or Basic Light
+package from <https://www.oracle.com/database/technologies/instant-client.html>
+and put its directory on the library path:
+
+```bash
+# Linux (x86_64). Instant Client needs libaio (libaio1t64 on Ubuntu 24.04).
+sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+unzip instantclient-basiclite-linuxx64.zip -d /opt/oracle
+export LD_LIBRARY_PATH=/opt/oracle/instantclient_23_7:$LD_LIBRARY_PATH   # your version's directory
+```
+
+On macOS put the directory on `DYLD_LIBRARY_PATH` (or symlink
+`libclntsh.dylib` into `~/lib`); on Windows add it to `PATH`. Without the
+client an Oracle connector fails at connect time — including `faucet doctor`'s
+probe — with a `DPI-1047` error and a hint naming this fix.
 
 Next: [run your first pipeline](./first-pipeline.md).

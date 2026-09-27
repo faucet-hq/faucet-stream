@@ -28,8 +28,19 @@ pub struct TriggerSpec {
     /// Spawn this trigger? Default `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// The pipeline to enqueue when the trigger fires (path string or inline doc).
-    pub config: PipelineRef,
+    /// The pipeline to enqueue when the trigger fires (path string or inline
+    /// doc). Exactly one of `config` and `template`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<PipelineRef>,
+    /// A registered template to trigger instead of a config (needs the
+    /// `templates` feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TemplateTrigger>,
+    /// Fan the fire out across tenants (#709): `all`, or a list of tenant ids.
+    /// Each tenant gets its own run, as that tenant (needs the `tenants`
+    /// feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenants: Option<crate::serve::history::tenants::TenantSelector>,
     /// Optional run-shaping.
     #[serde(default)]
     pub run: RunTemplate,
@@ -79,6 +90,44 @@ pub enum TriggerKind {
         #[serde(default = "default_poll_secs")]
         poll_interval_secs: u64,
     },
+    /// Fire on a cron schedule (#709; needs the `schedule` feature). With
+    /// `tenants`, each tick fans out one run per tenant.
+    Schedule {
+        /// Cron expression (5 or 6 fields).
+        cron: String,
+        /// IANA timezone the cron is evaluated in. Default `UTC`.
+        #[serde(default = "default_timezone")]
+        timezone: String,
+    },
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+/// A registered template a trigger runs (`template:` on a trigger).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateTrigger {
+    /// Template id.
+    pub id: String,
+    /// Version: a number or a channel. Default `stable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Values for the template's `params:`. String values may use
+    /// `${trigger.*}` tokens.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, serde_json::Value>,
+    /// For a source template: the sink template to compose in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink_version: Option<String>,
+    /// A registered deployment overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
@@ -268,7 +317,7 @@ triggers:
         let t = &f.triggers[0];
         assert_eq!(t.name, "drop");
         assert!(t.enabled);
-        assert!(matches!(t.config, PipelineRef::Path(ref p) if p == "./pipelines/load.yaml"));
+        assert!(matches!(t.config, Some(PipelineRef::Path(ref p)) if p == "./pipelines/load.yaml"));
         match &t.kind {
             TriggerKind::ObjectArrival {
                 poll_interval_secs,
@@ -301,7 +350,7 @@ triggers:
     threshold: 5
 "#;
         let f: TriggersFile = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(f.triggers[0].config, PipelineRef::Inline(_)));
+        assert!(matches!(f.triggers[0].config, Some(PipelineRef::Inline(_))));
         match &f.triggers[0].kind {
             TriggerKind::Webhook {
                 methods,

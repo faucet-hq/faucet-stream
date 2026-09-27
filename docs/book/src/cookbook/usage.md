@@ -55,8 +55,10 @@ usage by pipeline (since 2026-09-01T00:00:00Z; 42 invocation(s); estimates in US
 ```
 
 `--by` groups by `pipeline` (default), `row`, `dataset` (the sink dataset's
-catalog id), `sink` (connector kind) or `day`. The same report is
-`GET /v1/usage` on a server (`by`, `since`, `until`, `pipeline`, `limit`,
+catalog id), `sink` (connector kind), `day` or `tenant` (the
+[tenant](./embedded-integrations.md) a server run was started for; `--tenant`
+keeps one). The same report is
+`GET /v1/usage` on a server (`by`, `since`, `until`, `pipeline`, `tenant`, `limit`,
 `include_records`; `UsageRead`, viewer and up) and the **Usage** page of the
 web console.
 

@@ -50,9 +50,11 @@ pub struct LogQuery {
 /// 404 if the run is entirely unknown.
 pub async fn stream_logs(
     State(state): State<ServerState>,
+    axum::extract::Extension(actor): axum::extract::Extension<crate::serve::rbac::AuthContext>,
     Path(id): Path<String>,
     Query(q): Query<LogQuery>,
 ) -> Result<Response, ServeError> {
+    crate::serve::handlers::runs::ensure_visible(&state, &actor, &id).await?;
     match q.format.as_deref() {
         None => stream_logs_sse(state, id)
             .await

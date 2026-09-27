@@ -17,7 +17,7 @@ Move to faucet-stream when **throughput, operational simplicity, or in-flight go
 - **Speed you can measure.** On a reproducible 1M-row CSV→JSONL move, faucet does **712k rows/s in 11.8 MiB** vs Meltano's **7.4k rows/s in 724 MiB** — **~96× faster, ~62× less memory**, output identical row-for-row. Sink-bound moves (e.g. Postgres→Postgres) narrow the gap — the [benchmarks](https://github.com/faucet-hq/faucet-stream/blob/main/BENCHMARKS.md) show that scenario too, honestly. The difference is structural: no per-row Python overhead, native streaming with bounded memory.
 - **No Python runtime.** faucet is a single static binary — `brew install`, drop it on a box, done. No virtualenv, no plugin resolution, no Python-version matrix to keep green in CI and prod.
 - **Governance in the movement path, not bolted on.** Data-quality checks, versioned **data contracts**, **PII masking** (applied *before* any sink sees a row), schema-drift policy, column-level **lineage** (OpenLineage) + a data-movement catalog, and freshness/volume **SLAs** are native and zero-config. In the Singer world these are separate concerns you assemble (mappers, dbt tests, external tooling).
-- **Effectively-once delivery.** Per-page commit tokens commit atomically with the data, so a resumed run drops duplicates — across **11 sinks** (SQL, Kafka, Iceberg, BigQuery, Snowflake, Spanner, MongoDB, Redis), plus a keyed-upsert path on any source into an upsert-capable sink.
+- **Effectively-once delivery.** Per-page commit tokens commit atomically with the data, so a resumed run drops duplicates — across **13 sinks** (SQL, Oracle, Kafka, Iceberg, BigQuery, Snowflake, Spanner, Databricks, MongoDB, Redis), plus a keyed-upsert path on any source into an upsert-capable sink.
 - **Embeddable.** Compile the same engine into your own Rust service via the typed `Source` / `Sink` traits — not just a CLI.
 
 ## Where Meltano is the better choice
@@ -34,12 +34,12 @@ Straight with you, because it's what makes the rest credible:
 |---|---|---|
 | Runtime | Rust, single native binary | Python |
 | Install | one binary / `brew` / `cargo` | Python env + plugins |
-| Connectors | <!--COUNT:connectors-->68<!--/COUNT--> (<!--COUNT:sources-->38<!--/COUNT--> sources, <!--COUNT:sinks-->30<!--/COUNT--> sinks), growing | 600+ taps |
+| Connectors | <!--COUNT:connectors-->75<!--/COUNT--> (<!--COUNT:sources-->42<!--/COUNT--> sources, <!--COUNT:sinks-->33<!--/COUNT--> sinks), growing | 600+ taps |
 | Throughput (1M-row CSV→JSONL) | **712k rows/s, 11.8 MiB** | 7.4k rows/s, 724 MiB |
 | In-flight transforms | ✓ 11 record transforms + filter/explode/CDC-unwrap + embedded-DuckDB `sql` | mappers; dbt post-load |
 | Data quality / contracts / masking | ✓ native, in-path | assemble (mappers, dbt tests) |
 | Lineage + catalog | ✓ OpenLineage, native | external |
-| Effectively-once delivery | ✓ (11 sinks incl. Kafka, Iceberg, BigQuery) | ✗ |
+| Effectively-once delivery | ✓ (13 sinks incl. Kafka, Iceberg, BigQuery, Databricks, Oracle) | ✗ |
 | Embeddable as a library | ✓ (Rust) | ✗ |
 | License | MIT / Apache-2.0 | MIT |
 

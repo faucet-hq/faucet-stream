@@ -32,6 +32,7 @@ impl CompiledTrigger {
             TriggerKind::ObjectArrival { .. } => "object_arrival",
             TriggerKind::Webhook { .. } => "webhook",
             TriggerKind::QueueDepth { .. } => "queue_depth",
+            TriggerKind::Schedule { .. } => "schedule",
         }
     }
 }
@@ -65,18 +66,41 @@ impl CompiledTriggers {
             if !names.insert(t.name.clone()) {
                 return Err(format!("triggers: duplicate trigger name '{}'", t.name));
             }
-            // Pipeline ref must be present and non-empty.
-            match &t.config {
-                PipelineRef::Path(p) if p.trim().is_empty() => {
+            // Exactly one of a pipeline ref and a template; the ref non-empty.
+            match (&t.config, &t.template) {
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "triggers: '{}' sets both `config` and `template`; pick one",
+                        t.name
+                    ));
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "triggers: '{}' needs a `config` or a `template`",
+                        t.name
+                    ));
+                }
+                (Some(PipelineRef::Path(p)), None) if p.trim().is_empty() => {
                     return Err(format!("triggers: '{}' has an empty config path", t.name));
                 }
-                PipelineRef::Inline(v) if !v.is_object() => {
+                (Some(PipelineRef::Inline(v)), None) if !v.is_object() => {
                     return Err(format!(
                         "triggers: '{}' inline config must be a mapping",
                         t.name
                     ));
                 }
+                (None, Some(tpl)) => {
+                    require_feature(&t.name, "templates")?;
+                    if tpl.id.trim().is_empty() {
+                        return Err(format!("triggers: '{}' template id is empty", t.name));
+                    }
+                }
                 _ => {}
+            }
+            if let Some(sel) = &t.tenants {
+                require_feature(&t.name, "tenants")?;
+                sel.validate()
+                    .map_err(|e| format!("triggers: '{}' {e}", t.name))?;
             }
 
             let webhook_path = match &t.kind {
@@ -128,6 +152,11 @@ impl CompiledTriggers {
                     }
                     require_feature(&t.name, queue_feature(queue))?;
                     validate_queue(&t.name, queue)?;
+                    None
+                }
+                TriggerKind::Schedule { cron, timezone } => {
+                    require_feature(&t.name, "schedule")?;
+                    validate_schedule(&t.name, cron, timezone)?;
                     None
                 }
             };
@@ -208,12 +237,40 @@ fn validate_queue(name: &str, queue: &QueueSpec) -> Result<(), String> {
 }
 
 /// Returns Ok if the named feature is compiled in; else a clear error naming it.
+/// Compile a `schedule` trigger's cron + timezone the way `faucet schedule`
+/// does, so both runtimes accept exactly the same expressions.
+#[cfg(feature = "schedule")]
+pub fn compile_schedule(
+    trigger: &str,
+    cron: &str,
+    timezone: &str,
+) -> Result<crate::schedule::compiled::CompiledSchedule, String> {
+    let spec: crate::schedule::spec::ScheduleSpec =
+        serde_json::from_value(serde_json::json!({ "cron": cron, "timezone": timezone }))
+            .map_err(|e| format!("triggers: '{trigger}' {e}"))?;
+    crate::schedule::compiled::CompiledSchedule::compile(&spec)
+        .map_err(|e| format!("triggers: '{trigger}' {e}"))
+}
+
+#[cfg(feature = "schedule")]
+fn validate_schedule(trigger: &str, cron: &str, timezone: &str) -> Result<(), String> {
+    compile_schedule(trigger, cron, timezone).map(|_| ())
+}
+
+#[cfg(not(feature = "schedule"))]
+fn validate_schedule(_trigger: &str, _cron: &str, _timezone: &str) -> Result<(), String> {
+    Ok(())
+}
+
 fn require_feature(trigger: &str, feature: &str) -> Result<(), String> {
     let compiled = match feature {
         "triggers" => cfg!(feature = "triggers"),
         "triggers-object-store" => cfg!(feature = "triggers-object-store"),
         "triggers-redis" => cfg!(feature = "triggers-redis"),
         "triggers-kafka" => cfg!(feature = "triggers-kafka"),
+        "schedule" => cfg!(feature = "schedule"),
+        "templates" => cfg!(feature = "templates"),
+        "tenants" => cfg!(feature = "tenants"),
         _ => true,
     };
     if compiled {
@@ -231,6 +288,50 @@ mod tests {
 
     fn file(yaml: &str) -> TriggersFile {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    fn compile_err(yaml: &str) -> String {
+        CompiledTriggers::compile(file(yaml)).unwrap_err()
+    }
+
+    #[test]
+    fn config_template_tenants_and_schedule_are_validated() {
+        let base = "version: 1\ntriggers:\n  - name: t\n    type: webhook\n";
+        assert!(
+            compile_err(&format!(
+                "{base}    config: ./x.yaml\n    template: {{ id: a }}\n"
+            ))
+            .contains("both")
+        );
+        assert!(compile_err(base).contains("needs a `config` or a `template`"));
+        assert!(
+            compile_err(&format!("{base}    template: {{ id: \" \" }}\n"))
+                .contains("template id is empty")
+        );
+        assert!(
+            compile_err(&format!("{base}    config: ./x.yaml\n    tenants: every\n"))
+                .contains("\"all\"")
+        );
+        let ok = CompiledTriggers::compile(file(&format!(
+            "{base}    template: {{ id: tpl }}\n    tenants: all\n"
+        )))
+        .unwrap();
+        assert!(ok.triggers[0].spec.template.is_some());
+        let sched =
+            "version: 1\ntriggers:\n  - name: s\n    type: schedule\n    config: ./x.yaml\n";
+        assert!(
+            compile_err(&format!("{sched}    cron: \"not a cron\"\n")).contains("invalid cron")
+        );
+        assert!(
+            compile_err(&format!(
+                "{sched}    cron: \"* * * * *\"\n    timezone: Mars/Base\n"
+            ))
+            .contains("timezone")
+        );
+        let c =
+            CompiledTriggers::compile(file(&format!("{sched}    cron: \"0 * * * *\"\n"))).unwrap();
+        assert_eq!(c.triggers[0].kind_label(), "schedule");
+        assert!(c.triggers[0].webhook_path.is_none());
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub async fn write(
         run_id,
         config_fingerprint,
         source_ip: ctx.source_ip.clone(),
+        tenant: ctx.tenant.clone(),
         result: result.to_string(),
     };
     if let Err(e) = state.history().record_audit(&entry).await {

@@ -98,6 +98,17 @@ members = [
     "crates/state/postgres",
     "faucet-stream",
     "cli",
+    "crates/common/oracle",
+    "crates/source/oracle",
+    "crates/source/oracle-cdc",
+    "crates/sink/oracle",
+    "crates/common/iceberg",
+    "crates/source/iceberg",
+    "crates/common/dynamodb",
+    "crates/source/dynamodb",
+    "crates/sink/dynamodb",
+    "crates/common/databricks",
+    "crates/sink/databricks",
 ]
 # The reference WASM transform modules target `wasm32-unknown-unknown` with
 # their own release profile and are built out-of-band (see their README); they
@@ -206,6 +217,17 @@ faucet-sink-azure-blob = { path = "crates/sink/azure-blob", version = "1" }
 faucet-source-duckdb = { path = "crates/source/duckdb", version = "1" }
 faucet-sink-duckdb = { path = "crates/sink/duckdb", version = "1" }
 faucet-common-sqs = { path = "crates/common/sqs", version = "1" }
+faucet-common-oracle = { path = "crates/common/oracle", version = "1" }
+faucet-source-oracle = { path = "crates/source/oracle", version = "1" }
+faucet-source-oracle-cdc = { path = "crates/source/oracle-cdc", version = "1" }
+faucet-sink-oracle = { path = "crates/sink/oracle", version = "1" }
+faucet-common-iceberg = { path = "crates/common/iceberg", version = "1" }
+faucet-source-iceberg = { path = "crates/source/iceberg", version = "1" }
+faucet-common-dynamodb = { path = "crates/common/dynamodb", version = "1" }
+faucet-source-dynamodb = { path = "crates/source/dynamodb", version = "1" }
+faucet-sink-dynamodb = { path = "crates/sink/dynamodb", version = "1" }
+faucet-common-databricks = { path = "crates/common/databricks", version = "1" }
+faucet-sink-databricks = { path = "crates/sink/databricks", version = "1" }
 faucet-source-sqs = { path = "crates/source/sqs", version = "1" }
 faucet-sink-sqs = { path = "crates/sink/sqs", version = "1" }
 faucet-common-nats = { path = "crates/common/nats", version = "1" }
@@ -284,9 +306,12 @@ gcloud-gax = "1.4"
 gcloud-pubsub = { version = "1", default-features = false, features = ["auth", "rustls-tls", "jwt-rust-crypto"] }
 gcloud-auth = { version = "1", default-features = false, features = ["rustls-tls", "jwt-rust-crypto"] }
 aws-sdk-kinesis = "1"
+aws-sdk-dynamodb = "1"
+aws-sdk-dynamodbstreams = "1"
 aws-sdk-s3 = "1"
 aws-sdk-sqs = "1"
 aws-sdk-secretsmanager = "1"
+oracle = "0.6"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 # NATS (JetStream-capable async client) for the nats source/sink pair.
 async-nats = "0.50"

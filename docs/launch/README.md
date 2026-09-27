@@ -24,7 +24,7 @@ add this line under a relevant section (e.g. *Database* → *ETL* or *Data
 processing*), and open a PR:
 
 ```markdown
-* [faucet-stream](https://github.com/faucet-hq/faucet-stream) — A fast, config-driven data-movement platform: <!--COUNT:connectors-->68<!--/COUNT--> source and sink connectors wired by a single `faucet` binary (YAML) or embedded as a Rust library; runs your existing Singer taps unchanged, with streaming, CDC, DLQ, and built-in metrics.
+* [faucet-stream](https://github.com/faucet-hq/faucet-stream) — A fast, config-driven data-movement platform: <!--COUNT:connectors-->75<!--/COUNT--> source and sink connectors wired by a single `faucet` binary (YAML) or embedded as a Rust library; runs your existing Singer taps unchanged, with streaming, CDC, DLQ, and built-in metrics.
 ```
 
 Also consider [`awesome-data-engineering`](https://github.com/igorbarinov/awesome-data-engineering).
@@ -34,7 +34,7 @@ Also consider [`awesome-data-engineering`](https://github.com/igorbarinov/awesom
 Submit via the ["Send us a PR" form / issue](https://github.com/rust-lang/this-week-in-rust)
 (Crate of the Week nominations + project updates). Suggested blurb:
 
-> **faucet-stream** — a config-driven data-movement platform: <!--COUNT:connectors-->68<!--/COUNT--> connectors, a
+> **faucet-stream** — a config-driven data-movement platform: <!--COUNT:connectors-->75<!--/COUNT--> connectors, a
 > `faucet` CLI that runs pipelines from YAML, and an embeddable library, with
 > streaming, Postgres CDC, dead-letter queues, and built-in Prometheus/tracing.
 
@@ -48,7 +48,7 @@ Submit via the ["Send us a PR" form / issue](https://github.com/rust-lang/this-w
 > It's a single static binary that runs pipelines from a YAML file (no platform,
 > no Python, no daemon), or an embeddable library with typed Source/Sink traits.
 >
-> <!--COUNT:connectors-->68<!--/COUNT--> connectors today (REST, GraphQL, gRPC, Kafka, Postgres incl. CDC, MySQL,
+> <!--COUNT:connectors-->75<!--/COUNT--> connectors today (REST, GraphQL, gRPC, Kafka, Postgres incl. CDC, MySQL,
 > SQLite, S3/GCS/Azure, Parquet/Delta/Iceberg, MongoDB, Redis, Elasticsearch,
 > BigQuery, Snowflake, Databricks), with native streaming (bounded memory),
 > incremental/resumable replication, dead-letter queues, retries, and built-in
@@ -67,7 +67,7 @@ Post early in the US morning (Pacific) on a weekday; reply to comments quickly.
 
 ### 4. Reddit — r/rust
 
-**Title:** `faucet-stream: a config-driven data-movement platform (<!--COUNT:connectors-->68<!--/COUNT--> connectors, streaming, CDC) — CLI or embeddable library`
+**Title:** `faucet-stream: a config-driven data-movement platform (<!--COUNT:connectors-->75<!--/COUNT--> connectors, streaming, CDC) — CLI or embeddable library`
 
 Lead with the Rust angle: single binary, typed traits, every connector a Cargo
 feature, performance-first design (connection reuse, multi-row inserts, bounded

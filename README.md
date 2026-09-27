@@ -22,8 +22,8 @@
 ~62× less memory than Meltano**, output identical row-for-row ([see the benchmarks](BENCHMARKS.md)).
 No Python runtime, no platform to stand up, no daemon to babysit.
 
-faucet-stream is a **data-movement platform** for Rust — with governance built in: **<!--COUNT:sources-->38<!--/COUNT--> source**
-and **<!--COUNT:sinks-->30<!--/COUNT--> sink** connectors (**<!--COUNT:connectors-->68<!--/COUNT--> in total**) plus in-flight transforms, including a page-level
+faucet-stream is a **data-movement platform** for Rust — with governance built in: **<!--COUNT:sources-->42<!--/COUNT--> source**
+and **<!--COUNT:sinks-->33<!--/COUNT--> sink** connectors (**<!--COUNT:connectors-->75<!--/COUNT--> in total**) plus in-flight transforms, including a page-level
 embedded-DuckDB `sql` transform — wired by a single `faucet` binary that runs pipelines
 declaratively from YAML/JSON (no Rust code required), or embedded in your own service through
 the typed `Source` / `Sink` traits. One platform, whether you want a CLI you can drop on any
@@ -68,7 +68,7 @@ cargo add faucet-stream           # the library
   sink sees a row), schema-drift detection & policy, column-level lineage (OpenLineage) + a
   data-movement catalog, and freshness/volume SLA monitoring.
 - **📦 Pay only for what you use** — every connector is a Cargo feature, so a slim build can
-  be just REST + JSONL, or pull in all <!--COUNT:connectors-->68<!--/COUNT--> connectors with `--features full`.
+  be just REST + JSONL, or pull in all <!--COUNT:connectors-->75<!--/COUNT--> connectors with `--features full`.
 
 **Documentation:** the [faucet-stream guide](https://faucet-hq.github.io/faucet-stream/)
 (getting started, tutorials, cookbook, operations) · API reference on
@@ -219,6 +219,7 @@ one-block addition to your YAML:
 | **Column profiling** | Learned per-column profiles (null rate, type mix, distinct, numeric / string summaries, top values) in bounded memory, compared against a rolling baseline every run — statistically significant drift is reported per column with no thresholds to write; `warn`, `notify`, or `fail`. | [profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling.html) |
 | **Cost & usage accounting + run budgets** | Every invocation is metered — records, estimated bytes, backend round trips, connector cost signals (BigQuery bytes billed, S3/GCS requests) — priced against a `usage:` rate table you control and compared to a per-row-priced hosted ELT equivalent, always labelled as an estimate; `faucet usage` / `GET /v1/usage` / the console aggregate by pipeline, row, dataset, sink or day. A `budget:` block puts hard ceilings on a run (`max_records` / `max_bytes` refuse the crossing page whole, `max_duration_secs` cancels at a page boundary, `allowed_sinks` refuses before anything runs). See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html). |
 | **Change approvals (plan → approve → run)** | `POST /v1/changes`, the console's Changes page, or an agent's MCP `propose_run` / `propose_template` files a run, template registration or launch as a change request with its plan (rows, delivery guarantee, policy verdict, impact) and a budget; the approvers the `approvals:` block of `--auth-config` names approve it, faucet re-plans and runs it — or marks it `invalidated` if the plan changed underneath. `--require-approval run` makes the gate mandatory. Every step is audited. See the [approvals cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/approvals.html). |
+| **Embedded integrations (multi-tenant)** | Run the same pipeline for every customer: tenants with limits, credentials sealed under a vault key (stored by API or created through a hosted OAuth connect flow with PKCE), `auth: { ref }` resolved per tenant, `${tenant.*}` routing, per-tenant state namespaces, fan-out on demand or on a cron `schedule` trigger, re-authorization detection that pauses only the affected tenant, tenant-confined tokens and a delete that removes everything faucet holds. See the [embedded integrations cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/embedded-integrations.html). |
 | **Dead-letter queue** | Route failed rows to any sink instead of aborting the run, with a fixed envelope and reason. | [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html) |
 | **Adaptive batch sizing** | Opt-in AIMD controller that tunes write batch size from observed sink latency and error rate. | [tuning](https://faucet-hq.github.io/faucet-stream/) |
 | **Secrets-manager interpolation** | `${vault:…}`, `${aws-sm:…}`, `${gcp-sm:…}`, `${azure-kv:…}` resolved at load time, redacted from logs. | [secrets](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html) |
@@ -266,7 +267,7 @@ for help picking between overlapping connectors (Postgres query vs CDC, S3 vs Pa
 > production — Tier-2 means "not certified," **not** "low quality." The Singer
 > bridge is additionally **experimental (v0, single-stream)** ⚠️.
 
-### Sources (33)
+### Sources (<!--COUNT:sources-->42<!--/COUNT-->)
 
 `Tier`: **T1 ✅** = passes the `faucet-conformance` battery in CI; **T2** = not yet
 wired into the battery (see the support-tiers note above).
@@ -283,6 +284,8 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-source-mysql-cdc`](crates/source/mysql-cdc) | T1 ✅ | MySQL CDC — binlog row events, resumable via file/pos or GTID |
 | [`faucet-source-mssql`](crates/source/mssql) | T1 ✅ | Microsoft SQL Server — streaming queries, incremental replication |
 | [`faucet-source-mssql-cdc`](crates/source/mssql-cdc) | T1 ✅ | Microsoft SQL Server CDC — change tables (`fn_cdc_get_all_changes`), LSN bookmarks, resumable |
+| [`faucet-source-oracle`](crates/source/oracle) | T1 ✅ | Oracle Database — streaming queries, incremental replication, PK-range sharding, discovery (needs Oracle Instant Client) |
+| [`faucet-source-oracle-cdc`](crates/source/oracle-cdc) | T1 ✅ | Oracle CDC — LogMiner, committed transactions only, SCN bookmarks, exactly-once (needs Oracle Instant Client) |
 | [`faucet-source-sqlite`](crates/source/sqlite) | **T1 ✅** | SQLite — run SQL queries, return rows as JSON |
 | [`faucet-source-duckdb`](crates/source/duckdb) | T2 | DuckDB — run SQL against a file or `:memory:` database, stream rows as JSON |
 | [`faucet-source-sqs`](crates/source/sqs) | T2 | AWS SQS — long-poll receive, delete-after-emit (at-least-once), idle/max termination |
@@ -301,6 +304,8 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-source-parquet`](crates/source/parquet) | T1 ✅ | Apache Parquet — local file, glob, or S3; vectorized Arrow reader, projection |
 | [`faucet-source-delta`](crates/source/delta) | T1 ✅ | Apache Delta Lake — local FS or S3/Azure/GCS; time travel, projection pushdown |
 | [`faucet-source-databricks`](crates/source/databricks) | T1 ✅ᵐ | Databricks SQL query source (Statement Execution API) — typed rows, chunk pagination, incremental |
+| [`faucet-source-iceberg`](crates/source/iceberg) | T1 ✅ | Apache Iceberg — REST/Glue/SQL/HMS catalogs; projection + filter pushdown, time travel, incremental snapshot reads |
+| [`faucet-source-dynamodb`](crates/source/dynamodb) | T1 ✅ᵉ | Amazon DynamoDB — parallel Scan, Query, or Streams change capture; resumable, shardable, discoverable |
 | [`faucet-source-redshift`](crates/source/redshift) | T1 ✅ | Amazon Redshift — SQL query over the PostgreSQL wire, incremental replication |
 | [`faucet-source-clickhouse`](crates/source/clickhouse) | T1 ✅ | ClickHouse — HTTP interface, `FORMAT JSONEachRow` streaming, incremental replication |
 | [`faucet-source-elasticsearch`](crates/source/elasticsearch) | T1 ✅ᵐ | Elasticsearch — search/scroll API |
@@ -312,15 +317,18 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-source-csv`](crates/source/csv) | **T1 ✅** | CSV — read CSV files as JSON objects |
 | [`faucet-source-singer`](crates/source/singer) | T2 ⚠️ | **Singer tap bridge** — run any Singer tap and adapt its output. Passes the battery, but **experimental (v0, single-stream)** |
 
-### Sinks (25)
+### Sinks (<!--COUNT:sinks-->33<!--/COUNT-->)
 
 | Crate | Tier | Description |
 |-------|------|-------------|
 | [`faucet-sink-bigquery`](crates/sink/bigquery) | T2 | Google BigQuery — streaming inserts; effectively-once via MERGE |
 | [`faucet-sink-iceberg`](crates/sink/iceberg) | T2 | Apache Iceberg — append snapshots via REST/Glue/SQL/HMS catalogs |
+| [`faucet-sink-databricks`](crates/sink/databricks) | T1 ✅ᵐ | Databricks SQL warehouse — append/upsert/delete/overwrite into Delta tables, staged `COPY INTO`, effectively-once, schema evolution |
+| [`faucet-sink-dynamodb`](crates/sink/dynamodb) | T1 ✅ᵉ | Amazon DynamoDB — batched `BatchWriteItem`; upsert/delete by key, conditional writes |
 | [`faucet-sink-postgres`](crates/sink/postgres) | T1 ✅ | PostgreSQL — JSONB or auto-mapped columns; upsert/delete |
 | [`faucet-sink-mysql`](crates/sink/mysql) | T1 ✅ | MySQL — JSON column or auto-mapped columns; upsert/delete |
 | [`faucet-sink-mssql`](crates/sink/mssql) | T1 ✅ | Microsoft SQL Server — JSON or auto-mapped columns, 2100-param split |
+| [`faucet-sink-oracle`](crates/sink/oracle) | T1 ✅ | Oracle Database — array DML; upsert/delete/overwrite, effectively-once, schema evolution (needs Oracle Instant Client) |
 | [`faucet-sink-sqlite`](crates/sink/sqlite) | **T1 ✅** | SQLite — JSON column or auto-mapped columns; upsert/delete; effectively-once |
 | [`faucet-sink-duckdb`](crates/sink/duckdb) | T2 | DuckDB — transaction-wrapped multi-row INSERT (JSON column or auto-mapped); append-only |
 | [`faucet-sink-sqs`](crates/sink/sqs) | T2 | AWS SQS — batched SendMessageBatch with per-entry retry; FIFO group/dedup |
@@ -430,7 +438,7 @@ own service.
 | Runs existing Singer taps | ✓ bridge (experimental) | ✓ native | ✗ | ✗ | ✗ | ✗ |
 | Change data capture | ✓ Postgres / MySQL / Mongo / SQL Server | partial¹ | ✓ | partial | ✗ | ✓ |
 | Incremental + resumable state | ✓ | ✓ | ✓ | partial | n/a | ✓ |
-| Effectively-once delivery³ | ✓ (11 sinks incl. Kafka, Iceberg, BigQuery) | ✗ | partial | ✗ | ✗ | ✓ |
+| Effectively-once delivery³ | ✓ (13 sinks incl. Kafka, Iceberg, BigQuery, Databricks, Oracle) | ✗ | partial | ✗ | ✗ | ✓ |
 | Built-in data-quality checks | ✓ native | ✗ | paywalled add-on | ✗ | ✗ | paywalled add-on |
 | Built-in metrics + tracing | ✓ Prometheus + OTLP + `tracing` | partial | ✓ (platform) | ✓ | ✓ | ✓ (hosted) |
 | Self-hosted, no daemon | ✓ run-to-completion | ✓ | ✗ needs platform | usually a service | agent | ✗ SaaS |
@@ -502,7 +510,7 @@ flowchart LR
     class K sink
 ```
 
-faucet-stream is a Cargo workspace with **<!--COUNT:crates-->95<!--/COUNT--> crates** — <!--COUNT:sources-->38<!--/COUNT--> sources, <!--COUNT:sinks-->30<!--/COUNT--> sinks, <!--COUNT:common-->17<!--/COUNT--> shared
+faucet-stream is a Cargo workspace with **<!--COUNT:crates-->106<!--/COUNT--> crates** — <!--COUNT:sources-->42<!--/COUNT--> sources, <!--COUNT:sinks-->33<!--/COUNT--> sinks, <!--COUNT:common-->21<!--/COUNT--> shared
 connector libraries, the shared auth-provider library, 2 state-store backends, the lineage
 crate, the SQL transform crate, the conformance test battery, the shared core, the umbrella
 crate, and the CLI binary. See
@@ -871,13 +879,13 @@ and the runnable [`cli/examples/custom-cli/`](cli/examples/custom-cli/main.rs).
 ## Project structure
 
 ```
-Cargo.toml                    — workspace manifest (<!--COUNT:crates-->95<!--/COUNT--> crates)
+Cargo.toml                    — workspace manifest (<!--COUNT:crates-->106<!--/COUNT--> crates)
 crates/
   core/                       — faucet-core: shared types, traits, pipeline, transforms, config
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
-  source/                     — <!--COUNT:sources-->38<!--/COUNT--> source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, singer, duckdb, sqs, nats, rabbitmq, sftp, …)
-  sink/                       — <!--COUNT:sinks-->30<!--/COUNT--> sink connectors (bigquery, iceberg, delta, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, …)
-  common/                     — <!--COUNT:common-->17<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp)
+  source/                     — <!--COUNT:sources-->42<!--/COUNT--> source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, …)
+  sink/                       — <!--COUNT:sinks-->33<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, …)
+  common/                     — <!--COUNT:common-->21<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle)
   state/                      — Redis- and Postgres-backed StateStore backends
   lineage/                    — faucet-lineage: OpenLineage event emission
   transform-sql/              — faucet-transform-sql: embedded DuckDB SQL transform

@@ -303,6 +303,24 @@ impl NotifyEvent {
         .with("actual", Value::from(actual))
     }
 
+    /// A tenant connection needs re-authorization (#709). `pipeline` is the
+    /// tenant id, so a rule's pipeline filter can target tenants.
+    pub fn connection_needs_reauth(tenant: &str, connection: &str, reason: &str) -> Self {
+        Self::base(
+            EventKind::ConnectionNeedsReauth,
+            Severity::Error,
+            tenant.to_string(),
+            "",
+            format!("Connection `{connection}` of tenant `{tenant}` needs re-authorization"),
+            format!(
+                "{reason}; runs that use this connection are refused until the tenant \
+                 reconnects it"
+            ),
+        )
+        .with("tenant", Value::String(tenant.to_string()))
+        .with("connection", Value::String(connection.to_string()))
+    }
+
     pub fn circuit_open(
         pipeline: impl Into<String>,
         row: impl Into<String>,

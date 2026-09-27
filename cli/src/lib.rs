@@ -78,6 +78,7 @@ pub mod state;
 pub mod status;
 #[cfg(feature = "templates")]
 pub mod templates;
+pub mod tenant_tokens;
 pub mod topology;
 pub mod transforms;
 #[cfg(feature = "cli-tui")]
@@ -371,6 +372,7 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
             dry_run: false,
             limit: None,
             state_path_override: None,
+            state_scope: Default::default(),
             shard: None,
             auth,
             clock: chrono::Utc::now().fixed_offset(),

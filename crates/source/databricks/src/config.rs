@@ -49,7 +49,11 @@ fn default_batch_size() -> usize {
 /// `{ type, config }` shape, e.g. `auth: { type: pat, config: { token: … } }`.
 /// A shared `auth: { ref: <name> }` provider that yields a `Bearer`/`Token`
 /// credential maps onto [`DatabricksAuth::Token`].
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// Same shape as [`faucet_common_databricks::DatabricksAuth`] (which the sink
+/// uses); kept as this crate's own type so its public API is unchanged, and
+/// converted with `From` where the shared client needs it.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum DatabricksAuth {
     /// Databricks Personal Access Token.
@@ -64,14 +68,35 @@ pub enum DatabricksAuth {
     },
 }
 
+impl std::fmt::Debug for DatabricksAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        faucet_common_databricks::DatabricksAuth::from(self.clone()).fmt(f)
+    }
+}
+
 impl DatabricksAuth {
     /// The `Authorization` header value (`Bearer <token>`).
     pub fn authorization_value(&self) -> String {
-        match self {
-            DatabricksAuth::Pat { token } | DatabricksAuth::Token { token } => {
-                format!("Bearer {token}")
-            }
+        faucet_common_databricks::DatabricksAuth::from(self.clone()).authorization_value()
+    }
+}
+
+impl From<DatabricksAuth> for faucet_common_databricks::DatabricksAuth {
+    fn from(a: DatabricksAuth) -> Self {
+        match a {
+            DatabricksAuth::Pat { token } => Self::Pat { token },
+            DatabricksAuth::Token { token } => Self::Token { token },
         }
+    }
+}
+
+/// The shared-client form of an `auth` field.
+pub(crate) fn shared_auth(
+    auth: &AuthSpec<DatabricksAuth>,
+) -> AuthSpec<faucet_common_databricks::DatabricksAuth> {
+    match auth {
+        AuthSpec::Inline(a) => AuthSpec::Inline(a.clone().into()),
+        AuthSpec::Reference(r) => AuthSpec::Reference(r.clone()),
     }
 }
 
@@ -268,6 +293,17 @@ mod tests {
             .authorization_value(),
             "Bearer xyz"
         );
+        let dbg = format!(
+            "{:?}",
+            DatabricksAuth::Token {
+                token: "xyz".into()
+            }
+        );
+        assert!(!dbg.contains("xyz"));
+        let r = shared_auth(&AuthSpec::Reference(faucet_core::AuthReference {
+            name: "p".into(),
+        }));
+        assert!(matches!(r, AuthSpec::Reference(_)));
     }
 
     #[test]
