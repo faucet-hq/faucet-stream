@@ -162,7 +162,7 @@ Clicking one opens its **versions page** — the release console for that templa
   listing only channels that actually resolve
 - the **launch history**: who blessed which build, and when
 
-![The versions page for orders-by-country: the Health card (unavailable here until the required country param is bound), v3 as newest/staging, v2 as dev, v1 as stable/prod, and the typed trigger form](../assets/console/template-detail.png)
+![The versions page for orders-by-country: the Health card for the launched version (one row, ok, last success, DLQ 0, next run resumes from a full snapshot), v3 as newest/staging, v2 as dev, v1 as stable/prod, and the typed trigger form](../assets/console/template-detail.png)
 
 A **source template**'s page adds a **sink template** selector (plus its version
 channel) to the trigger form: the chosen sink's params join the form, tagged
