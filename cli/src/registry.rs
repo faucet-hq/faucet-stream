@@ -1839,6 +1839,18 @@ pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::B
         "azure-blob" => atomicity_of::<faucet_sink_azure_blob::AzureBlobSinkConfig>(config, |c| {
             c.batch_atomicity()
         }),
+        #[cfg(feature = "sink-oracle")]
+        "oracle" => {
+            atomicity_of::<faucet_sink_oracle::OracleSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-dynamodb")]
+        "dynamodb" => atomicity_of::<faucet_sink_dynamodb::DynamoDbSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-databricks")]
+        "databricks" => atomicity_of::<faucet_sink_databricks::DatabricksSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
         _ => None,
     }
 }

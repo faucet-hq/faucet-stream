@@ -153,6 +153,15 @@ impl DynamoDbSink {
         Ok(keys)
     }
 
+    /// [`Self::single_write`] with a request failure reported against the op's
+    /// rows, so a page never loses the outcomes of rows that already landed.
+    async fn single_write_outcome(&self, op: &Op) -> Result<(), String> {
+        match self.single_write(op).await {
+            Ok(result) => result,
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Write one op item-by-item (conditional writes, validation isolation).
     /// `Ok(Err)` is a per-row failure; the outer `Err` a request failure.
     async fn single_write(&self, op: &Op) -> Result<Result<(), String>, FaucetError> {
@@ -247,18 +256,20 @@ impl DynamoDbSink {
                         tracing::debug!(table = %table, error = %message,
                             "dynamodb: batch rejected; isolating rows");
                         for op in pending {
-                            let result = self.single_write(&op).await?;
+                            let result = self.single_write_outcome(&op).await;
                             outcomes.push((op.rows, result));
                         }
                         return Ok(outcomes);
                     }
                     let class = classify_error(code.as_deref());
                     if class == ErrorClass::Fatal || attempt >= retry.max_retries {
-                        return Err(FaucetError::Sink(format!(
+                        let msg = format!(
                             "dynamodb: BatchWriteItem to '{table}' failed after {} attempt(s): \
                              {message}",
                             attempt + 1
-                        )));
+                        );
+                        outcomes.extend(pending.into_iter().map(|op| (op.rows, Err(msg.clone()))));
+                        return Ok(outcomes);
                     }
                     tokio::time::sleep(retry.delay(attempt)).await;
                     attempt += 1;
@@ -273,12 +284,12 @@ impl DynamoDbSink {
         let mut outcomes = Vec::with_capacity(ops.len());
         if self.config.condition_expression.is_some() {
             let mut stream = futures::stream::iter(ops.into_iter().map(|op| async move {
-                let result = self.single_write(&op).await?;
-                Ok::<_, FaucetError>((op.rows, result))
+                let result = self.single_write_outcome(&op).await;
+                (op.rows, result)
             }))
             .buffer_unordered(self.config.concurrency);
             while let Some(r) = stream.next().await {
-                outcomes.push(r?);
+                outcomes.push(r);
             }
             return Ok(outcomes);
         }
@@ -319,6 +330,10 @@ pub(crate) fn classify_single(
 
 #[faucet_core::async_trait]
 impl faucet_core::Sink for DynamoDbSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
@@ -350,8 +365,9 @@ impl faucet_core::Sink for DynamoDbSink {
     /// Per-row outcomes: unkeyed / non-object / oversized rows, items
     /// DynamoDB rejects as invalid, items still unprocessed after the retry
     /// budget and (with `on_condition_failure: fail`) failed conditions come
-    /// back as `Err` rows for the DLQ; a request-level failure is the outer
-    /// `Err`.
+    /// back as `Err` rows for the DLQ, and so does a request that fails for
+    /// good — its rows only, so rows another request committed stay `Ok`. The
+    /// outer `Err` means nothing was sent.
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -611,28 +627,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_failures_propagate() {
+    async fn request_failures_fail_their_rows() {
+        let row_errors = |out: Vec<RowOutcome>| -> Vec<String> {
+            out.into_iter()
+                .map(|o| o.expect_err("every row of a failed request fails").to_string())
+                .collect()
+        };
         let server = MockServer::start().await;
         on(&server, BATCH, err(400, "ResourceNotFoundException"), 1).await;
         on(&server, BATCH, err(500, "InternalServerError"), 10).await;
         let mut cfg = DynamoDbSinkConfig::new("t");
         cfg.retry.max_retries = 1;
         let sink = mock_sink(&server.uri(), cfg);
-        let e = sink
-            .write_batch_partial(&rows())
-            .await
-            .unwrap_err()
-            .to_string();
+        let errs = row_errors(sink.write_batch_partial(&rows()).await.unwrap());
+        assert_eq!(errs.len(), rows().len());
         assert!(
-            e.contains("BatchWriteItem") && e.contains("1 attempt"),
-            "{e}"
+            errs.iter()
+                .all(|e| e.contains("BatchWriteItem") && e.contains("1 attempt")),
+            "{errs:?}"
         );
-        let e = sink
-            .write_batch_partial(&rows())
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("2 attempt"), "{e}");
+        let errs = row_errors(sink.write_batch_partial(&rows()).await.unwrap());
+        assert!(errs.iter().all(|e| e.contains("2 attempt")), "{errs:?}");
+        let e = sink.write_batch(&rows()).await.unwrap_err().to_string();
+        assert!(e.contains("write(s) failed"), "{e}");
     }
 
     #[tokio::test]
@@ -653,7 +670,8 @@ mod tests {
         on(&server, BATCH, err(400, "ValidationException"), 1).await;
         on(&server, PUT, err(400, "ResourceNotFoundException"), 1).await;
         let sink = mock_sink(&server.uri(), DynamoDbSinkConfig::new("t"));
-        assert!(sink.write_batch_partial(&rows()).await.is_err());
+        let out = sink.write_batch_partial(&rows()).await.unwrap();
+        assert!(out.iter().all(|o| o.is_err()), "{out:?}");
     }
 
     #[tokio::test]
@@ -677,7 +695,9 @@ mod tests {
         let server = MockServer::start().await;
         on(&server, DELETE, err(400, "ResourceNotFoundException"), 2).await;
         let sink = mock_sink(&server.uri(), cfg);
-        assert!(sink.write_batch_partial(&rows()).await.is_err());
+        let out = sink.write_batch_partial(&rows()).await.unwrap();
+        assert!(out.iter().all(|o| o.is_err()), "{out:?}");
+        assert!(sink.write_batch(&rows()).await.is_err());
     }
 
     #[tokio::test]

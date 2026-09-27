@@ -135,6 +135,11 @@ impl std::fmt::Debug for OracleSinkConfig {
 }
 
 impl OracleSinkConfig {
+    /// What a failed write leaves behind: every page is one transaction.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::Atomic
+    }
+
     /// An append-mode, `auto_columns` config with defaults elsewhere.
     pub fn new(connection: OracleConnectionConfig, table: impl Into<String>) -> Self {
         Self {
@@ -201,6 +206,17 @@ mod tests {
 
     fn conn() -> OracleConnectionConfig {
         OracleConnectionConfig::new("h", 1521, "S", "u", "p")
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let cfg: OracleSinkConfig = serde_json::from_value(json!({
+            "host": "h", "service_name": "S", "username": "u", "password": "p",
+            "table": "APP.EVENTS"
+        }))
+        .unwrap();
+        assert_eq!(cfg.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        let _ = conn();
     }
 
     #[test]
