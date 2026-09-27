@@ -1551,4 +1551,14 @@ mod tests {
         let json_src = test_source(S3SourceConfig::new("b"));
         assert!(!faucet_core::Source::supports_columnar(&json_src));
     }
+
+    #[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
+    #[test]
+    fn container_formats_never_reach_the_text_parser() {
+        for fmt in [S3FileFormat::Avro, S3FileFormat::Orc] {
+            let source = test_source(S3SourceConfig::new("b").file_format(fmt));
+            let err = source.parse_content("k", "").unwrap_err();
+            assert!(err.to_string().contains("internal error"), "{err}");
+        }
+    }
 }

@@ -741,3 +741,53 @@ async fn read_records_reads_a_path_back_with_defaults() {
     );
     assert!(faucet_source_file::read_records(" ").await.is_err());
 }
+
+#[tokio::test]
+async fn compressed_and_corrupt_parquet_and_unreadable_files() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = arrow::array::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![7]))],
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let gz = write(dir.path(), "a.parquet.gz", &gzip(&buf));
+    assert_eq!(
+        read_all(&FileSource::new(FileSourceConfig::new(gz)).unwrap())
+            .await
+            .unwrap(),
+        vec![json!({"id": 7})]
+    );
+    let bad = write(dir.path(), "bad.parquet", b"not parquet at all");
+    let err = read_all(&FileSource::new(FileSourceConfig::new(bad)).unwrap())
+        .await
+        .unwrap_err();
+    assert!(err.contains("bad.parquet"), "{err}");
+
+    let locked = write(dir.path(), "locked.jsonl", b"{}\n");
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    let res = read_all(&FileSource::new(FileSourceConfig::new(locked.clone())).unwrap()).await;
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    assert!(res.unwrap_err().contains("locked.jsonl"));
+
+    let single = FileSource::new(FileSourceConfig::new(gz_path(&dir))).unwrap();
+    let found = single.discover().await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(
+        found[0].name.ends_with("a.parquet.gz"),
+        "a single-file path names the dataset by its path"
+    );
+}
+
+fn gz_path(dir: &tempfile::TempDir) -> String {
+    dir.path()
+        .join("a.parquet.gz")
+        .to_string_lossy()
+        .into_owned()
+}

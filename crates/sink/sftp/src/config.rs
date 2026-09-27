@@ -343,4 +343,23 @@ mod tests {
         let c: SftpSinkConfig = serde_json::from_value(serde_json::json!({"host": "sftp.example.com", "username": "user", "type": "password", "config": {"password": "secret"}, "path": "/upload"})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
+
+    #[cfg(feature = "file-format-avro")]
+    #[test]
+    fn the_avro_block_reaches_the_encoder() {
+        let cfg = SftpSinkConfig::new(
+            faucet_common_sftp::SftpConnectionConfig::with_password("h", "u", "p"),
+            "/d",
+        )
+        .format(SftpSinkFormat::Avro)
+        .avro(faucet_core::AvroOptions {
+            schema: None,
+            codec: faucet_core::AvroCodec::Snappy,
+        });
+        assert_eq!(cfg.format.shared(), faucet_core::FileFormat::Avro);
+        assert_eq!(
+            cfg.format_options().avro.codec,
+            faucet_core::AvroCodec::Snappy
+        );
+    }
 }

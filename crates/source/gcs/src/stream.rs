@@ -1469,4 +1469,13 @@ mod tests {
             decode_parquet_bytes(bytes::Bytes::from_static(b"nope"), "bad.parquet").unwrap_err();
         assert!(matches!(err, FaucetError::Source(_)));
     }
+
+    #[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
+    #[test]
+    fn container_formats_never_reach_the_text_parser() {
+        for fmt in [GcsFileFormat::Avro, GcsFileFormat::Orc] {
+            let err = parse_file_content(&fmt, "k", "").unwrap_err();
+            assert!(err.to_string().contains("internal error"), "{err}");
+        }
+    }
 }

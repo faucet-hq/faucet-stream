@@ -1593,12 +1593,11 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
         #[cfg(feature = "source-sftp")]
         "sftp" => check::<faucet_source_sftp::SftpSourceConfig>("sftp", name, config),
         #[cfg(feature = "source-file")]
-        "file" => check_with::<faucet_source_file::FileSourceConfig, _, _>(
-            "file",
-            name,
-            config,
-            |c| c.validate(),
-        ),
+        "file" => {
+            check_with::<faucet_source_file::FileSourceConfig, _, _>("file", name, config, |c| {
+                c.validate()
+            })
+        }
         #[cfg(feature = "source-s3")]
         "s3" => check::<faucet_source_s3::S3SourceConfig>("s3", name, config),
         #[cfg(feature = "source-mongodb")]

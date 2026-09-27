@@ -503,4 +503,21 @@ mod tests {
             serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "p/"})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
+
+    #[cfg(feature = "file-format-avro")]
+    #[test]
+    fn the_avro_block_reaches_the_encoder() {
+        let cfg =
+            GcsSinkConfig::new("b")
+                .format(GcsSinkFormat::Avro)
+                .avro(faucet_core::AvroOptions {
+                    schema: None,
+                    codec: faucet_core::AvroCodec::Snappy,
+                });
+        assert_eq!(cfg.format.shared(), Some(faucet_core::FileFormat::Avro));
+        assert_eq!(
+            cfg.format_options().avro.codec,
+            faucet_core::AvroCodec::Snappy
+        );
+    }
 }

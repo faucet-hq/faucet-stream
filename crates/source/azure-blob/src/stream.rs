@@ -941,4 +941,13 @@ mod tests {
         assert_eq!(source.connector_name(), "azure-blob");
         assert_eq!(source.dataset_uri(), "az://c");
     }
+
+    #[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
+    #[test]
+    fn container_formats_never_reach_the_text_parser() {
+        for fmt in [AzureFileFormat::Avro, AzureFileFormat::Orc] {
+            let err = parse_file_content(&fmt, "k", "").unwrap_err();
+            assert!(err.to_string().contains("internal error"), "{err}");
+        }
+    }
 }

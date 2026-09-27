@@ -1,7 +1,11 @@
 //! The file source through the CLI config layer (#720): a JSON Lines file
 //! written by one pipeline is the input of the next, and incremental mode
 //! reads only a newly added file on the second run.
-#![cfg(all(feature = "source-file", feature = "source-csv", feature = "sink-jsonl"))]
+#![cfg(all(
+    feature = "source-file",
+    feature = "source-csv",
+    feature = "sink-jsonl"
+))]
 
 use std::fs;
 
@@ -47,5 +51,45 @@ async fn incremental_runs_read_only_new_files() {
     fs::write(dir.path().join("inbox/b.jsonl"), "{\"n\":2}\n").unwrap();
     faucet_cli::run_from_yaml_str(&yaml).await.unwrap();
     let got = lines(&dir.path().join("out.jsonl"));
-    assert_eq!(got, vec![serde_json::json!({"n": 1}), serde_json::json!({"n": 2})]);
+    assert_eq!(
+        got,
+        vec![serde_json::json!({"n": 1}), serde_json::json!({"n": 2})]
+    );
+}
+
+#[test]
+fn the_registry_knows_the_file_source() {
+    use faucet_cli::registry;
+    assert!(
+        registry::validate_source_config("file", "row", serde_json::json!({"path": "in/"})).is_ok()
+    );
+    assert!(
+        registry::validate_source_config("file", "row", serde_json::json!({"path": " "})).is_err()
+    );
+    assert!(
+        registry::source_descriptions()
+            .iter()
+            .any(|(k, _)| *k == "file")
+    );
+    assert!(
+        registry::source_schema("file").unwrap()["properties"]
+            .get("path")
+            .is_some()
+    );
+    assert!(registry::source_supports_discover("file"));
+}
+
+#[tokio::test]
+async fn discover_refuses_a_source_without_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("c.yaml");
+    fs::write(
+        &p,
+        "version: 1\nname: d\npipeline:\n  source:\n    type: csv\n    config: { path: x.csv }\n  sink:\n    type: jsonl\n    config: { path: y.jsonl }\n",
+    )
+    .unwrap();
+    use clap::Parser;
+    let args = faucet_cli::cli::DiscoverArgs::parse_from(["discover", p.to_str().unwrap()]);
+    let err = faucet_cli::commands::discover::run(args).await.unwrap_err();
+    assert!(err.to_string().contains("the `file` source"), "{err}");
 }

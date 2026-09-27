@@ -429,4 +429,20 @@ mod tests {
         let c: AzureBlobSinkConfig = serde_json::from_value(serde_json::json!({"container": "c", "account": "a", "prefix": "p/", "auth": {"type": "sas_token", "config": {"sas_token": "sv=x"}}})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
+
+    #[cfg(feature = "file-format-avro")]
+    #[test]
+    fn the_avro_block_reaches_the_encoder() {
+        let cfg = AzureBlobSinkConfig::new("c")
+            .format(AzureSinkFormat::Avro)
+            .avro(faucet_core::AvroOptions {
+                schema: None,
+                codec: faucet_core::AvroCodec::Snappy,
+            });
+        assert_eq!(cfg.format.shared(), faucet_core::FileFormat::Avro);
+        assert_eq!(
+            cfg.format_options().avro.codec,
+            faucet_core::AvroCodec::Snappy
+        );
+    }
 }

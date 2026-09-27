@@ -299,6 +299,14 @@ mod tests {
             vec![c("b", 2)],
             "a tie at the watermark is still new"
         );
+        let tied = advance(bm.clone(), IncrementalBy::Mtime, &c("b", 2)).unwrap();
+        assert_eq!(
+            tied,
+            Bookmark::Mtime {
+                mtime_ns: 2,
+                paths: vec!["a".into(), "b".into()]
+            }
+        );
         let older = advance(bm, IncrementalBy::Mtime, &c("q", 1)).unwrap();
         assert_eq!(
             older,
