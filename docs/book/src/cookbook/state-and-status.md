@@ -84,7 +84,7 @@ What each row reports:
 - **lag** — how far the source is behind its head
   ([#733](https://github.com/faucet-hq/faucet-stream/issues/733)): unread
   Postgres WAL or MySQL binlog, unconsumed Kafka messages, the age of the oldest
-  unread MongoDB / SQL Server / Kinesis change. The value the source reported
+  unread MongoDB / SQL Server / Oracle / Kinesis / DynamoDB Streams change. The value the source reported
   when the last run ended is kept on the status marker; `--probe` asks the
   source again now, from the stored bookmark (the gauge between scheduled runs
   is stale). `—` for sources without a head. A `max_lag_*`

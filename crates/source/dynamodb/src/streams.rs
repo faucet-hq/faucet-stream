@@ -118,8 +118,13 @@ pub(crate) enum ShardEvent {
         shard_id: String,
         records: Vec<(String, Value)>,
     },
-    /// The shard is still open: requeue it after `delay`.
-    Yielded { lease: Lease, delay: Duration },
+    /// The shard is still open: requeue it after `delay`. `caught_up` when
+    /// its last `GetRecords` came back empty.
+    Yielded {
+        lease: Lease,
+        delay: Duration,
+        caught_up: bool,
+    },
     /// Closed shard fully drained.
     Done { shard_id: String },
     /// Unrecoverable failure.
@@ -166,6 +171,7 @@ pub(crate) async fn read_slice(
                 .send(ShardEvent::Yielded {
                     lease,
                     delay: Duration::ZERO,
+                    caught_up: false,
                 })
                 .await;
             return;
@@ -209,7 +215,13 @@ pub(crate) async fn read_slice(
                 lease.iterator = out.next_shard_iterator().map(str::to_string);
                 if empty && lease.iterator.is_some() {
                     let delay = config.poll_interval();
-                    let _ = tx.send(ShardEvent::Yielded { lease, delay }).await;
+                    let _ = tx
+                        .send(ShardEvent::Yielded {
+                            lease,
+                            delay,
+                            caught_up: true,
+                        })
+                        .await;
                     return;
                 }
             }
@@ -247,7 +259,13 @@ pub(crate) async fn read_slice(
                             .delay(lease.throttles)
                             .min(MAX_THROTTLE_BACKOFF);
                         lease.throttles = lease.throttles.saturating_add(1);
-                        let _ = tx.send(ShardEvent::Yielded { lease, delay }).await;
+                        let _ = tx
+                            .send(ShardEvent::Yielded {
+                                lease,
+                                delay,
+                                caught_up: false,
+                            })
+                            .await;
                         return;
                     }
                     ErrorClass::Transient if attempts < config.retry.max_retries => {
@@ -500,6 +518,43 @@ mod tests {
         on(&server, ITER, err(400, "AccessDeniedException"), 1).await;
         on(&server, RECORDS, err(400, "ExpiredIteratorException"), 1).await;
         assert!(failed(&run(&server, cfg()).await).contains("GetShardIterator"));
+    }
+
+    #[tokio::test]
+    async fn yields_flag_whether_the_shard_is_caught_up() {
+        let first_yield = |server: MockServer, config: DynamoDbSourceConfig| async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            read_slice(
+                streams(&server.uri()),
+                config,
+                "arn".into(),
+                Lease::new("s1", StartAt::Latest),
+                tx,
+            )
+            .await;
+            let mut flag = None;
+            while let Ok(ev) = rx.try_recv() {
+                if let ShardEvent::Yielded { caught_up, .. } = ev {
+                    flag = Some(caught_up);
+                }
+            }
+            flag
+        };
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(
+            &server,
+            RECORDS,
+            ok(json!({"Records": [], "NextShardIterator": "it"})),
+            1,
+        )
+        .await;
+        assert_eq!(first_yield(server, cfg()).await, Some(true));
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(&server, RECORDS, err(400, "LimitExceededException"), 1).await;
+        assert_eq!(first_yield(server, cfg()).await, Some(false));
     }
 
     #[tokio::test]

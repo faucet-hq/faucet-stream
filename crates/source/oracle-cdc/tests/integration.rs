@@ -124,6 +124,7 @@ async fn oracle_logminer_cdc_end_to_end() {
         "{}",
         source.dataset_uri()
     );
+    assert_eq!(source.lag().await.unwrap(), None, "no position yet");
     let anchor = source
         .capture_resume_position()
         .await
@@ -168,7 +169,21 @@ async fn oracle_logminer_cdc_end_to_end() {
     .await;
 
     source.apply_start_bookmark(anchor.clone()).await.unwrap();
+    let behind = source.lag().await.unwrap().expect("lag behind the anchor");
+    assert!(behind.seconds.is_some() && behind.bytes.is_none() && behind.events.is_none());
     let (records, bookmark, pages) = drain(&source).await;
+    let after = source.lag().await.unwrap().expect("lag after capture");
+    assert!(after.seconds.unwrap() < 600.0, "{after:?}");
+    let ancient = OracleCdcSource::new(cfg(&conn)).await.expect("source");
+    ancient
+        .apply_start_bookmark(json!({"commit_scn": 1, "restart_scn": 1, "committed_xids": []}))
+        .await
+        .unwrap();
+    assert_eq!(
+        ancient.lag().await.unwrap(),
+        None,
+        "unmapped SCN reports no lag"
+    );
     assert_eq!(
         dml_ops(&records),
         vec!["i:1", "i:2", "u:1", "d:2", "i:3", "i:4"],

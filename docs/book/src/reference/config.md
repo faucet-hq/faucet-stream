@@ -1017,7 +1017,7 @@ sla:
 | `volume_anomaly.window` | int | `20` | Rolling window of successful-run volumes kept as the baseline (≥ `min_history`). |
 | `max_lag_bytes` | int | — | Maximum source lag in bytes — unread Postgres WAL or MySQL binlog (#733). |
 | `max_lag_events` | int | — | Maximum source lag in events — unconsumed Kafka messages, SQL Server change transactions. |
-| `max_lag_seconds` | int | — | Maximum age of the oldest change the source has not delivered — MongoDB, SQL Server, Kinesis. |
+| `max_lag_seconds` | int | — | Maximum age of the oldest change the source has not delivered — MongoDB, SQL Server, Oracle, Kinesis, DynamoDB Streams. |
 
 The `max_lag_*` thresholds are checked against the lag the source reports when
 each run ends (`kind="lag"` on the violations counter), by `faucet status`

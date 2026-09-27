@@ -630,7 +630,10 @@ mod tests {
     async fn request_failures_fail_their_rows() {
         let row_errors = |out: Vec<RowOutcome>| -> Vec<String> {
             out.into_iter()
-                .map(|o| o.expect_err("every row of a failed request fails").to_string())
+                .map(|o| {
+                    o.expect_err("every row of a failed request fails")
+                        .to_string()
+                })
                 .collect()
         };
         let server = MockServer::start().await;

@@ -795,7 +795,7 @@ asks each `write_mode: overwrite` row's sink whether its `…__faucet_ovw` stagi
 object exists (`present` / `absent` / `unknown`; without `--probe` a failed
 overwrite run is reported as an *unverified* `unknown`), and asks each
 lag-reporting source (`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`,
-`kafka`, `kinesis`) how far behind its head the stored bookmark is — without
+`oracle-cdc`, `kafka`, `kinesis`, `dynamodb` streams) how far behind its head the stored bookmark is — without
 `--probe` the **lag** column shows what the source reported when the last run
 ended. The `batches` field (and a detail line when not all committed) says how
 the last run's sink writes ended (#737).

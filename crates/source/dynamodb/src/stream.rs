@@ -5,6 +5,7 @@
 
 use crate::config::{DynamoDbSourceConfig, OnGap, ReadMode};
 use crate::envelope::snapshot_envelope;
+use crate::lag::{LagTracker, now_ms};
 use crate::lineage::{Planner, capture_bookmark, detect_gaps, ids_and_parents, start_for};
 use crate::scan::{ScanEvent, expressions, run_segment};
 use crate::sched::Scheduler;
@@ -30,6 +31,7 @@ pub struct DynamoDbSource {
     streams: StreamsClient,
     start_bookmark: Mutex<Option<Value>>,
     shard: Mutex<Option<(u32, u32)>>,
+    lag: Mutex<LagTracker>,
 }
 
 /// Parse a `{segment, total_segments}` shard descriptor. Pure.
@@ -95,6 +97,7 @@ impl DynamoDbSource {
             streams,
             start_bookmark: Mutex::new(None),
             shard: Mutex::new(None),
+            lag: Mutex::new(LagTracker::default()),
         })
     }
 
@@ -240,9 +243,16 @@ impl DynamoDbSource {
         })
     }
 
+    fn with_lag(&self, f: impl FnOnce(&mut LagTracker)) {
+        if let Ok(mut t) = self.lag.lock() {
+            f(&mut t);
+        }
+    }
+
     fn cdc_stream<'a>(&'a self) -> PageStream<'a> {
         let chunk = chunk_size(self.config.batch_size);
         Box::pin(async_stream::try_stream! {
+            self.with_lag(|t| *t = LagTracker::default());
             let arn = self.resolve_stream_arn().await?;
             let described = describe_shards(&self.streams, &arn).await?;
             let mut bm = self
@@ -345,6 +355,9 @@ impl DynamoDbSource {
                 match event {
                     Some(ShardEvent::Records { shard_id, records }) => {
                         last_record = Instant::now();
+                        if let Some(ts) = records.iter().filter_map(|(_, r)| r["ts_ms"].as_i64()).max() {
+                            self.with_lag(|t| t.observe(&shard_id, ts));
+                        }
                         for (sequence, record) in records {
                             buffer.push(record);
                             total += 1;
@@ -364,10 +377,14 @@ impl DynamoDbSource {
                             }
                         }
                     }
-                    Some(ShardEvent::Yielded { lease, delay }) => {
+                    Some(ShardEvent::Yielded { lease, delay, caught_up }) => {
+                        if caught_up {
+                            self.with_lag(|t| t.caught_up(&lease.shard_id));
+                        }
                         sched.yielded(lease, Instant::now() + delay);
                     }
                     Some(ShardEvent::Done { shard_id }) => {
+                        self.with_lag(|t| t.close(&shard_id));
                         bm.finish(&shard_id);
                         sched.finished(&shard_id);
                         if !sched.planner().has_children(&shard_id) {
@@ -462,6 +479,16 @@ impl faucet_core::Source for DynamoDbSource {
         let arn = self.resolve_stream_arn().await?;
         let described = describe_shards(&self.streams, &arn).await?;
         Ok(Some(capture_bookmark(&arn, &described).to_value()))
+    }
+
+    /// Streams mode: now minus the creation time of the newest record read
+    /// from each open shard, the largest across shards; a shard whose last
+    /// read was empty counts as caught up. Other modes: `None`.
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        if self.config.mode != ReadMode::Streams {
+            return Ok(None);
+        }
+        Ok(self.lag.lock().ok().and_then(|t| t.lag(now_ms())))
     }
 
     fn is_shardable(&self) -> bool {
@@ -782,6 +809,7 @@ mod tests {
             streams: streams(uri),
             start_bookmark: Mutex::new(None),
             shard: Mutex::new(None),
+            lag: Mutex::new(LagTracker::default()),
         }
     }
 
@@ -874,7 +902,8 @@ mod tests {
             .mount(server)
             .await;
         let mut page = json!({"Records": [{"eventID": id, "eventName": "INSERT", "dynamodb": {
-            "Keys": {"pk": {"S": id}}, "NewImage": {"pk": {"S": id}}, "SequenceNumber": "1"}}]});
+            "Keys": {"pk": {"S": id}}, "NewImage": {"pk": {"S": id}}, "SequenceNumber": "1",
+            "ApproximateCreationDateTime": 1_000_000_000}}]});
         if open {
             page["NextShardIterator"] = json!(format!("it-{id}"));
         }
@@ -928,6 +957,8 @@ mod tests {
             let n = records.iter().filter(|r| r["shard_id"] == id).count();
             assert!(n >= 8, "shard {id} starved: {n} records");
         }
+        let lag = source.lag().await.unwrap().expect("busy shards report lag");
+        assert!(lag.seconds.unwrap() > 1.0e8, "{lag:?}");
     }
 
     #[tokio::test]
@@ -971,11 +1002,23 @@ mod tests {
         cfg.max_messages = None;
         cfg.idle_termination_secs = Some(1);
         let source = mock_source(&server.uri(), cfg.clone());
+        assert_eq!(source.lag().await.unwrap(), None);
         assert!(source.fetch_all().await.unwrap().is_empty());
+        assert_eq!(
+            source.lag().await.unwrap(),
+            Some(faucet_core::SourceLag::seconds(0.0))
+        );
 
         let server = MockServer::start().await;
         mock_stream(&server, json!([])).await;
         let source = mock_source(&server.uri(), cfg);
         assert!(source.fetch_all().await.unwrap().is_empty());
+        assert_eq!(source.lag().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn scan_mode_reports_no_lag() {
+        let source = offline(DynamoDbSourceConfig::new("t")).await;
+        assert_eq!(source.lag().await.unwrap(), None);
     }
 }

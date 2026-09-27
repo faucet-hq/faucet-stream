@@ -102,6 +102,18 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
 - **Delivery** — at-least-once (`supports_exactly_once` is `false`, like the
   Kinesis source). Pair with an upsert sink keyed on the table key.
 
+## Source lag
+
+In `mode: streams`, `Source::lag` (#733) reports **seconds**: now minus the
+`ApproximateCreationDateTime` of the newest record read from each open shard,
+the largest across shards. DynamoDB Streams exposes no head position, so a
+shard whose last `GetRecords` came back empty counts as caught up (zero) rather
+than aging while quiet, and nothing is reported until this run has read a shard
+(so `faucet status --probe` shows no lag for a streams row). The pipeline polls
+it on the first page, at most every 15 s after, and when the run ends,
+exporting `faucet_source_lag_seconds{pipeline,row,connector}`; `sla.max_lag_seconds`
+turns the end-of-run value into an SLA. `scan` and `query` modes report no lag.
+
 ## Discovery and preflight
 
 `discover()` lists tables (`ListTables` + `DescribeTable`): one descriptor per

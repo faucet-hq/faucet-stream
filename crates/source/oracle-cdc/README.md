@@ -97,6 +97,19 @@ Transactions committed below `commit_scn`, or at it and listed in `committed_xid
 - **Dictionary mismatch** — mining uses the current data dictionary (`DICT_FROM_ONLINE_CATALOG`). Redo written *before* a DDL on a captured table cannot be rendered after it; if a restart has to re-mine such redo the run fails (or skips, with `on_unsupported: skip`). Mining near real time avoids this; after DDL during downtime, re-snapshot the table.
 - **Unsupported changes** (`UNSUPPORTED` operations, types LogMiner cannot render) fail by default.
 
+## Source lag
+
+`Source::lag` (#733) reports **seconds**: the commit time of the database's
+current SCN minus that of the captured `commit_scn` (this run's last emitted
+bookmark, else the applied start bookmark), via `SCN_TO_TIMESTAMP`. SCN
+distances are not event counts, so no `events` or `bytes` are reported. When
+the position is older than the database's SCN-to-time mapping (ORA-08181) no
+lag is reported. The pipeline polls it on the first page, at most every 15 s
+after, and when the run ends, exporting `faucet_source_lag_seconds{pipeline,row,connector}`;
+`faucet status --probe` and `faucet doctor` ask it from the stored bookmark,
+and `sla.max_lag_seconds` turns it into an SLA. A failing lag query is logged
+once and reported as no lag — it never fails a run.
+
 ## Mirroring
 
 Pair with `cdc_unwrap` and an upsert-capable sink (`write_mode: upsert`, `delete_marker: { field: __op, values: [d] }`). For an initial load, `faucet mirror` captures `capture_resume_position()` before bulk-copying with the `oracle` query source, then streams changes from that SCN.

@@ -82,7 +82,7 @@ that into an SLA:
 sla:
   max_lag_bytes: 1073741824   # Postgres slot / MySQL binlog: at most 1 GiB unread
   max_lag_events: 100000      # Kafka: at most 100k unconsumed messages
-  max_lag_seconds: 900        # MongoDB / SQL Server / Kinesis: oldest unread change ≤ 15 min
+  max_lag_seconds: 900        # MongoDB / SQL Server / Oracle / Kinesis / DynamoDB: oldest unread change ≤ 15 min
 ```
 
 | Source | Reports | Measured as |
@@ -93,6 +93,8 @@ sla:
 | `mongodb-cdc` | seconds | the cluster's `operationTime` minus the time of the oldest undelivered change |
 | `kafka` | events | each partition's high watermark minus the next offset to read, summed |
 | `kinesis` | seconds | `MillisBehindLatest` from `GetRecords`, worst shard |
+| `oracle-cdc` | seconds | commit time of the current SCN minus that of the captured `commit_scn` (`SCN_TO_TIMESTAMP`); nothing when the position is older than the SCN-to-time mapping (ORA-08181) |
+| `dynamodb` (`mode: streams`) | seconds | now minus the `ApproximateCreationDateTime` of the newest record read from each open shard, worst shard; a shard whose last read was empty counts as caught up. Reported only once this run has read a shard, so `--probe` shows none |
 
 The pipeline asks on the first page, at most every 15 s while pages flow, and
 once when the run ends; the gauges `faucet_source_lag_bytes`,

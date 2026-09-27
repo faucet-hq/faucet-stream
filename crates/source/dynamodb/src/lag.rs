@@ -1,0 +1,93 @@
+//! Streams-mode source lag (#733): the age of the newest record each open
+//! shard has handed to the pipeline. DynamoDB Streams exposes no head
+//! position, so a shard that returned an empty `GetRecords` counts as
+//! caught up (zero) rather than aging while it is quiet.
+
+use std::collections::HashMap;
+
+use faucet_core::SourceLag;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ShardLag {
+    Behind(i64),
+    CaughtUp,
+}
+
+/// Per-shard lag state for one streams run. Pure.
+#[derive(Debug, Default)]
+pub(crate) struct LagTracker {
+    shards: HashMap<String, ShardLag>,
+}
+
+impl LagTracker {
+    /// A record created at `ts_ms` was read from `shard`.
+    pub(crate) fn observe(&mut self, shard: &str, ts_ms: i64) {
+        let next = match self.shards.get(shard) {
+            Some(ShardLag::Behind(prev)) => ShardLag::Behind((*prev).max(ts_ms)),
+            _ => ShardLag::Behind(ts_ms),
+        };
+        self.shards.insert(shard.to_string(), next);
+    }
+
+    /// `shard` returned no records: nothing is waiting on it.
+    pub(crate) fn caught_up(&mut self, shard: &str) {
+        self.shards.insert(shard.to_string(), ShardLag::CaughtUp);
+    }
+
+    /// `shard` is closed and drained.
+    pub(crate) fn close(&mut self, shard: &str) {
+        self.shards.remove(shard);
+    }
+
+    /// The largest lag across open shards at `now_ms`, or `None` before any
+    /// shard has reported.
+    pub(crate) fn lag(&self, now_ms: i64) -> Option<SourceLag> {
+        self.shards
+            .values()
+            .map(|s| match s {
+                ShardLag::Behind(ts) => (now_ms - ts) as f64 / 1000.0,
+                ShardLag::CaughtUp => 0.0,
+            })
+            .reduce(f64::max)
+            .map(SourceLag::seconds)
+    }
+}
+
+/// Milliseconds since the Unix epoch.
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_the_largest_open_shard_lag() {
+        let mut t = LagTracker::default();
+        assert_eq!(t.lag(10_000), None);
+        t.observe("a", 4_000);
+        t.observe("a", 2_000);
+        t.observe("b", 1_000);
+        assert_eq!(t.lag(10_000), Some(SourceLag::seconds(9.0)));
+        t.caught_up("b");
+        assert_eq!(t.lag(10_000), Some(SourceLag::seconds(6.0)));
+        t.close("a");
+        assert_eq!(t.lag(10_000), Some(SourceLag::seconds(0.0)));
+        t.observe("b", 9_500);
+        assert_eq!(t.lag(10_000), Some(SourceLag::seconds(0.5)));
+        t.close("b");
+        assert_eq!(t.lag(10_000), None);
+    }
+
+    #[test]
+    fn clock_skew_clamps_to_zero() {
+        let mut t = LagTracker::default();
+        t.observe("a", 20_000);
+        assert_eq!(t.lag(10_000), Some(SourceLag::seconds(0.0)));
+        assert!(now_ms() > 1_700_000_000_000);
+    }
+}

@@ -211,9 +211,13 @@ async fn streams_cdc_captures_changes_and_resumes() {
         .unwrap();
     assert_eq!(report.failed_count(), 0, "{report:?}");
 
+    assert_eq!(source.lag().await.unwrap(), None);
     let (records, bookmarks) = drain(&source).await;
     let ops: Vec<&str> = records.iter().map(|r| r["op"].as_str().unwrap()).collect();
     assert_eq!(ops, vec!["c", "c", "c", "u", "d"]);
+    let lag = source.lag().await.unwrap().expect("streams lag");
+    let secs = lag.seconds.expect("seconds");
+    assert!((0.0..3600.0).contains(&secs), "{lag:?}");
     assert_eq!(records[3]["before"]["qty"], 1);
     assert_eq!(records[3]["after"]["qty"], 10);
     assert_eq!(records[4]["before"]["pk"], "o2");
