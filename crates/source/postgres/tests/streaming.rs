@@ -490,6 +490,9 @@ async fn discover_enumerates_tables_with_schemas() {
         r#"SELECT * FROM "public"."orders""#
     );
     assert_eq!(orders.estimated_rows, Some(50), "reltuples after ANALYZE");
+    assert_eq!(orders.primary_key, Some(vec!["id".to_string()]));
+    let leads = datasets.iter().find(|d| d.name == "sales.leads").unwrap();
+    assert_eq!(leads.primary_key, None, "no PRIMARY KEY declared");
     let schema = orders.schema.as_ref().expect("schema");
     assert_eq!(schema["properties"]["id"]["type"], "integer");
     assert_eq!(

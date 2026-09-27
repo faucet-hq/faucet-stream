@@ -349,7 +349,8 @@ fn descriptor_for_collection(
         name,
         "collection",
         serde_json::json!({ "collection": name }),
-    );
+    )
+    .with_primary_key(vec!["_id".to_string()]);
     if !sample.is_empty() {
         descriptor = descriptor.with_schema(faucet_core::schema::infer_schema(sample));
     }
@@ -595,6 +596,7 @@ mod tests {
             json!({"id": 2, "name": "beta"}),
         ];
         let d = descriptor_for_collection("orders", &sample, Some(120));
+        assert_eq!(d.primary_key, Some(vec!["_id".to_string()]));
         assert_eq!(d.name, "orders");
         assert_eq!(d.kind, "collection");
         assert_eq!(d.config_patch, json!({"collection": "orders"}));

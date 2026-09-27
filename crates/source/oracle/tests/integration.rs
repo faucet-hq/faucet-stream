@@ -155,6 +155,7 @@ async fn oracle_query_source_end_to_end() {
         .find(|d| d.name == "FAUCET.T_TYPES")
         .expect("T_TYPES discovered");
     assert_eq!(t.config_patch["json_columns"], json!(["DOC"]));
+    assert_eq!(t.primary_key, Some(vec!["ID".to_string()]));
     assert_eq!(
         t.schema.as_ref().unwrap()["properties"]["ID"]["type"],
         "integer"

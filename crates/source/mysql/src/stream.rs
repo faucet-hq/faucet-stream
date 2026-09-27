@@ -435,7 +435,22 @@ impl faucet_core::Source for MysqlSource {
             })
             .collect::<Result<_, _>>()?;
 
-        Ok(descriptors_from_catalog(catalog))
+        let key_sql = "\
+            SELECT CAST(table_name AS CHAR) AS table_name, \
+                   CAST(column_name AS CHAR) AS column_name \
+              FROM information_schema.key_column_usage \
+             WHERE table_schema = DATABASE() AND constraint_name = 'PRIMARY' \
+             ORDER BY table_name, ordinal_position";
+        let keys: Vec<(String, String)> = sqlx::query_as(key_sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("mysql: primary-key discovery failed: {e}"))
+            })?;
+        Ok(faucet_core::attach_primary_keys(
+            descriptors_from_catalog(catalog),
+            keys,
+        ))
     }
 
     /// Shardable when a [`ShardConfig`](crate::config::ShardConfig) is set.

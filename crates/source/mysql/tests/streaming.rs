@@ -579,6 +579,15 @@ async fn discover_enumerates_tables_with_schemas() {
         .iter()
         .find(|d| d.name == "orders")
         .expect("orders dataset");
+    assert_eq!(orders.primary_key, Some(vec!["id".to_string()]));
+    assert_eq!(
+        datasets
+            .iter()
+            .find(|d| d.name == "leads")
+            .unwrap()
+            .primary_key,
+        None
+    );
     assert_eq!(orders.kind, "table");
     assert_eq!(orders.config_patch["query"], "SELECT * FROM `orders`");
     // InnoDB's table_rows is approximate; after ANALYZE on a 5-row table it

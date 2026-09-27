@@ -433,7 +433,27 @@ impl faucet_core::Source for PostgresSource {
             })
             .collect::<Result<_, _>>()?;
 
-        Ok(descriptors_from_catalog(catalog, quote_ident))
+        let key_sql = r#"
+            SELECT tc.table_schema || '.' || tc.table_name AS name, k.column_name
+              FROM information_schema.table_constraints tc
+              JOIN information_schema.key_column_usage k
+                ON k.constraint_schema = tc.constraint_schema
+               AND k.constraint_name = tc.constraint_name
+               AND k.table_schema = tc.table_schema
+               AND k.table_name = tc.table_name
+             WHERE tc.constraint_type = 'PRIMARY KEY'
+               AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+             ORDER BY tc.table_schema, tc.table_name, k.ordinal_position"#;
+        let keys: Vec<(String, String)> = sqlx::query_as(key_sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!("postgres: primary-key discovery failed: {e}"))
+            })?;
+        Ok(faucet_core::attach_primary_keys(
+            descriptors_from_catalog(catalog, quote_ident),
+            keys,
+        ))
     }
 
     /// Shardable when a [`ShardConfig`](crate::config::ShardConfig) is set.

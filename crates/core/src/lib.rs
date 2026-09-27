@@ -108,7 +108,10 @@ pub use diff::{
     ContentDigest, Difference, DifferenceKind, DigestAccumulator, KeyRange, Normalizer,
     ServerDigest, VerifyReport, diff_rows, plan_ranges, row_hash,
 };
-pub use discover::{DatasetDescriptor, columns_to_schema, nullable_type, sql_type_to_json_schema};
+pub use discover::{
+    DatasetDescriptor, attach_primary_keys, columns_to_schema, nullable_type,
+    sql_type_to_json_schema,
+};
 pub use dlq::{
     BatchAtomicity, BatchOutcome, BatchOutcomeCounters, BatchOutcomes, DlqConfig, DlqReason,
     DlqStats, EnvelopeError, OnBatchError, UnwrappedEnvelope, build_envelope, check_dlq_all_policy,
