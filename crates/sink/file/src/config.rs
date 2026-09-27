@@ -561,23 +561,15 @@ mod tests {
 
     #[test]
     fn require_feature_reports_missing_builds() {
-        for f in [
-            FileFormat::Csv,
-            FileFormat::Xml,
-            FileFormat::Xlsx,
-            FileFormat::Avro,
-            FileFormat::Parquet,
-            FileFormat::JsonLines,
+        for (f, has) in [
+            (FileFormat::Csv, cfg!(feature = "file-format-csv")),
+            (FileFormat::Xml, cfg!(feature = "file-format-xml")),
+            (FileFormat::Xlsx, cfg!(feature = "file-format-excel")),
+            (FileFormat::Avro, cfg!(feature = "file-format-avro")),
+            (FileFormat::Parquet, cfg!(feature = "file-format-parquet")),
+            (FileFormat::JsonLines, true),
         ] {
             let r = require_feature(f);
-            let has = match f {
-                FileFormat::Csv => cfg!(feature = "file-format-csv"),
-                FileFormat::Xml => cfg!(feature = "file-format-xml"),
-                FileFormat::Xlsx => cfg!(feature = "file-format-excel"),
-                FileFormat::Avro => cfg!(feature = "file-format-avro"),
-                FileFormat::Parquet => cfg!(feature = "file-format-parquet"),
-                _ => true,
-            };
             assert_eq!(r.is_ok(), has, "{f:?}");
         }
     }

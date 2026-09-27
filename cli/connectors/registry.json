@@ -486,6 +486,13 @@
       "description": "SFTP sink; JSONL objects, atomic temp+rename upload"
     },
     {
+      "name": "file",
+      "kind": "sink",
+      "verified": true,
+      "tier": "stable",
+      "description": "Local file sink; JSONL/JSON/CSV/XML/Excel/Avro/Parquet by extension, rollover, atomic temp+rename, atomic overwrite"
+    },
+    {
       "name": "singer",
       "kind": "sink",
       "verified": true,

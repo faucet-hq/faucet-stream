@@ -115,6 +115,7 @@ source = [
 ]
 sink = [
     "sink-bigquery",
+    "sink-file",
     "sink-postgres",
     "sink-jsonl",
     "sink-snowflake",
@@ -230,6 +231,7 @@ sink-kafka = ["dep:faucet-sink-kafka"]
 sink-kinesis = ["dep:faucet-sink-kinesis"]
 sink-spanner = ["dep:faucet-sink-spanner"]
 sink-parquet = ["dep:faucet-sink-parquet"]
+sink-file = ["dep:faucet-sink-file"]
 sink-delta = ["dep:faucet-sink-delta"]
 sink-gcs = ["dep:faucet-sink-gcs"]
 sink-redshift = ["dep:faucet-sink-redshift"]
@@ -290,6 +292,7 @@ file-format-csv = [
     "faucet-sink-gcs?/file-format-csv",
     "faucet-sink-azure-blob?/file-format-csv",
     "faucet-sink-sftp?/file-format-csv",
+    "faucet-sink-file?/file-format-csv",
 ]
 file-format-xml = [
     "faucet-source-s3?/file-format-xml",
@@ -301,6 +304,7 @@ file-format-xml = [
     "faucet-sink-gcs?/file-format-xml",
     "faucet-sink-azure-blob?/file-format-xml",
     "faucet-sink-sftp?/file-format-xml",
+    "faucet-sink-file?/file-format-xml",
 ]
 file-format-excel = [
     "faucet-source-s3?/file-format-excel",
@@ -312,6 +316,7 @@ file-format-excel = [
     "faucet-sink-gcs?/file-format-excel",
     "faucet-sink-azure-blob?/file-format-excel",
     "faucet-sink-sftp?/file-format-excel",
+    "faucet-sink-file?/file-format-excel",
 ]
 file-format-avro = [
     "faucet-source-s3?/file-format-avro",
@@ -323,6 +328,7 @@ file-format-avro = [
     "faucet-sink-gcs?/file-format-avro",
     "faucet-sink-azure-blob?/file-format-avro",
     "faucet-sink-sftp?/file-format-avro",
+    "faucet-sink-file?/file-format-avro",
 ]
 file-format-orc = [
     "faucet-source-s3?/file-format-orc",
@@ -331,7 +337,7 @@ file-format-orc = [
     "faucet-source-sftp?/file-format-orc",
     "faucet-source-file?/file-format-orc",
 ]
-file-format-parquet = ["faucet-source-file?/file-format-parquet"]
+file-format-parquet = ["faucet-source-file?/file-format-parquet", "faucet-sink-file?/file-format-parquet"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
 
 # Mutual-TLS client-certificate auth (#495) on whichever HTTP sources are
@@ -375,6 +381,7 @@ arrow = [
     "faucet-source-azure-blob?/arrow",
     "faucet-source-sftp?/arrow",
     "faucet-source-file?/arrow",
+    "faucet-sink-file?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can
     # reach the BigQuery Parquet load without materializing `Value`.
     "faucet-source-rest?/arrow",
@@ -592,6 +599,7 @@ faucet-sink-kinesis = { workspace = true, optional = true }
 faucet-sink-spanner = { workspace = true, optional = true }
 faucet-sink-stdout = { workspace = true, optional = true }
 faucet-sink-parquet = { workspace = true, optional = true }
+faucet-sink-file = { workspace = true, optional = true }
 faucet-sink-delta = { workspace = true, optional = true }
 faucet-sink-gcs = { workspace = true, optional = true }
 faucet-sink-redshift = { workspace = true, optional = true }

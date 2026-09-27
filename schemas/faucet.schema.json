@@ -23825,6 +23825,137 @@
         },
         {
           "type": "object",
+          "title": "file",
+          "properties": {
+            "type": {
+              "const": "file"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "title": "FileSinkConfig",
+                  "description": "Configuration for the local file sink.",
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "description": "The file to write, as a template. `{part}` is replaced by the rollover\npart number (`00001`, `00002`, …); with a rollover cap and no `{part}`,\n`-{part}` is inserted before the extension. A path ending in `/` is a\ndirectory: files are named `part-{part}` plus the format's extension,\nso `format` must be set. `${now.*}` tokens are resolved by the CLI\nbefore the sink sees the path.",
+                      "type": "string"
+                    },
+                    "format": {
+                      "description": "File format: `auto` (default) resolves from the path's extension,\nlooking through a compression suffix (`.csv.gz` is CSV). ORC is\nread-only and refused.",
+                      "$ref": "#/$defs/sink_file__FileFormatChoice",
+                      "default": "auto"
+                    },
+                    "compression": {
+                      "description": "Compression: `auto` (default) resolves from the suffix (`.gz`, `.zst`).\nNot applicable to Parquet, Avro or Excel, which compress internally.",
+                      "$ref": "#/$defs/sink_file__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "mode": {
+                      "description": "What to do with a file that already exists (default `overwrite`).",
+                      "$ref": "#/$defs/sink_file__FileMode",
+                      "default": "overwrite"
+                    },
+                    "write_mode": {
+                      "description": "`append` (default) or `overwrite` — replace the destination's output\nset atomically when the run succeeds.",
+                      "$ref": "#/$defs/sink_file__FileWriteMode",
+                      "default": "append"
+                    },
+                    "max_records_per_file": {
+                      "description": "Roll to a new file after this many records.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "max_bytes_per_file": {
+                      "description": "Roll to a new file once the current one reaches this many bytes. A\nsingle page larger than the cap still lands in one file.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "create_dirs": {
+                      "description": "Create missing parent directories (default `true`).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "batch_size": {
+                      "description": "Records per upstream page. Informational: the sink writes each page it\nis handed. Defaults to [`DEFAULT_BATCH_SIZE`].",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when the format is CSV.",
+                      "$ref": "#/$defs/sink_file__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet name, used when the format is Excel.",
+                      "$ref": "#/$defs/sink_file__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when the format is XML.",
+                      "$ref": "#/$defs/sink_file__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    },
+                    "avro": {
+                      "description": "Writer schema and block codec, used when the format is Avro.",
+                      "$ref": "#/$defs/sink_file__AvroOptions",
+                      "default": {
+                        "codec": "null"
+                      }
+                    },
+                    "parquet": {
+                      "description": "Column-chunk compression, used when the format is Parquet.",
+                      "$ref": "#/$defs/sink_file__ParquetOptions",
+                      "default": {
+                        "compression": "snappy"
+                      }
+                    }
+                  }
+                },
+                true
+              ]
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "title": "delta",
           "properties": {
             "type": {
@@ -27804,6 +27935,252 @@
           "description": "Snappy with the per-block CRC-32 the spec requires.",
           "type": "string",
           "const": "snappy"
+        },
+        {
+          "description": "Zstandard.",
+          "type": "string",
+          "const": "zstd"
+        }
+      ]
+    },
+    "sink_file__FileFormatChoice": {
+      "description": "Which format a file is in: resolved from its extension (`auto`) or fixed.",
+      "oneOf": [
+        {
+          "description": "Resolve per file from its extension, looking through a compression\nsuffix (`.csv.gz` is CSV): `.jsonl`/`.ndjson`, `.json`, `.csv`, `.xml`,\n`.xlsx`, `.parquet`, `.avro`, `.orc`, `.txt`.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "One JSON value per line.",
+          "type": "string",
+          "const": "json_lines"
+        },
+        {
+          "description": "A JSON array (a lone object is one record).",
+          "type": "string",
+          "const": "json_array"
+        },
+        {
+          "description": "Delimited text; dialect from `csv`.",
+          "type": "string",
+          "const": "csv"
+        },
+        {
+          "description": "XML; record framing from `xml`.",
+          "type": "string",
+          "const": "xml"
+        },
+        {
+          "description": "An Excel workbook; sheet from `excel`.",
+          "type": "string",
+          "const": "xlsx"
+        },
+        {
+          "description": "Apache Parquet.",
+          "type": "string",
+          "const": "parquet"
+        },
+        {
+          "description": "Unparsed text, one record per file.",
+          "type": "string",
+          "const": "raw_text"
+        },
+        {
+          "description": "Apache Avro Object Container File; schema and codec from `avro`.",
+          "type": "string",
+          "const": "avro"
+        },
+        {
+          "description": "Apache ORC (read-only); projection from `orc`.",
+          "type": "string",
+          "const": "orc"
+        }
+      ]
+    },
+    "sink_file__CompressionConfig": {
+      "description": "User-facing compression config. Defaults to [`Auto`](Self::Auto).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "none",
+            "gzip",
+            "zstd"
+          ]
+        },
+        {
+          "description": "Detect from filename suffix: `.gz` → Gzip, `.zst` → Zstd, anything else → None.",
+          "type": "string",
+          "const": "auto"
+        }
+      ]
+    },
+    "sink_file__FileMode": {
+      "description": "What happens when a file this run writes already exists.",
+      "oneOf": [
+        {
+          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
+          "type": "string",
+          "const": "overwrite"
+        },
+        {
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Fail the run instead of touching an existing file.",
+          "type": "string",
+          "const": "error_if_exists"
+        }
+      ]
+    },
+    "sink_file__FileWriteMode": {
+      "description": "Pipeline-level write mode.",
+      "oneOf": [
+        {
+          "description": "Write this run's files; leave everything else in place.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "type": "string",
+          "const": "overwrite"
+        }
+      ]
+    },
+    "sink_file__CsvOptions": {
+      "description": "CSV dialect.",
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "Field separator. A single character; `\"\\t\"` is accepted for tabs.",
+          "type": "string",
+          "default": ","
+        },
+        "has_headers": {
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__ExcelOptions": {
+      "description": "Excel worksheet selection.",
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "description": "Worksheet name, or an index as a string. Default: the first sheet.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header_row": {
+          "description": "0-based row supplying the field names.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__XmlOptions": {
+      "description": "XML record framing.\n\nXML has no canonical record boundary, so one must be declared. On read,\n`record_element` names the repeated element; without it the decoder falls\nback to \"the document's root children\", which is right for the common\n`<rows><row/>…</rows>` shape and wrong often enough that naming the element\nis recommended in the docs.",
+      "type": "object",
+      "properties": {
+        "record_element": {
+          "description": "Element that delimits one record. Read: select these. Write: wrap each\nrecord in one.",
+          "type": "string",
+          "default": "record"
+        },
+        "root_element": {
+          "description": "Document element wrapping the records. Write only.",
+          "type": "string",
+          "default": "records"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__AvroOptions": {
+      "description": "Avro read/write options.",
+      "type": "object",
+      "properties": {
+        "schema": {
+          "description": "An Avro schema (the JSON form: an object, an array for a union, or a\nprimitive name). On a **source** it is the *reader* schema every file\nis resolved against — projection, aliases, defaults for added fields.\nOn a **sink** it is the *writer* schema; without it the schema is\ninferred from the records."
+        },
+        "codec": {
+          "description": "Block codec for written files: `null` (default), `deflate`, `snappy`,\n`zstd`. Reading detects the codec from the file header.",
+          "$ref": "#/$defs/sink_file__AvroCodec",
+          "default": "null"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__AvroCodec": {
+      "description": "Block compression for written files.",
+      "oneOf": [
+        {
+          "description": "Uncompressed blocks — the Avro default and the most portable.",
+          "type": "string",
+          "const": "null"
+        },
+        {
+          "description": "Raw deflate (RFC 1951), readable by every Avro implementation.",
+          "type": "string",
+          "const": "deflate"
+        },
+        {
+          "description": "Snappy with the per-block CRC-32 the spec requires.",
+          "type": "string",
+          "const": "snappy"
+        },
+        {
+          "description": "Zstandard.",
+          "type": "string",
+          "const": "zstd"
+        }
+      ]
+    },
+    "sink_file__ParquetOptions": {
+      "description": "Parquet write options.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_file__ParquetCodec",
+          "default": "snappy"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__ParquetCodec": {
+      "description": "Parquet column-chunk compression.",
+      "oneOf": [
+        {
+          "description": "Uncompressed pages.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Snappy (the default): fast and universally readable.",
+          "type": "string",
+          "const": "snappy"
+        },
+        {
+          "description": "Gzip.",
+          "type": "string",
+          "const": "gzip"
         },
         {
           "description": "Zstandard.",

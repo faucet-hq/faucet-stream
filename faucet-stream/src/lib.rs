@@ -71,6 +71,7 @@
 //! | `sink-kinesis` | AWS Kinesis Data Streams sink |
 //! | `sink-spanner` | Google Cloud Spanner mutation sink |
 //! | `sink-parquet` | Apache Parquet file sink (local, S3) |
+//! | `sink-file` | Local file sink (JSONL, JSON, CSV, XML, Excel, Avro, Parquet; rollover, atomic finalisation) |
 //! | `encryption` | AES-256-GCM at-rest sealing for file state-store bookmarks and per-line JSONL/DLQ output |
 //! | `sink-dynamodb` | Amazon DynamoDB sink (batched writes, upsert/delete) |
 //! | `sink-oracle` | Oracle Database sink (upsert/overwrite, exactly-once; needs Oracle Instant Client at runtime) |
@@ -665,6 +666,11 @@ pub mod sink {
     #[cfg(feature = "sink-parquet")]
     pub mod parquet {
         pub use faucet_sink_parquet::*;
+    }
+
+    #[cfg(feature = "sink-file")]
+    pub mod file {
+        pub use faucet_sink_file::*;
     }
 
     #[cfg(feature = "sink-delta")]

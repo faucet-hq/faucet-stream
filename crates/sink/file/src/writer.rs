@@ -24,17 +24,17 @@ type LineWriter = SyncCompressWriter<BufWriter<File>>;
 enum Enc {
     /// JSON Lines and raw text: encoded bytes streamed through the codec.
     /// `None` once finalised — the data then lives in the final file.
-    Lines(Option<LineWriter>),
+    Lines(Option<Box<LineWriter>>),
     /// CSV: rows in an uncompressed body file; the header is prepended when
     /// the file is finalised, so a later record can still add a column.
     #[cfg(feature = "file-format-csv")]
-    Csv(CsvState),
+    Csv(Box<CsvState>),
     /// Whole-document formats (JSON array, XML, Excel, Avro): the file's
     /// records, encoded together at each finalisation.
     Doc(Vec<Value>),
     /// Parquet row groups streamed to the temporary file.
     #[cfg(feature = "file-format-parquet")]
-    Parquet(crate::parquet::ParquetState),
+    Parquet(Box<crate::parquet::ParquetState>),
 }
 
 /// One output file in progress.
@@ -77,10 +77,10 @@ impl OpenFile {
             FileFormat::Csv => {
                 let (state, carried) = CsvState::create(ctx, &file.final_path, resume)?;
                 file.records = carried;
-                Enc::Csv(state)
+                Enc::Csv(Box::new(state))
             }
             #[cfg(feature = "file-format-parquet")]
-            FileFormat::Parquet => Enc::Parquet(crate::parquet::ParquetState::new()),
+            FileFormat::Parquet => Enc::Parquet(Box::new(crate::parquet::ParquetState::new())),
             _ => Enc::Doc(Vec::new()),
         };
         Ok(file)
@@ -233,7 +233,7 @@ fn open_lines(
     tmp: &Path,
     codec: Compression,
     resume: bool,
-) -> Result<LineWriter, FaucetError> {
+) -> Result<Box<LineWriter>, FaucetError> {
     let carry = resume && final_path.exists();
     if carry {
         std::fs::copy(final_path, tmp).map_err(|e| io_err("copying", final_path, e))?;
@@ -245,7 +245,7 @@ fn open_lines(
         .truncate(!carry)
         .open(tmp)
         .map_err(|e| io_err("creating", tmp, e))?;
-    Ok(sync_compress_writer(BufWriter::new(f), codec))
+    Ok(Box::new(sync_compress_writer(BufWriter::new(f), codec)))
 }
 
 /// Write `bytes` to `path` and sync it.

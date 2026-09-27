@@ -823,6 +823,11 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
             let cfg = decode::<faucet_sink_parquet::ParquetSinkConfig>("sink", "parquet", config)?;
             Ok(Box::new(faucet_sink_parquet::ParquetSink::new(cfg).await?))
         }
+        #[cfg(feature = "sink-file")]
+        "file" => {
+            let cfg = decode::<faucet_sink_file::FileSinkConfig>("sink", "file", config)?;
+            Ok(Box::new(faucet_sink_file::FileSink::new(cfg)?))
+        }
         #[cfg(feature = "sink-gcs")]
         "gcs" => {
             let cfg = decode::<faucet_sink_gcs::GcsSinkConfig>("sink", "gcs", config)?;
@@ -1070,6 +1075,8 @@ pub const OVERWRITE_SINK_KINDS: &[&str] = &[
     "elasticsearch",
     "databricks",
     "oracle",
+    // local files: staged in a hidden directory, moved into place on commit.
+    "file",
 ];
 
 /// Whether a sink kind supports `write_mode: overwrite`.
@@ -1862,6 +1869,8 @@ pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::B
         "parquet" => {
             atomicity_of::<faucet_sink_parquet::ParquetSinkConfig>(config, |c| c.batch_atomicity())
         }
+        #[cfg(feature = "sink-file")]
+        "file" => atomicity_of::<faucet_sink_file::FileSinkConfig>(config, |c| c.batch_atomicity()),
         #[cfg(feature = "sink-gcs")]
         "gcs" => atomicity_of::<faucet_sink_gcs::GcsSinkConfig>(config, |c| c.batch_atomicity()),
         #[cfg(feature = "sink-redshift")]
@@ -2031,6 +2040,10 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
             config,
             |c| c.validate(),
         ),
+        #[cfg(feature = "sink-file")]
+        "file" => check_with::<faucet_sink_file::FileSinkConfig, _, _>("file", name, config, |c| {
+            c.validate()
+        }),
         #[cfg(feature = "sink-gcs")]
         "gcs" => check_with::<faucet_sink_gcs::GcsSinkConfig, _, _>("gcs", name, config, |c| {
             c.validate()
@@ -2248,6 +2261,8 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         "stdout" => Ok(schema::<faucet_sink_stdout::StdoutSinkConfig>()),
         #[cfg(feature = "sink-parquet")]
         "parquet" => Ok(schema::<faucet_sink_parquet::ParquetSinkConfig>()),
+        #[cfg(feature = "sink-file")]
+        "file" => Ok(schema::<faucet_sink_file::FileSinkConfig>()),
         #[cfg(feature = "sink-gcs")]
         "gcs" => Ok(schema::<faucet_sink_gcs::GcsSinkConfig>()),
         #[cfg(feature = "sink-redshift")]
@@ -2508,6 +2523,8 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push(("stdout", "Stdout / stderr sink (JSON Lines, pretty, TSV)"));
     #[cfg(feature = "sink-parquet")]
     v.push(("parquet", "Apache Parquet file sink (local path or S3). Schema-inferred, configurable compression, row/byte rollover."));
+    #[cfg(feature = "sink-file")]
+    v.push(("file", "Local file sink. JSONL, JSON, CSV, XML, Excel, Avro or Parquet by extension; rollover, compression, temp-then-rename finalisation, atomic overwrite."));
     #[cfg(feature = "sink-delta")]
     v.push(("delta", "Apache Delta Lake sink (local FS or S3/Azure/GCS). Append-only, schema-inferred table creation, one commit per flush."));
     #[cfg(feature = "sink-gcs")]

@@ -85,6 +85,7 @@ sink = [
     "sink-http",
     "sink-stdout",
     "sink-parquet",
+    "sink-file",
     "sink-delta",
     "sink-gcs",
     "sink-iceberg",
@@ -131,6 +132,7 @@ file-format-csv = [
     "faucet-sink-gcs?/file-format-csv",
     "faucet-sink-azure-blob?/file-format-csv",
     "faucet-sink-sftp?/file-format-csv",
+    "faucet-sink-file?/file-format-csv",
 ]
 file-format-xml = [
     "faucet-source-s3?/file-format-xml",
@@ -142,6 +144,7 @@ file-format-xml = [
     "faucet-sink-gcs?/file-format-xml",
     "faucet-sink-azure-blob?/file-format-xml",
     "faucet-sink-sftp?/file-format-xml",
+    "faucet-sink-file?/file-format-xml",
 ]
 file-format-excel = [
     "faucet-source-s3?/file-format-excel",
@@ -153,6 +156,7 @@ file-format-excel = [
     "faucet-sink-gcs?/file-format-excel",
     "faucet-sink-azure-blob?/file-format-excel",
     "faucet-sink-sftp?/file-format-excel",
+    "faucet-sink-file?/file-format-excel",
 ]
 file-format-avro = [
     "faucet-source-s3?/file-format-avro",
@@ -164,6 +168,7 @@ file-format-avro = [
     "faucet-sink-gcs?/file-format-avro",
     "faucet-sink-azure-blob?/file-format-avro",
     "faucet-sink-sftp?/file-format-avro",
+    "faucet-sink-file?/file-format-avro",
 ]
 file-format-orc = [
     "faucet-source-s3?/file-format-orc",
@@ -172,7 +177,7 @@ file-format-orc = [
     "faucet-source-sftp?/file-format-orc",
     "faucet-source-file?/file-format-orc",
 ]
-file-format-parquet = ["faucet-source-file?/file-format-parquet"]
+file-format-parquet = ["faucet-source-file?/file-format-parquet", "faucet-sink-file?/file-format-parquet"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
 ## Enable mutual-TLS client-certificate auth (#495) on whichever HTTP sources
 ## have been opted in. Forwards through to each source's `mtls` feature using
@@ -212,6 +217,7 @@ arrow = [
     "faucet-source-azure-blob?/arrow",
     "faucet-source-sftp?/arrow",
     "faucet-source-file?/arrow",
+    "faucet-sink-file?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can
     # reach the BigQuery Parquet load without materializing `Value`.
     "faucet-source-rest?/arrow",
@@ -340,6 +346,7 @@ sink-kinesis = ["dep:faucet-sink-kinesis", "dep:faucet-common-kinesis"]
 ## Enable the Google Cloud Spanner sink.
 sink-spanner = ["dep:faucet-sink-spanner", "dep:faucet-common-spanner"]
 sink-parquet = ["dep:faucet-sink-parquet"]
+sink-file = ["dep:faucet-sink-file"]
 sink-delta = ["dep:faucet-sink-delta"]
 ## Delta Lake cloud object-store backends. Forwarded to whichever delta
 ## connector is enabled via optional-dep (`?`) syntax. In `full`; not default.
@@ -484,6 +491,7 @@ faucet-sink-elasticsearch = { workspace = true, optional = true }
 faucet-sink-http = { workspace = true, optional = true }
 faucet-sink-stdout = { workspace = true, optional = true }
 faucet-sink-parquet = { workspace = true, optional = true }
+faucet-sink-file = { workspace = true, optional = true }
 faucet-sink-delta = { workspace = true, optional = true }
 faucet-sink-gcs = { workspace = true, optional = true }
 faucet-sink-redshift = { workspace = true, optional = true }
