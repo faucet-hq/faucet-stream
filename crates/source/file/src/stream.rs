@@ -109,9 +109,8 @@ impl FileSource {
     }
 
     fn codec_of(&self, path: &str) -> Compression {
-        let name = resolution_name(path);
-        let codec = self.config.compression.resolve(name);
-        faucet_core::compression::warn_mismatch(name, codec);
+        let codec = faucet_common_file::resolve_compression(self.config.compression, path);
+        faucet_core::compression::warn_mismatch(resolution_name(path), codec);
         codec
     }
 

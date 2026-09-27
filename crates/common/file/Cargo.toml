@@ -11,7 +11,7 @@ keywords = ["file", "etl", "pipeline", "connector", "format"]
 categories.workspace = true
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["compression"] }
 schemars.workspace = true
 serde.workspace = true
 

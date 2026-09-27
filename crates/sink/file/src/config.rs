@@ -7,6 +7,10 @@ use faucet_core::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use faucet_common_file::{
+    appendable as is_appendable, compresses_internally as is_self_compressed,
+};
+
 pub use faucet_common_file::FileFormatChoice as FileSinkFormat;
 
 /// The placeholder a path template uses for the rollover part number.
@@ -223,7 +227,7 @@ impl FileSinkConfig {
 
     /// Whether the path names a directory rather than a file.
     pub fn is_directory(&self) -> bool {
-        self.path.ends_with('/') || self.path.ends_with('\\')
+        faucet_common_file::is_directory_path(&self.path)
     }
 
     /// Whether a rollover cap is set.
@@ -242,38 +246,24 @@ impl FileSinkConfig {
             )));
         }
         let name = self.path.replace(PART_TOKEN, "");
-        let format = match self.format.resolve(&name, false)? {
-            Some(f) => f,
-            None => {
-                return Err(FaucetError::Config(format!(
-                    "file sink: '{}' has no extension naming a writable format — use one of \
-                     .jsonl .json .csv .xml .xlsx .avro .parquet .txt (optionally + .gz/.zst) \
-                     or set `format`",
-                    self.path
-                )));
-            }
-        };
-        if format == FileFormat::Orc {
-            return Err(FaucetError::Config(
-                "file sink: ORC is read-only — there is no ORC writer; write Parquet for a \
-                 columnar output"
-                    .into(),
-            ));
-        }
+        let format = self
+            .format
+            .resolve_writable(&name)
+            .map_err(|e| FaucetError::Config(format!("file sink: {e}")))?;
         Ok(format)
     }
 
     /// The compression codec for the resolved path.
     pub fn resolved_compression(&self) -> Compression {
-        self.compression
-            .resolve(&self.path.replace(PART_TOKEN, "00001"))
+        faucet_common_file::resolve_compression(
+            self.compression,
+            &self.path.replace(PART_TOKEN, "00001"),
+        )
     }
 
     /// Validate every combination that would otherwise fail mid-run.
     pub fn validate(&self) -> Result<(), FaucetError> {
-        if self.path.trim().is_empty() {
-            return Err(FaucetError::Config("file sink: `path` is empty".into()));
-        }
+        faucet_common_file::require_path("file sink", &self.path)?;
         faucet_core::validate_batch_size(self.batch_size)?;
         let format = self.resolved_format()?;
         require_feature(format)?;
@@ -353,22 +343,6 @@ impl FileSinkConfig {
             faucet_core::BatchAtomicity::Atomic
         }
     }
-}
-
-/// Formats that carry their own compression.
-pub(crate) fn is_self_compressed(format: FileFormat) -> bool {
-    matches!(
-        format,
-        FileFormat::Parquet | FileFormat::Avro | FileFormat::Xlsx
-    )
-}
-
-/// Formats a new page can be added to without rewriting the file.
-pub(crate) fn is_appendable(format: FileFormat) -> bool {
-    matches!(
-        format,
-        FileFormat::JsonLines | FileFormat::Csv | FileFormat::RawText
-    )
 }
 
 fn require_feature(format: FileFormat) -> Result<(), FaucetError> {

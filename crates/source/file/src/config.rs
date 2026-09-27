@@ -181,9 +181,7 @@ impl FileSourceConfig {
     /// Avro reader schema, and header names/values HTTP can carry.
     pub fn validate(&self) -> Result<(), FaucetError> {
         faucet_core::validate_batch_size(self.batch_size)?;
-        if self.path.trim().is_empty() {
-            return Err(FaucetError::Config("file source: `path` is empty".into()));
-        }
+        faucet_common_file::require_path("file source", &self.path)?;
         if !self.headers.is_empty() && !self.is_http() {
             return Err(FaucetError::Config(
                 "file source: `headers` apply only to an http(s):// path".into(),
