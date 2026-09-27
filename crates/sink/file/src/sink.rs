@@ -227,6 +227,36 @@ impl FileSink {
         Ok(())
     }
 
+    /// `mode: overwrite` without the staged `write_mode: overwrite`: files are
+    /// replaced one by one as they are written, so after a successful run any
+    /// file of this layout the run did not write is an earlier run's output —
+    /// all of them after an empty run, the higher parts after a shorter one.
+    /// Remove them so the destination reflects this run only (#753).
+    fn complete_blocking(&self) -> Result<(), FaucetError> {
+        if self.config.mode != FileMode::Overwrite || self.overwriting() {
+            return Ok(());
+        }
+        let st = self.lock();
+        let first_unwritten = match (st.next_part, st.current.is_some()) {
+            (0, _) => 1,
+            (n, true) => n + 1,
+            (n, false) => n,
+        };
+        drop(st);
+        let mut removed = false;
+        for (n, path) in self.layout.existing(&self.layout.dir)? {
+            if n >= first_unwritten {
+                std::fs::remove_file(&path)
+                    .map_err(|e| io_err("removing earlier output", &path, e))?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_dir(&self.layout.dir.join("x"));
+        }
+        Ok(())
+    }
+
     fn begin_blocking(&self) -> Result<(), FaucetError> {
         let staging = self.layout.staging_dir();
         self.ensure_dir(&self.layout.dir, false)?;
@@ -370,6 +400,10 @@ impl Sink for FileSink {
 
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         blocking(|| self.abort_blocking())
+    }
+
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        blocking(|| self.complete_blocking())
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
