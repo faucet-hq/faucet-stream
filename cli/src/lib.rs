@@ -215,6 +215,10 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
 /// programmatically-built `Cli` (and a registry installed via
 /// [`PluginRegistry::install`]).
 pub async fn run_command(cli: Cli) -> CliResult<()> {
+    Box::pin(dispatch(cli)).await
+}
+
+async fn dispatch(cli: Cli) -> CliResult<()> {
     #[cfg(feature = "serve")]
     let serve_log_level = cli.log_level.clone();
     let log_format = cli.log_format;
