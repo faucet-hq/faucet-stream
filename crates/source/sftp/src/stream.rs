@@ -435,7 +435,10 @@ impl faucet_core::Source for SftpSource {
         any(feature = "file-format-avro", feature = "file-format-orc")
     ))]
     fn supports_columnar(&self) -> bool {
-        self.config.format.shared().is_some_and(|f| f.is_container())
+        self.config
+            .format
+            .shared()
+            .is_some_and(|f| f.is_container())
     }
 
     /// Stream Avro / ORC files as Arrow batches, in listing order, each file

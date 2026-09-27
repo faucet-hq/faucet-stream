@@ -206,8 +206,14 @@ mod containers {
     const ORC: &[u8] = include_bytes!("../../../core/tests/fixtures/orc/people.orc");
 
     fn avro(records: &[Value], codec: AvroCodec) -> Vec<u8> {
-        faucet_core::file_format::avro::encode(records, &AvroOptions { schema: None, codec })
-            .expect("encode avro")
+        faucet_core::file_format::avro::encode(
+            records,
+            &AvroOptions {
+                schema: None,
+                codec,
+            },
+        )
+        .expect("encode avro")
     }
 
     async fn columnar_rows(src: &S3Source) -> usize {
@@ -227,15 +233,33 @@ mod containers {
         seed(
             &endpoint,
             &[
-                ("avro/a.avro".into(), avro(&[json!({"id": 1, "name": "a"})], AvroCodec::Null)),
-                ("avro/b.avro".into(), avro(&[json!({"id": 2, "name": "b"})], AvroCodec::Snappy)),
+                (
+                    "avro/a.avro".into(),
+                    avro(&[json!({"id": 1, "name": "a"})], AvroCodec::Null),
+                ),
+                (
+                    "avro/b.avro".into(),
+                    avro(&[json!({"id": 2, "name": "b"})], AvroCodec::Snappy),
+                ),
                 (
                     "avro/c.avro".into(),
-                    avro(&[json!({"id": 3, "name": "c", "extra": true})], AvroCodec::Zstd),
+                    avro(
+                        &[json!({"id": 3, "name": "c", "extra": true})],
+                        AvroCodec::Zstd,
+                    ),
                 ),
-                ("avro/d.avro".into(), avro(&[json!({"id": 4, "name": "d"})], AvroCodec::Deflate)),
-                ("bad/a.avro".into(), avro(&[json!({"id": 1})], AvroCodec::Null)),
-                ("bad/b.avro".into(), avro(&[json!({"id": "x"})], AvroCodec::Null)),
+                (
+                    "avro/d.avro".into(),
+                    avro(&[json!({"id": 4, "name": "d"})], AvroCodec::Deflate),
+                ),
+                (
+                    "bad/a.avro".into(),
+                    avro(&[json!({"id": 1})], AvroCodec::Null),
+                ),
+                (
+                    "bad/b.avro".into(),
+                    avro(&[json!({"id": "x"})], AvroCodec::Null),
+                ),
             ],
         )
         .await;
@@ -250,7 +274,12 @@ mod containers {
             .map(|(i, n)| json!({"id": i + 1, "name": n}))
             .collect();
         assert_eq!(drain(&src).await, want);
-        assert_eq!(src.fetch_with_context(&HashMap::new()).await.expect("fetch"), want);
+        assert_eq!(
+            src.fetch_with_context(&HashMap::new())
+                .await
+                .expect("fetch"),
+            want
+        );
         assert_eq!(columnar_rows(&src).await, 4);
 
         let bad = build_source(
@@ -269,7 +298,10 @@ mod containers {
             }
         }
         let err = err.expect("conflicting schemas fail");
-        assert!(err.contains("bad/a.avro") && err.contains("bad/b.avro"), "{err}");
+        assert!(
+            err.contains("bad/a.avro") && err.contains("bad/b.avro"),
+            "{err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -280,7 +312,9 @@ mod containers {
             .prefix("orc/")
             .file_format(S3FileFormat::Orc)
             .with_batch_size(0);
-        cfg.orc = OrcOptions { columns: Some(vec!["id".into(), "name".into()]) };
+        cfg.orc = OrcOptions {
+            columns: Some(vec!["id".into(), "name".into()]),
+        };
         let src = build_source(&endpoint, cfg).await;
         let rows = drain(&src).await;
         assert_eq!(rows.len(), 3);

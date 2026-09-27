@@ -172,7 +172,10 @@ mod containers {
     fn avro(records: &[Value]) -> Vec<u8> {
         faucet_core::file_format::avro::encode(
             records,
-            &AvroOptions { schema: None, codec: AvroCodec::Deflate },
+            &AvroOptions {
+                schema: None,
+                codec: AvroCodec::Deflate,
+            },
         )
         .expect("encode avro")
     }
@@ -199,7 +202,12 @@ mod containers {
     async fn avro_and_orc_blobs_decode_on_both_paths() {
         let (_c, port) = start_azurite().await;
         create_container(port).await;
-        put(port, "avro/a.avro", avro(&[json!({"id": 1}), json!({"id": 2})])).await;
+        put(
+            port,
+            "avro/a.avro",
+            avro(&[json!({"id": 1}), json!({"id": 2})]),
+        )
+        .await;
         put(port, "avro/b.avro", avro(&[json!({"id": 3, "more": "x"})])).await;
         put(port, "bad/a.avro", avro(&[json!({"id": 1})])).await;
         put(port, "bad/b.avro", avro(&[json!({"id": "text"})])).await;
@@ -212,17 +220,33 @@ mod containers {
         let src = AzureBlobSource::new(cfg).await.expect("source");
         let want = vec![json!({"id": 1}), json!({"id": 2}), json!({"id": 3})];
         assert_eq!(drain(&src).await, want);
-        assert_eq!(src.fetch_with_context(&HashMap::new()).await.expect("fetch"), want);
+        assert_eq!(
+            src.fetch_with_context(&HashMap::new())
+                .await
+                .expect("fetch"),
+            want
+        );
         assert_eq!(columnar_rows(&src).await, Ok(3));
 
-        let bad = AzureBlobSource::new(source_config(port).prefix("bad/").file_format(AzureFileFormat::Avro))
-            .await
-            .expect("source");
+        let bad = AzureBlobSource::new(
+            source_config(port)
+                .prefix("bad/")
+                .file_format(AzureFileFormat::Avro),
+        )
+        .await
+        .expect("source");
         let err = columnar_rows(&bad).await.expect_err("conflict");
-        assert!(err.contains("bad/a.avro") && err.contains("bad/b.avro"), "{err}");
+        assert!(
+            err.contains("bad/a.avro") && err.contains("bad/b.avro"),
+            "{err}"
+        );
 
-        let mut cfg = source_config(port).prefix("orc/").file_format(AzureFileFormat::Orc);
-        cfg.orc = OrcOptions { columns: Some(vec!["name".into()]) };
+        let mut cfg = source_config(port)
+            .prefix("orc/")
+            .file_format(AzureFileFormat::Orc);
+        cfg.orc = OrcOptions {
+            columns: Some(vec!["name".into()]),
+        };
         let src = AzureBlobSource::new(cfg).await.expect("source");
         assert_eq!(drain(&src).await[0], json!({"name": "ada"}));
         assert_eq!(columnar_rows(&src).await, Ok(3));

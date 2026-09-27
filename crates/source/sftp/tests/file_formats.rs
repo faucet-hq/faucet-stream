@@ -148,7 +148,10 @@ mod containers {
     fn avro(records: &[Value]) -> Vec<u8> {
         faucet_core::file_format::avro::encode(
             records,
-            &AvroOptions { schema: None, codec: AvroCodec::Snappy },
+            &AvroOptions {
+                schema: None,
+                codec: AvroCodec::Snappy,
+            },
         )
         .expect("encode avro")
     }
@@ -176,12 +179,22 @@ mod containers {
         let src = source(port, SftpFormat::Avro, "*.avro");
         assert!(src.supports_columnar());
         assert_eq!(drain(&src).await, vec![json!({"id": 1}), json!({"id": 2})]);
-        assert_eq!(src.fetch_with_context(&HashMap::new()).await.expect("fetch").len(), 2);
+        assert_eq!(
+            src.fetch_with_context(&HashMap::new())
+                .await
+                .expect("fetch")
+                .len(),
+            2
+        );
         assert_eq!(columnar(&src).await, Ok(2));
 
         let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
-        let mut cfg = SftpSourceConfig::new(conn, "/data").format(SftpFormat::Orc).glob("*.orc");
-        cfg.orc = OrcOptions { columns: Some(vec!["id".into()]) };
+        let mut cfg = SftpSourceConfig::new(conn, "/data")
+            .format(SftpFormat::Orc)
+            .glob("*.orc");
+        cfg.orc = OrcOptions {
+            columns: Some(vec!["id".into()]),
+        };
         let orc = SftpSource::new(cfg).expect("config");
         assert_eq!(drain(&orc).await[1], json!({"id": 2}));
         assert_eq!(columnar(&orc).await, Ok(3));

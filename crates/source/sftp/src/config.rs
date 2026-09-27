@@ -389,7 +389,10 @@ mod tests {
             Some(faucet_core::FileFormat::Xlsx)
         );
         #[cfg(feature = "file-format-avro")]
-        assert_eq!(SftpFormat::Avro.shared(), Some(faucet_core::FileFormat::Avro));
+        assert_eq!(
+            SftpFormat::Avro.shared(),
+            Some(faucet_core::FileFormat::Avro)
+        );
         #[cfg(feature = "file-format-orc")]
         assert_eq!(SftpFormat::Orc.shared(), Some(faucet_core::FileFormat::Orc));
     }

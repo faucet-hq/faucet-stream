@@ -381,7 +381,7 @@ async fn sink_writes_avro_objects() {
     let names = object_names(&host, &bucket, "avro/").await;
     assert_eq!(names.len(), 1);
     let body = download(&host, &bucket, &names[0]).await;
-    let back =
-        faucet_core::file_format::avro::decode(&body, &faucet_core::AvroOptions::default()).unwrap();
+    let back = faucet_core::file_format::avro::decode(&body, &faucet_core::AvroOptions::default())
+        .unwrap();
     assert_eq!(back, rows.to_vec());
 }

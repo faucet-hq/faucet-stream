@@ -606,14 +606,48 @@ async fn avro_and_orc_objects_decode_on_both_paths() {
         return;
     };
     let avro = |r: Vec<serde_json::Value>| {
-        faucet_core::file_format::avro::encode(&r, &AvroOptions { schema: None, codec: AvroCodec::Zstd })
-            .expect("encode avro")
+        faucet_core::file_format::avro::encode(
+            &r,
+            &AvroOptions {
+                schema: None,
+                codec: AvroCodec::Zstd,
+            },
+        )
+        .expect("encode avro")
     };
     let ct = "application/octet-stream";
-    seed_bytes(&host, &bucket, "avro/a.avro", avro(vec![serde_json::json!({"id": 1})]), ct).await;
-    seed_bytes(&host, &bucket, "avro/b.avro", avro(vec![serde_json::json!({"id": 2})]), ct).await;
-    seed_bytes(&host, &bucket, "bad/a.avro", avro(vec![serde_json::json!({"id": 1})]), ct).await;
-    seed_bytes(&host, &bucket, "bad/b.avro", avro(vec![serde_json::json!({"id": false})]), ct).await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "avro/a.avro",
+        avro(vec![serde_json::json!({"id": 1})]),
+        ct,
+    )
+    .await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "avro/b.avro",
+        avro(vec![serde_json::json!({"id": 2})]),
+        ct,
+    )
+    .await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "bad/a.avro",
+        avro(vec![serde_json::json!({"id": 1})]),
+        ct,
+    )
+    .await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "bad/b.avro",
+        avro(vec![serde_json::json!({"id": false})]),
+        ct,
+    )
+    .await;
     seed_bytes(
         &host,
         &bucket,
@@ -639,19 +673,31 @@ async fn avro_and_orc_objects_decode_on_both_paths() {
         Ok(n)
     }
 
-    let src = GcsSource::new(build("avro/", GcsFileFormat::Avro)).await.unwrap();
+    let src = GcsSource::new(build("avro/", GcsFileFormat::Avro))
+        .await
+        .unwrap();
     assert!(src.supports_columnar());
     let rows = stream_all(&src).await;
-    assert_eq!(rows, vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]);
+    assert_eq!(
+        rows,
+        vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]
+    );
     assert_eq!(src.fetch_with_context(&HashMap::new()).await.unwrap(), rows);
     assert_eq!(columnar(&src).await, Ok(2));
 
-    let bad = GcsSource::new(build("bad/", GcsFileFormat::Avro)).await.unwrap();
+    let bad = GcsSource::new(build("bad/", GcsFileFormat::Avro))
+        .await
+        .unwrap();
     let err = columnar(&bad).await.expect_err("conflict");
-    assert!(err.contains("bad/a.avro") && err.contains("bad/b.avro"), "{err}");
+    assert!(
+        err.contains("bad/a.avro") && err.contains("bad/b.avro"),
+        "{err}"
+    );
 
     let mut cfg = build("orc/", GcsFileFormat::Orc);
-    cfg.orc = OrcOptions { columns: Some(vec!["id".into()]) };
+    cfg.orc = OrcOptions {
+        columns: Some(vec!["id".into()]),
+    };
     let orc = GcsSource::new(cfg).await.unwrap();
     assert_eq!(stream_all(&orc).await.len(), 3);
     assert_eq!(columnar(&orc).await, Ok(3));
