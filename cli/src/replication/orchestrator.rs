@@ -128,29 +128,12 @@ fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> Ex
     }
 }
 
-/// Spawn a task that cancels `token` on SIGTERM (Unix) or Ctrl-C. Shared
-/// with the backfill orchestrator.
+/// Spawn a task that cancels `token` on a stop signal (see
+/// [`crate::signals`]). Shared with the backfill orchestrator.
 pub(crate) fn spawn_cancel_on_signal(token: CancellationToken) {
+    let stop = crate::signals::wait_for_termination();
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            match signal(SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = sigterm.recv() => {}
-                    }
-                }
-                Err(_) => {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        stop.await;
         token.cancel();
     });
 }

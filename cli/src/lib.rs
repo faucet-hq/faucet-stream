@@ -73,6 +73,7 @@ pub mod secrets;
 pub mod select;
 #[cfg(feature = "serve")]
 pub mod serve;
+pub mod signals;
 pub mod sla;
 pub mod state;
 pub mod status;
