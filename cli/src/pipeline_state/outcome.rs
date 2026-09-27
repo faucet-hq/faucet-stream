@@ -208,5 +208,8 @@ mod tests {
         record(&s, "p::r", ev(1, None)).await;
         assert!(read(&s, "p::r").await.unwrap().last_success.is_none());
         assert!(read(&Broken, "p::r").await.is_err());
+        assert!(Broken.put("p::r", &Value::Null).await.is_err());
+        Broken.delete("p::r").await.unwrap();
+        s.delete("p::r").await.unwrap();
     }
 }

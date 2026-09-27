@@ -1459,6 +1459,7 @@ matrix:
         let store: Arc<dyn StateStore> = Arc::new(Bare {
             inner: MemoryStateStore::new(),
         });
+        store.delete("orders::none").await.unwrap();
         let s = Stores::build(&t, Some(store)).await.unwrap();
         let mut exp = StateExport::new("orders");
         exp.keys.insert("orders::a".into(), json!(1));
@@ -1479,6 +1480,102 @@ matrix:
         assert!(!o.atomic);
         assert_eq!(o.written, vec!["orders::a"]);
         assert!(o.error.unwrap().contains("orders::b"));
+    }
+
+    #[tokio::test]
+    async fn import_skips_leases_and_reports_batch_and_delete_failures() {
+        struct Flaky {
+            inner: MemoryStateStore,
+            batch_fails: bool,
+        }
+        #[faucet_core::async_trait]
+        impl StateStore for Flaky {
+            async fn get(&self, k: &str) -> Result<Option<Value>, faucet_core::FaucetError> {
+                self.inner.get(k).await
+            }
+            async fn put(&self, k: &str, v: &Value) -> Result<(), faucet_core::FaucetError> {
+                self.inner.put(k, v).await
+            }
+            async fn delete(&self, _: &str) -> Result<(), faucet_core::FaucetError> {
+                Err(faucet_core::FaucetError::State("read-only".into()))
+            }
+            async fn list(&self, p: &str) -> Result<Vec<String>, faucet_core::FaucetError> {
+                self.inner.list(p).await
+            }
+            fn supports_list(&self) -> bool {
+                true
+            }
+            fn supports_atomic_batch(&self) -> bool {
+                true
+            }
+            async fn put_batch(
+                &self,
+                e: &[(String, Value)],
+            ) -> Result<(), faucet_core::FaucetError> {
+                if self.batch_fails {
+                    return Err(faucet_core::FaucetError::State("tx aborted".into()));
+                }
+                for (k, v) in e {
+                    self.inner.put(k, v).await?;
+                }
+                Ok(())
+            }
+        }
+        let t = target("");
+        let req = |keys: &[(&str, Value)], overwrite: bool| {
+            let mut exp = StateExport::new("orders");
+            for (k, v) in keys {
+                exp.keys.insert((*k).to_string(), v.clone());
+            }
+            ImportRequest {
+                export: exp,
+                overwrite,
+                force: false,
+                dry_run: false,
+            }
+        };
+
+        let failing: Arc<dyn StateStore> = Arc::new(Flaky {
+            inner: MemoryStateStore::new(),
+            batch_fails: true,
+        });
+        let s = Stores::build(&t, Some(failing)).await.unwrap();
+        let o = import(&t, &s, &req(&[("orders::a", json!(1))], false), now())
+            .await
+            .unwrap();
+        assert!(o.atomic);
+        assert!(o.written.is_empty());
+        assert_eq!(o.error.as_deref(), Some("State error: tx aborted"));
+
+        let flaky = Flaky {
+            inner: MemoryStateStore::new(),
+            batch_fails: false,
+        };
+        flaky.inner.put("orders::a", &json!(0)).await.unwrap();
+        flaky
+            .inner
+            .put("orders::a::__sla__", &json!({}))
+            .await
+            .unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(flaky);
+        let s = Stores::build(&t, Some(Arc::clone(&store))).await.unwrap();
+        let lease = json!({"run_id": "r", "pid": 1, "acquired_at": now(), "expires_at": now()});
+        let o = import(
+            &t,
+            &s,
+            &req(
+                &[("orders::a", json!(9)), ("orders::a::__lease__", lease)],
+                true,
+            ),
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(o.written, vec!["orders::a"], "the lease is never imported");
+        assert!(store.get("orders::a::__lease__").await.unwrap().is_none());
+        assert_eq!(store.get("orders::a").await.unwrap(), Some(json!(9)));
+        let err = o.error.expect("the stale delete fails");
+        assert!(err.contains("deleting stale 'orders::a::__sla__'"), "{err}");
     }
 
     #[tokio::test]
@@ -1538,6 +1635,8 @@ matrix:
             .await
             .unwrap();
         store.put("orders::kid::1", &json!(1)).await.unwrap();
+        store.put("orders::gone", &json!(1)).await.unwrap();
+        store.delete("orders::gone").await.unwrap();
         let s = Stores::build(&t, Some(store)).await.unwrap();
         let keys: Vec<String> = collect_keys(&t, &s)
             .await

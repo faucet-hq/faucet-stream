@@ -473,3 +473,95 @@ pipeline:
         );
     }
 }
+
+#[tokio::test]
+async fn a_failing_backend_surfaces_every_read_error() {
+    struct Broken;
+    #[faucet_core::async_trait]
+    impl StateStore for Broken {
+        async fn get(&self, _: &str) -> Result<Option<Value>, faucet_core::FaucetError> {
+            Err(faucet_core::FaucetError::State("backend down".into()))
+        }
+        async fn put(&self, _: &str, _: &Value) -> Result<(), faucet_core::FaucetError> {
+            Err(faucet_core::FaucetError::State("backend down".into()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), faucet_core::FaucetError> {
+            Err(faucet_core::FaucetError::State("backend down".into()))
+        }
+    }
+    assert!(Broken.put("k", &json!(1)).await.is_err());
+    assert!(Broken.delete("k").await.is_err());
+    let t = target(
+        "profiling: {}\n",
+        "  - id: kid\n    parent: a\n    parent_key: id\n",
+    );
+    let store: Arc<dyn StateStore> = Arc::new(Broken);
+    let s = Stores::build(&t, Some(store)).await.unwrap();
+    let auth = AuthCatalog::new();
+    let r = assemble(&t, Ok(&s), &inputs(&auth)).await.unwrap();
+    let errors = r.rows[0].errors.join("\n");
+    for want in [
+        "bookmark: ",
+        "run outcomes: ",
+        "SLA history: ",
+        "run lease: ",
+        "profiling history: ",
+        "rollback markers: ",
+        "child row 'kid': this state store cannot enumerate per-parent bookmarks",
+    ] {
+        assert!(errors.contains(want), "missing {want:?} in {errors}");
+    }
+}
+
+#[tokio::test]
+async fn a_row_without_a_state_block_is_unknown_between_runs() {
+    let text = "version: 1\nname: n\npipeline:\n  source: { type: csv, config: { path: a } }\n  sink: { type: stdout, config: {} }\n";
+    let cfg = PipelineConfig::from_text(text, Path::new("t.yaml")).unwrap();
+    let t = PipelineTarget::resolve(&cfg, "n").unwrap();
+    let s = Stores::build(&t, None).await.unwrap();
+    let auth = AuthCatalog::new();
+    let r = assemble(&t, Ok(&s), &inputs(&auth)).await.unwrap();
+    assert_eq!(r.rows[0].health, Health::Unknown);
+    assert!(
+        r.rows[0]
+            .reasons
+            .iter()
+            .any(|x| x.contains("no `state:` block")),
+        "{:?}",
+        r.rows[0].reasons
+    );
+}
+
+#[tokio::test]
+async fn render_covers_unreadable_dlqs_repeat_failures_and_probed_lag() {
+    let t = target("", "");
+    let (s, store) = stores(&t).await;
+    let auth = AuthCatalog::new();
+    put_outcome(
+        store.as_ref(),
+        "orders::a",
+        vec![ev(300, Some("timeout")), ev(200, Some("timeout"))],
+    )
+    .await;
+    let mut r = assemble(&t, Ok(&s), &inputs(&auth)).await.unwrap();
+    assert_eq!(r.rows[0].consecutive_failures, 2);
+    r.state.kinds.clear();
+    let row = &mut r.rows[0];
+    row.dlq.configured = true;
+    row.dlq.readable = false;
+    row.dlq.note = Some("remote DLQ — backlog not readable".into());
+    row.lag = Some(LagStatus::new(
+        faucet_core::SourceLag::seconds(90.0),
+        "probe",
+        Utc::now(),
+    ));
+    let text = render::render(&r);
+    assert!(text.contains("state: none"), "{text}");
+    assert!(text.contains(" · 2 consecutive failures"), "{text}");
+    assert!(
+        text.contains("DLQ: remote DLQ — backlog not readable"),
+        "{text}"
+    );
+    assert!(text.contains("lag: 1m 30s (queried now"), "{text}");
+    assert!(text.contains('?'), "{text}");
+}

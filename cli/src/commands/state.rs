@@ -500,4 +500,76 @@ mod tests {
         assert!(marker_summary(&entry("p::__replication__", json!({"a": 1}))).contains("\"a\""));
         assert_eq!(compact(&json!("x".repeat(300))).chars().count(), 200);
     }
+
+    #[test]
+    fn show_renders_every_section() {
+        use crate::pipeline_state::lease::RunLease;
+        use crate::pipeline_state::target::RowRole;
+        let now = Utc::now();
+        let report = ops::ShowReport {
+            pipeline: "p".into(),
+            rows: vec![ops::RowState {
+                row: "r".into(),
+                role: RowRole::Root,
+                state_key: "p::r".into(),
+                store: Some("file".into()),
+                bookmark: Some(json!({"id": 3})),
+                exactly_once: Some(ops::EnvelopeInfo { seq: 7 }),
+                state_format: None,
+                sub_bookmarks: vec![entry("p::r::parent-1", json!({"id": 1}))],
+                markers: vec![entry("p::r::__sla__", json!({}))],
+                running: Some(RunLease {
+                    run_id: "run-9".into(),
+                    pid: 42,
+                    host: None,
+                    acquired_at: now,
+                    expires_at: now,
+                }),
+            }],
+            pipeline_keys: vec![entry("p::__replication__", json!({"phase": "cdc"}))],
+            orphans: vec![entry("p::gone", json!({"id": 5}))],
+        };
+        let text = render_show(&report);
+        assert!(
+            text.contains("exactly-once    envelope sequence 7"),
+            "{text}"
+        );
+        assert!(
+            text.contains("running         run run-9 (pid 42)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"sub-bookmark    parent-1 = {"id":1}"#),
+            "{text}"
+        );
+        assert!(text.contains("pipeline markers"), "{text}");
+        assert!(
+            text.contains(r#"p::__replication__ = {"phase":"cdc"}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains("keys of rows no longer in the config"),
+            "{text}"
+        );
+        assert!(text.contains(r#"p::gone = {"id":5}"#), "{text}");
+    }
+
+    #[test]
+    fn import_renders_deletes_and_failures() {
+        let o = ops::ImportOutcome {
+            pipeline: "p".into(),
+            keys: 1,
+            existing: vec!["p::old".into()],
+            written: vec!["p::r".into()],
+            deleted: vec!["p::old".into()],
+            atomic: false,
+            applied: true,
+            error: Some("store down".into()),
+            warnings: vec![],
+        };
+        let text = render_import(&o);
+        assert!(text.contains("delete  p::old"), "{text}");
+        assert!(text.contains("replacing 1 existing key(s)"), "{text}");
+        assert!(text.contains("FAILED: store down"), "{text}");
+    }
 }
