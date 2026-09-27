@@ -70,6 +70,15 @@ fn conformance_connector_name_nonempty() {
     assert_eq!(sink.connector_name(), "databricks");
 }
 
+#[test]
+fn conformance_batch_atomicity_declared() {
+    let sink = DatabricksSink::new(config("https://x")).unwrap();
+    assert_eq!(
+        faucet_conformance::assert_batch_atomicity_declared(&sink),
+        faucet_core::BatchAtomicity::BestEffort
+    );
+}
+
 #[tokio::test]
 async fn conformance_schema_evolution_effective() {
     let server = MockServer::start().await;
