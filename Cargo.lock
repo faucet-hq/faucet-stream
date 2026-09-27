@@ -4551,6 +4551,7 @@ dependencies = [
  "faucet-source-duckdb",
  "faucet-source-dynamodb",
  "faucet-source-elasticsearch",
+ "faucet-source-file",
  "faucet-source-gcs",
  "faucet-source-graphql",
  "faucet-source-grpc",
@@ -4717,6 +4718,16 @@ dependencies = [
 [[package]]
 name = "faucet-common-elasticsearch"
 version = "1.0.11"
+dependencies = [
+ "faucet-core",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "faucet-common-file"
+version = "1.0.0"
 dependencies = [
  "faucet-core",
  "schemars 1.2.1",
@@ -5933,6 +5944,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-source-file"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "faucet-common-file",
+ "faucet-conformance",
+ "faucet-core",
+ "faucet-sink-parquet",
+ "flate2",
+ "futures",
+ "glob",
+ "parquet",
+ "reqwest 0.13.3",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "faucet-source-gcs"
 version = "1.6.1"
 dependencies = [
@@ -6755,6 +6794,7 @@ dependencies = [
  "faucet-source-duckdb",
  "faucet-source-dynamodb",
  "faucet-source-elasticsearch",
+ "faucet-source-file",
  "faucet-source-gcs",
  "faucet-source-graphql",
  "faucet-source-grpc",
