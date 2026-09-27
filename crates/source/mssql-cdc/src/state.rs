@@ -75,9 +75,11 @@ impl Bookmarks {
     }
 }
 
-/// Component-wise order: `a` is at or before `b` when every capture instance
-/// `a` has consumed is consumed at least as far in `b` (a missing instance has
-/// consumed nothing). `None` when either side is not a bookmark map.
+/// Per-capture-instance order: `a` is at or before `b` when every capture
+/// instance both maps track is consumed at least as far in `b`. An instance
+/// only one side tracks does not constrain the order — each instance is its
+/// own cursor, and a multi-table mirror compares a table's position only on
+/// the instances it tracks. `None` when either side is not a bookmark map.
 pub fn bookmarks_le(a: &Value, b: &Value) -> Option<bool> {
     let (a, b) = (
         Bookmarks::from_value(a.clone()).ok()?,
@@ -85,25 +87,21 @@ pub fn bookmarks_le(a: &Value, b: &Value) -> Option<bool> {
     );
     Some(
         a.0.iter()
-            .all(|(ci, lsn)| b.get(ci).is_some_and(|have| *lsn <= have)),
+            .all(|(ci, lsn)| b.get(ci).is_none_or(|have| *lsn <= have)),
     )
 }
 
-/// The component-wise minimum of several bookmark maps: an instance keeps the
-/// lowest LSN any map holds, and is dropped when some map has not consumed it.
+/// The per-instance minimum of several bookmark maps: every instance any map
+/// tracks, at the lowest LSN a map holds for it.
 pub fn bookmarks_min(positions: &[Value]) -> Option<Value> {
-    let maps: Vec<Bookmarks> = positions
-        .iter()
-        .map(|v| Bookmarks::from_value(v.clone()).ok())
-        .collect::<Option<_>>()?;
-    let (first, rest) = maps.split_first()?;
+    if positions.is_empty() {
+        return None;
+    }
     let mut out = Bookmarks::new();
-    for (ci, lsn) in &first.0 {
-        let min = rest
-            .iter()
-            .try_fold(*lsn, |acc, m| m.get(ci).map(|l| acc.min(l)));
-        if let Some(min) = min {
-            out.set(ci.clone(), min);
+    for v in positions {
+        for (ci, lsn) in Bookmarks::from_value(v.clone()).ok()?.0 {
+            let keep = out.get(&ci).map_or(lsn, |have| have.min(lsn));
+            out.set(ci, keep);
         }
     }
     out.to_value().ok()
@@ -114,24 +112,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn component_wise_order_and_minimum() {
+    fn per_instance_order_and_minimum() {
         let lo = "0000002a000000550003";
         let hi = "0000002a000000560001";
         let a = serde_json::json!({"dbo_Orders": lo, "dbo_Items": lo});
         let b = serde_json::json!({"dbo_Orders": hi, "dbo_Items": lo});
         let c = serde_json::json!({"dbo_Orders": lo});
+        let d = serde_json::json!({"dbo_New": hi});
         assert_eq!(bookmarks_le(&a, &b), Some(true));
         assert_eq!(bookmarks_le(&b, &a), Some(false));
         assert_eq!(bookmarks_le(&c, &a), Some(true));
-        assert_eq!(bookmarks_le(&a, &c), Some(false));
+        assert_eq!(bookmarks_le(&a, &c), Some(true), "Items is untracked by c");
+        assert_eq!(bookmarks_le(&b, &c), Some(false));
+        assert_eq!(bookmarks_le(&d, &a), Some(true), "no shared instance");
         assert_eq!(bookmarks_le(&a, &serde_json::json!([])), None);
         assert_eq!(
             bookmarks_min(&[b.clone(), a.clone()]),
             Some(serde_json::json!({"dbo_Orders": lo, "dbo_Items": lo}))
         );
         assert_eq!(
-            bookmarks_min(&[b, c]),
-            Some(serde_json::json!({"dbo_Orders": lo}))
+            bookmarks_min(&[b, d]),
+            Some(serde_json::json!({"dbo_Orders": hi, "dbo_Items": lo, "dbo_New": hi}))
         );
         assert_eq!(bookmarks_min(&[]), None);
         assert_eq!(bookmarks_min(&[serde_json::json!(1)]), None);
