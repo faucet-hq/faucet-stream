@@ -433,23 +433,7 @@ impl faucet_core::Source for PostgresSource {
             })
             .collect::<Result<_, _>>()?;
 
-        let key_sql = r#"
-            SELECT tc.table_schema || '.' || tc.table_name AS name, k.column_name
-              FROM information_schema.table_constraints tc
-              JOIN information_schema.key_column_usage k
-                ON k.constraint_schema = tc.constraint_schema
-               AND k.constraint_name = tc.constraint_name
-               AND k.table_schema = tc.table_schema
-               AND k.table_name = tc.table_name
-             WHERE tc.constraint_type = 'PRIMARY KEY'
-               AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
-             ORDER BY tc.table_schema, tc.table_name, k.ordinal_position"#;
-        let keys: Vec<(String, String)> = sqlx::query_as(key_sql)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!("postgres: primary-key discovery failed: {e}"))
-            })?;
+        let keys = primary_keys(&self.pool).await?;
         Ok(faucet_core::attach_primary_keys(
             descriptors_from_catalog(catalog, quote_ident),
             keys,
@@ -561,6 +545,31 @@ pub fn digest_query(inner: &str, key: &str, columns: &[String]) -> String {
         cols = rendered.join(", "),
         k = quote_ident(key),
     )
+}
+
+/// Every primary-key column in the database, `(table, column)` in key order.
+async fn primary_keys(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+) -> Result<Vec<(String, String)>, FaucetError> {
+    let key_sql = r#"
+            SELECT tc.table_schema || '.' || tc.table_name AS name, k.column_name
+              FROM information_schema.table_constraints tc
+              JOIN information_schema.key_column_usage k
+                ON k.constraint_schema = tc.constraint_schema
+               AND k.constraint_name = tc.constraint_name
+               AND k.table_schema = tc.table_schema
+               AND k.table_name = tc.table_name
+             WHERE tc.constraint_type = 'PRIMARY KEY'
+               AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+             ORDER BY tc.table_schema, tc.table_name, k.ordinal_position"#;
+    sqlx::query_as(key_sql)
+        .fetch_all(pool)
+        .await
+        .map_err(key_discovery_error)
+}
+
+fn key_discovery_error(e: sqlx::Error) -> FaucetError {
+    FaucetError::Source(format!("postgres: primary-key discovery failed: {e}"))
 }
 
 #[cfg(test)]
@@ -1072,5 +1081,15 @@ mod bind_overflow_tests {
                 "{v} must still bind"
             );
         }
+    }
+
+    #[test]
+    fn key_discovery_errors_name_the_backend() {
+        let e = key_discovery_error(sqlx::Error::RowNotFound);
+        assert!(
+            e.to_string()
+                .contains("postgres: primary-key discovery failed"),
+            "{e}"
+        );
     }
 }

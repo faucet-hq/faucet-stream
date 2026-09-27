@@ -133,6 +133,10 @@ async fn cdc_captures_crud_then_resumes_without_replay() {
     assert!(create["resume_token"]["_data"].is_string());
 
     let bookmark = bookmark.expect("cycle 1 produced a bookmark");
+    assert_eq!(source.record_table(create).as_deref(), Some(COLL));
+    assert_eq!(source.position_le(create, &bookmark), Some(true));
+    assert_eq!(source.position_le(&bookmark, create), Some(false));
+    assert_eq!(source.position_le(&bookmark, &json!({})), None);
 
     // Resume after the last event of cycle 1, then write a NEW document.
     source
@@ -433,6 +437,12 @@ async fn capture_resume_position_cluster_scope() {
     assert!(
         pos.get("resume_token").is_some(),
         "resume_token present: {pos}"
+    );
+    let envelope = json!({ "namespace": { "db": "shop", "coll": "orders" } });
+    assert_eq!(
+        source.record_table(&envelope).as_deref(),
+        Some("shop.orders"),
+        "a cluster scope qualifies the collection by its database"
     );
 }
 

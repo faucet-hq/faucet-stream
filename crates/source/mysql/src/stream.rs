@@ -435,18 +435,7 @@ impl faucet_core::Source for MysqlSource {
             })
             .collect::<Result<_, _>>()?;
 
-        let key_sql = "\
-            SELECT CAST(table_name AS CHAR) AS table_name, \
-                   CAST(column_name AS CHAR) AS column_name \
-              FROM information_schema.key_column_usage \
-             WHERE table_schema = DATABASE() AND constraint_name = 'PRIMARY' \
-             ORDER BY table_name, ordinal_position";
-        let keys: Vec<(String, String)> = sqlx::query_as(key_sql)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| {
-                FaucetError::Source(format!("mysql: primary-key discovery failed: {e}"))
-            })?;
+        let keys = primary_keys(&self.pool).await?;
         Ok(faucet_core::attach_primary_keys(
             descriptors_from_catalog(catalog),
             keys,
@@ -564,6 +553,26 @@ pub fn digest_query(inner: &str, key: &str, columns: &[String]) -> String {
         cols = rendered.join(", "),
         k = quote_ident_mysql(key),
     )
+}
+
+/// Every primary-key column in the database, `(table, column)` in key order.
+async fn primary_keys(
+    pool: &sqlx::Pool<sqlx::MySql>,
+) -> Result<Vec<(String, String)>, FaucetError> {
+    let key_sql = "\
+            SELECT CAST(table_name AS CHAR) AS table_name, \
+                   CAST(column_name AS CHAR) AS column_name \
+              FROM information_schema.key_column_usage \
+             WHERE table_schema = DATABASE() AND constraint_name = 'PRIMARY' \
+             ORDER BY table_name, ordinal_position";
+    sqlx::query_as(key_sql)
+        .fetch_all(pool)
+        .await
+        .map_err(key_discovery_error)
+}
+
+fn key_discovery_error(e: sqlx::Error) -> FaucetError {
+    FaucetError::Source(format!("mysql: primary-key discovery failed: {e}"))
 }
 
 #[cfg(test)]
@@ -848,6 +857,16 @@ mod tests {
         assert!(
             err.to_string().contains("shard bounds"),
             "expected bounds-probe error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn key_discovery_errors_name_the_backend() {
+        let e = key_discovery_error(sqlx::Error::RowNotFound);
+        assert!(
+            e.to_string()
+                .contains("mysql: primary-key discovery failed"),
+            "{e}"
         );
     }
 }

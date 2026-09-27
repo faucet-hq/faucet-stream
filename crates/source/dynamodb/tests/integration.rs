@@ -69,6 +69,11 @@ async fn parallel_scan_returns_every_item_once_and_resumes() {
     assert_eq!(precise["v"], json!("12345678901234567890123"));
     assert_eq!(precise["bin"], json!("AQI="));
     assert_eq!(precise["tags"], json!(["x"]));
+    assert_eq!(
+        source.record_table(&json!({"table": "items"})),
+        None,
+        "scan items are user data, never routing"
+    );
     assert!(records.iter().any(|r| r["v"] == json!(7)));
     assert_eq!(
         bookmarks.last().unwrap().as_ref().unwrap()["segments"],
@@ -222,6 +227,7 @@ async fn streams_cdc_captures_changes_and_resumes() {
     let (records, bookmarks) = drain(&source).await;
     let ops: Vec<&str> = records.iter().map(|r| r["op"].as_str().unwrap()).collect();
     assert_eq!(ops, vec!["c", "c", "c", "u", "d"]);
+    assert_eq!(source.record_table(&records[0]).as_deref(), Some("orders"));
     let lag = source.lag().await.unwrap().expect("streams lag");
     let secs = lag.seconds.expect("seconds");
     assert!((0.0..3600.0).contains(&secs), "{lag:?}");
