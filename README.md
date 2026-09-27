@@ -220,7 +220,7 @@ Policies are checked before the run starts, and again at run time against the ac
 Most stacks add these as separate tools after the data has landed. In faucet each one is a
 block in the pipeline file and applies to every connector.
 
-| | What it does | Guide |
+| Guardrail | What it does | Guide |
 |---|---|---|
 | **PII masking** | Redact, hash, tokenize or partially mask fields, matched by name, pattern or value detector (emails, cards, …). Runs first, so raw PII never reaches a sink, the DLQ or a lineage event. | [masking](https://faucet-hq.github.io/faucet-stream/cookbook/masking.html) |
 | **Data-quality checks** | 13 per-record and per-batch assertions: not-null, regex, ranges, sets, uniqueness, row counts, JSON Schema. Each can quarantine, abort or warn. | [quality](https://faucet-hq.github.io/faucet-stream/cookbook/quality.html) |
@@ -248,7 +248,7 @@ warehouse is dbt's job, and the two work well together
 
 ## Reliability you don't have to build
 
-| | |
+| Guarantee | How it works |
 |---|---|
 | **Bounded memory** | Sources stream page by page and sinks write each page as it arrives, so memory stays at one batch whatever the volume. |
 | **Incremental and resumable** | Bookmarks are saved only after the page is durably written, to a file, Redis or Postgres. A crash replays at most the last page. State is versioned: after an upgrade, faucet migrates an older bookmark or refuses one it can't read, instead of silently re-syncing or skipping ([state](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)). |
@@ -267,10 +267,10 @@ warehouse is dbt's job, and the two work well together
 <!--COUNT:sources-->43<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
 connector depends only on `faucet-core`, so any source works with any sink.
 
-| | Sources | Sinks |
+| Category | Sources | Sinks |
 |---|---|---|
 | **Databases** | PostgreSQL, MySQL, SQL Server, Oracle, MongoDB, SQLite, DuckDB, Redis, DynamoDB, Spanner | PostgreSQL, MySQL, SQL Server, Oracle, MongoDB, SQLite, DuckDB, Redis, DynamoDB, Spanner |
-| **CDC** | PostgreSQL, MySQL, SQL Server, MongoDB, Oracle, DynamoDB Streams | |
+| **CDC** | PostgreSQL, MySQL, SQL Server, MongoDB, Oracle, DynamoDB Streams | Applied through `write_mode: upsert` / `delete` on keyed sinks |
 | **Warehouses and lakehouses** | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg |
 | **Object stores and files** | S3, GCS, Azure Blob, SFTP, local files (path, glob or URL), CSV, Parquet | S3, GCS, Azure Blob, SFTP, local files, CSV, Parquet, JSONL |
 | **Streams and queues** | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS |
@@ -289,7 +289,7 @@ These numbers are reproducible, and the [methodology](BENCHMARKS.md) includes th
 Each workload moves 1M rows on one machine, compared with Meltano running the equivalent
 Singer pipeline:
 
-| Workload | Bottleneck | faucet | Meltano | |
+| Workload | Bottleneck | faucet | Meltano | Speed-up |
 |---|---|---:|---:|---:|
 | CSV → JSONL | parsing and serialization | 712k rows/s, 11.8 MiB | 7.4k rows/s, 724 MiB | ~96× |
 | Postgres → JSONL | row decoding | 180k rows/s | 7.2k rows/s | ~25× |
