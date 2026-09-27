@@ -27,22 +27,28 @@ const CURRENT_FILE: &str = "current";
 /// Set to any non-empty value to skip the network and use the cache only.
 pub const OFFLINE_ENV: &str = "FAUCET_HUB_OFFLINE";
 /// Override the cache root (default `$XDG_CACHE_HOME/faucet/hub`, else
-/// `~/.cache/faucet/hub`).
+/// `%LOCALAPPDATA%/faucet/hub` on Windows, else `~/.cache/faucet/hub`).
 pub const CACHE_ENV: &str = "FAUCET_HUB_CACHE";
 
 /// Where remote hubs are cached.
 pub fn cache_root() -> PathBuf {
-    if let Ok(p) = std::env::var(CACHE_ENV)
-        && !p.trim().is_empty()
-    {
+    cache_root_from(|k| std::env::var(k).ok(), cfg!(windows))
+}
+
+fn cache_root_from(var: impl Fn(&str) -> Option<String>, windows: bool) -> PathBuf {
+    let set = |k: &str| var(k).filter(|v| !v.trim().is_empty());
+    if let Some(p) = set(CACHE_ENV) {
         return PathBuf::from(p);
     }
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME")
-        && !x.trim().is_empty()
-    {
+    if let Some(x) = set("XDG_CACHE_HOME") {
         return PathBuf::from(x).join("faucet").join("hub");
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    if windows && let Some(local) = set("LOCALAPPDATA") {
+        return PathBuf::from(local).join("faucet").join("hub");
+    }
+    let home = set("HOME")
+        .or_else(|| if windows { set("USERPROFILE") } else { None })
+        .unwrap_or_else(|| ".".into());
     PathBuf::from(home)
         .join(".cache")
         .join("faucet")
@@ -930,19 +936,45 @@ mod tests {
     #[test]
     #[serial_test::serial(hub_env)]
     fn cache_root_honours_overrides() {
-        // SAFETY: single-threaded assertions over env vars this test owns.
-        unsafe {
-            std::env::set_var(CACHE_ENV, "/tmp/hub-cache");
-        }
-        assert_eq!(cache_root(), PathBuf::from("/tmp/hub-cache"));
-        unsafe {
-            std::env::remove_var(CACHE_ENV);
-            std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg");
-        }
-        assert_eq!(cache_root(), PathBuf::from("/tmp/xdg/faucet/hub"));
-        unsafe {
-            std::env::remove_var("XDG_CACHE_HOME");
-        }
-        assert!(cache_root().ends_with(".cache/faucet/hub"));
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let hub = |p: &str| PathBuf::from(p).join("faucet").join("hub");
+        assert_eq!(
+            cache_root_from(env(&[(CACHE_ENV, "/c"), ("XDG_CACHE_HOME", "/x")]), false),
+            PathBuf::from("/c")
+        );
+        assert_eq!(
+            cache_root_from(env(&[(CACHE_ENV, " "), ("XDG_CACHE_HOME", "/x")]), true),
+            hub("/x")
+        );
+        assert_eq!(
+            cache_root_from(env(&[("LOCALAPPDATA", "C:/L"), ("HOME", "/h")]), true),
+            hub("C:/L")
+        );
+        assert_eq!(
+            cache_root_from(env(&[("LOCALAPPDATA", "C:/L"), ("HOME", "/h")]), false),
+            PathBuf::from("/h")
+                .join(".cache")
+                .join("faucet")
+                .join("hub")
+        );
+        assert_eq!(
+            cache_root_from(env(&[("USERPROFILE", "C:/U")]), true),
+            PathBuf::from("C:/U")
+                .join(".cache")
+                .join("faucet")
+                .join("hub")
+        );
+        assert_eq!(
+            cache_root_from(env(&[("USERPROFILE", "C:/U")]), false),
+            PathBuf::from(".").join(".cache").join("faucet").join("hub")
+        );
+        assert!(!cache_root().as_os_str().is_empty());
     }
 }
