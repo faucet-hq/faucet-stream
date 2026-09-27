@@ -1,0 +1,44 @@
+[package]
+name = "faucet-sink-singer"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Singer target bridge sink for the faucet-stream ecosystem — run any Singer target as a faucet sink"
+readme = "README.md"
+keywords = ["singer", "target", "meltano", "etl", "connector"]
+categories.workspace = true
+
+[dependencies]
+faucet-core.workspace = true
+faucet-common-singer.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+schemars.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile.workspace = true
+faucet-source-csv = { path = "../../source/csv" }
+faucet-conformance = { path = "../../conformance" }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides — the workspace-wide
+# declared contract (see crates/core/Cargo.toml): struct-literal construction
+# and exhaustive matching of config types are NOT part of the stability
+# surface, so adding an optional field or variant is a MINOR bump.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

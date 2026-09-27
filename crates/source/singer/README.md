@@ -7,7 +7,9 @@ A [Singer](https://www.singer.io/) tap bridge source for
 [faucet-stream](https://github.com/faucet-hq/faucet-stream). It runs an
 existing Singer **tap** executable and adapts its stdout message stream into
 faucet records — so any of the hundreds of community taps can feed a faucet
-pipeline.
+pipeline. Its counterpart, [`faucet-sink-singer`](../../sink/singer), runs a
+Singer **target** as a faucet sink; the protocol types both share live in
+[`faucet-common-singer`](../../common/singer).
 
 ## Honest trade-offs
 

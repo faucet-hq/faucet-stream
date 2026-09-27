@@ -4900,6 +4900,16 @@ name = "faucet-common-sqs"
 version = "1.0.5"
 dependencies = [
  "aws-config",
+[[package]]
+name = "faucet-common-singer"
+version = "1.0.0"
+dependencies = [
+ "faucet-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
  "aws-sdk-sqs",
  "faucet-core",
  "schemars 1.2.1",
@@ -5615,6 +5625,24 @@ dependencies = [
  "gcloud-spanner",
  "prost-types 0.14.3",
  "schemars 1.2.1",
+[[package]]
+name = "faucet-sink-singer"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "faucet-common-singer",
+ "faucet-conformance",
+ "faucet-core",
+ "faucet-source-csv",
+ "libc",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
  "serde",
  "serde_json",
  "testcontainers",
@@ -6473,6 +6501,7 @@ dependencies = [
 name = "faucet-source-spanner"
 version = "1.1.3"
 dependencies = [
+ "faucet-common-singer",
  "async-stream",
  "async-trait",
  "faucet-common-spanner",

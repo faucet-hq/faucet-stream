@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-singer.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 schemars.workspace = true
