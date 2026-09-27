@@ -4469,6 +4469,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "jsonpath-rust",
+ "jsonwebtoken 9.3.1",
  "percent-encoding",
  "reqwest 0.13.3",
  "serde",
@@ -4477,6 +4478,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "wiremock",
 ]
 

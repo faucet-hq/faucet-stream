@@ -25,6 +25,7 @@ pub fn build_auth_catalog(specs: Option<&HashMap<String, Value>>) -> CliResult<A
         return Ok(catalog);
     };
     for (name, spec) in specs {
+        register_key_material(spec);
         let provider =
             faucet_auth::build_provider(spec).map_err(|e| CliError::AuthProviderBuild {
                 name: name.clone(),
@@ -33,6 +34,41 @@ pub fn build_auth_catalog(specs: Option<&HashMap<String, Value>>) -> CliResult<A
         catalog.insert(name.clone(), provider);
     }
     Ok(catalog)
+}
+
+/// Register a `google_service_account` key's private key (and the raw key
+/// JSON) for log redaction, even when it was written inline rather than
+/// resolved from a secrets manager (#755).
+fn register_key_material(spec: &Value) {
+    if spec.get("type").and_then(Value::as_str) != Some("google_service_account") {
+        return;
+    }
+    let Some(config) = spec.get("config") else {
+        return;
+    };
+    let raw = match (config.get("key_json"), config.get("key_file")) {
+        (Some(Value::String(s)), _) => Some(s.clone()),
+        (Some(v @ Value::Object(_)), _) => Some(v.to_string()),
+        (_, Some(Value::String(path))) => std::fs::read_to_string(path).ok(),
+        _ => None,
+    };
+    let Some(raw) = raw else {
+        return;
+    };
+    crate::secrets::registry::register(&raw);
+    if let Some(pk) = serde_json::from_str::<Value>(&raw).ok().and_then(|v| {
+        v.get("private_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }) {
+        crate::secrets::registry::register(&pk);
+        for line in pk
+            .lines()
+            .filter(|l| l.len() >= 16 && !l.starts_with("-----"))
+        {
+            crate::secrets::registry::register(line);
+        }
+    }
 }
 
 /// Extract a connector config's `auth: { ref: <name> }` reference, if present.
@@ -101,5 +137,41 @@ mod tests {
             None
         );
         assert_eq!(auth_ref(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn service_account_key_material_is_registered_for_redaction() {
+        let pk = "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo755\n-----END PRIVATE KEY-----\n";
+        let key = serde_json::json!({"client_email": "a@b", "private_key": pk});
+        register_key_material(&serde_json::json!({
+            "type": "google_service_account",
+            "config": {"key_json": key}
+        }));
+        let out =
+            crate::secrets::registry::redact("leak QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo755 here");
+        assert!(
+            !out.contains("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo755"),
+            "{out}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k.json");
+        let pk2 = pk.replace("755", "766");
+        std::fs::write(
+            &file,
+            serde_json::json!({"client_email": "a@b", "private_key": pk2}).to_string(),
+        )
+        .unwrap();
+        register_key_material(&serde_json::json!({
+            "type": "google_service_account",
+            "config": {"key_file": file.to_str().unwrap()}
+        }));
+        let out = crate::secrets::registry::redact("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo766");
+        assert!(!out.contains("766"), "{out}");
+        register_key_material(&serde_json::json!({"type": "static", "config": {"token": "t"}}));
+        register_key_material(&serde_json::json!({"type": "google_service_account"}));
+        register_key_material(
+            &serde_json::json!({"type": "google_service_account", "config": {"key_json": 5}}),
+        );
     }
 }
