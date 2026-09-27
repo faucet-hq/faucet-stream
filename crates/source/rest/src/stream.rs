@@ -1104,7 +1104,7 @@ impl RestStream {
                     let params_clone = params.clone();
                     let ctx_ref = owned_context.as_ref();
                     let is_first_page = pages_fetched == 0;
-                    let (body, resp_headers) = retry::execute_with_retry(
+                    let (body, resp_headers) = retry::execute_with_retry_recorded(
                         // The REST runner takes retries-after-first; the policy holds
                         // total attempts. Feed both knobs from the resolved policy so
                         // an injected `resilience:` policy (when legacy fields are
@@ -1112,6 +1112,7 @@ impl RestStream {
                         // runner keeps its 429 / `Retry-After` handling.
                         self.retry_policy.max_attempts.saturating_sub(1),
                         self.retry_policy.base,
+                        self.roundtrips.get().cloned(),
                         || {
                             self.execute_request(
                                 &params_clone,
@@ -1471,9 +1472,10 @@ impl RestStream {
         // submitted job, and a connection dropped mid-body is retried the same
         // way the pagination path retries a page. Same policy knobs as the
         // pagination runner.
-        retry::execute_with_retry(
+        retry::execute_with_retry_recorded(
             self.retry_policy.max_attempts.saturating_sub(1),
             self.retry_policy.base,
+            self.roundtrips.get().cloned(),
             || async {
                 let resp = self
                     .job_request_response_once(op, method, url, headers, query, json)
@@ -1502,9 +1504,10 @@ impl RestStream {
         query: &HashMap<String, String>,
         json: Option<&Value>,
     ) -> Result<reqwest::Response, FaucetError> {
-        retry::execute_with_retry(
+        retry::execute_with_retry_recorded(
             self.retry_policy.max_attempts.saturating_sub(1),
             self.retry_policy.base,
+            self.roundtrips.get().cloned(),
             || self.job_request_response_once(op, method, url, headers, query, json),
         )
         .await
