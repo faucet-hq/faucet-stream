@@ -11,7 +11,7 @@ Built on the official `aws-sdk-s3` client (built once, reused across every read)
 
 ## Feature highlights
 
-- **Seven file formats** — `json_lines`, `json_array`, `raw_text`, `parquet`, plus `csv`, `xml` and `xlsx` via [file formats](#file-formats-604).
+- **Nine file formats** — `json_lines`, `json_array`, `raw_text`, `parquet`, plus `csv`, `xml`, `xlsx`, `avro` and `orc` via [file formats](#file-formats-604).
 - **Apache Parquet (Arrow columnar)** — behind the `arrow` feature, a fourth format `file_format: parquet` decodes each object via the Arrow Parquet reader and, when the sink is also Arrow-native (Parquet / Delta), moves records end-to-end as Arrow `RecordBatch`es with no `serde_json::Value` in between. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).
 - **Parallel object reads** — up to `concurrency` objects fetched at once (default 10), on the streaming path as well as the batch one. The streaming prefetch is *ordered*, so records still arrive in listing order and a failing object is still blamed at its own position.
 - **True line-level streaming** — for `json_lines` / `raw_text`, object bodies are decoded line-by-line via `tokio::io::AsyncBufReadExt`, so client memory is bounded at `O(batch_size)` regardless of file or scan size.
@@ -446,6 +446,35 @@ chunked into pages — a workbook is a zip container whose directory sits at the
 end, and an XML document is a tree. `csv` and `xml` are text formats: every
 value comes back a string. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+
+## Avro and ORC (#719)
+
+`file_format: avro` reads Avro Object Container Files. Every object is resolved
+against one reader schema: `avro.schema` when set, else the first object's
+writer schema. A object that cannot be resolved against it fails the run with
+an error naming both. Logical types are mapped explicitly: `decimal` becomes
+an exact string on the row path and `Decimal128` on the columnar path, and
+`date` / `timestamp-*` / `uuid` likewise.
+
+`file_format: orc` reads ORC (read-only; there is no ORC sink), projected by
+`orc.columns`. The whole object is fetched first, because the footer is at the
+end, and then decoded stripe by stripe. Every object must share one schema.
+
+```yaml
+file_format: avro
+avro:
+  schema: { type: record, name: order, fields: [ { name: id, type: long } ] }   # optional
+# or
+file_format: orc
+orc:
+  columns: [id, amount]
+```
+
+Both decode straight to Arrow, so with the `arrow` feature they take the
+columnar path (`avro → parquet` never builds JSON rows). Enable with
+`file-format-avro` / `file-format-orc` (ORC turns on `arrow`), or with
+`file-formats`. Details: the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
 
 ## License
 

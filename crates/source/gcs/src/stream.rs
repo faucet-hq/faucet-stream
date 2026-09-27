@@ -47,9 +47,17 @@ enum Fetched {
     #[cfg(any(
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ))]
     Records(Vec<Value>),
+    /// A whole Avro or ORC object (#719). Decoded in listing order by the
+    /// page loop's [`ContainerDecoder`](faucet_core::ContainerDecoder), not
+    /// at fetch time, because every object is resolved against the first
+    /// one's schema and prefetch completes out of order.
+    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+    Container(Vec<u8>),
 }
 
 /// A GCS source that lists and reads objects from a bucket.
@@ -157,7 +165,33 @@ impl GcsSource {
             GcsFileFormat::Xml => self.fetch_decoded(key).await?,
             #[cfg(feature = "file-format-excel")]
             GcsFileFormat::Xlsx => self.fetch_decoded(key).await?,
+            #[cfg(feature = "file-format-avro")]
+            GcsFileFormat::Avro => Fetched::Container(self.read_object_all(key).await?),
+            #[cfg(feature = "file-format-orc")]
+            GcsFileFormat::Orc => Fetched::Container(self.read_object_all(key).await?),
         })
+    }
+
+    /// A decoder for the configured container format, or `None` for every
+    /// other format.
+    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+    fn container_decoder(&self) -> Result<Option<faucet_core::ContainerDecoder>, FaucetError> {
+        match self.config.file_format.shared() {
+            Some(f) if f.is_container() => Ok(Some(faucet_core::ContainerDecoder::new(
+                f,
+                &self.config.format_options(),
+            )?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the configured format is Avro or ORC.
+    fn is_container(&self) -> bool {
+        #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+        if let Some(f) = self.config.file_format.shared() {
+            return f.is_container();
+        }
+        false
     }
 
     /// Read one object whole and decode it through the shared format layer.
@@ -401,7 +435,9 @@ impl GcsSource {
         feature = "arrow",
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
         use tokio::io::AsyncReadExt as _;
@@ -431,7 +467,9 @@ impl GcsSource {
 #[cfg(any(
     feature = "file-format-csv",
     feature = "file-format-xml",
-    feature = "file-format-excel"
+    feature = "file-format-excel",
+    feature = "file-format-avro",
+    feature = "file-format-orc"
 ))]
 fn shared_format_via_text(key: &str, format: &str) -> FaucetError {
     FaucetError::Source(format!(
@@ -494,6 +532,10 @@ pub(crate) fn parse_file_content(
         GcsFileFormat::Xml => Err(shared_format_via_text(key, "xml")),
         #[cfg(feature = "file-format-excel")]
         GcsFileFormat::Xlsx => Err(shared_format_via_text(key, "xlsx")),
+        #[cfg(feature = "file-format-avro")]
+        GcsFileFormat::Avro => Err(shared_format_via_text(key, "avro")),
+        #[cfg(feature = "file-format-orc")]
+        GcsFileFormat::Orc => Err(shared_format_via_text(key, "orc")),
         #[cfg(feature = "arrow")]
         GcsFileFormat::Parquet => Err(FaucetError::Source(format!(
             "GCS parquet object '{key}' cannot be parsed as text (internal error: \
@@ -569,6 +611,16 @@ impl faucet_core::Source for GcsSource {
         &self,
         context: &std::collections::HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
+        // Avro / ORC decode in listing order against the first object's
+        // schema, which the ordered page stream already guarantees.
+        if self.is_container() {
+            let mut out = Vec::new();
+            let mut pages = self.stream_pages(context, 0);
+            while let Some(page) = pages.next().await {
+                out.extend(page?.records);
+            }
+            return Ok(out);
+        }
         let substituted_prefix: Option<String> = if !context.is_empty() {
             self.config
                 .prefix
@@ -659,10 +711,23 @@ impl faucet_core::Source for GcsSource {
                     (key, payload)
                 })
                 .buffered(concurrency);
+            #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+            let mut container = self.container_decoder()?;
 
             while let Some((key, payload)) = fetched.next().await {
                 let key = &key;
-                match payload? {
+                let payload = payload?;
+                #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+                let payload = match payload {
+                    Fetched::Container(bytes) => Fetched::Records(
+                        container
+                            .as_mut()
+                            .expect("a container object implies a container format")
+                            .decode_all(key, faucet_core::FileInput::Bytes(bytes))?,
+                    ),
+                    other => other,
+                };
+                match payload {
                     Fetched::Lines(reader) => {
                         let mut lines = reader.lines();
                         let mut line_num: usize = 0;
@@ -802,10 +867,14 @@ impl faucet_core::Source for GcsSource {
                             }
                         }
                     }
+                    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+                    Fetched::Container(_) => unreachable!("decoded above"),
                     #[cfg(any(
                         feature = "file-format-csv",
                         feature = "file-format-xml",
-                        feature = "file-format-excel"
+                        feature = "file-format-excel",
+                        feature = "file-format-avro",
+                        feature = "file-format-orc"
                     ))]
                     Fetched::Records(records) => {
                         // CSV / XML / Excel (#604): already decoded at fetch
@@ -856,7 +925,7 @@ impl faucet_core::Source for GcsSource {
     /// path (RFC 0002 / #375).
     #[cfg(feature = "arrow")]
     fn supports_columnar(&self) -> bool {
-        matches!(self.config.file_format, GcsFileFormat::Parquet)
+        matches!(self.config.file_format, GcsFileFormat::Parquet) || self.is_container()
     }
 
     /// Stream Parquet objects natively as Arrow `RecordBatch`es — one
@@ -877,11 +946,15 @@ impl faucet_core::Source for GcsSource {
         >,
     > {
         Box::pin(async_stream::try_stream! {
-            if !matches!(self.config.file_format, GcsFileFormat::Parquet) {
+            if !self.supports_columnar() {
                 Err(FaucetError::Source(
-                    "GCS source: stream_batches invoked for a non-parquet file_format".into(),
+                    "GCS source: stream_batches invoked for a file_format without an Arrow \
+                     path"
+                        .into(),
                 ))?;
             }
+            #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+            let mut container = self.container_decoder()?;
 
             let substituted_prefix: Option<String> = if !context.is_empty() {
                 self.config
@@ -923,6 +996,18 @@ impl faucet_core::Source for GcsSource {
                     Fetched::Parquet(data) => {
                         let (schema, batches) = Self::decode_parquet(data, key).await?;
                         check_schema(&mut reference, &schema, key)?;
+                        pending = batches;
+                    }
+                    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+                    Fetched::Container(bytes) => {
+                        let (_, batches) = container
+                            .as_mut()
+                            .expect("a container object implies a container format")
+                            .decode_batches(
+                                key,
+                                faucet_core::FileInput::Bytes(bytes),
+                                self.config.batch_size,
+                            )?;
                         pending = batches;
                     }
                     _ => Err(FaucetError::Source(format!(

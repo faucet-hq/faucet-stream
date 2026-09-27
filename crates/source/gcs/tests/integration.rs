@@ -594,3 +594,65 @@ async fn parquet_schema_mismatch_across_objects_is_an_error() {
     let mut non_parquet = jsonl.stream_batches(&ctx, 0);
     assert!(non_parquet.next().await.unwrap().is_err());
 }
+
+/// Avro and ORC objects (#719): resolved against the first object's schema on
+/// the row path and the columnar path alike.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
+#[tokio::test]
+async fn avro_and_orc_objects_decode_on_both_paths() {
+    use faucet_core::{AvroCodec, AvroOptions, OrcOptions};
+    use futures::StreamExt;
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let avro = |r: Vec<serde_json::Value>| {
+        faucet_core::file_format::avro::encode(&r, &AvroOptions { schema: None, codec: AvroCodec::Zstd })
+            .expect("encode avro")
+    };
+    let ct = "application/octet-stream";
+    seed_bytes(&host, &bucket, "avro/a.avro", avro(vec![serde_json::json!({"id": 1})]), ct).await;
+    seed_bytes(&host, &bucket, "avro/b.avro", avro(vec![serde_json::json!({"id": 2})]), ct).await;
+    seed_bytes(&host, &bucket, "bad/a.avro", avro(vec![serde_json::json!({"id": 1})]), ct).await;
+    seed_bytes(&host, &bucket, "bad/b.avro", avro(vec![serde_json::json!({"id": false})]), ct).await;
+    seed_bytes(
+        &host,
+        &bucket,
+        "orc/p.orc",
+        include_bytes!("../../../core/tests/fixtures/orc/people.orc").to_vec(),
+        ct,
+    )
+    .await;
+    let build = |prefix: &str, fmt: GcsFileFormat| {
+        GcsSourceConfig::new(&bucket)
+            .prefix(prefix)
+            .file_format(fmt)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host)
+    };
+    async fn columnar(src: &GcsSource) -> Result<usize, String> {
+        let ctx = HashMap::new();
+        let mut batches = src.stream_batches(&ctx, 0);
+        let mut n = 0;
+        while let Some(page) = batches.next().await {
+            n += page.map_err(|e| e.to_string())?.num_rows();
+        }
+        Ok(n)
+    }
+
+    let src = GcsSource::new(build("avro/", GcsFileFormat::Avro)).await.unwrap();
+    assert!(src.supports_columnar());
+    let rows = stream_all(&src).await;
+    assert_eq!(rows, vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]);
+    assert_eq!(src.fetch_with_context(&HashMap::new()).await.unwrap(), rows);
+    assert_eq!(columnar(&src).await, Ok(2));
+
+    let bad = GcsSource::new(build("bad/", GcsFileFormat::Avro)).await.unwrap();
+    let err = columnar(&bad).await.expect_err("conflict");
+    assert!(err.contains("bad/a.avro") && err.contains("bad/b.avro"), "{err}");
+
+    let mut cfg = build("orc/", GcsFileFormat::Orc);
+    cfg.orc = OrcOptions { columns: Some(vec!["id".into()]) };
+    let orc = GcsSource::new(cfg).await.unwrap();
+    assert_eq!(stream_all(&orc).await.len(), 3);
+    assert_eq!(columnar(&orc).await, Ok(3));
+}

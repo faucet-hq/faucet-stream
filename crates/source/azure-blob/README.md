@@ -97,6 +97,35 @@ end, and an XML document is a tree. `csv` and `xml` are text formats: every
 value comes back a string. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
+## Avro and ORC (#719)
+
+`file_format: avro` reads Avro Object Container Files. Every blob is resolved
+against one reader schema: `avro.schema` when set, else the first blob's
+writer schema. A blob that cannot be resolved against it fails the run with
+an error naming both. Logical types are mapped explicitly: `decimal` becomes
+an exact string on the row path and `Decimal128` on the columnar path, and
+`date` / `timestamp-*` / `uuid` likewise.
+
+`file_format: orc` reads ORC (read-only; there is no ORC sink), projected by
+`orc.columns`. The whole blob is fetched first, because the footer is at the
+end, and then decoded stripe by stripe. Every blob must share one schema.
+
+```yaml
+file_format: avro
+avro:
+  schema: { type: record, name: order, fields: [ { name: id, type: long } ] }   # optional
+# or
+file_format: orc
+orc:
+  columns: [id, amount]
+```
+
+Both decode straight to Arrow, so with the `arrow` feature they take the
+columnar path (`avro → parquet` never builds JSON rows). Enable with
+`file-format-avro` / `file-format-orc` (ORC turns on `arrow`), or with
+`file-formats`. Details: the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
+
 ## Example
 
 ```yaml

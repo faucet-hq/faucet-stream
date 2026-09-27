@@ -33,9 +33,17 @@ enum Fetched {
     #[cfg(any(
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ))]
     Records(Vec<Value>),
+    /// A whole Avro or ORC file (#719). Decoded in listing order by the page
+    /// loop's [`ContainerDecoder`](faucet_core::ContainerDecoder), not at
+    /// fetch time, because every file is resolved against the first one's
+    /// schema and prefetch completes out of order.
+    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+    Container(Vec<u8>),
 }
 
 /// An SFTP source that lists and reads remote files.
@@ -140,7 +148,38 @@ impl SftpSource {
             SftpFormat::Xml => Self::fetch_decoded(sftp, path, format, opts).await?,
             #[cfg(feature = "file-format-excel")]
             SftpFormat::Xlsx => Self::fetch_decoded(sftp, path, format, opts).await?,
+            #[cfg(feature = "file-format-avro")]
+            SftpFormat::Avro => Fetched::Container(Self::read_file(sftp, path).await?),
+            #[cfg(feature = "file-format-orc")]
+            SftpFormat::Orc => Fetched::Container(Self::read_file(sftp, path).await?),
         })
+    }
+
+    /// A remote file's whole body.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
+    ))]
+    async fn read_file(sftp: &SftpSession, path: &str) -> Result<Vec<u8>, FaucetError> {
+        sftp.read(path)
+            .await
+            .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))
+    }
+
+    /// A decoder for the configured container format, or `None` for every
+    /// other format.
+    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+    fn container_decoder(&self) -> Result<Option<faucet_core::ContainerDecoder>, FaucetError> {
+        match self.config.format.shared() {
+            Some(f) if f.is_container() => Ok(Some(faucet_core::ContainerDecoder::new(
+                f,
+                &self.config.format_options(),
+            )?)),
+            _ => Ok(None),
+        }
     }
 
     /// Read one remote file whole and decode it through the shared format
@@ -160,10 +199,7 @@ impl SftpSource {
         format: SftpFormat,
         opts: &faucet_core::FormatOptions,
     ) -> Result<Fetched, FaucetError> {
-        let bytes = sftp
-            .read(path)
-            .await
-            .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))?;
+        let bytes = Self::read_file(sftp, path).await?;
         let shared = format
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("SFTP '{path}': format has no decoder")))?;
@@ -238,10 +274,23 @@ impl faucet_core::Source for SftpSource {
                     }
                 })
                 .buffered(concurrency);
+            #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+            let mut container = self.container_decoder()?;
 
             while let Some((file, payload)) = fetched.next().await {
                 let file = &file;
-                match payload? {
+                let payload = payload?;
+                #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+                let payload = match payload {
+                    Fetched::Container(bytes) => Fetched::Records(
+                        container
+                            .as_mut()
+                            .expect("a container file implies a container format")
+                            .decode_all(file, faucet_core::FileInput::Bytes(bytes))?,
+                    ),
+                    other => other,
+                };
+                match payload {
                     Fetched::Lines(handle) => {
                         let reader = tokio::io::BufReader::new(handle);
                         let mut lines = reader.lines();
@@ -323,10 +372,14 @@ impl faucet_core::Source for SftpSource {
                             }
                         }
                     }
+                    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+                    Fetched::Container(_) => unreachable!("decoded above"),
                     #[cfg(any(
                         feature = "file-format-csv",
                         feature = "file-format-xml",
-                        feature = "file-format-excel"
+                        feature = "file-format-excel",
+                        feature = "file-format-avro",
+                        feature = "file-format-orc"
                     ))]
                     Fetched::Records(records) => {
                         // CSV / XML / Excel (#604): already decoded at fetch
@@ -373,6 +426,55 @@ impl faucet_core::Source for SftpSource {
 
     fn connector_name(&self) -> &'static str {
         "sftp"
+    }
+
+    /// Avro and ORC files decode straight to Arrow, so they take the columnar
+    /// path; every other format stays on the row path (#719).
+    #[cfg(all(
+        feature = "arrow",
+        any(feature = "file-format-avro", feature = "file-format-orc")
+    ))]
+    fn supports_columnar(&self) -> bool {
+        self.config.format.shared().is_some_and(|f| f.is_container())
+    }
+
+    /// Stream Avro / ORC files as Arrow batches, in listing order, each file
+    /// resolved against the first one's schema.
+    #[cfg(all(
+        feature = "arrow",
+        any(feature = "file-format-avro", feature = "file-format-orc")
+    ))]
+    fn stream_batches<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+        _batch_size: usize,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async_stream::try_stream! {
+            let decoder = match self.container_decoder()? {
+                Some(d) => d,
+                None => Err(FaucetError::Source(
+                    "SFTP source: stream_batches needs format avro or orc".into(),
+                ))?,
+            };
+            let sftp = connect(&self.config.connection).await?;
+            let path = self.effective_path(context);
+            let files = self.resolve_files(&sftp, &path).await?;
+            let sftp = &sftp;
+            let mut pages = faucet_core::file_format::container::columnar_pages(
+                files,
+                self.config.concurrency,
+                decoder,
+                self.config.batch_size,
+                |file| async move { Self::read_file(sftp, &file).await },
+            );
+            while let Some(page) = pages.next().await {
+                yield page?;
+            }
+        })
     }
 
     fn dataset_uri(&self) -> String {

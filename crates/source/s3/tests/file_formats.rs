@@ -195,3 +195,96 @@ async fn decoded_records_chunk_at_the_batch_size() {
         "a trailing partial page is still emitted"
     );
 }
+
+/// Avro and ORC objects (#719): every object in the prefix is resolved against
+/// the first one's schema, on the row path and the columnar path alike.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
+mod containers {
+    use super::*;
+    use faucet_core::{AvroCodec, AvroOptions, OrcOptions};
+
+    const ORC: &[u8] = include_bytes!("../../../core/tests/fixtures/orc/people.orc");
+
+    fn avro(records: &[Value], codec: AvroCodec) -> Vec<u8> {
+        faucet_core::file_format::avro::encode(records, &AvroOptions { schema: None, codec })
+            .expect("encode avro")
+    }
+
+    async fn columnar_rows(src: &S3Source) -> usize {
+        let ctx = HashMap::new();
+        assert!(src.supports_columnar());
+        let mut batches = src.stream_batches(&ctx, 0);
+        let mut n = 0;
+        while let Some(page) = batches.next().await {
+            n += page.expect("columnar page").num_rows();
+        }
+        n
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mixed_avro_prefix_reads_as_one_shape() {
+        let (_c, endpoint) = start_minio().await;
+        seed(
+            &endpoint,
+            &[
+                ("avro/a.avro".into(), avro(&[json!({"id": 1, "name": "a"})], AvroCodec::Null)),
+                ("avro/b.avro".into(), avro(&[json!({"id": 2, "name": "b"})], AvroCodec::Snappy)),
+                (
+                    "avro/c.avro".into(),
+                    avro(&[json!({"id": 3, "name": "c", "extra": true})], AvroCodec::Zstd),
+                ),
+                ("avro/d.avro".into(), avro(&[json!({"id": 4, "name": "d"})], AvroCodec::Deflate)),
+                ("bad/a.avro".into(), avro(&[json!({"id": 1})], AvroCodec::Null)),
+                ("bad/b.avro".into(), avro(&[json!({"id": "x"})], AvroCodec::Null)),
+            ],
+        )
+        .await;
+        let cfg = S3SourceConfig::new(TEST_BUCKET)
+            .prefix("avro/")
+            .file_format(S3FileFormat::Avro)
+            .with_batch_size(2);
+        let src = build_source(&endpoint, cfg).await;
+        let want: Vec<Value> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| json!({"id": i + 1, "name": n}))
+            .collect();
+        assert_eq!(drain(&src).await, want);
+        assert_eq!(src.fetch_with_context(&HashMap::new()).await.expect("fetch"), want);
+        assert_eq!(columnar_rows(&src).await, 4);
+
+        let bad = build_source(
+            &endpoint,
+            S3SourceConfig::new(TEST_BUCKET)
+                .prefix("bad/")
+                .file_format(S3FileFormat::Avro),
+        )
+        .await;
+        let ctx = HashMap::new();
+        let mut pages = bad.stream_pages(&ctx, 0);
+        let mut err = None;
+        while let Some(page) = pages.next().await {
+            if let Err(e) = page {
+                err = Some(e.to_string());
+            }
+        }
+        let err = err.expect("conflicting schemas fail");
+        assert!(err.contains("bad/a.avro") && err.contains("bad/b.avro"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn orc_objects_are_projected() {
+        let (_c, endpoint) = start_minio().await;
+        seed(&endpoint, &[("orc/p.orc".into(), ORC.to_vec())]).await;
+        let mut cfg = S3SourceConfig::new(TEST_BUCKET)
+            .prefix("orc/")
+            .file_format(S3FileFormat::Orc)
+            .with_batch_size(0);
+        cfg.orc = OrcOptions { columns: Some(vec!["id".into(), "name".into()]) };
+        let src = build_source(&endpoint, cfg).await;
+        let rows = drain(&src).await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2], json!({"id": 3, "name": "grace"}));
+        assert_eq!(columnar_rows(&src).await, 3);
+    }
+}

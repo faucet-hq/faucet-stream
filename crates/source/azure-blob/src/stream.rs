@@ -34,9 +34,17 @@ enum Fetched {
     #[cfg(any(
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ))]
     Records(Vec<Value>),
+    /// A whole Avro or ORC blob (#719). Decoded in listing order by the page
+    /// loop's [`ContainerDecoder`](faucet_core::ContainerDecoder), not at
+    /// fetch time, because every blob is resolved against the first one's
+    /// schema and prefetch completes out of order.
+    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+    Container(Vec<u8>),
 }
 
 /// An Azure Blob source that lists and reads objects from a container.
@@ -105,7 +113,52 @@ impl AzureBlobSource {
             AzureFileFormat::Xml => self.fetch_decoded(key).await?,
             #[cfg(feature = "file-format-excel")]
             AzureFileFormat::Xlsx => self.fetch_decoded(key).await?,
+            #[cfg(feature = "file-format-avro")]
+            AzureFileFormat::Avro => Fetched::Container(self.read_object_all(key).await?),
+            #[cfg(feature = "file-format-orc")]
+            AzureFileFormat::Orc => Fetched::Container(self.read_object_all(key).await?),
         })
+    }
+
+    /// A blob's whole body, after any configured decompression.
+    #[cfg(any(
+        feature = "file-format-csv",
+        feature = "file-format-xml",
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
+    ))]
+    async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
+        use tokio::io::AsyncReadExt as _;
+        let mut reader = self.open_object_reader(key).await?;
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| FaucetError::Source(format!("azure read error for key '{key}': {e}")))?;
+        Ok(bytes)
+    }
+
+    /// A decoder for the configured container format, or `None` for every
+    /// other format.
+    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+    fn container_decoder(&self) -> Result<Option<faucet_core::ContainerDecoder>, FaucetError> {
+        match self.config.file_format.shared() {
+            Some(f) if f.is_container() => Ok(Some(faucet_core::ContainerDecoder::new(
+                f,
+                &self.config.format_options(),
+            )?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the configured format is Avro or ORC.
+    fn is_container(&self) -> bool {
+        #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+        if let Some(f) = self.config.file_format.shared() {
+            return f.is_container();
+        }
+        false
     }
 
     /// Read one blob whole and decode it through the shared format layer.
@@ -119,13 +172,7 @@ impl AzureBlobSource {
         feature = "file-format-excel"
     ))]
     async fn fetch_decoded(&self, key: &str) -> Result<Fetched, FaucetError> {
-        use tokio::io::AsyncReadExt as _;
-        let mut reader = self.open_object_reader(key).await?;
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| FaucetError::Source(format!("azure read error for key '{key}': {e}")))?;
+        let bytes = self.read_object_all(key).await?;
         let format =
             self.config.file_format.shared().ok_or_else(|| {
                 FaucetError::Source(format!("azure '{key}': format has no decoder"))
@@ -213,7 +260,9 @@ impl AzureBlobSource {
 #[cfg(any(
     feature = "file-format-csv",
     feature = "file-format-xml",
-    feature = "file-format-excel"
+    feature = "file-format-excel",
+    feature = "file-format-avro",
+    feature = "file-format-orc"
 ))]
 fn shared_format_via_text(key: &str, format: &str) -> FaucetError {
     FaucetError::Source(format!(
@@ -266,6 +315,10 @@ pub(crate) fn parse_file_content(
         AzureFileFormat::Xml => Err(shared_format_via_text(key, "xml")),
         #[cfg(feature = "file-format-excel")]
         AzureFileFormat::Xlsx => Err(shared_format_via_text(key, "xlsx")),
+        #[cfg(feature = "file-format-avro")]
+        AzureFileFormat::Avro => Err(shared_format_via_text(key, "avro")),
+        #[cfg(feature = "file-format-orc")]
+        AzureFileFormat::Orc => Err(shared_format_via_text(key, "orc")),
         AzureFileFormat::RawText => Ok(vec![serde_json::json!({
             "key": key,
             "content": text,
@@ -326,6 +379,16 @@ impl faucet_core::Source for AzureBlobSource {
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<Vec<Value>, FaucetError> {
+        // Avro / ORC decode in listing order against the first blob's schema,
+        // which the ordered page stream already guarantees.
+        if self.is_container() {
+            let mut out = Vec::new();
+            let mut pages = self.stream_pages(context, 0);
+            while let Some(page) = pages.next().await {
+                out.extend(page?.records);
+            }
+            return Ok(out);
+        }
         let substituted_prefix: Option<String> = if !context.is_empty() {
             self.config
                 .prefix
@@ -406,10 +469,23 @@ impl faucet_core::Source for AzureBlobSource {
                     (key, payload)
                 })
                 .buffered(concurrency);
+            #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+            let mut container = self.container_decoder()?;
 
             while let Some((key, payload)) = fetched.next().await {
                 let key = &key;
-                match payload? {
+                let payload = payload?;
+                #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+                let payload = match payload {
+                    Fetched::Container(bytes) => Fetched::Records(
+                        container
+                            .as_mut()
+                            .expect("a container object implies a container format")
+                            .decode_all(key, faucet_core::FileInput::Bytes(bytes))?,
+                    ),
+                    other => other,
+                };
+                match payload {
                     Fetched::Lines(reader) => {
                         let mut lines = reader.lines();
                         let mut line_num: usize = 0;
@@ -493,10 +569,14 @@ impl faucet_core::Source for AzureBlobSource {
                             }
                         }
                     }
+                    #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+                    Fetched::Container(_) => unreachable!("decoded above"),
                     #[cfg(any(
                         feature = "file-format-csv",
                         feature = "file-format-xml",
-                        feature = "file-format-excel"
+                        feature = "file-format-excel",
+                        feature = "file-format-avro",
+                        feature = "file-format-orc"
                     ))]
                     Fetched::Records(records) => {
                         // CSV / XML / Excel (#604): already decoded at fetch
@@ -548,6 +628,60 @@ impl faucet_core::Source for AzureBlobSource {
 
     fn connector_name(&self) -> &'static str {
         "azure-blob"
+    }
+
+    /// Avro and ORC blobs decode straight to Arrow, so they take the columnar
+    /// path; every other format stays on the row path (#719).
+    #[cfg(all(
+        feature = "arrow",
+        any(feature = "file-format-avro", feature = "file-format-orc")
+    ))]
+    fn supports_columnar(&self) -> bool {
+        self.is_container()
+    }
+
+    /// Stream Avro / ORC blobs as Arrow batches, in listing order, each blob
+    /// resolved against the first one's schema.
+    #[cfg(all(
+        feature = "arrow",
+        any(feature = "file-format-avro", feature = "file-format-orc")
+    ))]
+    fn stream_batches<'a>(
+        &'a self,
+        context: &'a HashMap<String, Value>,
+        _batch_size: usize,
+    ) -> Pin<
+        Box<
+            dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async_stream::try_stream! {
+            let decoder = match self.container_decoder()? {
+                Some(d) => d,
+                None => Err(FaucetError::Source(
+                    "azure source: stream_batches needs file_format avro or orc".into(),
+                ))?,
+            };
+            let prefix = if context.is_empty() {
+                None
+            } else {
+                self.config
+                    .prefix
+                    .as_ref()
+                    .map(|p| faucet_core::util::substitute_context(p, context))
+            };
+            let keys = self.list_object_names(prefix.as_deref()).await?;
+            let mut pages = faucet_core::file_format::container::columnar_pages(
+                keys,
+                self.config.concurrency,
+                decoder,
+                self.config.batch_size,
+                |key| async move { self.read_object_all(&key).await },
+            );
+            while let Some(page) = pages.next().await {
+                yield page?;
+            }
+        })
     }
 
     fn dataset_uri(&self) -> String {

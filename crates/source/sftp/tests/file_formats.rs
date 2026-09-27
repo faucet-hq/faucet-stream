@@ -135,3 +135,59 @@ async fn an_unreadable_workbook_is_a_typed_error() {
     let err = first.expect_err("a non-workbook must not decode");
     assert!(err.to_string().contains("bad.xlsx"), "{err}");
 }
+
+/// Avro and ORC files (#719): resolved against the first file's schema on the
+/// row path and the columnar path alike.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
+mod containers {
+    use super::*;
+    use faucet_core::{AvroCodec, AvroOptions, OrcOptions};
+
+    const ORC: &[u8] = include_bytes!("../../../core/tests/fixtures/orc/people.orc");
+
+    fn avro(records: &[Value]) -> Vec<u8> {
+        faucet_core::file_format::avro::encode(
+            records,
+            &AvroOptions { schema: None, codec: AvroCodec::Snappy },
+        )
+        .expect("encode avro")
+    }
+
+    async fn columnar(src: &SftpSource) -> Result<usize, String> {
+        let ctx = HashMap::new();
+        let mut batches = src.stream_batches(&ctx, 0);
+        let mut n = 0;
+        while let Some(page) = batches.next().await {
+            n += page.map_err(|e| e.to_string())?.num_rows();
+        }
+        Ok(n)
+    }
+
+    #[tokio::test]
+    async fn avro_and_orc_files_decode_on_both_paths() {
+        let files = vec![
+            ("a.avro".to_string(), avro(&[json!({"id": 1})])),
+            ("b.avro".to_string(), avro(&[json!({"id": 2})])),
+            ("p.orc".to_string(), ORC.to_vec()),
+        ];
+        let Some((_c, port)) = start_sftp(&files).await else {
+            return;
+        };
+        let src = source(port, SftpFormat::Avro, "*.avro");
+        assert!(src.supports_columnar());
+        assert_eq!(drain(&src).await, vec![json!({"id": 1}), json!({"id": 2})]);
+        assert_eq!(src.fetch_with_context(&HashMap::new()).await.expect("fetch").len(), 2);
+        assert_eq!(columnar(&src).await, Ok(2));
+
+        let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+        let mut cfg = SftpSourceConfig::new(conn, "/data").format(SftpFormat::Orc).glob("*.orc");
+        cfg.orc = OrcOptions { columns: Some(vec!["id".into()]) };
+        let orc = SftpSource::new(cfg).expect("config");
+        assert_eq!(drain(&orc).await[1], json!({"id": 2}));
+        assert_eq!(columnar(&orc).await, Ok(3));
+
+        let csv = source(port, SftpFormat::Csv, "*.avro");
+        assert!(!csv.supports_columnar());
+        assert!(columnar(&csv).await.is_err());
+    }
+}
