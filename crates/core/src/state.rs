@@ -52,6 +52,203 @@ pub trait StateStore: Send + Sync {
     ) -> Result<crate::check::CheckReport, FaucetError> {
         Ok(crate::check::CheckReport::not_implemented())
     }
+
+    /// Whether [`list`](Self::list) can enumerate keys. Every built-in store
+    /// can; the default is `false` so a third-party store keeps compiling.
+    fn supports_list(&self) -> bool {
+        false
+    }
+
+    /// Every stored key that starts with `prefix`, sorted ascending.
+    ///
+    /// Used to enumerate a pipeline's namespace (`{name}::…`) for
+    /// `faucet state show|export`. The default returns a typed error.
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>, FaucetError> {
+        Err(FaucetError::State(
+            "this state store cannot enumerate its keys".into(),
+        ))
+    }
+
+    /// Whether [`put_batch`](Self::put_batch) commits all-or-nothing.
+    fn supports_atomic_batch(&self) -> bool {
+        false
+    }
+
+    /// Store every entry. When [`supports_atomic_batch`](Self::supports_atomic_batch)
+    /// is `true` either all entries land or none do; the default writes them
+    /// one by one, so an error can leave a prefix of `entries` written.
+    async fn put_batch(&self, entries: &[(String, Value)]) -> Result<(), FaucetError> {
+        for (key, value) in entries {
+            self.put(key, value).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Version of the [`StateExport`] document this build writes and reads.
+pub const STATE_EXPORT_VERSION: u32 = 1;
+
+/// The key prefix every state key of pipeline `name` starts with.
+pub fn namespace_prefix(pipeline: &str) -> String {
+    format!("{pipeline}::")
+}
+
+/// A portable snapshot of one pipeline's durable state — every key under its
+/// namespace (`{pipeline}::…`) with its stored value, exactly as the store
+/// holds it (exactly-once envelopes included).
+///
+/// Serialized as `{ "version": 1, "pipeline": …, "exported_at": …, "keys": {…} }`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StateExport {
+    /// Document version — [`STATE_EXPORT_VERSION`] for documents this build writes.
+    pub version: u32,
+    /// The pipeline whose namespace the keys belong to.
+    pub pipeline: String,
+    /// When the snapshot was taken (RFC 3339), informational.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_at: Option<String>,
+    /// Every key and its stored value.
+    #[serde(default)]
+    pub keys: std::collections::BTreeMap<String, Value>,
+}
+
+impl StateExport {
+    /// A version-[`STATE_EXPORT_VERSION`] snapshot of `pipeline`.
+    pub fn new(pipeline: impl Into<String>) -> Self {
+        Self {
+            version: STATE_EXPORT_VERSION,
+            pipeline: pipeline.into(),
+            exported_at: None,
+            keys: Default::default(),
+        }
+    }
+
+    /// Parse and [`validate`](Self::validate) a document. A version newer than
+    /// this build understands is refused rather than half-read.
+    pub fn from_value(value: Value) -> Result<Self, FaucetError> {
+        let version = match value.get("version") {
+            None => {
+                return Err(FaucetError::State(
+                    "state export has no `version` field".into(),
+                ));
+            }
+            Some(v) => v.as_u64().ok_or_else(|| {
+                FaucetError::State(format!(
+                    "state export `version` must be an integer, got {v}"
+                ))
+            })?,
+        };
+        if version == 0 || version > u64::from(STATE_EXPORT_VERSION) {
+            return Err(FaucetError::State(format!(
+                "state export version {version} is not supported by this build (supported: \
+                 {STATE_EXPORT_VERSION}) — import it with the faucet release that wrote it or newer"
+            )));
+        }
+        let export: Self = serde_json::from_value(value)
+            .map_err(|e| FaucetError::State(format!("malformed state export: {e}")))?;
+        export.validate()?;
+        Ok(export)
+    }
+
+    /// Every key must be a valid state key inside the pipeline's namespace.
+    pub fn validate(&self) -> Result<(), FaucetError> {
+        validate_state_key(&self.pipeline)
+            .map_err(|e| FaucetError::State(format!("state export pipeline name: {e}")))?;
+        let ns = namespace_prefix(&self.pipeline);
+        for key in self.keys.keys() {
+            validate_state_key(key)?;
+            if !key.starts_with(&ns) {
+                return Err(FaucetError::State(format!(
+                    "state export key '{key}' is outside the namespace '{ns}' of pipeline '{}'",
+                    self.pipeline
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read every key under `pipeline`'s namespace into a [`StateExport`].
+pub async fn export_namespace(
+    store: &dyn StateStore,
+    pipeline: &str,
+) -> Result<StateExport, FaucetError> {
+    let mut export = StateExport::new(pipeline);
+    for key in store.list(&namespace_prefix(pipeline)).await? {
+        if let Some(value) = store.get(&key).await? {
+            export.keys.insert(key, value);
+        }
+    }
+    Ok(export)
+}
+
+/// What [`import_namespace`] did.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ImportReport {
+    /// Keys written, in write order.
+    pub written: Vec<String>,
+    /// Keys that existed in the namespace but not in the export and were
+    /// removed (only with `replace`).
+    pub deleted: Vec<String>,
+    /// Whether the writes went through one all-or-nothing batch.
+    pub atomic: bool,
+    /// The first failure, if any; with a non-atomic store `written` then lists
+    /// exactly what landed before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Write `export` into `store`. With `replace`, keys already in the namespace
+/// that the export does not hold are deleted afterwards, so the namespace ends
+/// up exactly as exported. Validates the document first.
+pub async fn import_namespace(
+    store: &dyn StateStore,
+    export: &StateExport,
+    replace: bool,
+) -> Result<ImportReport, FaucetError> {
+    export.validate()?;
+    let entries: Vec<(String, Value)> = export
+        .keys
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let stale: Vec<String> = if replace {
+        store
+            .list(&namespace_prefix(&export.pipeline))
+            .await?
+            .into_iter()
+            .filter(|k| !export.keys.contains_key(k))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut report = ImportReport {
+        atomic: store.supports_atomic_batch(),
+        ..Default::default()
+    };
+    if report.atomic {
+        if let Err(e) = store.put_batch(&entries).await {
+            report.error = Some(e.to_string());
+            return Ok(report);
+        }
+        report.written = entries.into_iter().map(|(k, _)| k).collect();
+    } else {
+        for (key, value) in &entries {
+            if let Err(e) = store.put(key, value).await {
+                report.error = Some(format!("writing '{key}': {e}"));
+                return Ok(report);
+            }
+            report.written.push(key.clone());
+        }
+    }
+    for key in stale {
+        if let Err(e) = store.delete(&key).await {
+            report.error = Some(format!("deleting stale '{key}': {e}"));
+            return Ok(report);
+        }
+        report.deleted.push(key);
+    }
+    Ok(report)
 }
 
 /// Sentinel key used by state-store `check()` probes. Valid per
@@ -135,6 +332,38 @@ impl StateStore for MemoryStateStore {
         Ok(())
     }
 
+    fn supports_list(&self) -> bool {
+        true
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let mut keys: Vec<String> = self
+            .inner
+            .lock()
+            .await
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    fn supports_atomic_batch(&self) -> bool {
+        true
+    }
+
+    async fn put_batch(&self, entries: &[(String, Value)]) -> Result<(), FaucetError> {
+        for (key, _) in entries {
+            validate_state_key(key)?;
+        }
+        let mut map = self.inner.lock().await;
+        for (key, value) in entries {
+            map.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
     async fn check(
         &self,
         _ctx: &crate::check::CheckContext,
@@ -155,6 +384,12 @@ impl StateStore for MemoryStateStore {
 /// appear in a valid key (see [`validate_state_key`]) (#78 LOW).
 fn safe_filename(key: &str) -> String {
     key.replace(':', "%3A").replace('/', "%2F")
+}
+
+/// Inverse of [`safe_filename`]; `None` when the stem is not a valid key.
+fn key_from_filename(stem: &str) -> Option<String> {
+    let key = stem.replace("%3A", ":").replace("%2F", "/");
+    validate_state_key(&key).ok().map(|()| key)
 }
 
 /// File-backed `StateStore`. Each key maps to a JSON file at
@@ -396,6 +631,44 @@ impl StateStore for FileStateStore {
                 path.display()
             ))),
         }
+    }
+
+    fn supports_list(&self) -> bool {
+        true
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let mut dir = match tokio::fs::read_dir(&self.root).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(FaucetError::State(format!(
+                    "failed to list state dir {}: {e}",
+                    self.root.display()
+                )));
+            }
+        };
+        let mut keys = Vec::new();
+        loop {
+            let entry = dir.next_entry().await.map_err(|e| {
+                FaucetError::State(format!(
+                    "failed to list state dir {}: {e}",
+                    self.root.display()
+                ))
+            })?;
+            let Some(entry) = entry else { break };
+            let name = entry.file_name();
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            if let Some(key) = key_from_filename(stem)
+                && key.starts_with(prefix)
+            {
+                keys.push(key);
+            }
+        }
+        keys.sort();
+        Ok(keys)
     }
 
     async fn check(
@@ -958,5 +1231,245 @@ mod tests {
                 "atomic write must leave no temp files"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod list_export_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Bare(MemoryStateStore);
+
+    #[async_trait]
+    impl StateStore for Bare {
+        async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+            if key.ends_with("::boom") {
+                return Err(FaucetError::State("disk full".into()));
+            }
+            self.0.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+            if key.ends_with("::stuck") {
+                return Err(FaucetError::State("locked".into()));
+            }
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn defaults_cannot_list_and_batch_sequentially() {
+        let s = Bare(MemoryStateStore::new());
+        assert!(!s.supports_list());
+        assert!(!s.supports_atomic_batch());
+        assert!(s.list("p::").await.is_err());
+        s.put_batch(&[("p::a".into(), json!(1)), ("p::b".into(), json!(2))])
+            .await
+            .unwrap();
+        assert_eq!(s.get("p::b").await.unwrap(), Some(json!(2)));
+        let err = s
+            .put_batch(&[("p::c".into(), json!(1)), ("p::boom".into(), json!(2))])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("disk full"));
+        assert_eq!(
+            s.get("p::c").await.unwrap(),
+            Some(json!(1)),
+            "prefix landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_lists_by_prefix_sorted_and_batches_atomically() {
+        let s = MemoryStateStore::new();
+        for k in ["p::b", "p::a", "q::a", "p::a::__sla__"] {
+            s.put(k, &json!(k)).await.unwrap();
+        }
+        assert!(s.supports_list());
+        assert_eq!(
+            s.list("p::").await.unwrap(),
+            vec!["p::a", "p::a::__sla__", "p::b"]
+        );
+        assert!(s.supports_atomic_batch());
+        let err = s
+            .put_batch(&[("p::x".into(), json!(1)), ("../bad".into(), json!(2))])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::State(_)));
+        assert!(s.get("p::x").await.unwrap().is_none(), "nothing written");
+        s.put_batch(&[("p::x".into(), json!(1))]).await.unwrap();
+        assert_eq!(s.get("p::x").await.unwrap(), Some(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn file_lists_decoded_keys_ignoring_temp_and_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FileStateStore::new(dir.path());
+        assert!(s.list("p::").await.unwrap().is_empty(), "missing root");
+        for k in ["p::a", "p::a::__sla__", "acme/p::x", "q::a"] {
+            s.put(k, &json!(1)).await.unwrap();
+        }
+        std::fs::write(dir.path().join("p%3A%3Az.json.tmp"), b"{}").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join(".hidden.json"), b"{}").unwrap();
+        assert!(s.supports_list());
+        assert_eq!(s.list("p::").await.unwrap(), vec!["p::a", "p::a::__sla__"]);
+        assert_eq!(s.list("acme/").await.unwrap(), vec!["acme/p::x"]);
+        assert!(!s.supports_atomic_batch());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_list_reports_unreadable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let s = FileStateStore::new(&file);
+        let err = s.list("p::").await.unwrap_err();
+        assert!(
+            err.to_string().contains("failed to list state dir"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn export_document_parses_and_validates() {
+        let ok = json!({
+            "version": 1,
+            "pipeline": "orders",
+            "exported_at": "2026-09-26T00:00:00Z",
+            "keys": {"orders::a": {"id": 3}, "orders::a::__sla__": {}}
+        });
+        let e = StateExport::from_value(ok).unwrap();
+        assert_eq!(e.keys.len(), 2);
+        assert_eq!(namespace_prefix("orders"), "orders::");
+
+        let cases = [
+            (json!({"pipeline": "o", "keys": {}}), "no `version`"),
+            (
+                json!({"version": "1", "pipeline": "o"}),
+                "must be an integer",
+            ),
+            (json!({"version": 2, "pipeline": "o"}), "not supported"),
+            (json!({"version": 0, "pipeline": "o"}), "not supported"),
+            (json!({"version": 1}), "malformed"),
+            (json!({"version": 1, "pipeline": "../o"}), "pipeline name"),
+            (
+                json!({"version": 1, "pipeline": "o", "keys": {"other::a": 1}}),
+                "outside the namespace",
+            ),
+            (
+                json!({"version": 1, "pipeline": "o", "keys": {"o::a b": 1}}),
+                "illegal character",
+            ),
+        ];
+        for (doc, needle) in cases {
+            let err = StateExport::from_value(doc.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{doc} → {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn export_then_import_round_trips_and_replace_drops_stale_keys() {
+        let from = MemoryStateStore::new();
+        from.put("o::a", &json!({"c": 1})).await.unwrap();
+        from.put("o::b", &json!(2)).await.unwrap();
+        from.put("other::a", &json!(9)).await.unwrap();
+        let export = export_namespace(&from, "o").await.unwrap();
+        assert_eq!(export.keys.len(), 2);
+
+        let to = MemoryStateStore::new();
+        to.put("o::stale", &json!(0)).await.unwrap();
+        let r = import_namespace(&to, &export, false).await.unwrap();
+        assert!(r.atomic && r.error.is_none());
+        assert_eq!(r.written, vec!["o::a", "o::b"]);
+        assert!(
+            to.get("o::stale").await.unwrap().is_some(),
+            "kept without replace"
+        );
+
+        let r = import_namespace(&to, &export, true).await.unwrap();
+        assert_eq!(r.deleted, vec!["o::stale"]);
+        assert!(to.get("o::stale").await.unwrap().is_none());
+        assert_eq!(to.get("o::a").await.unwrap(), Some(json!({"c": 1})));
+    }
+
+    #[tokio::test]
+    async fn import_reports_partial_progress_on_a_non_atomic_store() {
+        let mut export = StateExport::new("o");
+        export.keys.insert("o::a".into(), json!(1));
+        export.keys.insert("o::boom".into(), json!(2));
+        let s = Bare(MemoryStateStore::new());
+        let r = import_namespace(&s, &export, false).await.unwrap();
+        assert!(!r.atomic);
+        assert_eq!(r.written, vec!["o::a"]);
+        assert!(r.error.unwrap().contains("o::boom"));
+
+        let mut bad = StateExport::new("o");
+        bad.keys.insert("x::a".into(), json!(1));
+        assert!(import_namespace(&s, &bad, false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn import_reports_batch_and_delete_failures() {
+        struct Failing;
+        #[async_trait]
+        impl StateStore for Failing {
+            async fn get(&self, _: &str) -> Result<Option<Value>, FaucetError> {
+                Ok(None)
+            }
+            async fn put(&self, _: &str, _: &Value) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> Result<(), FaucetError> {
+                Ok(())
+            }
+            fn supports_atomic_batch(&self) -> bool {
+                true
+            }
+            async fn put_batch(&self, _: &[(String, Value)]) -> Result<(), FaucetError> {
+                Err(FaucetError::State("tx aborted".into()))
+            }
+        }
+        assert_eq!(Failing.get("o::a").await.unwrap(), None);
+        Failing.put("o::a", &json!(1)).await.unwrap();
+        Failing.delete("o::a").await.unwrap();
+        let mut export = StateExport::new("o");
+        export.keys.insert("o::a".into(), json!(1));
+        let r = import_namespace(&Failing, &export, false).await.unwrap();
+        assert!(r.written.is_empty());
+        assert!(r.error.unwrap().contains("tx aborted"));
+
+        // A replace needs to list the namespace first.
+        assert!(import_namespace(&Failing, &export, true).await.is_err());
+
+        let s = Bare(MemoryStateStore::new());
+        struct Listing(Bare);
+        #[async_trait]
+        impl StateStore for Listing {
+            async fn get(&self, k: &str) -> Result<Option<Value>, FaucetError> {
+                self.0.get(k).await
+            }
+            async fn put(&self, k: &str, v: &Value) -> Result<(), FaucetError> {
+                self.0.put(k, v).await
+            }
+            async fn delete(&self, k: &str) -> Result<(), FaucetError> {
+                self.0.delete(k).await
+            }
+            async fn list(&self, p: &str) -> Result<Vec<String>, FaucetError> {
+                self.0.0.list(p).await
+            }
+        }
+        s.put("o::stuck", &json!(1)).await.unwrap();
+        let listing = Listing(s);
+        assert_eq!(listing.get("o::stuck").await.unwrap(), Some(json!(1)));
+        let r = import_namespace(&listing, &export, true).await.unwrap();
+        assert_eq!(r.written, vec!["o::a"]);
+        assert!(r.error.unwrap().contains("deleting stale 'o::stuck'"));
     }
 }

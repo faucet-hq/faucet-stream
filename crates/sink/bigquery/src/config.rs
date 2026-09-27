@@ -282,6 +282,19 @@ impl BigQuerySinkConfig {
     }
 }
 
+impl BigQuerySinkConfig {
+    /// What a failed batch write leaves behind (#737): keyed writes run as one transaction; an append issues one insertAll per chunk, so only an unchunked batch keeps an outer error clean.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.write.dedups_by_key() {
+            faucet_core::BatchAtomicity::Atomic
+        } else if self.batch_size == 0 {
+            faucet_core::BatchAtomicity::PerRow
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +593,15 @@ mod tests {
         let dm = config.write.delete_marker.expect("delete_marker");
         assert_eq!(dm.field, "__op");
         assert_eq!(dm.values, vec!["d".to_string()]);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: BigQuerySinkConfig = serde_json::from_value(serde_json::json!({"project_id": "p", "dataset_id": "d", "table_id": "t", "auth": {"type": "application_default"}})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: BigQuerySinkConfig = serde_json::from_value(serde_json::json!({"project_id": "p", "dataset_id": "d", "table_id": "t", "auth": {"type": "application_default"}, "batch_size": 0})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
+        let c: BigQuerySinkConfig = serde_json::from_value(serde_json::json!({"project_id": "p", "dataset_id": "d", "table_id": "t", "auth": {"type": "application_default"}, "write_mode": "upsert", "key": ["id"]})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

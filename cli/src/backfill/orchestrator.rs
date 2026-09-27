@@ -274,8 +274,23 @@ impl faucet_core::Source for BoundedSource {
         self.inner.connector_name()
     }
 
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
+
     fn dataset_uri(&self) -> String {
         self.inner.dataset_uri()
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
     }
 }
 
@@ -286,6 +301,7 @@ fn make_opts(
     cancel: CancellationToken,
 ) -> ExecuteOptions {
     ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: opts.pipeline_name.clone(),
         run_id: None,
         execution: opts.execution.clone(),
@@ -942,5 +958,14 @@ matrix:
         let mut pages = bounded.stream_pages(&ctx, 10);
         let page = pages.next().await.unwrap().unwrap();
         assert_eq!(page.records.len(), 3);
+        drop(pages);
+        bounded.set_roundtrip_recorder(std::sync::Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "fixture",
+            ),
+        ));
     }
 }

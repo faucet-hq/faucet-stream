@@ -11,7 +11,7 @@ Reach for it when your data already lives in GCS — event exports, log dumps, a
 
 ## Feature highlights
 
-- **Seven file formats** — `json_lines`, `json_array`, `raw_text`, `parquet`, plus `csv`, `xml` and `xlsx` via [file formats](#file-formats-604).
+- **Nine file formats** — `json_lines`, `json_array`, `raw_text`, `parquet`, plus `csv`, `xml`, `xlsx`, `avro` and `orc` via [file formats](#file-formats-604).
 - **Apache Parquet (Arrow columnar)** — behind the `arrow` feature, a fourth format `file_format: parquet` decodes each object via the Arrow Parquet reader and, when the sink is also Arrow-native (Parquet / Delta), moves records end-to-end as Arrow `RecordBatch`es with no `serde_json::Value` in between. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).
 - **List or explicit keys** — scan a bucket by `prefix`, or skip listing entirely by passing an exact `object_keys` list.
 - **Concurrent reads** — objects are fetched in parallel (default 10) on the streaming path as well as the batch one, so wall-clock time is bounded by your slowest objects, not their sum. The streaming prefetch is *ordered*, so records still arrive in listing order and a failing object is still blamed at its own position. For `json_lines` the look-ahead holds only open body readers and for `parquet` only footer metadata, so peak memory stays `O(batch_size)`; `json_array` / `raw_text` hold up to `concurrency` whole bodies.
@@ -71,7 +71,7 @@ faucet run pipeline.yaml
 | `prefix` | string | *(unset)* | Object-name prefix filter for listing. Ignored when `object_keys` is set. Supports `${field.path}` placeholders resolved against the parent-record context at runtime. |
 | `object_keys` | array of string | *(unset)* | Explicit object names to read. When set, listing is skipped and `prefix` is ignored. |
 | `auth` | `GcsCredentials` | `application_default` | Authentication — see [Authentication](#authentication). |
-| `file_format` | enum | `json_lines` | `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx` — see [File formats](#file-formats-604). |
+| `file_format` | enum | `json_lines` | `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx`, `avro`, `orc` — see [File formats](#file-formats-604). |
 | `max_objects` | int | *(unset)* | Hard cap on the number of objects read (applied after listing, and to an explicit `object_keys` list). |
 
 ### Performance
@@ -165,6 +165,35 @@ chunked into pages — a workbook is a zip container whose directory sits at the
 end, and an XML document is a tree. `csv` and `xml` are text formats: every
 value comes back a string. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+
+## Avro and ORC (#719)
+
+`file_format: avro` reads Avro Object Container Files. Every object is resolved
+against one reader schema: `avro.schema` when set, else the first object's
+writer schema. A object that cannot be resolved against it fails the run with
+an error naming both. Logical types are mapped explicitly: `decimal` becomes
+an exact string on the row path and `Decimal128` on the columnar path, and
+`date` / `timestamp-*` / `uuid` likewise.
+
+`file_format: orc` reads ORC (read-only; there is no ORC sink), projected by
+`orc.columns`. The whole object is fetched first, because the footer is at the
+end, and then decoded stripe by stripe. Every object must share one schema.
+
+```yaml
+file_format: avro
+avro:
+  schema: { type: record, name: order, fields: [ { name: id, type: long } ] }   # optional
+# or
+file_format: orc
+orc:
+  columns: [id, amount]
+```
+
+Both decode straight to Arrow, so with the `arrow` feature they take the
+columnar path (`avro → parquet` never builds JSON rows). Enable with
+`file-format-avro` / `file-format-orc` (ORC turns on `arrow`), or with
+`file-formats`. Details: the
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
 
 ## Examples
 

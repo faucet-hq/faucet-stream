@@ -142,9 +142,46 @@ honored on the `xml`/`graphql` sources and on every sink-side write.)
 | `faucet_resilience_circuit_opened_total` | counter | `pipeline, row` |
 | `faucet_resilience_poison_rows_total` | counter | `pipeline, row, action` |
 
-`op` is one of `sink_write`, `flush`, `state_put`. Source-connector retries are
-observable through the connector's existing `faucet_source_errors_total` and
-tracing output rather than these metrics.
+`op` is one of `sink_write`, `flush`, `state_put`. Source-side retries have
+their own metrics (below).
+
+## Source-side throttling
+
+The `rest`, `graphql` and `xml` sources meter the rate limiting they hit, so a
+pipeline that took three hours because it spent two of them sleeping on `429`s
+is distinguishable from one that is slow for any other reason:
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `faucet_source_throttled_total` | counter | `pipeline, row, connector` | Rate-limit responses received (`429`, a `RateLimited` error) — every one, retried or not. |
+| `faucet_source_throttle_wait_seconds` | histogram | `pipeline, row, connector` | Time actually slept after each one. |
+| `faucet_source_retries_total` | counter | `pipeline, row, connector, class` | Every source-side retry by class (`rate_limited`, `http_5xx`, `connection`, `timeout`) — the source-side mirror of `faucet_resilience_retries_total`. |
+
+The wait is **measured**, not read from the header: `rest` sleeps the server's
+`Retry-After` (seconds or an HTTP date), `graphql` and `xml` sleep the policy's
+backoff, and either way the recorded figure is the time that passed. A sleep cut
+short by cancellation, a timeout or a dropped run records the partial wait.
+
+The totals also land on the run's [usage record](./usage.md) (`throttled`,
+`throttle_wait_secs`, `source_retries`), so `faucet run` and `faucet usage` show
+`throttled 312× · waited 41 min`. When the cumulative wait exceeds 10 % of the
+run, the run logs one warning:
+
+```text
+WARN pipeline=orders row=default source spent 2460.0s of a 3600.0s run (68%) waiting on rate limits (312 throttled responses); lower concurrency, stagger schedules or raise the quota
+```
+
+The [`FaucetSourceThrottled`](./dashboards.md) alert fires when a row spends
+more than a quarter of 15 minutes rate-limited.
+
+Other sources with their own throttle handling — `databricks`, `dynamodb`,
+`kinesis` — do not report through these metrics yet. A connector (including a
+third-party one) opts in through the round-trip recorder the pipeline installs:
+`RecorderSlot::throttled()` per rate-limit response, `RecorderSlot::retry(class)`
+per retry, and `RecorderSlot::throttle_wait_timer()` (or
+`faucet_core::observability::throttle_sleep`) around the sleep; a connector that
+retries through `faucet_core::execute_with_policy_recorded` gets all three for
+free.
 
 ## Inspecting the schema
 

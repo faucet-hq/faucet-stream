@@ -148,6 +148,10 @@ impl SftpSink {
 
 #[async_trait]
 impl faucet_core::Sink for SftpSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     /// Close the open file (#618).
     ///
     /// The pipeline calls `flush` at every bookmark-carrying page and once at

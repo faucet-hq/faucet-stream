@@ -105,6 +105,25 @@ pub async fn evaluate_post_run(
     violations
 }
 
+/// Post-run lag check (#733): the lag the source reported when the run ended
+/// against the `max_lag_*` thresholds. Monitoring only, like the rest.
+pub fn evaluate_lag_post_run(
+    spec: &SlaSpec,
+    pipeline: &str,
+    row: &str,
+    lag: Option<&faucet_core::SourceLag>,
+) -> Vec<SlaViolation> {
+    let Some(lag) = lag else {
+        return Vec::new();
+    };
+    let violations = eval::evaluate_lag(spec, lag);
+    for v in &violations {
+        metrics::record_violation(pipeline, row, v.kind());
+        tracing::warn!(pipeline, row, kind = v.kind(), "SLA violation: {v}");
+    }
+    violations
+}
+
 /// Read-only SLA probes for `faucet doctor` (and serve's `doctor_first`):
 /// staleness of the last recorded success and volume-baseline warm-up state.
 /// `min_rows_per_run` has nothing to probe without a run, so it is not
@@ -184,6 +203,9 @@ mod tests {
         SlaSpec {
             max_staleness_secs: Some(3600),
             min_rows_per_run: Some(5),
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: Some(VolumeAnomalySpec {
                 method: AnomalyMethod::Zscore,
                 sensitivity: None,
@@ -287,6 +309,9 @@ mod tests {
         let spec = SlaSpec {
             max_staleness_secs: None,
             min_rows_per_run: Some(10),
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: None,
         };
         let v = evaluate_post_run(
@@ -357,6 +382,9 @@ mod tests {
         let stateless = SlaSpec {
             max_staleness_secs: None,
             min_rows_per_run: Some(1),
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: None,
         };
         assert!(doctor_probes(&stateless, None, "k", 0).await.is_empty());
@@ -364,5 +392,19 @@ mod tests {
         let probes = doctor_probes(&full_spec(), None, "k", 0).await;
         assert_eq!(probes.len(), 1);
         assert!(matches!(probes[0].status, ProbeStatus::Skip { .. }));
+    }
+
+    #[test]
+    fn lag_post_run_reports_breaches_only_with_a_reading() {
+        let mut spec = full_spec();
+        spec.max_lag_events = Some(5);
+        assert!(evaluate_lag_post_run(&spec, "p", "r", None).is_empty());
+        let v = evaluate_lag_post_run(&spec, "p", "r", Some(&faucet_core::SourceLag::events(9)));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind(), "lag");
+        assert!(
+            evaluate_lag_post_run(&spec, "p", "r", Some(&faucet_core::SourceLag::events(5)))
+                .is_empty()
+        );
     }
 }

@@ -53,6 +53,10 @@ async fn conformance_live_battery() {
         async move { rows(&conn).await }
     };
     faucet_conformance::assert_connector_name_nonempty_value(sink.connector_name(), "oracle");
+    assert_eq!(
+        faucet_conformance::assert_batch_atomicity_declared(&sink),
+        faucet_core::BatchAtomicity::Atomic
+    );
     faucet_conformance::assert_sink_preflight_check_wellformed(
         &sink,
         &faucet_core::check::CheckContext::default(),

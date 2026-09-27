@@ -384,6 +384,14 @@ In the CLI/umbrella, the corresponding feature is `sink-iceberg` (REST), with `s
 - Read Iceberg tables back with [`faucet-source-iceberg`](https://crates.io/crates/faucet-source-iceberg) (same `catalog` block).
 - Related crates: [`faucet-sink-parquet`](https://crates.io/crates/faucet-sink-parquet), [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3), [`faucet-sink-bigquery`](https://crates.io/crates/faucet-sink-bigquery), [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc)
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **per-row** — rows are staged and committed as a snapshot only at flush. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

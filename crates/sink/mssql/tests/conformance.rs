@@ -84,6 +84,7 @@ async fn fresh_sink() -> (ContainerAsync<MssqlServer>, MssqlPool, MssqlSink) {
         rollback: None,
     };
     let sink = MssqlSink::new(scfg).await.expect("sink");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     (container, pool, sink)
 }
 

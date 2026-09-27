@@ -26,6 +26,7 @@ async fn conformance_capabilities_truthful() {
     let mut cfg = RabbitMqSinkConfig::to_queue("conformance");
     cfg.connection = RabbitMqConnectionConfig::from_url(&broker.url);
     let sink = RabbitMqSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
 
     faucet_conformance::assert_connector_name_nonempty_value(
         sink.connector_name(),

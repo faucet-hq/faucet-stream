@@ -159,3 +159,111 @@ async fn the_configured_csv_dialect_is_honoured() {
     let src = AzureBlobSource::new(cfg).await.expect("source");
     assert_eq!(drain(&src).await, vec![json!({"id": "1", "name": "ada"})]);
 }
+
+/// Avro and ORC blobs (#719): resolved against the first blob's schema on the
+/// row path and the columnar path alike.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-orc"))]
+mod containers {
+    use super::*;
+    use faucet_core::{AvroCodec, AvroOptions, OrcOptions};
+
+    const ORC: &[u8] = include_bytes!("../../../core/tests/fixtures/orc/people.orc");
+
+    fn avro(records: &[Value]) -> Vec<u8> {
+        faucet_core::file_format::avro::encode(
+            records,
+            &AvroOptions {
+                schema: None,
+                codec: AvroCodec::Deflate,
+            },
+        )
+        .expect("encode avro")
+    }
+
+    async fn put(port: u16, key: &str, body: Vec<u8>) {
+        seed_store(port)
+            .put(&ObjPath::from(key), PutPayload::from(body))
+            .await
+            .expect("seed blob");
+    }
+
+    async fn columnar_rows(src: &AzureBlobSource) -> Result<usize, String> {
+        let ctx = HashMap::new();
+        assert!(src.supports_columnar());
+        let mut batches = src.stream_batches(&ctx, 0);
+        let mut n = 0;
+        while let Some(page) = batches.next().await {
+            n += page.map_err(|e| e.to_string())?.num_rows();
+        }
+        Ok(n)
+    }
+
+    #[tokio::test]
+    async fn avro_and_orc_blobs_decode_on_both_paths() {
+        let (_c, port) = start_azurite().await;
+        create_container(port).await;
+        put(
+            port,
+            "avro/a.avro",
+            avro(&[json!({"id": 1}), json!({"id": 2})]),
+        )
+        .await;
+        put(port, "avro/b.avro", avro(&[json!({"id": 3, "more": "x"})])).await;
+        put(port, "bad/a.avro", avro(&[json!({"id": 1})])).await;
+        put(port, "bad/b.avro", avro(&[json!({"id": "text"})])).await;
+        put(port, "orc/p.orc", ORC.to_vec()).await;
+
+        let cfg = source_config(port)
+            .prefix("avro/")
+            .file_format(AzureFileFormat::Avro)
+            .with_batch_size(0);
+        let src = AzureBlobSource::new(cfg).await.expect("source");
+        let want = vec![json!({"id": 1}), json!({"id": 2}), json!({"id": 3})];
+        assert_eq!(drain(&src).await, want);
+        assert_eq!(
+            src.fetch_with_context(&HashMap::new())
+                .await
+                .expect("fetch"),
+            want
+        );
+        assert_eq!(columnar_rows(&src).await, Ok(3));
+
+        let bad = AzureBlobSource::new(
+            source_config(port)
+                .prefix("bad/")
+                .file_format(AzureFileFormat::Avro),
+        )
+        .await
+        .expect("source");
+        let err = columnar_rows(&bad).await.expect_err("conflict");
+        assert!(
+            err.contains("bad/a.avro") && err.contains("bad/b.avro"),
+            "{err}"
+        );
+
+        let mut cfg = source_config(port)
+            .prefix("orc/")
+            .file_format(AzureFileFormat::Orc);
+        cfg.orc = OrcOptions {
+            columns: Some(vec!["name".into()]),
+        };
+        let src = AzureBlobSource::new(cfg).await.expect("source");
+        assert_eq!(drain(&src).await[0], json!({"name": "ada"}));
+        assert_eq!(columnar_rows(&src).await, Ok(3));
+
+        let csv = AzureBlobSource::new(source_config(port).file_format(AzureFileFormat::Csv))
+            .await
+            .expect("source");
+        assert!(!csv.supports_columnar());
+        assert!(columnar_rows_unchecked(&csv).await.is_err());
+    }
+
+    async fn columnar_rows_unchecked(src: &AzureBlobSource) -> Result<(), String> {
+        let ctx = HashMap::new();
+        let mut batches = src.stream_batches(&ctx, 0);
+        while let Some(page) = batches.next().await {
+            page.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}

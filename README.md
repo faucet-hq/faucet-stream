@@ -179,9 +179,11 @@ faucet test     tests/orders.yaml          # fixture tests of the transforms and
 faucet plan --impact orders.yaml           # what will run, and which downstream datasets a schema change breaks
 faucet run      orders.yaml                # run once: extract, transform, govern, load
 faucet schedule orders.yaml                # or keep it running on the cron in the file
+faucet status   orders.yaml                # one screen: last success, resume point, lag, DLQ backlog; exit 0/1/2
 curl -s localhost:9090/metrics             # Prometheus metrics while it runs
 faucet dlq inspect ./dlq/orders.jsonl                    # why rows were quarantined
 faucet dlq replay --from ./dlq/orders.jsonl orders.yaml  # re-run them once fixed
+faucet state export orders.yaml -o orders-state.json     # back up or move the bookmark; also show / set / reset / import
 ```
 
 The [`cli/examples/`](cli/examples) directory has runnable configs for common
@@ -244,19 +246,20 @@ warehouse is dbt's job, and the two work well together
 | | |
 |---|---|
 | **Bounded memory** | Sources stream page by page and sinks write each page as it arrives, so memory stays at one batch whatever the volume. |
-| **Incremental and resumable** | Bookmarks are saved only after the page is durably written, to a file, Redis or Postgres. A crash replays at most the last page ([state](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)). |
+| **Incremental and resumable** | Bookmarks are saved only after the page is durably written, to a file, Redis or Postgres. A crash replays at most the last page. State is versioned: after an upgrade, faucet migrates an older bookmark or refuses one it can't read, instead of silently re-syncing or skipping ([state](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)). |
 | **Effectively-once** | On supported sinks, a per-page commit token is written atomically with the data, so a resumed run writes no duplicates. This is idempotent at-least-once, not distributed-consensus exactly-once. |
 | **Upsert and delete** | `write_mode: upsert \| delete` with a key and a delete marker ([upsert](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)). |
-| **Failure handling** | Retries with backoff and `Retry-After`, a circuit breaker, and a dead-letter queue you can inspect and replay ([resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html) · [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html)). |
+| **Failure handling** | Retries with backoff and `Retry-After`, a circuit breaker, and a dead-letter queue you can inspect and replay. Each sink declares whether a failed batch is all-or-nothing, and `on_batch_error: dlq_all` is refused on sinks where a failed write may have partly landed, so replaying the DLQ can't duplicate rows ([resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html) · [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html)). |
 | **Change data capture** | Row-level CDC from PostgreSQL, MySQL, SQL Server, MongoDB, Oracle (LogMiner) and DynamoDB Streams. `faucet mirror` runs a snapshot and hands it off to CDC without gaps ([replication](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html)). |
+| **Status and state** | `faucet status` shows each pipeline on one screen: last success or failure, where the next run resumes, how far a CDC or streaming source is behind, the DLQ backlog, and SLA and profiling verdicts. Exit codes 0 / 1 / 2 make it a cron or Nagios check. `faucet state show / set / reset / export / import` moves, resets, backs up or migrates a bookmark safely, including between file, Redis and Postgres stores ([state and status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html)). |
 | **Backfills** | Resumable, windowed historical replays with `faucet backfill` ([backfill](https://faucet-hq.github.io/faucet-stream/cookbook/backfill.html)). |
-| **Observability** | Prometheus metrics and `tracing` / OTLP spans for every source, sink, transform and state operation ([observability](https://faucet-hq.github.io/faucet-stream/operations/observability.html)). |
+| **Observability** | Prometheus metrics and `tracing` / OTLP spans for every source, sink, transform and state operation, including source lag (`faucet_source_lag_seconds`, `_bytes`, `_events`) and API throttling (`faucet_source_throttled_total`, `faucet_source_throttle_wait_seconds`) ([observability](https://faucet-hq.github.io/faucet-stream/operations/observability.html)). |
 | **Alerts** | Slack, PagerDuty or signed webhooks on run failures, SLA breaches, DLQ thresholds, open circuit breakers and column drift, with deduplication ([notifications](https://faucet-hq.github.io/faucet-stream/cookbook/notifications.html)). |
 | **Testing** | `faucet test` runs fixture-based tests of a pipeline's transforms and checks offline, and `validate --no-secrets` checks configs in CI without credentials ([testing](https://faucet-hq.github.io/faucet-stream/cookbook/testing.html)). |
 
 ## Connectors
 
-<!--COUNT:sources-->42<!--/COUNT--> sources and <!--COUNT:sinks-->33<!--/COUNT--> sinks. Every
+<!--COUNT:sources-->43<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
 connector depends only on `faucet-core`, so any source works with any sink.
 
 | | Sources | Sinks |
@@ -264,13 +267,14 @@ connector depends only on `faucet-core`, so any source works with any sink.
 | **Databases** | PostgreSQL, MySQL, SQL Server, Oracle, MongoDB, SQLite, DuckDB, Redis, DynamoDB, Spanner | PostgreSQL, MySQL, SQL Server, Oracle, MongoDB, SQLite, DuckDB, Redis, DynamoDB, Spanner |
 | **CDC** | PostgreSQL, MySQL, SQL Server, MongoDB, Oracle, DynamoDB Streams | |
 | **Warehouses and lakehouses** | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg |
-| **Object stores and files** | S3, GCS, Azure Blob, SFTP, CSV, Parquet | S3, GCS, Azure Blob, SFTP, CSV, Parquet, JSONL |
+| **Object stores and files** | S3, GCS, Azure Blob, SFTP, local files (path, glob or URL), CSV, Parquet | S3, GCS, Azure Blob, SFTP, local files, CSV, Parquet, JSONL |
 | **Streams and queues** | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS |
 | **APIs** | REST, GraphQL, gRPC, XML, Webhook, WebSocket | HTTP |
 | **Search** | Elasticsearch | Elasticsearch |
-| **Bridges** | Singer taps (experimental) | stdout |
+| **Bridges** | Singer taps (experimental) | Singer targets (experimental), stdout |
 
 - **Capabilities per connector** (streaming, resumable state, write modes, delivery guarantee, auth) are in the [connector matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html). For help choosing between overlapping connectors, see [choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html).
+- **File formats**: the file and object-store connectors read and write JSONL, JSON, CSV, Excel, XML, Parquet and Avro, and read ORC, chosen per file by extension or set explicitly ([file formats](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html)).
 - **Tier 1** connectors pass the [conformance battery](https://faucet-hq.github.io/faucet-stream/reference/conformance.html) in CI against a real backend or an official emulator.
 - **SaaS sources** such as Salesforce, HubSpot, Stripe and Jira are maintained as declarative templates on the REST and GraphQL engines, not as separate crates. Browse the [Template Hub](https://faucet-hq.github.io/hub) and run one with `faucet run --source <owner>/<system> --sink faucet-hq/bigquery` ([guide](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html)).
 

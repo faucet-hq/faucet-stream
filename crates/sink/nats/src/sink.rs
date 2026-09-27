@@ -63,6 +63,10 @@ impl NatsSink {
 
 #[async_trait]
 impl Sink for NatsSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);

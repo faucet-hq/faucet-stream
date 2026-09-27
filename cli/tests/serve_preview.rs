@@ -750,3 +750,37 @@ async fn a_server_without_the_flag_refuses_and_says_which_flag() {
     // Even an admin is refused: this is a server capability, not a permission.
     assert_eq!(body["error"]["code"], "forbidden");
 }
+
+#[cfg(all(feature = "sink-file", feature = "source-file"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn previews_a_file_sink_output_through_the_file_source() {
+    // The generic file sink (#743) records each rolled part; the preview reads
+    // one back with the file source, resolving the format from its extension.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    let output = dir.path().join("out.jsonl");
+    write_input(&input, 6);
+
+    let port = free_port();
+    spawn_server(port, dir.path(), true, 100, 1000).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    run_pipeline(
+        &base,
+        &client,
+        &csv_to(
+            "file",
+            &input.display().to_string(),
+            &output.display().to_string(),
+        ),
+    )
+    .await;
+
+    let id = id_of(&list_outputs(&base, &client).await, "out.jsonl");
+    let (status, body) = preview(&base, &client, "admin-tok", &id, "").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kind"], "file");
+    assert_eq!(body["row_count"], 6);
+    assert_eq!(body["rows"][5]["name"], "name-5");
+}

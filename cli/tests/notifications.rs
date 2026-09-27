@@ -305,6 +305,7 @@ notifications:
         faucet_cli::executor::run_expanded(
             nodes,
             faucet_cli::executor::ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "drift_pipeline".into(),
                 run_id: None,
                 execution: None,
@@ -444,6 +445,7 @@ notifications:
         .expect("notifier built");
 
     let opts = faucet_cli::executor::ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: "cb_pipeline".into(),
         run_id: Some("submitted-run-42".into()),
         execution: None,

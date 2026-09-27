@@ -257,9 +257,361 @@ pub fn unwrap_envelope(value: &Value) -> Result<UnwrappedEnvelope, EnvelopeError
     })
 }
 
+/// What a sink promises about one failed batch write (#737): whether rows of a
+/// batch whose write failed may already have landed.
+///
+/// It decides whether [`OnBatchError::DlqAll`] is safe: routing a failed batch
+/// to the DLQ only avoids duplicates when nothing of it committed, because a
+/// DLQ replay writes every routed row again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BatchAtomicity {
+    /// All or nothing: a failed write lands no row (one statement, a
+    /// transaction around every chunk, one object upload, one table commit).
+    Atomic,
+    /// Per-row outcomes through [`Sink::write_batch_partial`]; an outer `Err`
+    /// from it means no row of that call committed.
+    PerRow,
+    /// A failed write may have committed some rows and reports no per-row
+    /// detail. The default, because it is the only safe assumption.
+    #[default]
+    BestEffort,
+}
+
+impl BatchAtomicity {
+    /// Stable label (`atomic` / `per_row` / `best_effort`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BatchAtomicity::Atomic => "atomic",
+            BatchAtomicity::PerRow => "per_row",
+            BatchAtomicity::BestEffort => "best_effort",
+        }
+    }
+}
+
+impl fmt::Display for BatchAtomicity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether [`OnBatchError::DlqAll`] can route a failed batch without
+/// duplicating rows downstream: the sink lands nothing on failure, or writes
+/// by key so a replayed row overwrites itself.
+pub fn dlq_all_is_safe(atomicity: BatchAtomicity, dedups_by_key: bool) -> bool {
+    dedups_by_key || !matches!(atomicity, BatchAtomicity::BestEffort)
+}
+
+/// The refusal for `dlq_all` on a sink that may commit part of a failed batch.
+pub fn dlq_all_refusal(sink: &str, atomicity: BatchAtomicity) -> FaucetError {
+    FaucetError::Config(format!(
+        "dlq: on_batch_error 'dlq_all' is unsafe with sink '{sink}' (batch atomicity \
+         '{atomicity}'): a failed batch may already have written some rows, and replaying \
+         the DLQ would write them again. Use on_batch_error 'propagate', configure the sink \
+         with write_mode 'upsert' and a key so a replay overwrites instead of duplicating, or \
+         set allow_duplicates_on_dlq_all: true to accept the duplicates"
+    ))
+}
+
+/// Refuse [`OnBatchError::DlqAll`] against a sink that may commit part of a
+/// failed batch, unless the caller explicitly accepts duplicates.
+pub fn check_dlq_all_policy(
+    sink: &dyn Sink,
+    on_batch_error: OnBatchError,
+    allow_duplicates: bool,
+) -> Result<(), FaucetError> {
+    if on_batch_error != OnBatchError::DlqAll || allow_duplicates {
+        return Ok(());
+    }
+    let atomicity = sink.batch_atomicity();
+    if dlq_all_is_safe(atomicity, sink.dedups_by_key()) {
+        Ok(())
+    } else {
+        Err(dlq_all_refusal(sink.connector_name(), atomicity))
+    }
+}
+
+/// How one sink write (a page, or an adaptive sub-batch of one) ended (#737).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BatchOutcome {
+    /// Every row committed.
+    Committed,
+    /// Some rows committed; the sink reported the others per row and they went
+    /// to the DLQ.
+    DlqPartial,
+    /// The whole write failed and `on_batch_error: dlq_all` sent every row to
+    /// the DLQ.
+    DlqAll,
+    /// The write failed and the error propagated (or was retried).
+    Failed,
+}
+
+impl BatchOutcome {
+    /// Stable label (`committed` / `dlq_partial` / `dlq_all` / `failed`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BatchOutcome::Committed => "committed",
+            BatchOutcome::DlqPartial => "dlq_partial",
+            BatchOutcome::DlqAll => "dlq_all",
+            BatchOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// Per-run batch outcome counts, as reported on a run (#737). `attempted` is
+/// the sum of the other four.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct BatchOutcomes {
+    /// Sink writes attempted.
+    pub attempted: u64,
+    /// Writes where every row committed.
+    pub committed: u64,
+    /// Writes where some rows failed per row and went to the DLQ.
+    pub dlq_partial: u64,
+    /// Failed writes routed whole to the DLQ by `on_batch_error: dlq_all`.
+    pub dlq_all: u64,
+    /// Failed writes whose error propagated.
+    pub failed: u64,
+}
+
+impl BatchOutcomes {
+    /// Whether no write was attempted.
+    pub fn is_empty(&self) -> bool {
+        self.attempted == 0
+    }
+
+    /// Writes that did not fully commit.
+    pub fn unclean(&self) -> u64 {
+        self.dlq_partial + self.dlq_all + self.failed
+    }
+}
+
+/// Shared counters a pipeline run fills in as it writes (#737). Attach with
+/// [`Pipeline::with_batch_outcomes`](crate::Pipeline::with_batch_outcomes) and
+/// read [`snapshot`](Self::snapshot) afterwards — on failure too.
+#[derive(Debug, Default)]
+pub struct BatchOutcomeCounters {
+    committed: std::sync::atomic::AtomicU64,
+    dlq_partial: std::sync::atomic::AtomicU64,
+    dlq_all: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+}
+
+impl BatchOutcomeCounters {
+    /// Empty counters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Count one write.
+    pub fn record(&self, outcome: BatchOutcome) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cell = match outcome {
+            BatchOutcome::Committed => &self.committed,
+            BatchOutcome::DlqPartial => &self.dlq_partial,
+            BatchOutcome::DlqAll => &self.dlq_all,
+            BatchOutcome::Failed => &self.failed,
+        };
+        cell.fetch_add(1, Relaxed);
+    }
+
+    /// The counts so far.
+    pub fn snapshot(&self) -> BatchOutcomes {
+        use std::sync::atomic::Ordering::Relaxed;
+        let committed = self.committed.load(Relaxed);
+        let dlq_partial = self.dlq_partial.load(Relaxed);
+        let dlq_all = self.dlq_all.load(Relaxed);
+        let failed = self.failed.load(Relaxed);
+        BatchOutcomes {
+            attempted: committed + dlq_partial + dlq_all + failed,
+            committed,
+            dlq_partial,
+            dlq_all,
+            failed,
+        }
+    }
+}
+
+/// Where one pipeline run reports its batch outcomes: the
+/// `faucet_batch_outcomes_total` counter and, when attached, the caller's
+/// [`BatchOutcomeCounters`].
+#[derive(Debug, Clone)]
+pub(crate) struct BatchOutcomeSink {
+    labels: Vec<metrics::Label>,
+    counters: Option<Arc<BatchOutcomeCounters>>,
+}
+
+impl BatchOutcomeSink {
+    pub(crate) fn new(
+        pipeline: &str,
+        row: &str,
+        sink: &str,
+        counters: Option<Arc<BatchOutcomeCounters>>,
+    ) -> Self {
+        use metrics::{Label, SharedString};
+        Self {
+            labels: vec![
+                Label::new("pipeline", SharedString::from(pipeline.to_string())),
+                Label::new("row", SharedString::from(row.to_string())),
+                Label::new("sink", SharedString::from(sink.to_string())),
+            ],
+            counters,
+        }
+    }
+
+    pub(crate) fn record(&self, outcome: BatchOutcome) {
+        let mut labels = self.labels.clone();
+        labels.push(metrics::Label::new(
+            "outcome",
+            metrics::SharedString::const_str(outcome.as_str()),
+        ));
+        metrics::counter!("faucet_batch_outcomes_total", labels).increment(1);
+        if let Some(c) = &self.counters {
+            c.record(outcome);
+        }
+    }
+
+    /// Record the outcome of a plain (non-partial) write and pass it through.
+    pub(crate) fn observe<T>(&self, result: Result<T, FaucetError>) -> Result<T, FaucetError> {
+        self.record(if result.is_ok() {
+            BatchOutcome::Committed
+        } else {
+            BatchOutcome::Failed
+        });
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AtomSink {
+        atomicity: BatchAtomicity,
+        keyed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for AtomSink {
+        async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+            Ok(r.len())
+        }
+        fn batch_atomicity(&self) -> BatchAtomicity {
+            self.atomicity
+        }
+        fn dedups_by_key(&self) -> bool {
+            self.keyed
+        }
+        fn connector_name(&self) -> &'static str {
+            "atom"
+        }
+    }
+
+    #[test]
+    fn batch_atomicity_labels_and_default() {
+        assert_eq!(BatchAtomicity::default(), BatchAtomicity::BestEffort);
+        assert_eq!(BatchAtomicity::Atomic.as_str(), "atomic");
+        assert_eq!(BatchAtomicity::PerRow.to_string(), "per_row");
+        assert_eq!(BatchAtomicity::BestEffort.as_str(), "best_effort");
+        assert_eq!(
+            serde_json::to_value(BatchAtomicity::PerRow).unwrap(),
+            json!("per_row")
+        );
+    }
+
+    #[test]
+    fn dlq_all_is_safe_unless_best_effort_and_unkeyed() {
+        assert!(dlq_all_is_safe(BatchAtomicity::Atomic, false));
+        assert!(dlq_all_is_safe(BatchAtomicity::PerRow, false));
+        assert!(dlq_all_is_safe(BatchAtomicity::BestEffort, true));
+        assert!(!dlq_all_is_safe(BatchAtomicity::BestEffort, false));
+    }
+
+    #[test]
+    fn check_dlq_all_policy_decision_paths() {
+        let best = AtomSink {
+            atomicity: BatchAtomicity::BestEffort,
+            keyed: false,
+        };
+        assert!(check_dlq_all_policy(&best, OnBatchError::Propagate, false).is_ok());
+        assert!(check_dlq_all_policy(&best, OnBatchError::DlqAll, true).is_ok());
+        let err = check_dlq_all_policy(&best, OnBatchError::DlqAll, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'atom'") && msg.contains("best_effort"),
+            "{msg}"
+        );
+        assert!(msg.contains("allow_duplicates_on_dlq_all"), "{msg}");
+        let keyed = AtomSink {
+            atomicity: BatchAtomicity::BestEffort,
+            keyed: true,
+        };
+        assert!(check_dlq_all_policy(&keyed, OnBatchError::DlqAll, false).is_ok());
+        let atomic = AtomSink {
+            atomicity: BatchAtomicity::Atomic,
+            keyed: false,
+        };
+        assert!(check_dlq_all_policy(&atomic, OnBatchError::DlqAll, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn atom_sink_writes_every_record() {
+        let sink = AtomSink {
+            atomicity: BatchAtomicity::Atomic,
+            keyed: false,
+        };
+        assert_eq!(sink.write_batch(&[json!(1), json!(2)]).await.unwrap(), 2);
+    }
+
+    #[test]
+    fn batch_outcome_counters_snapshot() {
+        let c = BatchOutcomeCounters::new();
+        assert!(c.snapshot().is_empty());
+        for o in [
+            BatchOutcome::Committed,
+            BatchOutcome::Committed,
+            BatchOutcome::DlqPartial,
+            BatchOutcome::DlqAll,
+            BatchOutcome::Failed,
+        ] {
+            c.record(o);
+        }
+        let s = c.snapshot();
+        assert_eq!(
+            s,
+            BatchOutcomes {
+                attempted: 5,
+                committed: 2,
+                dlq_partial: 1,
+                dlq_all: 1,
+                failed: 1,
+            }
+        );
+        assert_eq!(s.unclean(), 3);
+        assert!(!s.is_empty());
+        assert_eq!(BatchOutcome::DlqPartial.as_str(), "dlq_partial");
+        assert_eq!(BatchOutcome::DlqAll.as_str(), "dlq_all");
+        assert_eq!(BatchOutcome::Failed.as_str(), "failed");
+        assert_eq!(BatchOutcome::Committed.as_str(), "committed");
+    }
+
+    #[test]
+    fn batch_outcome_sink_observes_and_counts() {
+        let counters = Arc::new(BatchOutcomeCounters::new());
+        let sink = BatchOutcomeSink::new("p", "r", "s", Some(Arc::clone(&counters)));
+        assert_eq!(sink.observe(Ok::<usize, FaucetError>(3)).unwrap(), 3);
+        assert!(
+            sink.observe(Err::<usize, _>(FaucetError::Sink("x".into())))
+                .is_err()
+        );
+        sink.record(BatchOutcome::DlqAll);
+        let snap = counters.snapshot();
+        assert_eq!((snap.committed, snap.failed, snap.dlq_all), (1, 1, 1));
+        BatchOutcomeSink::new("p", "r", "s", None).record(BatchOutcome::Committed);
+    }
 
     #[test]
     fn envelope_has_all_required_fields() {

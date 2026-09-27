@@ -32,7 +32,10 @@ compression = ["faucet-core/compression"]
 file-format-csv = ["faucet-core/file-format-csv"]
 file-format-xml = ["faucet-core/file-format-xml"]
 file-format-excel = ["faucet-core/file-format-excel"]
-file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
+# Avro Object Container Files (#719). ORC is read-only, so sinks have no ORC
+# feature.
+file-format-avro = ["faucet-core/file-format-avro"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "io-util", "sync"] }

@@ -252,6 +252,17 @@ impl Source for TransformingSource {
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
+    async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
+
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
 
     fn connector_name(&self) -> &'static str {
         self.inner.connector_name()
@@ -262,6 +273,13 @@ impl Source for TransformingSource {
         // the Data Movement Catalog would see the default
         // `<connector>://unknown` whenever transforms are attached.
         self.inner.dataset_uri()
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
     }
 }
 
@@ -300,6 +318,36 @@ mod tests {
         .expect("compile succeeds");
         let out = wrapped.fetch_with_context(&HashMap::new()).await.unwrap();
         assert_eq!(out, vec![json!({"foo_bar": 1})]);
+    }
+
+    struct VersionedSource;
+
+    #[async_trait]
+    impl Source for VersionedSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(Vec::new())
+        }
+        fn state_schema(&self) -> u32 {
+            2
+        }
+        fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+            Ok(json!({"from": from, "data": data}))
+        }
+    }
+
+    #[test]
+    fn state_versioning_is_forwarded_to_the_inner_source() {
+        let wrapped =
+            TransformingSource::new(Box::new(VersionedSource), vec![], Labels::for_named("test"))
+                .expect("compile succeeds");
+        assert_eq!(wrapped.state_schema(), 2);
+        assert_eq!(
+            wrapped.migrate_state(1, json!("x")).unwrap(),
+            json!({"from": 1, "data": "x"})
+        );
     }
 
     struct IncrementalSource {
@@ -525,6 +573,39 @@ mod tests {
         }
     }
 
+    struct RecorderProbe(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl Source for RecorderProbe {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn set_roundtrip_recorder(&self, _recorder: Arc<crate::observability::RoundtripRecorder>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn roundtrip_recorder_reaches_the_wrapped_source() {
+        let got = Arc::new(AtomicBool::new(false));
+        let wrapped = TransformingSource::new(
+            Box::new(RecorderProbe(got.clone())),
+            vec![],
+            Labels::for_named("test"),
+        )
+        .unwrap();
+        wrapped.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+            crate::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "probe",
+        )));
+        assert!(got.load(Ordering::Relaxed));
+    }
+
     #[tokio::test]
     async fn connector_name_state_key_and_start_bookmark_delegate_to_inner() {
         let started = Arc::new(AtomicBool::new(false));
@@ -555,6 +636,7 @@ mod tests {
             wrapped.capture_resume_position().await.unwrap(),
             Some(json!("captured"))
         );
+        assert_eq!(wrapped.lag().await.unwrap(), None);
     }
 
     #[tokio::test]

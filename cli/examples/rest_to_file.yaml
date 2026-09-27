@@ -1,0 +1,28 @@
+# Pull a REST API into local files — the quickest way to see what a source
+# produces. The format comes from the path's extension: change `.jsonl` to
+# `.csv`, `.json`, `.xml`, `.xlsx`, `.avro` or `.parquet` (build with
+# `--features file-formats` for the non-JSON ones), add `.gz` / `.zst` to
+# compress. Every file is written beside its final name and renamed into place
+# when complete, so a crashed run never leaves a half-written file.
+#
+#   faucet validate cli/examples/rest_to_file.yaml
+#   faucet run      cli/examples/rest_to_file.yaml
+version: 1
+name: rest_to_file
+
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: https://jsonplaceholder.typicode.com
+      path: /posts
+      pagination: { type: None }
+
+  sink:
+    type: file
+    config:
+      # One directory per day; roll to a new part every 50 records.
+      path: ./out/posts/${now.date}/posts-{part}.jsonl
+      max_records_per_file: 50
+      # Replace the day's parts only when the run succeeds.
+      write_mode: overwrite

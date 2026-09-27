@@ -460,3 +460,68 @@ async fn capture_resume_position_works_on_mysql_8_4() {
         "binlog pos present: {pos}"
     );
 }
+
+/// #733 — `lag()` reports the binlog bytes between the consumed position and
+/// the server's head: nothing before a position is known, a growing distance
+/// while changes pile up unread, and next to nothing once they are consumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lag_measures_unread_binlog_bytes() {
+    let (_container, url) = start_mysql_cdc().await;
+    {
+        let mut conn = connect(&url).await;
+        conn.query_drop("CREATE TABLE test.lagged (id INT PRIMARY KEY, pad TEXT)")
+            .await
+            .expect("create table");
+    }
+    let source = MysqlCdcSource::new(build_config(&url))
+        .await
+        .expect("source new");
+    assert_eq!(
+        source.lag().await.expect("lag"),
+        None,
+        "no position is known before a bookmark or a page"
+    );
+    let head = {
+        let mut conn = connect(&url).await;
+        let row: mysql_async::Row = conn
+            .query_first("SHOW MASTER STATUS")
+            .await
+            .expect("status")
+            .expect("binlog enabled");
+        (
+            row.get::<String, _>(0).unwrap(),
+            row.get::<u64, _>(1).unwrap(),
+        )
+    };
+    source
+        .apply_start_bookmark(json!({"file": head.0, "pos": head.1}))
+        .await
+        .expect("apply bookmark");
+    let caught_up = source.lag().await.expect("lag").expect("a reading");
+    assert_eq!(caught_up.bytes, Some(0));
+
+    {
+        let mut conn = connect(&url).await;
+        for i in 0..50 {
+            conn.exec_drop(
+                "INSERT INTO test.lagged (id, pad) VALUES (?, REPEAT('x', 512))",
+                (i,),
+            )
+            .await
+            .expect("insert");
+        }
+    }
+    let behind = source.lag().await.expect("lag").expect("a reading");
+    assert!(
+        behind.bytes.unwrap() > 50 * 512,
+        "50 half-KiB rows are unread: {behind:?}"
+    );
+
+    let (records, _) = drain(&source).await;
+    assert_eq!(records.len(), 50);
+    let after = source.lag().await.expect("lag").expect("a reading");
+    assert!(
+        after.bytes.unwrap() < behind.bytes.unwrap(),
+        "consuming the changes shrinks the lag: {after:?} vs {behind:?}"
+    );
+}

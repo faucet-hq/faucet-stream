@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "pipeline": "orders",
+  "exported_at": "2026-09-26T08:00:00Z",
+  "keys": {
+    "orders::customers": {
+      "updated_at": "2026-09-26T06:09:00Z"
+    },
+    "orders::customers::__sla__": {
+      "last_success_unix": 1790402940,
+      "volumes": [120, 118]
+    },
+    "orders::orders": {
+      "__faucet_eo": 1,
+      "bookmark": {
+        "lsn": "0/3A00F128"
+      },
+      "seq": 17
+    }
+  }
+}

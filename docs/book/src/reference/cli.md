@@ -41,11 +41,13 @@ JSON-RPC stream.
 | `faucet schedule [config]` | Run a pipeline on a cron schedule (long-running foreground process). |
 | `faucet serve` | Run a long-running HTTP control plane: submit / poll / cancel pipeline runs over REST. |
 | `faucet completions <shell>` | Print a shell tab-completion script (bash / zsh / fish / powershell / elvish). |
-| `faucet migrate [config]` | Upgrade a config written against an older grammar to the current shape (idempotent). |
+| `faucet migrate [config]` | Upgrade a config written against an older grammar to the current shape (idempotent); `--state` upgrades the pipeline's stored bookmarks instead. |
 | `faucet doctor --offline [config]` | Static, credential-free config lints (no network) — dangling/unused auth, unused vars, no-op sink `batch_size`. |
 | `faucet fmt [config] [--check]` | Canonicalize a config (stable key order); `--check` is a CI gate. |
 | `faucet explain [config]` | Plain-English narration of what a pipeline does (offline, zero I/O). |
 | `faucet history [config]` | Terminal view of the run history in a config's `catalog:` store. |
+| `faucet status [config]` | One screen of per-row health: last success / failure, bookmark, resume point, DLQ backlog, SLA verdicts. Exit 0 / 1 / 2. |
+| `faucet state show\|set\|reset\|export\|import` | Inspect, move, reset, back up, and restore a pipeline's durable state. |
 | `faucet run … --output json\|ndjson` | Machine-readable end-of-run summary (per-row + totals) for scripting. |
 
 `[config]` is optional for `run` / `validate` / `preview` / `doctor` / `mirror` / `schedule`: if
@@ -227,7 +229,8 @@ collections / indices / object-store prefixes), and emits a ready-to-run config
 with **one matrix row per dataset** — the input document with its `matrix:`
 block replaced, secrets echoed as raw `${…}` references. The generated config
 passes `faucet validate`. Supported sources: `postgres`, `mysql`, `mssql`,
-`sqlite`, `mongodb`, `elasticsearch`, `bigquery`, `snowflake`, `s3`, `gcs`.
+`sqlite`, `mongodb`, `elasticsearch`, `bigquery`, `snowflake`, `s3`, `gcs`,
+`file` (one dataset per file).
 
 | Flag | Purpose |
 |------|---------|
@@ -750,6 +753,102 @@ legitimate step change. `--row` narrows to one root row; both accept `--json`.
 `faucet schema profiling` prints the block's JSON Schema. See the
 [column profiling](../cookbook/profiling.md) cookbook page.
 
+## `status`
+
+```bash
+faucet status pipeline.yaml                 # one screen, every row
+faucet status pipeline.yaml --row orders    # one row
+faucet status pipeline.yaml --probe         # also ask sinks (watermarks, staging) and sources (lag)
+faucet status pipeline.yaml --json          # machine-readable
+```
+
+Answers, per matrix row (or topology sink node), *is this healthy, when did it
+last succeed, how far behind is it, what failed, and where does the next run
+resume* — without running anything. It reads the run-outcome marker and run
+lease every real run keeps in the `state:` store, the SLA and profiling
+histories, the rollback markers, a `catalog:` store's run history when the
+config has one, and the backlog of a local `jsonl` DLQ.
+
+```text
+pipeline shop (3 rows) — FAILED    state: file
+  row        status    last success            bookmark               lag  dlq  next run resumes at
+  customers  ok        2026-09-26 06:10 (2h)   updated_at=2026-09-26  —    0    updated_at=2026-09-26
+  orders     FAILED    2026-09-25 23:00 (9h)   lsn=0/3A00F128         412 MiB 17   lsn=0/3A00F128 (sink watermark agrees)
+             └ last error: Sink: deadlock detected (2026-09-26 02:14, run 01a0…)
+             └ exactly-once: state seq 42 · sink seq 42 · Agree → next run trusts the state
+             └ DLQ: 17 record(s), oldest 2026-09-26 02:14 (6h)
+  refunds    warming   never                   —                      —    0    full snapshot
+```
+
+Health, worst last: `ok`, `running` (a live run lease), `warming` (never
+completed a run), `unknown` (no durable state, or unreadable), `degraded` (an
+SLA breach — including a `max_lag_*` source-lag threshold —, a DLQ backlog,
+a last run that sent sink writes to the DLQ, column-profile drift, a crashed
+run's lease, or the state store ahead of the sink watermark), `failed` (the most recent run
+failed). Child rows aggregate under their parent (bookmark count, failed
+invocations, worst health). **Exit code:** `0` healthy (`ok` / `running` /
+`warming`), `1` degraded or unknown, `2` failed — usable from cron or a
+Nagios-style check. Each field is read independently: an unreachable state
+backend or DLQ is reported on its row, never failing the command. `--probe`
+reads each exactly-once row's committed sink watermark (read-only) and says
+whether it agrees with the state store and which side the next run trusts, and
+asks each `write_mode: overwrite` row's sink whether its `…__faucet_ovw` staging
+object exists (`present` / `absent` / `unknown`; without `--probe` a failed
+overwrite run is reported as an *unverified* `unknown`), and asks each
+lag-reporting source (`postgres-cdc`, `mysql-cdc`, `mssql-cdc`, `mongodb-cdc`,
+`oracle-cdc`, `kafka`, `kinesis`, `dynamodb` streams) how far behind its head the stored bookmark is — without
+`--probe` the **lag** column shows what the source reported when the last run
+ended. The `batches` field (and a detail line when not all committed) says how
+the last run's sink writes ended (#737).
+The `--json` document is the `StatusReport` schema in
+[`docs/openapi.yaml`](http-api.md#pipeline-status-and-state). See the
+[state and status cookbook](../cookbook/state-and-status.md).
+
+## `state`
+
+```bash
+faucet state show   pipeline.yaml [--row R] [--json]
+faucet state set    pipeline.yaml --row R --bookmark '{"updated_at":"2026-09-19T00:00:00Z"}' [--yes]
+faucet state reset  pipeline.yaml --row R [--parent-key K] [--include-markers] [--rewind-token] [--yes]
+faucet state export pipeline.yaml [-o state-backup.json]
+faucet state import pipeline.yaml state-backup.json [--to-state postgres://…] [--overwrite] [--yes]
+```
+
+Inspects and operates on a pipeline's durable state — every key under its
+namespace `{name}::…` in the `state:` store(s):
+
+- **`show`** — each row's bookmark (an exactly-once envelope unwrapped, its
+  sequence shown), child / shard sub-bookmarks, markers (SLA, profiling,
+  rollback, run outcomes, a live run lease), plus the pipeline's
+  replication / backfill markers and keys of rows the config no longer has.
+- **`set`** — move one row's bookmark (`--parent-key` for a child row). On an
+  exactly-once row the envelope is kept: its sequence is never lowered and is
+  raised to the sink's committed watermark when that is ahead, so the next run
+  honours the new position instead of re-anchoring to the sink's
+  (`--skip-watermark-check` skips reading the watermark — the command refuses
+  when it cannot be read).
+- **`reset`** — forget one row's bookmark(s) so its next run re-syncs from the
+  start; `--include-markers` also forgets its SLA / profiling baselines, run
+  outcomes and rollback markers. An exactly-once row keeps its envelope with a
+  null bookmark at the sink-safe sequence; `--rewind-token` instead deletes
+  the sink's commit token too (sinks that support it: postgres / sqlite /
+  mysql).
+- **`export`** — the versioned document `{version: 1, pipeline, exported_at,
+  keys}` (run leases excluded) on stdout or `-o FILE`.
+- **`import`** — restore an export into the config's store, or another with
+  `--to-state` (`postgres://…`, `redis://…`, `file:DIR` or a directory,
+  `memory`, or a `{type, config}` document). Refuses a namespace that already
+  holds state unless `--overwrite` (keys absent from the export are then
+  deleted), a document for another pipeline, and a newer document version.
+  Redis, Postgres and memory stores write all-or-nothing; a file store writes
+  key by key and reports exactly which keys landed before a failure.
+
+Every mutation prints the plan (before / after) first and needs `--yes`, an
+interactive confirmation on a terminal, or `--dry-run` to stop at the plan.
+It refuses while a run holds the row — a live run lease in the state store, or
+a run of the pipeline in flight in the config's `catalog:` store — unless
+`--force`.
+
 ## `catalog`
 
 *(requires the `catalog` build feature — included in `full`)*
@@ -825,6 +924,8 @@ faucet template run       acme/billing --sink faucet-hq/bigquery --sink-version 
   --param api_token="$TOKEN" --param bq_project=my-project    # source × sink, composed at run time
 faucet template run       acme/billing --sink faucet-hq/bigquery --overlay prod \
   --param state_dsn="$STATE_DSN"                              # + a deployment overlay
+faucet template run       crm --sink files --select deal_lines --include-parents eligible   # a subset of the streams
+faucet template rows      crm --sink files [--select … --include-parents …] [--no-state] [--json]  # list rows / preview a selection
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
 faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
@@ -865,6 +966,8 @@ as a pipeline but prints a deprecation notice — add `kind: pipeline`. See the
 | `--param <NAME=VALUE>` | *(run)* Supply a declared param. Repeatable. |
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
 | `--limit <n>` | *(run)* Stop after writing this many records. |
+| `--select` / `--only` / `--skip` / `--tag` / `--status` / `--include-parents` | *(run / rows)* Run — or, with `rows`, preview — only some of the template's rows: a source template's streams, a pipeline's matrix rows. The same selection model as `faucet run`; for a source template only the selected streams are composed, so a stream the sink cannot run does not block the others. A topology template refuses any selection. See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-streams). |
+| `--no-state` | *(rows)* Skip each row's `faucet status` view (last success / failure, bookmark age, lag, health). |
 | `--suite <path>` | *(test)* Positional: the suite file (YAML or JSON). `faucet schema template-test` prints its schema. |
 | `--select <n\|channel>` | *(test)* Override the suite's own `select:`. Ignored when the suite's `template:` is a path. A suite for a source template names its sink under `sink:` (a registered id, or a path when `template:` is a path) and `sink_select:`; every case then exercises the composed pipeline. |
 | `--filter <pattern>` | *(test)* Run only cases whose name matches; `*` wildcards, otherwise an exact match. |
@@ -926,6 +1029,7 @@ faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigque
 faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite [--overlay ops/prod.yaml] --out my-pipeline.yaml
 faucet hub matrix    --format table|markdown|json [--out FILE]
 faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint
+faucet hub rows      faucet-hq/example-csv [--sink faucet-hq/jsonl] [--select …] [--state] [--json]  # streams + metadata, or a pipeline file's rows
 faucet run           --source faucet-hq/example-csv --sink faucet-hq/jsonl                   # runs offline
 faucet validate      --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--show-composed]
 faucet schema source-template | sink-template | deployment
@@ -945,6 +1049,7 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 | `--sort name\|stars\|updated` | *(list)* Order by id, by stars (most starred first), or by the newest version's date. Stars, dates and open issues come from the catalog's `index.json` (`trust`) and are shown as columns; `--json` includes each entry's `trust` block. |
 | `--overlay <id\|path>` | *(compose / check, and `run` / `validate`)* A `kind: deployment` overlay applied over the pairing: a path, or an id under `<hub>/deployments/`. `check` also verifies every stream it names exists; `lint` accepts deployment files and flags literal credentials. |
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
+| `rows <source\|pipeline.yaml>` | List a catalog source template's streams (with `--sink`, their write resolution and guarantees against that sink) or a pipeline file's matrix rows — the same report as `GET /v1/templates/{id}/rows`. The selection flags preview a run set (exit≠0 when it would be refused); `--state` also reads each row's status from the composed run's state store. |
 | `--format table\|markdown\|json` | *(matrix)* Terminal table, the docs page, or `index.json`. |
 | `--json` | Machine-readable output. |
 
@@ -1372,6 +1477,30 @@ Rules applied today:
 
 Each rule is a pure, unit-tested transform. Comments are not preserved (the
 config is parsed and re-serialized).
+
+### `migrate --state`
+
+`faucet migrate --state [config]` upgrades the pipeline's **stored state**
+instead of the config: every row's bookmark is rewritten into the versioned
+state envelope and, when the row's source changed its bookmark shape, migrated
+to the current shape (#736). See [Upgrading faucet safely](../operations/upgrading.md).
+
+```bash
+faucet migrate --state orders.yaml            # rewrite every row's bookmark
+faucet migrate --state orders.yaml --check    # report only; exit non-zero if any key needs work
+faucet migrate --state orders.yaml --row cdc --json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--state` | Migrate stored state rather than the config file. |
+| `--check` | Report without writing; exits non-zero when a key is not current. |
+| `--row <id>` | Only this matrix row. |
+| `--json` | Machine-readable report (`pipeline`, `check`, `keys[]` with `row`, `key`, `owner`, `action` = `current` / `enveloped` / `migrated` / `refused`, `from_schema`, `to_schema`, `detail`). |
+
+A key this release cannot read (written by a newer faucet, or by another
+source) is reported as `refused`, left untouched, and makes the command exit
+non-zero.
 
 ## `doctor --offline`
 

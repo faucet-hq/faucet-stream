@@ -207,6 +207,11 @@ pub struct RunTemplate {
     /// Per-run timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Run only some of the pipeline's (or template's) matrix rows (#741) —
+    /// e.g. the cheap streams hourly and the heavy one nightly from two
+    /// triggers over one template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::select::SelectionRequest>,
 }
 
 /// Detect fields in the raw triggers document that the typed parse silently

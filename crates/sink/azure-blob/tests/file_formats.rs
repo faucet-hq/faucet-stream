@@ -185,3 +185,9 @@ async fn an_empty_write_leaves_no_blob() {
     let mut listing = store.list(Some(&ObjPath::from("empty/")));
     assert!(listing.next().await.is_none(), "no blob for an empty page");
 }
+
+#[cfg(feature = "file-format-avro")]
+#[tokio::test]
+async fn avro_blobs_round_trip() {
+    round_trip(AzureSinkFormat::Avro, FileFormat::Avro, ".avro").await;
+}

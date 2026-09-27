@@ -97,6 +97,13 @@ impl DuckdbSinkConfig {
     }
 }
 
+impl DuckdbSinkConfig {
+    /// What a failed batch write leaves behind (#737): every chunk of a batch runs in one transaction.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::Atomic
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +139,14 @@ mod tests {
         let json2 = r#"{ "database": ":memory:", "table_name": "e", "batch_size": 250 }"#;
         let config2: DuckdbSinkConfig = serde_json::from_str(json2).unwrap();
         assert_eq!(config2.batch_size, 250);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: DuckdbSinkConfig = serde_json::from_value(
+            serde_json::json!({"database": ":memory:", "table_name": "events"}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

@@ -21,6 +21,7 @@
 mod config;
 mod discover;
 mod envelope;
+mod lag;
 mod lineage;
 mod scan;
 mod sched;

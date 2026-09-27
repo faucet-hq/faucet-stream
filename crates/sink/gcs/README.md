@@ -69,7 +69,7 @@ This uploads each batch of records as one or more `events/{uuidv7}.jsonl` object
 | `bucket` | string | — *(required)* | GCS bucket name (without the `gs://` scheme). |
 | `prefix` | string | — *(required)* | Object-name prefix; concatenated with the UUIDv7 key and `file_extension` to form each object name. Use a trailing `/` for a folder-like layout (e.g. `events/2026/`). |
 | `auth` | `GcsCredentials` | `application_default` | Authentication — see [Authentication](#authentication). |
-| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
+| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `avro` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Suffix appended to every object name. Also drives compression auto-detection (`.jsonl.gz` → gzip). |
 
 ### Batching & throughput
@@ -359,6 +359,35 @@ same thing whatever the format. Columns are the union of every record's keys in
 the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+
+## Avro (#719)
+
+`format: avro` writes one Avro Object Container File per object, encoded
+against `avro.schema` or against a schema inferred from that object's records.
+Nullable and absent fields become `["null", T]`, mixed-type fields become
+`string`, and invalid names are sanitized (the original is kept in
+`faucet.name`). The block codec comes from `avro.codec`: `null` (default),
+`deflate`, `snappy` or `zstd`. With an explicit schema, logical types
+(`decimal`, `date`, `timestamp-*`, `uuid`, …) accept their string forms or
+epoch integers.
+
+```yaml
+format: avro
+file_extension: .avro
+avro:
+  codec: zstd
+```
+
+ORC is read-only, so there is no `orc` format here. Enable with
+`file-format-avro` (or `file-formats`).
+
+## Batch atomicity
+
+What a failed write leaves behind (#737): **atomic** for an unchunked Parquet write (`format: parquet`, `batch_size: 0`, no `max_records_per_file`), otherwise **best-effort** — only an unchunked Parquet batch is one object upload. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
 ## License
 

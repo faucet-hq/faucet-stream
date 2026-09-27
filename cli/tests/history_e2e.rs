@@ -42,6 +42,8 @@ fn record(id: &str, row_id: &str) -> RunRecord {
             duration_ms: 0,
             error: None,
             usage: None,
+            batches: None,
+            source_lag: None,
         }],
         error: None,
         idempotency_key: None,
@@ -54,6 +56,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         replay_of: None,
         callback: None,
         tenant: None,
+        selection: None,
     }
 }
 

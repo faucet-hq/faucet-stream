@@ -553,6 +553,107 @@ machine-readable report. The exit code is the failed-case count, mirroring
 `faucet test`, so CI gates on it without parsing output. `faucet schema
 template-test` prints the suite schema.
 
+## Running a subset of streams
+
+A template with rows — the `streams:` of a source template, the `matrix:` of a
+pipeline template — does not have to run all of them. Backfill one stream,
+re-run the one that failed, run the cheap streams hourly and the heavy one
+nightly, or let an embedding product's tenant pick which objects to sync, all
+from one registered template. Every trigger path takes the same **selection**,
+the model `faucet run` already uses (`--select` / `--only` / `--skip` /
+`--tag` / `--status` / `--include-parents`):
+
+```json
+{ "selection": { "select": ["deals"], "only": ["act*"], "skip": ["audit"],
+                 "tags": ["finance"], "status": ["available"],
+                 "include_parents": "eligible" } }
+```
+
+| surface | how |
+|---|---|
+| CLI | `faucet template run crm --sink files --select deals --include-parents eligible` |
+| HTTP | `selection` in the body of `POST /v1/templates/{id}/runs`, `POST /v1/runs`, `POST /v1/tenants/{t}/runs`, `POST /v1/tenants/{t}/templates/{id}/runs` and `POST /v1/templates/{id}/fanout` |
+| MCP | `selection` on `run_template`, `run_pipeline` and `propose_run` |
+| triggers | `run: { selection: {…} }` on a schedule / webhook / object-arrival / queue-depth trigger ([reference](../reference/triggers.md)) |
+| console | the **Streams** (or **Rows**) checkboxes on the trigger form |
+
+What runs is resolved the same way everywhere: status gate
+(`mandatory` / `active`, widened by `status`) → narrowed by `tags`, or picked by
+id with `select` / `only` → ancestors per `include_parents` → `skip` removed
+last. Omit `selection` and every row runs; an empty object applies only the
+status gate. For a source template the composition then includes **only the
+selected streams** — so a stream the chosen sink cannot run (say, one that
+needs `upsert` on a file sink) no longer blocks the others.
+
+**Parents and dependencies.** A child stream (`parent:`) or a row with
+`depends_on:` needs its ancestors in the run:
+
+| `include_parents` | a selected row whose ancestor is not selected |
+|---|---|
+| `off` (default) | refused before anything runs, naming every missing ancestor |
+| `eligible` | runnable (`mandatory` / `active`) ancestors are pulled in; a parked (`available` / `draft` / `archived`) one is refused |
+| `all` | every ancestor is pulled in (parked ones with a warning) |
+
+**What a selection does not change.** State keys are per row
+(`{pipeline}::{row}`), so running a subset never touches another row's
+bookmark. The run is labelled `selection=<canonical form>` (for example
+`select=deal_lines;include_parents=eligible`), which is also part of the
+idempotency fingerprint — the same key with a different subset is a `409`, not
+a replay. The selection is stored with the run, so a clustered, claimed or
+sharded run executes the same subset on whichever instance picks it up, and a
+[change request](./approvals.md) fingerprints it: a different subset is a
+different change. A topology pipeline (`pipeline.nodes`) has no rows, so any
+selection there is refused.
+
+**Errors are `400`s** naming the problem — an unknown row or tag (with the
+valid ones listed), an empty run set, a missing ancestor under
+`include_parents: off`.
+
+### Listing the rows
+
+Selection is only usable if callers can see the valid names, so every
+registered template lists its rows:
+
+```bash
+curl -s "localhost:8080/v1/templates/crm/rows?sink=files" -H "Authorization: Bearer $TOKEN"
+faucet template rows crm --sink files --store sqlite:./faucet-templates.db
+faucet hub rows example-csv --sink jsonl            # a catalog template, unregistered
+```
+
+Each row carries, where faucet can derive it:
+
+| group | fields |
+|---|---|
+| identity | `id`, `kind` (`stream` / `row`), `description`, `status`, `tags`, `default_selected` |
+| hierarchy | `parent`, `parent_key`, `children`, `depends_on`, `depth`, `per_parent_record` |
+| write | `write.requested`; with a sink `write.resolved`, `write.supported`, `write.offered`, `write.alias_applied`, `write.unsupported_reason`; `primary_keys`, `delete_marker` |
+| read | `read.source_kind`, `read.replication` (`full` / `incremental` + field), `read.resumable`, `read.shardable`, `read.supports_discover` |
+| guarantees (with a sink) | `guarantees.delivery_guarantee`, `guarantees.cleanup_capable` |
+| shape | `shape.schema` (from the contract, `schema_source: contract`), `shape.transforms` (count, kinds, whether any rename or drop fields) |
+| inputs | `params_used` |
+| state | `state.health`, `last_success`, `last_failure`, `last_error`, `bookmark_age_secs`, `lag` — from [`faucet status`](../reference/cli.md), when the state store is readable |
+
+Rows are expanded with placeholder-bound params, so a required param never
+blocks a listing; the state group needs the config's defaults to name its
+store (a source template's comes from the sink pairing and an `overlay`). A
+topology template returns `rows: []` with `selectable: false`.
+
+**Previewing a selection.** Pass the selection as query parameters (or flags)
+and the listing becomes a dry run: each row gains `selected`, `pulled_in`
+(with `because`), `blocked` (with the reason) or `excluded`, and the report
+gains `run_set` in execution order and the `error` a trigger would return.
+
+```bash
+curl -s "localhost:8080/v1/templates/crm/rows?select=deal_lines&include_parents=eligible"
+# → {…,"run_set":["deals","deal_lines"],
+#     "rows":[…,{"id":"deals","pulled_in":{"because":"deal_lines"},…},
+#                {"id":"deal_lines","selected":true,…}]}
+faucet template rows crm --select deal_lines --store sqlite:./faucet-templates.db
+#   ✗ deals   … blocked: required by `deal_lines` (parent) but not selected — include_parents is off; …
+```
+
+The MCP `list_template_rows` tool returns the same report.
+
 ## Triggering over HTTP
 
 Point `faucet serve --history` at the same store and the same templates become
@@ -614,7 +715,9 @@ Without a store the template tools are not advertised at all, so an agent never
 sees a tool it cannot use. `run_template` takes the same `sink` / `sink_version`
 pair as the HTTP trigger for a source template (and `overlay` / `overlay_version`
 for a deployment overlay), and its `dry_run` output carries the per-stream
-write-mode plan and what the overlay set.
+write-mode plan and what the overlay set. `list_template_rows` lists a template's rows (and
+previews a `selection`); `run_template` and `run_pipeline` take a `selection`
+to run a subset.
 
 ## What is and isn't stored
 

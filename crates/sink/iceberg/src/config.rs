@@ -413,6 +413,13 @@ impl IcebergSinkConfig {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+impl IcebergSinkConfig {
+    /// What a failed batch write leaves behind (#737): rows are staged and committed as a snapshot only at flush.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::PerRow
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +820,11 @@ mod tests {
                 serde_json::to_value(&cat).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: IcebergSinkConfig = serde_json::from_value(serde_json::json!({"catalog": {"type": "rest", "uri": "http://localhost:8181"}, "namespace": ["analytics"], "table": "events"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
     }
 }

@@ -49,6 +49,14 @@ pipeline:
       subject_field: "topic"        # each record's `topic` string is the subject
 ```
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **best-effort** — each record is its own publish. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
 ## License
 
 Licensed under either of Apache-2.0 or MIT at your option.

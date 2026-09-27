@@ -305,3 +305,57 @@ async fn the_dlq_presence_decides_whether_row_outcomes_are_consulted_at_all() {
         dlq_log.events()
     );
 }
+
+/// #737 — `dlq_all` against a sink whose failed write can land part of a batch
+/// is refused before anything is read or written: routing that batch would put
+/// the rows that did land into the DLQ too, and a replay would write them a
+/// second time.
+#[tokio::test]
+async fn dlq_all_on_a_best_effort_sink_is_refused_before_any_write() {
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone()).best_effort();
+    let dlq = Arc::new(ScriptedSink::new(log.clone()).as_dlq());
+    let store = Arc::new(sink.state_store());
+    let source = PagedSource::new(3, 4);
+
+    let err = Pipeline::new(&source, &sink)
+        .with_state_store(store)
+        .with_dlq(DlqConfig {
+            on_batch_error: OnBatchError::DlqAll,
+            ..DlqConfig::new(dlq)
+        })
+        .run()
+        .await
+        .expect_err("dlq_all on a best-effort sink must be refused");
+    assert!(err.to_string().contains("dlq_all"), "{err}");
+    assert!(
+        log.events().is_empty(),
+        "nothing may be written, dead-lettered or bookmarked: {:?}",
+        log.events()
+    );
+}
+
+/// The same sink is accepted when a replay cannot duplicate — it writes by
+/// key — or when the caller explicitly accepts the duplicates.
+#[tokio::test]
+async fn dlq_all_on_a_best_effort_sink_runs_when_keyed_or_opted_in() {
+    for (keyed, allow) in [(true, false), (false, true)] {
+        let log = EventLog::new();
+        let mut sink = ScriptedSink::new(log.clone()).best_effort();
+        if keyed {
+            sink = sink.keyed();
+        }
+        let dlq = Arc::new(ScriptedSink::new(log.clone()).as_dlq());
+        let source = PagedSource::new(2, 3);
+        Pipeline::new(&source, &sink)
+            .with_dlq(DlqConfig {
+                on_batch_error: OnBatchError::DlqAll,
+                ..DlqConfig::new(dlq)
+            })
+            .allow_dlq_all_duplicates(allow)
+            .run()
+            .await
+            .expect("keyed or opted-in dlq_all runs");
+        assert_eq!(log.records_written(), 6, "{:?}", log.events());
+    }
+}

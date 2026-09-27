@@ -46,46 +46,8 @@ pub enum Recv {
     IdleTimeout,
 }
 
-/// Conservative secret redactor: scrubs the scalar string values found in the
-/// tap config out of any echoed text (stderr, command description). We can't
-/// know which values are secret, so every non-trivial string leaf is treated as
-/// sensitive.
-#[derive(Clone, Default)]
-pub struct Redactor {
-    secrets: Vec<String>,
-}
-
-impl Redactor {
-    /// Build a redactor from a tap-config object, collecting string leaves.
-    pub fn from_config(cfg: &Value) -> Self {
-        let mut secrets = Vec::new();
-        collect_strings(cfg, &mut secrets);
-        // Longest first so containing values are scrubbed before substrings.
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        secrets.dedup();
-        Self { secrets }
-    }
-
-    /// Replace any known secret value in `s` with `***`.
-    pub fn redact(&self, s: &str) -> String {
-        let mut out = s.to_string();
-        for secret in &self.secrets {
-            if secret.len() >= 4 && out.contains(secret.as_str()) {
-                out = out.replace(secret.as_str(), "***");
-            }
-        }
-        out
-    }
-}
-
-fn collect_strings(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::String(s) => out.push(s.clone()),
-        Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
-        Value::Object(o) => o.values().for_each(|x| collect_strings(x, out)),
-        _ => {}
-    }
-}
+/// Conservative secret redactor, re-exported from [`faucet_common_singer`].
+pub use faucet_common_singer::Redactor;
 
 /// A running tap process and its stdout message channel.
 pub struct TapProcess {
@@ -302,50 +264,13 @@ pub(crate) fn write_temp(
     kind: &str,
     value: &Value,
 ) -> Result<tempfile::NamedTempFile, FaucetError> {
-    use std::io::Write;
-    let mut file = tempfile::Builder::new()
-        .prefix(&format!("faucet-singer-{kind}-"))
-        .suffix(".json")
-        .tempfile()
-        .map_err(|e| FaucetError::Source(format!("failed to create {kind} temp file: {e}")))?;
-    // `tempfile` creates the file 0600 via mkstemp; set it explicitly to be sure.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| FaucetError::Source(format!("failed to chmod {kind} temp file: {e}")))?;
-    }
-    let bytes = serde_json::to_vec(value)
-        .map_err(|e| FaucetError::Source(format!("failed to serialize {kind}: {e}")))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.flush())
-        .map_err(|e| FaucetError::Source(format!("failed to write {kind} temp file: {e}")))?;
-    Ok(file)
+    faucet_common_singer::write_private_json(kind, value).map_err(FaucetError::Source)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn redactor_scrubs_config_string_values() {
-        let cfg = json!({"token": "supersecrettoken", "n": 5, "nested": {"pw": "hunter2pass"}});
-        let r = Redactor::from_config(&cfg);
-        let line = "auth with supersecrettoken and hunter2pass ok";
-        let out = r.redact(line);
-        assert!(!out.contains("supersecrettoken"));
-        assert!(!out.contains("hunter2pass"));
-        assert!(out.contains("***"));
-    }
-
-    #[test]
-    fn redactor_ignores_short_values() {
-        let cfg = json!({"x": "ab"});
-        let r = Redactor::from_config(&cfg);
-        assert_eq!(r.redact("value ab here"), "value ab here");
-    }
 
     #[test]
     fn write_temp_is_private_and_valid_json() {

@@ -2,9 +2,11 @@
 //! honoring backoff, jitter, retry classification, and a cancellation token.
 
 use crate::error::FaucetError;
-use crate::resilience::classify::classify;
+use crate::observability::{RoundtripRecorder, ThrottleWait};
+use crate::resilience::classify::{RetryClass, classify};
 use crate::resilience::policy::RetryPolicy;
 use std::future::Future;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Per-op labels for the metered runner. Identifies which pipeline / matrix row
@@ -40,7 +42,29 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, None, op).await
+    run_with_policy(policy, cancel, None, None, op).await
+}
+
+/// Like [`execute_with_policy`], but reports source-side throttling to a
+/// connector's [`RoundtripRecorder`] (#734): every rate-limited error as
+/// `faucet_source_throttled_total`, each retry as
+/// `faucet_source_retries_total{class}`, and the time actually slept after a
+/// rate-limited attempt as `faucet_source_throttle_wait_seconds` (a sleep cut
+/// short by `cancel` records the partial wait). `None` behaves exactly like
+/// [`execute_with_policy`].
+///
+/// [`RoundtripRecorder`]: crate::observability::RoundtripRecorder
+pub async fn execute_with_policy_recorded<F, Fut, T>(
+    policy: &RetryPolicy,
+    cancel: Option<&CancellationToken>,
+    recorder: Option<&Arc<RoundtripRecorder>>,
+    op: F,
+) -> Result<T, FaucetError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, FaucetError>>,
+{
+    run_with_policy(policy, cancel, None, recorder, op).await
 }
 
 /// Like [`execute_with_policy`], but emits the resilience metrics
@@ -59,7 +83,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, Some(metrics), op).await
+    run_with_policy(policy, cancel, Some(metrics), None, op).await
 }
 
 /// Shared retry loop backing both the bare and metered public runners. When
@@ -70,6 +94,7 @@ async fn run_with_policy<F, Fut, T>(
     policy: &RetryPolicy,
     cancel: Option<&CancellationToken>,
     metrics: Option<&RetryMetrics>,
+    recorder: Option<&Arc<RoundtripRecorder>>,
     mut op: F,
 ) -> Result<T, FaucetError>
 where
@@ -85,7 +110,14 @@ where
     let max_attempts = policy.max_attempts.max(1);
     let mut attempt = 0u32;
     loop {
-        match op().await {
+        let outcome = op().await;
+        let class = outcome.as_ref().err().and_then(classify);
+        if class == Some(RetryClass::RateLimited)
+            && let Some(r) = recorder
+        {
+            r.throttled();
+        }
+        match outcome {
             Ok(val) => return Ok(val),
             Err(e) if policy.is_retriable(&e) && attempt + 1 < max_attempts => {
                 let base = policy.backoff.delay(policy.base, policy.max, attempt);
@@ -101,7 +133,7 @@ where
                 );
                 if let Some(m) = metrics {
                     // `is_retriable` above guarantees a class; fall back defensively.
-                    let class = classify(&e).map(|c| c.as_str()).unwrap_or("unknown");
+                    let class = class.map(|c| c.as_str()).unwrap_or("unknown");
                     crate::observability::resilience::retry(&m.pipeline, &m.row, m.op, class);
                     crate::observability::resilience::retry_sleep(
                         &m.pipeline,
@@ -110,6 +142,11 @@ where
                         wait.as_secs_f64(),
                     );
                 }
+                if let (Some(r), Some(c)) = (recorder, class) {
+                    r.retry(c);
+                }
+                let _throttle_timer = (class == Some(RetryClass::RateLimited))
+                    .then(|| ThrottleWait::start(recorder.cloned()));
                 if !wait.is_zero() {
                     match cancel {
                         Some(token) => {
@@ -398,5 +435,114 @@ mod tests {
         })
         .await;
         assert!(r.is_err());
+    }
+
+    fn rate_limited() -> FaucetError {
+        FaucetError::HttpStatus {
+            status: 429,
+            url: "u".into(),
+            body: "".into(),
+        }
+    }
+
+    fn recorder() -> Arc<RoundtripRecorder> {
+        Arc::new(RoundtripRecorder::new(
+            crate::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "graphql",
+        ))
+    }
+
+    #[tokio::test]
+    async fn recorded_runner_meters_rate_limits_retries_and_the_wait() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            backoff: BackoffKind::Fixed,
+            base: Duration::from_millis(20),
+            max: Duration::from_millis(20),
+            jitter: false,
+            ..RetryPolicy::default()
+        };
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        let rec = Arc::new(
+            RoundtripRecorder::new(crate::observability::RoundtripSide::Source, "p", "r", "xml")
+                .with_meter(meter.clone()),
+        );
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = calls.clone();
+        let r = execute_with_policy_recorded(&policy, None, Some(&rec), move || {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match n {
+                    0 | 1 => Err::<i32, _>(rate_limited()),
+                    2 => Err(FaucetError::HttpStatus {
+                        status: 503,
+                        url: "u".into(),
+                        body: "".into(),
+                    }),
+                    _ => Ok(7),
+                }
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        let tally = rec.throttle_tally();
+        assert_eq!(tally.throttled(), 2);
+        assert!(
+            tally.wait() >= Duration::from_millis(40),
+            "only the two rate-limit sleeps count: {:?}",
+            tally.wait()
+        );
+        assert!(tally.wait() < Duration::from_millis(60) + Duration::from_secs(1));
+        let usage = meter.snapshot();
+        assert_eq!(usage.source_retries["rate_limited"], 2);
+        assert_eq!(usage.source_retries["http_5xx"], 1);
+    }
+
+    #[tokio::test]
+    async fn recorded_runner_counts_a_final_rate_limit_it_does_not_retry() {
+        let rec = recorder();
+        let r = execute_with_policy_recorded(&fast_policy(1), None, Some(&rec), || async {
+            Err::<i32, _>(rate_limited())
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(rec.throttle_tally().throttled(), 1);
+        assert_eq!(rec.throttle_tally().wait(), Duration::ZERO);
+        let r = execute_with_policy_recorded(&fast_policy(3), None, None, || async {
+            Err::<i32, _>(rate_limited())
+        })
+        .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn recorded_runner_records_a_partial_wait_on_cancellation() {
+        let policy = RetryPolicy {
+            max_attempts: 10,
+            backoff: BackoffKind::Fixed,
+            base: Duration::from_secs(30),
+            max: Duration::from_secs(30),
+            jitter: false,
+            ..RetryPolicy::default()
+        };
+        let rec = recorder();
+        let token = CancellationToken::new();
+        let t = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            t.cancel();
+        });
+        let r = execute_with_policy_recorded(&policy, Some(&token), Some(&rec), || async {
+            Err::<i32, _>(rate_limited())
+        })
+        .await;
+        assert!(r.is_err());
+        let wait = rec.throttle_tally().wait();
+        assert!(
+            wait >= Duration::from_millis(25) && wait < Duration::from_secs(5),
+            "{wait:?}"
+        );
     }
 }

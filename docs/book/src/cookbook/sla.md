@@ -27,15 +27,16 @@ sla:
 
 A runnable example lives at `cli/examples/csv_to_jsonl_with_sla.yaml`.
 
-## The three checks
+## The checks
 
 | Check | Fires when… | Needs `state:`? |
 |-------|-------------|-----------------|
 | `max_staleness_secs` | a run **fails** and the last successful run is older than the threshold (also probed read-only by `faucet doctor`) | yes |
 | `min_rows_per_run` | a run **succeeds** but writes fewer records than the floor | no |
 | `volume_anomaly` | a run **succeeds** but its volume is anomalous against the rolling baseline of recent successful runs | yes |
+| `max_lag_bytes` / `max_lag_events` / `max_lag_seconds` | the source reports it is further behind its head than the threshold when a run ends (#733) | no |
 
-The three compose freely — declare any subset. An `sla:` block that declares
+They compose freely — declare any subset. An `sla:` block that declares
 none of them is rejected at config load, as is a stateful check without a
 `state:` block (`faucet validate` catches both).
 
@@ -70,11 +71,48 @@ executor checks how long ago the pipeline last succeeded and fires the
 `faucet schedule` this means every failing tick past the threshold re-alerts,
 which is exactly what you want a pager rule keyed on.
 
+## Source lag
+
+"Fresh by bookmark" is not "caught up": a CDC pipeline can commit a bookmark
+every minute while WAL piles up faster than it drains. Sources with a notion of
+a head report how far behind it they are, and the `max_lag_*` thresholds turn
+that into an SLA:
+
+```yaml
+sla:
+  max_lag_bytes: 1073741824   # Postgres slot / MySQL binlog: at most 1 GiB unread
+  max_lag_events: 100000      # Kafka: at most 100k unconsumed messages
+  max_lag_seconds: 900        # MongoDB / SQL Server / Oracle / Kinesis / DynamoDB: oldest unread change ≤ 15 min
+```
+
+| Source | Reports | Measured as |
+|---|---|---|
+| `postgres-cdc` | bytes | `pg_current_wal_lsn()` minus the furthest of the slot's `confirmed_flush_lsn` and the position this run reached |
+| `mysql-cdc` | bytes | binlog bytes from the consumed file/position to the head, across files (`SHOW BINARY LOGS`) |
+| `mssql-cdc` | events, seconds | change transactions after the slowest capture instance's LSN (`cdc.lsn_time_mapping`) and the age of the oldest |
+| `mongodb-cdc` | seconds | the cluster's `operationTime` minus the time of the oldest undelivered change |
+| `kafka` | events | each partition's high watermark minus the next offset to read, summed |
+| `kinesis` | seconds | `MillisBehindLatest` from `GetRecords`, worst shard |
+| `oracle-cdc` | seconds | commit time of the current SCN minus that of the captured `commit_scn` (`SCN_TO_TIMESTAMP`); nothing when the position is older than the SCN-to-time mapping (ORA-08181) |
+| `dynamodb` (`mode: streams`) | seconds | now minus the `ApproximateCreationDateTime` of the newest record read from each open shard, worst shard — or, before any, of the oldest unconsumed record at the bookmark (one `Limit: 1` read per open shard); a shard with nothing to read counts as caught up |
+
+The pipeline asks on the first page, at most every 15 s while pages flow, and
+once when the run ends; the gauges `faucet_source_lag_bytes`,
+`faucet_source_lag_events` and `faucet_source_lag_seconds{pipeline,row,connector}`
+carry the latest reading, and the end-of-run value is kept on the row's status
+marker. Between scheduled runs a gauge goes stale, so `faucet status --probe`
+(and `faucet doctor`) ask the source again from the stored bookmark. A lag
+query that fails is logged once and reported as no lag — it never fails a run.
+Some need extra grants: `pg_replication_slots` is readable by the replication
+role; MySQL needs `REPLICATION CLIENT` for `SHOW BINARY LOGS`; SQL Server needs
+`SELECT` on `cdc.lsn_time_mapping`.
+
 ## Metrics & alerting
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `faucet_pipeline_sla_violations_total` | counter | `pipeline`, `row`, `kind` | One increment per detected violation; `kind` ∈ `staleness` \| `min_rows` \| `volume`. |
+| `faucet_pipeline_sla_violations_total` | counter | `pipeline`, `row`, `kind` | One increment per detected violation; `kind` ∈ `staleness` \| `min_rows` \| `volume` \| `lag`. |
+| `faucet_source_lag_bytes` / `_events` / `_seconds` | gauge | `pipeline`, `row`, `connector` | The source's latest lag reading (#733), in the units it reports. |
 | `faucet_pipeline_sla_baseline_runs` | gauge | `pipeline`, `row` | Successful runs currently in the rolling volume baseline (cold-start visibility). |
 
 A minimal Prometheus alert:
@@ -104,6 +142,10 @@ invocation:
         hint: check the pipeline's schedule and recent run failures
   • sla    [sla] baseline (skip: volume baseline warming up: 2/5 successful runs)
 ```
+
+A source that reports lag also gets a `lag` probe, measured from the stored
+bookmark (`✓ source [postgres-cdc] lag` with `hint: behind by 412 MiB`); it
+fails when a `max_lag_*` threshold is exceeded.
 
 A stale pipeline makes `doctor` exit non-zero — usable as a standalone
 freshness check in CI or a cron health probe, independent of any run.

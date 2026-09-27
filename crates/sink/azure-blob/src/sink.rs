@@ -176,6 +176,10 @@ impl AzureBlobSink {
 
 #[async_trait]
 impl faucet_core::Sink for AzureBlobSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn dataset_uri(&self) -> String {
         format!("az://{}/{}", self.config.container(), self.config.prefix)
     }

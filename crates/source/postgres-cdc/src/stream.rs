@@ -47,6 +47,17 @@ pub struct PostgresCdcSource {
     /// downstream; doing so would let Postgres discard WAL for unwritten
     /// changes and lose data on a crash (#78/#1).
     confirmed_lsn: Mutex<u64>,
+    /// Highest LSN handed to the pipeline on a page bookmark this run — the
+    /// position [`Source::lag`] measures from while the slot's
+    /// `confirmed_flush_lsn` still trails (#733).
+    emitted_lsn: std::sync::atomic::AtomicU64,
+}
+
+/// Unread WAL: the server's current position minus the furthest point the
+/// consumer is known to have reached — the slot's `confirmed_flush_lsn` or,
+/// when ahead of it, this run's own position.
+fn slot_lag_bytes(current_wal: u64, slot_confirmed: Option<u64>, local: u64) -> u64 {
+    current_wal.saturating_sub(slot_confirmed.unwrap_or(0).max(local))
 }
 
 impl PostgresCdcSource {
@@ -62,6 +73,7 @@ impl PostgresCdcSource {
             state_key_value: key,
             pending_bookmark: Mutex::new(None),
             confirmed_lsn: Mutex::new(initial_lsn),
+            emitted_lsn: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -186,6 +198,20 @@ impl Source for PostgresCdcSource {
         )
         .await?;
         Ok(Some(crate::state::Bookmark::from_u64(lsn).to_value()?))
+    }
+
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        let local = (*self.confirmed_lsn.lock().await)
+            .max(self.emitted_lsn.load(std::sync::atomic::Ordering::Relaxed));
+        let positions = replication::slot_positions(
+            &self.config.connection_url,
+            &self.config.slot_name,
+            &self.config.tls,
+        )
+        .await?;
+        Ok(positions.map(|(current, confirmed)| {
+            faucet_core::SourceLag::bytes(slot_lag_bytes(current, confirmed, local))
+        }))
     }
 
     fn supports_exactly_once(&self) -> bool {
@@ -495,6 +521,8 @@ impl PostgresCdcSource {
                     // Postgres to discard WAL for changes that were never written
                     // downstream — a crash in that window loses data (#78/#1).
                     if per_transaction {
+                        self.emitted_lsn
+                            .fetch_max(lsn, std::sync::atomic::Ordering::Relaxed);
                         let bookmark = Some(Bookmark::from_u64(lsn).to_value()?);
                         yield StreamPage {
                             records: drained,
@@ -521,6 +549,8 @@ impl PostgresCdcSource {
             if !per_transaction
                 && let Some(lsn) = state.last_committed
             {
+                self.emitted_lsn
+                    .fetch_max(lsn, std::sync::atomic::Ordering::Relaxed);
                 let bookmark = Some(Bookmark::from_u64(lsn).to_value()?);
                 yield StreamPage {
                     records: agg_records,
@@ -804,6 +834,15 @@ fn tuple_to_object(rel: &Relation, tup: &TupleData) -> Result<TupleRow, FaucetEr
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn slot_lag_bytes_measures_from_the_furthest_known_position() {
+        assert_eq!(slot_lag_bytes(1000, Some(400), 0), 600);
+        assert_eq!(slot_lag_bytes(1000, Some(400), 900), 100);
+        assert_eq!(slot_lag_bytes(1000, None, 250), 750);
+        assert_eq!(slot_lag_bytes(1000, Some(1200), 0), 0);
+    }
+
     use super::*;
     use crate::pgoutput::messages::{ColumnDesc, ReplicaIdentity};
     use crate::replication::ReplicationEvent;

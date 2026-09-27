@@ -84,6 +84,7 @@ pub fn build_submit_request(
         reason: None,
         budget: None,
         approved_change: None,
+        selection: compiled.spec.run.selection.clone(),
     }
 }
 
@@ -310,6 +311,7 @@ pub fn template_body(
         labels,
         timeout_secs: compiled.spec.run.timeout_secs,
         idempotency_key: Some(context::idempotency_key(name, event)),
+        selection: compiled.spec.run.selection.clone(),
         ..Default::default()
     })
 }
@@ -490,6 +492,7 @@ mod tests {
                     name: Some("{name}:{object_key}".into()),
                     labels: Default::default(),
                     timeout_secs: Some(60),
+                    selection: None,
                 },
                 kind: TriggerKind::Webhook {
                     methods: vec!["POST".into()],

@@ -102,6 +102,24 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
 - **Delivery** — at-least-once (`supports_exactly_once` is `false`, like the
   Kinesis source). Pair with an upsert sink keyed on the table key.
 
+## Source lag
+
+In `mode: streams`, `Source::lag` (#733) reports **seconds**: now minus the
+`ApproximateCreationDateTime` of the newest record read from each open shard,
+the largest across shards. Before this run has read anything — `faucet status
+--probe`, `faucet doctor`, the start of a run — it peeks each open shard from
+the bookmark instead: `GetShardIterator` at the bookmarked sequence (or where a
+run would start for a shard with no entry) and one `GetRecords` with
+`Limit: 1`; the first record's `ApproximateCreationDateTime` is the age of the
+oldest unconsumed change. Stream reads are non-destructive, so the probe
+consumes nothing. DynamoDB Streams exposes no head position, so a shard with
+nothing to read counts as caught up (zero) rather than aging while quiet. The
+pipeline polls it on the first page, at most every 15 s after, and when the run
+ends, exporting `faucet_source_lag_seconds{pipeline,row,connector}`;
+`sla.max_lag_seconds` turns it into an SLA. A failed probe is logged once and
+reported as no lag — it never fails a run. `scan` and `query` modes report no
+lag.
+
 ## Discovery and preflight
 
 `discover()` lists tables (`ListTables` + `DescribeTable`): one descriptor per

@@ -1,7 +1,7 @@
 {
   "uid": "faucet-reliability",
   "title": "faucet · Reliability & data quality",
-  "description": "Retries, circuit breakers, DLQ traffic, quality/contract/drift/masking counters, SLA and backfill progress.",
+  "description": "Retries, circuit breakers, DLQ traffic, quality/contract/drift/masking counters, SLA and backfill progress, source throttling.",
   "tags": [
     "faucet",
     "reliability",
@@ -542,6 +542,207 @@
             "uid": "${datasource}"
           },
           "legendFormat": "{{pipeline}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Source lag — bytes (#733)",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pipeline, row, connector) (faucet_source_lag_bytes{pipeline=~\"$pipeline\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{row}} {{connector}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Source lag — events / seconds (#733)",
+      "gridPos": {
+        "x": 8,
+        "y": 40,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pipeline, row, connector) (faucet_source_lag_events{pipeline=~\"$pipeline\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{row}} events"
+        },
+        {
+          "refId": "B",
+          "expr": "max by (pipeline, row, connector) (faucet_source_lag_seconds{pipeline=~\"$pipeline\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{row}} seconds"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Sink batch outcomes (#737)",
+      "gridPos": {
+        "x": 16,
+        "y": 40,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pipeline, sink, outcome) (increase(faucet_batch_outcomes_total{pipeline=~\"$pipeline\"}[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{sink}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Source throttling — rate-limit responses (#734)",
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pipeline, row, connector) (increase(faucet_source_throttled_total{pipeline=~\"$pipeline\"}[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{row}} {{connector}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Source throttling — share of time waiting (#734)",
+      "gridPos": {
+        "x": 8,
+        "y": 48,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pipeline, row, connector) (rate(faucet_source_throttle_wait_seconds_sum{pipeline=~\"$pipeline\"}[15m]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{row}} {{connector}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Source retries (by class) (#734)",
+      "gridPos": {
+        "x": 16,
+        "y": 48,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (pipeline, connector, class) (increase(faucet_source_retries_total{pipeline=~\"$pipeline\"}[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{connector}} {{class}}"
         }
       ],
       "fieldConfig": {

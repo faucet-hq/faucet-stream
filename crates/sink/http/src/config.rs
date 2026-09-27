@@ -189,6 +189,13 @@ impl HttpSinkConfig {
     }
 }
 
+impl HttpSinkConfig {
+    /// What a failed batch write leaves behind (#737): per-request outcomes; the outer error fires only when nothing was delivered.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::PerRow
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +302,11 @@ mod tests {
         };
         let debug = format!("{custom:?}");
         assert!(debug.contains("***"));
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: HttpSinkConfig = serde_json::from_value(serde_json::json!({"url": "https://api.example.com/ingest", "method": "POST", "auth": {"type": "none"}, "batch_mode": {"type": "Array"}, "max_retries": 0, "concurrency": 10})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
     }
 }

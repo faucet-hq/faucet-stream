@@ -19,7 +19,7 @@ sinks that can't report per-row outcomes:
 ```yaml
 pipeline:
   source: { type: rest, config: { /* … */ } }
-  sink:   { type: bigquery, config: { /* … */ } }
+  sink:   { type: bigquery, config: { batch_size: 0, /* … */ } }   # one insertAll per write
   dlq:
     on_batch_error: dlq_all      # or `propagate`
     sink:
@@ -67,6 +67,70 @@ Sinks that *do* report per-row results (BigQuery, Elasticsearch, and the HTTP
 sink in `Individual` mode) override the partial-write path so only the genuinely
 failed rows are dead-lettered — the already-delivered rows are not duplicated
 into the DLQ.
+
+## Batch atomicity and `dlq_all`
+
+`dlq_all` sends *every* row of a failed write to the DLQ. That is only safe
+when the failed write landed nothing: a DLQ replay writes every routed row
+again, so rows that had already committed would land twice — silently.
+
+So every sink declares what a failed write leaves behind:
+
+| Batch atomicity | A failed write… | `dlq_all` |
+|---|---|---|
+| `atomic` | landed nothing (one statement, a transaction around every chunk, one object upload, one table commit) | allowed |
+| `per_row` | reports which rows failed; a whole-write error means nothing from that write landed | allowed |
+| `best_effort` | may have landed some rows and cannot say which | **refused** |
+
+Several sinks are all-or-nothing only in some configurations — typically
+`batch_size: 0`, which makes one page one statement or one request. The
+[capability matrix](../reference/connectors.md#sinks) lists each sink and the
+config that makes it atomic. A third-party sink that does not declare anything
+counts as `best_effort`.
+
+`faucet validate` and `faucet run` (before reading anything) refuse `dlq_all`
+on a `best_effort` sink:
+
+```text
+row 'orders': dlq: on_batch_error 'dlq_all' is unsafe with sink 'jsonl' (batch
+atomicity 'best_effort'): a failed batch may already have written some rows, and
+replaying the DLQ would write them again. Use on_batch_error 'propagate',
+configure the sink with write_mode 'upsert' and a key so a replay overwrites
+instead of duplicating, or set allow_duplicates_on_dlq_all: true to accept the
+duplicates
+```
+
+The ways out, safest first:
+
+1. **Make the write atomic** — e.g. `batch_size: 0` on BigQuery, SQLite,
+   Snowflake, ClickHouse or Redshift `COPY`.
+2. **Write by key** — `write_mode: upsert` (or `delete`) with a `key`: a
+   replayed row overwrites itself, so duplicates cannot happen.
+3. **Use `propagate`** — fail the run and let the next one retry from the
+   bookmark.
+4. **Accept the duplicates** — set `allow_duplicates_on_dlq_all: true` on the
+   `dlq:` block when the destination tolerates them (downstream dedup, an
+   append-only audit log):
+
+   ```yaml
+   dlq:
+     sink: { type: jsonl, config: { path: ./dead-letters.jsonl } }
+     on_batch_error: dlq_all
+     allow_duplicates_on_dlq_all: true
+   ```
+
+### Seeing what happened to each batch
+
+Every sink write is counted by outcome — `committed`, `dlq_partial` (some rows
+went to the DLQ per row), `dlq_all` (the whole write went to the DLQ) or
+`failed` (the error propagated):
+
+- the `faucet_batch_outcomes_total{pipeline,row,sink,outcome}` counter;
+- `faucet run --output json` (`rows[].batches`);
+- `faucet status`, which marks a row degraded when its last run sent writes to
+  the DLQ (`last run: of 40 sink write(s), 2 went to the DLQ whole (dlq_all)`);
+- the run-history record (`invocations[].batches`) and the **batches** column
+  of the web console's run detail.
 
 ## Failure budgets
 

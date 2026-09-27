@@ -52,6 +52,17 @@ $ cat out/records.jsonl
 {"id":"3","name":"Linus","city":"Helsinki"}
 ```
 
+To look at the output in another format, swap the sink for the general local
+[`file` sink](../cookbook/file-formats.md#the-local-file-sink) — the format
+follows the extension, and a file only appears once it is complete:
+
+```yaml
+  sink:
+    type: file
+    config:
+      path: ./out/records.csv      # or .json, .xml, .xlsx, .avro, .parquet
+```
+
 ## 4. Preview without writing
 
 To see what a source emits without touching a sink, use `preview` — it runs the

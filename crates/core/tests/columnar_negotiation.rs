@@ -204,7 +204,11 @@ async fn columnar_path_persists_bookmark_to_state_store() {
         .expect("columnar path with a state store should succeed");
 
     assert_eq!(result.records_written, 2);
-    let persisted = store.get("columnar-test").await.unwrap();
+    let persisted = store
+        .get("columnar-test")
+        .await
+        .unwrap()
+        .map(|v| faucet_core::state_version::peel_versioned(&v));
     assert_eq!(
         persisted,
         Some(json!({"done": true})),

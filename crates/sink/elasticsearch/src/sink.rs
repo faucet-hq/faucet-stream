@@ -911,6 +911,10 @@ fn extract_bulk_error_messages(resp_body: &Value) -> Vec<String> {
 
 #[async_trait]
 impl faucet_core::Sink for ElasticsearchSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn config_schema(&self) -> serde_json::Value {
         serde_json::to_value(faucet_core::schema_for!(ElasticsearchSinkConfig))
             .expect("schema serialization")

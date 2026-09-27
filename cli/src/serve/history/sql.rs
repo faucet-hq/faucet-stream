@@ -56,6 +56,11 @@ pub const DDL: &[&str] = &[
         in_flight TEXT)",
     "CREATE INDEX IF NOT EXISTS faucet_serve_instances_hb_idx \
         ON faucet_serve_instances (last_heartbeat)",
+    // What each member can read (#736). A separate table so members that
+    // predate it keep heartbeating unchanged; their missing row reads as 0.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_instance_caps (\
+        instance_id TEXT PRIMARY KEY,\
+        state_format TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS faucet_serve_idem (\
         key TEXT PRIMARY KEY,\
         run_id TEXT NOT NULL,\
@@ -365,10 +370,14 @@ pub struct Stmts {
     pub pending_cancellations: String,
     /// Upsert this instance's membership heartbeat into `faucet_serve_instances`.
     pub heartbeat_instance: String,
+    /// Upsert this instance's capabilities into `faucet_serve_instance_caps`.
+    pub heartbeat_caps: String,
     /// List instances whose last heartbeat is at or after a given threshold.
     pub live_instances: String,
     /// Prune instances whose last heartbeat is before a given threshold.
     pub prune_instances: String,
+    /// Drop capability rows whose member was pruned.
+    pub prune_instance_caps: String,
     // ── Source shards (Mode B, #230) ─────────────────────────────────────────
     /// Idempotent shard insert (`ON CONFLICT (run_id, shard_id) DO NOTHING`).
     pub insert_shard: String,
@@ -796,11 +805,17 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            live_instances: "SELECT instance_id, started_at, last_heartbeat, listen, \
-                max_concurrent, in_flight FROM faucet_serve_instances \
-                WHERE last_heartbeat >= $1"
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format) \
+                VALUES ($1,$2) ON CONFLICT (instance_id) DO UPDATE SET \
+                state_format = excluded.state_format"
+                .into(),
+            live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
+                i.max_concurrent, i.in_flight, c.state_format FROM faucet_serve_instances i \
+                LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
+                WHERE i.last_heartbeat >= $1"
                 .into(),
             prune_instances: "DELETE FROM faucet_serve_instances WHERE last_heartbeat < $1".into(),
+            prune_instance_caps: "DELETE FROM faucet_serve_instance_caps WHERE instance_id NOT IN (SELECT instance_id FROM faucet_serve_instances)".into(),
             insert_shard: "INSERT INTO faucet_serve_shards \
                 (run_id, shard_id, descriptor, size_estimate, status, attempt) \
                 VALUES ($1,$2,$3,$4,'pending','0') \
@@ -1178,11 +1193,17 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            live_instances: "SELECT instance_id, started_at, last_heartbeat, listen, \
-                max_concurrent, in_flight FROM faucet_serve_instances \
-                WHERE last_heartbeat >= ?"
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format) \
+                VALUES (?,?) ON CONFLICT (instance_id) DO UPDATE SET \
+                state_format = excluded.state_format"
+                .into(),
+            live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
+                i.max_concurrent, i.in_flight, c.state_format FROM faucet_serve_instances i \
+                LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
+                WHERE i.last_heartbeat >= ?"
                 .into(),
             prune_instances: "DELETE FROM faucet_serve_instances WHERE last_heartbeat < ?".into(),
+            prune_instance_caps: "DELETE FROM faucet_serve_instance_caps WHERE instance_id NOT IN (SELECT instance_id FROM faucet_serve_instances)".into(),
             insert_shard: "INSERT INTO faucet_serve_shards \
                 (run_id, shard_id, descriptor, size_estimate, status, attempt) \
                 VALUES (?,?,?,?,'pending','0') \
@@ -2081,6 +2102,9 @@ macro_rules! impl_sql_history {
                     .bind(sql::threshold(now, retain_for))
                     .execute(&self.pool)
                     .await;
+                let _ = sqlx::query(&self.stmts.prune_instance_caps)
+                    .execute(&self.pool)
+                    .await;
                 // Reclaim shard rows whose parent run was just purged (F25):
                 // `purge_runs` removed the expired terminal records above, so any
                 // shard row no longer matching a run is orphaned. Best-effort.
@@ -2440,6 +2464,12 @@ macro_rules! impl_sql_history {
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
+                sqlx::query(&self.stmts.heartbeat_caps)
+                    .bind(&self.instance_id)
+                    .bind(beat.state_format.to_string())
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
                 Ok(())
             }
 
@@ -2469,6 +2499,7 @@ macro_rules! impl_sql_history {
                     let hb: String = r.try_get("last_heartbeat").map_err(backend)?;
                     let mc: Option<String> = r.try_get("max_concurrent").map_err(backend)?;
                     let inf: Option<String> = r.try_get("in_flight").map_err(backend)?;
+                    let fmt: Option<String> = r.try_get("state_format").map_err(backend)?;
                     out.push(InstanceRecord {
                         instance_id: r.try_get("instance_id").map_err(backend)?,
                         started_at: parse_dt(&started),
@@ -2476,6 +2507,7 @@ macro_rules! impl_sql_history {
                         listen: r.try_get("listen").map_err(backend)?,
                         max_concurrent: mc.and_then(|s| s.parse().ok()).unwrap_or(0),
                         in_flight: inf.and_then(|s| s.parse().ok()).unwrap_or(0),
+                        state_format: fmt.and_then(|s| s.parse().ok()).unwrap_or(0),
                     });
                 }
                 Ok(out)

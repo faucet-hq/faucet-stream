@@ -127,3 +127,42 @@ async fn from_pool_with_custom_table_name() {
     store.put("k", &v).await.expect("put");
     assert_eq!(store.get("k").await.expect("get"), Some(v));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_by_prefix_and_atomic_batch() {
+    let (_container, url) = start_postgres().await;
+    let store = PostgresStateStore::connect(&url).await.expect("connect");
+    store.ensure_table().await.expect("ensure_table");
+    assert!(store.supports_list() && store.supports_atomic_batch());
+
+    // `_` is a LIKE wildcard; the listing must treat the prefix literally.
+    for k in ["o_x::a", "oax::a", "o_x::b::__sla__", "other::a"] {
+        store.put(k, &json!(k)).await.expect("put");
+    }
+    assert_eq!(
+        store.list("o_x::").await.expect("list"),
+        vec!["o_x::a", "o_x::b::__sla__"]
+    );
+
+    store
+        .put_batch(&[
+            ("o_x::a".to_string(), json!({"v": 2})),
+            ("o_x::c".to_string(), json!(3)),
+        ])
+        .await
+        .expect("batch");
+    assert_eq!(store.get("o_x::a").await.unwrap(), Some(json!({"v": 2})));
+    assert_eq!(store.get("o_x::c").await.unwrap(), Some(json!(3)));
+
+    // An invalid key aborts the batch before anything is written.
+    assert!(
+        store
+            .put_batch(&[
+                ("o_x::d".to_string(), json!(1)),
+                ("../bad".to_string(), json!(1)),
+            ])
+            .await
+            .is_err()
+    );
+    assert_eq!(store.get("o_x::d").await.unwrap(), None);
+}

@@ -82,6 +82,7 @@ async fn fresh_sink_delete(database: &str) -> SpannerSink {
 async fn conformance_idempotent_replay() {
     // Check 4: re-delivering committed rows leaves no duplicates.
     let sink = fresh_sink("conf-idem").await;
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     let conn = support::connection("conf-idem", &support::emulator_host().await);
     faucet_conformance::assert_idempotent_replay(&sink, || {
         let conn = conn.clone();

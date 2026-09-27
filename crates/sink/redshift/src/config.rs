@@ -241,6 +241,17 @@ impl RedshiftSinkConfig {
     }
 }
 
+impl RedshiftSinkConfig {
+    /// What a failed batch write leaves behind (#737): a commit group is one COPY only when unchunked; INSERT splits by bind parameters.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.write_strategy == RedshiftWriteStrategy::Copy && self.batch_size == 0 {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +371,13 @@ mod tests {
         let c = blocked.copy_spec();
         assert_eq!(c.staging_bucket.as_deref(), Some("block-bucket"));
         assert_eq!(c.staging_prefix, "", "block default, not the flat value");
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: RedshiftSinkConfig = serde_json::from_value(serde_json::json!({"host": "h", "database": "db", "user": "u", "credentials": {"type": "password", "config": {"password": "pw"}}, "table_name": "t", "staging_bucket": "b", "iam_role": "arn:x"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: RedshiftSinkConfig = serde_json::from_value(serde_json::json!({"host": "h", "database": "db", "user": "u", "credentials": {"type": "password", "config": {"password": "pw"}}, "table_name": "t", "staging_bucket": "b", "iam_role": "arn:x", "batch_size": 0})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

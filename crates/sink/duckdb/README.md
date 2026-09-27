@@ -54,3 +54,11 @@ the field (narrowing later is the `schema:` drift policy's job).
 
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.
+
+## Batch atomicity
+
+What a failed write leaves behind (#737): **atomic** — every chunk of a batch runs in one transaction. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).

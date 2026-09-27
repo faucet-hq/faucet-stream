@@ -35,6 +35,7 @@ pipeline:
 
 fn opts(budget: Option<BudgetSpec>) -> ExecuteOptions {
     ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: "usage_test".into(),
         run_id: None,
         execution: None,

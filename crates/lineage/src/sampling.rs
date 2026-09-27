@@ -261,6 +261,9 @@ impl Sink for SamplingSink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
         self.inner.supported_write_modes()
     }
@@ -428,6 +431,12 @@ impl Source for SamplingSource {
     fn state_key(&self) -> Option<String> {
         self.inner.state_key()
     }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         self.inner.apply_start_bookmark(bookmark).await
     }
@@ -508,6 +517,17 @@ impl Source for SamplingSource {
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
+
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +565,33 @@ mod tests {
         let names: Vec<&str> = schema.fields.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"id"));
         assert!(names.contains(&"name"));
+    }
+
+    #[test]
+    fn sampling_source_forwards_state_migration() {
+        struct Versioned;
+        #[async_trait]
+        impl faucet_core::Source for Versioned {
+            async fn fetch_with_context(
+                &self,
+                _: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+            fn state_schema(&self) -> u32 {
+                1
+            }
+            fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+                Ok(json!({"from": from, "data": data}))
+            }
+        }
+        use faucet_core::Source;
+        let s = SamplingSource::new(Box::new(Versioned), Arc::new(SampleState::new(1)));
+        assert_eq!(s.state_schema(), 1);
+        assert_eq!(
+            s.migrate_state(0, json!(7)).unwrap(),
+            json!({"from": 0, "data": 7})
+        );
     }
 
     #[test]
@@ -628,6 +675,42 @@ mod tests {
         assert!(names.contains(&"id"));
     }
 
+    struct RecorderProbe(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait]
+    impl faucet_core::Source for RecorderProbe {
+        async fn fetch_with_context(
+            &self,
+            _: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn set_roundtrip_recorder(
+            &self,
+            _recorder: Arc<faucet_core::observability::RoundtripRecorder>,
+        ) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn source_forwards_the_roundtrip_recorder() {
+        use faucet_core::Source as _;
+        let got = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = SamplingSource::new(
+            Box::new(RecorderProbe(Arc::clone(&got))),
+            Arc::new(SampleState::new(1)),
+        );
+        s.set_roundtrip_recorder(Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "probe",
+            ),
+        ));
+        assert!(got.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// An idempotent, upsert-capable sink: the sampler must forward every
     /// capability + exactly-once method instead of masking them with the trait
     /// defaults (which would make an exactly-once run fail as "sink is not
@@ -678,6 +761,7 @@ mod tests {
         let s = SamplingSink::new(Box::new(IdemSink), Arc::clone(&shared));
         assert!(s.supports_idempotent_writes());
         assert!(s.dedups_by_key());
+        assert_eq!(s.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
         assert_eq!(
             s.sink_guarantee(),
             faucet_core::SinkGuarantee::AtomicWatermark
@@ -747,6 +831,7 @@ mod tests {
             s.capture_resume_position().await.unwrap(),
             Some(json!("pos"))
         );
+        assert_eq!(s.lag().await.unwrap(), None);
     }
 
     // ---- #639: native byte-passthrough must survive lineage/catalog sampling ----

@@ -169,6 +169,16 @@ pub enum Command {
     /// Inspect or re-baseline the learned column profiles a config's
     /// `profiling:` block keeps in its state store.
     Profiling(ProfilingArgs),
+    /// Inspect and operate on a pipeline's durable state: show each row's
+    /// bookmark, exactly-once watermark and markers; move or reset a row's
+    /// bookmark; export / import all of it for backup, restore, or a move to
+    /// another state backend.
+    State(StateArgs),
+    /// One screen of pipeline health per row — last success and failure,
+    /// bookmark, where the next run resumes, DLQ backlog, SLA / profiling
+    /// verdicts — read without running anything. Exit code: 0 healthy,
+    /// 1 degraded or unknown, 2 failed.
+    Status(StatusArgs),
     /// Template Hub: compose a `source-template` with a `sink-template`, check
     /// a pairing, list a catalog, render its compatibility matrix, or lint
     /// templates for publication.
@@ -326,6 +336,18 @@ pub struct MigrateArgs {
     /// Write the migrated config to stdout instead of rewriting the file.
     #[arg(long, conflicts_with = "check")]
     pub stdout: bool,
+    /// Migrate the pipeline's **stored state** instead of the config (#736):
+    /// rewrite every row's bookmark into the current versioned envelope and
+    /// bookmark schema. With `--check`, only report (exit non-zero when a key
+    /// needs work).
+    #[arg(long, conflicts_with = "stdout")]
+    pub state: bool,
+    /// With `--state`: only this row.
+    #[arg(long, requires = "state")]
+    pub row: Option<String>,
+    /// With `--state`: emit the report as JSON.
+    #[arg(long, requires = "state")]
+    pub json: bool,
 }
 
 /// `faucet fmt` arguments.
@@ -575,6 +597,9 @@ pub enum TemplateCommand {
     Delete(TemplateDeleteArgs),
     /// Materialize a template with the given params and run it locally.
     Run(TemplateRunArgs),
+    /// List a template's selectable rows (streams / matrix rows) with their
+    /// metadata; with selection flags, preview what a run would execute.
+    Rows(TemplateRowsArgs),
     /// Run a parameter-combination test suite against a template (#648).
     Test(TemplateTestArgs),
     /// Pull templates from the origins in a `--config` sync file into the
@@ -877,6 +902,44 @@ pub struct TemplateRunArgs {
     /// Version of a registered overlay: a number or a channel. Default `stable`.
     #[arg(long, default_value = "stable", requires = "overlay")]
     pub overlay_version: String,
+    /// Run only some of the template's rows (#741): streams of a source
+    /// template, matrix rows of a pipeline. `faucet template rows` lists them.
+    #[command(flatten)]
+    pub selection: SelectionArgs,
+    #[command(flatten)]
+    pub common: TemplateStoreArgs,
+}
+
+/// `faucet template rows <id>` arguments (#741).
+#[cfg(feature = "templates")]
+#[derive(Debug, Parser)]
+pub struct TemplateRowsArgs {
+    /// Template id: a `source-template` or a `pipeline`.
+    pub id: String,
+    /// Version: a number or a channel. Default `stable`.
+    #[arg(long, default_value = "stable")]
+    pub version: String,
+    /// For a source template: the sink template to resolve write modes,
+    /// delivery guarantees and cleanup against.
+    #[arg(long)]
+    pub sink: Option<String>,
+    /// Version of the sink template. Default `stable`.
+    #[arg(long, default_value = "stable", requires = "sink")]
+    pub sink_version: String,
+    /// Deployment overlay applied over the pairing (a registered id or a
+    /// file) — its `state:` backs the state columns.
+    #[arg(long, requires = "sink")]
+    pub overlay: Option<String>,
+    /// Version of a registered overlay. Default `stable`.
+    #[arg(long, default_value = "stable", requires = "overlay")]
+    pub overlay_version: String,
+    /// Skip reading each row's state (last success / failure, bookmark age).
+    #[arg(long)]
+    pub no_state: bool,
+    /// Preview a selection: which rows would run, which ancestors are pulled
+    /// in, which are blocked.
+    #[command(flatten)]
+    pub selection: SelectionArgs,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -975,6 +1038,38 @@ pub enum HubCommand {
     /// Publishability lint: no literal credentials, no private
     /// infrastructure, secrets marked, descriptions present.
     Lint(HubLintArgs),
+    /// List a catalog source template's streams (or a pipeline file's rows)
+    /// with their metadata; with selection flags, preview a run's rows.
+    Rows(HubRowsArgs),
+}
+
+/// `faucet hub rows <source>` arguments (#741).
+#[derive(Debug, Parser)]
+pub struct HubRowsArgs {
+    /// Source template (a path or a catalog id), or a pipeline config file.
+    pub source: String,
+    /// Sink template to resolve write modes and guarantees against.
+    #[arg(long)]
+    pub sink: Option<String>,
+    /// Deployment overlay applied over the pairing.
+    #[arg(long, requires = "sink")]
+    pub overlay: Option<String>,
+    /// Hub catalog(s), as for `faucet hub compose`.
+    #[arg(long, env = "FAUCET_HUB", value_delimiter = ',')]
+    pub hub: Vec<String>,
+    #[arg(long)]
+    pub source_hub: Option<String>,
+    #[arg(long)]
+    pub sink_hub: Option<String>,
+    #[arg(long)]
+    pub overlay_hub: Option<String>,
+    /// Also read each row's state from the composed run's state store.
+    #[arg(long)]
+    pub state: bool,
+    #[command(flatten)]
+    pub selection: SelectionArgs,
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// The pairing every hub verb takes.
@@ -1330,6 +1425,185 @@ pub struct ProfilingResetArgs {
     /// Re-baseline only this column, keeping the rest of the history.
     #[arg(long)]
     pub column: Option<String>,
+}
+
+/// Config-loading flags shared by `faucet state` subcommands.
+#[derive(Debug, Parser)]
+pub struct StateLoadArgs {
+    /// Emit machine-readable JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Path to a `.env` file for `${env:VAR}` interpolation in the config.
+    #[arg(long, conflicts_with = "no_env_file")]
+    pub env_file: Option<PathBuf>,
+    /// Skip auto-loading `.env` from cwd.
+    #[arg(long)]
+    pub no_env_file: bool,
+    /// Select a named overlay from the config's `profiles:` block.
+    #[arg(long, env = "FAUCET_PROFILE")]
+    pub profile: Option<String>,
+}
+
+/// Safety flags shared by the mutating `faucet state` subcommands.
+#[derive(Debug, Parser)]
+pub struct StateMutateArgs {
+    /// Apply without the interactive confirmation.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Print what would change and exit without writing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Proceed even though a run's lease (or the run history) says a run is
+    /// in flight — only when that run is known to be gone.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `faucet state` arguments.
+#[derive(Debug, Parser)]
+pub struct StateArgs {
+    #[command(subcommand)]
+    pub command: StateCommand,
+}
+
+/// `faucet state` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum StateCommand {
+    /// Print each row's bookmark, exactly-once sequence, and markers (SLA,
+    /// profiling, rollback, run outcomes, a live run lease), plus the
+    /// pipeline's replication / backfill markers.
+    Show(StateShowArgs),
+    /// Move one row's bookmark. On an exactly-once row the envelope's sequence
+    /// is kept (and raised to the sink's watermark when that is ahead) so the
+    /// new position is honoured.
+    Set(StateSetArgs),
+    /// Forget one row's bookmark so its next run re-syncs from the start.
+    Reset(StateResetArgs),
+    /// Write every key under the pipeline's namespace as a versioned JSON
+    /// document (`{version, pipeline, exported_at, keys}`).
+    Export(StateExportArgs),
+    /// Restore an export into the config's state store (or `--to-state`).
+    Import(StateImportArgs),
+}
+
+/// `faucet state show` arguments.
+#[derive(Debug, Parser)]
+pub struct StateShowArgs {
+    /// Path to the pipeline config. If omitted, auto-discover `faucet.yaml` /
+    /// `.yml` / `.json` in cwd.
+    pub config: Option<PathBuf>,
+    /// Only this row.
+    #[arg(long)]
+    pub row: Option<String>,
+    #[command(flatten)]
+    pub load: StateLoadArgs,
+}
+
+/// `faucet state set` arguments.
+#[derive(Debug, Parser)]
+pub struct StateSetArgs {
+    /// Path to the pipeline config (auto-discovered when omitted).
+    pub config: Option<PathBuf>,
+    /// The row whose bookmark to move.
+    #[arg(long)]
+    pub row: String,
+    /// For a child row: the parent-record key whose bookmark to move.
+    #[arg(long)]
+    pub parent_key: Option<String>,
+    /// The new bookmark, as JSON (`'{"updated_at":"2026-09-19T00:00:00Z"}'`).
+    #[arg(long)]
+    pub bookmark: String,
+    /// Exactly-once rows: write without reading the sink's watermark. If the
+    /// sink has committed past the state store, the next run re-anchors to
+    /// the sink's position instead of this bookmark.
+    #[arg(long)]
+    pub skip_watermark_check: bool,
+    #[command(flatten)]
+    pub mutate: StateMutateArgs,
+    #[command(flatten)]
+    pub load: StateLoadArgs,
+}
+
+/// `faucet state reset` arguments.
+#[derive(Debug, Parser)]
+pub struct StateResetArgs {
+    /// Path to the pipeline config (auto-discovered when omitted).
+    pub config: Option<PathBuf>,
+    /// The row to reset.
+    #[arg(long)]
+    pub row: String,
+    /// For a child row: reset only this parent-record key's bookmark
+    /// (default: all of them).
+    #[arg(long)]
+    pub parent_key: Option<String>,
+    /// Also forget the row's markers: SLA and profiling baselines, run
+    /// outcomes, rollback markers.
+    #[arg(long)]
+    pub include_markers: bool,
+    /// Exactly-once rows: also delete the sink's commit token (sinks that
+    /// support it), instead of keeping the committed sequence in the state
+    /// store.
+    #[arg(long)]
+    pub rewind_token: bool,
+    /// Exactly-once rows: skip reading the sink's watermark.
+    #[arg(long)]
+    pub skip_watermark_check: bool,
+    #[command(flatten)]
+    pub mutate: StateMutateArgs,
+    #[command(flatten)]
+    pub load: StateLoadArgs,
+}
+
+/// `faucet state export` arguments.
+#[derive(Debug, Parser)]
+pub struct StateExportArgs {
+    /// Path to the pipeline config (auto-discovered when omitted).
+    pub config: Option<PathBuf>,
+    /// Write the export here instead of stdout.
+    #[arg(long, short = 'o')]
+    pub output: Option<PathBuf>,
+    #[command(flatten)]
+    pub load: StateLoadArgs,
+}
+
+/// `faucet state import` arguments.
+#[derive(Debug, Parser)]
+pub struct StateImportArgs {
+    /// Path to the pipeline config the export belongs to.
+    pub config: PathBuf,
+    /// The export document (`faucet state export` output).
+    pub file: PathBuf,
+    /// Import into this store instead of the config's: `postgres://…`,
+    /// `redis://…`, `file:DIR` (or a directory path), `memory`, or a
+    /// `{type, config}` document.
+    #[arg(long)]
+    pub to_state: Option<String>,
+    /// Replace a namespace that already holds state: keys absent from the
+    /// export are deleted.
+    #[arg(long)]
+    pub overwrite: bool,
+    #[command(flatten)]
+    pub mutate: StateMutateArgs,
+    #[command(flatten)]
+    pub load: StateLoadArgs,
+}
+
+/// `faucet status` arguments.
+#[derive(Debug, Parser)]
+pub struct StatusArgs {
+    /// Path to the pipeline config. If omitted, auto-discover `faucet.yaml` /
+    /// `.yml` / `.json` in cwd.
+    pub config: Option<PathBuf>,
+    /// Only this row (default: every row; child rows aggregate under their
+    /// parent).
+    #[arg(long)]
+    pub row: Option<String>,
+    /// Also read each exactly-once row's sink watermark (read-only) and say
+    /// whether it agrees with the state store.
+    #[arg(long)]
+    pub probe: bool,
+    #[command(flatten)]
+    pub load: StateLoadArgs,
 }
 
 /// `faucet dlq discard <location>` arguments.

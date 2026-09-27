@@ -659,6 +659,10 @@ impl MongoSink {
 
 #[async_trait]
 impl faucet_core::Sink for MongoSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn connector_name(&self) -> &'static str {
         "mongodb"
     }
@@ -740,6 +744,18 @@ impl faucet_core::Sink for MongoSink {
                 ))
             })?;
         Ok(())
+    }
+
+    /// Probe for the `<collection>__faucet_ovw` staging collection (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        let names = self
+            .client
+            .database(&self.config.database)
+            .list_collection_names()
+            .filter(bson::doc! { "name": self.staging_collection() })
+            .await
+            .map_err(|e| FaucetError::Sink(format!("mongodb staging probe failed: {e}")))?;
+        Ok(Some(!names.is_empty()))
     }
 
     /// Drop the staging collection so a failed/cancelled overwrite leaves

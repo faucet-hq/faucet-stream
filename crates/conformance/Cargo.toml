@@ -28,6 +28,8 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 # and sink shares, so its typed fidelity is asserted here against the same
 # corpus each connector pair uses.
 faucet-core = { workspace = true, features = ["file-formats"] }
+# The state-migration reliability suite (#735) moves state onto a file store.
+tempfile.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

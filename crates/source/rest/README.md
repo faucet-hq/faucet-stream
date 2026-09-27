@@ -163,6 +163,8 @@ record_ancestors: { event_id: id, event_created: created }
 | `retry_backoff` | int (seconds) | `1` | Base for exponential backoff. Per-attempt sleep is `retry_backoff × 2^attempt`, **capped at 60 s** and scaled by random jitter in `[0.5, 1.5)` (decorrelated across concurrent retries). On `429`, the server's `Retry-After` (delta-seconds **or** an RFC 7231 HTTP-date) is honoured instead. |
 | `tolerated_http_errors` | array<int> | `[]` | HTTP status codes treated as an empty page **on the first request only**. Mid-pagination, a tolerated status surfaces as an error instead of silently ending the stream (otherwise a transient failure on page _N_ would drop every later page as a "successful" run). Only safe for genuinely-empty resources. |
 
+**Throttling is metered (#734):** every `429` counts in `faucet_source_throttled_total`, the time actually slept on it (not the header's value — a cancelled sleep records the partial wait) in `faucet_source_throttle_wait_seconds`, and every retry by class in `faucet_source_retries_total{class}`. The totals land on the run's usage record, so `faucet run` / `faucet usage` print `throttled 312× · waited 41 min`, and a run that spent more than 10 % of its time rate-limited logs a warning. See [source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html#source-side-throttling).
+
 A **`204 No Content`** response — or any `2xx` with an empty/whitespace-only body — is treated as an empty page ("no data"), not a parse error. A non-empty body that isn't valid JSON still fails loudly with `FaucetError::Json`.
 
 ### Response format — authenticated CSV / Excel files

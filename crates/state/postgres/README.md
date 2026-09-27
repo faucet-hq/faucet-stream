@@ -170,6 +170,8 @@ CREATE TABLE faucet_state (
 | `get(key)` | `SELECT value FROM <table> WHERE key = $1` | Returns `None` when no row exists. |
 | `put(key, value)` | `INSERT … VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()` | Atomic upsert — the bookmark and its `updated_at` advance together. |
 | `delete(key)` | `DELETE FROM <table> WHERE key = $1` | A missing row is not an error. |
+| `list(prefix)` | `SELECT key FROM <table> WHERE left(key, char_length($1)) = $1 ORDER BY key` | Literal prefix match (no `LIKE` wildcards) — how `faucet state show\|export` enumerate a pipeline's keys. |
+| `put_batch(entries)` | the upsert above, once per entry, in one transaction | All-or-nothing (`supports_atomic_batch() == true`) — what `faucet state import` uses. |
 
 The pipeline reads the bookmark **before** fetching and writes it **only after the sink confirms** the batch, so a crash mid-write never advances state past delivered data.
 

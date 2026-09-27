@@ -1,0 +1,36 @@
+# Read every file dropped into a local directory — JSON Lines, JSON, CSV
+# (plain or .gz), Excel, XML, Parquet, Avro and ORC side by side — and append
+# the records to one JSON Lines file. With `incremental` and a `state:` block,
+# each run reads only the files that are new since the previous run.
+#
+#   faucet validate cli/examples/file_to_jsonl.yaml
+#   faucet run      cli/examples/file_to_jsonl.yaml
+#
+# Build with `--features file-formats` for every format; JSON Lines and JSON
+# arrays need no feature.
+version: 1
+name: file_to_jsonl
+
+pipeline:
+  source:
+    type: file
+    config:
+      path: ./inbox
+      recursive: true
+      format: auto           # per file, from the extension (.csv.gz is CSV)
+      compression: auto
+      incremental:
+        by: mtime            # a rewritten file is read again
+      stable_for_secs: 30    # leave files still being written for the next run
+      csv:
+        delimiter: ","
+
+  sink:
+    type: jsonl
+    config:
+      path: ./out/inbox.jsonl
+
+  state:
+    type: file
+    config:
+      path: ./.faucet-state

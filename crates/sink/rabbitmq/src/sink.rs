@@ -219,6 +219,10 @@ fn sink_error(context: &str, e: lapin::Error) -> FaucetError {
 
 #[async_trait]
 impl Sink for RabbitMqSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);

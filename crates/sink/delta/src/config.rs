@@ -114,6 +114,17 @@ impl DeltaSinkConfig {
     }
 }
 
+impl DeltaSinkConfig {
+    /// What a failed batch write leaves behind (#737): a page is one Delta commit unless target_file_size commits part of a chunked page early.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.target_file_size.is_some() && self.batch_size > 0 {
+            faucet_core::BatchAtomicity::BestEffort
+        } else {
+            faucet_core::BatchAtomicity::Atomic
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +191,14 @@ mod tests {
             "true"
         );
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: DeltaSinkConfig =
+            serde_json::from_value(serde_json::json!({"table_uri": "file:///t"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        let c: DeltaSinkConfig = serde_json::from_value(serde_json::json!({"table_uri": "file:///t", "target_file_size": 1024, "batch_size": 10})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

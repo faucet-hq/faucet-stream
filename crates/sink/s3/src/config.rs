@@ -33,6 +33,12 @@ pub enum S3SinkFormat {
     /// Requires `file-format-excel` (#604).
     #[cfg(feature = "file-format-excel")]
     Xlsx,
+    /// An Apache Avro Object Container File, against `avro.schema` or a
+    /// schema inferred from the object's records; block codec from
+    /// `avro.codec`. Requires `file-format-avro` (#719). There is no ORC
+    /// variant: ORC is read-only.
+    #[cfg(feature = "file-format-avro")]
+    Avro,
 }
 
 impl S3SinkFormat {
@@ -50,6 +56,8 @@ impl S3SinkFormat {
             Self::Xml => Some(faucet_core::FileFormat::Xml),
             #[cfg(feature = "file-format-excel")]
             Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+            #[cfg(feature = "file-format-avro")]
+            Self::Avro => Some(faucet_core::FileFormat::Avro),
         }
     }
 
@@ -142,6 +150,9 @@ pub struct S3SinkConfig {
     /// Record framing, used when `format: xml` (#604).
     #[serde(default)]
     pub xml: faucet_core::XmlOptions,
+    /// Writer schema and block codec, used when `format: avro` (#719).
+    #[serde(default)]
+    pub avro: faucet_core::AvroOptions,
 }
 
 fn default_batch_size() -> usize {
@@ -156,6 +167,8 @@ impl S3SinkConfig {
             csv: self.csv.clone(),
             excel: self.excel.clone(),
             xml: self.xml.clone(),
+            avro: self.avro.clone(),
+            orc: faucet_core::OrcOptions::default(),
         }
     }
 
@@ -177,6 +190,7 @@ impl S3SinkConfig {
             csv: faucet_core::CsvOptions::default(),
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
+            avro: faucet_core::AvroOptions::default(),
         }
     }
 
@@ -208,6 +222,12 @@ impl S3SinkConfig {
     /// Set the record framing used when `format: xml` (#604).
     pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
         self.xml = xml;
+        self
+    }
+
+    /// Set the Avro writer schema and codec used when `format: avro` (#719).
+    pub fn avro(mut self, avro: faucet_core::AvroOptions) -> Self {
+        self.avro = avro;
         self
     }
 
@@ -295,6 +315,28 @@ impl S3SinkConfig {
         }
         faucet_core::validate_batch_size(self.batch_size)?;
         Ok(())
+    }
+}
+
+impl S3SinkConfig {
+    fn single_parquet_object(&self) -> bool {
+        #[cfg(feature = "arrow")]
+        {
+            matches!(self.format, S3SinkFormat::Parquet) && self.effective_chunk_cap().is_none()
+        }
+        #[cfg(not(feature = "arrow"))]
+        {
+            false
+        }
+    }
+
+    /// What a failed batch write leaves behind (#737): only an unchunked Parquet batch is one object upload.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.single_parquet_object() {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
     }
 }
 
@@ -447,6 +489,8 @@ mod tests {
         assert!(!S3SinkFormat::Xml.appends_per_record());
         #[cfg(feature = "file-format-excel")]
         assert!(!S3SinkFormat::Xlsx.appends_per_record());
+        #[cfg(feature = "file-format-avro")]
+        assert!(!S3SinkFormat::Avro.appends_per_record());
     }
 
     /// Every variant maps onto exactly one shared format, so what this sink
@@ -530,5 +574,34 @@ mod tests {
         // Both are caps, so the tighter one binds — in either direction.
         assert_eq!(with(100, Some(500)), Some(100));
         assert_eq!(with(500, Some(100)), Some(100));
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        #[cfg(feature = "arrow")]
+        {
+            let c: S3SinkConfig = serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "p/", "file_extension": ".parquet", "concurrency": 10, "format": "parquet", "batch_size": 0})).unwrap();
+            assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        }
+        let c: S3SinkConfig =
+            serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "", "file_extension": ".jsonl", "concurrency": 10})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+    }
+
+    #[cfg(feature = "file-format-avro")]
+    #[test]
+    fn the_avro_block_reaches_the_encoder() {
+        let cfg =
+            S3SinkConfig::new("b")
+                .format(S3SinkFormat::Avro)
+                .avro(faucet_core::AvroOptions {
+                    schema: None,
+                    codec: faucet_core::AvroCodec::Snappy,
+                });
+        assert_eq!(cfg.format.shared(), Some(faucet_core::FileFormat::Avro));
+        assert_eq!(
+            cfg.format_options().avro.codec,
+            faucet_core::AvroCodec::Snappy
+        );
     }
 }

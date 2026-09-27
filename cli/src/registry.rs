@@ -7,7 +7,7 @@
 
 use crate::auth_catalog::{self, AuthCatalog};
 use crate::error::{CliError, CliResult};
-use faucet_core::{Sink, Source};
+use faucet_core::{FaucetError, Sink, Source};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -400,6 +400,11 @@ pub async fn build_source(
             let cfg = decode::<faucet_source_sftp::SftpSourceConfig>("source", "sftp", config)?;
             Ok(Box::new(faucet_source_sftp::SftpSource::new(cfg)?))
         }
+        #[cfg(feature = "source-file")]
+        "file" => {
+            let cfg = decode::<faucet_source_file::FileSourceConfig>("source", "file", config)?;
+            Ok(Box::new(faucet_source_file::FileSource::new(cfg)?))
+        }
         #[cfg(feature = "source-s3")]
         "s3" => {
             let cfg = decode::<faucet_source_s3::S3SourceConfig>("source", "s3", config)?;
@@ -743,6 +748,14 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
             let cfg = decode::<faucet_sink_sftp::SftpSinkConfig>("sink", "sftp", config)?;
             Ok(Box::new(faucet_sink_sftp::SftpSink::new(cfg)?))
         }
+        #[cfg(feature = "sink-singer")]
+        "singer" => {
+            let cfg = decode::<faucet_sink_singer::SingerSinkConfig>("sink", "singer", config)?;
+            for secret in faucet_sink_singer::secret_like_values(&cfg.target_config) {
+                crate::secrets::registry::register(&secret);
+            }
+            Ok(Box::new(faucet_sink_singer::SingerSink::new(cfg)?))
+        }
         #[cfg(feature = "sink-s3")]
         "s3" => {
             let cfg = decode::<faucet_sink_s3::S3SinkConfig>("sink", "s3", config)?;
@@ -809,6 +822,11 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         "parquet" => {
             let cfg = decode::<faucet_sink_parquet::ParquetSinkConfig>("sink", "parquet", config)?;
             Ok(Box::new(faucet_sink_parquet::ParquetSink::new(cfg).await?))
+        }
+        #[cfg(feature = "sink-file")]
+        "file" => {
+            let cfg = decode::<faucet_sink_file::FileSinkConfig>("sink", "file", config)?;
+            Ok(Box::new(faucet_sink_file::FileSink::new(cfg)?))
         }
         #[cfg(feature = "sink-gcs")]
         "gcs" => {
@@ -892,6 +910,77 @@ pub const EXACTLY_ONCE_SOURCE_KINDS: &[&str] = &[
     "kafka",
     "oracle-cdc",
 ];
+
+/// Source kinds that report how far behind their head they are
+/// (`Source::lag`, #733). Mirrors the overrides — `faucet status --probe` only
+/// builds a source to ask when its kind is listed.
+pub const LAG_SOURCE_KINDS: &[&str] = &[
+    "postgres-cdc",
+    "mysql-cdc",
+    "mssql-cdc",
+    "mongodb-cdc",
+    "oracle-cdc",
+    "kafka",
+    "kinesis",
+    "dynamodb",
+];
+
+/// See [`LAG_SOURCE_KINDS`].
+pub fn source_reports_lag(kind: &str) -> bool {
+    LAG_SOURCE_KINDS.contains(&kind)
+}
+
+/// The bookmark shape version a source kind stores (#736) — the offline
+/// answer `faucet state show`, `faucet migrate --state` and `faucet doctor`
+/// use, matching the built source's `Source::state_schema`. A kind that
+/// never changed its shape is at `0`.
+pub fn source_state_schema(kind: &str) -> u32 {
+    match kind {
+        #[cfg(feature = "source-mongodb-cdc")]
+        "mongodb-cdc" => faucet_source_mongodb_cdc::STATE_SCHEMA,
+        _ => 0,
+    }
+}
+
+/// Migrate a bookmark a source kind stored at shape version `from` to
+/// [`source_state_schema`] offline (#736), with the same code the built
+/// source's `Source::migrate_state` runs.
+pub fn migrate_source_state(kind: &str, from: u32, data: Value) -> Result<Value, FaucetError> {
+    match kind {
+        #[cfg(feature = "source-mongodb-cdc")]
+        "mongodb-cdc" => faucet_source_mongodb_cdc::migrate_state(from, data),
+        _ if from == source_state_schema(kind) => Ok(data),
+        _ => Err(FaucetError::State(format!(
+            "{kind} has no migration from bookmark schema {from} to {}",
+            source_state_schema(kind)
+        ))),
+    }
+}
+
+/// The owner and shape version a row's bookmark is stored under (#736): its
+/// source kind, or `topology` for a graph whose sink nodes cannot be
+/// attributed to one source.
+pub fn state_codec_for(source: Option<(&str, &Value)>) -> faucet_core::state_version::StateCodec {
+    match source {
+        Some((kind, config)) => {
+            if let Some(entry) = global().sources.get(kind)
+                && let Ok(built) = (entry.factory)(config.clone())
+            {
+                return faucet_core::state_version::StateCodec::for_source(built.as_ref(), false);
+            }
+            faucet_core::state_version::StateCodec {
+                owner: kind.to_string(),
+                schema: source_state_schema(kind),
+                legacy: false,
+            }
+        }
+        None => faucet_core::state_version::StateCodec {
+            owner: "topology".into(),
+            schema: 0,
+            legacy: false,
+        },
+    }
+}
 
 /// Sink connector kinds that can durably commit a token atomically with data.
 /// Mirrors `Sink::supports_idempotent_writes` overrides — keep in sync when a
@@ -986,6 +1075,8 @@ pub const OVERWRITE_SINK_KINDS: &[&str] = &[
     "elasticsearch",
     "databricks",
     "oracle",
+    // local files: staged in a hidden directory, moved into place on commit.
+    "file",
 ];
 
 /// Whether a sink kind supports `write_mode: overwrite`.
@@ -1061,6 +1152,7 @@ pub const DISCOVER_SOURCE_KINDS: &[&str] = &[
     "iceberg",
     "dynamodb",
     "oracle",
+    "file",
 ];
 
 /// Whether a source kind supports `faucet discover` (dataset introspection).
@@ -1113,10 +1205,24 @@ pub fn sink_supports_cleanup(kind: &str) -> bool {
     CLEANUP_SINK_KINDS.contains(&kind)
 }
 
+/// The Singer target bridge's write modes: upsert only hands `key` to the
+/// target as `key_properties` (the target merges), and overwrite maps to
+/// `ACTIVATE_VERSION`. It is deliberately not in [`UPSERT_SINK_KINDS`] — faucet
+/// cannot vouch for the target deduplicating by key — nor in
+/// [`OVERWRITE_SINK_KINDS`], which promises an atomic swap.
+pub const SINGER_WRITE_MODES: &[faucet_core::WriteMode] = &[
+    faucet_core::WriteMode::Append,
+    faucet_core::WriteMode::Upsert,
+    faucet_core::WriteMode::Overwrite,
+];
+
 /// Write modes each sink kind supports. Kept in sync with each sink's
 /// `Sink::supported_write_modes()` override via [`UPSERT_SINK_KINDS`].
 pub fn sink_supported_write_modes(kind: &str) -> &'static [faucet_core::WriteMode] {
     use faucet_core::WriteMode;
+    if kind == "singer" {
+        return SINGER_WRITE_MODES;
+    }
     match (
         UPSERT_SINK_KINDS.contains(&kind),
         OVERWRITE_SINK_KINDS.contains(&kind),
@@ -1486,6 +1592,12 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
         ),
         #[cfg(feature = "source-sftp")]
         "sftp" => check::<faucet_source_sftp::SftpSourceConfig>("sftp", name, config),
+        #[cfg(feature = "source-file")]
+        "file" => {
+            check_with::<faucet_source_file::FileSourceConfig, _, _>("file", name, config, |c| {
+                c.validate()
+            })
+        }
         #[cfg(feature = "source-s3")]
         "s3" => check::<faucet_source_s3::S3SourceConfig>("s3", name, config),
         #[cfg(feature = "source-mongodb")]
@@ -1641,6 +1753,157 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
     }
 }
 
+/// What a failed batch write leaves behind for this sink kind + config (#737),
+/// read offline from the typed config — the same answer the built sink's
+/// `Sink::batch_atomicity` gives. `None` for an unknown kind or a config that
+/// does not deserialize (the config check reports that). A plugin sink is
+/// built through its factory and asked.
+pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::BatchAtomicity> {
+    if let Some(entry) = global().sinks.get(kind) {
+        return (entry.factory)(config.clone())
+            .ok()
+            .map(|s| s.batch_atomicity());
+    }
+    #[allow(dead_code)]
+    fn atomicity_of<T: serde::de::DeserializeOwned>(
+        config: &Value,
+        f: impl Fn(&T) -> faucet_core::BatchAtomicity,
+    ) -> Option<faucet_core::BatchAtomicity> {
+        serde_json::from_value::<T>(config.clone())
+            .ok()
+            .map(|c| f(&c))
+    }
+    match kind {
+        #[cfg(feature = "sink-bigquery")]
+        "bigquery" => atomicity_of::<faucet_sink_bigquery::BigQuerySinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-iceberg")]
+        "iceberg" => {
+            atomicity_of::<faucet_sink_iceberg::IcebergSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-delta")]
+        "delta" => {
+            atomicity_of::<faucet_sink_delta::DeltaSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-postgres")]
+        "postgres" => atomicity_of::<faucet_sink_postgres::PostgresSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-jsonl")]
+        "jsonl" => {
+            atomicity_of::<faucet_sink_jsonl::JsonlSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-snowflake")]
+        "snowflake" => atomicity_of::<faucet_sink_snowflake::SnowflakeSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-mysql")]
+        "mysql" => {
+            atomicity_of::<faucet_sink_mysql::MysqlSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-mssql")]
+        "mssql" => {
+            atomicity_of::<faucet_sink_mssql::MssqlSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-sqlite")]
+        "sqlite" => {
+            atomicity_of::<faucet_sink_sqlite::SqliteSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-duckdb")]
+        "duckdb" => {
+            atomicity_of::<faucet_sink_duckdb::DuckdbSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-sqs")]
+        "sqs" => atomicity_of::<faucet_sink_sqs::SqsSinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-nats")]
+        "nats" => atomicity_of::<faucet_sink_nats::NatsSinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-rabbitmq")]
+        "rabbitmq" => atomicity_of::<faucet_sink_rabbitmq::RabbitMqSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-sftp")]
+        "sftp" => atomicity_of::<faucet_sink_sftp::SftpSinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-singer")]
+        "singer" => {
+            atomicity_of::<faucet_sink_singer::SingerSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-s3")]
+        "s3" => atomicity_of::<faucet_sink_s3::S3SinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-mongodb")]
+        "mongodb" => {
+            atomicity_of::<faucet_sink_mongodb::MongoSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-redis")]
+        "redis" => {
+            atomicity_of::<faucet_sink_redis::RedisSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-csv")]
+        "csv" => atomicity_of::<faucet_sink_csv::CsvSinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-elasticsearch")]
+        "elasticsearch" => {
+            atomicity_of::<faucet_sink_elasticsearch::ElasticsearchSinkConfig>(config, |c| {
+                c.batch_atomicity()
+            })
+        }
+        #[cfg(feature = "sink-kafka")]
+        "kafka" => {
+            atomicity_of::<faucet_sink_kafka::KafkaSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-kinesis")]
+        "kinesis" => {
+            atomicity_of::<faucet_sink_kinesis::KinesisSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-spanner")]
+        "spanner" => {
+            atomicity_of::<faucet_sink_spanner::SpannerSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-http")]
+        "http" => atomicity_of::<faucet_sink_http::HttpSinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-stdout")]
+        "stdout" => {
+            atomicity_of::<faucet_sink_stdout::StdoutSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-parquet")]
+        "parquet" => {
+            atomicity_of::<faucet_sink_parquet::ParquetSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-file")]
+        "file" => atomicity_of::<faucet_sink_file::FileSinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-gcs")]
+        "gcs" => atomicity_of::<faucet_sink_gcs::GcsSinkConfig>(config, |c| c.batch_atomicity()),
+        #[cfg(feature = "sink-redshift")]
+        "redshift" => atomicity_of::<faucet_sink_redshift::RedshiftSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-pubsub")]
+        "pubsub" => {
+            atomicity_of::<faucet_sink_pubsub::PubsubSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-clickhouse")]
+        "clickhouse" => atomicity_of::<faucet_sink_clickhouse::ClickHouseSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-azure-blob")]
+        "azure-blob" => atomicity_of::<faucet_sink_azure_blob::AzureBlobSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-oracle")]
+        "oracle" => {
+            atomicity_of::<faucet_sink_oracle::OracleSinkConfig>(config, |c| c.batch_atomicity())
+        }
+        #[cfg(feature = "sink-dynamodb")]
+        "dynamodb" => atomicity_of::<faucet_sink_dynamodb::DynamoDbSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        #[cfg(feature = "sink-databricks")]
+        "databricks" => atomicity_of::<faucet_sink_databricks::DatabricksSinkConfig>(config, |c| {
+            c.batch_atomicity()
+        }),
+        _ => None,
+    }
+}
+
 /// Validate a sink's `config` **without building it**: deserialize the raw
 /// `Value` into the connector's typed config and discard the result.
 ///
@@ -1723,6 +1986,12 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
         ),
         #[cfg(feature = "sink-sftp")]
         "sftp" => check::<faucet_sink_sftp::SftpSinkConfig>("sftp", name, config),
+        #[cfg(feature = "sink-singer")]
+        "singer" => {
+            check_with::<faucet_sink_singer::SingerSinkConfig, _, _>("singer", name, config, |c| {
+                c.validate()
+            })
+        }
         #[cfg(feature = "sink-s3")]
         "s3" => {
             check_with::<faucet_sink_s3::S3SinkConfig, _, _>("s3", name, config, |c| c.validate())
@@ -1770,6 +2039,10 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
             config,
             |c| c.validate(),
         ),
+        #[cfg(feature = "sink-file")]
+        "file" => check_with::<faucet_sink_file::FileSinkConfig, _, _>("file", name, config, |c| {
+            c.validate()
+        }),
         #[cfg(feature = "sink-gcs")]
         "gcs" => check_with::<faucet_sink_gcs::GcsSinkConfig, _, _>("gcs", name, config, |c| {
             c.validate()
@@ -1855,6 +2128,8 @@ pub fn source_schema(kind: &str) -> CliResult<Value> {
         "rabbitmq" => Ok(schema::<faucet_source_rabbitmq::RabbitMqSourceConfig>()),
         #[cfg(feature = "source-sftp")]
         "sftp" => Ok(schema::<faucet_source_sftp::SftpSourceConfig>()),
+        #[cfg(feature = "source-file")]
+        "file" => Ok(schema::<faucet_source_file::FileSourceConfig>()),
         #[cfg(feature = "source-s3")]
         "s3" => Ok(schema::<faucet_source_s3::S3SourceConfig>()),
         #[cfg(feature = "source-mongodb")]
@@ -1961,6 +2236,8 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         "rabbitmq" => Ok(schema::<faucet_sink_rabbitmq::RabbitMqSinkConfig>()),
         #[cfg(feature = "sink-sftp")]
         "sftp" => Ok(schema::<faucet_sink_sftp::SftpSinkConfig>()),
+        #[cfg(feature = "sink-singer")]
+        "singer" => Ok(schema::<faucet_sink_singer::SingerSinkConfig>()),
         #[cfg(feature = "sink-s3")]
         "s3" => Ok(schema::<faucet_sink_s3::S3SinkConfig>()),
         #[cfg(feature = "sink-mongodb")]
@@ -1983,6 +2260,8 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         "stdout" => Ok(schema::<faucet_sink_stdout::StdoutSinkConfig>()),
         #[cfg(feature = "sink-parquet")]
         "parquet" => Ok(schema::<faucet_sink_parquet::ParquetSinkConfig>()),
+        #[cfg(feature = "sink-file")]
+        "file" => Ok(schema::<faucet_sink_file::FileSinkConfig>()),
         #[cfg(feature = "sink-gcs")]
         "gcs" => Ok(schema::<faucet_sink_gcs::GcsSinkConfig>()),
         #[cfg(feature = "sink-redshift")]
@@ -2061,6 +2340,11 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push((
         "sftp",
         "SFTP source. Lists/globs a remote directory and streams JSONL / JSON-array / raw-text files over SSH.",
+    ));
+    #[cfg(feature = "source-file")]
+    v.push((
+        "file",
+        "Local file source. Reads JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC from a path, directory, glob or http(s) URL, format and compression resolved per file; incremental by mtime or name.",
     ));
     #[cfg(feature = "source-s3")]
     v.push(("s3", "AWS S3 object source"));
@@ -2211,6 +2495,11 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
         "sftp",
         "SFTP sink. Writes JSONL files over SSH with atomic temp-then-rename uploads.",
     ));
+    #[cfg(feature = "sink-singer")]
+    v.push((
+        "singer",
+        "Singer target bridge. Runs a Singer target executable and feeds it SCHEMA/RECORD/STATE messages; bookmarks advance only after the target confirms (echoed STATE or clean exit).",
+    ));
     #[cfg(feature = "sink-s3")]
     v.push(("s3", "AWS S3 object sink"));
     #[cfg(feature = "sink-mongodb")]
@@ -2233,6 +2522,8 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push(("stdout", "Stdout / stderr sink (JSON Lines, pretty, TSV)"));
     #[cfg(feature = "sink-parquet")]
     v.push(("parquet", "Apache Parquet file sink (local path or S3). Schema-inferred, configurable compression, row/byte rollover."));
+    #[cfg(feature = "sink-file")]
+    v.push(("file", "Local file sink. JSONL, JSON, CSV, XML, Excel, Avro or Parquet by extension; rollover, compression, temp-then-rename finalisation, atomic overwrite."));
     #[cfg(feature = "sink-delta")]
     v.push(("delta", "Apache Delta Lake sink (local FS or S3/Azure/GCS). Append-only, schema-inferred table creation, one commit per flush."));
     #[cfg(feature = "sink-gcs")]
@@ -2346,6 +2637,30 @@ fn unknown(name: &str, kind: &'static str, available: Vec<&'static str>) -> CliE
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bookmark_schema_and_migration_per_source_kind() {
+        assert_eq!(source_state_schema("csv"), 0);
+        assert_eq!(
+            migrate_source_state("csv", 0, json!({"a": 1})).unwrap(),
+            json!({"a": 1})
+        );
+        assert!(migrate_source_state("csv", 1, json!({})).is_err());
+        #[cfg(feature = "source-mongodb-cdc")]
+        {
+            assert_eq!(source_state_schema("mongodb-cdc"), 1);
+            let m = migrate_source_state("mongodb-cdc", 0, json!({"resume_token": {"_data": "A"}}))
+                .unwrap();
+            assert_eq!(m["invalidate"], json!(false));
+            assert_eq!(state_codec_for(Some(("mongodb-cdc", &json!({})))).schema, 1);
+        }
+        let topo = state_codec_for(None);
+        assert_eq!(
+            (topo.owner.as_str(), topo.schema, topo.legacy),
+            ("topology", 0, false)
+        );
+        assert_eq!(state_codec_for(Some(("csv", &json!({})))).owner, "csv");
+    }
 
     /// Every compiled source kind reaches a real deserializer (#609).
     ///
@@ -3015,6 +3330,45 @@ mod tests {
         // Upsert-capable but not atomic: elasticsearch dedups by key only.
         assert_eq!(sink_guarantee("elasticsearch"), SinkGuarantee::KeyedUpsert);
         assert_eq!(sink_guarantee("jsonl"), SinkGuarantee::AtLeastOnce);
+    }
+
+    #[test]
+    fn singer_write_modes_are_not_key_deduplicating() {
+        use faucet_core::WriteMode;
+        assert_eq!(sink_supported_write_modes("singer"), SINGER_WRITE_MODES);
+        assert!(!sink_supported_write_modes("singer").contains(&WriteMode::Delete));
+        assert!(!UPSERT_SINK_KINDS.contains(&"singer"));
+        assert!(!sink_supports_overwrite("singer"));
+        assert_eq!(
+            sink_guarantee("singer"),
+            faucet_core::SinkGuarantee::AtLeastOnce
+        );
+    }
+
+    #[cfg(feature = "sink-singer")]
+    #[tokio::test]
+    async fn singer_sink_builds_validates_and_registers_secrets() {
+        let auth = crate::auth_catalog::AuthCatalog::new();
+        let cfg = json!({
+            "target_command": "target-jsonl",
+            "target_config": {"api_token": "singer-reg-secret-1234"},
+            "stream": "s"
+        });
+        let sink = build_sink("singer", cfg.clone(), &auth).await.unwrap();
+        assert_eq!(sink.connector_name(), "singer");
+        assert_eq!(
+            crate::secrets::registry::redact("x singer-reg-secret-1234 y"),
+            "x *** y"
+        );
+        assert_eq!(
+            sink_batch_atomicity("singer", &cfg),
+            Some(faucet_core::BatchAtomicity::BestEffort)
+        );
+        assert!(sink_schema("singer").is_ok());
+        assert!(validate_sink_config("singer", "row", cfg).is_ok());
+        let bad = json!({"target_command": "t", "write_mode": "delete", "key": ["id"]});
+        assert!(validate_sink_config("singer", "row", bad).is_err());
+        assert!(sink_descriptions().iter().any(|(k, _)| *k == "singer"));
     }
 
     #[test]

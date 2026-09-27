@@ -82,6 +82,12 @@ pub struct SubmitRequest {
     /// client (`skip`): lets the run through the approval gate.
     #[serde(skip)]
     pub approved_change: Option<String>,
+    /// Run only some of the config's matrix rows (#741) — the CLI's
+    /// `--select` / `--only` / `--skip` / `--tag` / `--status` /
+    /// `--include-parents`. Stored with the run so a clustered, claimed or
+    /// sharded run applies the same subset. Omitted: every row runs.
+    #[serde(default)]
+    pub selection: Option<crate::select::SelectionRequest>,
 }
 
 /// What a gated submission produced (#703).
@@ -188,6 +194,48 @@ pub fn usage_options(
     crate::usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
 }
 
+/// Run label naming the pipeline (`cfg.name`, else `serve`) a run belongs to.
+pub const LABEL_PIPELINE: &str = "pipeline";
+
+/// [`load_for`], narrowed to `selection`'s rows (#741). A bad selection —
+/// an unknown row or tag, an empty run set, a missing ancestor, a topology
+/// config — is a 400 naming the valid rows.
+pub(crate) async fn load_selected(
+    state: &ServerState,
+    body: &str,
+    format: ConfigFormat,
+    tenant: Option<&str>,
+    selection: Option<&crate::select::SelectionRequest>,
+) -> Result<LoadedSubmission, ServeError> {
+    if selection.is_some() && is_topology_body(body, format) {
+        return Err(ServeError::BadConfig(
+            crate::select::TOPOLOGY_REFUSAL.to_string(),
+        ));
+    }
+    let mut loaded = load_for(state, body, format, tenant).await?;
+    if let Some(sel) = selection {
+        let nodes = std::mem::take(&mut loaded.nodes);
+        loaded.nodes = sel.apply(&loaded.cfg, nodes).map_err(|e| {
+            ServeError::BadConfig(crate::secrets::registry::redact(&e.to_string()).into_owned())
+        })?;
+    }
+    Ok(loaded)
+}
+
+/// Whether a submitted body is a topology config (`pipeline.nodes`).
+fn is_topology_body(body: &str, format: ConfigFormat) -> bool {
+    let doc: Option<serde_json::Value> = match format {
+        ConfigFormat::Yaml => serde_yaml::from_str(body).ok(),
+        ConfigFormat::Json => serde_json::from_str(body).ok(),
+    };
+    doc.and_then(|d| d.pointer("/pipeline/nodes").cloned())
+        .is_some_and(|n| match n {
+            serde_json::Value::Object(o) => !o.is_empty(),
+            serde_json::Value::Array(a) => !a.is_empty(),
+            _ => false,
+        })
+}
+
 /// Load a submission for a run, scoped to `tenant` when it is set (#709):
 /// the tenant's connections, `${tenant.*}` values and state namespace.
 pub(crate) async fn load_for(
@@ -290,7 +338,15 @@ pub fn resume_claimed_run(state: ServerState, rec: RunRecord) {
             return;
         };
         let format = rec.config_format.unwrap_or_default();
-        let loaded = match load_for(&state, body, format, rec.tenant.as_deref()).await {
+        let loaded = match load_selected(
+            &state,
+            body,
+            format,
+            rec.tenant.as_deref(),
+            rec.selection.as_ref(),
+        )
+        .await
+        {
             Ok(l) => l,
             Err(e) => {
                 finalize(
@@ -483,7 +539,15 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             return;
         };
         let format = run.config_format.unwrap_or_default();
-        let loaded = match load_for(&state, &body, format, run.tenant.as_deref()).await {
+        let loaded = match load_selected(
+            &state,
+            &body,
+            format,
+            run.tenant.as_deref(),
+            run.selection.as_ref(),
+        )
+        .await
+        {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(
@@ -632,6 +696,7 @@ async fn execute_shard(
         }
     };
     let opts = ExecuteOptions {
+        legacy_state_writes: state.cluster().legacy_state_writes(),
         pipeline_name,
         // Correlate notifications to the submitted run (#480). Every shard of a
         // sharded run reports the same `run_id`; they differ by `invocation_id`.
@@ -890,9 +955,24 @@ pub async fn submit(
     };
     // A request-level budget (#703) becomes part of the document before it is
     // loaded or stored.
-    let req = apply_request_budget(req)?;
+    let mut req = apply_request_budget(req)?;
+    // The selection names the run (#741): a label for listings, and — being
+    // a label — part of the idempotency fingerprint, so the same key with a
+    // different subset is a conflict rather than a replay.
+    if let Some(sel) = &req.selection {
+        req.labels
+            .entry(crate::select::LABEL_SELECTION.to_string())
+            .or_insert_with(|| sel.canonical());
+    }
     let format: ConfigFormat = req.config_format.into();
-    let loaded = load_for(&state, &req.config, format, actor.tenant.as_deref()).await?;
+    let loaded = load_selected(
+        &state,
+        &req.config,
+        format,
+        actor.tenant.as_deref(),
+        req.selection.as_ref(),
+    )
+    .await?;
     policy_gate(&state, &actor, &loaded).await?;
 
     // At-least-once duplicate-write warning for clustered / source-sharded runs
@@ -985,16 +1065,27 @@ pub async fn submit(
     }
 
     let submitted_at = Utc::now();
+    // The pipeline a run belongs to, whatever the run is named — what
+    // `faucet status` / `/v1/state` look runs up by (#732, #735).
+    let mut labels = req.labels.clone();
+    labels.entry(LABEL_PIPELINE.to_string()).or_insert_with(|| {
+        loaded
+            .cfg
+            .name
+            .clone()
+            .unwrap_or_else(|| "serve".to_string())
+    });
     let mut rec = RunRecord::queued(
         run_id.clone(),
         req.name.clone(),
-        req.labels.clone(),
+        labels,
         req.idempotency_key.clone(),
         submitted_at,
     );
     rec.doctor_report = doctor_report;
     rec.callback = req.callback.clone();
     rec.tenant = actor.tenant.clone();
+    rec.selection = req.selection.clone();
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -1623,6 +1714,7 @@ async fn execute_run(
         }
     };
     let opts = ExecuteOptions {
+        legacy_state_writes: state.cluster().legacy_state_writes(),
         pipeline_name,
         // The id returned by `POST /v1/runs`, so a completion notification can be
         // matched back to the submission (#480).
@@ -2025,6 +2117,7 @@ mod tests {
             reason: None,
             budget: None,
             approved_change: None,
+            selection: None,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -2109,6 +2202,7 @@ mod tests {
             reason: None,
             budget: None,
             approved_change: None,
+            selection: None,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -2321,6 +2415,7 @@ mod tests {
             reason: None,
             budget: None,
             approved_change: None,
+            selection: None,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(

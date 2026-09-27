@@ -136,6 +136,10 @@ fn csv_cell(value: &Value) -> Result<String, FaucetError> {
 
 #[async_trait]
 impl faucet_core::Sink for StdoutSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn connector_name(&self) -> &'static str {
         "stdout"
     }

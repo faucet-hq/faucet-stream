@@ -431,3 +431,41 @@ async fn new_rejects_cdc_disabled_database() {
         "error must hint the fix: {msg}"
     );
 }
+
+/// #733 — `lag()` counts the change transactions behind the consumed LSN and
+/// the age of the oldest; none before a position is known, zero once drained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a SQL Server (mssql) container: the ~2 GB image is too heavy/slow \
+            to come up reliably on the shared CI runner. Run explicitly with \
+            `cargo test -p faucet-source-mssql-cdc -- --ignored`."]
+async fn lag_counts_unread_change_transactions() {
+    let _serial = SERIAL.lock().await;
+    let Some((_c, port)) = start_mssql_cdc().await else {
+        return;
+    };
+    let (pool, conn) = setup(port, "cdc_lag").await;
+    exec(&pool, "INSERT INTO dbo.users (id, name) VALUES (1, N'a')").await;
+    wait_for_changes(&pool, 1).await;
+
+    let source = MssqlCdcSource::new(build_config(&conn))
+        .await
+        .expect("source new");
+    assert_eq!(source.lag().await.expect("lag"), None);
+    let (_, bookmark) = drain(&source).await;
+    let drained = source.lag().await.expect("lag").expect("a reading");
+    assert_eq!(drained.events, Some(0));
+
+    exec(&pool, "INSERT INTO dbo.users (id, name) VALUES (2, N'b')").await;
+    exec(&pool, "INSERT INTO dbo.users (id, name) VALUES (3, N'c')").await;
+    wait_for_changes(&pool, 3).await;
+    let probe = MssqlCdcSource::new(build_config(&conn))
+        .await
+        .expect("source new");
+    probe
+        .apply_start_bookmark(bookmark.expect("bookmark"))
+        .await
+        .expect("apply");
+    let behind = probe.lag().await.expect("lag").expect("a reading");
+    assert_eq!(behind.events, Some(2), "{behind:?}");
+    assert!(behind.seconds.unwrap() >= 0.0);
+}

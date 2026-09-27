@@ -35,6 +35,18 @@ pub enum SftpFormat {
     /// `file-format-excel` (#604).
     #[cfg(feature = "file-format-excel")]
     Xlsx,
+    /// Apache Avro Object Container Files. Each file's embedded writer
+    /// schema is resolved against [`avro.schema`](SftpSourceConfig::avro) when set, else
+    /// against the first file's schema, so the directory reads as one shape.
+    /// Joins the columnar path with the `arrow` feature. Requires
+    /// `file-format-avro` (#719).
+    #[cfg(feature = "file-format-avro")]
+    Avro,
+    /// Apache ORC, projected by [`orc.columns`](SftpSourceConfig::orc). **Buffered
+    /// whole** (the footer sits at the end) and decoded stripe by stripe;
+    /// joins the columnar path. Requires `file-format-orc` (#719).
+    #[cfg(feature = "file-format-orc")]
+    Orc,
 }
 
 impl SftpFormat {
@@ -43,7 +55,9 @@ impl SftpFormat {
     #[cfg(any(
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ))]
     pub(crate) fn shared(self) -> Option<faucet_core::FileFormat> {
         match self {
@@ -56,6 +70,10 @@ impl SftpFormat {
             Self::Xml => Some(faucet_core::FileFormat::Xml),
             #[cfg(feature = "file-format-excel")]
             Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+            #[cfg(feature = "file-format-avro")]
+            Self::Avro => Some(faucet_core::FileFormat::Avro),
+            #[cfg(feature = "file-format-orc")]
+            Self::Orc => Some(faucet_core::FileFormat::Orc),
         }
     }
 }
@@ -105,6 +123,12 @@ pub struct SftpSourceConfig {
     /// Record framing, used when `format: xml` (#604).
     #[serde(default)]
     pub xml: faucet_core::XmlOptions,
+    /// Reader schema, used when `format: avro` (#719).
+    #[serde(default)]
+    pub avro: faucet_core::AvroOptions,
+    /// Column projection, used when `format: orc` (#719).
+    #[serde(default)]
+    pub orc: faucet_core::OrcOptions,
 }
 
 fn default_batch_size() -> usize {
@@ -129,6 +153,8 @@ impl SftpSourceConfig {
             csv: faucet_core::CsvOptions::default(),
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
+            avro: faucet_core::AvroOptions::default(),
+            orc: faucet_core::OrcOptions::default(),
         }
     }
 
@@ -142,6 +168,8 @@ impl SftpSourceConfig {
             csv: self.csv.clone(),
             excel: self.excel.clone(),
             xml: self.xml.clone(),
+            avro: self.avro.clone(),
+            orc: self.orc.clone(),
         }
     }
 
@@ -336,7 +364,9 @@ mod tests {
     #[cfg(any(
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ))]
     #[test]
     fn formats_map_onto_the_shared_vocabulary_or_opt_out() {
@@ -358,12 +388,21 @@ mod tests {
             SftpFormat::Xlsx.shared(),
             Some(faucet_core::FileFormat::Xlsx)
         );
+        #[cfg(feature = "file-format-avro")]
+        assert_eq!(
+            SftpFormat::Avro.shared(),
+            Some(faucet_core::FileFormat::Avro)
+        );
+        #[cfg(feature = "file-format-orc")]
+        assert_eq!(SftpFormat::Orc.shared(), Some(faucet_core::FileFormat::Orc));
     }
 
     #[cfg(any(
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ))]
     #[test]
     fn the_format_option_blocks_reach_the_decoder() {

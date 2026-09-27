@@ -1,0 +1,30 @@
+[package]
+name = "faucet-common-singer"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Singer protocol types (messages, encoding, redaction, private config files) for the faucet-stream Singer tap and target bridges"
+readme = "README.md"
+keywords = ["singer", "meltano", "etl", "pipeline", "faucet"]
+categories.workspace = true
+
+[dependencies]
+faucet-core.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides — the workspace-wide
+# declared contract (see crates/core/Cargo.toml): struct-literal construction
+# and exhaustive matching of config/data types are NOT part of the stability
+# surface, so adding an optional field or variant is a MINOR bump.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"

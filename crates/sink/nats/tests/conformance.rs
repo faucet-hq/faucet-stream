@@ -63,6 +63,7 @@ mod docker {
         let mut cfg = NatsSinkConfig::new(subject);
         cfg.connection.servers = vec![server.clone()];
         let sink = NatsSink::new(cfg).await.expect("sink new");
+        faucet_conformance::assert_batch_atomicity_declared(&sink);
 
         // Check 10: connector_name is non-empty (metric-cardinality contract).
         faucet_conformance::assert_connector_name_nonempty_value(

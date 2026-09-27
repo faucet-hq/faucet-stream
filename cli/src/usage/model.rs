@@ -267,6 +267,12 @@ pub struct UsageRow {
     pub bytes_written: u64,
     pub duration_ms: u64,
     pub roundtrips: u64,
+    /// Rate-limit responses the sources received.
+    #[serde(default)]
+    pub throttled: u64,
+    /// Seconds the sources slept on those rate limits.
+    #[serde(default)]
+    pub throttle_wait_secs: f64,
     pub cost: f64,
     pub hosted_equivalent: f64,
     /// Connector kinds whose compute is not in `cost`.
@@ -342,6 +348,8 @@ fn empty_row(key: &str) -> UsageRow {
         bytes_written: 0,
         duration_ms: 0,
         roundtrips: 0,
+        throttled: 0,
+        throttle_wait_secs: 0.0,
         cost: 0.0,
         hosted_equivalent: 0.0,
         not_reported: Vec::new(),
@@ -357,6 +365,8 @@ fn fold(row: &mut UsageRow, r: &UsageRecord) {
     row.bytes_written += r.usage.bytes_written;
     row.duration_ms += r.duration_ms;
     row.roundtrips += r.usage.roundtrips(UsageSide::Source) + r.usage.roundtrips(UsageSide::Sink);
+    row.throttled += r.usage.throttled;
+    row.throttle_wait_secs += r.usage.throttle_wait_secs;
     row.cost += r.cost.total;
     row.hosted_equivalent += r.cost.hosted_equivalent;
     for k in &r.cost.not_reported {

@@ -24,8 +24,169 @@ use crate::error::{CliError, CliResult};
 use serde_json::{Map, Value};
 use std::path::Path;
 
+/// One stored key's migration (#736).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StateKeyMigration {
+    pub row: String,
+    pub key: String,
+    pub owner: String,
+    /// `current`, `enveloped` (a pre-versioning value rewritten in the
+    /// envelope), `migrated` (`from_schema` → `to_schema`), or `refused`.
+    pub action: &'static str,
+    pub from_schema: u32,
+    pub to_schema: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `faucet migrate --state`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StateMigrationReport {
+    pub pipeline: String,
+    pub check: bool,
+    pub keys: Vec<StateKeyMigration>,
+}
+
+impl StateMigrationReport {
+    /// Keys that are not current (`--check` fails on them).
+    pub fn pending(&self) -> usize {
+        self.keys.iter().filter(|k| k.action != "current").count()
+    }
+}
+
+/// Plan (and unless `check`, apply) the migration of every row's bookmark keys.
+pub async fn migrate_state(
+    target: &crate::pipeline_state::PipelineTarget,
+    stores: &crate::pipeline_state::ops::Stores,
+    row: Option<&str>,
+    check: bool,
+) -> CliResult<StateMigrationReport> {
+    use crate::pipeline_state::keys::KeyKind;
+    use faucet_core::state_version::{StoredState, resolve_with};
+    let rows = target.select(row)?;
+    let entries = crate::pipeline_state::ops::collect_keys(target, stores).await?;
+    let mut keys = Vec::new();
+    for r in rows {
+        let codec = crate::pipeline_state::ops::row_codec(r);
+        let kind = r.source.as_ref().map(|(k, _)| k.clone());
+        for e in entries.iter().filter(|e| {
+            e.key.kind == KeyKind::Bookmark && e.key.row.as_deref() == Some(r.id.as_str())
+        }) {
+            let stored = StoredState::parse(&e.value);
+            let resolved = resolve_with(
+                &e.key.key,
+                &e.value,
+                &codec.owner,
+                codec.schema,
+                |from, data| match &kind {
+                    Some(k) => crate::registry::migrate_source_state(k, from, data),
+                    None => Ok(data),
+                },
+            );
+            let (action, detail, write) = match resolved {
+                Err(err) => ("refused", Some(err.to_string()), None),
+                Ok(res) if res.migrated_from.is_some() => ("migrated", None, Some(res.data)),
+                Ok(res) if res.legacy => ("enveloped", None, Some(res.data)),
+                Ok(_) => ("current", None, None),
+            };
+            if let (Some(data), false) = (&write, check) {
+                let store = stores.for_key(&e.key).ok_or_else(|| {
+                    CliError::Config(format!("no state store holds '{}'", e.key.key))
+                })?;
+                store.put(&e.key.key, &codec.encode(data)).await?;
+            }
+            keys.push(StateKeyMigration {
+                row: r.id.clone(),
+                key: e.key.key.clone(),
+                owner: codec.owner.clone(),
+                action,
+                from_schema: stored.schema,
+                to_schema: codec.schema,
+                detail,
+            });
+        }
+    }
+    Ok(StateMigrationReport {
+        pipeline: target.pipeline.clone(),
+        check,
+        keys,
+    })
+}
+
+/// Human rendering of a state migration report.
+pub fn render_state_report(r: &StateMigrationReport) -> String {
+    let mut out = format!(
+        "pipeline {} — {}\n",
+        r.pipeline,
+        if r.check {
+            "state check"
+        } else {
+            "state migration"
+        }
+    );
+    if r.keys.is_empty() {
+        out.push_str("  no stored bookmarks\n");
+    }
+    for k in &r.keys {
+        let what = match k.action {
+            "current" => format!("current ({} schema {})", k.owner, k.to_schema),
+            "enveloped" if r.check => {
+                "stored before versioning — would be rewritten in the envelope".to_string()
+            }
+            "enveloped" => "rewritten in the versioned envelope".to_string(),
+            "migrated" if r.check => format!(
+                "needs migration: {} schema {} → {}",
+                k.owner, k.from_schema, k.to_schema
+            ),
+            "migrated" => format!(
+                "migrated: {} schema {} → {}",
+                k.owner, k.from_schema, k.to_schema
+            ),
+            _ => format!("REFUSED — {}", k.detail.as_deref().unwrap_or("")),
+        };
+        out.push_str(&format!("  {:<14} {}  {}\n", k.row, k.key, what));
+    }
+    out
+}
+
+async fn run_state(args: &MigrateArgs) -> CliResult<()> {
+    let load = crate::cli::StateLoadArgs {
+        json: args.json,
+        env_file: None,
+        no_env_file: false,
+        profile: None,
+    };
+    let (_, target, _) = crate::commands::state::load(args.config.as_deref(), &load).await?;
+    let stores = crate::pipeline_state::ops::Stores::build(&target, None).await?;
+    let report = migrate_state(&target, &stores, args.row.as_deref(), args.check).await?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| CliError::Internal(e.to_string()))?
+        );
+    } else {
+        print!("{}", render_state_report(&report));
+    }
+    let refused = report.keys.iter().filter(|k| k.action == "refused").count();
+    if refused > 0 {
+        return Err(CliError::Config(format!(
+            "{refused} stored bookmark(s) cannot be read by this release — see above"
+        )));
+    }
+    if args.check && report.pending() > 0 {
+        return Err(CliError::Config(format!(
+            "{} stored bookmark(s) are not current; run `faucet migrate --state` to upgrade them",
+            report.pending()
+        )));
+    }
+    Ok(())
+}
+
 /// Execute the `migrate` subcommand.
 pub async fn run(args: MigrateArgs) -> CliResult<()> {
+    if args.state {
+        return run_state(&args).await;
+    }
     let cwd = std::env::current_dir()?;
     let path = match args.config.clone() {
         Some(p) => p,
@@ -411,6 +572,9 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             config: Some(path.clone()),
             check: false,
             stdout: false,
+            state: false,
+            row: None,
+            json: false,
         })
         .await
         .unwrap();
@@ -423,6 +587,9 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             config: Some(path.clone()),
             check: false,
             stdout: false,
+            state: false,
+            row: None,
+            json: false,
         })
         .await
         .unwrap();
@@ -436,6 +603,9 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             config: Some(legacy),
             check: true,
             stdout: false,
+            state: false,
+            row: None,
+            json: false,
         })
         .await;
         assert!(err.is_err(), "--check must fail on a legacy config");
@@ -446,6 +616,9 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             config: Some(cur),
             check: true,
             stdout: false,
+            state: false,
+            row: None,
+            json: false,
         })
         .await
         .expect("--check passes on a current config");
@@ -459,6 +632,9 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
             config: Some(path.clone()),
             check: false,
             stdout: true,
+            state: false,
+            row: None,
+            json: false,
         })
         .await
         .unwrap();

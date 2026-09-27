@@ -138,6 +138,24 @@ pub struct UsageSnapshot {
     /// Backend-reported usage figures.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signals: Vec<CostSignal>,
+    /// Rate-limit responses (HTTP 429 and equivalents) the source received.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub throttled: u64,
+    /// Seconds the source actually slept because of those responses.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub throttle_wait_secs: f64,
+    /// Source-side retries by retry class (`rate_limited`, `http_5xx`,
+    /// `connection`, `timeout`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_retries: BTreeMap<String, u64>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 impl UsageSnapshot {
@@ -162,6 +180,11 @@ impl UsageSnapshot {
             *self.sink_roundtrips.entry(k.clone()).or_default() += v;
         }
         self.signals.extend(other.signals.iter().cloned());
+        self.throttled += other.throttled;
+        self.throttle_wait_secs += other.throttle_wait_secs;
+        for (k, v) in &other.source_retries {
+            *self.source_retries.entry(k.clone()).or_default() += v;
+        }
     }
 }
 
@@ -174,6 +197,9 @@ pub struct UsageMeter {
     bytes_written: AtomicU64,
     roundtrips: Mutex<BTreeMap<(UsageSide, &'static str), u64>>,
     signals: Mutex<Vec<CostSignal>>,
+    throttled: AtomicU64,
+    throttle_wait_nanos: AtomicU64,
+    source_retries: Mutex<BTreeMap<&'static str, u64>>,
 }
 
 impl UsageMeter {
@@ -205,6 +231,28 @@ impl UsageMeter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(signal);
+    }
+
+    /// Count one rate-limit response the source received.
+    pub fn add_throttled(&self) {
+        self.throttled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add time the source actually slept on a rate limit.
+    pub fn add_throttle_wait(&self, slept: std::time::Duration) {
+        self.throttle_wait_nanos.fetch_add(
+            u64::try_from(slept.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Count one source-side retry of `class`.
+    pub fn add_source_retry(&self, class: &'static str) {
+        let mut map = self
+            .source_retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *map.entry(class).or_default() += 1;
     }
 
     /// Records the sink accepted so far (what a `max_records` budget checks).
@@ -245,6 +293,18 @@ impl UsageMeter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            throttled: self.throttled.load(Ordering::Relaxed),
+            throttle_wait_secs: std::time::Duration::from_nanos(
+                self.throttle_wait_nanos.load(Ordering::Relaxed),
+            )
+            .as_secs_f64(),
+            source_retries: self
+                .source_retries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
         }
     }
 }
@@ -313,6 +373,39 @@ mod tests {
         assert_eq!(total.records_written, 4);
         assert_eq!(total.source_roundtrips["page"], 4);
         assert_eq!(total.signals.len(), 2);
+        let round: UsageSnapshot =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(round, s);
+    }
+
+    #[test]
+    fn meter_tallies_throttling_and_retries() {
+        let m = UsageMeter::new();
+        let quiet = m.snapshot();
+        let v = serde_json::to_value(&quiet).unwrap();
+        assert!(v.get("throttled").is_none());
+        assert!(v.get("throttle_wait_secs").is_none());
+        assert!(v.get("source_retries").is_none());
+
+        m.add_throttled();
+        m.add_throttled();
+        m.add_throttle_wait(std::time::Duration::from_millis(1500));
+        m.add_throttle_wait(std::time::Duration::from_millis(500));
+        m.add_source_retry("rate_limited");
+        m.add_source_retry("rate_limited");
+        m.add_source_retry("http_5xx");
+        let s = m.snapshot();
+        assert_eq!(s.throttled, 2);
+        assert!((s.throttle_wait_secs - 2.0).abs() < 1e-9);
+        assert_eq!(s.source_retries["rate_limited"], 2);
+        assert_eq!(s.source_retries["http_5xx"], 1);
+
+        let mut total = UsageSnapshot::default();
+        total.merge(&s);
+        total.merge(&s);
+        assert_eq!(total.throttled, 4);
+        assert!((total.throttle_wait_secs - 4.0).abs() < 1e-9);
+        assert_eq!(total.source_retries["rate_limited"], 4);
         let round: UsageSnapshot =
             serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
         assert_eq!(round, s);

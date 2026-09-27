@@ -153,6 +153,16 @@ pub struct Pipeline<'a, So: Source + ?Sized, Si: Sink + ?Sized> {
     /// off its own `is_overwrite()` config, independent of this flag). Default
     /// `false`: a standalone `Pipeline::run` manages its own overwrite.
     suppress_overwrite_lifecycle: bool,
+    /// Batch outcome counters the run fills in (#737).
+    batch_outcomes: Option<Arc<crate::dlq::BatchOutcomeCounters>>,
+    /// The caller accepts duplicates from `on_batch_error: dlq_all` on a
+    /// best-effort sink (#737).
+    allow_dlq_all_duplicates: bool,
+    /// Receives the run's source-lag samples (#733).
+    lag_observer: Option<Arc<crate::lag::LagObserver>>,
+    /// Store bookmarks bare instead of in the versioned envelope (#736): a
+    /// cluster member that predates the envelope is still live.
+    legacy_state_writes: bool,
 }
 
 /// Build and install the source/sink round-trip recorders for one run (#638).
@@ -166,7 +176,7 @@ pub(crate) fn install_roundtrip_recorders(
     pipeline: &str,
     row: &str,
     meter: Option<&Arc<crate::usage::UsageMeter>>,
-) {
+) -> Arc<crate::observability::ThrottleTally> {
     use crate::observability::{RoundtripRecorder, RoundtripSide};
     let mut src = RoundtripRecorder::new(
         RoundtripSide::Source,
@@ -184,8 +194,10 @@ pub(crate) fn install_roundtrip_recorders(
         src = src.with_meter(Arc::clone(m));
         snk = snk.with_meter(Arc::clone(m));
     }
+    let throttle = src.throttle_tally();
     source.set_roundtrip_recorder(Arc::new(src));
     sink.set_roundtrip_recorder(Arc::new(snk));
+    throttle
 }
 
 impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
@@ -213,6 +225,10 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             cleanup: None,
             usage_meter: None,
             suppress_overwrite_lifecycle: false,
+            batch_outcomes: None,
+            allow_dlq_all_duplicates: false,
+            lag_observer: None,
+            legacy_state_writes: false,
         }
     }
 
@@ -356,6 +372,42 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// Count every sink write's outcome — committed, partly failed into the
+    /// DLQ, routed whole by `dlq_all`, or failed — into `counters` (#737). The
+    /// counts are complete when [`run`](Self::run) returns, `Err` included.
+    pub fn with_batch_outcomes(mut self, counters: Arc<crate::dlq::BatchOutcomeCounters>) -> Self {
+        self.batch_outcomes = Some(counters);
+        self
+    }
+
+    /// Accept `on_batch_error: dlq_all` on a sink that may commit part of a
+    /// failed batch (#737). Without it [`run`](Self::run) refuses that
+    /// combination before reading anything, because a DLQ replay would write
+    /// the already-committed rows a second time.
+    pub fn allow_dlq_all_duplicates(mut self, allow: bool) -> Self {
+        self.allow_dlq_all_duplicates = allow;
+        self
+    }
+
+    /// Receive the run's source-lag samples (#733): the source's
+    /// [`lag`](crate::Source::lag) is polled on the first page, at most every
+    /// [`LAG_POLL_INTERVAL`](crate::lag::LAG_POLL_INTERVAL) after, and once
+    /// when the run ends; the latest lands in `observer`. The
+    /// `faucet_source_lag_*` gauges are exported either way.
+    pub fn with_lag_observer(mut self, observer: Arc<crate::lag::LagObserver>) -> Self {
+        self.lag_observer = Some(observer);
+        self
+    }
+
+    /// Store bookmarks bare instead of in the versioned envelope (#736) — for
+    /// a rolling upgrade in which a process that predates the envelope still
+    /// reads this state. A source whose bookmark shape is past schema 0 is
+    /// then refused, because such a reader would misread it.
+    pub fn with_legacy_state_writes(mut self, legacy: bool) -> Self {
+        self.legacy_state_writes = legacy;
+        self
+    }
+
     /// Run the pipeline in streaming mode.
     ///
     /// 1. Loads the stored bookmark and pushes it to the source (if a state
@@ -398,7 +450,8 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         // pipeline/row/connector trio every other metric carries; the
         // decorators forward it down to the connector that does the I/O. A
         // connector that never records emits nothing.
-        install_roundtrip_recorders(
+        let run_started = std::time::Instant::now();
+        let throttle = install_roundtrip_recorders(
             &wrapped_source,
             &wrapped_sink,
             &name,
@@ -467,15 +520,52 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         let _run_timer =
             DurationGuard::new("faucet_pipeline_run_duration_seconds", run_labels.clone());
 
+        let lag_poller =
+            crate::lag::LagPoller::new(&wrapped_source, &name, &row, self.lag_observer.clone());
+
         // Run inside the span.
         let result = async {
+            if let Some(dlq) = &self.dlq {
+                crate::dlq::check_dlq_all_policy(
+                    &wrapped_sink,
+                    dlq.on_batch_error,
+                    self.allow_dlq_all_duplicates,
+                )?;
+            }
             // Bookmark resume — goes through the wrapped state store so the
             // get is instrumented too.
             let state_key = self.source.state_key();
+            let codec = crate::state_version::StateCodec::for_source(
+                &wrapped_source,
+                self.legacy_state_writes,
+            );
+            if codec.legacy && codec.schema > 0 {
+                return Err(crate::state_version::incompatible(
+                    state_key.as_deref().unwrap_or_default(),
+                    format!(
+                        "a reader that predates versioned state (bare '{}' bookmarks)",
+                        codec.owner
+                    ),
+                    format!("'{}' state schema {}", codec.owner, codec.schema),
+                ));
+            }
+            // Every bookmark write goes into the versioned envelope (#736).
+            let wrapped_state_store: Option<Arc<dyn StateStore>> =
+                match (wrapped_state_store.clone(), state_key.as_ref()) {
+                    (Some(store), Some(key)) => Some(Arc::new(
+                        crate::state_version::VersionedStateStore::new(store, key.clone(), codec),
+                    )),
+                    (store, _) => store,
+                };
             let mut start_seq = 0u64;
             if let (Some(store), Some(key)) = (wrapped_state_store.as_ref(), state_key.as_ref()) {
                 validate_state_key(key)?;
-                if let Some(prior) = store.get(key).await? {
+                if let Some(stored) = store.get(key).await? {
+                    // Refuse state this release or source cannot read before
+                    // anything is read from the source; migrate an older shape.
+                    let prior =
+                        crate::state_version::resolve_for_source(key, &stored, &wrapped_source)?
+                            .data;
                     if self.delivery == crate::idempotency::DeliveryMode::ExactlyOnce {
                         let (bookmark, seq) = crate::idempotency::unwrap_state(&prior);
                         start_seq = seq;
@@ -593,6 +683,12 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             self.cancel.clone(),
                             &name,
                             &row,
+                            crate::dlq::BatchOutcomeSink::new(
+                                &name,
+                                &row,
+                                wrapped_sink.connector_name(),
+                                self.batch_outcomes.clone(),
+                            ),
                         )
                         .await;
                     }
@@ -681,13 +777,27 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         specs,
                         has_governance,
                         self.dlq.clone(),
+                        crate::dlq::BatchOutcomeSink::new(
+                            &name,
+                            &row,
+                            sink_name,
+                            self.batch_outcomes.clone(),
+                        ),
                     )
                     .await;
                 }
             }
 
             let ctx = std::collections::HashMap::new();
-            let pages = wrapped_source.stream_pages(&ctx, DEFAULT_BATCH_SIZE);
+            let raw_pages = wrapped_source.stream_pages(&ctx, DEFAULT_BATCH_SIZE);
+            let lag_poller_ref = &lag_poller;
+            let pages = Box::pin(futures::StreamExt::then(
+                raw_pages,
+                move |page| async move {
+                    lag_poller_ref.poll(false).await;
+                    page
+                },
+            ));
 
             let mut opts = RunStreamOptions::new()
                 .with_name(name.clone())
@@ -746,13 +856,16 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             // (the CLI executor) owns begin/commit/abort across the fan-out
             // group, so a per-invocation begin here would re-create (wipe) the
             // shared staging table each parent — the silent data-loss bug.
+            let extras = StreamExtras {
+                batch_outcomes: self.batch_outcomes.clone(),
+            };
             let overwriting = wrapped_sink.is_overwrite() && !self.suppress_overwrite_lifecycle;
             if overwriting {
                 wrapped_sink.begin_overwrite().await?;
             }
 
             let run_result = match self.cleanup.clone() {
-                None => run_stream(pages, &wrapped_sink, opts).await,
+                None => run_stream_with(pages, &wrapped_sink, opts, extras).await,
                 Some(policy) => {
                     if !wrapped_sink.supports_cleanup() {
                         return Err(FaucetError::Config(format!(
@@ -761,7 +874,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         )));
                     }
                     let tracker = crate::cleanup::CleanupTracker::new(&wrapped_sink, &policy);
-                    let result = run_stream(pages, &tracker, opts).await;
+                    let result = run_stream_with(pages, &tracker, opts, extras).await;
                     match result {
                         Ok(r) => {
                             let cancelled = self.cancel.as_ref().is_some_and(|c| c.is_cancelled());
@@ -847,6 +960,16 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         }
         .instrument(span)
         .await;
+        if result.is_ok() {
+            lag_poller.poll(true).await;
+        }
+        if let Some(msg) = crate::observability::throttle_warning(
+            throttle.throttled(),
+            throttle.wait(),
+            run_started.elapsed(),
+        ) {
+            tracing::warn!(pipeline = %name, row = %row, "{msg}");
+        }
 
         // Final run-counter increment. On error, also attach a `kind` label
         // (matching the FaucetError variant) so dashboards can break out failed
@@ -889,6 +1012,7 @@ async fn run_stream_columnar<S, Si>(
     specs: GovernanceSpecs<'_>,
     has_governance: bool,
     dlq: Option<crate::dlq::DlqConfig>,
+    outcomes: crate::dlq::BatchOutcomeSink,
 ) -> Result<PipelineResult, FaucetError>
 where
     S: crate::Source + ?Sized,
@@ -1001,7 +1125,7 @@ where
         let rows = batch.num_rows();
 
         if rows > 0 {
-            let n = sink.write_batch_columnar(&batch).await?;
+            let n = outcomes.observe(sink.write_batch_columnar(&batch).await)?;
             records_written += n;
             counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
             counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
@@ -1069,6 +1193,7 @@ async fn run_stream_native<S, Si>(
     cancel: Option<tokio_util::sync::CancellationToken>,
     pipeline: &str,
     row: &str,
+    outcomes: crate::dlq::BatchOutcomeSink,
 ) -> Result<PipelineResult, FaucetError>
 where
     S: crate::Source + ?Sized,
@@ -1127,7 +1252,7 @@ where
             write_mode,
             first_batch,
         };
-        let n = sink.load_native(batch, &scope, load_ctx).await?;
+        let n = outcomes.observe(sink.load_native(batch, &scope, load_ctx).await)?;
         first_batch = false;
         records_written += n;
         counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
@@ -1192,7 +1317,7 @@ where
 /// Returns the cumulative [`PipelineResult`] — `records_written` is the sum
 /// across all pages and `bookmark` is the last per-page bookmark observed.
 pub async fn run_stream<S, Si>(
-    mut pages: S,
+    pages: S,
     sink: &Si,
     options: RunStreamOptions,
 ) -> Result<PipelineResult, FaucetError>
@@ -1200,7 +1325,27 @@ where
     S: Stream<Item = Result<StreamPage, FaucetError>> + Unpin,
     Si: Sink + ?Sized,
 {
-    use crate::dlq::{DlqReason, DlqStats, OnBatchError, build_envelope};
+    run_stream_with(pages, sink, options, StreamExtras::default()).await
+}
+
+/// What [`Pipeline::run`] hands [`run_stream`] beyond the public
+/// [`RunStreamOptions`], whose shape is frozen public API.
+#[derive(Default)]
+pub(crate) struct StreamExtras {
+    pub(crate) batch_outcomes: Option<Arc<crate::dlq::BatchOutcomeCounters>>,
+}
+
+pub(crate) async fn run_stream_with<S, Si>(
+    mut pages: S,
+    sink: &Si,
+    options: RunStreamOptions,
+    extras: StreamExtras,
+) -> Result<PipelineResult, FaucetError>
+where
+    S: Stream<Item = Result<StreamPage, FaucetError>> + Unpin,
+    Si: Sink + ?Sized,
+{
+    use crate::dlq::{BatchOutcome, DlqReason, DlqStats, OnBatchError, build_envelope};
 
     let state_store = options.state_store.clone();
     let state_key = options.state_key.clone();
@@ -1366,6 +1511,12 @@ where
     let mut warned_poison_drop = false;
 
     let sink_name = sink.connector_name();
+    let outcomes = crate::dlq::BatchOutcomeSink::new(
+        &pipeline_name,
+        &row,
+        sink_name,
+        extras.batch_outcomes.clone(),
+    );
     let dlq_sink_name = dlq.as_ref().map(|d| d.sink.connector_name()).unwrap_or("");
 
     // Drive the streaming loop inside an inner future so that EVERY early exit
@@ -1581,7 +1732,10 @@ where
                             ) = match chunk_outcomes_result {
                                 Ok(o) => (o, false),
                                 Err(e) => match dlq_cfg.on_batch_error {
-                                    OnBatchError::Propagate => return Err(e),
+                                    OnBatchError::Propagate => {
+                                        outcomes.record(BatchOutcome::Failed);
+                                        return Err(e);
+                                    }
                                     OnBatchError::DlqAll => {
                                         outer_err_recovered = true;
                                         let msg = e.to_string();
@@ -1633,7 +1787,13 @@ where
                                     // to a non-idempotent partial sink up to
                                     // `(max_row_attempts - 1) * max_attempts`,
                                     // amplifying duplicate writes (F47).
-                                    let retried = sink.write_batch_partial(&subset).await?;
+                                    let retried = match sink.write_batch_partial(&subset).await {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            outcomes.record(BatchOutcome::Failed);
+                                            return Err(e);
+                                        }
+                                    };
                                     // `retried` aligns positionally with `failing`
                                     // (the subset was built in `failing` order).
                                     // Consume by value — `FaucetError` is not Clone.
@@ -1666,6 +1826,7 @@ where
                                             .unwrap_or(crate::resilience::PoisonAction::Dlq);
                                         match action {
                                             crate::resilience::PoisonAction::Fail => {
+                                                outcomes.record(BatchOutcome::Failed);
                                                 crate::observability::resilience::poison_rows(
                                                     &pipeline_name,
                                                     &row,
@@ -1696,7 +1857,11 @@ where
                                                 envelopes.push(build_envelope(
                                                     &chunk[j],
                                                     err,
-                                                    DlqReason::Partial,
+                                                    if chunk_synthesized {
+                                                        DlqReason::DlqAll
+                                                    } else {
+                                                        DlqReason::Partial
+                                                    },
                                                     sink_name,
                                                     &pipeline_name,
                                                     &row,
@@ -1724,6 +1889,13 @@ where
                                     poison_drop,
                                 );
                             }
+                            outcomes.record(if chunk_synthesized {
+                                BatchOutcome::DlqAll
+                            } else if chunk_errors > 0 || poison_drop > 0 {
+                                BatchOutcome::DlqPartial
+                            } else {
+                                BatchOutcome::Committed
+                            });
                             if let Some(ctrl) = controller.as_mut() {
                                 let adj = ctrl.observe(crate::adaptive::Observation {
                                     batch_len: chunk.len(),
@@ -1950,10 +2122,10 @@ where
                                 counter!("faucet_pipeline_pages_skipped_total", skip_labels)
                                     .increment(1);
                             } else {
-                                records_written += with_retry!(
+                                records_written += outcomes.observe(with_retry!(
                                     "sink_write",
                                     sink.write_batch_idempotent(&page.records, &scope, &token)
-                                )?;
+                                ))?;
                             }
                             with_retry!("flush", sink.flush())?;
                             let bm_labels =
@@ -1971,8 +2143,10 @@ where
                             // No bookmark → not individually checkpointed; write
                             // as-is (rare for EO sources, which bookmark every
                             // page). Stays at-least-once for this page.
-                            records_written +=
-                                with_retry_write!("sink_write", sink.write_batch(&page.records))?;
+                            records_written += outcomes.observe(with_retry_write!(
+                                "sink_write",
+                                sink.write_batch(&page.records)
+                            ))?;
                         }
                     } else {
                         // ── DLQ-disabled path (today's behaviour) ──────────────
@@ -1992,7 +2166,10 @@ where
                                         ctrl.current().max(1).min(page.records.len() - offset);
                                     let chunk = &page.records[offset..offset + size];
                                     let t0 = std::time::Instant::now();
-                                    let n = with_retry_write!("sink_write", sink.write_batch(chunk))?;
+                                    let n = outcomes.observe(with_retry_write!(
+                                        "sink_write",
+                                        sink.write_batch(chunk)
+                                    ))?;
                                     let latency = t0.elapsed();
                                     records_written += n;
                                     offset += size;
@@ -2004,8 +2181,10 @@ where
                                     emit_adaptive_metrics(ctrl, adj, &pipeline_name, &row);
                                 }
                             } else {
-                                records_written +=
-                                    with_retry_write!("sink_write", sink.write_batch(&page.records))?;
+                                records_written += outcomes.observe(with_retry_write!(
+                                    "sink_write",
+                                    sink.write_batch(&page.records)
+                                ))?;
                             }
                         }
                         if let Some(bookmark) = page.bookmark {
@@ -3182,7 +3361,14 @@ mod tests {
         assert_eq!(r.records_written, 1);
         assert_eq!(sink.0.written(), vec![json!({"id": 1})]);
         // Bare bookmark, not the exactly-once wrapper.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("b1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("b1"))
+        );
     }
 
     #[tokio::test]
@@ -3395,6 +3581,43 @@ mod tests {
         assert_eq!(snap.bytes_read, bytes);
         assert_eq!(snap.bytes_written, bytes);
         assert_eq!(sink.written().len(), 2);
+    }
+
+    struct ThrottlingSource(crate::observability::RecorderSlot);
+
+    #[async_trait]
+    impl Source for ThrottlingSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            self.0.throttled();
+            if let Some(r) = self.0.recorder() {
+                r.throttle_wait(std::time::Duration::from_secs(2));
+            }
+            Ok(vec![json!({"id": 1})])
+        }
+        fn set_roundtrip_recorder(&self, recorder: Arc<crate::observability::RoundtripRecorder>) {
+            self.0.install(recorder);
+        }
+    }
+
+    /// Throttling a connector reports reaches the run's usage meter, and a run
+    /// that spent most of its time waiting takes the warning branch (#734).
+    #[tokio::test]
+    async fn source_throttling_lands_on_the_usage_meter() {
+        let source = ThrottlingSource(crate::observability::RecorderSlot::new());
+        let sink = MockSink::new();
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        Pipeline::new(&source, &sink)
+            .with_name("p")
+            .with_usage_meter(Arc::clone(&meter))
+            .run()
+            .await
+            .unwrap();
+        let snap = meter.snapshot();
+        assert_eq!(snap.throttled, 1);
+        assert!((snap.throttle_wait_secs - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -3715,7 +3938,11 @@ mod tests {
         assert_eq!(result.records_written, 2);
         assert_eq!(result.bookmark, Some(json!("checkpoint-final")));
         assert_eq!(
-            store.get("k").await.unwrap(),
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!("checkpoint-final"))
         );
     }
@@ -3745,7 +3972,14 @@ mod tests {
         .unwrap();
 
         // Latest per-page bookmark wins.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("tx-2")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("tx-2"))
+        );
     }
 
     // ── State-store integration tests ───────────────────────────────────────
@@ -3819,7 +4053,11 @@ mod tests {
         assert_eq!(result.records_written, 1);
         assert_eq!(result.bookmark, Some(json!("2026-05-01")));
         // Stored value matches what the source returned.
-        let stored = store.get("github_issues").await.unwrap();
+        let stored = store
+            .get("github_issues")
+            .await
+            .unwrap()
+            .map(|v| crate::state_version::peel_versioned(&v));
         assert_eq!(stored, Some(json!("2026-05-01")));
     }
 
@@ -3844,7 +4082,11 @@ mod tests {
         assert_eq!(source.observed_start(), Some(json!("2026-04-30")));
         // And then overwrote it with the new value from this run.
         assert_eq!(
-            store.get("github_issues").await.unwrap(),
+            store
+                .get("github_issues")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!("2026-05-01"))
         );
     }
@@ -3988,7 +4230,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s1.observed_start(), None);
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
 
         // Run 2: resume from v1, persist v2.
         let s2 = StatefulSource::new("k", vec![json!({"i": 2})], json!("v2"));
@@ -3999,7 +4248,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s2.observed_start(), Some(json!("v1")));
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v2")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v2"))
+        );
     }
 
     #[tokio::test]
@@ -4349,7 +4605,14 @@ mod tests {
                 assert!(msg.contains("write failed"), "got: {msg}");
             }
         }
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
         assert_eq!(result.dlq.unwrap().records_dlq, 3);
     }
 
@@ -4435,7 +4698,14 @@ mod tests {
         // The two failures were routed to the DLQ (not lost on abort).
         assert_eq!(dlq.0.lock().unwrap().len(), 2);
         // The bookmark was persisted, so the survivor will NOT re-deliver.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
     }
 
     #[tokio::test]
@@ -4469,7 +4739,14 @@ mod tests {
         );
         assert_eq!(main.committed.lock().unwrap().len(), 1);
         assert_eq!(dlq.0.lock().unwrap().len(), 2);
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
     }
 
     /// DLQ sink that always fails. Used to assert the router does not
@@ -4554,7 +4831,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("v1")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("v1"))
+        );
         assert_eq!(dlq.0.lock().unwrap().len(), 1);
         assert_eq!(main.committed.lock().unwrap().len(), 1);
     }
@@ -5350,7 +5634,14 @@ mod tests {
         assert_eq!(result.records_written, 1); // row 0 committed
         assert_eq!(result.bookmark, Some(json!("ckpt")));
         // Bookmark was persisted after the page was made durable.
-        assert_eq!(store.get("k").await.unwrap(), Some(json!("ckpt")));
+        assert_eq!(
+            store
+                .get("k")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
+            Some(json!("ckpt"))
+        );
         // The single failed row reached the DLQ.
         let envelopes = dlq.0.lock().unwrap();
         assert_eq!(envelopes.len(), 1);
@@ -6655,6 +6946,236 @@ mod tests {
             vec![json!({"id": 1, "name": "ok", "email": "a@x"})]
         );
     }
+
+    // ── #737 batch atomicity + outcomes, #733 source lag ─────────────────────
+
+    struct AlwaysFailPartialSink;
+
+    #[async_trait]
+    impl Sink for AlwaysFailPartialSink {
+        async fn write_batch(&self, _r: &[Value]) -> Result<usize, FaucetError> {
+            Err(FaucetError::Sink("batch rejected".into()))
+        }
+    }
+
+    struct AtomicSink(MockSink);
+
+    #[async_trait]
+    impl Sink for AtomicSink {
+        async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+            self.0.write_batch(r).await
+        }
+        fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+            crate::dlq::BatchAtomicity::Atomic
+        }
+    }
+
+    fn records(n: usize) -> Vec<Value> {
+        (0..n).map(|i| json!({"i": i})).collect()
+    }
+
+    #[tokio::test]
+    async fn run_refuses_dlq_all_on_a_best_effort_sink() {
+        let source = MockSource(records(2));
+        let sink = MockSink::new();
+        let dlq = DlqConfig {
+            on_batch_error: OnBatchError::DlqAll,
+            ..DlqConfig::new(Arc::new(MockSink::new()))
+        };
+        let err = Pipeline::new(&source, &sink)
+            .with_dlq(dlq)
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FaucetError::Config(ref m) if m.contains("dlq_all")),
+            "{err}"
+        );
+        assert!(sink.written().is_empty(), "nothing may be read or written");
+    }
+
+    #[tokio::test]
+    async fn run_accepts_dlq_all_on_an_atomic_sink_or_with_the_opt_in() {
+        let source = MockSource(records(2));
+        let atomic = AtomicSink(MockSink::new());
+        let dlq = || DlqConfig {
+            on_batch_error: OnBatchError::DlqAll,
+            ..DlqConfig::new(Arc::new(MockSink::new()))
+        };
+        Pipeline::new(&source, &atomic)
+            .with_dlq(dlq())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(atomic.0.written().len(), 2);
+        let best = MockSink::new();
+        Pipeline::new(&source, &best)
+            .with_dlq(dlq())
+            .allow_dlq_all_duplicates(true)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(best.written().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_outcomes_count_every_write_path() {
+        use crate::dlq::{BatchOutcomeCounters, BatchOutcomes};
+        let source = MockSource(records(3));
+
+        let committed = Arc::new(BatchOutcomeCounters::new());
+        Pipeline::new(&source, &MockSink::new())
+            .with_batch_outcomes(Arc::clone(&committed))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(committed.snapshot().committed, 1);
+
+        let failed = Arc::new(BatchOutcomeCounters::new());
+        assert!(
+            Pipeline::new(&source, &FailingSink)
+                .with_batch_outcomes(Arc::clone(&failed))
+                .run()
+                .await
+                .is_err()
+        );
+        assert_eq!(failed.snapshot().failed, 1);
+
+        let partial = Arc::new(BatchOutcomeCounters::new());
+        Pipeline::new(&source, &PartialSink::new(vec![1]))
+            .with_dlq(DlqConfig::new(Arc::new(MockSink::new())))
+            .with_batch_outcomes(Arc::clone(&partial))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(partial.snapshot().dlq_partial, 1);
+
+        let routed = Arc::new(BatchOutcomeCounters::new());
+        let dlq_sink = Arc::new(MockSink::new());
+        Pipeline::new(&source, &AlwaysFailPartialSink)
+            .with_dlq(DlqConfig {
+                on_batch_error: OnBatchError::DlqAll,
+                ..DlqConfig::new(dlq_sink.clone())
+            })
+            .allow_dlq_all_duplicates(true)
+            .with_batch_outcomes(Arc::clone(&routed))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            routed.snapshot(),
+            BatchOutcomes {
+                attempted: 1,
+                dlq_all: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(dlq_sink.written().len(), 3);
+        assert!(
+            dlq_sink.written().iter().all(|e| e["reason"] == "dlq_all"),
+            "a whole routed batch is labelled dlq_all, not partial"
+        );
+
+        let propagated = Arc::new(BatchOutcomeCounters::new());
+        assert!(
+            Pipeline::new(&source, &AlwaysFailPartialSink)
+                .with_dlq(DlqConfig::new(Arc::new(MockSink::new())))
+                .with_batch_outcomes(Arc::clone(&propagated))
+                .run()
+                .await
+                .is_err()
+        );
+        assert_eq!(propagated.snapshot().failed, 1);
+    }
+
+    #[tokio::test]
+    async fn batch_outcomes_count_adaptive_and_exactly_once_writes() {
+        use crate::dlq::BatchOutcomeCounters;
+        let counters = Arc::new(BatchOutcomeCounters::new());
+        let pages = futures::stream::iter(vec![Ok(StreamPage {
+            records: records(4),
+            bookmark: None,
+        })]);
+        run_stream_with(
+            pages,
+            &MockSink::new(),
+            RunStreamOptions::new().with_adaptive(
+                serde_json::from_value(json!({"enabled": true, "min": 1, "max": 2})).unwrap(),
+            ),
+            StreamExtras {
+                batch_outcomes: Some(Arc::clone(&counters)),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            counters.snapshot().committed >= 2,
+            "{:?}",
+            counters.snapshot()
+        );
+
+        let eo = Arc::new(BatchOutcomeCounters::new());
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let sink = IdempotentMockSink::new();
+        let pages = futures::stream::iter(vec![
+            Ok(StreamPage {
+                records: records(1),
+                bookmark: Some(json!(1)),
+            }),
+            Ok(StreamPage {
+                records: records(1),
+                bookmark: None,
+            }),
+        ]);
+        run_stream_with(
+            pages,
+            &sink,
+            RunStreamOptions::new()
+                .with_state(store, "k".to_string())
+                .with_delivery(crate::idempotency::DeliveryMode::ExactlyOnce),
+            StreamExtras {
+                batch_outcomes: Some(Arc::clone(&eo)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(eo.snapshot().committed, 2);
+    }
+
+    struct LaggingSource {
+        polls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Source for LaggingSource {
+        async fn fetch_with_context(
+            &self,
+            _: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(records(3))
+        }
+        async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
+            let n = self
+                .polls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(crate::lag::SourceLag::events(100 - n as u64)))
+        }
+    }
+
+    #[tokio::test]
+    async fn lag_is_polled_on_the_first_page_and_at_the_end() {
+        let source = LaggingSource {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let observer = Arc::new(crate::lag::LagObserver::new());
+        Pipeline::new(&source, &MockSink::new())
+            .with_lag_observer(Arc::clone(&observer))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(source.polls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(observer.last(), Some(crate::lag::SourceLag::events(99)));
+    }
 }
 
 #[cfg(test)]
@@ -7145,7 +7666,11 @@ mod cleanup_tests {
         // The final batch's bookmark landed in the state store under the
         // source's natural key.
         assert_eq!(
-            store.get("native-test").await.unwrap(),
+            store
+                .get("native-test")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!({"page": 0}))
         );
     }
@@ -7201,7 +7726,11 @@ mod cleanup_tests {
         assert_eq!(flush_count(&events), 1, "one terminal flush: {events:?}");
         assert_eq!(result.bookmark, Some(json!({"page": 2})));
         assert_eq!(
-            store.get("ovw-key").await.unwrap(),
+            store
+                .get("ovw-key")
+                .await
+                .unwrap()
+                .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!({"page": 2})),
             "bookmark persisted after the terminal flush"
         );
@@ -7353,6 +7882,7 @@ mod cleanup_tests {
         };
         Pipeline::new(&source, &sink)
             .with_dlq(dlq)
+            .allow_dlq_all_duplicates(true)
             .run()
             .await
             .unwrap();

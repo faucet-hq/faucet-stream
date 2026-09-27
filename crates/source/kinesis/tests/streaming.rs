@@ -274,3 +274,31 @@ async fn max_messages_and_check_probe() {
         .expect("check");
     assert_eq!(report.failed_count(), 1, "missing stream fails the probe");
 }
+
+/// #733 — `lag()` reports `MillisBehindLatest` in seconds: probed per shard
+/// from the resume position before any read, and the value the reads of a
+/// run reported afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn lag_reports_millis_behind_latest() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "lagging", 2).await;
+    put_records(&client, "lagging", 0, 20).await;
+
+    let source = KinesisSource::new(source_config(&endpoint, "lagging"))
+        .await
+        .expect("source");
+    let probed = source.lag().await.expect("lag").expect("a reading");
+    assert!(probed.seconds.unwrap() >= 0.0, "{probed:?}");
+
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 25);
+    let mut n = 0;
+    while let Some(page) = pages.next().await {
+        n += page.expect("page").records.len();
+    }
+    drop(pages);
+    assert_eq!(n, 20);
+    let after = source.lag().await.expect("lag").expect("a reading");
+    assert!(after.seconds.unwrap() >= 0.0, "{after:?}");
+}

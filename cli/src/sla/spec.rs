@@ -42,6 +42,22 @@ pub struct SlaSpec {
     /// Requires a `state:` block to persist the rolling baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_anomaly: Option<VolumeAnomalySpec>,
+
+    /// Maximum source lag in bytes (unread Postgres WAL, MySQL binlog) before
+    /// the pipeline counts as behind. Checked against the lag the source
+    /// reports at the end of each run and by `faucet status --probe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lag_bytes: Option<u64>,
+
+    /// Maximum source lag in events (unconsumed Kafka messages, SQL Server
+    /// change rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lag_events: Option<u64>,
+
+    /// Maximum age, in seconds, of the oldest change the source has not yet
+    /// delivered (MongoDB, SQL Server, Kinesis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lag_seconds: Option<u64>,
 }
 
 /// How a run's record volume is flagged as anomalous against the rolling
@@ -96,10 +112,22 @@ impl SlaSpec {
         if self.max_staleness_secs.is_none()
             && self.min_rows_per_run.is_none()
             && self.volume_anomaly.is_none()
+            && !self.has_lag_checks()
         {
             return Err("declares no checks — set max_staleness_secs, \
-                 min_rows_per_run, or volume_anomaly"
+                 min_rows_per_run, volume_anomaly, or a max_lag_* threshold"
                 .into());
+        }
+        for (field, v) in [
+            ("max_lag_bytes", self.max_lag_bytes),
+            ("max_lag_events", self.max_lag_events),
+            ("max_lag_seconds", self.max_lag_seconds),
+        ] {
+            if v == Some(0) {
+                return Err(format!(
+                    "{field} must be at least 1 (omit the field to disable)"
+                ));
+            }
         }
         if self.max_staleness_secs == Some(0) {
             return Err("max_staleness_secs must be at least 1".into());
@@ -131,6 +159,13 @@ impl SlaSpec {
         Ok(())
     }
 
+    /// Whether any `max_lag_*` threshold is set.
+    pub fn has_lag_checks(&self) -> bool {
+        self.max_lag_bytes.is_some()
+            || self.max_lag_events.is_some()
+            || self.max_lag_seconds.is_some()
+    }
+
     /// Whether any configured check needs persisted history (a `state:` block).
     pub fn needs_state(&self) -> bool {
         self.max_staleness_secs.is_some() || self.volume_anomaly.is_some()
@@ -155,6 +190,9 @@ mod tests {
         SlaSpec {
             max_staleness_secs: Some(3600),
             min_rows_per_run: None,
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: None,
         }
     }
@@ -164,6 +202,9 @@ mod tests {
         let s = SlaSpec {
             max_staleness_secs: None,
             min_rows_per_run: None,
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: None,
         };
         let err = s.validate().unwrap_err();
@@ -187,6 +228,9 @@ mod tests {
             let s = SlaSpec {
                 max_staleness_secs: None,
                 min_rows_per_run: None,
+                max_lag_bytes: None,
+                max_lag_events: None,
+                max_lag_seconds: None,
                 volume_anomaly: Some(VolumeAnomalySpec {
                     method: AnomalyMethod::Zscore,
                     sensitivity: Some(bad),
@@ -206,6 +250,9 @@ mod tests {
         let s = SlaSpec {
             max_staleness_secs: None,
             min_rows_per_run: None,
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: Some(VolumeAnomalySpec {
                 method: AnomalyMethod::Iqr,
                 sensitivity: None,
@@ -218,6 +265,9 @@ mod tests {
         let s = SlaSpec {
             max_staleness_secs: None,
             min_rows_per_run: None,
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: Some(VolumeAnomalySpec {
                 method: AnomalyMethod::Iqr,
                 sensitivity: None,
@@ -257,6 +307,9 @@ mod tests {
         let rows_only = SlaSpec {
             max_staleness_secs: None,
             min_rows_per_run: Some(1),
+            max_lag_bytes: None,
+            max_lag_events: None,
+            max_lag_seconds: None,
             volume_anomaly: None,
         };
         assert!(!rows_only.needs_state());
@@ -280,5 +333,20 @@ mod tests {
     fn unknown_fields_are_rejected() {
         let r: Result<SlaSpec, _> = serde_yaml::from_str("max_staleness: 900\n");
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn lag_thresholds_alone_are_a_valid_sla() {
+        let lag_only: SlaSpec = serde_yaml::from_str("max_lag_bytes: 1048576\n").unwrap();
+        assert!(lag_only.has_lag_checks());
+        assert!(!lag_only.needs_state());
+        lag_only.validate().unwrap();
+        for field in ["max_lag_bytes", "max_lag_events", "max_lag_seconds"] {
+            let zero: SlaSpec = serde_yaml::from_str(&format!("{field}: 0\n")).unwrap();
+            let err = zero.validate().unwrap_err();
+            assert!(err.contains(field), "{err}");
+        }
+        let none: SlaSpec = serde_yaml::from_str("{}").unwrap();
+        assert!(none.validate().unwrap_err().contains("max_lag_*"));
     }
 }

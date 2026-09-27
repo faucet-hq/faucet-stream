@@ -59,3 +59,11 @@ dropped, un-flushed writer loses the buffered, uncommitted batch. The
 `faucet` pipeline flushes after every bookmark-carrying page.
 
 License: MIT OR Apache-2.0.
+
+## Batch atomicity
+
+What a failed write leaves behind (#737): **atomic**, unless `target_file_size` is set and `batch_size` splits a page (then **best-effort**) — a page is one Delta commit unless target_file_size commits part of a chunked page early. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).

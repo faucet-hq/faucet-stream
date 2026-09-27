@@ -144,7 +144,17 @@ async fn overwrite_abort_leaves_previous_data_intact() {
         .await
         .unwrap();
     // Simulate a mid-run failure/cancel: abort instead of commit.
+    assert_eq!(
+        sink.overwrite_staging_exists().await.unwrap(),
+        Some(true),
+        "the staging probe sees the in-flight staging"
+    );
     sink.abort_overwrite().await.unwrap();
+    assert_eq!(
+        sink.overwrite_staging_exists().await.unwrap(),
+        Some(false),
+        "the staging probe sees it gone after abort"
+    );
 
     // The prior destination is completely untouched.
     assert_eq!(names(&url, "users").await, vec!["old_a", "old_b"]);

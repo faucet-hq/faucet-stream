@@ -118,8 +118,13 @@ pub(crate) enum ShardEvent {
         shard_id: String,
         records: Vec<(String, Value)>,
     },
-    /// The shard is still open: requeue it after `delay`.
-    Yielded { lease: Lease, delay: Duration },
+    /// The shard is still open: requeue it after `delay`. `caught_up` when
+    /// its last `GetRecords` came back empty.
+    Yielded {
+        lease: Lease,
+        delay: Duration,
+        caught_up: bool,
+    },
     /// Closed shard fully drained.
     Done { shard_id: String },
     /// Unrecoverable failure.
@@ -166,6 +171,7 @@ pub(crate) async fn read_slice(
                 .send(ShardEvent::Yielded {
                     lease,
                     delay: Duration::ZERO,
+                    caught_up: false,
                 })
                 .await;
             return;
@@ -209,7 +215,13 @@ pub(crate) async fn read_slice(
                 lease.iterator = out.next_shard_iterator().map(str::to_string);
                 if empty && lease.iterator.is_some() {
                     let delay = config.poll_interval();
-                    let _ = tx.send(ShardEvent::Yielded { lease, delay }).await;
+                    let _ = tx
+                        .send(ShardEvent::Yielded {
+                            lease,
+                            delay,
+                            caught_up: true,
+                        })
+                        .await;
                     return;
                 }
             }
@@ -247,7 +259,13 @@ pub(crate) async fn read_slice(
                             .delay(lease.throttles)
                             .min(MAX_THROTTLE_BACKOFF);
                         lease.throttles = lease.throttles.saturating_add(1);
-                        let _ = tx.send(ShardEvent::Yielded { lease, delay }).await;
+                        let _ = tx
+                            .send(ShardEvent::Yielded {
+                                lease,
+                                delay,
+                                caught_up: false,
+                            })
+                            .await;
                         return;
                     }
                     ErrorClass::Transient if attempts < config.retry.max_retries => {
@@ -265,6 +283,55 @@ pub(crate) async fn read_slice(
                         return;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Peek one record at `start` without consuming anything: the creation time
+/// (ms) of the oldest unread record, or `None` when the shard has nothing
+/// to read. Throttled / transient failures retry per `config.retry`.
+pub(crate) async fn peek_oldest(
+    client: &StreamsClient,
+    config: &DynamoDbSourceConfig,
+    stream_arn: &str,
+    shard_id: &str,
+    start: &StartAt,
+) -> Result<Option<i64>, FaucetError> {
+    let iterator = match acquire_iterator(client, stream_arn, shard_id, start).await? {
+        IteratorOutcome::Ready(Some(it)) => it,
+        IteratorOutcome::Ready(None) => return Ok(None),
+        IteratorOutcome::Trimmed => return Err(gap_error(shard_id)),
+    };
+    let mut attempt = 0u32;
+    loop {
+        match client
+            .get_records()
+            .shard_iterator(&iterator)
+            .limit(1)
+            .send()
+            .await
+        {
+            Ok(out) => {
+                return Ok(out.records().first().and_then(|r| {
+                    r.dynamodb()
+                        .and_then(|sr| sr.approximate_creation_date_time())
+                        .and_then(|t| t.to_millis().ok())
+                }));
+            }
+            Err(e) => {
+                let (code, message) = sdk_error_parts(&e);
+                let retriable = matches!(
+                    classify_error(code.as_deref()),
+                    ErrorClass::Throttle | ErrorClass::Transient
+                );
+                if !retriable || attempt >= config.retry.max_retries {
+                    return Err(FaucetError::Source(format!(
+                        "dynamodb streams: lag probe GetRecords on {shard_id} failed: {message}"
+                    )));
+                }
+                tokio::time::sleep(config.retry.delay(attempt).min(MAX_THROTTLE_BACKOFF)).await;
+                attempt += 1;
             }
         }
     }
@@ -500,6 +567,115 @@ mod tests {
         on(&server, ITER, err(400, "AccessDeniedException"), 1).await;
         on(&server, RECORDS, err(400, "ExpiredIteratorException"), 1).await;
         assert!(failed(&run(&server, cfg()).await).contains("GetShardIterator"));
+    }
+
+    #[tokio::test]
+    async fn yields_flag_whether_the_shard_is_caught_up() {
+        let first_yield = |server: MockServer, config: DynamoDbSourceConfig| async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            read_slice(
+                streams(&server.uri()),
+                config,
+                "arn".into(),
+                Lease::new("s1", StartAt::Latest),
+                tx,
+            )
+            .await;
+            let mut flag = None;
+            while let Ok(ev) = rx.try_recv() {
+                if let ShardEvent::Yielded { caught_up, .. } = ev {
+                    flag = Some(caught_up);
+                }
+            }
+            flag
+        };
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(
+            &server,
+            RECORDS,
+            ok(json!({"Records": [], "NextShardIterator": "it"})),
+            1,
+        )
+        .await;
+        assert_eq!(first_yield(server, cfg()).await, Some(true));
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(&server, RECORDS, err(400, "LimitExceededException"), 1).await;
+        assert_eq!(first_yield(server, cfg()).await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn peek_reads_one_record_without_consuming() {
+        let c = |server: &MockServer| streams(&server.uri());
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(&server, RECORDS, err(400, "LimitExceededException"), 1).await;
+        let mut rec = record("5");
+        rec["dynamodb"]["ApproximateCreationDateTime"] = json!(1_000_000_000);
+        on(
+            &server,
+            RECORDS,
+            ok(json!({"Records": [rec], "NextShardIterator": "n"})),
+            1,
+        )
+        .await;
+        let at = StartAt::After("4".into());
+        assert_eq!(
+            peek_oldest(&c(&server), &cfg(), "arn", "s1", &at)
+                .await
+                .unwrap(),
+            Some(1_000_000_000_000)
+        );
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(
+            &server,
+            RECORDS,
+            ok(json!({"Records": [], "NextShardIterator": "n"})),
+            1,
+        )
+        .await;
+        assert_eq!(
+            peek_oldest(&c(&server), &cfg(), "arn", "s1", &at)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({})), 1).await;
+        assert_eq!(
+            peek_oldest(&c(&server), &cfg(), "arn", "s1", &at)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let server = MockServer::start().await;
+        on(&server, ITER, err(400, "TrimmedDataAccessException"), 1).await;
+        let e = peek_oldest(&c(&server), &cfg(), "arn", "s1", &at)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("trimmed"), "{e}");
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(&server, RECORDS, err(400, "AccessDeniedException"), 1).await;
+        let e = peek_oldest(&c(&server), &cfg(), "arn", "s1", &at)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("lag probe"), "{e}");
+
+        let server = MockServer::start().await;
+        on(&server, ITER, ok(json!({"ShardIterator": "it"})), 1).await;
+        on(&server, RECORDS, err(500, "InternalServerError"), 5).await;
+        let e = peek_oldest(&c(&server), &cfg(), "arn", "s1", &at)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("InternalServerError"), "{e}");
     }
 
     #[tokio::test]

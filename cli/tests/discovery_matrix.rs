@@ -14,6 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn opts() -> ExecuteOptions {
     ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: "disc_test".into(),
         run_id: None,
         execution: None,

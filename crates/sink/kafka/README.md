@@ -436,6 +436,14 @@ In a full pipeline, wire the sink into `faucet_core::Pipeline` (or `run_stream`)
 - [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the full pipeline-config grammar.
 - A complete working example: [`cli/examples/rest_to_kafka.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/rest_to_kafka.yaml).
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **best-effort** — each record is its own send. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

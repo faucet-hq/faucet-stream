@@ -51,13 +51,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "file-format-avro")]
+pub mod avro;
+pub mod container;
 #[cfg(feature = "file-format-csv")]
 pub mod csv;
 #[cfg(feature = "file-format-excel")]
 pub mod excel;
 pub mod json;
+#[cfg(feature = "file-format-orc")]
+pub mod orc;
 #[cfg(feature = "file-format-xml")]
 pub mod xml;
+
+pub use container::{ContainerDecoder, FileInput};
 
 /// How the bytes of one object are laid out.
 ///
@@ -84,6 +91,12 @@ pub enum FileFormat {
     Parquet,
     /// Unparsed text: one record per object, `{"text": "<whole body>"}`.
     RawText,
+    /// Apache Avro Object Container File. See [`AvroOptions`]. Read and
+    /// write; decodes to records or, with `arrow`, straight to Arrow batches.
+    Avro,
+    /// Apache ORC. See [`OrcOptions`]. **Read-only** — see the `orc` module
+    /// for why there is no writer.
+    Orc,
 }
 
 impl FileFormat {
@@ -98,6 +111,8 @@ impl FileFormat {
             Self::Xlsx => ".xlsx",
             Self::Parquet => ".parquet",
             Self::RawText => ".txt",
+            Self::Avro => ".avro",
+            Self::Orc => ".orc",
         }
     }
 
@@ -108,7 +123,50 @@ impl FileFormat {
     /// record boundary until it is parsed, a zip-container workbook has its
     /// directory at the end, and an XML document is a tree.
     pub fn requires_whole_object(self) -> bool {
-        matches!(self, Self::JsonArray | Self::Xml | Self::Xlsx)
+        matches!(self, Self::JsonArray | Self::Xml | Self::Xlsx | Self::Orc)
+    }
+
+    /// Whether the format is a self-describing binary container decoded by
+    /// [`ContainerDecoder`] (Avro, ORC) rather than by [`decode`] per object.
+    pub fn is_container(self) -> bool {
+        matches!(self, Self::Avro | Self::Orc)
+    }
+
+    /// Whether a sink can write this format through [`encode`].
+    pub fn is_writable(self) -> bool {
+        !matches!(self, Self::Orc | Self::Parquet)
+    }
+
+    /// The format a file name's extension names, looking through a trailing
+    /// compression suffix (`.gz`, `.gzip`, `.zst`, `.zstd`), so
+    /// `export.csv.gz` is CSV. `None` for an extension no format claims.
+    ///
+    /// `.json` is a JSON array (a lone object is one record); `.jsonl` and
+    /// `.ndjson` are JSON Lines; `.tsv` is not claimed, because its delimiter
+    /// is an option rather than a format.
+    pub fn from_path(path: &str) -> Option<Self> {
+        let name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(path)
+            .to_ascii_lowercase();
+        let stem = ["gz", "gzip", "zst", "zstd"]
+            .iter()
+            .find_map(|c| name.strip_suffix(&format!(".{c}")))
+            .unwrap_or(&name);
+        let ext = stem.rsplit_once('.')?.1;
+        Some(match ext {
+            "jsonl" | "ndjson" => Self::JsonLines,
+            "json" => Self::JsonArray,
+            "csv" => Self::Csv,
+            "xml" => Self::Xml,
+            "xlsx" => Self::Xlsx,
+            "parquet" => Self::Parquet,
+            "txt" => Self::RawText,
+            "avro" => Self::Avro,
+            "orc" => Self::Orc,
+            _ => return None,
+        })
     }
 
     /// The name used in config and error messages.
@@ -121,6 +179,8 @@ impl FileFormat {
             Self::Xlsx => "xlsx",
             Self::Parquet => "parquet",
             Self::RawText => "raw_text",
+            Self::Avro => "avro",
+            Self::Orc => "orc",
         }
     }
 }
@@ -226,6 +286,48 @@ impl Default for XmlOptions {
     }
 }
 
+/// Block compression for written files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AvroCodec {
+    /// Uncompressed blocks — the Avro default and the most portable.
+    #[default]
+    Null,
+    /// Raw deflate (RFC 1951), readable by every Avro implementation.
+    Deflate,
+    /// Snappy with the per-block CRC-32 the spec requires.
+    Snappy,
+    /// Zstandard.
+    Zstd,
+}
+
+/// Avro read/write options.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AvroOptions {
+    /// An Avro schema (the JSON form: an object, an array for a union, or a
+    /// primitive name). On a **source** it is the *reader* schema every file
+    /// is resolved against — projection, aliases, defaults for added fields.
+    /// On a **sink** it is the *writer* schema; without it the schema is
+    /// inferred from the records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    /// Block codec for written files: `null` (default), `deflate`, `snappy`,
+    /// `zstd`. Reading detects the codec from the file header.
+    #[serde(default)]
+    pub codec: AvroCodec,
+}
+
+/// ORC read options.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrcOptions {
+    /// Top-level columns to read, in file order. Default: every column. A
+    /// name the file does not have is an error, not an empty column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
+}
+
 /// The per-format option blocks, flattened into a connector's config so they
 /// appear at its top level (`csv: {...}`, `excel: {...}`, `xml: {...}`).
 ///
@@ -243,6 +345,12 @@ pub struct FormatOptions {
     /// Record framing, used when `format: xml`.
     #[serde(default)]
     pub xml: XmlOptions,
+    /// Reader / writer schema and codec, used when `format: avro`.
+    #[serde(default)]
+    pub avro: AvroOptions,
+    /// Column projection, used when `format: orc`.
+    #[serde(default)]
+    pub orc: OrcOptions,
 }
 
 /// Decode one object's bytes into records.
@@ -263,6 +371,8 @@ pub async fn decode(
         FileFormat::Xml => decode_xml(bytes, opts),
         FileFormat::Xlsx => decode_xlsx(bytes, opts),
         FileFormat::Parquet => Err(columnar_refusal("decode")),
+        FileFormat::Avro => decode_avro(bytes, opts),
+        FileFormat::Orc => decode_orc(bytes, opts),
     }
 }
 
@@ -280,6 +390,12 @@ pub fn encode(
         FileFormat::Xml => encode_xml(records, opts),
         FileFormat::Xlsx => encode_xlsx(records, opts),
         FileFormat::Parquet => Err(columnar_refusal("encode")),
+        FileFormat::Avro => encode_avro(records, opts),
+        FileFormat::Orc => Err(FaucetError::Config(
+            "`format: orc` is read-only — there is no ORC writer; write Parquet for a columnar \
+             output"
+                .into(),
+        )),
     }
 }
 
@@ -302,7 +418,9 @@ fn columnar_refusal(verb: &str) -> FaucetError {
     all(
         feature = "file-format-csv",
         feature = "file-format-xml",
-        feature = "file-format-excel"
+        feature = "file-format-excel",
+        feature = "file-format-avro",
+        feature = "file-format-orc"
     ),
     allow(dead_code)
 )]
@@ -374,6 +492,36 @@ fn encode_xlsx(_: &[Value], _: &FormatOptions) -> Result<Vec<u8>, FaucetError> {
     Err(missing_feature(FileFormat::Xlsx, "file-format-excel"))
 }
 
+#[cfg(feature = "file-format-avro")]
+fn decode_avro(bytes: &[u8], opts: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
+    avro::decode(bytes, &opts.avro)
+}
+
+#[cfg(not(feature = "file-format-avro"))]
+fn decode_avro(_: &[u8], _: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
+    Err(missing_feature(FileFormat::Avro, "file-format-avro"))
+}
+
+#[cfg(feature = "file-format-avro")]
+fn encode_avro(records: &[Value], opts: &FormatOptions) -> Result<Vec<u8>, FaucetError> {
+    avro::encode(records, &opts.avro)
+}
+
+#[cfg(not(feature = "file-format-avro"))]
+fn encode_avro(_: &[Value], _: &FormatOptions) -> Result<Vec<u8>, FaucetError> {
+    Err(missing_feature(FileFormat::Avro, "file-format-avro"))
+}
+
+#[cfg(feature = "file-format-orc")]
+fn decode_orc(bytes: &[u8], opts: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
+    orc::decode(bytes, &opts.orc)
+}
+
+#[cfg(not(feature = "file-format-orc"))]
+fn decode_orc(_: &[u8], _: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
+    Err(missing_feature(FileFormat::Orc, "file-format-orc"))
+}
+
 /// Field names across `records`, in first-seen order.
 ///
 /// A union rather than the first record's keys, so a later record carrying an
@@ -432,6 +580,8 @@ mod tests {
             (FileFormat::Xlsx, ".xlsx", "xlsx"),
             (FileFormat::Parquet, ".parquet", "parquet"),
             (FileFormat::RawText, ".txt", "raw_text"),
+            (FileFormat::Avro, ".avro", "avro"),
+            (FileFormat::Orc, ".orc", "orc"),
         ];
         for (f, ext, name) in all {
             assert_eq!(f.extension(), ext, "{f:?}");
@@ -474,7 +624,12 @@ mod tests {
 
     #[test]
     fn whole_object_formats_are_the_ones_without_a_record_boundary() {
-        for f in [FileFormat::JsonArray, FileFormat::Xml, FileFormat::Xlsx] {
+        for f in [
+            FileFormat::JsonArray,
+            FileFormat::Xml,
+            FileFormat::Xlsx,
+            FileFormat::Orc,
+        ] {
             assert!(f.requires_whole_object(), "{f:?}");
         }
         for f in [
@@ -482,9 +637,48 @@ mod tests {
             FileFormat::Csv,
             FileFormat::RawText,
             FileFormat::Parquet,
+            FileFormat::Avro,
         ] {
             assert!(!f.requires_whole_object(), "{f:?}");
         }
+    }
+
+    #[test]
+    fn extensions_resolve_through_compression_suffixes() {
+        let cases = [
+            ("a.jsonl", Some(FileFormat::JsonLines)),
+            ("dir/b.NDJSON", Some(FileFormat::JsonLines)),
+            ("c.json.gz", Some(FileFormat::JsonArray)),
+            ("d.csv.gz", Some(FileFormat::Csv)),
+            ("e.xml.zst", Some(FileFormat::Xml)),
+            ("f.xlsx", Some(FileFormat::Xlsx)),
+            ("g.parquet", Some(FileFormat::Parquet)),
+            ("h.txt", Some(FileFormat::RawText)),
+            ("i.avro", Some(FileFormat::Avro)),
+            ("j.orc", Some(FileFormat::Orc)),
+            ("k.csv.gzip", Some(FileFormat::Csv)),
+            ("l.jsonl.zstd", Some(FileFormat::JsonLines)),
+            ("m.tsv", None),
+            ("noext", None),
+            ("n.gz", None),
+        ];
+        for (path, want) in cases {
+            assert_eq!(FileFormat::from_path(path), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn container_and_writable_classification() {
+        assert!(FileFormat::Avro.is_container() && FileFormat::Orc.is_container());
+        assert!(!FileFormat::Csv.is_container());
+        assert!(FileFormat::Avro.is_writable());
+        assert!(!FileFormat::Orc.is_writable() && !FileFormat::Parquet.is_writable());
+    }
+
+    #[tokio::test]
+    async fn orc_is_refused_for_writing() {
+        let err = encode(&[], FileFormat::Orc, &FormatOptions::default()).expect_err("orc");
+        assert!(err.to_string().contains("read-only"), "{err}");
     }
 
     #[tokio::test]

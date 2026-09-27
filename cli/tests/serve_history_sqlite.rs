@@ -709,6 +709,7 @@ async fn membership_heartbeat_and_liveness() {
         listen: Some("127.0.0.1:8080".into()),
         max_concurrent: 4,
         in_flight: n,
+        state_format: faucet_core::state_version::STATE_FORMAT,
     };
     a.heartbeat_instance(&beat(1)).await.unwrap();
     b.heartbeat_instance(&beat(0)).await.unwrap();

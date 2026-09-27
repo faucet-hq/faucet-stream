@@ -1,7 +1,9 @@
 //! Exponential backoff retry executor with jitter.
 
-use faucet_core::FaucetError;
+use faucet_core::observability::{RoundtripRecorder, throttle_sleep};
+use faucet_core::{FaucetError, RetryClass};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Hard cap on *consecutive* `RateLimited` (HTTP 429) responses before the
@@ -24,6 +26,25 @@ const MAX_CONSECUTIVE_RATE_LIMITS: u32 = 10;
 pub async fn execute_with_retry<F, Fut, T>(
     max_retries: u32,
     base_backoff: Duration,
+    operation: F,
+) -> Result<T, FaucetError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, FaucetError>>,
+{
+    execute_with_retry_recorded(max_retries, base_backoff, None, operation).await
+}
+
+/// [`execute_with_retry`] that also reports throttling to the connector's
+/// round-trip recorder (#734): every rate-limited response as
+/// `faucet_source_throttled_total`, every retry by class as
+/// `faucet_source_retries_total`, and the time actually slept on a rate limit
+/// as `faucet_source_throttle_wait_seconds` (measured, not the `Retry-After`
+/// value; a sleep interrupted by the run being dropped records what elapsed).
+pub async fn execute_with_retry_recorded<F, Fut, T>(
+    max_retries: u32,
+    base_backoff: Duration,
+    recorder: Option<Arc<RoundtripRecorder>>,
     mut operation: F,
 ) -> Result<T, FaucetError>
 where
@@ -33,7 +54,13 @@ where
     let mut attempt = 0u32;
     let mut rate_limited = 0u32;
     loop {
-        match operation().await {
+        let outcome = operation().await;
+        let class = outcome.as_ref().err().and_then(faucet_core::classify);
+        let throttled = class == Some(RetryClass::RateLimited);
+        if throttled && let Some(r) = &recorder {
+            r.throttled();
+        }
+        match outcome {
             Ok(val) => return Ok(val),
             Err(FaucetError::RateLimited(wait)) => {
                 if rate_limited >= MAX_CONSECUTIVE_RATE_LIMITS {
@@ -44,7 +71,10 @@ where
                 tracing::warn!(
                     "rate limited; retrying after {wait:?} ({rate_limited}/{MAX_CONSECUTIVE_RATE_LIMITS})"
                 );
-                tokio::time::sleep(wait).await;
+                if let Some(r) = &recorder {
+                    r.retry(RetryClass::RateLimited);
+                }
+                throttle_sleep(recorder.clone(), wait, None).await;
                 // Rate-limited waits do not count as a `max_retries` attempt.
             }
             Err(e) if e.is_retriable() && attempt < max_retries => {
@@ -55,8 +85,15 @@ where
                     attempt + 1,
                     max_retries + 1
                 );
+                if let (Some(r), Some(c)) = (&recorder, class) {
+                    r.retry(c);
+                }
                 let wait = faucet_core::retry::backoff_with_jitter(base_backoff, attempt);
-                tokio::time::sleep(wait).await;
+                if throttled {
+                    throttle_sleep(recorder.clone(), wait, None).await;
+                } else {
+                    tokio::time::sleep(wait).await;
+                }
                 attempt += 1;
             }
             Err(e) => {
@@ -203,5 +240,73 @@ mod tests {
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             MAX_CONSECUTIVE_RATE_LIMITS + 1
         );
+    }
+
+    #[tokio::test]
+    async fn recorded_executor_meters_every_rate_limit_and_retry() {
+        use faucet_core::observability::RoundtripSide;
+        use faucet_core::usage::UsageMeter;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let meter = Arc::new(UsageMeter::new());
+        let rec = Arc::new(
+            RoundtripRecorder::new(RoundtripSide::Source, "p", "r", "rest")
+                .with_meter(meter.clone()),
+        );
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = calls.clone();
+        let result = execute_with_retry_recorded(
+            3,
+            Duration::from_millis(10),
+            Some(rec.clone()),
+            move || {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match n {
+                        0 => Err::<i32, _>(FaucetError::RateLimited(Duration::from_millis(30))),
+                        1 => Err(FaucetError::HttpStatus {
+                            status: 429,
+                            url: "u".into(),
+                            body: String::new(),
+                        }),
+                        2 => Err(FaucetError::HttpStatus {
+                            status: 502,
+                            url: "u".into(),
+                            body: String::new(),
+                        }),
+                        _ => Ok(1),
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 1);
+        let tally = rec.throttle_tally();
+        assert_eq!(
+            tally.throttled(),
+            2,
+            "a RateLimited error and a bare 429 both count"
+        );
+        assert!(
+            tally.wait() >= Duration::from_millis(30),
+            "{:?}",
+            tally.wait()
+        );
+        let usage = meter.snapshot();
+        assert_eq!(usage.throttled, 2);
+        assert_eq!(usage.source_retries["rate_limited"], 2);
+        assert_eq!(usage.source_retries["http_5xx"], 1);
+
+        let gave_up =
+            execute_with_retry_recorded(0, Duration::from_millis(1), Some(rec.clone()), || async {
+                Err::<i32, _>(FaucetError::HttpStatus {
+                    status: 429,
+                    url: "u".into(),
+                    body: String::new(),
+                })
+            })
+            .await;
+        assert!(gave_up.is_err());
+        assert_eq!(tally.throttled(), 3, "a final, unretried 429 still counts");
     }
 }

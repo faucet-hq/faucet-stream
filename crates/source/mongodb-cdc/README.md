@@ -434,6 +434,23 @@ This crate has no optional features of its own. From the umbrella / CLI it is ga
 - [`faucet-state-redis`](https://crates.io/crates/faucet-state-redis) / [`faucet-state-postgres`](https://crates.io/crates/faucet-state-postgres) — durable `StateStore` backends for resumeToken bookmarks.
 - [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc) / [`faucet-source-mysql-cdc`](https://crates.io/crates/faucet-source-mysql-cdc) — CDC sources for other databases.
 
+## Source lag
+
+`Source::lag` (#733) reports **seconds**: the cluster's `operationTime` minus the cluster time of the oldest change not yet delivered — near zero on an idle stream that has caught up. Before a run has read anything it opens one short-lived change stream after the stored resume token to find that change. The pipeline polls it on the first page, at most every
+15 s after, and when the run ends, exporting `faucet_source_lag_*{pipeline,row,connector}`;
+`faucet status --probe` and `faucet doctor` ask it from the stored bookmark,
+and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
+logged once and reported as no lag — it never fails a run.
+
+## Bookmark schema
+
+The stored bookmark is at **schema 1** (#736): `{ "resume_token": {…}, "invalidate": false }`,
+with `invalidate` always written. Schema 0 (releases before versioned state)
+omitted the flag when `false`; such a bookmark is migrated on the next run
+(`MongoCdcSource::migrate_state`, pure) or ahead of it with
+`faucet migrate --state`. A bookmark at a newer schema is refused rather than
+misread. See [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading.html).
+
 ## License
 
 Licensed under either of:

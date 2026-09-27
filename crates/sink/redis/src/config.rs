@@ -84,6 +84,13 @@ impl RedisSinkConfig {
     }
 }
 
+impl RedisSinkConfig {
+    /// What a failed batch write leaves behind (#737): pipelines are not MULTI/EXEC transactions.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +173,11 @@ mod tests {
         }"#;
         let config: RedisSinkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: RedisSinkConfig = serde_json::from_value(serde_json::json!({"url": "redis://localhost", "sink_type": {"type": "List", "key": "items"}})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

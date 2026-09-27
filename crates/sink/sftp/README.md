@@ -115,3 +115,31 @@ the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
+## Avro (#719)
+
+`format: avro` writes one Avro Object Container File per object, encoded
+against `avro.schema` or against a schema inferred from that object's records.
+Nullable and absent fields become `["null", T]`, mixed-type fields become
+`string`, and invalid names are sanitized (the original is kept in
+`faucet.name`). The block codec comes from `avro.codec`: `null` (default),
+`deflate`, `snappy` or `zstd`. With an explicit schema, logical types
+(`decimal`, `date`, `timestamp-*`, `uuid`, …) accept their string forms or
+epoch integers.
+
+```yaml
+format: avro
+file_extension: .avro
+avro:
+  codec: zstd
+```
+
+ORC is read-only, so there is no `orc` format here. Enable with
+`file-format-avro` (or `file-formats`).
+
+## Batch atomicity
+
+What a failed write leaves behind (#737): **best-effort** — each file is atomic, but one batch can span several files. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).

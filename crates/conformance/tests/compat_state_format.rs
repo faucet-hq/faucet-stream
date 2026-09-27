@@ -249,3 +249,102 @@ fn an_envelope_from_the_future_degrades_to_a_bare_bookmark_rather_than_panicking
     assert_eq!(seq, 42, "unknown sibling fields must not break the read");
     assert_eq!(bookmark.expect("bookmark")["page"], 7);
 }
+
+#[tokio::test]
+async fn a_state_export_written_by_a_release_still_imports_and_resumes() {
+    use faucet_core::StateStore;
+    use faucet_core::state::{MemoryStateStore, StateExport, import_namespace};
+
+    let export = StateExport::from_value(fixture("state-export-v1.json"))
+        .expect("a v1 export must stay readable");
+    assert_eq!(export.pipeline, "orders");
+    assert_eq!(export.keys.len(), 3);
+
+    let store = MemoryStateStore::new();
+    let report = import_namespace(&store, &export, false)
+        .await
+        .expect("import");
+    assert!(report.error.is_none(), "{report:?}");
+
+    // The exactly-once envelope lands byte-for-byte, so the resumed run keeps
+    // its committed sequence rather than restarting the watermark at zero.
+    let (bookmark, seq) = unwrap_state(&store.get("orders::orders").await.unwrap().unwrap());
+    assert_eq!(seq, 17);
+    assert_eq!(bookmark.unwrap()["lsn"], "0/3A00F128");
+    assert_eq!(
+        store.get("orders::customers").await.unwrap().unwrap()["updated_at"],
+        "2026-09-26T06:09:00Z"
+    );
+}
+
+#[test]
+fn a_state_export_from_a_future_release_is_refused_not_half_read() {
+    let mut doc = fixture("state-export-v1.json");
+    doc["version"] = serde_json::json!(2);
+    let err = faucet_core::StateExport::from_value(doc).unwrap_err();
+    assert!(err.to_string().contains("not supported"), "{err}");
+}
+
+// ── #736: the versioned envelope ────────────────────────────────────────────
+
+use faucet_core::state_version::{StoredState, resolve_with, wrap_versioned};
+
+#[test]
+fn a_versioned_envelope_written_by_a_release_still_resolves() {
+    let stored = fixture("state-envelope-v1.json");
+    let parsed = StoredState::parse(&stored);
+    assert_eq!(parsed.format, 1);
+    assert_eq!(parsed.owner.as_deref(), Some("rest"));
+    assert_eq!(parsed.schema, 0);
+    let resolved = resolve_with("p::r", &stored, "rest", 0, |_, d| Ok(d)).unwrap();
+    assert_eq!(resolved.data["page"], 7);
+    assert_eq!(resolved.migrated_from, None);
+    assert!(!resolved.legacy);
+    let (bookmark, seq) = unwrap_state(&stored);
+    assert_eq!(
+        (bookmark.unwrap()["page"].clone(), seq),
+        (Value::from(7), 0)
+    );
+}
+
+#[test]
+fn an_exactly_once_wrapper_inside_the_envelope_still_unwraps() {
+    let stored = fixture("eo-state-envelope-v1.json");
+    let (bookmark, seq) = unwrap_state(&stored);
+    assert_eq!(seq, 42);
+    assert_eq!(bookmark.unwrap()["last_lsn"], "0/16B3748");
+    let resolved = resolve_with("p::r", &stored, "postgres-cdc", 0, |_, d| Ok(d)).unwrap();
+    assert_eq!(unwrap_state(&resolved.data).1, 42);
+}
+
+#[test]
+fn a_scalar_bookmark_in_the_envelope_survives_unchanged() {
+    let stored = fixture("scalar-state-envelope-v1.json");
+    let resolved = resolve_with("p::r", &stored, "mssql", 0, |_, d| Ok(d)).unwrap();
+    assert_eq!(resolved.data, Value::from("2026-05-01T00:00:00Z"));
+}
+
+#[test]
+fn the_envelope_this_release_writes_still_matches_the_frozen_shape() {
+    let written = wrap_versioned(
+        "rest",
+        0,
+        &serde_json::json!({ "updated_at": "2026-05-01T00:00:00Z", "page": 7 }),
+    );
+    assert_eq!(written, fixture("state-envelope-v1.json"));
+}
+
+#[test]
+fn every_pre_envelope_fixture_still_resolves_as_a_legacy_bookmark() {
+    for name in [
+        "bare-bookmark-v1.json",
+        "bare-bookmark-scalar-v1.json",
+        "eo-envelope-v1.json",
+        "eo-envelope-null-bookmark-v1.json",
+    ] {
+        let resolved = resolve_with("p::r", &fixture(name), "rest", 0, |_, d| Ok(d))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(resolved.legacy, "{name}");
+        assert_eq!(resolved.data, fixture(name), "{name} is read as-is");
+    }
+}

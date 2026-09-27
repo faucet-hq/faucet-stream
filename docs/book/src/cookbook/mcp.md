@@ -74,11 +74,12 @@ even on a mutation-enabled server.
 | `scaffold_config` | no | A commented YAML skeleton for a source→sink pair. |
 | `validate_config` | no | Full load-time validation (matrix **or** topology). |
 | `preview` | no | Up to 100 sample records from the first source (source side only). |
-| `run_pipeline` | **yes** | Run an inline config. Pass `dry_run: true` to validate + preview only. |
+| `run_pipeline` | **yes** | Run an inline config. Pass `dry_run: true` to validate + preview only, and `selection` (`{select, only, skip, tags, status, include_parents}`) to run only some matrix rows. |
 | `list_templates` | no | Registered [pipeline templates](./templates.md) and the typed params each takes. |
 | `get_template` | no | One template: declared params, stored config body, and its release state (status, `stable` / `previous` / `newest`, channel pointers, launch log). |
+| `list_template_rows` | no | A template's selectable rows — a source template's streams (write resolution and guarantees against `sink` when given) or a pipeline's matrix rows — with status, tags, hierarchy, read/write facts, params used and the last run's state. With `selection`, also the `run_set` a run with it would execute, the ancestors it pulls in, and the rows it blocks. See [Running a subset of streams](./templates.md#running-a-subset-of-streams). |
 | `register_template` | **yes** | Register a template document as a new version — `kind: source-template`, `kind: sink-template`, or `kind: pipeline`. Inert by default — pass `launch: true` to make it live. |
-| `run_template` | **yes** | Run a template with given `params` / `env`, at a version or named channel (default `stable` — the launched version). A source template also takes `sink` (a registered sink template) + `sink_version`, and optionally `overlay` (a registered deployment id or an inline mapping) + `overlay_version`. `dry_run: true` materializes + validates only and reports the per-stream write-mode plan. |
+| `run_template` | **yes** | Run a template with given `params` / `env`, at a version or named channel (default `stable` — the launched version). A source template also takes `sink` (a registered sink template) + `sink_version`, and optionally `overlay` (a registered deployment id or an inline mapping) + `overlay_version`. `dry_run: true` materializes + validates only and reports the per-stream write-mode plan. `selection` runs a subset of the streams / rows (the dry run reports the `run_set`). |
 
 The four template tools appear **only when a registry is wired** — `faucet serve
 --mcp` uses its own `--history` backend; `faucet mcp` needs

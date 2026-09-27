@@ -472,11 +472,32 @@
       "description": "SFTP source; list/glob a remote dir, stream JSONL/JSON-array/raw-text"
     },
     {
+      "name": "file",
+      "kind": "source",
+      "verified": true,
+      "tier": "stable",
+      "description": "Local file source; path/dir/glob/URL, every file format incl. Avro/ORC/Parquet, incremental by mtime or name"
+    },
+    {
       "name": "sftp",
       "kind": "sink",
       "verified": true,
       "tier": "stable",
       "description": "SFTP sink; JSONL objects, atomic temp+rename upload"
+    },
+    {
+      "name": "file",
+      "kind": "sink",
+      "verified": true,
+      "tier": "stable",
+      "description": "Local file sink; JSONL/JSON/CSV/XML/Excel/Avro/Parquet by extension, rollover, atomic temp+rename, atomic overwrite"
+    },
+    {
+      "name": "singer",
+      "kind": "sink",
+      "verified": true,
+      "tier": "stable",
+      "description": "Singer target bridge (runs an external Singer target; bookmarks advance after the target confirms)"
     },
     {
       "name": "iceberg",
