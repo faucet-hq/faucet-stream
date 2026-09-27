@@ -3,11 +3,16 @@
 </p>
 
 <p align="center">
-  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg" alt="crates.io"></a>
-  <a href="https://docs.rs/faucet-stream"><img src="https://docs.rs/faucet-stream/badge.svg" alt="docs.rs"></a>
+  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg" alt="Crates.io"></a>
+  <a href="https://docs.rs/faucet-stream"><img src="https://docs.rs/faucet-stream/badge.svg" alt="Docs.rs"></a>
+  <a href="https://faucet-hq.github.io/faucet-stream/"><img src="https://img.shields.io/badge/guide-faucet--hq.github.io-1f6feb" alt="Guide"></a>
   <a href="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml"><img src="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://codecov.io/gh/faucet-hq/faucet-stream"><img src="https://codecov.io/gh/faucet-hq/faucet-stream/branch/main/graph/badge.svg" alt="coverage"></a>
-  <a href="#license"><img src="https://img.shields.io/crates/l/faucet-stream.svg" alt="MIT OR Apache-2.0"></a>
+  <a href="https://codecov.io/gh/faucet-hq/faucet-stream"><img src="https://codecov.io/gh/faucet-hq/faucet-stream/branch/main/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/d/faucet-core.svg" alt="Downloads"></a>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/crates/msrv/faucet-stream.svg" alt="MSRV"></a>
+  <a href="deny.toml"><img src="https://img.shields.io/badge/deps-cargo--deny-blue" alt="Dependencies"></a>
+  <a href="#license"><img src="https://img.shields.io/crates/l/faucet-stream.svg" alt="License"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep%20a%20changelog-orange" alt="Changelog"></a>
 </p>
 
 # faucet-stream
