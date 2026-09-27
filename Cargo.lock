@@ -5243,6 +5243,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-sink-file"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "csv",
+ "faucet-common-file",
+ "faucet-conformance",
+ "faucet-core",
+ "faucet-source-file",
+ "faucet-source-rest",
+ "flate2",
+ "parquet",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "faucet-sink-gcs"
 version = "1.3.1"
 dependencies = [

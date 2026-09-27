@@ -50,6 +50,7 @@ members = [
     "crates/source/csv",
     "crates/source/file",
     "crates/common/file",
+    "crates/sink/file",
     "crates/source/elasticsearch",
     "crates/source/parquet",
     "crates/source/postgres-cdc",
@@ -180,6 +181,7 @@ faucet-source-sqlite = { path = "crates/source/sqlite", version = "1" }
 faucet-source-csv = { path = "crates/source/csv", version = "1" }
 faucet-source-file = { path = "crates/source/file", version = "1" }
 faucet-common-file = { path = "crates/common/file", version = "1" }
+faucet-sink-file = { path = "crates/sink/file", version = "1" }
 faucet-source-elasticsearch = { path = "crates/source/elasticsearch", version = "1" }
 faucet-source-parquet = { path = "crates/source/parquet", version = "1" }
 faucet-source-bigquery = { path = "crates/source/bigquery", version = "1" }
