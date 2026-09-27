@@ -22,6 +22,11 @@ pipeline can be migrated one side at a time.
   crash re-sends the unconfirmed records — the Singer contract. Pair with a
   target that merges on `key_properties` (`write_mode: upsert`) to absorb the
   replay.
+- **Stopping on Windows.** On Unix the target gets `SIGTERM` and a grace period
+  before it is killed. Windows has no `SIGTERM`, so the target gets the same grace
+  period to exit on its own and is then terminated. `target_command` must be
+  something Windows can launch directly: an `.exe` (pip's console-script
+  launchers are) or a `.cmd`/`.bat` named with its extension.
 
 ## What the target receives
 

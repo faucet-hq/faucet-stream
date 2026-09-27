@@ -133,6 +133,14 @@ connector READMEs for full pipeline examples.
 > In the umbrella `faucet-stream` crate and the `faucet-cli`, this is enabled via the
 > `kafka-schema-registry` feature, which forwards to this crate's `schema-registry` feature.
 
+### Platform support
+
+librdkafka is built with TLS plus its built-in `PLAIN`, `SCRAM-SHA-256/512` and
+`OAUTHBEARER` mechanisms on every platform. On Unix it also links Cyrus SASL, so
+Kerberos (`sasl.mechanism: GSSAPI` through the connectors' `extra_client_config`)
+works there; Cyrus SASL does not build on Windows, so GSSAPI is unavailable in
+Windows builds.
+
 ---
 
 ## Troubleshooting / FAQ

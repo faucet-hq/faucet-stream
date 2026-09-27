@@ -5,8 +5,8 @@
 ### Prebuilt binaries (no Rust required)
 
 Every `faucet-cli` release ships prebuilt binaries for macOS (Apple Silicon +
-Intel) and Linux (x86_64 + aarch64), so you don't need a Rust toolchain to try
-it.
+Intel), Linux (x86_64 + aarch64) and Windows (x86_64), so you don't need a Rust
+toolchain to try it.
 
 **Homebrew (macOS / Linux):**
 
@@ -23,9 +23,21 @@ binary.)
 curl -LsSf https://github.com/faucet-hq/faucet-stream/releases/latest/download/faucet-cli-installer.sh | sh
 ```
 
+**PowerShell installer (Windows):**
+
+```powershell
+irm https://github.com/faucet-hq/faucet-stream/releases/latest/download/faucet-cli-installer.ps1 | iex
+```
+
+It installs `faucet.exe` into `%USERPROFILE%\.cargo\bin` and adds that
+directory to your user `PATH` (open a new terminal afterwards). Windows on ARM
+runs the x86_64 binary under Windows' built-in x64 emulation; there is no
+native `aarch64-pc-windows-msvc` build yet.
+
 **Direct download:** grab the archive for your platform from the latest
 [`faucet-cli` GitHub Release](https://github.com/faucet-hq/faucet-stream/releases?q=faucet-cli&expanded=true)
-(e.g. `faucet-cli-aarch64-apple-darwin.tar.xz`), verify it against the
+(e.g. `faucet-cli-aarch64-apple-darwin.tar.xz`, or
+`faucet-cli-x86_64-pc-windows-msvc.zip` on Windows), verify it against the
 published `.sha256` checksum, and put `faucet` on your `PATH`.
 
 The prebuilt binary includes the CLI **default** feature set (every first-party
@@ -37,6 +49,33 @@ needs a `serve-history-*` backend). Not included — build from source for these
 `serve-history-*` backends, and the Oracle connectors (`source-oracle`,
 `source-oracle-cdc`, `sink-oracle`), which need Oracle Instant Client at runtime
 (see [Oracle Instant Client](#oracle-instant-client)).
+
+### Windows notes
+
+Every connector in the prebuilt binary works on Windows, with these
+platform differences:
+
+- **Kafka:** `PLAIN`, `SCRAM-SHA-256/512`, `OAUTHBEARER` and TLS work. Kerberos
+  (`sasl.mechanism: GSSAPI` set through `extra_client_config`) is not available —
+  it needs Cyrus SASL, which does not build on Windows.
+- **Stopping long-running verbs:** `faucet serve`, `schedule`, `mirror` and
+  `backfill` drain gracefully on Ctrl-C, Ctrl-Break, closing the console window,
+  or a system shutdown (the Unix builds use `SIGTERM`). `faucet schedule`'s
+  `SIGHUP` hot reload is Unix-only; restart the scheduler to pick up a changed
+  config.
+- **Singer taps / targets:** the child process gets the same grace period to
+  exit, but Windows has no `SIGTERM`, so a tap that is still running when the
+  grace period ends is terminated. The temporary config/state files are
+  created in your per-user temp directory rather than with Unix `0600` mode.
+- **Paths:** write Windows paths as plain YAML scalars (`path: C:\data\in.csv`)
+  or with forward slashes; inside double quotes a backslash starts an escape.
+  State-store keys are percent-encoded on disk, so `::` in a key is safe.
+- **Template Hub cache:** remote hubs are cached under
+  `%LOCALAPPDATA%\faucet\hub` (override with `FAUCET_HUB_CACHE`).
+
+> **Windows SmartScreen:** the binaries are not code-signed yet, so the first
+> run of a downloaded `faucet.exe` may show a SmartScreen prompt ("More info" →
+> "Run anyway"). The PowerShell installer is not affected.
 
 > **macOS Gatekeeper:** the binaries are not currently notarized. If macOS
 > blocks the downloaded binary, clear the quarantine attribute:
@@ -117,6 +156,9 @@ You can also depend on individual connector crates directly
   current MSRV).
 - Some connectors link native libraries — the Kafka connectors build
   `librdkafka` and need `cmake` and a C toolchain available at compile time.
+- Building from source on Windows needs the MSVC build tools, CMake, Strawberry
+  Perl and [NASM](https://www.nasm.us/) on `PATH` (the vendored OpenSSL and
+  `aws-lc` assemble with it).
 
 ### Oracle Instant Client
 
