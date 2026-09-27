@@ -237,6 +237,17 @@ replication_bind:
   format: iso8601
 ```
 
+**Next-page links.** With `LinkHeader` / `NextLinkInBody` pagination the
+server's next-page URL is used as given: static `query_params`, query-target
+`replication_bind` values and query-target `window` bounds are sent on the first
+request only, because the link already carries them (Shopify rejects any filter
+next to `page_info`; a duplicated window bound can select the wrong window).
+Credentials are still sent on every page — an `ApiKeyQuery` key is appended
+unless the link already echoes it, and a flow provider's query placements are
+always re-applied. A server that does *not* echo its filter into the link
+degrades to over-fetching on page 2+, which the client-side incremental filter
+then trims — never to data loss. Header / body / path binds are unaffected.
+
 A POST-search API whose filter sits deep in the body (HubSpot CRM search) takes
 the bookmark through a JSON Pointer. The value is written after any
 `${parent.*}` substitution, on the first request and on every paginated one:

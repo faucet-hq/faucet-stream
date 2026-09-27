@@ -2215,16 +2215,26 @@ impl RestStream {
                 .collect();
             req = req.query(&pairs);
         }
-        // #513/#527 query-target bindings.
-        for b in &binds {
+        // #513/#527 query-target bindings — first requests only. A server-given
+        // next-page URL already carries the filter from the first request, so
+        // re-appending it duplicates (or, per window, contradicts) it and some
+        // APIs reject any extra filter next to their page token (#749). Auth
+        // placements (flow provider, ApiKeyQuery) are still sent on every page.
+        for b in binds.iter().filter(|_| !use_override) {
             if b.target == BindTarget::Query {
                 req = req.query(&[(b.name.as_str(), b.rendered.as_str())]);
             }
         }
 
         // ApiKeyQuery: inject the API key as a query parameter.
+        // A next-page link that already echoes the key keeps its single copy.
         if let AuthSpec::Inline(Auth::ApiKeyQuery { param, value }) = &self.config.auth {
-            req = req.query(&[(param.as_str(), value.as_str())]);
+            let echoed = use_override
+                && reqwest::Url::parse(&url)
+                    .is_ok_and(|u| u.query_pairs().any(|(k, _)| k == param.as_str()));
+            if !echoed {
+                req = req.query(&[(param.as_str(), value.as_str())]);
+            }
         }
 
         // Build the request JSON body, if any. Substitute context into body
