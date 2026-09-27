@@ -285,6 +285,13 @@ impl faucet_core::Source for BoundedSource {
     fn dataset_uri(&self) -> String {
         self.inner.dataset_uri()
     }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
 }
 
 /// Build a fresh `ExecuteOptions` for one unit run.
@@ -951,5 +958,14 @@ matrix:
         let mut pages = bounded.stream_pages(&ctx, 10);
         let page = pages.next().await.unwrap().unwrap();
         assert_eq!(page.records.len(), 3);
+        drop(pages);
+        bounded.set_roundtrip_recorder(std::sync::Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "fixture",
+            ),
+        ));
     }
 }
