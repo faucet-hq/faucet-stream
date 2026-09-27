@@ -232,6 +232,18 @@ impl RoundtripRecorder {
         }
     }
 
+    /// Count records whose incremental replication key was missing or `null`
+    /// (#747). Emits `faucet_source_replication_key_missing_total`.
+    pub fn replication_key_missing(&self, n: u64) {
+        if n > 0 {
+            counter!(
+                "faucet_source_replication_key_missing_total",
+                self.base.clone()
+            )
+            .increment(n);
+        }
+    }
+
     /// Count one round trip and record how long it took.
     pub fn record_timed(&self, op: &'static str, elapsed: Duration) {
         let labels = self.labels_for(op);
@@ -363,6 +375,10 @@ pub fn describe_roundtrip_metrics() {
         "Time a source actually slept because of one rate-limit response"
     );
     metrics::describe_counter!(
+        "faucet_source_replication_key_missing_total",
+        "Records an incremental source received without its replication key (kept, dropped or failed per on_missing_key)"
+    );
+    metrics::describe_counter!(
         "faucet_source_retries_total",
         "Retries a source made against its upstream backend, by retry class"
     );
@@ -489,6 +505,39 @@ mod tests {
             Some(2),
             "each poll counts — the poll loop's overhead is the whole signal: {counts:?}"
         );
+    }
+
+    #[test]
+    fn replication_key_missing_counts_through_the_slot() {
+        use crate::observability::decorator::source_tests::{LOCK, snapshotter};
+        use metrics_util::debugging::DebugValue;
+
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshotter();
+        let slot = RecorderSlot::new();
+        slot.replication_key_missing(4);
+        slot.install(Arc::new(RoundtripRecorder::new(
+            RoundtripSide::Source,
+            "pipe",
+            "rowK",
+            "rest",
+        )));
+        slot.replication_key_missing(0);
+        slot.replication_key_missing(3);
+        let total: u64 = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| {
+                k.key().name() == "faucet_source_replication_key_missing_total"
+                    && k.key().labels().any(|l| l.value() == "rowK")
+            })
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total, 3);
     }
 
     #[test]
@@ -717,6 +766,13 @@ impl RecorderSlot {
     pub fn record_timed(&self, op: &'static str, elapsed: Duration) {
         if let Some(r) = self.0.get() {
             r.record_timed(op, elapsed);
+        }
+    }
+
+    /// Count records missing their replication key when a recorder is installed.
+    pub fn replication_key_missing(&self, n: u64) {
+        if let Some(r) = self.0.get() {
+            r.replication_key_missing(n);
         }
     }
 

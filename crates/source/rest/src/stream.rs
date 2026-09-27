@@ -9,7 +9,8 @@ use crate::pagination::{PaginationState, PaginationStyle};
 use crate::retry;
 use async_trait::async_trait;
 use faucet_core::replication::{
-    BindTarget, ReplicationMethod, filter_incremental, max_replication_value, max_value,
+    BindTarget, OnMissingKey, ReplicationKey, ReplicationMethod, filter_incremental_path,
+    max_replication_value_path, max_value,
 };
 use faucet_core::schema;
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
@@ -75,6 +76,10 @@ pub struct RestStream {
     /// the config because the labels are only known at run time, and because
     /// the hook takes `&self`.
     roundtrips: std::sync::OnceLock<Arc<faucet_core::observability::RoundtripRecorder>>,
+    /// `config.replication_key`, compiled once (#747).
+    replication_key: Option<ReplicationKey>,
+    /// Set once the missing-key warning has been logged (once per instance).
+    missing_key_warned: std::sync::atomic::AtomicBool,
 }
 
 /// Default value of [`RestStreamConfig::max_retries`]. When the user leaves this
@@ -479,6 +484,11 @@ impl RestStream {
         // Static custom headers (#539): validated once here (also validated in
         // `config.validate()` above, so this cannot fail) and reused per request.
         let static_headers = crate::config::build_header_map(&config.headers)?;
+        let replication_key = config
+            .replication_key
+            .as_deref()
+            .map(ReplicationKey::parse)
+            .transpose()?;
         Ok(Self {
             config,
             client: builder.build()?,
@@ -492,7 +502,64 @@ impl RestStream {
             static_headers,
             metadata_xml_cache: tokio::sync::OnceCell::new(),
             roundtrips: std::sync::OnceLock::new(),
+            replication_key,
+            missing_key_warned: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Count (and warn once about) records that lacked the replication key.
+    fn note_missing_key(&self, missing: usize) {
+        if missing == 0 {
+            return;
+        }
+        if let Some(r) = self.roundtrips.get() {
+            r.replication_key_missing(missing as u64);
+        }
+        if !self
+            .missing_key_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let key = self.config.replication_key.as_deref().unwrap_or_default();
+            let action = match self.config.on_missing_key {
+                OnMissingKey::Drop => "dropped (on_missing_key: drop)",
+                _ => "kept to avoid silent data loss",
+            };
+            tracing::warn!(
+                key,
+                missing,
+                "incremental replication: {missing} record(s) lacked replication_key '{key}'; \
+                 {action} (further occurrences are counted in \
+                 faucet_source_replication_key_missing_total)"
+            );
+        }
+    }
+
+    /// Client-side incremental filter over one page (#747).
+    fn filter_incremental_page(
+        &self,
+        records: Vec<Value>,
+        start: &Value,
+    ) -> Result<Vec<Value>, FaucetError> {
+        let Some(key) = &self.replication_key else {
+            return Ok(records);
+        };
+        let out = filter_incremental_path(records, key, start, self.config.on_missing_key)?;
+        self.note_missing_key(out.missing);
+        Ok(out.records)
+    }
+
+    /// The page's max replication value. `count_missing` reports records
+    /// lacking the key when the filter did not already count them.
+    fn page_replication_max(&self, records: &[Value], count_missing: bool) -> Option<Value> {
+        let key = self.replication_key.as_ref()?;
+        if count_missing {
+            let missing = records
+                .iter()
+                .filter(|r| key.resolve(r).is_none_or(Value::is_null))
+                .count();
+            self.note_missing_key(missing);
+        }
+        max_replication_value_path(records, key).cloned()
     }
 
     /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set, the
@@ -628,12 +695,7 @@ impl RestStream {
     /// [`fetch_all`](Self::fetch_all) and the bookmark is `None`.
     pub async fn fetch_all_incremental(&self) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let records = self.fetch_all().await?;
-        let bookmark = self
-            .config
-            .replication_key
-            .as_deref()
-            .and_then(|key| max_replication_value(&records, key))
-            .cloned();
+        let bookmark = self.page_replication_max(&records, false);
         Ok((records, bookmark))
     }
 
@@ -1143,18 +1205,12 @@ impl RestStream {
                     // Client-side incremental filter. Skipped for windowed passes:
                     // the server already bounds each window, and filtering by the
                     // overall start would drop `lookback` rows that fall before it.
-                    let records = if !windowed
+                    let filtered = !windowed
                         && self.config.replication_method == ReplicationMethod::Incremental
-                    {
-                        if let (Some(key), Some(start)) =
-                            (&self.config.replication_key, effective_start.as_ref())
-                        {
-                            filter_incremental(raw_records, key, start)
-                        } else {
-                            raw_records
-                        }
-                    } else {
-                        raw_records
+                        && effective_start.is_some();
+                    let records = match effective_start.as_ref() {
+                        Some(start) if filtered => self.filter_incremental_page(raw_records, start)?,
+                        _ => raw_records,
                     };
 
                     // Track the running max replication value across pages so the
@@ -1175,11 +1231,7 @@ impl RestStream {
                             Some(path) => faucet_core::util::extract_records(&body, Some(path))
                                 .ok()
                                 .and_then(|vs| vs.into_iter().next()),
-                            None => self
-                                .config
-                                .replication_key
-                                .as_deref()
-                                .and_then(|key| max_replication_value(&records, key).cloned()),
+                            None => self.page_replication_max(&records, !filtered),
                         };
                         if let Some(page_max) = page_max {
                             running_max = Some(match running_max.take() {
@@ -2437,12 +2489,7 @@ impl faucet_core::Source for RestStream {
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let records = self.fetch_with_context(context).await?;
-        let bookmark = self
-            .config
-            .replication_key
-            .as_deref()
-            .and_then(|key| faucet_core::replication::max_replication_value(&records, key))
-            .cloned();
+        let bookmark = self.page_replication_max(&records, false);
         Ok((records, bookmark))
     }
 

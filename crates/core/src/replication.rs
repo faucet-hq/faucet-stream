@@ -19,32 +19,213 @@ pub enum ReplicationMethod {
     Incremental,
 }
 
-/// Filter `records` to only those where `record[key] > start`.
+/// What to do with a record whose replication key is missing or `null` (#747).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMissingKey {
+    /// Keep the record, count it, and warn (default): dropping it would be
+    /// silent data loss.
+    #[default]
+    Keep,
+    /// Drop the record (counted and warned, never silent).
+    Drop,
+    /// Fail the run.
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyForm {
+    TopLevel,
+    DotPath(Vec<String>),
+    Pointer,
+}
+
+/// A compiled replication key: a top-level field name, a dot path
+/// (`fields.updated`, numeric segments index arrays), or an RFC 6901 JSON
+/// Pointer (`/fields/updated`, for field names that contain a dot) (#747).
 ///
-/// Records missing the key are excluded. Strings compare lexicographically
-/// (ISO-8601 dates compare correctly this way); integers compare exactly
-/// (no `f64` precision loss); floats compare as `f64`.
+/// A dot path first tries the whole string as a literal top-level field, so a
+/// flat column literally named `Account.LastModifiedDate` (a CSV header) still
+/// resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationKey {
+    raw: String,
+    form: KeyForm,
+}
+
+impl ReplicationKey {
+    /// Parse a user-facing key (see the type docs for the accepted forms).
+    pub fn parse(raw: &str) -> Result<Self, FaucetError> {
+        if raw.trim().is_empty() {
+            return Err(FaucetError::Config(
+                "replication_key must not be empty".to_owned(),
+            ));
+        }
+        if raw.starts_with('/') {
+            return Ok(Self {
+                raw: raw.to_owned(),
+                form: KeyForm::Pointer,
+            });
+        }
+        if !raw.contains('.') {
+            return Ok(Self::top_level(raw));
+        }
+        let segments: Vec<String> = raw.split('.').map(str::to_owned).collect();
+        if segments.iter().any(String::is_empty) {
+            return Err(FaucetError::Config(format!(
+                "replication_key '{raw}': empty path segment (use the JSON Pointer form \
+                 `/a/b` for field names that contain dots)"
+            )));
+        }
+        Ok(Self {
+            raw: raw.to_owned(),
+            form: KeyForm::DotPath(segments),
+        })
+    }
+
+    /// A literal top-level field name, never interpreted as a path.
+    pub fn top_level(name: &str) -> Self {
+        Self {
+            raw: name.to_owned(),
+            form: KeyForm::TopLevel,
+        }
+    }
+
+    /// The key as configured.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Whether the key is a JSON Pointer (`/a/b`).
+    pub fn is_pointer(&self) -> bool {
+        self.form == KeyForm::Pointer
+    }
+
+    /// Whether the key addresses a nested value (dot path or pointer).
+    pub fn is_nested(&self) -> bool {
+        self.form != KeyForm::TopLevel
+    }
+
+    /// Resolve the key against one record.
+    pub fn resolve<'a>(&self, record: &'a Value) -> Option<&'a Value> {
+        match &self.form {
+            KeyForm::TopLevel => record.get(&self.raw),
+            KeyForm::Pointer => record.pointer(&self.raw),
+            KeyForm::DotPath(segments) => {
+                if let Some(v) = record.get(&self.raw) {
+                    return Some(v);
+                }
+                segments.iter().try_fold(record, |cur, seg| match cur {
+                    Value::Object(m) => m.get(seg),
+                    Value::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get(i)),
+                    _ => None,
+                })
+            }
+        }
+    }
+
+    fn resolve_present<'a>(&self, record: &'a Value) -> Option<&'a Value> {
+        self.resolve(record).filter(|v| !v.is_null())
+    }
+}
+
+/// The result of [`filter_incremental_path`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct IncrementalFilter {
+    /// Records to write.
+    pub records: Vec<Value>,
+    /// Records whose key was missing or `null` (kept or dropped per policy).
+    pub missing: usize,
+}
+
+/// Filter `records` to those where `key > start`, using a compiled key.
 ///
-/// If a record's key value is a *different JSON type* than `start` (e.g. a
-/// numeric key against a string bookmark), the comparison is not meaningful;
-/// rather than silently dropping the record — which is data loss (#78/#27) —
-/// it is **kept** and a warning is logged.
-pub fn filter_incremental(records: Vec<Value>, key: &str, start: &Value) -> Vec<Value> {
-    records
-        .into_iter()
-        .filter(|r| match r.get(key) {
-            None => false,
+/// A record whose key is missing or `null` is handled per `on_missing`
+/// (counted in [`IncrementalFilter::missing`] either way); a record whose key
+/// has a different JSON type than `start` is kept with a warning. Returns
+/// `Err` only for [`OnMissingKey::Fail`].
+pub fn filter_incremental_path(
+    records: Vec<Value>,
+    key: &ReplicationKey,
+    start: &Value,
+    on_missing: OnMissingKey,
+) -> Result<IncrementalFilter, FaucetError> {
+    let mut missing = 0usize;
+    let mut kept = Vec::with_capacity(records.len());
+    for r in records {
+        let keep = match key.resolve_present(&r) {
+            None => {
+                missing += 1;
+                match on_missing {
+                    OnMissingKey::Keep => true,
+                    OnMissingKey::Drop => false,
+                    OnMissingKey::Fail => {
+                        return Err(FaucetError::Source(format!(
+                            "incremental replication: a record lacks replication_key '{}' \
+                             (on_missing_key: fail)",
+                            key.as_str()
+                        )));
+                    }
+                }
+            }
             Some(v) if type_rank(v) != type_rank(start) => {
                 tracing::warn!(
-                    key,
+                    key = key.as_str(),
                     "incremental replication: record key type does not match the bookmark \
                      type; keeping the record to avoid silently dropping data"
                 );
                 true
             }
             Some(v) => json_gt(v, start),
-        })
-        .collect()
+        };
+        if keep {
+            kept.push(r);
+        }
+    }
+    Ok(IncrementalFilter {
+        records: kept,
+        missing,
+    })
+}
+
+/// Filter `records` to only those where `record[key] > start`.
+///
+/// `key` is a literal top-level field. Strings compare lexicographically
+/// (ISO-8601 dates compare correctly this way); integers compare exactly
+/// (no `f64` precision loss); floats compare as `f64`.
+///
+/// Records missing the key (or holding `null`) are **kept** and a warning is
+/// logged (#747): dropping them silently is data loss. Likewise a record whose
+/// key value is a *different JSON type* than `start` is kept (#78/#27).
+pub fn filter_incremental(records: Vec<Value>, key: &str, start: &Value) -> Vec<Value> {
+    let out = filter_incremental_path(
+        records,
+        &ReplicationKey::top_level(key),
+        start,
+        OnMissingKey::Keep,
+    )
+    .unwrap_or_default();
+    if out.missing > 0 {
+        tracing::warn!(
+            key,
+            missing = out.missing,
+            "incremental replication: {} record(s) lacked replication_key '{key}'; kept to \
+             avoid silent data loss",
+            out.missing
+        );
+    }
+    out.records
+}
+
+/// Return the maximum non-null value of `key` across all records, if any.
+pub fn max_replication_value_path<'a>(
+    records: &'a [Value],
+    key: &ReplicationKey,
+) -> Option<&'a Value> {
+    records
+        .iter()
+        .filter_map(|r| key.resolve_present(r))
+        .max_by(|a, b| json_compare(a, b))
 }
 
 /// Return the maximum value of `record[key]` across all records, if any.
@@ -359,15 +540,106 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_incremental_missing_key_excluded() {
+    fn test_filter_incremental_missing_key_kept() {
+        // #747: a record without the key used to be dropped silently.
         let records = vec![
             json!({"id": 1}),
             json!({"id": 2, "updated_at": "2024-12-01"}),
+            json!({"id": 3, "updated_at": null}),
         ];
         let start = json!("2024-01-01");
         let filtered = filter_incremental(records, "updated_at", &start);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0]["id"], 2);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn replication_key_parse_forms() {
+        assert!(!ReplicationKey::parse("updated").unwrap().is_nested());
+        let dot = ReplicationKey::parse("fields.updated").unwrap();
+        assert!(dot.is_nested() && !dot.is_pointer());
+        assert_eq!(dot.as_str(), "fields.updated");
+        let ptr = ReplicationKey::parse("/a.b/c").unwrap();
+        assert!(ptr.is_pointer() && ptr.is_nested());
+        assert!(ReplicationKey::parse(" ").is_err());
+        assert!(ReplicationKey::parse("a..b").is_err());
+        assert!(ReplicationKey::parse(".a").is_err());
+    }
+
+    #[test]
+    fn replication_key_resolves_nested_array_and_pointer() {
+        let r = json!({
+            "fields": {"updated": "2024-06-01"},
+            "items": [{"date": 1}, {"date": 2}],
+            "a.b": {"c": 7},
+            "x": 5
+        });
+        let k = |s: &str| ReplicationKey::parse(s).unwrap();
+        assert_eq!(k("fields.updated").resolve(&r), Some(&json!("2024-06-01")));
+        assert_eq!(k("items.1.date").resolve(&r), Some(&json!(2)));
+        assert_eq!(k("items.x.date").resolve(&r), None);
+        assert_eq!(k("items.9.date").resolve(&r), None);
+        assert_eq!(k("x.y").resolve(&r), None);
+        assert_eq!(k("/a.b/c").resolve(&r), Some(&json!(7)));
+        assert_eq!(k("x").resolve(&r), Some(&json!(5)));
+        let flat = json!({"Account.LastModifiedDate": "2024"});
+        assert_eq!(
+            k("Account.LastModifiedDate").resolve(&flat),
+            Some(&json!("2024"))
+        );
+        assert_eq!(
+            ReplicationKey::top_level("a.b").resolve(&r),
+            Some(&json!({"c": 7}))
+        );
+    }
+
+    #[test]
+    fn filter_incremental_path_nested_and_policies() {
+        let records = || {
+            vec![
+                json!({"id": 1, "fields": {"updated": "2024-01-01"}}),
+                json!({"id": 2, "fields": {"updated": "2024-12-01"}}),
+                json!({"id": 3, "fields": {}}),
+                json!({"id": 4, "fields": {"updated": 5}}),
+            ]
+        };
+        let key = ReplicationKey::parse("fields.updated").unwrap();
+        let start = json!("2024-06-01");
+        let keep = filter_incremental_path(records(), &key, &start, OnMissingKey::Keep).unwrap();
+        let ids: Vec<i64> = keep
+            .records
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4]);
+        assert_eq!(keep.missing, 1);
+        let drop = filter_incremental_path(records(), &key, &start, OnMissingKey::Drop).unwrap();
+        assert_eq!(drop.records.len(), 2);
+        assert_eq!(drop.missing, 1);
+        let err = filter_incremental_path(records(), &key, &start, OnMissingKey::Fail).unwrap_err();
+        assert!(err.to_string().contains("fields.updated"), "{err}");
+    }
+
+    #[test]
+    fn max_replication_value_path_skips_missing_and_null() {
+        let key = ReplicationKey::parse("fields.updated").unwrap();
+        let records = vec![
+            json!({"fields": {"updated": "2024-01-01"}}),
+            json!({"fields": {"updated": null}}),
+            json!({"fields": {"updated": "2024-12-01"}}),
+            json!({}),
+        ];
+        assert_eq!(
+            max_replication_value_path(&records, &key),
+            Some(&json!("2024-12-01"))
+        );
+        assert!(max_replication_value_path(&records[1..2], &key).is_none());
+    }
+
+    #[test]
+    fn on_missing_key_serde() {
+        assert_eq!(OnMissingKey::default(), OnMissingKey::Keep);
+        let v: OnMissingKey = serde_json::from_value(json!("fail")).unwrap();
+        assert_eq!(v, OnMissingKey::Fail);
     }
 
     #[test]

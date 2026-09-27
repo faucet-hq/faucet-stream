@@ -3,7 +3,7 @@
 use crate::auth::Auth;
 use crate::pagination::PaginationStyle;
 use faucet_core::AuthSpec;
-use faucet_core::{ReplicationBind, ReplicationMethod};
+use faucet_core::{OnMissingKey, ReplicationBind, ReplicationKey, ReplicationMethod};
 use reqwest::{
     Method,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -210,9 +210,19 @@ pub struct RestStreamConfig {
     /// bookmark so the next run resumes.
     #[serde(default = "default_replication_method")]
     pub replication_method: ReplicationMethod,
-    /// Field name (not a JSONPath) used for incremental replication bookmarking.
+    /// Field used for incremental replication bookmarking: a top-level field
+    /// name (`updated_at`), a dot path into nested objects (`fields.updated`;
+    /// numeric segments index arrays, and a literal top-level field of that
+    /// exact name wins), or a JSON Pointer (`/fields/updated`) for field names
+    /// that contain dots. Not a JSONPath: it must resolve to one value.
     #[serde(default)]
     pub replication_key: Option<String>,
+    /// What to do with a record whose `replication_key` is missing or `null`
+    /// once a start bookmark exists: `keep` (default — kept, counted in
+    /// `faucet_source_replication_key_missing_total`, warned once per run),
+    /// `drop` (counted and warned), or `fail` the run.
+    #[serde(default)]
+    pub on_missing_key: OnMissingKey,
     /// Bookmark value: records where `record[replication_key] <= start_replication_value`
     /// are filtered out when `replication_method` is `Incremental`.
     #[serde(default)]
@@ -711,6 +721,7 @@ impl Default for RestStreamConfig {
             replication_method: ReplicationMethod::FullTable,
             replication_key: None,
             start_replication_value: None,
+            on_missing_key: OnMissingKey::Keep,
             state_key: None,
             name: None,
             primary_keys: Vec::new(),
@@ -756,6 +767,10 @@ impl RestStreamConfig {
         // Static custom headers: reject an invalid header name/value at load
         // time rather than panicking on the first request (#539).
         build_header_map(&self.headers)?;
+        if let Some(key) = &self.replication_key {
+            ReplicationKey::parse(key)
+                .map_err(|e| faucet_core::FaucetError::Config(format!("rest: {e}")))?;
+        }
         if !matches!(self.response_format, ResponseFormat::Json) {
             if !matches!(self.pagination, PaginationStyle::None) {
                 return Err(faucet_core::FaucetError::Config(
@@ -832,6 +847,18 @@ impl RestStreamConfig {
                     return Err(faucet_core::FaucetError::Config(
                         "rest: `replication_method: incremental` with `async_job` requires \
                          `replication_key` (the field the submit query is filtered on)"
+                            .into(),
+                    ));
+                }
+                if self
+                    .replication_key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with('/'))
+                {
+                    return Err(faucet_core::FaucetError::Config(
+                        "rest: `replication_method: incremental` with `async_job` injects \
+                         `replication_key` verbatim into the submit query, so it must be a field \
+                         name or a dotted relationship path, not a JSON Pointer"
                             .into(),
                     ));
                 }

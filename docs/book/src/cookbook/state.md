@@ -7,7 +7,7 @@ a **state store** to persist the bookmark between runs.
 ## Replication methods
 
 - `FullTable` — fetch everything every run.
-- `Incremental` — track a high-water mark on a `cursor_field` (e.g. `updated_at`,
+- `Incremental` — track a high-water mark on a `replication_key` (e.g. `updated_at`,
   an auto-increment id) and only emit records past the last seen value.
 
 ```yaml
@@ -17,9 +17,40 @@ source:
     # …
     replication_method:
       type: Incremental
-      cursor_field: updated_at
-    primary_keys: [id]
+    replication_key: updated_at
 ```
+
+### Nested replication keys
+
+Many APIs put the cursor inside a nested object (Jira `fields.updated`, GitHub
+`commit.committer.date`, Google Ads `segments.date`). `replication_key` accepts
+three forms:
+
+| Form | Example | Resolves |
+|------|---------|----------|
+| Field name | `updated_at` | a top-level field |
+| Dot path | `fields.updated`, `items.0.date` | nested objects; numeric segments index arrays. A top-level field literally named `fields.updated` still wins, so flat CSV columns such as `Account.LastModifiedDate` keep working |
+| JSON Pointer | `/fields/updated`, `/a.b/c` | RFC 6901, for field names that themselves contain dots |
+
+The key must resolve to a single value; it is not a JSONPath. It is resolved on
+the raw records, before transforms run, so no `flatten` is needed.
+
+### Records without the key
+
+A record whose key is missing or `null` is **kept** by default — dropping it
+would be silent data loss. Each one is counted in
+`faucet_source_replication_key_missing_total{pipeline,row,connector}` and the
+source logs one warning per run. Choose explicitly with `on_missing_key`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `keep` (default) | Write the record; counted and warned |
+| `drop` | Skip the record; counted and warned |
+| `fail` | Fail the run |
+
+When every record on a run lacks the key, the bookmark does not advance (and the
+warning fires), so a misspelled key shows up immediately instead of as an empty
+incremental run.
 
 ## State stores
 

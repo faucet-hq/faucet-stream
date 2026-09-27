@@ -204,7 +204,8 @@ Because the REST source keeps its own `429`/`Retry-After`-aware retry runner, it
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `replication_method` | `{ type: FullTable \| Incremental }` | `FullTable` | `FullTable` fetches all records; `Incremental` filters by bookmark. |
-| `replication_key` | string / null | `null` | Record **field name** (not a JSONPath) used for incremental bookmarking. |
+| `replication_key` | string / null | `null` | Field used for incremental bookmarking: a top-level name (`updated_at`), a dot path into nested objects (`fields.updated`, `items.0.date` — a literal top-level field of that exact name wins), or a JSON Pointer (`/fields/updated`) for names containing dots. Not a JSONPath. With `async_job`, it is injected into the submit query verbatim, so use a field name or a dotted relationship path there. |
+| `on_missing_key` | `keep \| drop \| fail` | `keep` | A record whose key is missing or `null` is kept (default), dropped, or fails the run. Kept and dropped records are counted in `faucet_source_replication_key_missing_total` and warned about once per run — never dropped silently. |
 | `start_replication_value` | JSON / null | `null` | Bookmark value; records where `record[replication_key] <= start_replication_value` are filtered out in `Incremental` mode. |
 | `state_key` | string / null | `null` | Stable key used by `Pipeline::with_state_store` to persist this stream's bookmark across runs. See [Resume & state](#resume--state). |
 

@@ -173,8 +173,8 @@ pub use profiling::{
     ProfilingSpec, RunProfile, detect_drift,
 };
 pub use replication::{
-    BindFormat, BindTarget, ReplicationBind, ReplicationMethod, format_bookmark, format_instant,
-    json_gt, parse_instant,
+    BindFormat, BindTarget, IncrementalFilter, OnMissingKey, ReplicationBind, ReplicationKey,
+    ReplicationMethod, format_bookmark, format_instant, json_gt, parse_instant,
 };
 pub use resilience::{
     BackoffKind, CircuitBreaker, CircuitBreakerConfig, PoisonAction, PoisonPolicy,

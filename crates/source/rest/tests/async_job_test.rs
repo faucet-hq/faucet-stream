@@ -567,6 +567,17 @@ fn incremental_async_job_without_query_is_rejected_at_validate() {
     assert!(cfg.validate().is_ok());
 }
 
+/// A JSON Pointer key cannot be injected into the submit query (#747).
+#[test]
+fn incremental_async_job_rejects_a_pointer_key() {
+    let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+    cfg.async_job = Some(bulk_job());
+    cfg.replication_method = faucet_core::ReplicationMethod::Incremental;
+    cfg.replication_key = Some("/Account/SystemModstamp".into());
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("not a JSON Pointer"), "{err}");
+}
+
 /// `replication_bind` and `async_job` are mutually exclusive — the async-job
 /// path pushes the bookmark down via the submit query, not a request bind, and
 /// a silently-ignored bind would look configured while doing nothing.
