@@ -235,6 +235,7 @@ pub async fn submit_backfill(
             reason: None,
             budget: None,
             approved_change: None,
+            selection: None,
         };
         match runner::submit(state.clone(), submit, actor.clone()).await {
             Ok(resp) => {

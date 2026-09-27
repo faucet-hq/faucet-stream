@@ -56,6 +56,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         replay_of: None,
         callback: None,
         tenant: None,
+        selection: None,
     }
 }
 

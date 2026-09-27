@@ -352,6 +352,7 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::POST, "/v1/templates"),
         (Method::GET, "/v1/templates"),
         (Method::GET, "/v1/templates/{id}"),
+        (Method::GET, "/v1/templates/{id}/rows"),
         (Method::DELETE, "/v1/templates/{id}"),
         (Method::POST, "/v1/templates/{id}/runs"),
         (Method::POST, "/v1/templates/{id}/tags"),

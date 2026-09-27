@@ -91,6 +91,7 @@ const ROUTES_TEMPLATES: &[(&str, &str)] = &[
     ("GET", "/v1/templates/{id}"),
     ("DELETE", "/v1/templates/{id}"),
     ("POST", "/v1/templates/{id}/runs"),
+    ("GET", "/v1/templates/{id}/rows"),
     ("POST", "/v1/templates/{id}/tags"),
     ("POST", "/v1/templates/{id}/launch"),
     ("POST", "/v1/templates/{id}/rollback"),

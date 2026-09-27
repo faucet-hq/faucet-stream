@@ -321,6 +321,14 @@ fn install_tracing(_level: &str, _format: crate::cli::LogFormat) {}
 /// performs — callers can wire their own `metrics` recorder / tracing
 /// subscriber before calling this function (or not at all).
 pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
+    run_from_yaml_str_selected(yaml, None).await
+}
+
+/// [`run_from_yaml_str`] over a subset of the config's matrix rows (#741).
+pub async fn run_from_yaml_str_selected(
+    yaml: &str,
+    selection: Option<&select::SelectionRequest>,
+) -> CliResult<executor::RunSummary> {
     // Parse first, then resolve ${env}/${file}/${secret} INTO the parsed tree
     // (post-parse) so a resolved value can never alter the document's structure
     // (F43) — mirroring the binary's `from_path` path.
@@ -365,6 +373,10 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
         None => None,
     };
     let nodes = expand::expand(&cfg)?;
+    let nodes = match selection {
+        Some(sel) => sel.apply(&cfg, nodes)?,
+        None => nodes,
+    };
     executor::run_expanded(
         nodes,
         executor::ExecuteOptions {

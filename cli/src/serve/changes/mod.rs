@@ -336,6 +336,16 @@ pub fn material_of_rows(rows: &[Value]) -> String {
     sha_hex(&serde_json::to_string(&parts).unwrap_or_default())
 }
 
+/// The material fingerprint of a run: its rows, plus the selection that
+/// chose them (#741) — a different subset is a different change even when the
+/// rows it keeps are unchanged.
+pub fn run_material(rows: &[Value], selection: Option<&str>) -> String {
+    match selection {
+        None => material_of_rows(rows),
+        Some(sel) => sha_hex(&format!("{}\nselection={sel}", material_of_rows(rows))),
+    }
+}
+
 /// Which row-level facts differ between two plans (for the invalidation
 /// message). Empty when nothing material moved.
 pub fn material_diff(before: &[Value], after: &[Value]) -> Vec<String> {
@@ -391,7 +401,14 @@ async fn plan_run(
     req: &SubmitRequest,
 ) -> Result<ChangePlan, ServeError> {
     let format: crate::serve::load::ConfigFormat = req.config_format.into();
-    let loaded = runner::load_for(state, &req.config, format, actor.tenant.as_deref()).await?;
+    let loaded = runner::load_selected(
+        state,
+        &req.config,
+        format,
+        actor.tenant.as_deref(),
+        req.selection.as_ref(),
+    )
+    .await?;
     runner::policy_gate(state, actor, &loaded).await?;
     let auth = loaded
         .auth_catalog()
@@ -434,11 +451,13 @@ async fn plan_run(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
+    let selection = req.selection.as_ref().map(|s| s.canonical());
     Ok(ChangePlan {
-        material: material_of_rows(&rows),
+        material: run_material(&rows, selection.as_deref()),
         summary: json!({
             "pipeline": loaded.cfg.name,
             "rows": rows.len(),
+            "selection": selection,
             "sinks": sinks,
             "delivery": loaded.cfg.delivery,
             "budget": loaded.cfg.budget,

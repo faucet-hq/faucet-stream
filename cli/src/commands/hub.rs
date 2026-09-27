@@ -16,6 +16,7 @@ pub async fn run(args: HubArgs) -> CliResult<()> {
         HubCommand::List(a) => list(a).await,
         HubCommand::Matrix(a) => matrix(a).await,
         HubCommand::Lint(a) => lint(a).await,
+        HubCommand::Rows(a) => rows(a).await,
     }
 }
 
@@ -729,5 +730,75 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(!err.is_empty());
+    }
+}
+
+/// `faucet hub rows <source> [--sink Y]` — a catalog source template's
+/// streams, or a pipeline file's matrix rows, with their metadata (#741).
+async fn rows(a: crate::cli::HubRowsArgs) -> CliResult<()> {
+    let selection = crate::select::SelectionRequest::from_flags(&a.selection)?;
+    let opts = |state| hub::rows::ListOptions {
+        selection: selection.as_ref(),
+        state,
+        history: Default::default(),
+    };
+    let as_path = std::path::Path::new(&a.source);
+    let is_pipeline = as_path.is_file()
+        && !matches!(
+            hub::detect_kind_in_file(as_path),
+            Some(hub::spec::TemplateKind::SourceTemplate)
+        );
+    let report = if is_pipeline {
+        if a.sink.is_some() {
+            return Err(CliError::Config(format!(
+                "'{}' is a pipeline config — it takes no sink",
+                a.source
+            )));
+        }
+        let text = std::fs::read_to_string(as_path)
+            .map_err(|e| CliError::Config(format!("reading {}: {e}", as_path.display())))?;
+        let doc: serde_json::Value = serde_yaml::from_str(&text)
+            .map_err(|e| CliError::Config(format!("parsing {}: {e}", as_path.display())))?;
+        let name = as_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("pipeline")
+            .to_string();
+        hub::rows::list_pipeline(&doc, &name, opts(a.state)).await?
+    } else {
+        let sides = hub::resolve_sides(
+            &a.hub,
+            a.source_hub.as_deref(),
+            a.sink_hub.as_deref(),
+            a.overlay_hub.as_deref(),
+        )
+        .await?;
+        let (source_file, _) =
+            hub::locate_in(&a.source, &sides.source, hub::catalog::SOURCE_DIR).await?;
+        let src = hub::parse_source_file(&source_file)?;
+        let sink = match &a.sink {
+            Some(k) => {
+                let (f, _) = hub::locate_in(k, &sides.sink, hub::catalog::SINK_DIR).await?;
+                Some(hub::parse_sink_file(&f)?)
+            }
+            None => None,
+        };
+        let overlay = match &a.overlay {
+            Some(o) => {
+                let (f, _) = hub::locate_in(o, &sides.overlay, hub::DEPLOYMENT_DIR).await?;
+                Some(hub::parse_deployment_file(&f)?)
+            }
+            None => None,
+        };
+        hub::rows::list_source(&src, sink.as_ref(), overlay.as_ref(), opts(a.state)).await?
+    };
+    if a.json {
+        println!("{}", pretty(&report)?);
+    } else {
+        print!("{}", hub::rows::render_human(&report));
+    }
+    match &report.error {
+        Some(e) => Err(CliError::Config(e.clone())),
+        None => Ok(()),
     }
 }

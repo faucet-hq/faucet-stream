@@ -30,6 +30,7 @@ pub async fn run(args: TemplateArgs) -> CliResult<()> {
         TemplateCommand::Promote(a) => promote(a).await,
         TemplateCommand::Delete(a) => delete(a).await,
         TemplateCommand::Run(a) => run_template(a).await,
+        TemplateCommand::Rows(a) => rows(a).await,
         TemplateCommand::Test(a) => test_suite(a).await,
         #[cfg(feature = "templates-sync")]
         TemplateCommand::Sync(a) => sync(a).await,
@@ -641,7 +642,8 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         version: VersionSelector::parse(&args.sink_version)?,
         overlay: overlay_choice(args.overlay.as_deref(), &args.overlay_version)?,
     };
-    let materialized = crate::templates::materialize_for_run(
+    let selection = crate::select::SelectionRequest::from_flags(&args.selection)?;
+    let materialized = crate::templates::materialize_for_run_selected(
         &store,
         &args.id,
         want,
@@ -650,6 +652,7 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         &env,
         // `faucet template run` executes locally; nothing is persisted.
         crate::templates::Materialize::Local,
+        selection.as_ref(),
     )
     .await?;
 
@@ -694,12 +697,58 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         dry_run: args.dry_run,
         limit: args.limit,
         no_env_file: true,
+        selection: materialized
+            .selection
+            .as_ref()
+            .map(crate::select::SelectionRequest::to_args)
+            .unwrap_or_default(),
         ..Default::default()
     };
     // Boxed: `execute` is a large future, and every command that awaits it by
     // value would otherwise carry the whole state machine in its own frame
     // (a debug-build `#[tokio::test]` overflowed its 2 MiB stack that way).
     Box::pin(crate::commands::run::execute(cfg, run_args, None)).await
+}
+
+/// `faucet template rows <id>` — the template's selectable rows (#741).
+async fn rows(args: crate::cli::TemplateRowsArgs) -> CliResult<()> {
+    let store = connect(&args.common).await?;
+    let version =
+        crate::templates::resolve_version(&store, &args.id, VersionSelector::parse(&args.version)?)
+            .await?;
+    let sink_version = match &args.sink {
+        Some(sid) => Some(
+            crate::templates::resolve_version(
+                &store,
+                sid,
+                VersionSelector::parse(&args.sink_version)?,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let selection = crate::select::SelectionRequest::from_flags(&args.selection)?;
+    let report = crate::templates::rows::list_rows(
+        &store,
+        crate::templates::rows::RowsQuery {
+            id: &args.id,
+            version,
+            sink: args.sink.as_deref().zip(sink_version),
+            overlay: overlay_choice(args.overlay.as_deref(), &args.overlay_version)?,
+            selection: selection.as_ref(),
+            state: !args.no_state,
+        },
+    )
+    .await?;
+    if args.common.json {
+        println!("{}", to_pretty(&report)?);
+    } else {
+        print!("{}", crate::hub::rows::render_human(&report));
+    }
+    match &report.error {
+        Some(e) => Err(CliError::Config(e.clone())),
+        None => Ok(()),
+    }
 }
 
 /// `faucet template test` — run a suite across a template's parameter space
@@ -906,6 +955,7 @@ pipeline:
             param_env: vec![],
             dry_run: true,
             limit: None,
+            selection: Default::default(),
             common: common("memory", false),
         };
         let f = run_template(args);
@@ -1009,6 +1059,7 @@ pipeline:
             param_env: vec![],
             dry_run,
             limit: None,
+            selection: Default::default(),
             common: common(&store, false),
         };
         let err = run_template(run_args(None, true))
@@ -1199,6 +1250,7 @@ pipeline:
             param_env: vec![],
             dry_run: true,
             limit: None,
+            selection: Default::default(),
             common: common(&store, false),
         })
         .await
@@ -1225,6 +1277,7 @@ pipeline:
             param_env: vec![],
             dry_run: false,
             limit: None,
+            selection: Default::default(),
             common: common(&store, false),
         })
         .await

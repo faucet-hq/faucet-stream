@@ -129,6 +129,193 @@ impl RunSelection {
     }
 }
 
+/// Run label carrying a run's canonical selection (#741), so a subset run is
+/// distinguishable in `GET /v1/runs`.
+pub const LABEL_SELECTION: &str = "selection";
+
+/// The wire form of a row selection (#741) — the `selection` object every
+/// run-starting surface accepts (HTTP bodies, MCP arguments, trigger files,
+/// suites). Mirrors the CLI flags one for one; every field is optional, and an
+/// empty object applies only the status gate.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionRequest {
+    /// Row ids to run, exactly (bypasses the status gate).
+    #[serde(default)]
+    pub select: Vec<String>,
+    /// Row-id globs to run (`act*`; bypasses the status gate).
+    #[serde(default)]
+    pub only: Vec<String>,
+    /// Row ids / globs removed last. A `mandatory` row needs an exact id.
+    #[serde(default)]
+    pub skip: Vec<String>,
+    /// Narrow the eligible rows to those carrying any of these tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Status tiers added to the default eligible set (`mandatory`, `active`).
+    #[serde(default)]
+    pub status: Vec<SourceStatus>,
+    /// Whether a selected row's missing `parent:` / `depends_on:` ancestors
+    /// are pulled in: `off` (default — refuse), `eligible`, or `all`.
+    #[serde(default)]
+    pub include_parents: Option<IncludeParents>,
+}
+
+impl SelectionRequest {
+    /// Parse the CLI flags (typed errors on an unknown status tier or policy).
+    pub fn from_args(args: &crate::cli::SelectionArgs) -> CliResult<Self> {
+        let sel = RunSelection::from_args(args, None)?;
+        let mut req = Self::from_run_selection(&sel);
+        req.include_parents = args.include_parents.as_ref().map(|_| sel.include_parents);
+        Ok(req)
+    }
+
+    /// The flags as a selection, `None` when no selection flag is set.
+    pub fn from_flags(args: &crate::cli::SelectionArgs) -> CliResult<Option<Self>> {
+        let any = !args.select.is_empty()
+            || !args.only.is_empty()
+            || !args.skip.is_empty()
+            || !args.tags.is_empty()
+            || !args.status.is_empty()
+            || args.include_parents.is_some();
+        if any {
+            Self::from_args(args).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Back to CLI flags (for handing a resolved selection to `faucet run`'s
+    /// execution path).
+    pub fn to_args(&self) -> crate::cli::SelectionArgs {
+        crate::cli::SelectionArgs {
+            select: self.select.clone(),
+            only: self.only.clone(),
+            skip: self.skip.clone(),
+            status: self.status.iter().map(|s| s.as_str().to_string()).collect(),
+            tags: self.tags.clone(),
+            include_parents: self.include_parents.map(|p| p.as_str().to_string()),
+        }
+    }
+
+    /// The wire form of a resolved selection (policy always explicit).
+    pub fn from_run_selection(sel: &RunSelection) -> Self {
+        Self {
+            select: sel.select.clone(),
+            only: sel.only.clone(),
+            skip: sel.skip.clone(),
+            tags: sel.tags.clone(),
+            status: sel.status.clone(),
+            include_parents: Some(sel.include_parents),
+        }
+    }
+
+    /// The typed selection, with the config's `selection.include_parents` as
+    /// the policy when the request does not name one.
+    pub fn to_run_selection(&self, cfg: Option<&SelectionSpec>) -> RunSelection {
+        let mut status = Vec::new();
+        for s in &self.status {
+            if !status.contains(s) {
+                status.push(*s);
+            }
+        }
+        RunSelection {
+            select: dedup(&self.select),
+            only: dedup(&self.only),
+            skip: dedup(&self.skip),
+            status,
+            tags: dedup(&self.tags),
+            include_parents: self
+                .include_parents
+                .or_else(|| cfg.map(|c| c.include_parents))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether no field is set (the status gate alone).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A stable one-line form — sorted, deduplicated, fields in a fixed order:
+    /// `select=contacts,deals;include_parents=eligible`, or `default` for an
+    /// empty selection. The `selection` run label and the change-request
+    /// fingerprint use it.
+    pub fn canonical(&self) -> String {
+        fn list(name: &str, items: &[String], out: &mut Vec<String>) {
+            if items.is_empty() {
+                return;
+            }
+            let set: BTreeSet<&str> = items.iter().map(String::as_str).collect();
+            out.push(format!(
+                "{name}={}",
+                set.into_iter().collect::<Vec<_>>().join(",")
+            ));
+        }
+        let mut parts = Vec::new();
+        list("select", &self.select, &mut parts);
+        list("only", &self.only, &mut parts);
+        list("skip", &self.skip, &mut parts);
+        list("tags", &self.tags, &mut parts);
+        let status: Vec<String> = self.status.iter().map(|s| s.as_str().to_string()).collect();
+        list("status", &status, &mut parts);
+        if let Some(p) = self.include_parents {
+            parts.push(format!("include_parents={}", p.as_str()));
+        }
+        if parts.is_empty() {
+            "default".to_string()
+        } else {
+            parts.join(";")
+        }
+    }
+
+    /// Apply to a loaded config's expanded rows. A topology-mode config
+    /// (`pipeline.nodes`) has no rows to select, so any selection is refused
+    /// rather than ignored.
+    pub fn apply(
+        &self,
+        cfg: &crate::config::PipelineConfig,
+        nodes: Vec<ExpandedNode>,
+    ) -> CliResult<Vec<ExpandedNode>> {
+        refuse_topology(cfg)?;
+        select_nodes(
+            nodes,
+            &self.to_run_selection(cfg.selection.as_ref()),
+            !cfg.matrix.is_empty(),
+        )
+    }
+}
+
+/// Why a selection on a topology-mode config is refused.
+pub const TOPOLOGY_REFUSAL: &str = "this pipeline is a topology (`pipeline.nodes`) — it has no \
+     matrix rows to select; run it without a selection";
+
+/// Whether `e` is a refused selection (an unknown row / tag / status tier, an
+/// empty run set, a missing ancestor, a topology) — a caller error, which the
+/// control plane answers with 400.
+pub fn is_selection_error(e: &CliError) -> bool {
+    matches!(
+        e,
+        CliError::NoMatchForSelector { .. }
+            | CliError::UnknownTag { .. }
+            | CliError::EmptyRunSet { .. }
+            | CliError::RunSetMissingAncestors { .. }
+            | CliError::SelectorsWithoutMatrix { .. }
+            | CliError::UnknownStatus { .. }
+            | CliError::UnknownIncludeParents { .. }
+    ) || matches!(e, CliError::Config(m) if m == TOPOLOGY_REFUSAL)
+}
+
+/// The refusal for a row selection on a topology-mode config.
+pub fn refuse_topology(cfg: &crate::config::PipelineConfig) -> CliResult<()> {
+    if crate::topology::is_topology(cfg) {
+        return Err(CliError::Config(TOPOLOGY_REFUSAL.into()));
+    }
+    Ok(())
+}
+
 /// Apply `sel` to `nodes` (expanded, in BFS order) and return the running
 /// subset, order-preserved. Errors on unknown tokens, an empty run set, or a
 /// dependency violation under the active `include_parents` policy.
@@ -141,6 +328,62 @@ pub fn select_nodes(
     sel: &RunSelection,
     has_matrix: bool,
 ) -> CliResult<Vec<ExpandedNode>> {
+    let resolution = resolve(&nodes, sel, has_matrix);
+    if let Some(e) = resolution.error {
+        return Err(e);
+    }
+    let run: HashSet<&str> = resolution.run_set.iter().map(String::as_str).collect();
+    Ok(nodes
+        .into_iter()
+        .filter(|n| run.contains(n.id.as_str()))
+        .collect())
+}
+
+/// Why one row is — or is not — in a resolved run set (#741).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum RowDecision {
+    /// Picked by the selection itself: `by` is `default` (the status gate with
+    /// no narrowing selector), `select`, `only`, or `tag`.
+    Selected { by: &'static str },
+    /// Added as a required ancestor of `because` under `include_parents`.
+    PulledIn { because: String },
+    /// Not in the run set, and nothing needs it.
+    Excluded { reason: String },
+    /// Needed by a row in the run set but not allowed into it — the reason the
+    /// selection is refused.
+    Blocked { reason: String },
+}
+
+impl RowDecision {
+    /// Whether the row runs.
+    pub fn runs(&self) -> bool {
+        matches!(self, Self::Selected { .. } | Self::PulledIn { .. })
+    }
+}
+
+/// A selection resolved against a node list without running anything: the run
+/// set in execution order, each row's decision, and the error a trigger with
+/// this selection would return.
+#[derive(Debug)]
+pub struct Resolution {
+    /// Row ids that run, in execution order (dependency level, then declared
+    /// order). Empty when `error` is set.
+    pub run_set: Vec<String>,
+    /// One decision per row. Empty when the selection names an unknown row or
+    /// tag (nothing is decided before the typo is fixed).
+    pub decisions: HashMap<String, RowDecision>,
+    pub error: Option<CliError>,
+}
+
+/// Resolve `sel` against `nodes` — the one implementation behind
+/// [`select_nodes`] and the rows API's dry-run resolve.
+pub fn resolve(nodes: &[ExpandedNode], sel: &RunSelection, has_matrix: bool) -> Resolution {
+    let fail = |error: CliError, decisions: HashMap<String, RowDecision>| Resolution {
+        run_set: Vec::new(),
+        decisions,
+        error: Some(error),
+    };
     if !has_matrix && sel.has_matrix_only_selector() {
         let mut flags = Vec::new();
         if !sel.select.is_empty() {
@@ -155,9 +398,12 @@ pub fn select_nodes(
         if !sel.tags.is_empty() {
             flags.push("--tag");
         }
-        return Err(CliError::SelectorsWithoutMatrix {
-            flags: flags.join(", "),
-        });
+        return fail(
+            CliError::SelectorsWithoutMatrix {
+                flags: flags.join(", "),
+            },
+            HashMap::new(),
+        );
     }
 
     // Typo protection: every identity/skip token must match ≥1 row id, and
@@ -166,11 +412,14 @@ pub fn select_nodes(
     // status.
     for token in &sel.select {
         if !nodes.iter().any(|n| &n.id == token) {
-            return Err(CliError::NoMatchForSelector {
-                flag: "--select",
-                token: token.clone(),
-                available: all_ids(&nodes),
-            });
+            return fail(
+                CliError::NoMatchForSelector {
+                    flag: "--select",
+                    token: token.clone(),
+                    available: all_ids(nodes),
+                },
+                HashMap::new(),
+            );
         }
     }
     for token in sel.only.iter().chain(sel.skip.iter()) {
@@ -180,11 +429,14 @@ pub fn select_nodes(
             "--skip"
         };
         if !nodes.iter().any(|n| token_matches(token, &n.id)) {
-            return Err(CliError::NoMatchForSelector {
-                flag,
-                token: token.clone(),
-                available: all_ids(&nodes),
-            });
+            return fail(
+                CliError::NoMatchForSelector {
+                    flag,
+                    token: token.clone(),
+                    available: all_ids(nodes),
+                },
+                HashMap::new(),
+            );
         }
     }
     if !sel.tags.is_empty() {
@@ -194,10 +446,13 @@ pub fn select_nodes(
             .collect();
         for tag in &sel.tags {
             if !present.contains(tag.as_str()) {
-                return Err(CliError::UnknownTag {
-                    tag: tag.clone(),
-                    available: present.iter().map(|s| (*s).to_owned()).collect(),
-                });
+                return fail(
+                    CliError::UnknownTag {
+                        tag: tag.clone(),
+                        available: present.iter().map(|s| (*s).to_owned()).collect(),
+                    },
+                    HashMap::new(),
+                );
             }
         }
     }
@@ -211,50 +466,78 @@ pub fn select_nodes(
     let has_tag = !sel.tags.is_empty();
 
     let is_eligible = |n: &ExpandedNode| active_status.contains(&n.status);
-    let is_identity = |n: &ExpandedNode| {
-        sel.select.iter().any(|id| id == &n.id) || sel.only.iter().any(|g| token_matches(g, &n.id))
-    };
+    let by_select = |n: &ExpandedNode| sel.select.iter().any(|id| id == &n.id);
+    let by_only = |n: &ExpandedNode| sel.only.iter().any(|g| token_matches(g, &n.id));
     let matches_tag = |n: &ExpandedNode| sel.tags.iter().any(|t| n.tags.iter().any(|nt| nt == t));
 
     // Stage 1 + 2: eligibility → narrowing.
+    let mut decisions: HashMap<String, RowDecision> = HashMap::new();
     let mut run: HashSet<String> = HashSet::new();
-    for n in &nodes {
-        let included = if !has_identity && !has_tag {
-            is_eligible(n)
+    for n in nodes {
+        let decision = if !has_identity && !has_tag {
+            if is_eligible(n) {
+                RowDecision::Selected { by: "default" }
+            } else {
+                RowDecision::Excluded {
+                    reason: parked_reason(n.status),
+                }
+            }
+        } else if has_identity && by_select(n) {
+            RowDecision::Selected { by: "select" }
+        } else if has_identity && by_only(n) {
+            RowDecision::Selected { by: "only" }
+        } else if has_tag && matches_tag(n) && is_eligible(n) {
+            RowDecision::Selected { by: "tag" }
+        } else if has_tag && matches_tag(n) {
+            RowDecision::Excluded {
+                reason: format!(
+                    "tagged, but {} — a tag never resurrects a parked row",
+                    parked_reason(n.status)
+                ),
+            }
         } else {
-            let by_tag = has_tag && is_eligible(n) && matches_tag(n);
-            let by_identity = has_identity && is_identity(n);
-            by_tag || by_identity
+            RowDecision::Excluded {
+                reason: "not selected".to_string(),
+            }
         };
-        if included {
+        if decision.runs() {
             run.insert(n.id.clone());
         }
+        decisions.insert(n.id.clone(), decision);
     }
 
     // Stage 3: parent / dependency closure under the include_parents policy.
     let node_by_id: HashMap<&str, &ExpandedNode> =
         nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    apply_parent_policy(
-        &nodes,
+    if let Err(e) = apply_parent_policy(
         &node_by_id,
         &active_status,
         sel.include_parents,
         &mut run,
-    )?;
+        &mut decisions,
+    ) {
+        return fail(e, decisions);
+    }
 
     // Stage 4: skip (applied last). A `mandatory` row is removable only by an
     // exact `--skip <id>`, never by a glob.
-    for n in &nodes {
+    for n in nodes {
         if !run.contains(&n.id) {
             continue;
         }
         let mandatory = n.status == SourceStatus::Mandatory;
-        let removed = sel
+        if let Some(tok) = sel
             .skip
             .iter()
-            .any(|tok| skip_matches(tok, &n.id, mandatory));
-        if removed {
+            .find(|tok| skip_matches(tok, &n.id, mandatory))
+        {
             run.remove(&n.id);
+            decisions.insert(
+                n.id.clone(),
+                RowDecision::Excluded {
+                    reason: format!("removed by skip `{tok}`"),
+                },
+            );
         }
     }
 
@@ -262,23 +545,32 @@ pub fn select_nodes(
     // depends on would orphan the dependent (a child can't fan out without its
     // parent). Fail fast rather than run a broken graph.
     let mut orphans: Vec<String> = Vec::new();
-    for n in &nodes {
+    for n in nodes {
         if !run.contains(&n.id) {
             continue;
         }
         for (anc, kind) in required_ancestors(n) {
             if !run.contains(&anc) {
                 orphans.push(format!("{} → {anc} ({kind})", n.id));
+                decisions.insert(
+                    n.id.clone(),
+                    RowDecision::Blocked {
+                        reason: format!("its {kind} `{anc}` was removed from the run set"),
+                    },
+                );
             }
         }
     }
     if !orphans.is_empty() {
         orphans.sort();
         orphans.dedup();
-        return Err(CliError::RunSetMissingAncestors {
-            pairs: orphans,
-            policy: sel.include_parents.as_str(),
-        });
+        return fail(
+            CliError::RunSetMissingAncestors {
+                pairs: orphans,
+                policy: sel.include_parents.as_str(),
+            },
+            decisions,
+        );
     }
 
     if run.is_empty() {
@@ -286,21 +578,68 @@ pub fn select_nodes(
             .iter()
             .map(|n| format!("{} [{}]", n.id, n.status.as_str()))
             .collect();
-        return Err(CliError::EmptyRunSet { rows });
+        return fail(CliError::EmptyRunSet { rows }, decisions);
     }
 
-    Ok(nodes.into_iter().filter(|n| run.contains(&n.id)).collect())
+    let depths = execution_depths(nodes);
+    let mut run_set: Vec<&ExpandedNode> = nodes.iter().filter(|n| run.contains(&n.id)).collect();
+    run_set.sort_by_key(|n| depths.get(n.id.as_str()).copied().unwrap_or(0));
+    Resolution {
+        run_set: run_set.into_iter().map(|n| n.id.clone()).collect(),
+        decisions,
+        error: None,
+    }
+}
+
+fn parked_reason(status: SourceStatus) -> String {
+    format!(
+        "status `{}` is not in the default eligible set (mandatory, active)",
+        status.as_str()
+    )
+}
+
+/// Each row's execution level: `0` for a row with no `parent:` / `depends_on:`
+/// edge, else one more than its deepest ancestor. Rows at the same level may
+/// run together.
+pub fn execution_depths(nodes: &[ExpandedNode]) -> HashMap<&str, usize> {
+    let by_id: HashMap<&str, &ExpandedNode> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    fn depth<'a>(
+        id: &'a str,
+        by_id: &HashMap<&'a str, &'a ExpandedNode>,
+        memo: &mut HashMap<&'a str, usize>,
+        guard: usize,
+    ) -> usize {
+        if let Some(d) = memo.get(id) {
+            return *d;
+        }
+        let d = match by_id.get(id) {
+            Some(n) if guard < by_id.len() => required_ancestors(n)
+                .iter()
+                .filter_map(|(a, _)| by_id.get_key_value(a.as_str()).map(|(k, _)| *k))
+                .map(|a| depth(a, by_id, memo, guard + 1) + 1)
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        };
+        memo.insert(id, d);
+        d
+    }
+    let mut memo = HashMap::new();
+    for n in nodes {
+        depth(n.id.as_str(), &by_id, &mut memo, 0);
+    }
+    memo
 }
 
 /// Walk the `parent:` / `depends_on:` ancestor closure of the current run set,
 /// adding or rejecting ancestors per the policy. Collects **every** offending
 /// pair (transitively) before erroring.
 fn apply_parent_policy(
-    _nodes: &[ExpandedNode],
     node_by_id: &HashMap<&str, &ExpandedNode>,
     active_status: &HashSet<SourceStatus>,
     policy: IncludeParents,
     run: &mut HashSet<String>,
+    decisions: &mut HashMap<String, RowDecision>,
 ) -> CliResult<()> {
     let mut violations: Vec<String> = Vec::new();
     let mut queue: VecDeque<String> = run.iter().cloned().collect();
@@ -319,9 +658,26 @@ fn apply_parent_policy(
             let eligible = anc_status
                 .map(|s| active_status.contains(&s))
                 .unwrap_or(false);
+            let pulled = |decisions: &mut HashMap<String, RowDecision>| {
+                decisions.insert(
+                    anc.clone(),
+                    RowDecision::PulledIn {
+                        because: id.clone(),
+                    },
+                );
+            };
             match policy {
                 IncludeParents::Off => {
                     violations.push(format!("{id} → {anc} ({kind})"));
+                    decisions.insert(
+                        anc.clone(),
+                        RowDecision::Blocked {
+                            reason: format!(
+                                "required by `{id}` ({kind}) but not selected — include_parents is \
+                                 off; select it, or use include_parents: eligible / all"
+                            ),
+                        },
+                    );
                 }
                 IncludeParents::Eligible => {
                     if eligible {
@@ -330,10 +686,22 @@ fn apply_parent_policy(
                                 dependent = %id, ancestor = %anc, edge = kind,
                                 "include_parents=eligible: auto-included required ancestor"
                             );
+                            pulled(decisions);
                             queue.push_back(anc);
                         }
                     } else {
                         violations.push(format!("{id} → {anc} ({kind}, parked)"));
+                        decisions.insert(
+                            anc.clone(),
+                            RowDecision::Blocked {
+                                reason: format!(
+                                    "required by `{id}` ({kind}) but parked (status `{}`) — \
+                                     include_parents: eligible never pulls in a parked row; use \
+                                     all, or select it by id",
+                                    anc_status.map(SourceStatus::as_str).unwrap_or("unknown")
+                                ),
+                            },
+                        );
                     }
                 }
                 IncludeParents::All => {
@@ -349,6 +717,7 @@ fn apply_parent_policy(
                                 "include_parents=all: pulling a parked ancestor into the run set"
                             );
                         }
+                        pulled(decisions);
                         queue.push_back(anc);
                     }
                 }

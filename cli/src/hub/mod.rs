@@ -20,6 +20,7 @@ pub mod catalog;
 pub mod compose;
 #[cfg(feature = "hub-remote")]
 pub mod remote;
+pub mod rows;
 pub mod spec;
 pub mod trust;
 
