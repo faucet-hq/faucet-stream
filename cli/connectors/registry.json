@@ -472,6 +472,13 @@
       "description": "SFTP source; list/glob a remote dir, stream JSONL/JSON-array/raw-text"
     },
     {
+      "name": "file",
+      "kind": "source",
+      "verified": true,
+      "tier": "stable",
+      "description": "Local file source; path/dir/glob/URL, every file format incl. Avro/ORC/Parquet, incremental by mtime or name"
+    },
+    {
       "name": "sftp",
       "kind": "sink",
       "verified": true,

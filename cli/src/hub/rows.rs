@@ -29,8 +29,8 @@ use crate::select::{Resolution, RowDecision, SelectionRequest};
 /// Source kinds that can split one read across workers (`Source::is_shardable`
 /// overrides; PK-range for the SQL sources needs `shard: { key }` config).
 pub const SHARDABLE_SOURCE_KINDS: &[&str] = &[
-    "dynamodb", "gcs", "iceberg", "kafka", "mssql", "mysql", "oracle", "parquet", "postgres", "s3",
-    "spanner", "sqlite",
+    "dynamodb", "file", "gcs", "iceberg", "kafka", "mssql", "mysql", "oracle", "parquet", "postgres",
+    "s3", "spanner", "sqlite",
 ];
 
 /// Transform kinds that change which field names reach the sink.

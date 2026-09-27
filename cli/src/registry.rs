@@ -400,6 +400,11 @@ pub async fn build_source(
             let cfg = decode::<faucet_source_sftp::SftpSourceConfig>("source", "sftp", config)?;
             Ok(Box::new(faucet_source_sftp::SftpSource::new(cfg)?))
         }
+        #[cfg(feature = "source-file")]
+        "file" => {
+            let cfg = decode::<faucet_source_file::FileSourceConfig>("source", "file", config)?;
+            Ok(Box::new(faucet_source_file::FileSource::new(cfg)?))
+        }
         #[cfg(feature = "source-s3")]
         "s3" => {
             let cfg = decode::<faucet_source_s3::S3SourceConfig>("source", "s3", config)?;
@@ -1140,6 +1145,7 @@ pub const DISCOVER_SOURCE_KINDS: &[&str] = &[
     "iceberg",
     "dynamodb",
     "oracle",
+    "file",
 ];
 
 /// Whether a source kind supports `faucet discover` (dataset introspection).
@@ -1579,6 +1585,13 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
         ),
         #[cfg(feature = "source-sftp")]
         "sftp" => check::<faucet_source_sftp::SftpSourceConfig>("sftp", name, config),
+        #[cfg(feature = "source-file")]
+        "file" => check_with::<faucet_source_file::FileSourceConfig, _, _>(
+            "file",
+            name,
+            config,
+            |c| c.validate(),
+        ),
         #[cfg(feature = "source-s3")]
         "s3" => check::<faucet_source_s3::S3SourceConfig>("s3", name, config),
         #[cfg(feature = "source-mongodb")]
@@ -2103,6 +2116,8 @@ pub fn source_schema(kind: &str) -> CliResult<Value> {
         "rabbitmq" => Ok(schema::<faucet_source_rabbitmq::RabbitMqSourceConfig>()),
         #[cfg(feature = "source-sftp")]
         "sftp" => Ok(schema::<faucet_source_sftp::SftpSourceConfig>()),
+        #[cfg(feature = "source-file")]
+        "file" => Ok(schema::<faucet_source_file::FileSourceConfig>()),
         #[cfg(feature = "source-s3")]
         "s3" => Ok(schema::<faucet_source_s3::S3SourceConfig>()),
         #[cfg(feature = "source-mongodb")]
@@ -2311,6 +2326,11 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push((
         "sftp",
         "SFTP source. Lists/globs a remote directory and streams JSONL / JSON-array / raw-text files over SSH.",
+    ));
+    #[cfg(feature = "source-file")]
+    v.push((
+        "file",
+        "Local file source. Reads JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC from a path, directory, glob or http(s) URL, format and compression resolved per file; incremental by mtime or name.",
     ));
     #[cfg(feature = "source-s3")]
     v.push(("s3", "AWS S3 object source"));

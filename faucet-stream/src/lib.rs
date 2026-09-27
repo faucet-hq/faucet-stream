@@ -25,6 +25,7 @@
 //! | `source-nats` | NATS source |
 //! | `source-rabbitmq` | RabbitMQ (AMQP 0.9.1) queue source |
 //! | `source-sftp` | SFTP source |
+//! | `source-file` | Local file source (path, directory, glob or URL; every file format) |
 
 //! | `source-s3` | AWS S3 file source |
 //! | `source-mongodb` | MongoDB query source |
@@ -168,6 +169,11 @@ pub mod source {
     #[cfg(feature = "source-sftp")]
     pub mod sftp {
         pub use faucet_source_sftp::*;
+    }
+
+    #[cfg(feature = "source-file")]
+    pub mod file {
+        pub use faucet_source_file::*;
     }
 
     #[cfg(feature = "source-s3")]
@@ -377,6 +383,11 @@ pub mod source {
     #[cfg(feature = "source-sftp")]
     pub mod sftp {
         pub use faucet_source_sftp::*;
+    }
+
+    #[cfg(feature = "source-file")]
+    pub mod file {
+        pub use faucet_source_file::*;
     }
 
     #[cfg(feature = "source-s3")]

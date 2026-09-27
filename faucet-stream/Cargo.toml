@@ -45,6 +45,7 @@ source = [
     "source-webhook",
     "source-websocket",
     "source-csv",
+    "source-file",
     "source-elasticsearch",
     "source-parquet",
     "source-delta",
@@ -125,6 +126,7 @@ file-format-csv = [
     "faucet-source-gcs?/file-format-csv",
     "faucet-source-azure-blob?/file-format-csv",
     "faucet-source-sftp?/file-format-csv",
+    "faucet-source-file?/file-format-csv",
     "faucet-sink-s3?/file-format-csv",
     "faucet-sink-gcs?/file-format-csv",
     "faucet-sink-azure-blob?/file-format-csv",
@@ -135,6 +137,7 @@ file-format-xml = [
     "faucet-source-gcs?/file-format-xml",
     "faucet-source-azure-blob?/file-format-xml",
     "faucet-source-sftp?/file-format-xml",
+    "faucet-source-file?/file-format-xml",
     "faucet-sink-s3?/file-format-xml",
     "faucet-sink-gcs?/file-format-xml",
     "faucet-sink-azure-blob?/file-format-xml",
@@ -145,12 +148,32 @@ file-format-excel = [
     "faucet-source-gcs?/file-format-excel",
     "faucet-source-azure-blob?/file-format-excel",
     "faucet-source-sftp?/file-format-excel",
+    "faucet-source-file?/file-format-excel",
     "faucet-sink-s3?/file-format-excel",
     "faucet-sink-gcs?/file-format-excel",
     "faucet-sink-azure-blob?/file-format-excel",
     "faucet-sink-sftp?/file-format-excel",
 ]
-file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
+file-format-avro = [
+    "faucet-source-s3?/file-format-avro",
+    "faucet-source-gcs?/file-format-avro",
+    "faucet-source-azure-blob?/file-format-avro",
+    "faucet-source-sftp?/file-format-avro",
+    "faucet-source-file?/file-format-avro",
+    "faucet-sink-s3?/file-format-avro",
+    "faucet-sink-gcs?/file-format-avro",
+    "faucet-sink-azure-blob?/file-format-avro",
+    "faucet-sink-sftp?/file-format-avro",
+]
+file-format-orc = [
+    "faucet-source-s3?/file-format-orc",
+    "faucet-source-gcs?/file-format-orc",
+    "faucet-source-azure-blob?/file-format-orc",
+    "faucet-source-sftp?/file-format-orc",
+    "faucet-source-file?/file-format-orc",
+]
+file-format-parquet = ["faucet-source-file?/file-format-parquet"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
 ## Enable mutual-TLS client-certificate auth (#495) on whichever HTTP sources
 ## have been opted in. Forwards through to each source's `mtls` feature using
 ## optional-dep syntax, so this flag does not pull sources the user has not
@@ -186,6 +209,9 @@ arrow = [
     "faucet-sink-gcs?/arrow",
     "faucet-source-databricks?/arrow",
     "faucet-source-iceberg?/arrow",
+    "faucet-source-azure-blob?/arrow",
+    "faucet-source-sftp?/arrow",
+    "faucet-source-file?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can
     # reach the BigQuery Parquet load without materializing `Value`.
     "faucet-source-rest?/arrow",
@@ -259,6 +285,7 @@ source-redis = ["dep:faucet-source-redis"]
 source-webhook = ["dep:faucet-source-webhook"]
 source-websocket = ["dep:faucet-source-websocket"]
 source-csv = ["dep:faucet-source-csv"]
+source-file = ["dep:faucet-source-file"]
 source-elasticsearch = ["dep:faucet-source-elasticsearch"]
 source-kafka = ["dep:faucet-source-kafka", "dep:faucet-common-kafka"]
 source-kinesis = ["dep:faucet-source-kinesis", "dep:faucet-common-kinesis"]
@@ -416,6 +443,7 @@ faucet-source-redis = { workspace = true, optional = true }
 faucet-source-webhook = { workspace = true, optional = true }
 faucet-source-websocket = { workspace = true, optional = true }
 faucet-source-csv = { workspace = true, optional = true }
+faucet-source-file = { workspace = true, optional = true }
 faucet-source-elasticsearch = { workspace = true, optional = true }
 faucet-source-parquet = { workspace = true, optional = true }
 faucet-source-delta = { workspace = true, optional = true }
