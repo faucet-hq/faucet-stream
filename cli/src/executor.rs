@@ -3311,6 +3311,9 @@ impl Source for StateKeyOverride {
     fn dataset_uri(&self) -> String {
         self.inner.dataset_uri()
     }
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
     fn state_key(&self) -> Option<String> {
         Some(self.key.clone())
     }
