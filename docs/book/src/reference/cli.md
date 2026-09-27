@@ -923,6 +923,8 @@ faucet template run       acme/billing --sink faucet-hq/bigquery --sink-version 
   --param api_token="$TOKEN" --param bq_project=my-project    # source × sink, composed at run time
 faucet template run       acme/billing --sink faucet-hq/bigquery --overlay prod \
   --param state_dsn="$STATE_DSN"                              # + a deployment overlay
+faucet template run       crm --sink files --select deal_lines --include-parents eligible   # a subset of the streams
+faucet template rows      crm --sink files [--select … --include-parents …] [--no-state] [--json]  # list rows / preview a selection
 faucet template delete    tenant-sync --store sqlite:./faucet-templates.db --version 1
 faucet template test      suite.yaml                            # suite names a config path — no registry
 faucet template test      suite.yaml --store sqlite:./faucet-templates.db --select prod
@@ -963,6 +965,8 @@ as a pipeline but prints a deprecation notice — add `kind: pipeline`. See the
 | `--param <NAME=VALUE>` | *(run)* Supply a declared param. Repeatable. |
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
 | `--limit <n>` | *(run)* Stop after writing this many records. |
+| `--select` / `--only` / `--skip` / `--tag` / `--status` / `--include-parents` | *(run / rows)* Run — or, with `rows`, preview — only some of the template's rows: a source template's streams, a pipeline's matrix rows. The same selection model as `faucet run`; for a source template only the selected streams are composed, so a stream the sink cannot run does not block the others. A topology template refuses any selection. See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-streams). |
+| `--no-state` | *(rows)* Skip each row's `faucet status` view (last success / failure, bookmark age, lag, health). |
 | `--suite <path>` | *(test)* Positional: the suite file (YAML or JSON). `faucet schema template-test` prints its schema. |
 | `--select <n\|channel>` | *(test)* Override the suite's own `select:`. Ignored when the suite's `template:` is a path. A suite for a source template names its sink under `sink:` (a registered id, or a path when `template:` is a path) and `sink_select:`; every case then exercises the composed pipeline. |
 | `--filter <pattern>` | *(test)* Run only cases whose name matches; `*` wildcards, otherwise an exact match. |
@@ -1024,6 +1028,7 @@ faucet hub check     --source faucet-hq/example-rest-api --sink faucet-hq/bigque
 faucet hub compose   --source faucet-hq/example-rest-api --sink faucet-hq/sqlite [--overlay ops/prod.yaml] --out my-pipeline.yaml
 faucet hub matrix    --format table|markdown|json [--out FILE]
 faucet hub lint      [--hub ./hub] [FILE…]                   # publishability lint
+faucet hub rows      faucet-hq/example-csv [--sink faucet-hq/jsonl] [--select …] [--state] [--json]  # streams + metadata, or a pipeline file's rows
 faucet run           --source faucet-hq/example-csv --sink faucet-hq/jsonl                   # runs offline
 faucet validate      --source faucet-hq/example-rest-api --sink faucet-hq/bigquery [--show-composed]
 faucet schema source-template | sink-template | deployment
@@ -1043,6 +1048,7 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 | `--sort name\|stars\|updated` | *(list)* Order by id, by stars (most starred first), or by the newest version's date. Stars, dates and open issues come from the catalog's `index.json` (`trust`) and are shown as columns; `--json` includes each entry's `trust` block. |
 | `--overlay <id\|path>` | *(compose / check, and `run` / `validate`)* A `kind: deployment` overlay applied over the pairing: a path, or an id under `<hub>/deployments/`. `check` also verifies every stream it names exists; `lint` accepts deployment files and flags literal credentials. |
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
+| `rows <source\|pipeline.yaml>` | List a catalog source template's streams (with `--sink`, their write resolution and guarantees against that sink) or a pipeline file's matrix rows — the same report as `GET /v1/templates/{id}/rows`. The selection flags preview a run set (exit≠0 when it would be refused); `--state` also reads each row's status from the composed run's state store. |
 | `--format table\|markdown\|json` | *(matrix)* Terminal table, the docs page, or `index.json`. |
 | `--json` | Machine-readable output. |
 

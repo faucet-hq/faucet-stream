@@ -116,7 +116,7 @@ someone does.
 | `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` | — | — | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
-| `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
+| `GET /v1/templates`, `/v1/templates/{id}`, `/v1/templates/{id}/rows` | ✓ | ✓ | ✓ |
 | `POST /v1/templates/{id}/runs` (trigger) | — | ✓ | ✓ |
 | `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | — | ✓ |
 | `POST /v1/templates/{id}/{tags,launch,rollback,deprecate}` | — | — | ✓ |
@@ -203,6 +203,7 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/templates` | `201` | Register a pipeline template (admin / `TemplateAdmin`) — requires the `templates` build feature |
 | `GET` | `/v1/templates` | `200` | List templates — newest version each, plus release state (viewer / `TemplateRead`) |
 | `GET` | `/v1/templates/{id}` | `200` | One template version + its whole release state. `?version=stable` (default), another channel, or `?version=N` |
+| `GET` | `/v1/templates/{id}/rows` | `200` | The template's selectable rows (streams / matrix rows) with their metadata; selector params (`select`, `only`, `skip`, `tags`, `status`, `include_parents`) turn it into a dry-run resolve (`TemplateRead`, audit `template.rows`) |
 | `DELETE` | `/v1/templates/{id}` | `204` | Delete one version (`?version=<channel\|N>`) or all (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/runs` | `202` | Trigger a run from a template with `params` / `env` (operator / `RunWrite`) |
 | `POST` | `/v1/templates/{id}/tags` | `200` | Point an assignable channel (`prod`, `dev`, …) at a version (admin / `TemplateAdmin`) |
@@ -282,6 +283,16 @@ Request body:
   fingerprint, so replaying a key with a different value is a 409, not a
   replay.
 - **`callback`** — a per-run completion callback; see below.
+- **`selection`** — run only some of the config's matrix rows (#741):
+  `{ "select": [ids], "only": [globs], "skip": [ids|globs], "tags": [..],
+  "status": [tiers], "include_parents": "off|eligible|all" }` — the CLI's
+  selection flags. Omitted: every row runs; `{}` applies the status gate
+  only. An unknown row or tag, an empty run set, a missing ancestor or a
+  topology config is a `400` naming the valid rows. The run is labelled
+  `selection=<canonical>` (part of the idempotency fingerprint) and the
+  selection is stored with it, so a clustered or sharded run applies the same
+  subset. The same field is accepted by every run-starting endpoint
+  (template triggers, tenant runs, fan-out).
 
 Response (`202`):
 
@@ -679,6 +690,31 @@ curl -sX POST http://127.0.0.1:8080/v1/templates/acme%2Fbilling/runs \
 #        "sink_template":"faucet-hq/bigquery","sink_template_version":1,
 #        "streams":[{"stream":"bills","requested":["overwrite","upsert"],"chosen":"overwrite","key":["id"]}, …],
 #        "params":{"api_token":"***","bq_project":"my-project"}}
+```
+
+**Rows and selection (#741).** `GET /v1/templates/{id}/rows?version=&sink=&sink_version=&overlay=`
+lists a source template's streams or a pipeline template's matrix rows —
+identity (`status`, `tags`, `default_selected`), hierarchy (`parent`,
+`children`, `depends_on`, `depth`, `per_parent_record`), `write` (resolved
+against `sink` when given, with `supported` / `unsupported_reason`), `read`,
+`guarantees`, `shape`, `params_used`, and the `faucet status` view as `state`
+when the state store is readable (`?state=false` skips it). Any selector
+parameter (`select`, `only`, `skip`, `tags`, `status` comma-joined;
+`include_parents`) resolves that selection without running anything: rows gain
+`selected` / `pulled_in` / `blocked` / `excluded`, and the body gains `run_set`
+and the `error` a trigger would return. A topology template returns
+`rows: []`, `selectable: false`. The trigger body takes the same `selection`
+object as `POST /v1/runs`; for a source template only the selected streams are
+composed, so a stream the sink cannot run does not block the others.
+
+```bash
+curl -s "http://127.0.0.1:8080/v1/templates/crm/rows?sink=files&select=deal_lines&include_parents=eligible" \
+  -H "Authorization: Bearer $TOKEN"
+curl -sX POST http://127.0.0.1:8080/v1/templates/crm/runs -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"sink":"files","selection":{"select":["deal_lines"],"include_parents":"eligible"}}'
+# → 202 {…,"selection":{"select":["deal_lines"],…}} — the run is labelled
+#   selection=select=deal_lines;include_parents=eligible
 ```
 
 **Matrix.** `GET /v1/templates/matrix` composes every registered source

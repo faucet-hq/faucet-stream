@@ -33,6 +33,7 @@ triggers:
       name: <template>      # run name; supports {name}, {object_key}, {bucket}, etc.
       labels: {}            # static labels merged with the auto-derived trigger labels
       timeout_secs: null    # per-run timeout in seconds
+      selection: null       # optional: run only some rows / streams (see below)
     type: <trigger type>    # required; one of object_arrival, webhook, queue_depth, schedule
     # … type-specific fields below
 ```
@@ -250,6 +251,34 @@ Every trigger-fired run receives these automatic labels (visible in
 | `faucet.trigger.tick` | The scheduled tick (`schedule` only) |
 
 Additional labels can be added per trigger via `run.labels:`.
+
+## Running a subset of rows (`run.selection`)
+
+`run.selection` runs only some of the pipeline's matrix rows (or a template's
+streams) on every fire — the same object `POST /v1/runs` takes (`select`,
+`only`, `skip`, `tags`, `status`, `include_parents`). Two triggers over one
+template can then run the cheap streams hourly and the heavy one nightly:
+
+```yaml
+triggers:
+  - name: crm-hourly
+    type: schedule
+    cron: "0 * * * *"
+    template: { id: acme/crm, sink: faucet-hq/bigquery }
+    run:
+      selection: { skip: [activities] }
+  - name: crm-nightly
+    type: schedule
+    cron: "0 2 * * *"
+    template: { id: acme/crm, sink: faucet-hq/bigquery }
+    run:
+      selection: { select: [activities] }
+```
+
+The selection is validated when the trigger fires (an unknown row fails that
+fire and counts in `faucet_serve_trigger_errors_total`), labels the run
+`selection=<canonical>`, and applies to every tenant of a `tenants:` fan-out.
+See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-streams).
 
 ## `/readyz` — trigger health
 
