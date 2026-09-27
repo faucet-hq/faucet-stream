@@ -1436,6 +1436,9 @@ mod list_export_tests {
                 Err(FaucetError::State("tx aborted".into()))
             }
         }
+        assert_eq!(Failing.get("o::a").await.unwrap(), None);
+        Failing.put("o::a", &json!(1)).await.unwrap();
+        Failing.delete("o::a").await.unwrap();
         let mut export = StateExport::new("o");
         export.keys.insert("o::a".into(), json!(1));
         let r = import_namespace(&Failing, &export, false).await.unwrap();
@@ -1463,7 +1466,9 @@ mod list_export_tests {
             }
         }
         s.put("o::stuck", &json!(1)).await.unwrap();
-        let r = import_namespace(&Listing(s), &export, true).await.unwrap();
+        let listing = Listing(s);
+        assert_eq!(listing.get("o::stuck").await.unwrap(), Some(json!(1)));
+        let r = import_namespace(&listing, &export, true).await.unwrap();
         assert_eq!(r.written, vec!["o::a"]);
         assert!(r.error.unwrap().contains("deleting stale 'o::stuck'"));
     }

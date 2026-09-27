@@ -987,6 +987,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_migrate_state_accepts_only_its_own_schema() {
+        let src = MockSource { records: vec![] };
+        assert_eq!(src.state_schema(), 0);
+        assert_eq!(
+            src.migrate_state(0, json!({"id": 1})).unwrap(),
+            json!({"id": 1})
+        );
+        let err = src.migrate_state(3, json!({})).unwrap_err().to_string();
+        assert!(
+            err.contains("no migration from bookmark schema 3 to 0"),
+            "{err}"
+        );
+    }
+
     struct IncrementalSource {
         records: Vec<Value>,
         bookmark: Value,

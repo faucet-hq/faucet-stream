@@ -305,6 +305,13 @@ mod tests {
         assert_eq!(failing.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(obs.last(), None);
         LagPoller::new(&none, "p", "r", None).poll(true).await;
+        use crate::Source;
+        assert!(
+            none.fetch_with_context(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

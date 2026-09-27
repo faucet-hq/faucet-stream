@@ -492,6 +492,57 @@ async fn lag_reports_the_age_of_the_oldest_unread_change() {
     );
 }
 
+/// #733 — the lag probe opens its one-shot change stream on the configured
+/// scope (database and cluster, not only a collection), and honours an
+/// invalidate bookmark by resuming with `startAfter`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lag_probe_covers_database_and_cluster_scopes_and_invalidate_tokens() {
+    let (_container, uri) = start_repl_set().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let coll = client.database(DB).collection::<Document>(COLL);
+    coll.insert_one(doc! { "_id": 0 })
+        .await
+        .expect("seed insert");
+    for scope in [
+        json!({ "type": "database", "database": DB }),
+        json!({ "type": "cluster" }),
+    ] {
+        let cfg = |uri: &str| -> MongoCdcSourceConfig {
+            serde_json::from_value(json!({
+                "connection_uri": uri,
+                "scope": scope.clone(),
+                "start_from": { "type": "now" },
+                "idle_timeout": 5,
+                "max_await_time_ms": 500,
+                "batch_size": 0
+            }))
+            .expect("config")
+        };
+        let capture = MongoCdcSource::new(cfg(&uri)).await.expect("source");
+        let position = capture
+            .capture_resume_position()
+            .await
+            .expect("capture")
+            .expect("a position");
+        coll.insert_one(doc! { "scope": scope.to_string() })
+            .await
+            .expect("insert");
+        for invalidate in [false, true] {
+            let mut bm = position.clone();
+            bm["invalidate"] = json!(invalidate);
+            let probe = MongoCdcSource::new(cfg(&uri)).await.expect("source");
+            probe.apply_start_bookmark(bm).await.expect("apply");
+            let lag = probe.lag().await.expect("lag");
+            if let Some(l) = lag {
+                assert!(
+                    l.seconds.expect("seconds") < 600.0,
+                    "{scope} invalidate={invalidate}: {l:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Records every row a pipeline writes.
 #[derive(Default)]
 struct Capture(std::sync::Mutex<Vec<Value>>);

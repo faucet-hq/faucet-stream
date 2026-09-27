@@ -313,6 +313,36 @@ mod tests {
         assert_eq!(out, vec![json!({"foo_bar": 1})]);
     }
 
+    struct VersionedSource;
+
+    #[async_trait]
+    impl Source for VersionedSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(Vec::new())
+        }
+        fn state_schema(&self) -> u32 {
+            2
+        }
+        fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+            Ok(json!({"from": from, "data": data}))
+        }
+    }
+
+    #[test]
+    fn state_versioning_is_forwarded_to_the_inner_source() {
+        let wrapped =
+            TransformingSource::new(Box::new(VersionedSource), vec![], Labels::for_named("test"))
+                .expect("compile succeeds");
+        assert_eq!(wrapped.state_schema(), 2);
+        assert_eq!(
+            wrapped.migrate_state(1, json!("x")).unwrap(),
+            json!({"from": 1, "data": "x"})
+        );
+    }
+
     struct IncrementalSource {
         records: Vec<Value>,
         bookmark: Value,

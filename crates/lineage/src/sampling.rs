@@ -562,6 +562,33 @@ mod tests {
     }
 
     #[test]
+    fn sampling_source_forwards_state_migration() {
+        struct Versioned;
+        #[async_trait]
+        impl faucet_core::Source for Versioned {
+            async fn fetch_with_context(
+                &self,
+                _: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+            fn state_schema(&self) -> u32 {
+                1
+            }
+            fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+                Ok(json!({"from": from, "data": data}))
+            }
+        }
+        use faucet_core::Source;
+        let s = SamplingSource::new(Box::new(Versioned), Arc::new(SampleState::new(1)));
+        assert_eq!(s.state_schema(), 1);
+        assert_eq!(
+            s.migrate_state(0, json!(7)).unwrap(),
+            json!({"from": 0, "data": 7})
+        );
+    }
+
+    #[test]
     fn sample_record_is_a_noop_when_cap_is_zero() {
         // cap 0 = counting only: the native tap must never retain a record.
         let state = SampleState::new(0);

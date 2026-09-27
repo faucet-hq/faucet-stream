@@ -557,6 +557,15 @@ mod tests {
         assert!(check_dlq_all_policy(&atomic, OnBatchError::DlqAll, false).is_ok());
     }
 
+    #[tokio::test]
+    async fn atom_sink_writes_every_record() {
+        let sink = AtomSink {
+            atomicity: BatchAtomicity::Atomic,
+            keyed: false,
+        };
+        assert_eq!(sink.write_batch(&[json!(1), json!(2)]).await.unwrap(), 2);
+    }
+
     #[test]
     fn batch_outcome_counters_snapshot() {
         let c = BatchOutcomeCounters::new();
