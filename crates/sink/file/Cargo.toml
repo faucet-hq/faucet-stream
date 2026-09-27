@@ -42,7 +42,9 @@ faucet-source-rest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 tempfile = "3"
 wiremock = "0.6"
-flate2.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 

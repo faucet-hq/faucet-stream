@@ -5247,6 +5247,7 @@ name = "faucet-sink-file"
 version = "1.0.0"
 dependencies = [
  "arrow",
+ "async-stream",
  "async-trait",
  "csv",
  "faucet-common-file",
@@ -5254,7 +5255,7 @@ dependencies = [
  "faucet-core",
  "faucet-source-file",
  "faucet-source-rest",
- "flate2",
+ "futures",
  "parquet",
  "schemars 1.2.1",
  "serde",

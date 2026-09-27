@@ -150,9 +150,7 @@ impl FileSink {
     fn roll(&self, st: &mut State) -> Result<(), FaucetError> {
         if let Some(mut f) = st.current.take() {
             let r = f.finalize(&self.ctx());
-            if r.is_err() {
-                f.discard();
-            }
+            f.discard();
             r?;
         }
         st.next_part += 1;
