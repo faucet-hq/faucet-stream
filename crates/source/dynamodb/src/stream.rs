@@ -622,6 +622,10 @@ impl faucet_core::Source for DynamoDbSource {
         "dynamodb"
     }
 
+    fn record_table(&self, record: &Value) -> Option<String> {
+        stream_record_table(self.config.mode, record)
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "dynamodb://{}/{}",
@@ -695,8 +699,32 @@ impl faucet_core::Source for DynamoDbSource {
     }
 }
 
+/// The table a DynamoDB Streams envelope belongs to. Scan / query items are
+/// user data, so a `table` attribute there is never read as routing.
+fn stream_record_table(mode: crate::config::ReadMode, record: &Value) -> Option<String> {
+    if mode != crate::config::ReadMode::Streams {
+        return None;
+    }
+    record.get("table")?.as_str().map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn routes_only_stream_envelopes() {
+        use crate::config::ReadMode;
+        let env = serde_json::json!({"op": "c", "table": "orders"});
+        assert_eq!(
+            stream_record_table(ReadMode::Streams, &env),
+            Some("orders".into())
+        );
+        assert_eq!(stream_record_table(ReadMode::Scan, &env), None);
+        assert_eq!(
+            stream_record_table(ReadMode::Streams, &serde_json::json!({})),
+            None
+        );
+    }
     use super::*;
     use faucet_core::Source as _;
 

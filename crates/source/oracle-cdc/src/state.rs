@@ -111,9 +111,35 @@ impl Position {
     }
 }
 
+/// Order two stored positions: by commit SCN, and at one SCN by the set of
+/// transactions already emitted there. `None` when either is not a position.
+pub fn position_le(a: &Value, b: &Value) -> Option<bool> {
+    let (a, b) = (Position::from_value(a).ok()?, Position::from_value(b).ok()?);
+    Some(
+        a.commit_scn < b.commit_scn
+            || (a.commit_scn == b.commit_scn
+                && a.committed_xids
+                    .iter()
+                    .all(|x| b.committed_xids.contains(x))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positions_order_by_scn_then_emitted_transactions() {
+        let p = |scn: u64, xids: &[&str]| json!({"commit_scn": scn, "restart_scn": scn, "committed_xids": xids});
+        assert_eq!(position_le(&p(10, &["a"]), &p(11, &[])), Some(true));
+        assert_eq!(position_le(&p(11, &[]), &p(10, &["a"])), Some(false));
+        assert_eq!(position_le(&p(10, &["a"]), &p(10, &["a", "b"])), Some(true));
+        assert_eq!(
+            position_le(&p(10, &["a", "b"]), &p(10, &["a"])),
+            Some(false)
+        );
+        assert_eq!(position_le(&p(10, &[]), &json!("x")), None);
+    }
 
     #[test]
     fn resume_reaches_back_to_open_transactions() {

@@ -574,6 +574,14 @@ impl Source for OracleCdcSource {
         true
     }
 
+    fn record_table(&self, record: &Value) -> Option<String> {
+        schema_table(record)
+    }
+
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        crate::state::position_le(a, b)
+    }
+
     fn connector_name(&self) -> &'static str {
         "oracle-cdc"
     }
@@ -654,8 +662,25 @@ impl Source for OracleCdcSource {
     }
 }
 
+/// `OWNER.TABLE` of a change envelope, the name the `oracle` source's
+/// discovery reports for the same table.
+fn schema_table(record: &Value) -> Option<String> {
+    let schema = record.get("schema")?.as_str()?;
+    let table = record.get("table")?.as_str()?;
+    Some(format!("{schema}.{table}"))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn routes_by_owner_table() {
+        assert_eq!(
+            schema_table(&serde_json::json!({"schema": "APP", "table": "ORDERS"})),
+            Some("APP.ORDERS".into())
+        );
+        assert_eq!(schema_table(&serde_json::json!({"table": "ORDERS"})), None);
+    }
     use super::*;
 
     #[test]
