@@ -173,7 +173,7 @@ pub use replication::{
 pub use resilience::{
     BackoffKind, CircuitBreaker, CircuitBreakerConfig, PoisonAction, PoisonPolicy,
     ResiliencePolicy, RetryClass, RetryClassSet, RetryMetrics, RetryPolicy, classify,
-    execute_with_policy, execute_with_policy_metered,
+    execute_with_policy, execute_with_policy_metered, execute_with_policy_recorded,
 };
 pub use retry::execute_with_retry;
 pub use rollback::{

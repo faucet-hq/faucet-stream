@@ -431,6 +431,12 @@ impl Source for SamplingSource {
     fn state_key(&self) -> Option<String> {
         self.inner.state_key()
     }
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         self.inner.apply_start_bookmark(bookmark).await
     }
@@ -667,6 +673,42 @@ mod tests {
         let schema = shared.inferred_schema();
         let names: Vec<&str> = schema.fields.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"id"));
+    }
+
+    struct RecorderProbe(Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait]
+    impl faucet_core::Source for RecorderProbe {
+        async fn fetch_with_context(
+            &self,
+            _: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn set_roundtrip_recorder(
+            &self,
+            _recorder: Arc<faucet_core::observability::RoundtripRecorder>,
+        ) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn source_forwards_the_roundtrip_recorder() {
+        use faucet_core::Source as _;
+        let got = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = SamplingSource::new(
+            Box::new(RecorderProbe(Arc::clone(&got))),
+            Arc::new(SampleState::new(1)),
+        );
+        s.set_roundtrip_recorder(Arc::new(
+            faucet_core::observability::RoundtripRecorder::new(
+                faucet_core::observability::RoundtripSide::Source,
+                "p",
+                "r",
+                "probe",
+            ),
+        ));
+        assert!(got.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// An idempotent, upsert-capable sink: the sampler must forward every

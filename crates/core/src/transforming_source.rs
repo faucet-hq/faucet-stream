@@ -274,6 +274,13 @@ impl Source for TransformingSource {
         // `<connector>://unknown` whenever transforms are attached.
         self.inner.dataset_uri()
     }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
+    ) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +571,39 @@ mod tests {
         async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
             Ok(Some(json!("captured")))
         }
+    }
+
+    struct RecorderProbe(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl Source for RecorderProbe {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn set_roundtrip_recorder(&self, _recorder: Arc<crate::observability::RoundtripRecorder>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn roundtrip_recorder_reaches_the_wrapped_source() {
+        let got = Arc::new(AtomicBool::new(false));
+        let wrapped = TransformingSource::new(
+            Box::new(RecorderProbe(got.clone())),
+            vec![],
+            Labels::for_named("test"),
+        )
+        .unwrap();
+        wrapped.set_roundtrip_recorder(Arc::new(crate::observability::RoundtripRecorder::new(
+            crate::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "probe",
+        )));
+        assert!(got.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

@@ -176,7 +176,7 @@ pub(crate) fn install_roundtrip_recorders(
     pipeline: &str,
     row: &str,
     meter: Option<&Arc<crate::usage::UsageMeter>>,
-) {
+) -> Arc<crate::observability::ThrottleTally> {
     use crate::observability::{RoundtripRecorder, RoundtripSide};
     let mut src = RoundtripRecorder::new(
         RoundtripSide::Source,
@@ -194,8 +194,10 @@ pub(crate) fn install_roundtrip_recorders(
         src = src.with_meter(Arc::clone(m));
         snk = snk.with_meter(Arc::clone(m));
     }
+    let throttle = src.throttle_tally();
     source.set_roundtrip_recorder(Arc::new(src));
     sink.set_roundtrip_recorder(Arc::new(snk));
+    throttle
 }
 
 impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
@@ -448,7 +450,8 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         // pipeline/row/connector trio every other metric carries; the
         // decorators forward it down to the connector that does the I/O. A
         // connector that never records emits nothing.
-        install_roundtrip_recorders(
+        let run_started = std::time::Instant::now();
+        let throttle = install_roundtrip_recorders(
             &wrapped_source,
             &wrapped_sink,
             &name,
@@ -959,6 +962,13 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         .await;
         if result.is_ok() {
             lag_poller.poll(true).await;
+        }
+        if let Some(msg) = crate::observability::throttle_warning(
+            throttle.throttled(),
+            throttle.wait(),
+            run_started.elapsed(),
+        ) {
+            tracing::warn!(pipeline = %name, row = %row, "{msg}");
         }
 
         // Final run-counter increment. On error, also attach a `kind` label
@@ -3571,6 +3581,43 @@ mod tests {
         assert_eq!(snap.bytes_read, bytes);
         assert_eq!(snap.bytes_written, bytes);
         assert_eq!(sink.written().len(), 2);
+    }
+
+    struct ThrottlingSource(crate::observability::RecorderSlot);
+
+    #[async_trait]
+    impl Source for ThrottlingSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            self.0.throttled();
+            if let Some(r) = self.0.recorder() {
+                r.throttle_wait(std::time::Duration::from_secs(2));
+            }
+            Ok(vec![json!({"id": 1})])
+        }
+        fn set_roundtrip_recorder(&self, recorder: Arc<crate::observability::RoundtripRecorder>) {
+            self.0.install(recorder);
+        }
+    }
+
+    /// Throttling a connector reports reaches the run's usage meter, and a run
+    /// that spent most of its time waiting takes the warning branch (#734).
+    #[tokio::test]
+    async fn source_throttling_lands_on_the_usage_meter() {
+        let source = ThrottlingSource(crate::observability::RecorderSlot::new());
+        let sink = MockSink::new();
+        let meter = Arc::new(crate::usage::UsageMeter::new());
+        Pipeline::new(&source, &sink)
+            .with_name("p")
+            .with_usage_meter(Arc::clone(&meter))
+            .run()
+            .await
+            .unwrap();
+        let snap = meter.snapshot();
+        assert_eq!(snap.throttled, 1);
+        assert!((snap.throttle_wait_secs - 2.0).abs() < 1e-9);
     }
 
     #[test]

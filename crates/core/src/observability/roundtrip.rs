@@ -19,10 +19,12 @@
 //! consistent with the rest, and — unlike a tokio task-local — the `Arc`
 //! survives `tokio::spawn`, which the S3 and Parquet fan-out paths rely on.
 
+use crate::resilience::RetryClass;
 use crate::usage::{CostSignal, UsageMeter, UsageSide};
 use metrics::{Label, SharedString, counter, histogram};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Which side of the pipeline a round trip belongs to. Selects the metric
 /// name, so the counter reads the same way as every other source/sink pair.
@@ -48,6 +50,47 @@ impl RoundtripSide {
             Self::Sink => "faucet_sink_roundtrip_duration_seconds",
         }
     }
+
+    const fn throttled_name(self) -> &'static str {
+        match self {
+            Self::Source => "faucet_source_throttled_total",
+            Self::Sink => "faucet_sink_throttled_total",
+        }
+    }
+
+    const fn throttle_wait_name(self) -> &'static str {
+        match self {
+            Self::Source => "faucet_source_throttle_wait_seconds",
+            Self::Sink => "faucet_sink_throttle_wait_seconds",
+        }
+    }
+
+    const fn retries_name(self) -> &'static str {
+        match self {
+            Self::Source => "faucet_source_retries_total",
+            Self::Sink => "faucet_sink_retries_total",
+        }
+    }
+}
+
+/// Running totals of the rate limiting one recorder observed (#734), shared by
+/// every clone so the pipeline can compare the wait against the run's length.
+#[derive(Debug, Default)]
+pub struct ThrottleTally {
+    throttled: AtomicU64,
+    wait_nanos: AtomicU64,
+}
+
+impl ThrottleTally {
+    /// Rate-limit responses received.
+    pub fn throttled(&self) -> u64 {
+        self.throttled.load(Ordering::Relaxed)
+    }
+
+    /// Time actually slept because of them.
+    pub fn wait(&self) -> Duration {
+        Duration::from_nanos(self.wait_nanos.load(Ordering::Relaxed))
+    }
 }
 
 /// A pre-labelled handle a connector uses to count its own backend calls.
@@ -66,6 +109,7 @@ pub struct RoundtripRecorder {
     /// and cost signal is tallied there as well as emitted as a metric.
     meter: Option<Arc<UsageMeter>>,
     connector: SharedString,
+    throttle: Arc<ThrottleTally>,
 }
 
 impl RoundtripSide {
@@ -95,6 +139,55 @@ impl RoundtripRecorder {
             ],
             meter: None,
             connector,
+            throttle: Arc::new(ThrottleTally::default()),
+        }
+    }
+
+    /// The rate-limit totals this recorder has observed so far.
+    pub fn throttle_tally(&self) -> Arc<ThrottleTally> {
+        Arc::clone(&self.throttle)
+    }
+
+    /// Count one rate-limit response (HTTP 429, a `RateLimited` error, a
+    /// backend's throttling code) — every one received, whether or not it is
+    /// retried. Emits `faucet_source_throttled_total`.
+    pub fn throttled(&self) {
+        counter!(self.side.throttled_name(), self.base.clone()).increment(1);
+        self.throttle.throttled.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = self.metered_source() {
+            m.add_throttled();
+        }
+    }
+
+    /// Record time actually slept because of a rate limit. Pass the measured
+    /// sleep, never the server's `Retry-After` value; [`ThrottleWait`] measures
+    /// it for you, including a sleep cut short by cancellation.
+    pub fn throttle_wait(&self, slept: Duration) {
+        histogram!(self.side.throttle_wait_name(), self.base.clone()).record(slept.as_secs_f64());
+        self.throttle.wait_nanos.fetch_add(
+            u64::try_from(slept.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if let Some(m) = self.metered_source() {
+            m.add_throttle_wait(slept);
+        }
+    }
+
+    /// Count one retry the connector is about to make, by class. Emits
+    /// `faucet_source_retries_total{class}`.
+    pub fn retry(&self, class: RetryClass) {
+        let mut labels = self.base.clone();
+        labels.push(Label::new("class", SharedString::const_str(class.as_str())));
+        counter!(self.side.retries_name(), labels).increment(1);
+        if let Some(m) = self.metered_source() {
+            m.add_source_retry(class.as_str());
+        }
+    }
+
+    fn metered_source(&self) -> Option<&Arc<UsageMeter>> {
+        match self.side {
+            RoundtripSide::Source => self.meter.as_ref(),
+            RoundtripSide::Sink => None,
         }
     }
 
@@ -167,6 +260,74 @@ impl RoundtripRecorder {
     }
 }
 
+/// Measures one rate-limit sleep (#734): hold it across the sleep and the
+/// elapsed time is recorded when it drops — after the sleep completes, when a
+/// cancellation branch wins a `select!`, or when the future is dropped mid-sleep
+/// — so the recorded wait is always what was actually slept.
+#[derive(Debug)]
+#[must_use = "the wait is recorded when the guard drops"]
+pub struct ThrottleWait {
+    recorder: Option<Arc<RoundtripRecorder>>,
+    start: Instant,
+}
+
+impl ThrottleWait {
+    /// Start timing a sleep on behalf of `recorder` (a no-op guard for `None`).
+    pub fn start(recorder: Option<Arc<RoundtripRecorder>>) -> Self {
+        Self {
+            recorder,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ThrottleWait {
+    fn drop(&mut self) {
+        if let Some(r) = &self.recorder {
+            r.throttle_wait(self.start.elapsed());
+        }
+    }
+}
+
+/// Sleep `wait` on behalf of a rate limit, recording the time actually slept
+/// (#734). Returns `false` when `cancel` fired first; the partial wait is still
+/// recorded.
+pub async fn throttle_sleep(
+    recorder: Option<Arc<RoundtripRecorder>>,
+    wait: Duration,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    let _timer = ThrottleWait::start(recorder);
+    match cancel {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => false,
+                _ = tokio::time::sleep(wait) => true,
+            }
+        }
+        None => {
+            tokio::time::sleep(wait).await;
+            true
+        }
+    }
+}
+
+/// The one-line warning a run logs when rate-limit waits took more than a
+/// tenth of it (#734), or `None` when they did not.
+pub fn throttle_warning(throttled: u64, wait: Duration, run: Duration) -> Option<String> {
+    if wait.is_zero() || run.is_zero() || wait.as_secs_f64() * 10.0 <= run.as_secs_f64() {
+        return None;
+    }
+    let pct = (wait.as_secs_f64() / run.as_secs_f64() * 100.0).min(100.0);
+    Some(format!(
+        "source spent {:.1}s of a {:.1}s run ({pct:.0}%) waiting on rate limits \
+         ({throttled} throttled responses); lower concurrency, stagger schedules or raise the quota",
+        wait.as_secs_f64(),
+        run.as_secs_f64(),
+    ))
+}
+
 /// Register descriptions for both sides' counters and histograms. Called once
 /// by `install_observability`.
 pub fn describe_roundtrip_metrics() {
@@ -191,6 +352,19 @@ pub fn describe_roundtrip_metrics() {
         "faucet_sink_roundtrip_duration_seconds",
         metrics::Unit::Seconds,
         "Duration of one sink round trip to its upstream backend"
+    );
+    metrics::describe_counter!(
+        "faucet_source_throttled_total",
+        "Rate-limit responses (HTTP 429 and equivalents) a source received"
+    );
+    metrics::describe_histogram!(
+        "faucet_source_throttle_wait_seconds",
+        metrics::Unit::Seconds,
+        "Time a source actually slept because of one rate-limit response"
+    );
+    metrics::describe_counter!(
+        "faucet_source_retries_total",
+        "Retries a source made against its upstream backend, by retry class"
     );
 }
 
@@ -328,6 +502,175 @@ mod tests {
     }
 
     #[test]
+    fn throttling_feeds_the_tally_the_meter_and_the_metrics() {
+        use crate::observability::decorator::source_tests::{LOCK, snapshotter};
+        use metrics_util::debugging::DebugValue;
+
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshotter();
+        let meter = Arc::new(UsageMeter::new());
+        let r = RoundtripRecorder::new(RoundtripSide::Source, "pipe", "rowT", "rest")
+            .with_meter(meter.clone());
+        let tally = r.throttle_tally();
+        r.throttled();
+        r.throttled();
+        r.throttle_wait(Duration::from_millis(300));
+        r.retry(RetryClass::RateLimited);
+        r.retry(RetryClass::Http5xx);
+        assert_eq!(tally.throttled(), 2);
+        assert_eq!(tally.wait(), Duration::from_millis(300));
+        let usage = meter.snapshot();
+        assert_eq!(usage.throttled, 2);
+        assert!((usage.throttle_wait_secs - 0.3).abs() < 1e-9);
+        assert_eq!(usage.source_retries["rate_limited"], 1);
+        assert_eq!(usage.source_retries["http_5xx"], 1);
+
+        let entries: Vec<_> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().labels().any(|l| l.value() == "rowT"))
+            .collect();
+        let counter = |name: &str, class: Option<&str>| {
+            entries.iter().find_map(|(k, _, _, v)| {
+                let class_ok = class.is_none_or(|c| {
+                    k.key()
+                        .labels()
+                        .any(|l| l.key() == "class" && l.value() == c)
+                });
+                match v {
+                    DebugValue::Counter(n) if k.key().name() == name && class_ok => Some(*n),
+                    _ => None,
+                }
+            })
+        };
+        assert_eq!(counter("faucet_source_throttled_total", None), Some(2));
+        assert_eq!(
+            counter("faucet_source_retries_total", Some("rate_limited")),
+            Some(1)
+        );
+        assert_eq!(
+            counter("faucet_source_retries_total", Some("http_5xx")),
+            Some(1)
+        );
+        assert!(entries.iter().any(|(k, _, _, v)| {
+            k.key().name() == "faucet_source_throttle_wait_seconds"
+                && matches!(v, DebugValue::Histogram(h) if h.len() == 1)
+        }));
+    }
+
+    #[test]
+    fn sink_side_throttling_emits_metrics_but_stays_off_the_usage_record() {
+        let meter = Arc::new(UsageMeter::new());
+        let r =
+            RoundtripRecorder::new(RoundtripSide::Sink, "p", "r", "http").with_meter(meter.clone());
+        r.throttled();
+        r.throttle_wait(Duration::from_millis(5));
+        r.retry(RetryClass::Timeout);
+        assert_eq!(r.throttle_tally().throttled(), 1);
+        let usage = meter.snapshot();
+        assert_eq!(usage.throttled, 0);
+        assert!(usage.source_retries.is_empty());
+        assert_eq!(
+            RoundtripSide::Sink.throttled_name(),
+            "faucet_sink_throttled_total"
+        );
+        assert_eq!(
+            RoundtripSide::Sink.throttle_wait_name(),
+            "faucet_sink_throttle_wait_seconds"
+        );
+        assert_eq!(
+            RoundtripSide::Sink.retries_name(),
+            "faucet_sink_retries_total"
+        );
+    }
+
+    #[tokio::test]
+    async fn throttle_sleep_records_the_time_actually_slept() {
+        let r = Arc::new(RoundtripRecorder::new(
+            RoundtripSide::Source,
+            "p",
+            "r",
+            "rest",
+        ));
+        let tally = r.throttle_tally();
+        assert!(throttle_sleep(Some(r.clone()), Duration::from_millis(40), None).await);
+        let full = tally.wait();
+        assert!(full >= Duration::from_millis(40), "{full:?}");
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let t = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            t.cancel();
+        });
+        let completed =
+            throttle_sleep(Some(r.clone()), Duration::from_secs(30), Some(&token)).await;
+        assert!(!completed, "cancellation wins");
+        let partial = tally.wait() - full;
+        assert!(
+            partial >= Duration::from_millis(25) && partial < Duration::from_secs(5),
+            "the partial wait is recorded, not the requested 30 s: {partial:?}"
+        );
+
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(throttle_sleep(None, Duration::from_millis(1), Some(&token)).await);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_sleep_still_records_its_partial_wait() {
+        let slot = RecorderSlot::new();
+        slot.throttled();
+        slot.retry(RetryClass::Connection);
+        drop(slot.throttle_wait_timer());
+        let r = Arc::new(RoundtripRecorder::new(
+            RoundtripSide::Source,
+            "p",
+            "r",
+            "rest",
+        ));
+        slot.install(r.clone());
+        slot.throttled();
+        slot.retry(RetryClass::Connection);
+        let tally = r.throttle_tally();
+        let sleeping = async {
+            let _t = slot.throttle_wait_timer();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(30), sleeping).await;
+        assert_eq!(tally.throttled(), 1);
+        assert!(
+            tally.wait() >= Duration::from_millis(25),
+            "{:?}",
+            tally.wait()
+        );
+        assert!(tally.wait() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn warns_only_when_waiting_exceeds_a_tenth_of_the_run() {
+        assert_eq!(
+            throttle_warning(0, Duration::ZERO, Duration::from_secs(10)),
+            None
+        );
+        assert_eq!(
+            throttle_warning(3, Duration::from_secs(1), Duration::from_secs(10)),
+            None,
+            "exactly 10% does not warn"
+        );
+        assert_eq!(
+            throttle_warning(3, Duration::from_secs(1), Duration::ZERO),
+            None
+        );
+        let msg = throttle_warning(312, Duration::from_secs(2460), Duration::from_secs(3600))
+            .expect("68% warns");
+        assert!(msg.contains("2460.0s of a 3600.0s run (68%)"), "{msg}");
+        assert!(msg.contains("312 throttled responses"), "{msg}");
+        let capped = throttle_warning(1, Duration::from_secs(20), Duration::from_secs(10)).unwrap();
+        assert!(capped.contains("(100%)"), "{capped}");
+    }
+
+    #[test]
     fn clone_shares_the_prebuilt_labels() {
         let r = RoundtripRecorder::new(RoundtripSide::Source, "p", "r", "kafka");
         let c = r.clone();
@@ -375,6 +718,25 @@ impl RecorderSlot {
         if let Some(r) = self.0.get() {
             r.record_timed(op, elapsed);
         }
+    }
+
+    /// Count one rate-limit response when a recorder is installed.
+    pub fn throttled(&self) {
+        if let Some(r) = self.0.get() {
+            r.throttled();
+        }
+    }
+
+    /// Count one retry of `class` when a recorder is installed.
+    pub fn retry(&self, class: RetryClass) {
+        if let Some(r) = self.0.get() {
+            r.retry(class);
+        }
+    }
+
+    /// Start timing a rate-limit sleep ([`ThrottleWait`]).
+    pub fn throttle_wait_timer(&self) -> ThrottleWait {
+        ThrottleWait::start(self.recorder())
     }
 
     /// Report a backend-measured usage figure when a recorder is installed.
