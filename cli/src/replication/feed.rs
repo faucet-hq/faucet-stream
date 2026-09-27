@@ -106,6 +106,14 @@ impl Source for ChannelSource {
         self.inner.config_schema()
     }
 
+    fn state_key(&self) -> Option<String> {
+        Some(
+            self.inner
+                .state_key()
+                .unwrap_or_else(|| "mirror".to_string()),
+        )
+    }
+
     fn connector_name(&self) -> &'static str {
         self.inner.connector_name()
     }
@@ -128,6 +136,24 @@ impl Source for ChannelSource {
 
     fn dataset_uri(&self) -> String {
         self.inner.dataset_uri()
+    }
+}
+
+/// A source with nothing to read and no identity of its own — backs the empty
+/// feed of an atomic destination truncate.
+pub struct EmptySource;
+
+#[async_trait::async_trait]
+impl Source for EmptySource {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        Ok(Vec::new())
+    }
+
+    fn connector_name(&self) -> &'static str {
+        "mirror"
     }
 }
 
@@ -650,10 +676,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_closed_feed_is_an_empty_source() {
+        let (feed, source) = channel("t", Arc::new(EmptySource));
+        drop(feed);
+        assert!(
+            source
+                .fetch_with_context(&HashMap::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(source.connector_name(), "mirror");
+        assert!(
+            EmptySource
+                .fetch_with_context(&HashMap::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn channel_source_reports_the_inner_identity() {
         let src = script(vec![]);
         let (_f, c) = channel("a", src.clone());
         assert_eq!(c.connector_name(), "script");
+        assert_eq!(
+            c.state_key().as_deref(),
+            Some("mirror"),
+            "resumable even when the inner has no key"
+        );
         assert_eq!(c.state_schema(), 0);
         assert_eq!(c.migrate_state(0, json!(1)).unwrap(), json!(1));
         assert!(!c.supports_exactly_once());

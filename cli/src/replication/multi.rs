@@ -114,6 +114,21 @@ impl Shared {
         node
     }
 
+    /// Whether a snapshot replaces the destination atomically (so a redo or a
+    /// re-sync after a pause leaves no row the source no longer has).
+    fn snapshot_replaces(&self) -> bool {
+        crate::registry::sink_supports_overwrite(&self.sink_kind)
+    }
+
+    /// Whether the table's destination already exists (asked of the sinks
+    /// whose keyed writes need the destination's own key constraint).
+    async fn destination_exists(&self, plan: &TablePlan) -> CliResult<bool> {
+        let sink =
+            crate::registry::build_sink(&self.sink_kind, plan.sink_config.clone(), &self.opts.auth)
+                .await?;
+        Ok(sink.current_schema().await?.is_some())
+    }
+
     /// Tables currently sharing the change stream with `table` (for scoping
     /// the capture connection).
     async fn stream_mates(&self, table: &str) -> Vec<String> {
@@ -313,15 +328,55 @@ async fn snapshot_table(
     shared.persist().await?;
     tracing::info!(pipeline = %shared.opts.pipeline_name, table = %table, shards = shards.len(), "mirror: snapshotting table");
 
+    let missing = !plan.key.is_empty()
+        && KEY_CONSTRAINT_SINKS.contains(&shared.sink_kind.as_str())
+        && !shared.destination_exists(&plan).await?;
+    let strategy = snapshot_strategy(shared.snapshot_replaces(), missing, shards.len());
+    if strategy.clear_first {
+        let summary = run_expanded(
+            vec![snapshot_as_overwrite(&snap, true)],
+            make_opts(&shared.opts, Some(cancel.clone())),
+        )
+        .await?;
+        if let Some(e) = summary_error(&summary) {
+            return Err(CliError::Internal(format!(
+                "clearing '{table}' before its sharded snapshot failed: {e}"
+            )));
+        }
+    }
     let mut runs = JoinSet::new();
+    let mut first_alone = strategy.first_shard_alone;
     for shard in shards {
-        let mut node = snap.clone();
+        let mut node = if strategy.overwrite {
+            snapshot_as_overwrite(&snap, false)
+        } else {
+            snap.clone()
+        };
         let mut opts = make_opts(&shared.opts, Some(cancel.clone()));
         if let Some(spec) = shard {
             node.source.config = spec.0;
             opts.shard = Some(spec.1);
         }
         runs.spawn(async move { run_expanded(vec![node], opts).await });
+        if first_alone {
+            first_alone = false;
+            if let Some(joined) = runs.join_next().await {
+                let summary =
+                    joined.map_err(|e| CliError::Internal(format!("snapshot task: {e}")))??;
+                if let Some(e) = summary_error(&summary) {
+                    return Err(CliError::Internal(format!(
+                        "snapshot of '{table}' failed: {e}"
+                    )));
+                }
+                let mut state = shared.state.lock().await;
+                multi_state::mark_shard_done(
+                    &mut state,
+                    &table,
+                    summary_rows(&summary),
+                    Utc::now(),
+                );
+            }
+        }
     }
     let mut failure: Option<String> = None;
     while let Some(joined) = runs.join_next().await {
@@ -357,6 +412,68 @@ async fn snapshot_table(
     shared.persist().await?;
     tracing::info!(pipeline = %shared.opts.pipeline_name, table = %table, "mirror: snapshot complete; table joins the stream");
     Ok(true)
+}
+
+/// The snapshot node rewritten to replace the destination (`write_mode:
+/// overwrite`). With `empty`, it reads nothing — an atomic truncate ahead of a
+/// sharded snapshot whose ranges then write in the table's own mode.
+fn snapshot_as_overwrite(snap: &ExpandedNode, empty: bool) -> ExpandedNode {
+    let mut node = snap.clone();
+    if let Some(obj) = node.sink.config.as_object_mut() {
+        obj.insert("write_mode".into(), json!("overwrite"));
+        obj.remove("delete_marker");
+        obj.remove("key");
+    }
+    node.schema = None;
+    if empty {
+        node.id = format!("{}::clear", node.id);
+        let (feed, source) = feed::channel(&node.id, Arc::new(feed::EmptySource));
+        drop(feed);
+        node.source_override = Some(crate::dlq_replay::reader::SourceOverride::new(Box::new(
+            source,
+        )));
+    }
+    node
+}
+
+/// Sinks whose keyed upsert relies on a key constraint in the destination
+/// table — a snapshot must create their table keyed, never by an overwrite's
+/// keyless first-run swap.
+const KEY_CONSTRAINT_SINKS: &[&str] = &["postgres", "mysql", "sqlite", "mssql"];
+
+/// How a table's snapshot writes its destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SnapshotStrategy {
+    /// Atomically empty the destination first (sharded re-snapshot).
+    clear_first: bool,
+    /// Write the snapshot as an atomic overwrite.
+    overwrite: bool,
+    /// Run the first range alone (it creates the destination) before the rest.
+    first_shard_alone: bool,
+}
+
+/// Pick the snapshot's write strategy. A destination that can be replaced
+/// atomically is — so a redo or a re-sync leaves no row the source no longer
+/// has — except a keyed destination that does not exist yet, which the
+/// table's own keyed mode must create (with its key constraint).
+fn snapshot_strategy(replaces: bool, missing_keyed: bool, shards: usize) -> SnapshotStrategy {
+    if !replaces || missing_keyed {
+        return SnapshotStrategy {
+            first_shard_alone: missing_keyed && shards > 1,
+            ..Default::default()
+        };
+    }
+    if shards <= 1 {
+        SnapshotStrategy {
+            overwrite: true,
+            ..Default::default()
+        }
+    } else {
+        SnapshotStrategy {
+            clear_first: true,
+            ..Default::default()
+        }
+    }
 }
 
 type ShardRun = Option<(Value, faucet_core::ShardSpec)>;
@@ -712,6 +829,15 @@ impl Driver {
     }
 }
 
+/// Aborts a helper task when the cycle (or the whole mirror future) ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> {
     let mut d = Driver {
         shared,
@@ -803,10 +929,10 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
                         }
                     })
                 };
+                let _guards = (AbortOnDrop(watcher), AbortOnDrop(ticker));
                 let cycle = run_cycle(&d.shared, active, cycle_cancel.clone()).await;
                 let interrupted = cycle_cancel.is_cancelled();
-                watcher.abort();
-                ticker.abort();
+                drop(_guards);
                 let ok = d.apply_cycle(&cycle).await?;
                 if !cycle.new_tables.is_empty() {
                     tracing::info!(pipeline = %d.shared.opts.pipeline_name, tables = ?cycle.new_tables, "mirror: new tables seen on the stream; re-discovering");
@@ -877,6 +1003,61 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_replace_the_destination_and_clearing_reads_nothing() {
+        let cfg = crate::config::parse_with_extension(
+            r#"
+version: 1
+name: m
+pipeline:
+  source: { type: postgres, config: { connection_url: "postgres://x", query: "SELECT 1" } }
+  sink:   { type: postgres, config: { connection_url: "postgres://y", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id], delete_marker: { field: __op, values: [d] } } }
+  schema: { on_drift: evolve }
+"#,
+            "yaml",
+        )
+        .unwrap();
+        let snap = expand(&cfg).unwrap().remove(0);
+        let whole = snapshot_as_overwrite(&snap, false);
+        assert_eq!(whole.sink.config["write_mode"], "overwrite");
+        assert!(whole.sink.config.get("delete_marker").is_none());
+        assert!(whole.sink.config.get("key").is_none());
+        assert!(whole.schema.is_none());
+        assert!(whole.source_override.is_none());
+        let clear = snapshot_as_overwrite(&snap, true);
+        assert!(clear.id.ends_with("::clear"));
+        assert!(clear.source_override.is_some());
+    }
+
+    #[test]
+    fn snapshot_strategies() {
+        let s = |r, m, n| snapshot_strategy(r, m, n);
+        assert_eq!(
+            s(true, false, 1),
+            SnapshotStrategy {
+                overwrite: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            s(true, false, 4),
+            SnapshotStrategy {
+                clear_first: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(s(true, true, 1), SnapshotStrategy::default());
+        assert_eq!(
+            s(true, true, 4),
+            SnapshotStrategy {
+                first_shard_alone: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(s(false, false, 4), SnapshotStrategy::default());
+        assert_eq!(s(false, true, 1), SnapshotStrategy::default());
+    }
 
     #[test]
     fn summaries_fold_rows_and_errors() {

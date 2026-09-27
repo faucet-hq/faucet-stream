@@ -241,7 +241,10 @@ pub fn reconcile_discovery(
                 t.apply_plan(plan);
             }
             (Some(t), Resolution::Refused(reason)) => {
-                if matches!(t.phase, TablePhase::Pending | TablePhase::Refused) {
+                let changed = t.phase == TablePhase::Pending
+                    || (t.phase == TablePhase::Refused
+                        && t.last_error.as_deref() != Some(reason.as_str()));
+                if changed {
                     t.set_phase(TablePhase::Refused, now);
                     t.last_error = Some(reason.clone());
                     diff.refused.push(name.clone());
@@ -454,6 +457,11 @@ mod tests {
         assert_eq!(d.added, vec!["c"]);
         assert_eq!(d.refused, vec!["b"], "refused again with the new reason");
         assert_eq!(s.tables["b"].last_error.as_deref(), Some("x"));
+        let d = reconcile_discovery(&mut s, &two, true, t0());
+        assert!(
+            d.refused.is_empty(),
+            "an unchanged refusal is not reported again"
+        );
     }
 
     #[test]
