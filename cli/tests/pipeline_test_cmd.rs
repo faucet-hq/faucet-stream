@@ -422,6 +422,19 @@ fn shipped_masking_example_spec_passes() {
         .stdout(contains("3 tests, 3 passed, 0 failed"));
 }
 
+#[cfg(feature = "transform-zip-columns")]
+#[test]
+fn shipped_zip_columns_groups_spec_passes() {
+    // #746: the GA4 runReport fixture (quoted by the transforms cookbook).
+    let spec =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/tests/zip_columns_groups_tests.yaml");
+    faucet()
+        .arg(&spec)
+        .assert()
+        .success()
+        .stdout(contains("3 tests, 3 passed, 0 failed"));
+}
+
 #[test]
 fn resolve_secrets_flag_loads_plain_config() {
     // --resolve-secrets on a config with no secret directives goes through the

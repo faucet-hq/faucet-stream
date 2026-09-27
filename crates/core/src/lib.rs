@@ -239,7 +239,7 @@ pub use write_mode::{
     key_to_filter, plan_writes, sql_literal,
 };
 #[cfg(feature = "transform-zip-columns")]
-pub use zip_columns::{CompiledZipColumns, ZipColumnsSpec};
+pub use zip_columns::{ColumnGroupSpec, CompiledZipColumns, ZipColumnsSpec};
 
 // Re-export dependencies that connector authors need, so they only depend on
 // `faucet-core` instead of adding `async-trait` and `serde_json` themselves.
