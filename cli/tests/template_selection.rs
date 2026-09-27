@@ -389,6 +389,48 @@ async fn rows_api_describes_every_group_and_resolves_selections() {
     assert_eq!(code, 422);
     let (code, _) = api.get("/v1/templates/nope/rows").await;
     assert_eq!(code, 404);
+    // A pipeline takes no sink; a sink must be a sink template.
+    let (code, _) = api.get("/v1/templates/hr/rows?sink=files").await;
+    assert_eq!(code, 422);
+    let (code, _) = api.get("/v1/templates/crm/rows?sink=hr").await;
+    assert_eq!(code, 422);
+
+    // An overlay's state store backs the state group of a composed listing.
+    let ops = format!(
+        "kind: deployment\nname: ops\nstate: {{ type: file, config: {{ path: \"{}\" }} }}\n",
+        dir.path().join("ops-state").display()
+    );
+    api.register(ops).await;
+    let (code, r) = api
+        .get("/v1/templates/crm/rows?sink=files&overlay=ops")
+        .await;
+    assert_eq!(code, 200, "{r}");
+    assert!(row(&r, "accounts")["state"]["health"].is_string(), "{r}");
+    assert_eq!(
+        row(&r, "accounts")["read"]["resumable"],
+        false,
+        "a full-refresh CSV stream does not bookmark"
+    );
+}
+
+#[test]
+fn a_topology_refuses_a_selection_on_the_cli() {
+    on_big_stack(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let d = data(dir.path());
+        let out = dir.path().join("out");
+        let p = dir.path().join("topo.yaml");
+        std::fs::write(&p, topology_template(&d, &out)).unwrap();
+        let e = cli(&[
+            "run".to_string(),
+            p.to_str().unwrap().to_string(),
+            "--select".to_string(),
+            "src".to_string(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(e.to_string().contains("topology"), "{e}");
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
