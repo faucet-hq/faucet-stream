@@ -528,11 +528,74 @@ impl Source for SamplingSource {
     fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
         self.inner.migrate_state(from, data)
     }
+
+    fn record_table(&self, record: &Value) -> Option<String> {
+        self.inner.record_table(record)
+    }
+
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        self.inner.position_le(a, b)
+    }
+
+    fn position_min(&self, positions: &[Value]) -> Option<Value> {
+        self.inner.position_min(positions)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A change-stream double with its own multi-table hooks (#731).
+    struct RoutedSource;
+
+    #[async_trait::async_trait]
+    impl faucet_core::Source for RoutedSource {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, serde_json::Value>,
+        ) -> Result<Vec<serde_json::Value>, faucet_core::FaucetError> {
+            Ok(Vec::new())
+        }
+
+        fn record_table(&self, record: &serde_json::Value) -> Option<String> {
+            record.get("t")?.as_str().map(str::to_string)
+        }
+
+        fn position_le(&self, a: &serde_json::Value, b: &serde_json::Value) -> Option<bool> {
+            Some(a.as_u64()? <= b.as_u64()?)
+        }
+
+        fn position_min(&self, _positions: &[serde_json::Value]) -> Option<serde_json::Value> {
+            Some(serde_json::json!("inner-min"))
+        }
+    }
+
+    fn assert_forwards_multi_table_hooks(s: &dyn faucet_core::Source) {
+        assert_eq!(
+            s.record_table(&serde_json::json!({"t": "public.a"}))
+                .as_deref(),
+            Some("public.a")
+        );
+        assert_eq!(
+            s.position_le(&serde_json::json!(1), &serde_json::json!(2)),
+            Some(true)
+        );
+        assert_eq!(
+            s.position_le(&serde_json::json!(3), &serde_json::json!(2)),
+            Some(false)
+        );
+        assert_eq!(
+            s.position_min(&[serde_json::json!(1), serde_json::json!(2)]),
+            Some(serde_json::json!("inner-min"))
+        );
+    }
+
+    #[test]
+    fn multi_table_hooks_are_forwarded_to_the_inner_source() {
+        let wrapped = SamplingSource::new(Box::new(RoutedSource), Arc::new(SampleState::new(1)));
+        assert_forwards_multi_table_hooks(&wrapped);
+    }
     use async_trait::async_trait;
     use faucet_core::{FaucetError, Sink};
     use serde_json::{Value, json};

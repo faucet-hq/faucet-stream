@@ -126,6 +126,18 @@ impl Source for ChannelSource {
         self.inner.migrate_state(from, data)
     }
 
+    fn record_table(&self, record: &Value) -> Option<String> {
+        self.inner.record_table(record)
+    }
+
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        self.inner.position_le(a, b)
+    }
+
+    fn position_min(&self, positions: &[Value]) -> Option<Value> {
+        self.inner.position_min(positions)
+    }
+
     fn supports_exactly_once(&self) -> bool {
         self.inner.supports_exactly_once()
     }
@@ -744,6 +756,9 @@ mod tests {
         let src = script(vec![]);
         let (_f, c) = channel("a", src.clone());
         assert_eq!(c.connector_name(), "script");
+        assert_eq!(c.record_table(&json!({"table": "a"})).as_deref(), Some("a"));
+        assert_eq!(c.position_le(&json!(1), &json!(2)), Some(true));
+        assert_eq!(c.position_min(&[json!(4), json!(2)]), Some(json!(2)));
         assert_eq!(
             c.state_key().as_deref(),
             Some("mirror"),
