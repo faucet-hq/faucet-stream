@@ -1019,7 +1019,7 @@ fn run_auto_discovers_faucet_yaml_and_dotenv_in_cwd() {
     fs::write(&csv, "name\nzed\n").unwrap();
     fs::write(
         dir.path().join(".env"),
-        format!("DISCOVERED_OUT={}\n", out.display()),
+        format!("DISCOVERED_OUT='{}'\n", out.display()),
     )
     .unwrap();
     fs::write(
