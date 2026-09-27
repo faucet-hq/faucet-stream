@@ -219,7 +219,9 @@ net). Requires `replication_method: incremental` + `replication_key`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `into` | `query \| header \| body \| path` | `query` | Where to place the rendered bookmark. |
-| `name` | string | — | Query param / header / body-field / path-placeholder name. |
+| `name` | string | — | Query param / header / top-level body-field / path-placeholder name. Omit it for `into: body` with a `path`. |
+| `path` | string / null | `null` | `into: body` only: an RFC 6901 JSON Pointer into the configured `body` (`/filterGroups/0/filters/0/value`) instead of a top-level `name`. Set exactly one of `name` / `path`. The pointer must resolve to an existing scalar (or `null`), or to a new key of an existing object — array elements and intermediate objects are never created, and an unresolvable pointer fails the request naming it. Requires a JSON object `body`; two binds may not write the same pointer. |
+| `value_type` | `string \| number` | `string` | JSON type a body bind writes — `number` for an `epoch_ms` / `epoch_s` value an API wants unquoted. |
 | `template` | string | `${bookmark}` | Rendered with `${bookmark}` → the formatted value, e.g. `"gte\|${bookmark}"`, `"[${bookmark} TO *]"`. |
 | `format` | `raw \| iso8601 \| epoch_s \| epoch_ms \| date` | `raw` | Value formatting (string↔epoch conversion via a parsed instant). |
 | `advance_from` | string / null | `null` | JSONPath into the **response** to advance the bookmark from, instead of `max(record[replication_key])`. |
@@ -234,6 +236,27 @@ replication_bind:
   template: "gte|${bookmark}"
   format: iso8601
 ```
+
+A POST-search API whose filter sits deep in the body (HubSpot CRM search) takes
+the bookmark through a JSON Pointer. The value is written after any
+`${parent.*}` substitution, on the first request and on every paginated one:
+
+```yaml
+method: POST
+body:
+  filterGroups:
+    - filters: [{ propertyName: hs_lastmodifieddate, operator: GTE, value: null }]
+replication_key: updatedAt
+replication_bind:
+  into: body
+  path: /filterGroups/0/filters/0/value
+  format: epoch_ms
+  value_type: number
+```
+
+A windowed report API (GA4 `runReport`) can place both bounds the same way:
+`lower: { into: body, path: /dateRanges/0/startDate, format: date }` and
+`upper: { into: body, path: /dateRanges/0/endDate, format: date }`.
 
 #### Datetime window slicing (`window`)
 
@@ -263,7 +286,9 @@ the window start, the `upper` bind the window end.
 
 A `WindowBind` has `into` (`query \| header \| body \| path`, default `query`),
 `name`, `template` (default `${window}`, e.g. `"[${window} TO *]"`), and `format`
-(`raw \| iso8601 \| epoch_s \| epoch_ms \| date`).
+(`raw \| iso8601 \| epoch_s \| epoch_ms \| date`). Like `replication_bind`, a
+body window bind may use `path` (a JSON Pointer) instead of `name`, and
+`value_type`.
 
 ```yaml
 replication_method: { type: incremental }
@@ -781,7 +806,7 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 |----------------|--------|------------|
 | `None` | — | After the first page. |
 | `Cursor` | `next_token_path`, `param_name` | Next-token JSONPath is null/absent, or the same cursor repeats (loop detection). |
-| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. HubSpot CRM `POST …/search` — `$.paging.next.after` → `after`. |
+| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. HubSpot CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |

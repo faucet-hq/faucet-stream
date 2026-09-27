@@ -35,6 +35,27 @@ three forms:
 The key must resolve to a single value; it is not a JSONPath. It is resolved on
 the raw records, before transforms run, so no `flatten` is needed.
 
+### Pushing the bookmark into a nested request body
+
+A `replication_bind` with `into: body` writes the bookmark into the JSON request
+body — as a top-level field (`name`) or at any location addressed by a JSON
+Pointer (`path`):
+
+```yaml
+replication_bind:
+  into: body
+  path: /filterGroups/0/filters/0/value   # HubSpot CRM search filter
+  format: epoch_ms
+  value_type: number                      # write 1717200000000, not "1717200000000"
+```
+
+The pointer must resolve to an existing scalar (or `null`) in the configured
+`body`, or to a new key of an existing object; array elements are never
+created. `window` binds accept the same `path` / `value_type`, so GA4-style
+`dateRanges[0].startDate` / `endDate` can be windowed. Set exactly one of
+`name` or `path`, configure a JSON object `body`, and don't point two binds at
+the same location — all three are checked at load time.
+
 ### Records without the key
 
 A record whose key is missing or `null` is **kept** by default — dropping it

@@ -49,7 +49,7 @@ pub struct RestStream {
     /// by the window loop in `stream_pages_inner` before each window's pages;
     /// empty when no `window:` block is configured. Each entry is
     /// `(target, name, rendered-value)`.
-    window_binds: Arc<AsyncMutex<Vec<(BindTarget, String, String)>>>,
+    window_binds: Arc<AsyncMutex<Vec<ResolvedBind>>>,
     /// Test-only override for the "now" upper bound of datetime window slicing
     /// (#527). `None` in production (uses `Utc::now()`); set by unit tests so the
     /// window enumeration is deterministic.
@@ -80,6 +80,28 @@ pub struct RestStream {
     replication_key: Option<ReplicationKey>,
     /// Set once the missing-key warning has been logged (once per instance).
     missing_key_warned: std::sync::atomic::AtomicBool,
+}
+
+/// A bookmark or window bind rendered for the current request (#513/#527/#748).
+#[derive(Debug, Clone)]
+struct ResolvedBind {
+    target: BindTarget,
+    name: String,
+    path: Option<String>,
+    value_type: faucet_core::BindValueType,
+    rendered: String,
+}
+
+impl ResolvedBind {
+    fn window(bind: &faucet_core::WindowBind, rendered: String) -> Self {
+        Self {
+            target: bind.into,
+            name: bind.name.clone(),
+            path: bind.path.clone(),
+            value_type: bind.value_type,
+            rendered,
+        }
+    }
 }
 
 /// Default value of [`RestStreamConfig::max_retries`]. When the user leaves this
@@ -1099,9 +1121,8 @@ impl RestStream {
                         .window
                         .as_ref()
                         .expect("a window pass implies a `window:` block");
-                    let lower = (win.lower.into, win.lower.name.clone(), win.render_lower(w));
-                    let upper_rendered = win.render_upper(w)?;
-                    let upper = (win.upper.into, win.upper.name.clone(), upper_rendered);
+                    let lower = ResolvedBind::window(&win.lower, win.render_lower(w));
+                    let upper = ResolvedBind::window(&win.upper, win.render_upper(w)?);
                     *self.window_binds.lock().await = vec![lower, upper];
                 }
 
@@ -1492,7 +1513,7 @@ impl RestStream {
     /// Resolve the server-side push-down binding for this run:
     /// `(target, name, rendered-value)`. Returns `None` when no `replication_bind`
     /// is configured or there is no bookmark yet (first run — a full pull).
-    async fn resolved_bind(&self) -> Result<Option<(BindTarget, String, String)>, FaucetError> {
+    async fn resolved_bind(&self) -> Result<Option<ResolvedBind>, FaucetError> {
         let Some(bind) = &self.config.replication_bind else {
             return Ok(None);
         };
@@ -1502,7 +1523,13 @@ impl RestStream {
         }
         .or_else(|| self.config.start_replication_value.clone());
         match bookmark {
-            Some(bm) => Ok(Some((bind.into, bind.name.clone(), bind.render(&bm)?))),
+            Some(bm) => Ok(Some(ResolvedBind {
+                target: bind.into,
+                name: bind.name.clone(),
+                path: bind.path.clone(),
+                value_type: bind.value_type,
+                rendered: bind.render(&bm)?,
+            })),
             None => Ok(None),
         }
     }
@@ -1950,7 +1977,7 @@ impl RestStream {
         // #513 server-side push-down + #527 window slicing: the outgoing request
         // carries the bookmark binding (0 or 1) plus the current window's rendered
         // lower/upper bounds (0 or 2). They apply at the same four placement sites.
-        let mut binds: Vec<(BindTarget, String, String)> = Vec::new();
+        let mut binds: Vec<ResolvedBind> = Vec::new();
         if let Some(b) = self.resolved_bind().await? {
             binds.push(b);
         }
@@ -2011,9 +2038,9 @@ impl RestStream {
                 format!("{}/{}", base_url, path.trim_start_matches('/'))
             }
         };
-        for (target, name, rendered) in &binds {
-            if *target == BindTarget::Path {
-                url = url.replace(&format!("{{{name}}}"), rendered);
+        for b in &binds {
+            if b.target == BindTarget::Path {
+                url = url.replace(&format!("{{{}}}", b.name), &b.rendered);
             }
         }
         // #567: substitute flow-captured `${name}` values into the URL (a
@@ -2131,9 +2158,9 @@ impl RestStream {
             insert_header(&mut headers, "Cookie", &cookie)?;
         }
         // #513/#527 header-target bindings.
-        for (target, name, rendered) in &binds {
-            if *target == BindTarget::Header {
-                insert_header(&mut headers, name, rendered)?;
+        for b in &binds {
+            if b.target == BindTarget::Header {
+                insert_header(&mut headers, &b.name, &b.rendered)?;
             }
         }
 
@@ -2189,9 +2216,9 @@ impl RestStream {
             req = req.query(&pairs);
         }
         // #513/#527 query-target bindings.
-        for (target, name, rendered) in &binds {
-            if *target == BindTarget::Query {
-                req = req.query(&[(name.as_str(), rendered.as_str())]);
+        for b in &binds {
+            if b.target == BindTarget::Query {
+                req = req.query(&[(b.name.as_str(), b.rendered.as_str())]);
             }
         }
 
@@ -2233,9 +2260,13 @@ impl RestStream {
         if !body_params.is_empty() {
             let obj = body_value.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
             match obj.as_object_mut() {
-                Some(map) => {
+                Some(_) => {
                     for (field, value) in body_params {
-                        map.insert(field.clone(), value.clone());
+                        if field.starts_with('/') {
+                            faucet_core::set_body_pointer(obj, field, value.clone())?;
+                        } else if let Some(map) = obj.as_object_mut() {
+                            map.insert(field.clone(), value.clone());
+                        }
                     }
                 }
                 None => {
@@ -2248,7 +2279,7 @@ impl RestStream {
             }
         }
         // #511 body-field placements + #513/#527 body-target bindings.
-        let has_body_bind = binds.iter().any(|(t, _, _)| *t == BindTarget::Body);
+        let has_body_bind = binds.iter().any(|b| b.target == BindTarget::Body);
         if !ra_body.is_empty() || has_body_bind {
             let obj = body_value.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
             match obj.as_object_mut() {
@@ -2256,9 +2287,15 @@ impl RestStream {
                     for (name, value) in &ra_body {
                         map.insert(name.clone(), Value::String(value.clone()));
                     }
-                    for (target, name, rendered) in &binds {
-                        if *target == BindTarget::Body {
-                            map.insert(name.clone(), Value::String(rendered.clone()));
+                    for b in binds.iter().filter(|b| b.target == BindTarget::Body) {
+                        let value = b.value_type.to_value(&b.rendered)?;
+                        match &b.path {
+                            Some(pointer) => faucet_core::set_body_pointer(obj, pointer, value)?,
+                            None => {
+                                if let Some(map) = obj.as_object_mut() {
+                                    map.insert(b.name.clone(), value);
+                                }
+                            }
                         }
                     }
                 }

@@ -59,6 +59,11 @@ pub enum PaginationStyle {
     /// `next_token_path` is null/absent, and a repeated cursor trips the same
     /// loop guard as [`PaginationStyle::Cursor`]. Used by e.g. HubSpot CRM
     /// `POST /crm/v3/objects/{obj}/search` (`$.paging.next.after` → `after`).
+    ///
+    /// `body_cursor_field` may also be an RFC 6901 JSON Pointer
+    /// (`/variables/after`) for a nested location — e.g. a GraphQL request
+    /// sent through the REST source. The pointer must resolve to an existing
+    /// value, or to a new key of an existing object (#751).
     CursorInBody {
         next_token_path: String,
         body_cursor_field: String,
@@ -91,6 +96,8 @@ pub enum PaginationStyle {
     /// offset advances by the page's record count. With `stop_when_short`
     /// (default `true`) a page shorter than `limit` ends pagination; a zero-record
     /// page always ends it, and a repeated identical page trips a loop guard.
+    /// Either field may be a JSON Pointer (`/page/offset`) for a nested
+    /// location, with the same rules as `CursorInBody.body_cursor_field`.
     OffsetInBody {
         offset_field: String,
         limit_field: String,

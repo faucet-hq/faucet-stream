@@ -62,8 +62,17 @@ pub struct WindowBind {
     /// path placeholder).
     #[serde(default)]
     pub into: BindTarget,
-    /// The parameter / header / body-field / path-placeholder name.
+    /// The parameter / header / body-field / path-placeholder name. Optional
+    /// only for `into: body` with a `path`.
+    #[serde(default)]
     pub name: String,
+    /// `into: body` only: an RFC 6901 JSON Pointer into the configured `body`
+    /// (`/dateRanges/0/startDate`) instead of a top-level `name` (#748).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// JSON type written by a body bind: `string` (default) or `number`.
+    #[serde(default)]
+    pub value_type: crate::replication::BindValueType,
     /// Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the
     /// formatted boundary. Defaults to the bare `${window}`; set e.g.
     /// `"gte|${window}"` or `"[${window} TO *]"`.
@@ -78,11 +87,12 @@ impl WindowBind {
     /// Validate the bind at config-load time. `side` names the field for errors
     /// (`"lower"` / `"upper"`).
     pub fn validate(&self, side: &str) -> Result<(), FaucetError> {
-        if self.name.trim().is_empty() {
-            return Err(FaucetError::Config(format!(
-                "window slicing: `{side}.name` must not be empty"
-            )));
-        }
+        crate::replication::validate_bind_placement(
+            &format!("window slicing `{side}`"),
+            self.into,
+            &self.name,
+            self.path.as_deref(),
+        )?;
         if !self.template.contains(WINDOW_PLACEHOLDER) {
             return Err(FaucetError::Config(format!(
                 "window slicing: `{side}.template` must contain the `{WINDOW_PLACEHOLDER}` placeholder"
@@ -357,12 +367,16 @@ mod tests {
                 name: "start".into(),
                 template: "${window}".into(),
                 format: BindFormat::Date,
+                path: None,
+                value_type: Default::default(),
             },
             upper: WindowBind {
                 into: BindTarget::Query,
                 name: "end".into(),
                 template: "${window}".into(),
                 format: BindFormat::Date,
+                path: None,
+                value_type: Default::default(),
             },
             granularity: Some("1d".into()),
             lookback: None,
@@ -384,6 +398,8 @@ mod tests {
             name: "since".into(),
             template: "gte|${window}".into(),
             format: BindFormat::EpochS,
+            path: None,
+            value_type: Default::default(),
         };
         let ts = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         assert_eq!(bind.render(ts), "gte|1700000000");
@@ -398,12 +414,16 @@ mod tests {
                 name: "start".into(),
                 template: "${window}".into(),
                 format: BindFormat::Iso8601,
+                path: None,
+                value_type: Default::default(),
             },
             upper: WindowBind {
                 into: BindTarget::Query,
                 name: "end".into(),
                 template: "${window}".into(),
                 format: BindFormat::Iso8601,
+                path: None,
+                value_type: Default::default(),
             },
             granularity: None,
             lookback: None,

@@ -125,6 +125,8 @@ async fn bind_pushes_bookmark_into_query_and_advances() {
                 template: "gte|${bookmark}".to_owned(),
                 format: faucet_core::BindFormat::Iso8601,
                 advance_from: Some("$.max_updated".to_owned()),
+                path: None,
+                value_type: Default::default(),
             }),
     )
     .unwrap();
@@ -273,6 +275,8 @@ async fn replication_bind_pushes_bookmark_into_a_header() {
                 template: "${bookmark}".to_owned(),
                 format: faucet_core::BindFormat::Iso8601,
                 advance_from: None,
+                path: None,
+                value_type: Default::default(),
             }),
     )
     .unwrap();

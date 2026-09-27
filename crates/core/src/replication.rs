@@ -343,7 +343,9 @@ pub enum BindTarget {
     Query,
     /// A request header — e.g. `If-Modified-Since: …`.
     Header,
-    /// A top-level field of the JSON request body (POST-search APIs).
+    /// A field of the JSON request body (POST-search APIs): a top-level field
+    /// named by `name`, or any existing location addressed by a JSON Pointer
+    /// `path` (#748).
     Body,
     /// A `{name}` placeholder in the request path.
     Path,
@@ -375,6 +377,126 @@ pub enum BindFormat {
     Date,
 }
 
+/// The JSON type a body-target bind writes (#748).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BindValueType {
+    /// A JSON string (default).
+    #[default]
+    String,
+    /// A JSON number (e.g. an `epoch_ms` bookmark an API requires unquoted).
+    Number,
+}
+
+impl BindValueType {
+    /// Convert a rendered bind value into the JSON value to write.
+    pub fn to_value(self, rendered: &str) -> Result<Value, FaucetError> {
+        match self {
+            Self::String => Ok(Value::String(rendered.to_owned())),
+            Self::Number => {
+                let n: Option<serde_json::Number> = rendered
+                    .parse::<i64>()
+                    .map(serde_json::Number::from)
+                    .ok()
+                    .or_else(|| rendered.parse::<u64>().ok().map(serde_json::Number::from))
+                    .or_else(|| {
+                        rendered
+                            .parse::<f64>()
+                            .ok()
+                            .and_then(serde_json::Number::from_f64)
+                    });
+                n.map(Value::Number).ok_or_else(|| {
+                    FaucetError::Source(format!(
+                        "bind: rendered value '{rendered}' is not a number (value_type: number)"
+                    ))
+                })
+            }
+        }
+    }
+}
+
+fn unescape_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+/// Write `value` into `body` at the RFC 6901 JSON Pointer `pointer` (#748).
+///
+/// The pointer must address an existing scalar (or `null`) — or a missing
+/// final key whose parent is an existing object. Intermediate objects and
+/// array elements are never created, and an object/array target is refused
+/// (a bind replaces a value; it does not merge).
+pub fn set_body_pointer(body: &mut Value, pointer: &str, value: Value) -> Result<(), FaucetError> {
+    if !pointer.starts_with('/') {
+        return Err(FaucetError::Config(format!(
+            "JSON Pointer '{pointer}' must start with '/'"
+        )));
+    }
+    if let Some(slot) = body.pointer_mut(pointer) {
+        if slot.is_object() || slot.is_array() {
+            return Err(FaucetError::Source(format!(
+                "request body location '{pointer}' holds an object or array; a bind replaces \
+                 a scalar value"
+            )));
+        }
+        *slot = value;
+        return Ok(());
+    }
+    let cut = pointer.rfind('/').unwrap_or(0);
+    let (parent, leaf) = (&pointer[..cut], &pointer[cut + 1..]);
+    let parent_value = if parent.is_empty() {
+        Some(body)
+    } else {
+        body.pointer_mut(parent)
+    };
+    match parent_value {
+        Some(Value::Object(map)) => {
+            map.insert(unescape_pointer_token(leaf), value);
+            Ok(())
+        }
+        _ => Err(FaucetError::Source(format!(
+            "request body has no location '{pointer}' (the pointer must resolve to an \
+             existing value, or to a new key of an existing object)"
+        ))),
+    }
+}
+
+/// Load-time check of a bind's placement: a body bind needs exactly one of
+/// `name` / `path`; every other target needs `name` and refuses `path`.
+pub(crate) fn validate_bind_placement(
+    what: &str,
+    into: BindTarget,
+    name: &str,
+    path: Option<&str>,
+) -> Result<(), FaucetError> {
+    let has_name = !name.trim().is_empty();
+    match (into, path) {
+        (BindTarget::Body, Some(p)) => {
+            if has_name {
+                return Err(FaucetError::Config(format!(
+                    "{what}: set either `name` (top-level body field) or `path` (JSON Pointer), \
+                     not both"
+                )));
+            }
+            if !p.starts_with('/') || p.len() < 2 {
+                return Err(FaucetError::Config(format!(
+                    "{what}: `path` must be a JSON Pointer such as `/filters/0/value`, got '{p}'"
+                )));
+            }
+            Ok(())
+        }
+        (_, Some(_)) => Err(FaucetError::Config(format!(
+            "{what}: `path` applies only to `into: body`"
+        ))),
+        (BindTarget::Body, None) if !has_name => Err(FaucetError::Config(format!(
+            "{what}: `into: body` needs `name` (top-level field) or `path` (JSON Pointer)"
+        ))),
+        (_, None) if !has_name => Err(FaucetError::Config(format!(
+            "{what}: `name` must not be empty"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Declarative binding of the stored bookmark into the **outgoing request** —
 /// "server-side incremental push-down" (#513).
 ///
@@ -389,8 +511,19 @@ pub struct ReplicationBind {
     /// Where to place the rendered value.
     #[serde(default)]
     pub into: BindTarget,
-    /// The parameter / header / body-field / path-placeholder name.
+    /// The parameter / header / body-field / path-placeholder name. Optional
+    /// only for `into: body` with a `path`.
+    #[serde(default)]
     pub name: String,
+    /// `into: body` only: an RFC 6901 JSON Pointer into the configured `body`
+    /// (`/filterGroups/0/filters/0/value`) instead of a top-level `name` (#748).
+    /// It must resolve to an existing scalar or to a new key of an existing
+    /// object; array elements are never created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// JSON type written by a body bind: `string` (default) or `number`.
+    #[serde(default)]
+    pub value_type: BindValueType,
     /// Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by
     /// the formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.
     /// `"gte|${bookmark}"` (Greenhouse) or `"[${bookmark} TO *]"` (Lucene).
@@ -408,11 +541,12 @@ pub struct ReplicationBind {
 impl ReplicationBind {
     /// Validate the binding at config-load time.
     pub fn validate(&self) -> Result<(), FaucetError> {
-        if self.name.trim().is_empty() {
-            return Err(FaucetError::Config(
-                "replication bind: `name` must not be empty".to_owned(),
-            ));
-        }
+        validate_bind_placement(
+            "replication bind",
+            self.into,
+            &self.name,
+            self.path.as_deref(),
+        )?;
         if !self.template.contains(BIND_PLACEHOLDER) {
             return Err(FaucetError::Config(format!(
                 "replication bind: `template` must contain the `{BIND_PLACEHOLDER}` placeholder"
@@ -744,6 +878,8 @@ mod tests {
             template: template.to_owned(),
             format,
             advance_from: None,
+            path: None,
+            value_type: BindValueType::String,
         }
     }
 
@@ -847,6 +983,75 @@ mod tests {
 
         let ok = bind(BindTarget::Query, "gte|${bookmark}", BindFormat::Raw);
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn bind_placement_validation() {
+        let mut b = bind(BindTarget::Body, "${bookmark}", BindFormat::Raw);
+        assert!(b.validate().is_ok());
+        b.path = Some("/a/0/b".into());
+        assert!(b.validate().unwrap_err().to_string().contains("not both"));
+        b.name.clear();
+        assert!(b.validate().is_ok());
+        b.path = Some("a".into());
+        assert!(b.validate().is_err());
+        b.path = Some("/".into());
+        assert!(b.validate().is_err());
+        b.path = None;
+        assert!(
+            b.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("needs `name`")
+        );
+        let mut q = bind(BindTarget::Query, "${bookmark}", BindFormat::Raw);
+        q.path = Some("/a".into());
+        assert!(
+            q.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("only to `into: body`")
+        );
+        let parsed: ReplicationBind = serde_json::from_value(json!({
+            "into": "body", "path": "/f/0/v", "value_type": "number"
+        }))
+        .unwrap();
+        assert!(parsed.validate().is_ok());
+        assert_eq!(parsed.value_type, BindValueType::Number);
+    }
+
+    #[test]
+    fn value_type_conversion() {
+        assert_eq!(BindValueType::String.to_value("5").unwrap(), json!("5"));
+        assert_eq!(BindValueType::Number.to_value("5").unwrap(), json!(5));
+        assert_eq!(
+            BindValueType::Number
+                .to_value("18446744073709551615")
+                .unwrap(),
+            json!(18_446_744_073_709_551_615_u64)
+        );
+        assert_eq!(BindValueType::Number.to_value("1.5").unwrap(), json!(1.5));
+        assert!(BindValueType::Number.to_value("x").is_err());
+    }
+
+    #[test]
+    fn set_body_pointer_rules() {
+        let mut body = json!({"filterGroups": [{"filters": [{"value": null}]}], "v": {}, "a/b": 1});
+        set_body_pointer(&mut body, "/filterGroups/0/filters/0/value", json!("x")).unwrap();
+        assert_eq!(body["filterGroups"][0]["filters"][0]["value"], json!("x"));
+        set_body_pointer(&mut body, "/v/after", json!("c")).unwrap();
+        assert_eq!(body["v"]["after"], json!("c"));
+        set_body_pointer(&mut body, "/top", json!(1)).unwrap();
+        assert_eq!(body["top"], json!(1));
+        set_body_pointer(&mut body, "/a~1b", json!(2)).unwrap();
+        assert_eq!(body["a/b"], json!(2));
+        set_body_pointer(&mut body, "/v/x~1y~0z", json!(3)).unwrap();
+        assert_eq!(body["v"]["x/y~z"], json!(3));
+        assert!(set_body_pointer(&mut body, "/filterGroups/1/filters", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "/missing/leaf", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "/v", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "/filterGroups/0/filters/5", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "nope", json!(1)).is_err());
     }
 
     #[test]

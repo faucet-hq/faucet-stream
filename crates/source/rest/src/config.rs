@@ -902,6 +902,37 @@ impl RestStreamConfig {
                 ));
             }
         }
+        // #748: JSON Pointer body binds write into the configured `body`, and
+        // two binds must never write the same location.
+        let mut pointers: Vec<(&str, &str)> = Vec::new();
+        if let Some(b) = &self.replication_bind
+            && let Some(p) = &b.path
+        {
+            pointers.push(("replication_bind.path", p));
+        }
+        if let Some(w) = &self.window {
+            for (label, bind) in [
+                ("window.lower.path", &w.lower),
+                ("window.upper.path", &w.upper),
+            ] {
+                if let Some(p) = &bind.path {
+                    pointers.push((label, p));
+                }
+            }
+        }
+        for (i, (label, p)) in pointers.iter().enumerate() {
+            if !self.body.as_ref().is_some_and(Value::is_object) {
+                return Err(faucet_core::FaucetError::Config(format!(
+                    "rest: `{label}` points into the request body, so a JSON object `body` \
+                     must be configured"
+                )));
+            }
+            if let Some((other, _)) = pointers[..i].iter().find(|(_, q)| q == p) {
+                return Err(faucet_core::FaucetError::Config(format!(
+                    "rest: `{other}` and `{label}` both write '{p}'"
+                )));
+            }
+        }
         // #548: multi-array fan-out is its own extraction mode.
         if !self.records_multi.is_empty() {
             if self.records_path.is_some() {
@@ -1295,6 +1326,8 @@ mod tests {
             template: "${bookmark}".to_owned(),
             format: BindFormat::Raw,
             advance_from: None,
+            path: None,
+            value_type: Default::default(),
         }
     }
 
