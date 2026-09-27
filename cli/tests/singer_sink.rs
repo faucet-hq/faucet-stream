@@ -135,3 +135,44 @@ pipeline:
     assert!(err.contains("fatal: cannot load record"), "{err}");
     assert!(!err.contains("cli-secret-value-42"), "{err}");
 }
+
+#[tokio::test]
+async fn upsert_passes_key_properties_but_is_not_effectively_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "id,name\n1,ada\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let log = dir.path().join("log.jsonl");
+    let base = format!(
+        r#"
+version: 1
+name: people
+pipeline:
+  source: {{ type: csv, config: {{ path: "{csv}" }} }}
+  sink:
+    type: singer
+    config:
+      target_command: "{target}"
+      target_config: {{ path: "{out}", log: "{log}" }}
+      write_mode: upsert
+      key: [id]
+"#,
+        csv = csv.display(),
+        target = fake_target().display(),
+        out = out.display(),
+        log = log.display(),
+    );
+    let summary = faucet_cli::run_from_yaml_str(&base).await.unwrap();
+    assert!(!summary.had_failures(), "{:?}", summary.invocations);
+    assert_eq!(
+        events(&log, "schema")[0]["key_properties"],
+        serde_json::json!(["id"])
+    );
+
+    let eo = base.replace("version: 1\n", "version: 1\ndelivery: exactly_once\n");
+    let err = faucet_cli::run_from_yaml_str(&eo)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("exactly"), "{err}");
+}

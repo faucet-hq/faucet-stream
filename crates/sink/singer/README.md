@@ -40,7 +40,10 @@ The pipeline persists a bookmark only after the sink's `flush` returns, and
 - **`exit` (default)** — the sink sends the flush `STATE`, closes the target's
   stdin and waits for it to exit `0`; the next page starts a fresh target (and
   a fresh `SCHEMA`). Works with every target: most (including Meltano SDK
-  targets and `target-jsonl`) drain and emit `STATE` only at end of input.
+  targets and `target-jsonl`) drain and emit `STATE` only at end of input. A
+  target that reports `STATE` at all must echo the flush marker before exiting
+  — one that exits `0` having echoed only some other state evidently did not
+  read all of its input, and the flush fails.
 - **`state`** — one long-lived target; the sink sends the flush `STATE` and
   waits for the target to echo it back (the Singer "everything before this
   state is persisted" signal). For targets that echo `STATE` as soon as the
