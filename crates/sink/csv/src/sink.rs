@@ -16,6 +16,39 @@ type SinkWriter = faucet_core::compression::SyncCompressWriter<std::fs::File>;
 #[cfg(not(feature = "compression"))]
 type SinkWriter = std::fs::File;
 
+/// Create or truncate the output to an empty file (a valid empty compressed
+/// stream when a codec applies).
+fn truncate_blocking(config: &CsvSinkConfig) -> Result<(), FaucetError> {
+    if let Some(parent) = std::path::Path::new(&config.path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            FaucetError::Sink(format!(
+                "failed to create parent directory '{}': {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&config.path)
+        .map_err(|e| {
+            FaucetError::Sink(format!("failed to open CSV file '{}': {e}", config.path))
+        })?;
+    #[cfg(feature = "compression")]
+    {
+        let codec = config.compression.resolve(&config.path);
+        faucet_core::compression::sync_compress_writer(file, codec)
+            .finish()
+            .map_err(|e| FaucetError::Sink(format!("CSV compression finalise failed: {e}")))?;
+    }
+    #[cfg(not(feature = "compression"))]
+    drop(file);
+    Ok(())
+}
+
 /// State for the CSV writer, including the determined column order.
 struct WriterState {
     writer: csv::Writer<SinkWriter>,
@@ -247,6 +280,26 @@ impl faucet_core::Sink for CsvSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("CSV flush task failed: {e}")))??;
         }
+        Ok(())
+    }
+
+    /// With `append: false` the file must hold exactly this run's output, so a
+    /// successful run that wrote no record still truncates it (#753). There is
+    /// no record to derive a header from, so the result is an empty file (an
+    /// empty gzip / zstd stream under compression). Only reached after a
+    /// successful, uncancelled run.
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        if self.config.append || self.opened_once.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.outputs
+            .record_open_probing_with(std::path::PathBuf::from(&self.config.path), true);
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || truncate_blocking(&config))
+            .await
+            .map_err(|e| FaucetError::Sink(format!("CSV truncate task failed: {e}")))??;
+        self.opened_once
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
