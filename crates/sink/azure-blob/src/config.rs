@@ -30,6 +30,12 @@ pub enum AzureSinkFormat {
     /// `file-format-excel`.
     #[cfg(feature = "file-format-excel")]
     Xlsx,
+    /// An Apache Avro Object Container File, against `avro.schema` or a
+    /// schema inferred from the object's records; block codec from
+    /// `avro.codec`. Requires `file-format-avro` (#719). There is no ORC
+    /// variant: ORC is read-only.
+    #[cfg(feature = "file-format-avro")]
+    Avro,
 }
 
 impl AzureSinkFormat {
@@ -44,6 +50,8 @@ impl AzureSinkFormat {
             Self::Xml => faucet_core::FileFormat::Xml,
             #[cfg(feature = "file-format-excel")]
             Self::Xlsx => faucet_core::FileFormat::Xlsx,
+            #[cfg(feature = "file-format-avro")]
+            Self::Avro => faucet_core::FileFormat::Avro,
         }
     }
 
@@ -107,6 +115,9 @@ pub struct AzureBlobSinkConfig {
     /// Record framing, used when `format: xml` (#604).
     #[serde(default)]
     pub xml: faucet_core::XmlOptions,
+    /// Writer schema and block codec, used when `format: avro` (#719).
+    #[serde(default)]
+    pub avro: faucet_core::AvroOptions,
 }
 
 fn default_file_extension() -> String {
@@ -136,6 +147,7 @@ impl AzureBlobSinkConfig {
             csv: faucet_core::CsvOptions::default(),
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
+            avro: faucet_core::AvroOptions::default(),
         }
     }
 
@@ -163,6 +175,12 @@ impl AzureBlobSinkConfig {
         self
     }
 
+    /// Set the Avro writer schema and codec used when `format: avro` (#719).
+    pub fn avro(mut self, avro: faucet_core::AvroOptions) -> Self {
+        self.avro = avro;
+        self
+    }
+
     /// The per-format option blocks in the shape
     /// [`faucet_core::file_format::encode`] wants.
     pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
@@ -170,6 +188,8 @@ impl AzureBlobSinkConfig {
             csv: self.csv.clone(),
             excel: self.excel.clone(),
             xml: self.xml.clone(),
+            avro: self.avro.clone(),
+            orc: faucet_core::OrcOptions::default(),
         }
     }
 
@@ -351,6 +371,8 @@ mod tests {
         assert!(!AzureSinkFormat::Xml.appends_per_record());
         #[cfg(feature = "file-format-excel")]
         assert!(!AzureSinkFormat::Xlsx.appends_per_record());
+        #[cfg(feature = "file-format-avro")]
+        assert!(!AzureSinkFormat::Avro.appends_per_record());
     }
 
     /// Every variant maps onto exactly one shared format, so what this sink

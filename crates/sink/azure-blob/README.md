@@ -25,7 +25,7 @@ Sink-specific fields:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `prefix` | string | `""` | Object-name prefix; a virtual "directory" in the flat blob namespace. |
-| `format` | enum | `json_lines` | `json_lines` / `json_array` / `csv` / `xml` / `xlsx` — see [File formats](#file-formats-604). |
+| `format` | enum | `json_lines` | `json_lines` / `json_array` / `csv` / `xml` / `xlsx` / `avro` — see [File formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Extension for written objects. |
 | `max_records_per_file` | int | — | Cap records per object (file rollover). |
 | `concurrency` | int | `10` | Max concurrent uploads. |
@@ -113,6 +113,27 @@ same thing whatever the format. Columns are the union of every record's keys in
 the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+
+## Avro (#719)
+
+`format: avro` writes one Avro Object Container File per object, encoded
+against `avro.schema` or against a schema inferred from that object's records.
+Nullable and absent fields become `["null", T]`, mixed-type fields become
+`string`, and invalid names are sanitized (the original is kept in
+`faucet.name`). The block codec comes from `avro.codec`: `null` (default),
+`deflate`, `snappy` or `zstd`. With an explicit schema, logical types
+(`decimal`, `date`, `timestamp-*`, `uuid`, …) accept their string forms or
+epoch integers.
+
+```yaml
+format: avro
+file_extension: .avro
+avro:
+  codec: zstd
+```
+
+ORC is read-only, so there is no `orc` format here. Enable with
+`file-format-avro` (or `file-formats`).
 
 ## Batch atomicity
 
