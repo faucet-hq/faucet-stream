@@ -405,6 +405,7 @@ jobs:
           - sink-nats
           - sink-rabbitmq
           - sink-sftp
+          - sink-singer
           - sink-s3
           - sink-mongodb
           - sink-redis
@@ -718,7 +719,7 @@ jobs:
           # published baseline yet — cargo-semver-checks can only compare
           # against a crates.io release. Drop them from this list once
           # release-plz publishes 1.0.0.
-          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq,faucet-common-oracle,faucet-source-oracle,faucet-source-oracle-cdc,faucet-sink-oracle,faucet-common-iceberg,faucet-source-iceberg,faucet-common-dynamodb,faucet-source-dynamodb,faucet-sink-dynamodb,faucet-common-databricks,faucet-sink-databricks
+          exclude: faucet-cli,faucet-stream,faucet-common-delta,faucet-source-delta,faucet-sink-delta,faucet-common-rabbitmq,faucet-source-rabbitmq,faucet-sink-rabbitmq,faucet-common-oracle,faucet-source-oracle,faucet-source-oracle-cdc,faucet-sink-oracle,faucet-common-iceberg,faucet-source-iceberg,faucet-common-dynamodb,faucet-source-dynamodb,faucet-sink-dynamodb,faucet-common-databricks,faucet-sink-databricks,faucet-common-singer,faucet-sink-singer
           # No `package:` — check the whole workspace. Gating only `faucet-core`
           # left 89 crates unguarded, so a genuine removal or signature change in
           # a connector could publish in a minor and break dependents silently

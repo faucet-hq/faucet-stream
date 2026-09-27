@@ -479,6 +479,13 @@
       "description": "SFTP sink; JSONL objects, atomic temp+rename upload"
     },
     {
+      "name": "singer",
+      "kind": "sink",
+      "verified": true,
+      "tier": "stable",
+      "description": "Singer target bridge (runs an external Singer target; bookmarks advance after the target confirms)"
+    },
+    {
       "name": "iceberg",
       "kind": "source",
       "verified": true,
