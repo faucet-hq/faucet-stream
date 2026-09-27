@@ -443,3 +443,6 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 ## Observability
 
 Metrics emitted by this source are labelled `connector="xml"`.
+
+- `faucet_source_roundtrips_total{op="request"}` — one per HTTP request, retries included (#638).
+- `faucet_source_throttled_total` — `429` responses received; `faucet_source_throttle_wait_seconds` — the backoff actually slept after each; `faucet_source_retries_total{class}` — every retry by class (#734). The totals also appear on the run's usage record (`throttled 2× · waited 1.2 s` in `faucet run` / `faucet usage`). The sleep after a `429` is the retry policy's backoff (this source does not read `Retry-After`).

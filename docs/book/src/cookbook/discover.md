@@ -89,6 +89,7 @@ listing, never a data scan.
 | `spanner` | base tables (default schema) | `INFORMATION_SCHEMA.COLUMNS` | — | `query` |
 | `s3` | common prefixes under the configured prefix (one delimiter listing; falls back to per-object entries) | — | — | `prefix` |
 | `gcs` | same as s3 | — | — | `prefix` (objects: `object_keys`) |
+| `file` | every readable file under `path` (the listing the run would read; no file opened) | — | — | `path` + the resolved `format` |
 | `oracle` | tables (`ALL_TABLES`) | `ALL_TAB_COLUMNS` | — | `query` (native `JSON` columns wrapped in `JSON_SERIALIZE`) |
 | `iceberg` | tables in every catalog namespace (nested namespaces walked) | the table's current Iceberg schema | snapshot summary `total-records` | `table` |
 | `dynamodb` | tables (`ListTables`) | key attributes only (`DescribeTable` key schema — DynamoDB is schemaless beyond the key) | `ItemCount` | `table_name` |

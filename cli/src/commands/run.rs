@@ -259,6 +259,9 @@ pub(crate) async fn execute(
     // matrix entirely. Run it directly and report through the same summary
     // surfaces (`--output text|json|ndjson`), then return.
     if crate::topology::is_topology(&cfg) {
+        if crate::select::SelectionRequest::from_flags(&args.selection)?.is_some() {
+            return Err(CliError::Config(crate::select::TOPOLOGY_REFUSAL.into()));
+        }
         #[cfg(feature = "policy")]
         if let Some(spec) = cfg.policy.as_ref() {
             let report = crate::policy::evaluate_topology(spec, &cfg)?;

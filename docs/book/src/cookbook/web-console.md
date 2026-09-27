@@ -173,7 +173,18 @@ to the run; its params join the form tagged `deployment`. A **sink template**'s
 or **deployment**'s page has no trigger form; it lists the source templates it
 can be used with.
 
-![The versions page for the example-csv source template: the trigger form with a sink-template dropdown, sink version and deployment selector beside the source's own params, the sink's param tagged](../assets/console/template-source-detail.png)
+Below the params, a **Streams** section (**Rows** for a pipeline template with
+a `matrix:`) lists what the run can include, from
+`GET /v1/templates/{id}/rows`: each stream with its status, tags, parent /
+dependency and the write mode it resolves to on the chosen sink. Rows a bare
+run would pick are checked; a stream the sink cannot run is disabled with the
+reason. **include parents** (`off` / `eligible` / `all`) decides what happens
+to a checked child whose parent is not checked — the rows it would pull in are
+highlighted, a blocked one says why — and the line under the list previews the
+run set the server resolves before you press **Run**. See
+[Running a subset of streams](./templates.md#running-a-subset-of-streams).
+
+![The trigger form of the example-csv source template, scrolled to the sink-template picker, the deployment selector and the Streams section: orders checked, customers unchecked, both resolving overwrite→append on the csv sink, include parents set to off, and the resolved run set "orders"](../assets/console/template-source-detail.png)
 
 When the server was started with `--templates-sync`, the Templates page also
 shows **Sync from origins**: the configured remote origins (repo or bucket,

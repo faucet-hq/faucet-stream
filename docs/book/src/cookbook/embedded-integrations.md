@@ -199,6 +199,20 @@ revoked connection, a suspended tenant, a tenant at its limit — with the
 reason) or `failed`. An `idempotency_key` is suffixed `:<tenant>`, and every
 run carries a `fanout` label with the fan-out's id.
 
+A fan-out body is a trigger body, so it takes a `selection` too — every tenant
+runs the same subset of the template's streams:
+
+```bash
+curl -X POST localhost:8080/v1/templates/crm-contacts/fanout \
+  -H "Authorization: Bearer $OPERATOR" -H 'content-type: application/json' \
+  -d '{"tenants": ["acme", "globex"], "selection": {"select": ["contacts"]}}'
+```
+
+An embedding product that lets each tenant pick which objects to sync sends
+that tenant's choice with its own run (`POST /v1/tenants/{t}/templates/{id}/runs`
+with a `selection`), and lists the choices from `GET /v1/templates/{id}/rows`
+([Running a subset of streams](./templates.md#running-a-subset-of-streams)).
+
 On a schedule, add a `schedule` trigger to the `--triggers` file (needs the
 `triggers` and `schedule` features):
 

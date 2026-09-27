@@ -1450,6 +1450,43 @@ select {
 .tpl-param-tags .pill { font-size: 0.6rem; line-height: 1; padding: 3px 7px; justify-content: center; }
 .tpl-param-tags .pill::before { display: none; }
 
+/* Trigger form row picker (#741): one checkbox row per stream / matrix row. */
+.tpl-rows-bar { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 10px 18px; }
+.tpl-rows-parents { display: flex; flex-direction: column; gap: 5px; font-size: 0.82rem; font-weight: 600; color: var(--ink); min-width: 240px; }
+.tpl-rows-parents select { font-weight: 400; }
+.tpl-rows-quick { display: flex; gap: 6px; flex-wrap: wrap; }
+.tpl-rows { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; }
+.tpl-pick {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) minmax(0, 1.3fr); align-items: center; gap: 4px 12px;
+  padding: 9px 12px; border-top: 1px solid var(--border); cursor: pointer; font-size: 0.84rem; color: var(--ink);
+  transition: background 0.12s;
+}
+.tpl-pick:first-child { border-top: 0; }
+.tpl-pick:hover { background: var(--surface-2); }
+.tpl-pick input[type="checkbox"] { margin: 0; accent-color: var(--brand); }
+.tpl-pick-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.tpl-pick-id { font-weight: 600; overflow-wrap: anywhere; }
+.tpl-pick-main .pill { font-size: 0.66rem; padding: 2px 8px; }
+.tpl-pick-tag { font-size: 0.7rem; color: var(--ink-dim); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
+.tpl-pick-facts { color: var(--ink-faint); font-size: 0.78rem; min-width: 0; overflow-wrap: anywhere; }
+.tpl-pick-why, .tpl-pick-mark { grid-column: 2 / -1; font-size: 0.76rem; }
+.tpl-pick-why { color: var(--fail); }
+.tpl-pick-mark:empty { display: none; }
+.tpl-pick-disabled { cursor: not-allowed; opacity: 0.7; }
+.tpl-pick-disabled:hover { background: transparent; }
+.tpl-pick-ancestor { background: var(--brand-tint); }
+.tpl-pick-pulled .tpl-pick-mark { color: var(--brand); font-weight: 550; }
+.tpl-pick-blocked { background: color-mix(in srgb, var(--fail) 8%, transparent); }
+.tpl-pick-blocked .tpl-pick-mark { color: var(--fail); }
+.tpl-rows-preview { font-size: 0.8rem; color: var(--ink-dim); display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 1.2em; }
+.tpl-rows-preview-label { font-size: 0.7rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); }
+.tpl-rows-arrow { color: var(--ink-faint); }
+.tpl-rows-preview-err { color: var(--fail); }
+@media (max-width: 700px) {
+  .tpl-pick { grid-template-columns: 18px minmax(0, 1fr); }
+  .tpl-pick-facts { grid-column: 2 / -1; }
+}
+
 /* Status filter chips on the templates list (multi-toggle; launched+draft on by default). */
 .tpl-status-filter { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 /* Status and kind are separate dimensions: a label each, and a divider between. */

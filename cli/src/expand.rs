@@ -1176,7 +1176,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let keyed_upsert_configured = matches!(
             mode,
             faucet_core::WriteMode::Upsert | faucet_core::WriteMode::Delete
-        );
+        ) && crate::registry::UPSERT_SINK_KINDS
+            .contains(&merged_sink.kind.as_str());
         let guarantee_inputs = faucet_core::GuaranteeInputs {
             replay: crate::registry::source_replay_guarantee(&merged_source.kind),
             sink_atomic: crate::registry::sink_supports_idempotent_writes(&merged_sink.kind),
@@ -1516,7 +1517,38 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             }
         }
     }
+    check_file_sink_paths(&out)?;
     Ok(out)
+}
+
+/// Local file sinks must not share a path (#743): two writers renaming onto
+/// one file lose one writer's data. Rows must differ, and a row that runs once
+/// per parent record or discovered tuple needs a per-invocation `${...}` token.
+fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
+    fn per_invocation(path: &str) -> bool {
+        path.match_indices("${")
+            .any(|(i, _)| !path[i + 2..].starts_with("now."))
+    }
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for n in nodes.iter().filter(|n| n.sink.kind == "file") {
+        let Some(path) = n.sink.config.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
+        if fans_out && !per_invocation(path) {
+            return Err(CliError::Config(format!(
+                "row '{}': its file sink path '{path}' is the same for every invocation of a                  fan-out row, so concurrent writers would overwrite each other — put a                  per-invocation token (e.g. `${{parent.id}}`) in the path",
+                n.id
+            )));
+        }
+        if let Some(other) = seen.insert(path, n.id.as_str()) {
+            return Err(CliError::Config(format!(
+                "rows '{other}' and '{}' both write the file sink path '{path}' — give each row                  its own path (a per-row template such as `out/${{stream}}.jsonl` in a sink                  template, or a row-level `sink.config.path` override)",
+                n.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn detect_cycle(parents: &HashMap<&str, &str>) -> CliResult<()> {

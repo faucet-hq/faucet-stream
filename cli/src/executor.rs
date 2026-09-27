@@ -1140,6 +1140,48 @@ fn mark_overwrite_staging(kind: &str, cfg: &mut Value, grouped: bool) {
     }
 }
 
+/// Singer target sink (#722) defaults the CLI knows and the sink cannot: the
+/// stream name (the row id, or the pipeline name for a single-row config), the
+/// pipeline `contract:` as the `SCHEMA`, and one `ACTIVATE_VERSION` per run
+/// shared by every writer and the overwrite lifecycle sink. Explicit config
+/// always wins; other sink kinds are untouched.
+fn inject_singer_defaults(
+    node: &ExpandedNode,
+    pipeline_name: &str,
+    clock: DateTime<FixedOffset>,
+    cfg: &mut Value,
+) {
+    if node.sink.kind != "singer" {
+        return;
+    }
+    let Value::Object(map) = cfg else {
+        return;
+    };
+    if !map.contains_key("stream") {
+        let synthetic = node
+            .id
+            .strip_prefix("row-")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let stream = if synthetic && !pipeline_name.is_empty() {
+            pipeline_name
+        } else {
+            node.id.as_str()
+        };
+        map.insert("stream".into(), Value::String(stream.to_string()));
+    }
+    #[cfg(feature = "contract")]
+    if !map.contains_key("schema")
+        && let Some(contract) = &node.contract
+    {
+        map.insert(
+            "schema".into(),
+            faucet_core::contract::to_json_schema(contract),
+        );
+    }
+    map.entry("_activate_version")
+        .or_insert_with(|| Value::from(clock.timestamp_millis()));
+}
+
 /// Whether a node's sink is configured for `write_mode: overwrite`. The write
 /// mode is `#[serde(flatten)]`'d into the sink config, so it reads off the top
 /// level — mirroring the `write_mode` gate in `expand.rs`.
@@ -1170,6 +1212,7 @@ fn describe_sink_dest(kind: &str, cfg: &Value) -> String {
 /// a distinct destination per parent, and stays a single-member group).
 fn resolved_sink_destination(unit: &Unit, opts: &ExecuteOptions) -> CliResult<Value> {
     let mut sink_cfg = unit.node.sink.config.clone();
+    inject_singer_defaults(&unit.node, &opts.pipeline_name, opts.clock, &mut sink_cfg);
     resolve_now_inplace(&mut sink_cfg, opts.clock)?;
     let mut ctx: HashMap<String, Value> = HashMap::new();
     if let (Some(record), NodeRole::Child { parent_id, .. }) =
@@ -2067,6 +2110,7 @@ async fn run_one_invocation(
     // can't coordinate a direct WRITE_TRUNCATE. A solo overwrite is left to load
     // directly into the target. No-op for non-bigquery kinds and non-overwrite.
     mark_overwrite_staging(&node.sink.kind, &mut sink_cfg, overwrite_grouped);
+    inject_singer_defaults(node, &opts.pipeline_name, opts.clock, &mut sink_cfg);
 
     // Resolve `${now.*}` run-clock tokens for every invocation (root + child),
     // before the parent-record pass. Leaves all other tokens verbatim.
@@ -3267,6 +3311,9 @@ impl Source for StateKeyOverride {
     fn dataset_uri(&self) -> String {
         self.inner.dataset_uri()
     }
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        self.inner.set_roundtrip_recorder(recorder);
+    }
     fn state_key(&self) -> Option<String> {
         Some(self.key.clone())
     }
@@ -3989,6 +4036,69 @@ mod tests {
             usage: Default::default(),
             budget: None,
         }
+    }
+
+    #[cfg(all(
+        feature = "sink-singer",
+        feature = "sink-jsonl",
+        feature = "source-csv",
+        feature = "contract"
+    ))]
+    fn singer_nodes(yaml: &str) -> Vec<ExpandedNode> {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = PipelineConfig::from_text(yaml, &dir.path().join("s.yaml")).expect("parses");
+        expand(&cfg).expect("expands")
+    }
+
+    #[cfg(all(
+        feature = "sink-singer",
+        feature = "sink-jsonl",
+        feature = "source-csv",
+        feature = "contract"
+    ))]
+    #[test]
+    fn inject_singer_defaults_fills_stream_schema_and_version() {
+        let clock = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z").unwrap();
+        let single = singer_nodes(
+            "version: 1\nname: people\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: singer, config: { target_command: target-jsonl } }\n",
+        );
+        let mut cfg = single[0].sink.config.clone();
+        inject_singer_defaults(&single[0], "people", clock, &mut cfg);
+        assert_eq!(cfg["stream"], json!("people"));
+        assert_eq!(cfg["_activate_version"], json!(clock.timestamp_millis()));
+        assert!(cfg.get("schema").is_none());
+
+        let mut cfg = single[0].sink.config.clone();
+        inject_singer_defaults(&single[0], "", clock, &mut cfg);
+        assert_eq!(
+            cfg["stream"],
+            json!("row-0"),
+            "no pipeline name: the row id"
+        );
+
+        let rows = singer_nodes(
+            "version: 1\nname: p\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: singer, config: { target_command: t } }\n  contract:\n    version: \"1\"\n    fields:\n      - { name: id, type: integer, required: true }\nmatrix:\n  - id: orders\n  - id: users\n    sink: { config: { stream: members, schema: { type: object } } }\n",
+        );
+        let mut cfg = rows[0].sink.config.clone();
+        inject_singer_defaults(&rows[0], "p", clock, &mut cfg);
+        assert_eq!(cfg["stream"], json!("orders"));
+        assert_eq!(cfg["schema"]["properties"]["id"]["type"], json!("integer"));
+        let mut cfg = rows[1].sink.config.clone();
+        cfg["_activate_version"] = json!(5);
+        inject_singer_defaults(&rows[1], "p", clock, &mut cfg);
+        assert_eq!(cfg["stream"], json!("members"));
+        assert_eq!(cfg["schema"], json!({"type": "object"}));
+        assert_eq!(cfg["_activate_version"], json!(5));
+
+        let other = singer_nodes(
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: o.jsonl } }\n",
+        );
+        let mut cfg = other[0].sink.config.clone();
+        inject_singer_defaults(&other[0], "x", clock, &mut cfg);
+        assert_eq!(cfg, other[0].sink.config);
+        let mut not_object = json!(null);
+        inject_singer_defaults(&single[0], "x", clock, &mut not_object);
+        assert_eq!(not_object, json!(null));
     }
 
     async fn run_yaml(yaml: &str, path: &Path) -> RunSummary {

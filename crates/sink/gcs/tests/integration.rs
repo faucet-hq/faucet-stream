@@ -352,3 +352,36 @@ async fn sink_columnar_batch_falls_back_to_rows_for_jsonl() {
     let text = String::from_utf8(download(&host, &bucket, &names[0]).await).unwrap();
     assert_eq!(text.lines().count(), 2);
 }
+
+/// Avro objects (#719) are written whole on flush with the configured codec
+/// and read back with their inferred schema.
+#[cfg(feature = "file-format-avro")]
+#[tokio::test]
+async fn sink_writes_avro_objects() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let sink = GcsSink::new(
+        GcsSinkConfig::new(&bucket)
+            .prefix("avro/")
+            .format(faucet_sink_gcs::GcsSinkFormat::Avro)
+            .avro(faucet_core::AvroOptions {
+                schema: None,
+                codec: faucet_core::AvroCodec::Deflate,
+            })
+            .file_extension(".avro")
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host),
+    )
+    .await
+    .unwrap();
+    let rows = [json!({"i": 1, "s": "a"}), json!({"i": 2, "s": null})];
+    sink.write_batch(&rows).await.unwrap();
+    sink.flush().await.unwrap();
+    let names = object_names(&host, &bucket, "avro/").await;
+    assert_eq!(names.len(), 1);
+    let body = download(&host, &bucket, &names[0]).await;
+    let back = faucet_core::file_format::avro::decode(&body, &faucet_core::AvroOptions::default())
+        .unwrap();
+    assert_eq!(back, rows.to_vec());
+}

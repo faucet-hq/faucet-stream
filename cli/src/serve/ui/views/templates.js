@@ -1008,6 +1008,25 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
          <label>version <select id="tg-overlay-version" disabled><option value="">—</option></select></label>`,
         "state, DLQ, notifications and SLA for this run",
       ) : ""}
+      <section class="tpl-seg" id="tg-rows-seg" hidden>
+        <header class="tpl-seg-head"><h3>${withSink ? "Streams" : "Rows"}</h3><span class="tpl-seg-hint">run all of them, or a subset</span></header>
+        <div class="tpl-rows-bar">
+          <label class="tpl-rows-parents">include parents
+            <select id="tg-parents" title="what happens when a checked row's parent or dependency is not checked">
+              <option value="off">off — refuse</option>
+              <option value="eligible">eligible — pull in runnable ones</option>
+              <option value="all">all — pull in every one</option>
+            </select>
+          </label>
+          <span class="tpl-rows-quick">
+            <button type="button" class="tpl-chip" data-pick="default">defaults</button>
+            <button type="button" class="tpl-chip" data-pick="all">all</button>
+            <button type="button" class="tpl-chip" data-pick="none">none</button>
+          </span>
+        </div>
+        <div class="tpl-rows" id="tg-rows"></div>
+        <div class="tpl-rows-preview" id="tg-rows-preview"></div>
+      </section>
       <section class="tpl-seg">
         <header class="tpl-seg-head"><h3>Run</h3></header>
         <div class="tpl-seg-fields"><label class="tpl-field-wide">run name <input id="tg-name" placeholder="optional" /></label></div>
@@ -1118,12 +1137,143 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       renderParams();
     };
   }
+  // The row picker (#741): the template's rows from the rows API, checked by
+  // default the way a bare run would pick them, with a live preview of the
+  // run set the server resolves for the current choice.
+  const rowsSeg = host.querySelector("#tg-rows-seg");
+  const rowsList = host.querySelector("#tg-rows");
+  const parentsSel = host.querySelector("#tg-parents");
+  const preview = host.querySelector("#tg-rows-preview");
+  let rowData = [];
+  let rowsSeq = 0;
+  let previewSeq = 0;
+  const rowsQuery = () => {
+    const q = new URLSearchParams({ version: versionSel.value });
+    if (sinkSel && sinkSel.value) {
+      q.set("sink", sinkSel.value);
+      if (sinkVersionSel && sinkVersionSel.value) q.set("sink_version", sinkVersionSel.value);
+    }
+    if (overlaySel && overlaySel.value) {
+      q.set("overlay", overlaySel.value);
+      if (overlayVersionSel.value) q.set("overlay_version", overlayVersionSel.value);
+    }
+    return q;
+  };
+  const rowInputs = () => [...rowsList.querySelectorAll("input[data-row]")];
+  const checkedRows = () => rowInputs().filter((el) => el.checked).map((el) => el.dataset.row);
+  const ancestorsOf = (ids) => {
+    const byId = new Map(rowData.map((r) => [r.id, r]));
+    const out = new Set();
+    const stack = [...ids];
+    while (stack.length) {
+      const r = byId.get(stack.pop());
+      if (!r) continue;
+      for (const a of [r.parent, ...(r.depends_on || [])].filter(Boolean)) {
+        if (!out.has(a)) { out.add(a); stack.push(a); }
+      }
+    }
+    return out;
+  };
+  const refreshPreview = async () => {
+    const seq = ++previewSeq;
+    const picked = checkedRows();
+    for (const item of rowsList.querySelectorAll("[data-row-item]")) {
+      item.classList.remove("tpl-pick-pulled", "tpl-pick-blocked");
+      item.querySelector("[data-mark]").textContent = "";
+    }
+    const anc = ancestorsOf(picked);
+    for (const item of rowsList.querySelectorAll("[data-row-item]")) {
+      const id2 = item.dataset.rowItem;
+      item.classList.toggle("tpl-pick-ancestor", anc.has(id2) && !picked.includes(id2));
+    }
+    if (!picked.length) {
+      preview.className = "tpl-rows-preview tpl-rows-preview-err";
+      preview.textContent = "choose at least one row";
+      return;
+    }
+    const q = rowsQuery();
+    q.set("state", "false");
+    q.set("select", picked.join(","));
+    q.set("include_parents", parentsSel.value);
+    let rep;
+    try {
+      rep = await api(`/v1/templates/${encodeURIComponent(id)}/rows?${q}`);
+    } catch (e) {
+      if (seq !== previewSeq) return;
+      preview.className = "tpl-rows-preview tpl-rows-preview-err";
+      preview.textContent = e.message;
+      return;
+    }
+    if (seq !== previewSeq) return;
+    for (const r of rep.rows || []) {
+      const item = rowsList.querySelector(`[data-row-item="${CSS.escape(r.id)}"]`);
+      if (!item) continue;
+      const mark = item.querySelector("[data-mark]");
+      if (r.pulled_in) {
+        item.classList.add("tpl-pick-pulled");
+        mark.textContent = `+ pulled in for ${r.pulled_in.because}`;
+      } else if (r.blocked) {
+        item.classList.add("tpl-pick-blocked");
+        mark.textContent = `blocked — ${r.blocked}`;
+      }
+    }
+    if (rep.error) {
+      preview.className = "tpl-rows-preview tpl-rows-preview-err";
+      preview.textContent = rep.error;
+    } else {
+      preview.className = "tpl-rows-preview";
+      preview.innerHTML = `<span class="tpl-rows-preview-label">runs</span> ${(rep.run_set || [])
+        .map((r) => `<span class="mono">${escapeHtml(r)}</span>`)
+        .join(`<span class="tpl-rows-arrow">→</span>`)}`;
+    }
+  };
+  const pick = (mode) => {
+    for (const el of rowInputs()) {
+      if (el.disabled) { el.checked = false; continue; }
+      const r = rowData.find((x) => x.id === el.dataset.row) || {};
+      el.checked = mode === "all" ? true : mode === "none" ? false : !!r.default_selected;
+    }
+    refreshPreview();
+  };
+  const loadRows = async () => {
+    const seq = ++rowsSeq;
+    let rep;
+    try {
+      rep = await api(`/v1/templates/${encodeURIComponent(id)}/rows?${rowsQuery()}`);
+    } catch (e) {
+      if (seq !== rowsSeq) return;
+      rowData = [];
+      rowsSeg.hidden = false;
+      rowsList.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+      preview.textContent = "";
+      return;
+    }
+    if (seq !== rowsSeq) return;
+    const before = rowInputs().length ? new Set(checkedRows()) : null;
+    rowData = rep.selectable ? rep.rows || [] : [];
+    rowsSeg.hidden = rowData.length < 2;
+    rowsList.innerHTML = rowData.map(rowItem).join("");
+    for (const el of rowInputs()) {
+      const r = rowData.find((x) => x.id === el.dataset.row);
+      el.checked = !el.disabled && (before ? before.has(r.id) : !!r.default_selected);
+      el.onchange = refreshPreview;
+    }
+    if (!rowsSeg.hidden) refreshPreview();
+  };
+  parentsSel.onchange = refreshPreview;
+  for (const b of host.querySelectorAll("[data-pick]")) b.onclick = () => pick(b.dataset.pick);
+  const reloadForm = () => { renderParams(); loadRows(); };
+  for (const r of rows) {
+    const choose = r.onclick;
+    r.onclick = (ev) => { const before = versionSel.value; choose(ev); if (versionSel.value !== before) loadRows(); };
+  }
+
   markPicked();
-  renderParams();
-  if (sinkSel) sinkSel.onchange = () => { refillSinkVersions(); renderParams(); };
-  if (sinkVersionSel) sinkVersionSel.onchange = renderParams;
-  if (overlaySel) overlaySel.onchange = () => { refillOverlayVersions(); renderParams(); };
-  if (overlayVersionSel) overlayVersionSel.onchange = renderParams;
+  reloadForm();
+  if (sinkSel) sinkSel.onchange = () => { refillSinkVersions(); reloadForm(); };
+  if (sinkVersionSel) sinkVersionSel.onchange = reloadForm;
+  if (overlaySel) overlaySel.onchange = () => { refillOverlayVersions(); reloadForm(); };
+  if (overlayVersionSel) overlayVersionSel.onchange = reloadForm;
 
   const out = host.querySelector("#tg-out");
   host.querySelector("#tg-go").onclick = async () => {
@@ -1143,6 +1293,16 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       body.overlay_version = overlayVersionSel.value;
     }
     if (Object.keys(supplied).length) body.params = supplied;
+    if (!rowsSeg.hidden) {
+      const picked = checkedRows();
+      if (!picked.length) {
+        toast("choose at least one row to run", "error");
+        return;
+      }
+      if (picked.length !== rowData.length || parentsSel.value !== "off") {
+        body.selection = { select: picked, include_parents: parentsSel.value };
+      }
+    }
     const name = host.querySelector("#tg-name").value.trim();
     if (name) body.name = name;
     try {
@@ -1163,6 +1323,40 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       toast(e.message, "error");
     }
   };
+}
+
+const ROW_STATUS_PILL = {
+  mandatory: "pill-running",
+  active: "pill-completed",
+  available: "pill-queued",
+  draft: "pill-queued",
+  archived: "pill-cancelled",
+};
+
+/** One checkbox row of the trigger form's row picker (#741). */
+function rowItem(r) {
+  const w = r.write || {};
+  const unsupported = w.supported === false;
+  const facts = [];
+  if (r.parent) facts.push(`child of <span class="mono">${escapeHtml(r.parent)}</span>`);
+  if ((r.depends_on || []).length) facts.push(`after ${r.depends_on.map((d) => `<span class="mono">${escapeHtml(d)}</span>`).join(", ")}`);
+  if (w.resolved) facts.push(escapeHtml(w.alias_applied || w.resolved));
+  else if ((w.requested || []).length) facts.push(`wants ${escapeHtml(w.requested.join(" | "))}`);
+  if (r.state && r.state.health) facts.push(`health ${escapeHtml(r.state.health)}`);
+  const tags = (r.tags || []).map((t) => `<span class="tpl-pick-tag">${escapeHtml(t)}</span>`).join("");
+  const title = [r.description, unsupported ? w.unsupported_reason : null].filter(Boolean).join(" — ");
+  return `
+    <label class="tpl-pick${unsupported ? " tpl-pick-disabled" : ""}" data-row-item="${escapeHtml(r.id)}"${title ? ` title="${escapeHtml(title)}"` : ""}>
+      <input type="checkbox" data-row="${escapeHtml(r.id)}"${unsupported ? " disabled" : ""} />
+      <span class="tpl-pick-main">
+        <span class="tpl-pick-id mono">${escapeHtml(r.id)}</span>
+        <span class="pill ${ROW_STATUS_PILL[r.status] || ""}">${escapeHtml(r.status)}</span>
+        ${tags}
+      </span>
+      <span class="tpl-pick-facts">${facts.join(" · ")}</span>
+      ${unsupported ? `<span class="tpl-pick-why">cannot run on this sink — ${escapeHtml(w.unsupported_reason || "")}</span>` : ""}
+      <span class="tpl-pick-mark" data-mark></span>
+    </label>`;
 }
 
 /** One typed input for a declared param. `fromSink` marks a field the selected

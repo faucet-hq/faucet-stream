@@ -241,3 +241,9 @@ async fn an_empty_write_leaves_no_object() {
         .expect("list");
     assert!(listed.contents().is_empty(), "no object for an empty page");
 }
+
+#[cfg(feature = "file-format-avro")]
+#[tokio::test]
+async fn avro_objects_round_trip() {
+    round_trip(S3SinkFormat::Avro, FileFormat::Avro, ".avro").await;
+}

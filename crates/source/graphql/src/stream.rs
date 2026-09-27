@@ -32,6 +32,8 @@ pub struct GraphqlStream {
     /// reproduce the legacy `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_BACKOFF`
     /// constants; overridable via [`with_retry_policy`](Self::with_retry_policy).
     retry_policy: faucet_core::RetryPolicy,
+    /// Round-trip / throttling recorder installed by the pipeline (#638, #734).
+    roundtrips: faucet_core::observability::RecorderSlot,
 }
 
 /// Attach a mutual-TLS client identity to the HTTP client builder (#495). Only
@@ -156,6 +158,7 @@ impl GraphqlStream {
                 jitter: true,
                 retry_on: faucet_core::RetryClassSet::default(),
             },
+            roundtrips: faucet_core::observability::RecorderSlot::new(),
         })
     }
 
@@ -372,17 +375,23 @@ impl GraphqlStream {
         // backoff, matching the REST source's reliability layer (#78/#16).
         // GraphQL-level `errors` in a 200 body are application errors and are
         // handled below — they are not retried here.
-        let body: Value = faucet_core::execute_with_policy(&self.retry_policy, None, || {
-            let attempt = req.try_clone();
-            async move {
-                let req = attempt.ok_or_else(|| {
-                    FaucetError::Source("graphql: request is not cloneable for retry".into())
-                })?;
-                let resp = req.send().await.map_err(FaucetError::Http)?;
-                let resp = util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                resp.json().await.map_err(FaucetError::Http)
-            }
-        })
+        let body: Value = faucet_core::execute_with_policy_recorded(
+            &self.retry_policy,
+            None,
+            self.roundtrips.recorder().as_ref(),
+            || {
+                let attempt = req.try_clone();
+                async move {
+                    let req = attempt.ok_or_else(|| {
+                        FaucetError::Source("graphql: request is not cloneable for retry".into())
+                    })?;
+                    self.roundtrips.record("request");
+                    let resp = req.send().await.map_err(FaucetError::Http)?;
+                    let resp = util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+                    resp.json().await.map_err(FaucetError::Http)
+                }
+            },
+        )
         .await?;
 
         // Check for GraphQL-level errors.
@@ -568,6 +577,13 @@ impl faucet_core::Source for GraphqlStream {
 
     fn connector_name(&self) -> &'static str {
         "graphql"
+    }
+
+    fn set_roundtrip_recorder(
+        &self,
+        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
+    ) {
+        self.roundtrips.install(recorder);
     }
 
     fn config_schema(&self) -> serde_json::Value {

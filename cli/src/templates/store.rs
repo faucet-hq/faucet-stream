@@ -78,6 +78,10 @@ pub struct MaterializedConfig {
     pub overlay_contributes: Vec<String>,
     /// Operator-facing warnings about the composed run.
     pub warnings: Vec<String>,
+    /// The row selection to apply to the materialized config's rows (#741):
+    /// the caller's for a `pipeline`; for a composed run, the streams the
+    /// caller's selection resolved to (the composition carries only those).
+    pub selection: Option<crate::select::SelectionRequest>,
 }
 
 impl MaterializedConfig {
@@ -805,6 +809,7 @@ pub async fn materialize(
         overlay_version: None,
         overlay_contributes: Vec::new(),
         warnings: Vec::new(),
+        selection: None,
     })
 }
 
@@ -889,6 +894,34 @@ pub async fn materialize_for_run(
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
 ) -> CliResult<MaterializedConfig> {
+    materialize_for_run_selected(
+        store,
+        id,
+        version,
+        sink,
+        supplied,
+        env_overrides,
+        mode,
+        None,
+    )
+    .await
+}
+
+/// [`materialize_for_run`] for a subset of the template's rows (#741). A
+/// `pipeline` carries the selection through to the run; a `source-template`
+/// composes only the streams the selection resolves to, so a stream the sink
+/// cannot run does not block the ones selected.
+#[allow(clippy::too_many_arguments)]
+pub async fn materialize_for_run_selected(
+    store: &TemplateStore,
+    id: &str,
+    version: u32,
+    sink: &SinkChoice,
+    supplied: &SuppliedParams,
+    env_overrides: &BTreeMap<String, String>,
+    mode: Materialize,
+    selection: Option<&crate::select::SelectionRequest>,
+) -> CliResult<MaterializedConfig> {
     let record = fetch_version(store, id, version).await?;
     match record.kind {
         TemplateKind::Pipeline => {
@@ -903,7 +936,9 @@ pub async fn materialize_for_run(
                      config itself; an overlay applies to a composed source × sink run"
                 )));
             }
-            materialize(store, id, version, supplied, env_overrides, mode).await
+            let mut m = materialize(store, id, version, supplied, env_overrides, mode).await?;
+            m.selection = selection.cloned();
+            Ok(m)
         }
         TemplateKind::SourceTemplate => {
             let sink_id = sink.id.as_deref().ok_or_else(|| {
@@ -913,7 +948,7 @@ pub async fn materialize_for_run(
                 ))
             })?;
             let sink_version = resolve_version(store, sink_id, sink.version).await?;
-            materialize_pair_overlaid(
+            materialize_pair_selected(
                 store,
                 (id, version),
                 (sink_id, sink_version),
@@ -921,6 +956,7 @@ pub async fn materialize_for_run(
                 supplied,
                 env_overrides,
                 mode,
+                selection,
             )
             .await
         }
@@ -959,6 +995,30 @@ pub async fn materialize_pair_overlaid(
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
 ) -> CliResult<MaterializedConfig> {
+    materialize_pair_selected(
+        store,
+        (source_id, source_version),
+        (sink_id, sink_version),
+        overlay,
+        supplied,
+        env_overrides,
+        mode,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_pair_selected(
+    store: &TemplateStore,
+    (source_id, source_version): (&str, u32),
+    (sink_id, sink_version): (&str, u32),
+    overlay: Option<&OverlayChoice>,
+    supplied: &SuppliedParams,
+    env_overrides: &BTreeMap<String, String>,
+    mode: Materialize,
+    selection: Option<&crate::select::SelectionRequest>,
+) -> CliResult<MaterializedConfig> {
     let src_rec = fetch_version(store, source_id, source_version).await?;
     let sink_rec = fetch_version(store, sink_id, sink_version).await?;
     if src_rec.kind != TemplateKind::SourceTemplate {
@@ -985,6 +1045,13 @@ pub async fn materialize_pair_overlaid(
                 "stored sink-template '{sink_id}' v{sink_version}: {e}"
             ))
         })?;
+    let (source, effective) = match selection {
+        Some(sel) => {
+            let (narrowed, effective) = crate::hub::rows::narrow_source_template(&source, sel)?;
+            (narrowed, Some(effective))
+        }
+        None => (source, None),
+    };
     let mut composition = crate::hub::compose(&source, &sink)?;
     let (mut overlay_id, mut overlay_version) = (None, None);
     if let Some(choice) = overlay {
@@ -1010,6 +1077,7 @@ pub async fn materialize_pair_overlaid(
         overlay_version,
         overlay_contributes,
         warnings,
+        selection: effective,
     })
 }
 

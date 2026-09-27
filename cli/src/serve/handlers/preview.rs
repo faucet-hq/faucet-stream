@@ -248,6 +248,9 @@ fn source_spec(record: &LocalOutputRecord, rows: RowCap) -> Result<PreviewReques
     let config = match record.kind.as_str() {
         "jsonl" => json!({ "path": record.path, "batch_size": page, "limit": row_limit }),
         "csv" => json!({ "path": record.path, "batch_size": page }),
+        // The file sink's output is read back by the file source, which
+        // resolves the format from the extension exactly as the sink did.
+        "file" => json!({ "path": record.path, "batch_size": page, "strict": true }),
         // `local_path` is `ParquetLocation`'s snake_case tag; a rolled parquet
         // run records each part as its own ledger row, so this is always one
         // concrete file, never a glob.
@@ -258,7 +261,7 @@ fn source_spec(record: &LocalOutputRecord, rows: RowCap) -> Result<PreviewReques
         other => {
             return Err(ServeError::BadConfig(format!(
                 "preview is not supported for `{other}` outputs — only the local file \
-                 sinks faucet can read back (jsonl, csv, parquet)"
+                 sinks faucet can read back (jsonl, csv, parquet, file)"
             )));
         }
     };
@@ -379,6 +382,17 @@ mod tests {
         assert_eq!(spec.config["path"], p.to_string_lossy().as_ref());
         // CsvSource ignores the trait-level hint, so this field is the cap.
         assert_eq!(spec.config["batch_size"], 6);
+    }
+
+    #[test]
+    fn file_spec_targets_the_file_source_strictly() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = touch(dir.path(), "rows.jsonl");
+        let spec = source_spec(&record(&p, "file"), RowCap::Rows(3)).unwrap();
+        assert_eq!(spec.kind, "file");
+        assert_eq!(spec.config["path"], p.to_string_lossy().as_ref());
+        assert_eq!(spec.config["batch_size"], 4);
+        assert_eq!(spec.config["strict"], true);
     }
 
     #[test]

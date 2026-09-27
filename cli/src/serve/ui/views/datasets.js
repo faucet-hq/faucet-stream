@@ -348,7 +348,7 @@ export async function renderLocalOutputs(host, scope = {}) {
           ? outputs.map((o) => outputRow(o, canManage, canPreview)).join("")
           : `<div class="empty">No local output files tracked${
               datasetId ? " for this dataset" : ""
-            } yet — run a pipeline with a jsonl, csv, or parquet sink.</div>`
+            } yet — run a pipeline with a file, jsonl, csv, or parquet sink.</div>`
       }</div>`;
 
     body.querySelector("#lo-expired").onchange = (e) => {
@@ -497,7 +497,7 @@ function outputRow(o, canManage, canPreview) {
 // offering either would be offering a button that can only fail.
 
 /** Sink kinds that have a reader on the server. Anything else gets no button. */
-const PREVIEWABLE = new Set(["jsonl", "csv", "parquet"]);
+const PREVIEWABLE = new Set(["jsonl", "csv", "parquet", "file"]);
 
 /** Truncation point for one cell's rendered text. */
 const CELL_MAX = 240;

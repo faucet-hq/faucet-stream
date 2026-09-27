@@ -1397,6 +1397,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TriggerTemplateResponse" }
+        "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
@@ -2212,6 +2213,48 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
+  /v1/templates/{id}/rows:
+    get:
+      summary: List a template's selectable rows, or preview a selection (#741)
+      description: >
+        The streams of a `source-template` (write resolution, delivery
+        guarantee and cleanup against `sink` when given) or the matrix rows of
+        a `pipeline` template, with identity, hierarchy, read, shape, params and
+        — when the state store is readable — state metadata. Rows come from
+        expanding the template with placeholder-bound params, so required
+        params never block a listing. Any selector parameter turns the listing
+        into a dry-run resolve: each row gains `selected` / `pulled_in` /
+        `blocked` / `excluded`, and the body gains `run_set` and the `error`
+        a trigger with that selection would return. A topology template
+        returns `rows: []` with `selectable: false`. Requires `TemplateRead`
+        (viewer+); audited as `template.rows`.
+      operationId: templateRows
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: version, in: query, required: false, schema: { type: string }, description: "A number or a channel (default `stable`)." }
+        - { name: sink, in: query, required: false, schema: { type: string }, description: "For a source template: the sink template to resolve against." }
+        - { name: sink_version, in: query, required: false, schema: { type: string } }
+        - { name: overlay, in: query, required: false, schema: { type: string }, description: "A registered deployment overlay applied over the pairing (its `state:` backs the state group)." }
+        - { name: overlay_version, in: query, required: false, schema: { type: string } }
+        - { name: select, in: query, required: false, schema: { type: string }, description: "Comma-joined row ids." }
+        - { name: only, in: query, required: false, schema: { type: string }, description: "Comma-joined row-id globs." }
+        - { name: skip, in: query, required: false, schema: { type: string } }
+        - { name: tags, in: query, required: false, schema: { type: string } }
+        - { name: status, in: query, required: false, schema: { type: string } }
+        - { name: include_parents, in: query, required: false, schema: { type: string, enum: ["off", eligible, all] } }
+        - { name: state, in: query, required: false, schema: { type: boolean, default: true }, description: "Read each row's status." }
+      responses:
+        "200":
+          description: The rows.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TemplateRows" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
   /v1/audit:
     get:
       summary: Read the control-plane audit log (RBAC, admin-only)
@@ -2476,6 +2519,7 @@ components:
         require_approval: { type: boolean, default: false, description: "Ask for an approved change request (#703) instead of a run; implied by `--require-approval run`. The 202 body is then `{ status: pending_approval, change_id, change }`." }
         reason: { type: string, description: "Why, for the approvers (with require_approval)." }
         budget: { $ref: "#/components/schemas/BudgetSpec" }
+        selection: { $ref: "#/components/schemas/RowSelection" }
       example:
         name: orders_to_warehouse
         config_format: yaml
@@ -2618,6 +2662,7 @@ components:
         elapsed_secs: { type: number, nullable: true }
         records_written: { type: integer }
         tenant: { type: string, description: "The tenant this run was started for (#709); absent for an ordinary run." }
+        selection: { $ref: "#/components/schemas/RowSelection" }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -3021,6 +3066,12 @@ components:
         signals:
           type: array
           items: { $ref: "#/components/schemas/CostSignal" }
+        throttled: { type: integer, description: "Rate-limit responses (HTTP 429 and equivalents) the source received (#734). Omitted when zero." }
+        throttle_wait_secs: { type: number, description: "Seconds the source actually slept because of them. Omitted when zero." }
+        source_retries:
+          type: object
+          description: Source-side retries by class (`rate_limited`, `http_5xx`, `connection`, `timeout`).
+          additionalProperties: { type: integer }
     CostEstimate:
       type: object
       description: The priced view of a `UsageSnapshot` — an estimate, in the deployment's configured currency.
@@ -3075,6 +3126,8 @@ components:
         bytes_written: { type: integer }
         duration_ms: { type: integer }
         roundtrips: { type: integer }
+        throttled: { type: integer, description: "Rate-limit responses the sources received (#734)." }
+        throttle_wait_secs: { type: number, description: "Seconds the sources slept on those rate limits." }
         cost: { type: number }
         hosted_equivalent: { type: number }
         not_reported: { type: array, items: { type: string } }
@@ -3648,6 +3701,121 @@ components:
               config: { dataset: analytics, table: orders }
         description: Orders → BigQuery
         launch: true
+    RowSelection:
+      type: object
+      nullable: true
+      additionalProperties: false
+      description: >
+        Run only some of the config's matrix rows / a source template's streams
+        (#741) — the CLI's `--select` / `--only` / `--skip` / `--tag` /
+        `--status` / `--include-parents`. Omitted: every row runs. An empty
+        object applies only the status gate (`mandatory` + `active` rows). An
+        unknown row or tag, an empty run set, a missing ancestor under
+        `include_parents: off`, or any selection on a topology is a `400`
+        naming the valid rows. The run is labelled
+        `selection=<canonical form>`, and the selection is stored with the run
+        so a clustered / claimed / sharded run applies the same subset.
+      properties:
+        select: { type: array, items: { type: string }, description: "Row ids to run exactly (bypasses the status gate)." }
+        only: { type: array, items: { type: string }, description: "Row-id globs (`act*`) to run (bypasses the status gate)." }
+        skip: { type: array, items: { type: string }, description: "Row ids / globs removed last; a `mandatory` row needs an exact id." }
+        tags: { type: array, items: { type: string }, description: "Narrow the eligible rows to those carrying any of these tags." }
+        status: { type: array, items: { type: string, enum: [mandatory, active, available, draft, archived] }, description: "Status tiers added to the default eligible set." }
+        include_parents: { type: string, nullable: true, enum: ["off", eligible, all], description: "A selected row's missing parent / depends_on ancestors: `off` refuses (default), `eligible` pulls in runnable ones and refuses a parked one, `all` pulls in every one." }
+      example: { select: [deals], include_parents: eligible }
+    TemplateRows:
+      type: object
+      required: [template, kind, selectable, rows]
+      description: "`GET /v1/templates/{id}/rows` (#741). Also printed by `faucet template rows --json`, `faucet hub rows --json` and the MCP `list_template_rows` tool."
+      properties:
+        template: { type: string }
+        version: { type: integer }
+        kind: { type: string, enum: [source-template, pipeline] }
+        selectable: { type: boolean, description: "`false` for a topology pipeline (`pipeline.nodes`), which has no rows." }
+        sink: { type: string, description: "The sink template resolved against (with `?sink=`)." }
+        sink_version: { type: integer }
+        sink_kind: { type: string }
+        rows: { type: array, items: { $ref: "#/components/schemas/TemplateRow" } }
+        selection: { $ref: "#/components/schemas/RowSelection" }
+        run_set: { type: array, items: { type: string }, description: "With selector params: the rows a trigger with that selection runs, in execution order." }
+        error: { type: string, description: "With selector params: the error a trigger with that selection would return." }
+        notes: { type: array, items: { type: string }, description: "Why an optional group (`state`) is missing." }
+    TemplateRow:
+      type: object
+      required: [id, kind, status, tags, default_selected, children, depends_on, depth, per_parent_record, primary_keys, read, shape, params_used]
+      description: "One selectable row, described from the template spec, the composed / expanded row, the capability registry, the delivery-guarantee derivation and the `faucet status` report."
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [stream, row] }
+        description: { type: string }
+        status: { type: string, enum: [mandatory, active, available, draft, archived] }
+        tags: { type: array, items: { type: string } }
+        default_selected: { type: boolean, description: "Included by a run with no narrowing selector (status `mandatory` / `active`)." }
+        parent: { type: string, nullable: true }
+        parent_key: { type: string }
+        children: { type: array, items: { type: string } }
+        depends_on: { type: array, items: { type: string } }
+        depth: { type: integer, description: "Execution level: 0 without ancestors, else one past the deepest." }
+        per_parent_record: { type: boolean, description: "Runs once per record of its parent (a child fan-out)." }
+        write:
+          type: object
+          properties:
+            requested: { type: array, items: { type: string } }
+            resolved: { type: string, description: "With a sink." }
+            supported: { type: boolean, description: "With a sink: whether the row can run against it." }
+            offered: { type: array, items: { type: string }, description: "With a sink: the write modes it offers." }
+            alias_applied: { type: string, description: "A `write_mode_aliases` substitution, `overwrite→append`." }
+            unsupported_reason: { type: string }
+        primary_keys: { type: array, items: { type: string } }
+        delete_marker: { type: object, additionalProperties: true }
+        read:
+          type: object
+          properties:
+            source_kind: { type: string }
+            replication:
+              type: object
+              properties:
+                method: { type: string, enum: [full, incremental] }
+                field: { type: string }
+            resumable: { type: boolean, description: "Bookmarks (incremental, CDC or stream source) and has a durable state store." }
+            shardable: { type: boolean }
+            supports_discover: { type: boolean }
+        guarantees:
+          type: object
+          description: "With a sink (always for a pipeline)."
+          properties:
+            delivery_guarantee: { type: string, description: "`at-least-once`, or `effectively-once (atomic watermark | keyed upsert)`." }
+            cleanup_capable: { type: boolean }
+        shape:
+          type: object
+          properties:
+            schema: { type: object, additionalProperties: true }
+            schema_source: { type: string, enum: [contract] }
+            transforms:
+              type: object
+              properties:
+                count: { type: integer }
+                kinds: { type: array, items: { type: string } }
+                renames_fields: { type: boolean }
+                drops_fields: { type: boolean }
+        params_used: { type: array, items: { type: string } }
+        state:
+          type: object
+          description: "From the `faucet status` report, when the state store is readable."
+          properties:
+            health: { type: string, enum: [ok, running, warming, unknown, degraded, failed] }
+            last_success: { type: string, format: date-time }
+            last_failure: { type: string, format: date-time }
+            last_error: { type: string }
+            bookmark_age_secs: { type: integer }
+            lag: { type: object, additionalProperties: true }
+        selected: { type: boolean, description: "With selector params: picked by the selection itself." }
+        pulled_in:
+          type: object
+          properties: { because: { type: string } }
+          description: "With selector params: added as a required ancestor of `because`."
+        blocked: { type: string, description: "With selector params: needed by the run set but refused — why." }
+        excluded: { type: string, description: "With selector params: not in the run set — why." }
     TriggerTemplateRequest:
       type: object
       description: >
@@ -3694,6 +3862,8 @@ components:
         idempotency_key: { type: string }
         clock: { type: string, description: "RFC3339 or YYYY-MM-DD override for `${now.*}`." }
         concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
+        budget: { $ref: "#/components/schemas/BudgetSpec" }
+        selection: { $ref: "#/components/schemas/RowSelection" }
       example:
         params:
           region: us-east-1
@@ -3748,6 +3918,7 @@ components:
             Present only when the template is deprecated — the run still started,
             but the caller should migrate. Carries the retirement reason when one
             was given.
+        selection: { $ref: "#/components/schemas/RowSelection" }
       example:
         run_id: run_01HZY8K3QK7
         status: queued

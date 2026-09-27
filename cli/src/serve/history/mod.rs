@@ -174,6 +174,11 @@ pub struct RunRecord {
     /// so a listing can filter by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The row selection the run applies (#741) — stored so a claimed,
+    /// resumed or sharded run executes the same subset. In the SQL `body`
+    /// column; defaulted for records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::select::SelectionRequest>,
 }
 
 impl RunRecord {
@@ -208,6 +213,7 @@ impl RunRecord {
             replay_of: None,
             callback: None,
             tenant: None,
+            selection: None,
         }
     }
 }

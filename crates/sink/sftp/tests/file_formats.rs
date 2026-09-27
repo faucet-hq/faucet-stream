@@ -144,3 +144,9 @@ async fn an_empty_write_leaves_no_file() {
         .collect();
     assert!(names.is_empty(), "no file for an empty page, got {names:?}");
 }
+
+#[cfg(feature = "file-format-avro")]
+#[tokio::test]
+async fn avro_files_round_trip() {
+    round_trip(SftpSinkFormat::Avro, FileFormat::Avro, ".avro").await;
+}

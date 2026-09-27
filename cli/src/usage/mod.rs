@@ -120,7 +120,28 @@ pub fn summary_line(r: &UsageRecord) -> String {
         "; hosted per-row equivalent {} {:.2}",
         r.cost.currency, r.cost.hosted_equivalent
     ));
+    if let Some(t) = throttle_note(r.usage.throttled, r.usage.throttle_wait_secs) {
+        s.push_str(&format!("; {t}"));
+    }
     s
+}
+
+/// `throttled 312× · waited 41 min`, or `None` when nothing was throttled.
+pub fn throttle_note(throttled: u64, wait_secs: f64) -> Option<String> {
+    (throttled > 0).then(|| format!("throttled {throttled}× · waited {}", fmt_wait(wait_secs)))
+}
+
+/// Human-readable wait: `850 ms`, `12.4 s`, `41 min`, `2.3 h`.
+pub fn fmt_wait(secs: f64) -> String {
+    if secs < 1.0 {
+        format!("{:.0} ms", secs * 1000.0)
+    } else if secs < 60.0 {
+        format!("{secs:.1} s")
+    } else if secs < 3600.0 {
+        format!("{:.0} min", secs / 60.0)
+    } else {
+        format!("{:.1} h", secs / 3600.0)
+    }
 }
 
 /// Human-readable byte count.
@@ -194,10 +215,20 @@ pub fn render_report(rep: &UsageReport) -> String {
             r.roundtrips,
             r.cost,
             r.hosted_equivalent,
-            if r.not_reported.is_empty() {
-                String::new()
-            } else {
-                format!("  (compute not reported: {})", r.not_reported.join(", "))
+            {
+                let mut notes = Vec::new();
+                if !r.not_reported.is_empty() {
+                    notes.push(format!(
+                        "compute not reported: {}",
+                        r.not_reported.join(", ")
+                    ));
+                }
+                notes.extend(throttle_note(r.throttled, r.throttle_wait_secs));
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", notes.join("; "))
+                }
             },
             key_w = key_w
         ));
@@ -259,6 +290,43 @@ mod tests {
         let opts = UsageOptions::from_spec(None, None).unwrap();
         assert_eq!(opts.pricing.currency, "USD");
         assert_eq!(UsageOptions::default().pricing.currency, "USD");
+    }
+
+    #[test]
+    fn throttling_shows_in_the_summary_and_the_report() {
+        let usage = UsageSnapshot {
+            records_read: 3,
+            records_written: 3,
+            throttled: 312,
+            throttle_wait_secs: 2460.0,
+            ..Default::default()
+        };
+        let r = build_record(
+            RecordIdentity {
+                run_id: "r1",
+                pipeline: "p",
+                row: "row-0",
+                source_kind: "rest",
+                sink_kind: "jsonl",
+                dataset_id: None,
+                dataset_uri: None,
+            },
+            usage,
+            3_000_000,
+            false,
+            &PricingSpec::default(),
+            Utc::now(),
+        );
+        let line = summary_line(&r);
+        assert!(line.ends_with("; throttled 312× · waited 41 min"), "{line}");
+        let rep = aggregate(&[r.clone(), r], GroupBy::Pipeline, "USD");
+        assert_eq!(rep.total.throttled, 624);
+        let text = render_report(&rep);
+        assert!(text.contains("; throttled 624× · waited 1.4 h)"), "{text}");
+        assert_eq!(throttle_note(0, 5.0), None);
+        assert_eq!(fmt_wait(0.25), "250 ms");
+        assert_eq!(fmt_wait(12.44), "12.4 s");
+        assert_eq!(fmt_wait(8280.0), "2.3 h");
     }
 
     #[test]

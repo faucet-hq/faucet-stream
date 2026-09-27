@@ -34,6 +34,12 @@ pub enum GcsSinkFormat {
     /// Requires `file-format-excel` (#604).
     #[cfg(feature = "file-format-excel")]
     Xlsx,
+    /// An Apache Avro Object Container File, against `avro.schema` or a
+    /// schema inferred from the object's records; block codec from
+    /// `avro.codec`. Requires `file-format-avro` (#719). There is no ORC
+    /// variant: ORC is read-only.
+    #[cfg(feature = "file-format-avro")]
+    Avro,
 }
 
 impl GcsSinkFormat {
@@ -51,6 +57,8 @@ impl GcsSinkFormat {
             Self::Xml => Some(faucet_core::FileFormat::Xml),
             #[cfg(feature = "file-format-excel")]
             Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
+            #[cfg(feature = "file-format-avro")]
+            Self::Avro => Some(faucet_core::FileFormat::Avro),
         }
     }
 
@@ -125,6 +133,9 @@ pub struct GcsSinkConfig {
     /// Record framing, used when `format: xml` (#604).
     #[serde(default)]
     pub xml: faucet_core::XmlOptions,
+    /// Writer schema and block codec, used when `format: avro` (#719).
+    #[serde(default)]
+    pub avro: faucet_core::AvroOptions,
 }
 
 fn default_file_extension() -> String {
@@ -155,6 +166,7 @@ impl GcsSinkConfig {
             csv: faucet_core::CsvOptions::default(),
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
+            avro: faucet_core::AvroOptions::default(),
         }
     }
 
@@ -165,6 +177,8 @@ impl GcsSinkConfig {
             csv: self.csv.clone(),
             excel: self.excel.clone(),
             xml: self.xml.clone(),
+            avro: self.avro.clone(),
+            orc: faucet_core::OrcOptions::default(),
         }
     }
 
@@ -183,6 +197,12 @@ impl GcsSinkConfig {
     /// Set the record framing used when `format: xml` (#604).
     pub fn xml(mut self, xml: faucet_core::XmlOptions) -> Self {
         self.xml = xml;
+        self
+    }
+
+    /// Set the Avro writer schema and codec used when `format: avro` (#719).
+    pub fn avro(mut self, avro: faucet_core::AvroOptions) -> Self {
+        self.avro = avro;
         self
     }
 
@@ -422,6 +442,8 @@ mod tests {
         assert!(!GcsSinkFormat::Xml.appends_per_record());
         #[cfg(feature = "file-format-excel")]
         assert!(!GcsSinkFormat::Xlsx.appends_per_record());
+        #[cfg(feature = "file-format-avro")]
+        assert!(!GcsSinkFormat::Avro.appends_per_record());
     }
 
     #[test]
@@ -480,5 +502,22 @@ mod tests {
         let c: GcsSinkConfig =
             serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "p/"})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+    }
+
+    #[cfg(feature = "file-format-avro")]
+    #[test]
+    fn the_avro_block_reaches_the_encoder() {
+        let cfg =
+            GcsSinkConfig::new("b")
+                .format(GcsSinkFormat::Avro)
+                .avro(faucet_core::AvroOptions {
+                    schema: None,
+                    codec: faucet_core::AvroCodec::Snappy,
+                });
+        assert_eq!(cfg.format.shared(), Some(faucet_core::FileFormat::Avro));
+        assert_eq!(
+            cfg.format_options().avro.codec,
+            faucet_core::AvroCodec::Snappy
+        );
     }
 }

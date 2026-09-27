@@ -1,0 +1,66 @@
+[package]
+name = "faucet-source-file"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local file source (JSONL, JSON, CSV, Excel, XML, Parquet, Avro, ORC; path, directory, glob or URL) for the faucet-stream ecosystem"
+readme = "README.md"
+keywords = ["file", "jsonl", "csv", "etl", "connector"]
+categories.workspace = true
+
+[dependencies]
+faucet-core = { workspace = true, features = ["compression"] }
+faucet-common-file.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures.workspace = true
+glob.workspace = true
+chrono.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+arrow = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[features]
+# Formats that need a dependency. JSON Lines, JSON arrays and raw text are
+# always available; `file-formats` turns on the rest.
+file-format-csv = ["faucet-core/file-format-csv"]
+file-format-xml = ["faucet-core/file-format-xml"]
+file-format-excel = ["faucet-core/file-format-excel"]
+file-format-avro = ["faucet-core/file-format-avro"]
+file-format-orc = ["faucet-core/file-format-orc", "arrow"]
+file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
+# The columnar (Arrow) path for Avro, ORC and Parquet.
+arrow = ["faucet-core/arrow", "dep:arrow"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
+
+[dev-dependencies]
+faucet-conformance.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
+tempfile = "3"
+wiremock = "0.6"
+flate2.workspace = true
+async-trait.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+faucet-sink-parquet = { workspace = true, features = ["arrow"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides — the workspace-wide
+# declared contract (see crates/core/Cargo.toml).
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"
+enum_variant_added = "allow"

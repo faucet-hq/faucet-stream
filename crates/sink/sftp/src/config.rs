@@ -30,6 +30,12 @@ pub enum SftpSinkFormat {
     /// `file-format-excel`.
     #[cfg(feature = "file-format-excel")]
     Xlsx,
+    /// An Apache Avro Object Container File, against `avro.schema` or a
+    /// schema inferred from the object's records; block codec from
+    /// `avro.codec`. Requires `file-format-avro` (#719). There is no ORC
+    /// variant: ORC is read-only.
+    #[cfg(feature = "file-format-avro")]
+    Avro,
 }
 
 impl SftpSinkFormat {
@@ -44,6 +50,8 @@ impl SftpSinkFormat {
             Self::Xml => faucet_core::FileFormat::Xml,
             #[cfg(feature = "file-format-excel")]
             Self::Xlsx => faucet_core::FileFormat::Xlsx,
+            #[cfg(feature = "file-format-avro")]
+            Self::Avro => faucet_core::FileFormat::Avro,
         }
     }
 
@@ -97,6 +105,9 @@ pub struct SftpSinkConfig {
     /// Record framing, used when `format: xml` (#604).
     #[serde(default)]
     pub xml: faucet_core::XmlOptions,
+    /// Writer schema and block codec, used when `format: avro` (#719).
+    #[serde(default)]
+    pub avro: faucet_core::AvroOptions,
 }
 
 fn default_file_extension() -> String {
@@ -121,6 +132,7 @@ impl SftpSinkConfig {
             csv: faucet_core::CsvOptions::default(),
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
+            avro: faucet_core::AvroOptions::default(),
         }
     }
 
@@ -148,6 +160,12 @@ impl SftpSinkConfig {
         self
     }
 
+    /// Set the Avro writer schema and codec used when `format: avro` (#719).
+    pub fn avro(mut self, avro: faucet_core::AvroOptions) -> Self {
+        self.avro = avro;
+        self
+    }
+
     /// The per-format option blocks in the shape
     /// [`faucet_core::file_format::encode`] wants.
     pub(crate) fn format_options(&self) -> faucet_core::FormatOptions {
@@ -155,6 +173,8 @@ impl SftpSinkConfig {
             csv: self.csv.clone(),
             excel: self.excel.clone(),
             xml: self.xml.clone(),
+            avro: self.avro.clone(),
+            orc: faucet_core::OrcOptions::default(),
         }
     }
 
@@ -246,6 +266,8 @@ mod tests {
         assert!(!SftpSinkFormat::Xml.appends_per_record());
         #[cfg(feature = "file-format-excel")]
         assert!(!SftpSinkFormat::Xlsx.appends_per_record());
+        #[cfg(feature = "file-format-avro")]
+        assert!(!SftpSinkFormat::Avro.appends_per_record());
     }
 
     /// Every variant maps onto exactly one shared format, so what this sink
@@ -320,5 +342,24 @@ mod tests {
     fn batch_atomicity_matches_the_write_path() {
         let c: SftpSinkConfig = serde_json::from_value(serde_json::json!({"host": "sftp.example.com", "username": "user", "type": "password", "config": {"password": "secret"}, "path": "/upload"})).unwrap();
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+    }
+
+    #[cfg(feature = "file-format-avro")]
+    #[test]
+    fn the_avro_block_reaches_the_encoder() {
+        let cfg = SftpSinkConfig::new(
+            faucet_common_sftp::SftpConnectionConfig::with_password("h", "u", "p"),
+            "/d",
+        )
+        .format(SftpSinkFormat::Avro)
+        .avro(faucet_core::AvroOptions {
+            schema: None,
+            codec: faucet_core::AvroCodec::Snappy,
+        });
+        assert_eq!(cfg.format.shared(), faucet_core::FileFormat::Avro);
+        assert_eq!(
+            cfg.format_options().avro.codec,
+            faucet_core::AvroCodec::Snappy
+        );
     }
 }

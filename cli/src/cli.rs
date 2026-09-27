@@ -597,6 +597,9 @@ pub enum TemplateCommand {
     Delete(TemplateDeleteArgs),
     /// Materialize a template with the given params and run it locally.
     Run(TemplateRunArgs),
+    /// List a template's selectable rows (streams / matrix rows) with their
+    /// metadata; with selection flags, preview what a run would execute.
+    Rows(TemplateRowsArgs),
     /// Run a parameter-combination test suite against a template (#648).
     Test(TemplateTestArgs),
     /// Pull templates from the origins in a `--config` sync file into the
@@ -899,6 +902,44 @@ pub struct TemplateRunArgs {
     /// Version of a registered overlay: a number or a channel. Default `stable`.
     #[arg(long, default_value = "stable", requires = "overlay")]
     pub overlay_version: String,
+    /// Run only some of the template's rows (#741): streams of a source
+    /// template, matrix rows of a pipeline. `faucet template rows` lists them.
+    #[command(flatten)]
+    pub selection: SelectionArgs,
+    #[command(flatten)]
+    pub common: TemplateStoreArgs,
+}
+
+/// `faucet template rows <id>` arguments (#741).
+#[cfg(feature = "templates")]
+#[derive(Debug, Parser)]
+pub struct TemplateRowsArgs {
+    /// Template id: a `source-template` or a `pipeline`.
+    pub id: String,
+    /// Version: a number or a channel. Default `stable`.
+    #[arg(long, default_value = "stable")]
+    pub version: String,
+    /// For a source template: the sink template to resolve write modes,
+    /// delivery guarantees and cleanup against.
+    #[arg(long)]
+    pub sink: Option<String>,
+    /// Version of the sink template. Default `stable`.
+    #[arg(long, default_value = "stable", requires = "sink")]
+    pub sink_version: String,
+    /// Deployment overlay applied over the pairing (a registered id or a
+    /// file) — its `state:` backs the state columns.
+    #[arg(long, requires = "sink")]
+    pub overlay: Option<String>,
+    /// Version of a registered overlay. Default `stable`.
+    #[arg(long, default_value = "stable", requires = "overlay")]
+    pub overlay_version: String,
+    /// Skip reading each row's state (last success / failure, bookmark age).
+    #[arg(long)]
+    pub no_state: bool,
+    /// Preview a selection: which rows would run, which ancestors are pulled
+    /// in, which are blocked.
+    #[command(flatten)]
+    pub selection: SelectionArgs,
     #[command(flatten)]
     pub common: TemplateStoreArgs,
 }
@@ -997,6 +1038,38 @@ pub enum HubCommand {
     /// Publishability lint: no literal credentials, no private
     /// infrastructure, secrets marked, descriptions present.
     Lint(HubLintArgs),
+    /// List a catalog source template's streams (or a pipeline file's rows)
+    /// with their metadata; with selection flags, preview a run's rows.
+    Rows(HubRowsArgs),
+}
+
+/// `faucet hub rows <source>` arguments (#741).
+#[derive(Debug, Parser)]
+pub struct HubRowsArgs {
+    /// Source template (a path or a catalog id), or a pipeline config file.
+    pub source: String,
+    /// Sink template to resolve write modes and guarantees against.
+    #[arg(long)]
+    pub sink: Option<String>,
+    /// Deployment overlay applied over the pairing.
+    #[arg(long, requires = "sink")]
+    pub overlay: Option<String>,
+    /// Hub catalog(s), as for `faucet hub compose`.
+    #[arg(long, env = "FAUCET_HUB", value_delimiter = ',')]
+    pub hub: Vec<String>,
+    #[arg(long)]
+    pub source_hub: Option<String>,
+    #[arg(long)]
+    pub sink_hub: Option<String>,
+    #[arg(long)]
+    pub overlay_hub: Option<String>,
+    /// Also read each row's state from the composed run's state store.
+    #[arg(long)]
+    pub state: bool,
+    #[command(flatten)]
+    pub selection: SelectionArgs,
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// The pairing every hub verb takes.

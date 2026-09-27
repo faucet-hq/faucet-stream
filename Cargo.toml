@@ -21,6 +21,8 @@ members = [
     "crates/common/azure",
     "crates/source/rest",
     "crates/source/singer",
+    "crates/common/singer",
+    "crates/sink/singer",
     "crates/conformance",
     "crates/source/graphql",
     "crates/source/xml",
@@ -46,6 +48,9 @@ members = [
     "crates/source/websocket",
     "crates/source/sqlite",
     "crates/source/csv",
+    "crates/source/file",
+    "crates/common/file",
+    "crates/sink/file",
     "crates/source/elasticsearch",
     "crates/source/parquet",
     "crates/source/postgres-cdc",
@@ -144,6 +149,8 @@ faucet-common-mssql = { path = "crates/common/mssql", version = "1" }
 faucet-common-delta = { path = "crates/common/delta", version = "1" }
 faucet-source-rest = { path = "crates/source/rest", version = "1" }
 faucet-source-singer = { path = "crates/source/singer", version = "1" }
+faucet-common-singer = { path = "crates/common/singer", version = "1" }
+faucet-sink-singer = { path = "crates/sink/singer", version = "1" }
 # Path-only on purpose: faucet-conformance is a test battery consumed only as
 # a dev-dependency; a versioned entry would make dependents' `cargo publish`
 # require it on crates.io first (release-plz does not order by dev-dep edges).
@@ -172,6 +179,9 @@ faucet-source-webhook = { path = "crates/source/webhook", version = "1" }
 faucet-source-websocket = { path = "crates/source/websocket", version = "1" }
 faucet-source-sqlite = { path = "crates/source/sqlite", version = "1" }
 faucet-source-csv = { path = "crates/source/csv", version = "1" }
+faucet-source-file = { path = "crates/source/file", version = "1" }
+faucet-common-file = { path = "crates/common/file", version = "1" }
+faucet-sink-file = { path = "crates/sink/file", version = "1" }
 faucet-source-elasticsearch = { path = "crates/source/elasticsearch", version = "1" }
 faucet-source-parquet = { path = "crates/source/parquet", version = "1" }
 faucet-source-bigquery = { path = "crates/source/bigquery", version = "1" }
@@ -344,7 +354,9 @@ schemars = "1.2.1"
 futures = "0.3"
 async-stream = "0.3"
 rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored", "sasl"] }
-apache-avro = { version = "0.21", default-features = false, features = ["snappy"] }
+apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
+# ORC reader (#719). Arrow-native; pinned to the arrow-58 line like parquet.
+orc-rust = { version = "0.8", default-features = false }
 jsonschema = { version = "0.46", default-features = false }
 lru = "0.18"
 # Observability fixture. `metrics` and `tracing` are core deps because they are

@@ -19,6 +19,7 @@ listed as *compute not reported* — never as zero.
 | `records_read` / `records_written` | The pipeline's own decorators around every source and sink (post-transform, what the sink accepted). |
 | `bytes_read` / `bytes_written` | An estimate of the serialized JSON size of the same records — the same estimate for every connector, so pipelines compare; **not** wire bytes. |
 | `source_roundtrips` / `sink_roundtrips` | Calls a connector made to its backend, by op (`page`, `get`, `list`, `put`, `insert`, …) — the same counts as the `faucet_*_roundtrips_total` metrics. |
+| `throttled` / `throttle_wait_secs` / `source_retries` | Rate-limit responses the source received, the seconds it actually slept on them, and its retries by class — reported by `rest`, `graphql` and `xml` ([source-side throttling](./resilience.md#source-side-throttling)). Omitted when zero. |
 | `signals` | Backend-reported figures: BigQuery `bytes_processed` / `bytes_billed` / `bytes_streamed` / `bytes_loaded`; S3 and GCS request counts. Each names the connector it came from. |
 
 Accounting is always on; there is nothing to enable. Recording into a store
@@ -34,6 +35,12 @@ into its `--history` backend.
 ```text
 csv_to_jsonl: 1 invocation, 1 ok, 0 failed, wrote 5 records
   default                        usage: 5 in / 5 out, 312 B read / 312 B written, est. USD 0.0000; hosted per-row equivalent USD 0.00
+```
+
+A run that was rate limited appends what it cost in time:
+
+```text
+  default                        usage: 90,000 in / 90,000 out, 41.2 MiB read / 41.2 MiB written, est. USD 0.0000; hosted per-row equivalent USD 1.35; throttled 312× · waited 41 min
 ```
 
 `faucet run --output json` carries the full record under each row's `usage`,
@@ -53,6 +60,9 @@ usage by pipeline (since 2026-09-01T00:00:00Z; 42 invocation(s); estimates in US
   orders        42     1,204,000     512.3 MiB      118.4s         168        3.1200         18.06
   total         42     1,204,000     512.3 MiB      118.4s         168        3.1200         18.06
 ```
+
+Rows whose runs were throttled carry a `(throttled N× · waited …)` note, and
+the JSON report's rows have `throttled` / `throttle_wait_secs`.
 
 `--by` groups by `pipeline` (default), `row`, `dataset` (the sink dataset's
 catalog id), `sink` (connector kind), `day` or `tenant` (the
@@ -98,6 +108,7 @@ schema. A config submitted to `faucet serve` may set `pricing:` inline but not
 |---|---|
 | `faucet_source_bytes_total{pipeline,row,connector}` / `faucet_sink_bytes_total{…}` | Estimated bytes read / written, per page, live. |
 | `faucet_cost_signals_total{pipeline,row,connector,kind,unit}` | Connector-reported cost signals as they arrive. |
+| `faucet_source_throttled_total{pipeline,row,connector}` / `faucet_source_throttle_wait_seconds{…}` / `faucet_source_retries_total{…,class}` | Source-side rate limiting, live ([details](./resilience.md#source-side-throttling)). |
 | `faucet_usage_estimated_cost_total{pipeline,row,currency}` | Estimated cost of finished invocations, in thousandths of a currency unit. |
 | `faucet_usage_hosted_equivalent_total{pipeline,row,currency}` | The hosted per-row equivalent, same unit. |
 | `faucet_usage_bytes_total{pipeline,row,direction}` | Estimated bytes of finished invocations (`read` / `written`). |

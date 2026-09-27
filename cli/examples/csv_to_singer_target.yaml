@@ -1,0 +1,31 @@
+# Feed a faucet source into an existing Singer target (#722) — here the
+# community `target-jsonl`, but any Singer target works. Useful when moving a
+# Meltano project to faucet one side at a time: keep the target you depend on,
+# replace the tap with a native faucet source.
+#
+#   pipx install target-jsonl        # or: pip install target-jsonl
+#   faucet validate cli/examples/csv_to_singer_target.yaml   # from the repo root
+#   faucet run      cli/examples/csv_to_singer_target.yaml
+#
+# The Singer stream is named after the pipeline (`orders`); with a matrix each
+# row id becomes its stream. `target-jsonl` writes `./out/orders.jsonl`.
+version: 1
+name: orders
+
+pipeline:
+  source:
+    type: csv
+    config:
+      path: ./cli/examples/data/orders.csv
+
+  sink:
+    type: singer
+    config:
+      target_command: target-jsonl
+      target_config:
+        destination_path: ./out
+        do_timestamp_file: false
+      # `exit` (default) closes the target at every flush and waits for a clean
+      # exit — works with every target. Use `state` for a target that echoes
+      # STATE as soon as the preceding records are persisted.
+      flush_on: exit

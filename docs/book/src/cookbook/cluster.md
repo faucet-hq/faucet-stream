@@ -296,6 +296,7 @@ finalized to `completed`/`failed` once every shard is terminal.
 | `s3` | hash-of-object-key modulo N | automatic (no config) |
 | `gcs` | hash-of-object-key modulo N | automatic (no config) |
 | `parquet` | hash-of-file-path modulo N | automatic (no config) |
+| `file` | hash-of-file-path modulo N (local paths; a single `http(s)://` file is one shard) | automatic (no config) |
 | `kafka` | native consumer-group membership | automatic (no config) |
 
 > **NULL shard keys are not dropped.** Rows whose `shard` key column is `NULL`

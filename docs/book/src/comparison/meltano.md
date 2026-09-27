@@ -34,7 +34,7 @@ Straight with you, because it's what makes the rest credible:
 |---|---|---|
 | Runtime | Rust, single native binary | Python |
 | Install | one binary / `brew` / `cargo` | Python env + plugins |
-| Connectors | <!--COUNT:connectors-->75<!--/COUNT--> (<!--COUNT:sources-->42<!--/COUNT--> sources, <!--COUNT:sinks-->33<!--/COUNT--> sinks), growing | 600+ taps |
+| Connectors | <!--COUNT:connectors-->78<!--/COUNT--> (<!--COUNT:sources-->43<!--/COUNT--> sources, <!--COUNT:sinks-->35<!--/COUNT--> sinks), growing | 600+ taps |
 | Throughput (1M-row CSV→JSONL) | **712k rows/s, 11.8 MiB** | 7.4k rows/s, 724 MiB |
 | In-flight transforms | ✓ 11 record transforms + filter/explode/CDC-unwrap + embedded-DuckDB `sql` | mappers; dbt post-load |
 | Data quality / contracts / masking | ✓ native, in-path | assemble (mappers, dbt tests) |
@@ -54,6 +54,51 @@ The mental model maps cleanly:
 | `meltano.yml` | a `faucet.yaml` `pipeline:` block |
 | Singer `STATE` | a resumable `state:` bookmark |
 | stream maps / mappers | `transforms:` (incl. the `sql` transform) |
+
+### Keep a Singer target you depend on
+
+You do not have to replace both sides at once. The `singer` **sink** runs any
+existing Singer target and feeds it faucet records, so a pipeline can move one
+side at a time: first swap the tap for a native faucet source and keep the
+target, then swap the target when a native sink covers it (or run a tap
+through the `singer` **source** into a native sink — the mirror image).
+
+```yaml
+# was: meltano run tap-csv target-jsonl
+version: 1
+name: orders
+pipeline:
+  source:
+    type: csv                       # native faucet source replaces the tap
+    config: { path: ./data/orders.csv }
+  sink:
+    type: singer                    # the Singer target you already run
+    config:
+      target_command: target-jsonl
+      target_config:                # what used to be the loader's config in meltano.yml
+        destination_path: ./out
+```
+
+What carries over and what changes:
+
+| Meltano loader setting | faucet `singer` sink |
+|---|---|
+| `pip_url` / executable | install the target yourself; `target_command` is its path or `PATH` name |
+| loader `config:` | `target_config:` — written to a private (0600) temp file passed as `--config`; its values are scrubbed from the target's stderr in faucet's logs and errors |
+| environment variables | `env:` |
+| stream name | the matrix row id (or the pipeline `name` for a single-row config); override with `stream:` |
+| `key_properties` from the tap | `write_mode: upsert` + `key: [...]` (or `key_properties:`) |
+| full-table / `ACTIVATE_VERSION` | `write_mode: overwrite` — records carry the run's version and `ACTIVATE_VERSION` is sent only after a successful run |
+| Meltano's state backend | faucet's `state:` block — a bookmark is saved only after the target confirms the records before it |
+
+Confirmation is `flush_on: exit` by default: at every flush the target's input
+is closed and faucet waits for a clean exit, which works with every target
+(most, including Meltano SDK targets, only emit `STATE` at end of input). For a
+target that echoes `STATE` as soon as it has persisted the preceding records,
+`flush_on: state` keeps one target running and waits for the echo. A target that
+exits non-zero fails the run with its last stderr lines. See the
+[`faucet-sink-singer` README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/singer)
+and the example `cli/examples/csv_to_singer_target.yaml`.
 
 For a full step-by-step walkthrough with before/after configs, see the
 [**Migrating from Meltano/Singer** guide](https://github.com/faucet-hq/faucet-stream/blob/main/docs/blog/migrating-from-meltano.md).

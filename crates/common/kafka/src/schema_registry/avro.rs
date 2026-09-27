@@ -1,7 +1,9 @@
 //! Avro encode/decode wrapped in the Confluent wire envelope.
 
 use crate::schema_registry::{client::SchemaRegistryClient, envelope};
-use apache_avro::{Schema, from_avro_datum, to_avro_datum, types::Value as AvroValue};
+use apache_avro::reader::datum::GenericDatumReader;
+use apache_avro::writer::datum::GenericDatumWriter;
+use apache_avro::{Schema, types::Value as AvroValue};
 use faucet_core::FaucetError;
 use serde_json::Value;
 
@@ -13,7 +15,9 @@ pub async fn decode(client: &SchemaRegistryClient, bytes: &[u8]) -> Result<Value
     let schema = Schema::parse_str(&registered.schema)
         .map_err(|e| FaucetError::Source(format!("avro schema parse: {e}")))?;
     let mut cursor = std::io::Cursor::new(body);
-    let avro_value = from_avro_datum(&schema, &mut cursor, None)
+    let avro_value = GenericDatumReader::builder(&schema)
+        .build()
+        .and_then(|r| r.read_value(&mut cursor))
         .map_err(|e| FaucetError::Source(format!("avro decode: {e}")))?;
     avro_to_json(avro_value)
 }
@@ -34,16 +38,16 @@ pub async fn encode(
         .map_err(|e| FaucetError::Config(format!("avro schema parse: {e}")))?;
     let id = client.register_schema(subject, "AVRO", schema_text).await?;
     let avro_value = json_to_avro(value, &schema)?;
-    let payload = to_avro_datum(&schema, avro_value)
+    let payload = GenericDatumWriter::builder(&schema)
+        .build()
+        .and_then(|w| w.write_value_to_vec(avro_value))
         .map_err(|e| FaucetError::Sink(format!("avro encode: {e}")))?;
     Ok(envelope::encode(id, &payload))
 }
 
 /// Convert an `AvroValue` to a `serde_json::Value`.
 ///
-/// Uses the `TryFrom<AvroValue> for serde_json::Value` impl that is present in
-/// apache-avro 0.21 — the plan's `v.clone().try_into()` pattern works exactly
-/// as expected here.
+/// Uses apache-avro's `TryFrom<AvroValue> for serde_json::Value`.
 fn avro_to_json(v: AvroValue) -> Result<Value, FaucetError> {
     v.try_into()
         .map_err(|e: apache_avro::Error| FaucetError::Source(format!("avro->json: {e}")))
@@ -52,12 +56,12 @@ fn avro_to_json(v: AvroValue) -> Result<Value, FaucetError> {
 /// Convert a `serde_json::Value` to an `AvroValue` and resolve it against
 /// the writer schema.
 ///
-/// apache-avro 0.21 provides `impl From<serde_json::Value> for AvroValue` so
-/// the conversion is infallible; schema resolution (`.resolve()`) can fail if
-/// the JSON shape doesn't match the Avro schema.
+/// Both steps are fallible: a JSON number outside every Avro numeric range
+/// has no Avro value, and schema resolution fails when the shape does not
+/// match the writer schema.
 fn json_to_avro(v: &Value, schema: &Schema) -> Result<AvroValue, FaucetError> {
-    // `From<serde_json::Value> for AvroValue` exists in apache-avro 0.21.
-    let avro: AvroValue = AvroValue::from(v.clone())
+    let avro: AvroValue = AvroValue::try_from(v.clone())
+        .map_err(|e| FaucetError::Sink(format!("json->avro: {e}")))?
         .resolve(schema)
         .map_err(|e| FaucetError::Sink(format!("json->avro resolve: {e}")))?;
     Ok(avro)
@@ -69,6 +73,12 @@ mod tests {
     use crate::SchemaRegistryConfig;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn json_without_an_avro_value_is_a_sink_error() {
+        let err = json_to_avro(&serde_json::json!(u64::MAX), &Schema::Long).expect_err("u64");
+        assert!(err.to_string().contains("json->avro"), "{err}");
+    }
 
     #[tokio::test]
     async fn avro_round_trip_through_mock_registry() {

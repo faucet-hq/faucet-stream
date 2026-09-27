@@ -123,7 +123,13 @@ arrow = ["dep:arrow", "dep:arrow-json"]
 file-format-csv = ["dep:csv", "dep:csv-async"]
 file-format-xml = ["dep:quick-xml"]
 file-format-excel = ["dep:calamine", "dep:rust_xlsxwriter"]
-file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
+# Apache Avro Object Container Files (#719). Read + write through the record
+# helper; with `arrow` also decoded straight to `RecordBatch`es.
+file-format-avro = ["dep:apache-avro"]
+# Apache ORC (#719). Read-only: decoded to Arrow `RecordBatch`es stripe by
+# stripe, so it pulls `arrow` in.
+file-format-orc = ["arrow", "dep:orc-rust", "dep:bytes"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
 [dependencies]
 serde.workspace = true
@@ -180,6 +186,9 @@ quick-xml = { workspace = true, optional = true }
 calamine = { workspace = true, optional = true }
 rust_xlsxwriter = { workspace = true, optional = true }
 arrow-json = { workspace = true, optional = true }
+apache-avro = { workspace = true, optional = true, features = ["snappy", "zstandard"] }
+orc-rust = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

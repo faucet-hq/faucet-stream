@@ -32,7 +32,12 @@ compression = ["faucet-core/compression"]
 file-format-csv = ["faucet-core/file-format-csv"]
 file-format-xml = ["faucet-core/file-format-xml"]
 file-format-excel = ["faucet-core/file-format-excel"]
-file-formats = ["file-format-csv", "file-format-xml", "file-format-excel"]
+# Avro OCF and ORC (#719). Both decode straight to Arrow, so with `arrow` they
+# take the columnar path; ORC is Arrow-native and turns `arrow` on.
+file-format-avro = ["faucet-core/file-format-avro"]
+file-format-orc = ["faucet-core/file-format-orc", "arrow"]
+arrow = ["faucet-core/arrow"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
 [dev-dependencies]
 faucet-conformance.workspace = true

@@ -91,7 +91,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "config": { "type": "string" },
-                    "dry_run": { "type": "boolean", "description": "If true, validate + preview only; do not write to any sink." }
+                    "dry_run": { "type": "boolean", "description": "If true, validate + preview only; do not write to any sink." },
+                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
                 },
                 "required": ["config"]
             }),
@@ -112,6 +113,21 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                 "properties": {
                     "id": { "type": "string", "description": "Template id." },
                     "version": { "description": "Version: a number, or a named channel. Derived: \"stable\" (the launched version — the default), \"previous\", \"newest\". Assignable: \"dev\", \"test\", \"staging\", \"pre-prod\", \"canary\", \"prod\". Note \"latest\" is deliberately not a channel — use \"stable\" for the current release or \"newest\" for the highest version number.", "oneOf": [{ "type": "integer" }, { "type": "string" }] }
+                },
+                "required": ["id"]
+            }),
+        });
+        defs.push(ToolDef {
+            name: "list_template_rows",
+            description: "List a registered template's selectable rows — the streams of a source template (write resolution and guarantees against `sink` when given) or the matrix rows of a pipeline — with status, tags, hierarchy, read/write facts, the params each uses, and the last run's state. With `selection`, also resolve what a run with it would execute (run_set, pulled-in ancestors, blocked rows, the error it would return).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "version": { "description": "Version: a number or a channel. Default \"stable\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                    "sink": { "type": "string", "description": "For a source template: the registered sink template to resolve against." },
+                    "sink_version": { "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
                 },
                 "required": ["id"]
             }),
@@ -182,7 +198,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "overlay": { "description": "Deployment overlay for a composed run: a registered `kind: deployment` id, or an inline mapping of operational blocks (state, dlq, notifications, sla, resilience, execution, delivery, schedule, streams).", "oneOf": [{ "type": "string" }, { "type": "object" }] },
                         "overlay_version": { "description": "Version of a registered overlay: a number or a channel. Default \"stable\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
                         "env": { "type": "object", "description": "Per-run overrides for ${env:VAR} resolution." },
-                        "dry_run": { "type": "boolean", "description": "If true, materialize + validate only; do not write to any sink." }
+                        "dry_run": { "type": "boolean", "description": "If true, materialize + validate only; do not write to any sink." },
+                        "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
                     },
                     "required": ["id"]
                 }),
@@ -205,7 +222,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "max_duration_secs": { "type": "integer" }, "allowed_sinks": { "type": "array", "items": { "type": "string" } } } },
                     "labels": { "type": "object", "additionalProperties": { "type": "string" } },
                     "timeout_secs": { "type": "integer" },
-                    "clock": { "type": "string", "description": "RFC 3339 / YYYY-MM-DD run clock for ${now.*}." }
+                    "clock": { "type": "string", "description": "RFC 3339 / YYYY-MM-DD run clock for ${now.*}." },
+                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
                 },
                 "required": ["config", "reason"]
             }),
@@ -285,6 +303,8 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
         "list_templates" => list_templates(ctx).await,
         #[cfg(feature = "templates")]
         "get_template" => get_template(ctx, args).await,
+        #[cfg(feature = "templates")]
+        "list_template_rows" => list_template_rows(ctx, args).await,
         #[cfg(feature = "templates")]
         "register_template" => {
             if !ctx.allow_mutations {
@@ -372,7 +392,7 @@ async fn propose_run(p: &crate::mcp::ChangeProposer, args: &Value) -> Result<Str
         "config": config,
         "config_format": args.get("config_format").cloned().unwrap_or(json!("yaml")),
     });
-    for key in ["name", "labels", "timeout_secs", "clock"] {
+    for key in ["name", "labels", "timeout_secs", "clock", "selection"] {
         if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
             payload[key] = v.clone();
         }
@@ -630,8 +650,19 @@ async fn preview(ctx: &McpContext, args: &Value) -> Result<String, String> {
     ))
 }
 
+/// The optional `selection` argument (#741).
+fn selection_arg(args: &Value) -> Result<Option<crate::select::SelectionRequest>, String> {
+    match args.get("selection") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone())
+            .map(Some)
+            .map_err(|e| format!("selection: {e}")),
+    }
+}
+
 async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let text = str_arg(args, "config")?;
+    let selection = selection_arg(args)?;
     let dry_run = args
         .get("dry_run")
         .and_then(Value::as_bool)
@@ -648,12 +679,13 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
         return Ok(report);
     }
 
-    let summary = crate::run_from_yaml_str(text)
+    let summary = crate::run_from_yaml_str_selected(text, selection.as_ref())
         .await
         .map_err(|e| e.to_string())?;
     let failed = summary.failure_count();
     let total: usize = summary.invocations.iter().map(|i| i.records_written).sum();
     let doc = json!({
+        "selection": selection.as_ref().map(|s| s.canonical()),
         "invocations": summary.invocations.len(),
         "ok": summary.invocations.len() - failed,
         "failed": failed,
@@ -859,6 +891,43 @@ async fn deprecate_template(ctx: &McpContext, args: &Value) -> Result<String, St
 }
 
 #[cfg(feature = "templates")]
+async fn list_template_rows(ctx: &McpContext, args: &Value) -> Result<String, String> {
+    let store = template_store(ctx)?;
+    let id = str_arg(args, "id")?;
+    let version = resolved_version_arg(store, id, args).await?;
+    let sink = args.get("sink").and_then(Value::as_str);
+    let sink_version = match sink {
+        Some(sid) => {
+            let sel = match args.get("sink_version") {
+                None | Some(Value::Null) => Default::default(),
+                Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string())?,
+            };
+            Some(
+                crate::templates::resolve_version(store, sid, sel)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        }
+        None => None,
+    };
+    let selection = selection_arg(args)?;
+    let report = crate::templates::rows::list_rows(
+        store,
+        crate::templates::rows::RowsQuery {
+            id,
+            version,
+            sink: sink.zip(sink_version),
+            overlay: None,
+            selection: selection.as_ref(),
+            state: true,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "templates")]
 async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> {
     let store = template_store(ctx)?;
     let id = str_arg(args, "id")?;
@@ -907,7 +976,8 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             Some(_) => return Err("`overlay` must be a deployment id or a mapping".into()),
         },
     };
-    let materialized = crate::templates::materialize_for_run(
+    let selection = selection_arg(args)?;
+    let materialized = crate::templates::materialize_for_run_selected(
         store,
         id,
         version,
@@ -916,6 +986,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         &env,
         // The MCP tool runs the pipeline in this process; nothing is persisted.
         crate::templates::Materialize::Local,
+        selection.as_ref(),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -924,9 +995,12 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         // Validate the materialized config without touching a sink, and never
         // echo the body — a secret param value would be in it.
         let cfg = parse_config_with(&materialized.body, crate::params::BindMode::Strict)?;
-        let rows = crate::expand::expand(&cfg)
-            .map_err(|e| e.to_string())?
-            .len();
+        let mut nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
+        if let Some(sel) = &materialized.selection {
+            nodes = sel.apply(&cfg, nodes).map_err(|e| e.to_string())?;
+        }
+        let run_set: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let rows = nodes.len();
         return Ok(pretty(&json!({
             "template_id": materialized.template_id,
             "template_version": materialized.version,
@@ -939,6 +1013,8 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             "warnings": materialized.warnings,
             "params": materialized.params_redacted,
             "rows": rows,
+            "run_set": run_set,
+            "selection": selection.as_ref().map(|s| s.canonical()),
             "dry_run": true,
             "deprecated": deprecated,
         })));
@@ -946,9 +1022,10 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
 
     // The materialized body is JSON, which `run_from_yaml_str` parses (YAML is a
     // JSON superset) and takes through the ordinary run path.
-    let summary = crate::run_from_yaml_str(&materialized.body)
-        .await
-        .map_err(|e| e.to_string())?;
+    let summary =
+        crate::run_from_yaml_str_selected(&materialized.body, materialized.selection.as_ref())
+            .await
+            .map_err(|e| e.to_string())?;
     let failed = summary.failure_count();
     let total: usize = summary.invocations.iter().map(|i| i.records_written).sum();
     let doc = json!({
@@ -959,6 +1036,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         "overlay": materialized.overlay_id,
         "overlay_version": materialized.overlay_version,
         "params": materialized.params_redacted,
+        "selection": selection.as_ref().map(|s| s.canonical()),
         "invocations": summary.invocations.len(),
         "ok": summary.invocations.len() - failed,
         "failed": failed,
@@ -1373,6 +1451,100 @@ mod tests {
                 dir.display()
             );
             (source, sink)
+        }
+
+        #[tokio::test]
+        async fn rows_and_selection_through_the_template_tools() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = tpl_ctx(true);
+            std::fs::write(dir.path().join("orders.csv"), "id,total\n1,10\n").unwrap();
+            std::fs::write(dir.path().join("items.csv"), "id,sku\n1,a\n").unwrap();
+            let source = format!(
+                "kind: source-template\nname: shop\nparams:\n  data_dir: {{ type: string, default: {d} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, write: append }}\n  - {{ name: items, source: {{ config: {{ path: \"${{param.data_dir}}/items.csv\" }} }}, write: append }}\n",
+                d = dir.path().display()
+            );
+            let (_, sink) = hub_pair(dir.path());
+            for config in [source, sink] {
+                let out = call_tool(
+                    &ctx,
+                    "register_template",
+                    &json!({"config": config, "launch": true}),
+                )
+                .await;
+                assert_eq!(out["isError"], false, "{out}");
+            }
+            let out = call_tool(
+                &ctx,
+                "list_template_rows",
+                &json!({"id": "shop", "sink": "local-jsonl", "sink_version": "stable", "selection": {"select": ["items"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["run_set"], json!(["items"]));
+            assert_eq!(doc["rows"].as_array().unwrap().len(), 2);
+            let bad = call_tool(
+                &ctx,
+                "list_template_rows",
+                &json!({"id": "shop", "selection": {"rows": []}}),
+            )
+            .await;
+            assert_eq!(bad["isError"], true);
+
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "shop", "sink": "local-jsonl", "dry_run": true, "selection": {"select": ["items"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["run_set"], json!(["items"]));
+            assert_eq!(doc["selection"], "select=items");
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "shop", "sink": "local-jsonl", "selection": {"select": ["items"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            assert!(dir.path().join("shop/items.jsonl").exists());
+            assert!(!dir.path().join("shop/orders.jsonl").exists());
+        }
+
+        #[tokio::test]
+        async fn run_pipeline_honours_a_selection() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("in.csv"), "id\n1\n").unwrap();
+            let config = format!(
+                "version: 1\nname: m\npipeline:\n  source: {{ type: csv, config: {{ path: {d}/in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: {d}/x.jsonl }} }}\nmatrix:\n  - {{ id: a, sink: {{ config: {{ path: {d}/a.jsonl }} }} }}\n  - {{ id: b, sink: {{ config: {{ path: {d}/b.jsonl }} }} }}\n",
+                d = dir.path().display()
+            );
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "selection": {"select": ["b"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            assert!(dir.path().join("b.jsonl").exists());
+            assert!(!dir.path().join("a.jsonl").exists());
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "selection": {"select": ["zz"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "selection": "b"}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
         }
 
         #[tokio::test]

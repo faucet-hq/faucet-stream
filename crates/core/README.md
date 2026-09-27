@@ -547,6 +547,7 @@ let schema = serde_json::to_value(schema_for!(MyConfig))?;
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |
 | `compression` | `CompressionConfig`, `compress_buf` (the `compression` feature) |
+| `file_format` | One format vocabulary for every file connector — `FileFormat` (incl. `from_path` extension detection), `decode` / `encode`, `ContainerDecoder` (Avro / ORC across many files, resolved against the first file's schema), `avro` (OCF read + write, explicit logical-type mapping, schema inference), `orc` (read-only, projection, stripe streaming) |
 | `util` | `quote_ident`, `extract_records`, `check_http_response`, `redact_uri_credentials` |
 
 ## Feature flags
@@ -562,6 +563,10 @@ Defaults: `transform-flatten`, `transform-rename-keys`, `transform-keys-case`.
 | `contract` | Versioned data contracts (the `contract:` config block + enforcement pass) |
 | `masking` | PII detection + column-level masking (the `masking:` config block; pulls `regex`+`sha2`+`hmac`) |
 | `compression` | `CompressionConfig` + gzip/zstd helpers |
+| `file-format-csv` / `-xml` / `-excel` | The CSV, XML and Excel codecs in `file_format` |
+| `file-format-avro` | Avro Object Container Files (`apache-avro`) — read with an optional reader schema, write with a supplied or inferred schema and a `null` / `deflate` / `snappy` / `zstd` codec |
+| `file-format-orc` | ORC reading (`orc-rust`, Arrow-native, so it turns on `arrow`); read-only by design |
+| `file-formats` | All of the above |
 | `observability-install` | `install_observability` (Prometheus exporter + tracing subscriber) |
 
 > Connector authors: enable in your **own** `Cargo.toml` every feature your crate uses — the feature-isolation CI matrix builds each connector alone, so relying on workspace feature unification compiles locally but fails CI.

@@ -74,7 +74,8 @@ Below the quorum the request stays `pending` with the approval recorded. At
 the quorum faucet **re-plans** the payload against the world as it is now and
 compares the material fingerprint — per row: source, sink, write mode,
 delivery guarantee, transform chain, quality / contract / masking / drift
-settings; for a launch, the target version and the version it replaces. If
+settings, plus the run's row `selection` (a different subset is a different
+change); for a launch, the target version and the version it replaces. If
 anything material moved (a template version was launched in the meantime, the
 default config now points somewhere else), the request becomes `invalidated`
 with the difference spelled out and **nothing runs**: the approver reviewed

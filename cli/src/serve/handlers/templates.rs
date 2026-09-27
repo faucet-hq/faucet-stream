@@ -33,6 +33,9 @@ fn map_err(e: crate::error::CliError) -> ServeError {
     match e {
         CliError::UnknownPipelineTemplate { .. } => ServeError::NotFound,
         CliError::Internal(m) => ServeError::Internal(m),
+        other if crate::select::is_selection_error(&other) => {
+            ServeError::BadConfig(other.to_string())
+        }
         other => ServeError::Unprocessable {
             message: other.to_string(),
             details: None,
@@ -362,6 +365,134 @@ pub async fn get_template(
         is_stable,
         launches,
     }))
+}
+
+// ── GET /v1/templates/{id}/rows ─────────────────────────────────────────────
+
+/// `GET /v1/templates/{id}/rows` query (#741). The selector params are the
+/// trigger body's `selection`, comma-joined; any of them turns the listing
+/// into a dry-run resolve.
+#[derive(Debug, Default, Deserialize)]
+pub struct RowsParams {
+    #[serde(default)]
+    pub version: Option<VersionSelector>,
+    /// For a source template: the sink template to resolve write modes and
+    /// guarantees against.
+    #[serde(default)]
+    pub sink: Option<String>,
+    #[serde(default)]
+    pub sink_version: Option<VersionSelector>,
+    /// A registered deployment overlay applied over the pairing (its state
+    /// store backs the `state` group).
+    #[serde(default)]
+    pub overlay: Option<String>,
+    #[serde(default)]
+    pub overlay_version: Option<VersionSelector>,
+    #[serde(default)]
+    pub select: Option<String>,
+    #[serde(default)]
+    pub only: Option<String>,
+    #[serde(default)]
+    pub skip: Option<String>,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub include_parents: Option<String>,
+    /// Read each row's status (default `true`).
+    #[serde(default)]
+    pub state: Option<bool>,
+}
+
+fn csv(v: &Option<String>) -> Vec<String> {
+    v.as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl RowsParams {
+    /// The selection the query names, `None` when it names none.
+    pub fn selection(&self) -> Result<Option<crate::select::SelectionRequest>, ServeError> {
+        let any = [
+            &self.select,
+            &self.only,
+            &self.skip,
+            &self.tags,
+            &self.status,
+            &self.include_parents,
+        ]
+        .iter()
+        .any(|v| v.is_some());
+        if !any {
+            return Ok(None);
+        }
+        let sel = crate::select::RunSelection::resolve(
+            &csv(&self.select),
+            &csv(&self.only),
+            &csv(&self.skip),
+            &csv(&self.status),
+            &csv(&self.tags),
+            self.include_parents.as_deref(),
+            None,
+        )
+        .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+        let mut req = crate::select::SelectionRequest::from_run_selection(&sel);
+        if self.include_parents.is_none() {
+            req.include_parents = None;
+        }
+        Ok(Some(req))
+    }
+}
+
+/// `GET /v1/templates/{id}/rows` → the template's rows with their metadata;
+/// with selector params, also what a trigger with that selection would run.
+pub async fn template_rows(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(id): Path<String>,
+    Query(q): Query<RowsParams>,
+) -> Result<Json<crate::hub::rows::RowsReport>, ServeError> {
+    let s = store(&state);
+    let selection = q.selection()?;
+    let version = crate::templates::resolve_version(&s, &id, q.version.unwrap_or_default())
+        .await
+        .map_err(map_err)?;
+    let sink_version = match &q.sink {
+        Some(sid) => Some(
+            crate::templates::resolve_version(&s, sid, q.sink_version.unwrap_or_default())
+                .await
+                .map_err(map_err)?,
+        ),
+        None => None,
+    };
+    let report = crate::templates::rows::list_rows(
+        &s,
+        crate::templates::rows::RowsQuery {
+            id: &id,
+            version,
+            sink: q.sink.as_deref().zip(sink_version),
+            overlay: q
+                .overlay
+                .clone()
+                .map(|oid| crate::templates::OverlayChoice::Registered {
+                    id: oid,
+                    version: q.overlay_version.unwrap_or_default(),
+                }),
+            selection: selection.as_ref(),
+            state: q.state.unwrap_or(true),
+        },
+    )
+    .await
+    .map_err(map_err)?;
+    crate::serve::audit::write(&state, &actor, "template.rows", None, None, "ok").await;
+    Ok(Json(report))
 }
 
 // ── DELETE /v1/templates/{id} ───────────────────────────────────────────────
@@ -723,6 +854,11 @@ pub struct TriggerBody {
     /// Run budget (#703), merged with the materialized config's own.
     #[serde(default)]
     pub budget: Option<faucet_core::BudgetSpec>,
+    /// Run only some of the template's rows (#741): streams of a source
+    /// template, matrix rows of a pipeline. `GET /v1/templates/{id}/rows`
+    /// lists them and previews what a selection resolves to.
+    #[serde(default)]
+    pub selection: Option<crate::select::SelectionRequest>,
 }
 
 /// A trigger's `overlay`: a registered deployment id, or an inline document.
@@ -779,6 +915,9 @@ pub struct TriggerResponse {
     /// the caller should migrate. Silently succeeding would hide the retirement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
+    /// The selection the run applies, as the caller sent it (#741).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::select::SelectionRequest>,
 }
 
 /// Label keys stamped on a template-triggered run, so `GET /v1/runs` can filter
@@ -873,10 +1012,18 @@ pub async fn trigger_template_outcome(
             tracing::warn!(sink_template = %sink_id, "composing a DEPRECATED sink template");
         }
     }
-    let materialized =
-        crate::templates::materialize_for_run(&s, &id, want, &sink, &supplied, &body.env, mode)
-            .await
-            .map_err(map_err)?;
+    let materialized = crate::templates::materialize_for_run_selected(
+        &s,
+        &id,
+        want,
+        &sink,
+        &supplied,
+        &body.env,
+        mode,
+        body.selection.as_ref(),
+    )
+    .await
+    .map_err(map_err)?;
 
     // Caller-supplied values that would land in the persisted body: a
     // `secret: true` param, or an `env:` override (which substitutes into the
@@ -917,6 +1064,11 @@ pub async fn trigger_template_outcome(
             labels.insert(LABEL_OVERLAY_VERSION.into(), ov.to_string());
         }
     }
+    // The caller's selection names the run, not the stream list it resolved
+    // to (#741).
+    if let Some(sel) = &body.selection {
+        labels.insert(crate::select::LABEL_SELECTION.into(), sel.canonical());
+    }
 
     let req = SubmitRequest {
         config: materialized.body.clone(),
@@ -933,6 +1085,7 @@ pub async fn trigger_template_outcome(
         reason: body.reason,
         budget: body.budget,
         approved_change: None,
+        selection: materialized.selection.clone(),
     };
     let run = match runner::submit_gated(state.clone(), req, actor.clone()).await? {
         runner::SubmitOutcome::Accepted(run) => run,
@@ -966,6 +1119,7 @@ pub async fn trigger_template_outcome(
         warnings: materialized.warnings,
         params: materialized.params_redacted,
         deprecated,
+        selection: body.selection,
     }))
 }
 

@@ -121,7 +121,10 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
 pub use error::FaucetError;
-pub use file_format::{CsvOptions, ExcelOptions, FileFormat, FormatOptions, XmlOptions};
+pub use file_format::{
+    AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, ExcelOptions, FileFormat, FileInput,
+    FormatOptions, OrcOptions, XmlOptions,
+};
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,
     SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,
@@ -173,7 +176,7 @@ pub use replication::{
 pub use resilience::{
     BackoffKind, CircuitBreaker, CircuitBreakerConfig, PoisonAction, PoisonPolicy,
     ResiliencePolicy, RetryClass, RetryClassSet, RetryMetrics, RetryPolicy, classify,
-    execute_with_policy, execute_with_policy_metered,
+    execute_with_policy, execute_with_policy_metered, execute_with_policy_recorded,
 };
 pub use retry::execute_with_retry;
 pub use rollback::{

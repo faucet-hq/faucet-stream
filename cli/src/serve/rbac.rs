@@ -547,6 +547,7 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::GET, "/v1/templates") => Some(TemplateRead),
         (&Method::GET, "/v1/templates/matrix") => Some(TemplateRead),
         (&Method::GET, "/v1/templates/{id}") => Some(TemplateRead),
+        (&Method::GET, "/v1/templates/{id}/rows") => Some(TemplateRead),
         (&Method::DELETE, "/v1/templates/{id}") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/runs") => Some(RunWrite),
         (&Method::POST, "/v1/templates/{id}/tags") => Some(TemplateAdmin),
@@ -639,6 +640,7 @@ pub fn tenant_scope_decision(
         | (&Method::GET, "/v1/schemas/{kind}/{name}")
         | (&Method::GET, "/v1/templates")
         | (&Method::GET, "/v1/templates/{id}")
+        | (&Method::GET, "/v1/templates/{id}/rows")
         | (_, "/v1/changes")
         | (_, "/v1/changes/{id}")
         | (_, "/v1/changes/{id}/approve")
@@ -692,6 +694,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/templates") => "template.register",
         (&Method::GET, "/v1/templates") => "template.list",
         (&Method::GET, "/v1/templates/{id}") => "template.get",
+        (&Method::GET, "/v1/templates/{id}/rows") => "template.rows",
         (&Method::DELETE, "/v1/templates/{id}") => "template.delete",
         (&Method::POST, "/v1/templates/{id}/runs") => "template.run",
         (&Method::POST, "/v1/templates/{id}/tags") => "template.promote",
@@ -986,6 +989,7 @@ mod tests {
             (Method::POST, "/v1/templates", TemplateAdmin),
             (Method::GET, "/v1/templates", TemplateRead),
             (Method::GET, "/v1/templates/{id}", TemplateRead),
+            (Method::GET, "/v1/templates/{id}/rows", TemplateRead),
             (Method::DELETE, "/v1/templates/{id}", TemplateAdmin),
             (Method::POST, "/v1/templates/{id}/runs", RunWrite),
             (Method::POST, "/v1/templates/{id}/tags", TemplateAdmin),

@@ -25,6 +25,7 @@
 //! | `source-nats` | NATS source |
 //! | `source-rabbitmq` | RabbitMQ (AMQP 0.9.1) queue source |
 //! | `source-sftp` | SFTP source |
+//! | `source-file` | Local file source (path, directory, glob or URL; every file format) |
 
 //! | `source-s3` | AWS S3 file source |
 //! | `source-mongodb` | MongoDB query source |
@@ -58,6 +59,7 @@
 //! | `sink-nats` | NATS sink |
 //! | `sink-rabbitmq` | RabbitMQ (AMQP 0.9.1) publish sink |
 //! | `sink-sftp` | SFTP sink |
+//! | `sink-singer` | Singer target bridge sink (runs a Singer target executable) |
 
 //! | `sink-s3` | AWS S3 file sink |
 //! | `sink-mongodb` | MongoDB insert sink |
@@ -69,6 +71,7 @@
 //! | `sink-kinesis` | AWS Kinesis Data Streams sink |
 //! | `sink-spanner` | Google Cloud Spanner mutation sink |
 //! | `sink-parquet` | Apache Parquet file sink (local, S3) |
+//! | `sink-file` | Local file sink (JSONL, JSON, CSV, XML, Excel, Avro, Parquet; rollover, atomic finalisation) |
 //! | `encryption` | AES-256-GCM at-rest sealing for file state-store bookmarks and per-line JSONL/DLQ output |
 //! | `sink-dynamodb` | Amazon DynamoDB sink (batched writes, upsert/delete) |
 //! | `sink-oracle` | Oracle Database sink (upsert/overwrite, exactly-once; needs Oracle Instant Client at runtime) |
@@ -167,6 +170,11 @@ pub mod source {
     #[cfg(feature = "source-sftp")]
     pub mod sftp {
         pub use faucet_source_sftp::*;
+    }
+
+    #[cfg(feature = "source-file")]
+    pub mod file {
+        pub use faucet_source_file::*;
     }
 
     #[cfg(feature = "source-s3")]
@@ -376,6 +384,11 @@ pub mod source {
     #[cfg(feature = "source-sftp")]
     pub mod sftp {
         pub use faucet_source_sftp::*;
+    }
+
+    #[cfg(feature = "source-file")]
+    pub mod file {
+        pub use faucet_source_file::*;
     }
 
     #[cfg(feature = "source-s3")]
@@ -595,6 +608,11 @@ pub mod sink {
         pub use faucet_sink_sftp::*;
     }
 
+    #[cfg(feature = "sink-singer")]
+    pub mod singer {
+        pub use faucet_sink_singer::*;
+    }
+
     #[cfg(feature = "sink-s3")]
     pub mod s3 {
         pub use faucet_sink_s3::*;
@@ -648,6 +666,11 @@ pub mod sink {
     #[cfg(feature = "sink-parquet")]
     pub mod parquet {
         pub use faucet_sink_parquet::*;
+    }
+
+    #[cfg(feature = "sink-file")]
+    pub mod file {
+        pub use faucet_sink_file::*;
     }
 
     #[cfg(feature = "sink-delta")]
