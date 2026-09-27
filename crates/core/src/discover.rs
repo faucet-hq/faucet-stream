@@ -46,6 +46,11 @@ pub struct DatasetDescriptor {
     /// Must never contain credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_patch: Option<Value>,
+    /// The dataset's primary-key columns in key order, when the catalog
+    /// declares one (`None` when it has none or the source cannot tell). A
+    /// multi-table `faucet mirror` keys each table's upsert on it (#731).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_key: Option<Vec<String>>,
 }
 
 impl DatasetDescriptor {
@@ -58,7 +63,15 @@ impl DatasetDescriptor {
             estimated_rows: None,
             config_patch,
             sink_patch: None,
+            primary_key: None,
         }
+    }
+
+    /// Attach the catalog's primary-key columns (in key order). An empty list
+    /// means "no primary key" and is stored as `None`.
+    pub fn with_primary_key(mut self, columns: Vec<String>) -> Self {
+        self.primary_key = (!columns.is_empty()).then_some(columns);
+        self
     }
 
     /// Attach an inferred/introspected schema.
@@ -166,6 +179,18 @@ mod tests {
         let v = serde_json::to_value(&d).unwrap();
         let back: DatasetDescriptor = serde_json::from_value(v).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn primary_key_builder_keeps_order_and_treats_empty_as_none() {
+        let d = DatasetDescriptor::new("public.orders", "table", json!({}))
+            .with_primary_key(vec!["tenant".into(), "id".into()]);
+        assert_eq!(d.primary_key, Some(vec!["tenant".into(), "id".into()]));
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["primary_key"], json!(["tenant", "id"]));
+        let none = DatasetDescriptor::new("t", "table", json!({})).with_primary_key(vec![]);
+        assert_eq!(none.primary_key, None);
+        assert!(serde_json::to_value(&none).unwrap().get("primary_key").is_none());
     }
 
     #[test]
