@@ -229,7 +229,8 @@ collections / indices / object-store prefixes), and emits a ready-to-run config
 with **one matrix row per dataset** — the input document with its `matrix:`
 block replaced, secrets echoed as raw `${…}` references. The generated config
 passes `faucet validate`. Supported sources: `postgres`, `mysql`, `mssql`,
-`sqlite`, `mongodb`, `elasticsearch`, `bigquery`, `snowflake`, `s3`, `gcs`.
+`sqlite`, `mongodb`, `elasticsearch`, `bigquery`, `snowflake`, `s3`, `gcs`,
+`file` (one dataset per file).
 
 | Flag | Purpose |
 |------|---------|

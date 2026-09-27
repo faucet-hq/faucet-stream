@@ -1,6 +1,6 @@
 # Connector catalog
 
-faucet-stream ships **<!--COUNT:sources-->42<!--/COUNT--> sources** and **<!--COUNT:sinks-->34<!--/COUNT--> sinks**. Each is a Cargo feature
+faucet-stream ships **<!--COUNT:sources-->43<!--/COUNT--> sources** and **<!--COUNT:sinks-->34<!--/COUNT--> sinks**. Each is a Cargo feature
 (`source-<name>` / `sink-<name>`) and an independently published crate. Full API
 docs are on [docs.rs](https://docs.rs/faucet-stream).
 
@@ -40,16 +40,17 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | AWS SQS | T2 | `source-sqs` | ✓ | ✗ | ✗ | ✗ | ✗ | long-poll ReceiveMessage, delete-after-emit (at-least-once), idle/max-messages termination |
 | NATS | T2 | `source-nats` | ✓ | ✗ | ✗ | ✗ | ✗ | subject subscription or JetStream durable consumer; idle/max-messages termination |
 | RabbitMQ | T2 | `source-rabbitmq` | ✓ | ✗ | ✗ | ✗ | ✗ | AMQP 0.9.1 queue consumer (`lapin`), optional declare + bind; a page is acked (`basic.ack` multiple) only after the sink flushes it — at-least-once; idle/max-messages termination |
-| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| AWS S3 | T1 ✅ | `source-s3` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| Google Cloud Storage | T2 | `source-gcs` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text, plus CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `source-s3` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
+| Google Cloud Storage | T2 | `source-gcs` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
 | MongoDB | T1 ✅ | `source-mongodb` | ✓ | ✗ | ✗ | ✗ | ✓ | `find()` with filter/projection/sort |
 | MongoDB CDC | T1 ✅ | `source-mongodb-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | Change Streams, resumeToken bookmarks; `max_staged_records` buffer cap |
 | Redis | T1 ✅ | `source-redis` | ✓ | ✗ | ✗ | ✗ | ✗ | streams, lists, key patterns |
 | Webhook | T2 | `source-webhook` | ✗⁶ | ✗ | ✗ | ✗ | ✗ | temporary HTTP server collecting POSTs |
 | WebSocket | T1 ✅ | `source-websocket` | ✓ | ✗ | ✗ | ✗ | ✗ | live push feed; subscribe frames, reconnect, ping keepalive |
-| CSV | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | CSV files as JSON; strict field count by default (`flexible: true` to tolerate ragged rows) |
+| CSV | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | CSV files as JSON; strict field count by default (`flexible: true` to tolerate ragged rows). For new configs prefer the file source |
+| Local files | T1 ✅ | `source-file` | ✓ | ✓ | ✗ | ✓ | ✓ | [file source](../cookbook/file-formats.md#the-local-file-source): a path, directory, glob or `http(s)://` URL; JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC, format + compression resolved per file; incremental by mtime or name; hash-of-path sharding; Avro / ORC / Parquet join the columnar path |
 | Elasticsearch | T1 ✅ᵐ | `source-elasticsearch` | ✓ | ✗ | ✗ | ✗ | ✓ | search/scroll API |
 | Apache Kafka | T1 ✅ | `source-kafka` | ✓ | ✓ | **✓** | ✗ | ✗ | consumer; idle/max-messages termination, offset bookmarks |
 | AWS Kinesis | T1 ✅ | `source-kinesis` | ✓ | ✓ | ✗ | ✗ | ✗ | per-shard GetRecords workers; sequence-number bookmarks, idle/max-messages termination |
@@ -238,11 +239,11 @@ config this project treats as a defect.
 | AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | best-effort | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
 | NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to a subject (optional subject-per-record), flush per batch |
 | RabbitMQ | T2 | `sink-rabbitmq` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to an exchange with a static / field / JSONPath routing key; publisher confirms per batch; `mandatory` returns surface as per-row (DLQ-routable) errors |
-| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | best-effort | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | best-effort | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
 | Singer bridge ⚠️ | T2 ⚠️ | `sink-singer` | no-op | ✗ | `key_properties` | ✗ | best-effort | runs an external Singer target; `SCHEMA`/`RECORD` over stdin with back-pressure, bookmarks advance only after the target confirms (echoed `STATE` or clean exit, `flush_on`); `write_mode: overwrite` → `ACTIVATE_VERSION`. **Tier-2 / experimental** |
-| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | best-effort | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
+| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, Parquet; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | best-effort | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
 | MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | best-effort | `insert_many`; multi-document transaction for effectively-once (replica set required) |
 | Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | best-effort | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
 | CSV | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |

@@ -1,8 +1,8 @@
 # File formats
 
-Every file and object-store connector — **S3**, **GCS**, **Azure Blob** and
-**SFTP**, source *and* sink — reads and writes the same set of formats, with the
-same option names:
+Every file and object-store connector — **S3**, **GCS**, **Azure Blob**,
+**SFTP** and **local files**, source *and* sink — reads and writes the same set
+of formats, with the same option names:
 
 | `format` | Source | Sink | Notes |
 |---|:--:|:--:|---|
@@ -13,6 +13,8 @@ same option names:
 | `xlsx` | ✅ | ✅ | An Excel worksheet. Carries types. Whole-workbook in memory. |
 | `parquet` | ✅ | ✅ | Columnar, handled by each connector's own Arrow path — see [Arrow](../reference/connectors.md). |
 | `raw_text` | ✅ | — | One record per object, carrying the whole body. Source-only. |
+| `avro` | ✅ | ✅ | Avro Object Container File. Carries types, including logical types. See [Avro](#avro). |
+| `orc` | ✅ | — | Apache ORC, with column projection. **Read-only.** See [ORC](#orc). |
 
 Before this, what you could read depended on which store the file was in, and
 what you could write was a strict subset of what you could read — the gap filled
@@ -27,8 +29,10 @@ Each format pulls only its own parser and writer, so a build that reads CSV does
 not link an Excel reader:
 
 ```bash
-cargo install faucet-cli --features file-formats             # all three
+cargo install faucet-cli --features file-formats             # every format
 cargo install faucet-cli --features file-format-csv          # just CSV
+cargo install faucet-cli --features file-format-avro         # just Avro
+cargo install faucet-cli --features file-format-orc          # just ORC (pulls Arrow)
 ```
 
 ```toml
@@ -176,6 +180,156 @@ On write, a field name that is not a legal XML element name (a space, a slash, a
 leading digit) has the offending characters replaced with `_` — the document
 stays well-formed rather than the write failing on a field you cannot rename.
 
+## Avro
+
+Avro Object Container Files (`.avro`) read and write on every file connector.
+Each file carries its own *writer* schema, so reading needs no configuration:
+
+```yaml
+source:
+  type: s3
+  config:
+    bucket: exports
+    prefix: kafka-dump/
+    file_format: avro
+    avro:
+      schema:                      # optional reader schema
+        type: record
+        name: order
+        fields:
+          - { name: id, type: long }
+          - { name: amount, type: { type: bytes, logicalType: decimal, precision: 12, scale: 2 } }
+          - { name: channel, type: string, default: "web" }   # added later: files without it read "web"
+```
+
+**Many files, one shape.** Every file under the prefix is resolved against one
+reader schema: `avro.schema` when set, otherwise **the first file's writer
+schema**. Avro's schema resolution then applies. A later file that added a
+field has it dropped. A field the reader declares with a default is filled for
+files that lack it. Numeric promotions such as `int → long` apply. A file that
+cannot be resolved fails the run with an error naming both files:
+
+```text
+avro schema of 'b.avro' cannot be resolved against 'a.avro' (the first file's schema): …
+```
+
+**Logical types are mapped explicitly.** Nothing goes through a lossy numeric
+fallback:
+
+| Avro | Record (JSON) | Columnar (Arrow) |
+|---|---|---|
+| `decimal(p, s)` | exact decimal string, `"12.30"` | `Decimal128(p, s)` (`Decimal256` above 38 digits) |
+| `date` | `"2024-02-29"` | `Date32` |
+| `time-millis` / `time-micros` | `"01:02:03.004"` / `"01:02:03.000004"` | `Time32(ms)` / `Time64(µs)` |
+| `timestamp-millis` / `-micros` / `-nanos` | RFC 3339 UTC at that precision (`"…Z"`) | `Timestamp(unit, "UTC")` |
+| `local-timestamp-*` | naive ISO 8601 | `Timestamp(unit)` without a zone |
+| `uuid` | canonical string | `Utf8` |
+| `duration` | `{months, days, millis}` | `Struct` |
+| `bytes` / `fixed` | lowercase hex, the same as the Arrow JSON writer | `Binary` / `FixedSizeBinary` |
+| `enum` | the symbol | `Utf8` |
+
+A union of `null` and one type is that type, nullable. A union of several
+non-null types reads as whichever branch the value holds. On the columnar path,
+where a column has one type, it becomes a `Utf8` column holding the value's
+JSON. A recursive record is a nested object on the record path and JSON text
+on the columnar path, because Arrow has no recursive types. `NaN` and the
+infinities, which JSON cannot hold, read as the strings `"NaN"`, `"Infinity"`
+and `"-Infinity"`.
+
+**Writing.** A sink encodes each object against `avro.schema`, or against a
+schema inferred from that object's records:
+
+```yaml
+sink:
+  type: gcs
+  config:
+    bucket: archive
+    format: avro
+    file_extension: .avro
+    avro:
+      codec: zstd                  # null (default) | deflate | snappy | zstd
+      # schema: { … }              # optional writer schema
+```
+
+Inference maps `integer` to `long`, `number` to `double`, objects to nested
+records, and arrays to arrays. A field that is null or absent in any record
+becomes `["null", T]` with a `null` default, and a field whose values mix types
+is written as `string`. Field names that are not valid Avro names are
+sanitized (`first-name` becomes `first_name`, and a leading digit gains `_`).
+The original name is kept in the field's `faucet.name` attribute. Two names
+that sanitize to the same field are an error rather than a silent merge. With
+an explicit schema, logical types accept the shapes above, and epoch integers
+too.
+
+## ORC
+
+ORC (`.orc`) is **read-only**. The reader is `orc-rust`. Its writer covers only
+primitive columns, panics on nested and temporal types, and writes no
+compression, so faucet does not put it behind a sink. For a columnar output,
+write Parquet.
+
+```yaml
+source:
+  type: azure-blob
+  config:
+    container: lake
+    prefix: hive/orders/
+    file_format: orc
+    orc:
+      columns: [id, amount, day]   # top-level projection; default: every column
+```
+
+Files are decoded stripe by stripe, straight to Arrow, and the projection is
+applied before any stripe is read. A column the file does not have is an
+error, not an empty column. Every file must have the same (projected) schema,
+and a mismatch names both files. On an object store the whole object is
+fetched first, because the ORC footer sits at the end. The local file source
+reads by stripe from disk.
+
+Types follow Arrow: `decimal` becomes `Decimal128`, `date` becomes `Date32`,
+timestamps become `Timestamp(ns)`, and nested types become `Struct` / `List` /
+`Map`. On the record path they convert the same way a Parquet file's do, so
+the two formats produce the same records for the same content.
+
+## The columnar path for Avro and ORC
+
+Both formats decode to Arrow `RecordBatch`es. On S3, GCS, Azure Blob, SFTP and
+the local file source they take the columnar path whenever the pipeline can:
+an `avro → parquet` run moves typed batches end to end, with no JSON records
+in between, and Avro decimals and timestamps land in Parquet as
+`DECIMAL` and `TIMESTAMP` columns. Build with `arrow` (ORC turns it on).
+
+## The local file source
+
+The `file` source reads local files with everything above. It takes a file, a
+directory (`recursive: true` descends), a glob, or a single `http(s)://` URL:
+
+```yaml
+source:
+  type: file
+  config:
+    path: ./inbox                  # or ./inbox/**/*.csv.gz, or https://…/export.avro
+    format: auto                   # per file, from the extension
+    incremental: { by: mtime }     # re-runs read only new files (needs `state:`)
+    stable_for_secs: 30            # skip files still being written
+    strict: false                  # true: refuse an unrecognised extension instead of skipping it
+```
+
+Under `format: auto` each file's format comes from its extension, looking
+through a compression suffix: `.jsonl`/`.ndjson`, `.json`, `.csv`, `.xml`,
+`.xlsx`, `.parquet`, `.avro`, `.orc`, `.txt`. So a directory holding `a.jsonl`,
+`b.json`, `c.csv.gz` and `d.xlsx` reads in one run. A file with any other
+extension is skipped with a warning, or fails the run with `strict: true`.
+
+Incremental mode reads only new files. `by: mtime` reads files modified after
+the newest one the previous run read; `by: name` reads files whose path sorts
+after the last one read. The bookmark advances after each file. Over HTTP, the
+`Last-Modified` header is the modification time. JSON Lines, Avro, ORC and
+Parquet stream; the other formats are read whole per file. See the
+[crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/file)
+for sharding, discovery and HTTP retries. The older `csv` source stays for
+existing configs; the `file` source is the general one.
+
 ## Parquet is separate on purpose
 
 `parquet` is columnar and self-describing, and each connector reads and writes
@@ -186,5 +340,6 @@ silently cost that fast path, so the shared helper refuses it.
 ## See also
 
 - [Compression](./compression.md) — gzip / zstd, independent of format
+- [`cli/examples/file_to_jsonl.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/file_to_jsonl.yaml) — a local inbox read incrementally
 - [Connector reference](../reference/connectors.md) — the capability matrix
 - [Transforms](./transforms.md) — `cast` and `json_parse` for text-format values
