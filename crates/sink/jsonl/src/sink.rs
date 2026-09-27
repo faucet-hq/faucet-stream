@@ -233,6 +233,18 @@ impl faucet_core::Sink for JsonlSink {
         Ok(())
     }
 
+    /// With `append: false` the file must hold exactly this run's output, so a
+    /// successful run that wrote no record still truncates it to an empty (or
+    /// empty-compressed) file rather than leaving the previous run's rows in
+    /// place (#753). Only reached after a successful, uncancelled run.
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        if self.config.append || self.opened_once.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        drop(self.ensure_open().await?);
+        self.flush().await
+    }
+
     /// Preflight probe for `faucet doctor`. Verifies the configured output
     /// path's parent directory exists and is writable by creating, then
     /// immediately removing, a uniquely-named temp file there. Never touches
