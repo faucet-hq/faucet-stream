@@ -72,6 +72,12 @@ each. Highlights:
 
 - `filter` — keep records where a JSONPath predicate is true. See the cookbook for the operator set and path syntax.
 - `explode` — expand an array field into one record per element. See the cookbook for the merge rule and `on_missing` semantics.
+- `zip_columns` — zip a positional report into one object per row: one header list (`columns_path`) or several header + cell-array `groups` (`from`, `header`, `header_label?`, `value?` — GA4 `runReport`'s dimensions and metrics). A width mismatch or a column two groups both name fails the page.
+
+Source-side incremental replication (`replication_method`, `replication_key`,
+`replication_bind`) is configured per connector: `rest` binds the bookmark into
+a query param / header / body field / path, `graphql` into a GraphQL variable —
+see [state & incremental](../cookbook/state.md#incremental-graphql).
 
 ## Config composition
 
@@ -971,6 +977,23 @@ The `rest` source's legacy `max_retries` / `retry_backoff` fields win when set
 explicitly; otherwise the injected policy's `max_attempts` + `base` apply (its
 `retry_on` / `max` / `jitter` are inert on REST, honored on `xml` / `graphql`
 and on every sink-side write).
+
+For APIs that signal a rate limit with a 4xx other than `429` plus a code in the
+body, the `rest` source's own `retry_on_response` list turns matching responses
+into throttling (counted in `faucet_source_throttled_total` and retried up to
+`max_retries` times in a row):
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `status` | `[]` | Statuses the rule applies to (empty = any non-2xx). |
+| `body_path` | — | JSONPath into the JSON error body; its first match is compared with `values`. |
+| `values` | `[]` | Matching values (numbers and strings compare by text). Required with `body_path`. |
+| `header` | — | A header that must be present (compared with `values` when there is no `body_path`). |
+| `backoff_secs` | — | Fixed wait; otherwise `Retry-After`, otherwise the exponential `retry_backoff`. |
+
+Rules are checked before `tolerated_http_errors` and apply to data pages,
+`async_job` requests and discovery requests. See the
+[resilience cookbook](../cookbook/resilience.md).
 
 ## `dlq`
 

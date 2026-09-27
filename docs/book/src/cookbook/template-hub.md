@@ -302,6 +302,39 @@ falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
 sent when set — needed for a private catalog, and it lifts the anonymous API
 rate limit.
 
+### The official starter set
+
+The `faucet-hq` namespace carries ten maintained SaaS source templates. Each
+has a README beside it (scopes, run times, changelog), a `faucet template test`
+suite and recorded API fixtures, and composes with all four official sinks
+(`bigquery`, `postgres`, `sqlite`, `jsonl`):
+
+| Template | API | Streams | Incremental (column) |
+|---|---|---|---|
+| `faucet-hq/salesforce` | Bulk API 2.0 (v62.0) | accounts, contacts, leads, opportunities, users, campaigns, tasks | every stream (`SystemModstamp`, plus soft deletes) |
+| `faucet-hq/hubspot` | CRM v3 | contacts, companies, deals, tickets, products, owners, deal_pipelines | — full refresh |
+| `faucet-hq/stripe` | API 2024-06-20 | customers, subscriptions, invoices, charges, refunds, payment_intents, products, prices, payouts, balance_transactions, events | balance_transactions, events (`created`) |
+| `faucet-hq/jira` | Jira Cloud REST v3 | issues, projects, users, fields, statuses, issue_types | — full refresh |
+| `faucet-hq/zendesk` | Support API v2 | tickets, users, organizations, satisfaction_ratings, groups, ticket_metrics, ticket_fields | tickets, users, organizations, satisfaction_ratings (`updated_at`) |
+| `faucet-hq/shopify` | Admin REST 2025-07 | orders, customers, products, custom_collections, smart_collections, locations | orders, customers, products (`updated_at`) |
+| `faucet-hq/github` | REST 2022-11-28 | repository, issues, issue_comments, pull_requests, commits, releases, workflow_runs, contributors | issues, issue_comments (`updated_at`) |
+| `faucet-hq/google-ads` | Google Ads API v22 (GAQL) | campaigns, ad_groups, ads, campaign_performance, ad_group_performance, keyword_performance | rolling window (performance streams) |
+| `faucet-hq/meta-ads` | Marketing API v24.0 | ad_account, campaigns, ad_sets, ads, ad_creatives, ad_insights | rolling window (`ad_insights`) |
+| `faucet-hq/google-analytics-4` | GA4 Data API v1beta | daily_traffic, pages, events, devices, geography, acquisition | rolling window (every stream) |
+
+Incremental streams keep their bookmark in the pipeline's `state:` store —
+supply one with a [deployment overlay](#deployment-overlays), or they re-read
+everything each run. Rolling-window streams re-read a fixed trailing window
+every run and upsert on date + dimensions, because the upstream keeps
+revising recent days.
+
+```bash
+faucet hub check --source faucet-hq/shopify --sink faucet-hq/postgres
+faucet run --source faucet-hq/google-analytics-4 --sink faucet-hq/sqlite \
+  --param ga4_property_id=123456789 --param google_client_id=… \
+  --param google_client_secret="$SECRET" --param google_refresh_token="$REFRESH"
+```
+
 ### A private source with the public sinks
 
 Keep internal source templates in your own repository and still use the
