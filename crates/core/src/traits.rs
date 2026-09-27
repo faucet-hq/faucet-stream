@@ -383,6 +383,51 @@ pub trait Source: Send + Sync {
         )))
     }
 
+    /// The dataset (table / collection) a change record belongs to, for a
+    /// change stream that carries several tables (#731). A multi-table
+    /// `faucet mirror` runs one stream and routes each record to its table's
+    /// pipeline by this name, which must match the name the paired bulk
+    /// source's [`discover`](Self::discover) reports (e.g. `public.orders`).
+    /// `None` means the record belongs to no table (a DDL / control event) —
+    /// and is the default, so a source that does not override this cannot be
+    /// used for a multi-table mirror.
+    fn record_table(&self, _record: &Value) -> Option<String> {
+        None
+    }
+
+    /// Order two of this source's bookmarks (#731): `Some(true)` when stream
+    /// position `a` is at or before `b` (every change up to `a` is also covered
+    /// by `b`), `Some(false)` when it is not, and `None` when the source cannot
+    /// tell (the default, or two positions it cannot relate). A multi-table
+    /// mirror uses it to resume one shared stream from the earliest table and
+    /// skip, per table, pages that table has already committed.
+    fn position_le(&self, _a: &Value, _b: &Value) -> Option<bool> {
+        None
+    }
+
+    /// The earliest stream position every one of `positions` can resume from
+    /// (#731): the shared change stream restarts there and each table skips
+    /// what it has already applied. The default picks the position that
+    /// [`position_le`](Self::position_le) orders at or before all the others,
+    /// and `None` when there is none (an empty slice, or positions this source
+    /// cannot order). Sources whose positions are only partially ordered (one
+    /// cursor per capture instance, say) override it with a component-wise
+    /// minimum.
+    fn position_min(&self, positions: &[Value]) -> Option<Value> {
+        let first = positions.first()?;
+        if positions.iter().all(|p| p == first) {
+            return Some(first.clone());
+        }
+        positions
+            .iter()
+            .find(|cand| {
+                positions
+                    .iter()
+                    .all(|other| self.position_le(cand, other) == Some(true))
+            })
+            .cloned()
+    }
+
     /// Stable identifier used as the `connector` label on metrics and the
     /// `connector` attribute on spans. Defaults to the final segment of
     /// `std::any::type_name::<Self>()`, e.g. `"RestSource"`. Built-in
@@ -1000,6 +1045,54 @@ mod tests {
             err.contains("no migration from bookmark schema 3 to 0"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn default_multi_table_hooks_route_nothing_and_order_nothing() {
+        let src = MockSource { records: vec![] };
+        assert_eq!(src.record_table(&json!({"table": "t"})), None);
+        assert_eq!(src.position_le(&json!(1), &json!(2)), None);
+        assert_eq!(src.position_min(&[]), None);
+        assert_eq!(src.position_min(&[json!(3), json!(3)]), Some(json!(3)));
+        assert_eq!(src.position_min(&[json!(1), json!(2)]), None);
+    }
+
+    #[tokio::test]
+    async fn ordered_double_fetches_nothing() {
+        use crate::Source as _;
+        assert!(
+            OrderedSource
+                .fetch_with_context(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    struct OrderedSource;
+
+    #[async_trait]
+    impl Source for OrderedSource {
+        async fn fetch_with_context(
+            &self,
+            _context: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+
+        fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+            Some(a.as_u64()? <= b.as_u64()?)
+        }
+    }
+
+    #[test]
+    fn default_position_min_uses_position_le() {
+        let src = OrderedSource;
+        assert_eq!(
+            src.position_min(&[json!(5), json!(2), json!(9)]),
+            Some(json!(2))
+        );
+        assert_eq!(src.position_min(&[json!(5), json!("x")]), None);
     }
 
     struct IncrementalSource {

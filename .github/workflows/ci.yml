@@ -583,6 +583,48 @@ jobs:
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: cargo build -p faucet-cli --no-default-features --features "${{ matrix.features }}"
 
+  # Windows (#565): the prebuilt x86_64-pc-windows-msvc binary's feature set
+  # (CLI default + the dist-workspace.toml `features`) must build and pass the
+  # engine + CLI unit suites and the real-binary end-to-end suite. The Docker-
+  # backed integration suites stay Linux-only (Windows runners have no Linux
+  # containers). Not a required check.
+  windows:
+    name: Windows (x86_64-pc-windows-msvc)
+    runs-on: windows-2022
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    env:
+      SHIPPED_FEATURES: "serve,serve-ui,schedule,lineage,templates"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep LF line endings and allow long paths
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      # aws-lc-sys and the vendored OpenSSL (librdkafka) assemble with NASM;
+      # Strawberry Perl, CMake and MSVC are already on the image.
+      - name: Install NASM
+        run: |
+          choco install nasm --yes --no-progress
+          echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the shipped CLI
+        run: cargo build -p faucet-cli --features "$SHIPPED_FEATURES"
+      - name: Smoke-test the binary
+        run: |
+          ./target/debug/faucet.exe --version
+          ./target/debug/faucet.exe list > /dev/null
+      - name: Engine unit tests
+        run: cargo test -p faucet-core --lib
+      - name: CLI unit + end-to-end tests
+        run: cargo test -p faucet-cli --features "$SHIPPED_FEATURES" --lib --test cli_end_to_end
+
   observability-bench:
     name: Observability bench (5% regression budget)
     runs-on: ubuntu-latest

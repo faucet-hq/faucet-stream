@@ -46,6 +46,11 @@ pub struct DatasetDescriptor {
     /// Must never contain credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_patch: Option<Value>,
+    /// The dataset's primary-key columns in key order, when the catalog
+    /// declares one (`None` when it has none or the source cannot tell). A
+    /// multi-table `faucet mirror` keys each table's upsert on it (#731).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_key: Option<Vec<String>>,
 }
 
 impl DatasetDescriptor {
@@ -58,7 +63,15 @@ impl DatasetDescriptor {
             estimated_rows: None,
             config_patch,
             sink_patch: None,
+            primary_key: None,
         }
+    }
+
+    /// Attach the catalog's primary-key columns (in key order). An empty list
+    /// means "no primary key" and is stored as `None`.
+    pub fn with_primary_key(mut self, columns: Vec<String>) -> Self {
+        self.primary_key = (!columns.is_empty()).then_some(columns);
+        self
     }
 
     /// Attach an inferred/introspected schema.
@@ -78,6 +91,27 @@ impl DatasetDescriptor {
         self.estimated_rows = Some(rows);
         self
     }
+}
+
+/// Attach primary keys to catalog descriptors (#731). `key_columns` yields
+/// `(dataset name, column)` pairs **in key order** (as a catalog query ordered
+/// by the constraint's column position returns them); a dataset with no pair
+/// keeps `primary_key: None`.
+pub fn attach_primary_keys(
+    descriptors: Vec<DatasetDescriptor>,
+    key_columns: impl IntoIterator<Item = (String, String)>,
+) -> Vec<DatasetDescriptor> {
+    let mut keys: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (name, column) in key_columns {
+        keys.entry(name).or_default().push(column);
+    }
+    descriptors
+        .into_iter()
+        .map(|d| match keys.remove(&d.name) {
+            Some(cols) => d.with_primary_key(cols),
+            None => d,
+        })
+        .collect()
 }
 
 /// Map a SQL catalog type name (as reported by `information_schema.columns`
@@ -166,6 +200,41 @@ mod tests {
         let v = serde_json::to_value(&d).unwrap();
         let back: DatasetDescriptor = serde_json::from_value(v).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn primary_key_builder_keeps_order_and_treats_empty_as_none() {
+        let d = DatasetDescriptor::new("public.orders", "table", json!({}))
+            .with_primary_key(vec!["tenant".into(), "id".into()]);
+        assert_eq!(d.primary_key, Some(vec!["tenant".into(), "id".into()]));
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["primary_key"], json!(["tenant", "id"]));
+        let none = DatasetDescriptor::new("t", "table", json!({})).with_primary_key(vec![]);
+        assert_eq!(none.primary_key, None);
+        assert!(
+            serde_json::to_value(&none)
+                .unwrap()
+                .get("primary_key")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn attach_primary_keys_matches_by_name_in_key_order() {
+        let ds = vec![
+            DatasetDescriptor::new("public.a", "table", json!({})),
+            DatasetDescriptor::new("public.b", "table", json!({})),
+        ];
+        let out = attach_primary_keys(
+            ds,
+            [
+                ("public.a".to_string(), "tenant".to_string()),
+                ("public.a".to_string(), "id".to_string()),
+                ("public.zzz".to_string(), "id".to_string()),
+            ],
+        );
+        assert_eq!(out[0].primary_key, Some(vec!["tenant".into(), "id".into()]));
+        assert_eq!(out[1].primary_key, None);
     }
 
     #[test]

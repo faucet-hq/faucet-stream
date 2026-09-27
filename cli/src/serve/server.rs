@@ -65,6 +65,10 @@ pub fn build_router(
             get(state_h::get_status).post(state_h::post_status),
         )
         .route(
+            "/v1/mirror/{name}",
+            get(state_h::get_mirror).post(state_h::post_mirror),
+        )
+        .route(
             "/v1/state/{pipeline}/{row}",
             get(state_h::get_state)
                 .put(state_h::put_state)
@@ -896,27 +900,10 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     Ok(())
 }
 
-/// Resolve on SIGTERM (Unix) or Ctrl-C (any platform).
+/// Resolve on a stop signal (Ctrl-C; SIGTERM on Unix; Ctrl-Break, console
+/// close or shutdown on Windows).
 async fn wait_for_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    crate::signals::wait_for_termination().await;
 }
 
 #[cfg(test)]

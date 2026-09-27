@@ -14,6 +14,7 @@
 /// **kibibytes on Linux and the BSDs** — the exact 1024× ambiguity this pure
 /// function exists to pin under test on *both* branches (the I/O caller passes
 /// its platform's flag, so a double-scaling bug can never hide behind `cfg!`).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn normalize_maxrss(raw: i64, unit_is_bytes: bool) -> Option<u64> {
     if raw <= 0 {
         return None;

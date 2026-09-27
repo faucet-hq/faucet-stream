@@ -295,7 +295,7 @@ async fn discover_enumerates_tables_with_schemas() {
     exec(
         &pool,
         "CREATE TABLE dbo.orders (
-            id BIGINT NOT NULL,
+            id BIGINT NOT NULL PRIMARY KEY,
             note NVARCHAR(50) NULL,
             total DECIMAL(10,2) NULL
         )",
@@ -336,6 +336,9 @@ async fn discover_enumerates_tables_with_schemas() {
         .expect("orders dataset");
     assert_eq!(orders.kind, "table");
     assert_eq!(orders.config_patch["query"], "SELECT * FROM [dbo].[orders]");
+    assert_eq!(orders.primary_key, Some(vec!["id".to_string()]));
+    let leads = datasets.iter().find(|d| d.name == "sales.leads").unwrap();
+    assert_eq!(leads.primary_key, None);
     assert_eq!(
         orders.estimated_rows,
         Some(50),

@@ -285,10 +285,24 @@ impl Source for OracleSource {
           WHERE c.OWNER IN (SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED = 'N') \
             AND t.TEMPORARY = 'N' AND t.NESTED = 'NO' AND t.SECONDARY = 'N' \
           ORDER BY c.OWNER, c.TABLE_NAME, c.COLUMN_ID";
+        const KEY_SQL: &str = "SELECT c.OWNER || '.' || c.TABLE_NAME, cc.COLUMN_NAME \
+           FROM ALL_CONSTRAINTS c \
+           JOIN ALL_CONS_COLUMNS cc \
+             ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME \
+          WHERE c.CONSTRAINT_TYPE = 'P' \
+            AND c.OWNER IN (SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED = 'N') \
+          ORDER BY c.OWNER, c.TABLE_NAME, cc.POSITION";
         let pool = self.pool.clone();
         let timeout = call_timeout(self.config.statement_timeout_secs);
-        let rows = blocking(move || {
+        let (rows, keys) = blocking(move || {
             let conn = checkout(&pool, Side::Source, timeout)?;
+            let mut keys: Vec<(String, String)> = Vec::new();
+            for r in conn
+                .query_as::<(String, String)>(KEY_SQL, &[])
+                .map_err(|e| ora_err(Side::Source, "primary-key discovery", &e))?
+            {
+                keys.push(r.map_err(|e| ora_err(Side::Source, "primary-key discovery", &e))?);
+            }
             let rs = conn
                 .query_as::<(
                     String,
@@ -314,10 +328,13 @@ impl Source for OracleSource {
                     num_rows,
                 });
             }
-            Ok(out)
+            Ok((out, keys))
         })
         .await?;
-        descriptors_from_catalog(rows)
+        Ok(faucet_core::attach_primary_keys(
+            descriptors_from_catalog(rows)?,
+            keys,
+        ))
     }
 
     fn is_shardable(&self) -> bool {

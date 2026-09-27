@@ -277,7 +277,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         })
         .collect();
 
-    let nodes = expand(&cfg)?;
+    let mut nodes = expand(&cfg)?;
 
     if !unprobed.is_empty() && !args.json {
         println!(
@@ -291,7 +291,23 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
     // Validate the replication block (snapshot source / CDC source / state) so
     // `faucet validate` catches misconfiguration without running.
     if let Some(spec) = &cfg.replication {
-        crate::replication::compiled::CompiledReplication::compile(spec, &cfg)?;
+        let compiled = crate::replication::compiled::CompiledReplication::compile(spec, &cfg)?;
+        // A multi-table mirror's sink template names no table; check the
+        // per-table config a discovered table would get (#731).
+        if let Some(tables) = &compiled.tables {
+            for node in nodes.iter_mut() {
+                let upsert = crate::registry::sink_supported_write_modes(&node.sink.kind)
+                    .contains(&faucet_core::WriteMode::Upsert);
+                if let Some(sample) = crate::replication::tables::sample_sink_config(
+                    &tables.spec,
+                    &node.sink.kind,
+                    &node.sink.config,
+                    upsert,
+                ) {
+                    node.sink.config = sample;
+                }
+            }
+        }
         if !args.json {
             println!("replication: mode={:?} — valid", spec.mode);
         }
@@ -671,6 +687,31 @@ fn check_transforms(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
 mod tests {
     use super::{check_connector_configs, check_transforms, row_line};
     use crate::expand::expand;
+
+    #[cfg(all(
+        feature = "source-postgres-cdc",
+        feature = "source-postgres",
+        feature = "sink-postgres",
+        feature = "transform-cdc-unwrap"
+    ))]
+    #[tokio::test]
+    async fn a_multi_table_mirror_validates_its_per_table_sink_config() {
+        use clap::Parser as _;
+        let example = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/postgres_mirror_tables.yaml"
+        );
+        let args = crate::cli::ValidateArgs::try_parse_from([
+            "validate",
+            "--no-secrets",
+            "--no-env-file",
+            example,
+        ])
+        .unwrap();
+        super::run(args)
+            .await
+            .expect("the shipped mirror example validates");
+    }
 
     #[test]
     fn row_line_renders_role_and_depends_on() {

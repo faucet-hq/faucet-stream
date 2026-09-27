@@ -362,6 +362,7 @@ For detailed comparisons that are honest about where each tool wins, see
 ```bash
 brew install faucet-hq/faucet-stream/faucet-cli                  # macOS / Linux
 curl -LsSf https://github.com/faucet-hq/faucet-stream/releases/latest/download/faucet-cli-installer.sh | sh
+irm https://github.com/faucet-hq/faucet-stream/releases/latest/download/faucet-cli-installer.ps1 | iex   # Windows (PowerShell)
 cargo install faucet-cli                                        # from source
 cargo add faucet-stream                                         # as a library
 ```
@@ -369,7 +370,8 @@ cargo add faucet-stream                                         # as a library
 Prebuilt archives with SHA-256 checksums are on the
 [releases page](https://github.com/faucet-hq/faucet-stream/releases). The minimum supported
 Rust version is 1.96. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
-for container images and slim builds.
+for container images, slim builds and
+[Windows notes](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html#windows-notes).
 
 ## Project
 

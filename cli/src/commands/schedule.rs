@@ -33,44 +33,6 @@ struct RunFinished {
     cooldown: Option<Duration>,
 }
 
-/// Cross-platform shutdown-signal source, registered once.
-struct Shutdown {
-    #[cfg(unix)]
-    sigterm: tokio::signal::unix::Signal,
-}
-
-impl Shutdown {
-    fn new() -> CliResult<Self> {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let sigterm = signal(SignalKind::terminate()).map_err(|e| {
-                CliError::Internal(format!("failed to install SIGTERM handler: {e}"))
-            })?;
-            Ok(Self { sigterm })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self {})
-        }
-    }
-
-    /// Resolve when SIGTERM (Unix) or Ctrl-C (any platform) is received.
-    async fn recv(&mut self) {
-        #[cfg(unix)]
-        {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = self.sigterm.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    }
-}
-
 /// Cross-platform hot-reload signal source (SIGHUP on Unix). On non-Unix
 /// platforms `recv()` never resolves, so the reload arm simply never fires.
 struct Reload {
@@ -523,7 +485,8 @@ async fn run_loop(
         .as_ref()
         .and_then(|r| r.circuit_breaker)
         .map(|cb| cb.cooldown);
-    let mut shutdown = Shutdown::new()?;
+    let mut shutdown = crate::signals::Terminate::new()
+        .map_err(|e| CliError::Internal(format!("failed to install stop-signal handlers: {e}")))?;
     let mut reload = Reload::new()?;
     let mut running: Option<RunningRun> = None;
     let mut pending_scheduled_for: Option<DateTime<Utc>> = None;

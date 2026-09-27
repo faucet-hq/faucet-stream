@@ -277,6 +277,8 @@ impl TargetProcess {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
         }
+        #[cfg(not(unix))]
+        let _ = self.pid;
         if tokio::time::timeout(TERMINATE_GRACE, child.wait())
             .await
             .is_err()

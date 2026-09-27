@@ -75,9 +75,68 @@ impl Bookmarks {
     }
 }
 
+/// Per-capture-instance order: `a` is at or before `b` when every capture
+/// instance both maps track is consumed at least as far in `b`. An instance
+/// only one side tracks does not constrain the order — each instance is its
+/// own cursor, and a multi-table mirror compares a table's position only on
+/// the instances it tracks. `None` when either side is not a bookmark map.
+pub fn bookmarks_le(a: &Value, b: &Value) -> Option<bool> {
+    let (a, b) = (
+        Bookmarks::from_value(a.clone()).ok()?,
+        Bookmarks::from_value(b.clone()).ok()?,
+    );
+    Some(
+        a.0.iter()
+            .all(|(ci, lsn)| b.get(ci).is_none_or(|have| *lsn <= have)),
+    )
+}
+
+/// The per-instance minimum of several bookmark maps: every instance any map
+/// tracks, at the lowest LSN a map holds for it.
+pub fn bookmarks_min(positions: &[Value]) -> Option<Value> {
+    if positions.is_empty() {
+        return None;
+    }
+    let mut out = Bookmarks::new();
+    for v in positions {
+        for (ci, lsn) in Bookmarks::from_value(v.clone()).ok()?.0 {
+            let keep = out.get(&ci).map_or(lsn, |have| have.min(lsn));
+            out.set(ci, keep);
+        }
+    }
+    out.to_value().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_instance_order_and_minimum() {
+        let lo = "0000002a000000550003";
+        let hi = "0000002a000000560001";
+        let a = serde_json::json!({"dbo_Orders": lo, "dbo_Items": lo});
+        let b = serde_json::json!({"dbo_Orders": hi, "dbo_Items": lo});
+        let c = serde_json::json!({"dbo_Orders": lo});
+        let d = serde_json::json!({"dbo_New": hi});
+        assert_eq!(bookmarks_le(&a, &b), Some(true));
+        assert_eq!(bookmarks_le(&b, &a), Some(false));
+        assert_eq!(bookmarks_le(&c, &a), Some(true));
+        assert_eq!(bookmarks_le(&a, &c), Some(true), "Items is untracked by c");
+        assert_eq!(bookmarks_le(&b, &c), Some(false));
+        assert_eq!(bookmarks_le(&d, &a), Some(true), "no shared instance");
+        assert_eq!(bookmarks_le(&a, &serde_json::json!([])), None);
+        assert_eq!(
+            bookmarks_min(&[b.clone(), a.clone()]),
+            Some(serde_json::json!({"dbo_Orders": lo, "dbo_Items": lo}))
+        );
+        assert_eq!(
+            bookmarks_min(&[b, d]),
+            Some(serde_json::json!({"dbo_Orders": hi, "dbo_Items": lo, "dbo_New": hi}))
+        );
+        assert_eq!(bookmarks_min(&[]), None);
+        assert_eq!(bookmarks_min(&[serde_json::json!(1)]), None);
+    }
     use serde_json::json;
 
     fn lsn(hex: &str) -> Lsn {

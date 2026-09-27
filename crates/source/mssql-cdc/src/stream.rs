@@ -230,6 +230,18 @@ impl Source for MssqlCdcSource {
         true
     }
 
+    fn record_table(&self, record: &Value) -> Option<String> {
+        schema_table(record)
+    }
+
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        crate::state::bookmarks_le(a, b)
+    }
+
+    fn position_min(&self, positions: &[Value]) -> Option<Value> {
+        crate::state::bookmarks_min(positions)
+    }
+
     fn connector_name(&self) -> &'static str {
         "mssql-cdc"
     }
@@ -739,8 +751,25 @@ fn changes_sql(capture_instance: &str) -> String {
     )
 }
 
+/// `schema.table` of a change envelope, the name the `mssql` source's
+/// discovery reports for the same table.
+fn schema_table(record: &Value) -> Option<String> {
+    let schema = record.get("schema")?.as_str()?;
+    let table = record.get("table")?.as_str()?;
+    Some(format!("{schema}.{table}"))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn routes_by_schema_table() {
+        assert_eq!(
+            schema_table(&serde_json::json!({"schema": "dbo", "table": "Orders"})),
+            Some("dbo.Orders".into())
+        );
+        assert_eq!(schema_table(&serde_json::json!({"schema": "dbo"})), None);
+    }
 
     #[test]
     fn slowest_position_waits_for_every_instance() {

@@ -519,6 +519,8 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         // Cost & usage accounting (#704): a priced read of what the catalog
         // already shows, so viewer+.
         (&Method::GET, "/v1/usage") => Some(UsageRead),
+        // Multi-table mirror status (#731): a read of the mirror's state, viewer+.
+        (&Method::GET | &Method::POST, "/v1/mirror/{name}") => Some(StatusRead),
         // Change requests (#703). Reading is viewer+; proposing needs the run
         // scope; approving/rejecting reach the route as operator+ and the
         // `approvals:` policy decides further.
@@ -678,6 +680,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::GET, "/v1/catalog/lineage") => "catalog.lineage",
         (&Method::POST, "/v1/catalog/datasets/{id}/consumers") => "catalog.annotate",
         (&Method::GET, "/v1/usage") => "usage.list",
+        (&Method::GET | &Method::POST, "/v1/mirror/{name}") => "mirror.status",
         (&Method::GET | &Method::POST, "/v1/status") => "status",
         (&Method::GET, "/v1/state/{pipeline}/{row}") => "state.get",
         (&Method::PUT, "/v1/state/{pipeline}/{row}") => "state.set",
@@ -1007,6 +1010,8 @@ mod tests {
             (Method::GET, "/v1/whoami", Identity),
             (Method::GET, "/v1/status", StatusRead),
             (Method::POST, "/v1/status", StatusRead),
+            (Method::GET, "/v1/mirror/{name}", StatusRead),
+            (Method::POST, "/v1/mirror/{name}", StatusRead),
             (Method::GET, "/v1/state/{pipeline}/{row}", StateAdmin),
             (Method::PUT, "/v1/state/{pipeline}/{row}", StateAdmin),
             (Method::DELETE, "/v1/state/{pipeline}/{row}", StateAdmin),
@@ -1020,6 +1025,10 @@ mod tests {
         assert!(!Role::Operator.grants(Permission::StateAdmin));
         assert!(Role::Admin.grants(Permission::StateAdmin));
         assert_eq!(audit_action(&Method::POST, "/v1/status"), "status");
+        assert_eq!(
+            audit_action(&Method::GET, "/v1/mirror/{name}"),
+            "mirror.status"
+        );
         assert_eq!(
             audit_action(&Method::GET, "/v1/state/{pipeline}/{row}"),
             "state.get"

@@ -294,6 +294,14 @@ impl Source for MongoCdcSource {
         true
     }
 
+    fn record_table(&self, record: &Value) -> Option<String> {
+        namespace_table(&self.config.scope, record)
+    }
+
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        token_le(a, b)
+    }
+
     fn connector_name(&self) -> &'static str {
         "mongodb-cdc"
     }
@@ -698,8 +706,51 @@ impl MongoCdcSource {
     }
 }
 
+/// The collection a change envelope belongs to: the bare collection name for a
+/// database or collection scope (what the `mongodb` source's discovery lists),
+/// `db.collection` for a cluster scope where names can collide across databases.
+fn namespace_table(scope: &crate::config::Scope, record: &Value) -> Option<String> {
+    let ns = record.get("namespace")?;
+    let coll = ns.get("coll")?.as_str()?;
+    match scope {
+        crate::config::Scope::Cluster => Some(format!("{}.{coll}", ns.get("db")?.as_str()?)),
+        _ => Some(coll.to_string()),
+    }
+}
+
+/// Resume tokens order by their hex-encoded `_data` key string, which MongoDB
+/// encodes so that byte order is event order.
+fn token_le(a: &Value, b: &Value) -> Option<bool> {
+    let data = |v: &Value| {
+        v.get("resume_token")?
+            .get("_data")?
+            .as_str()
+            .map(str::to_ascii_uppercase)
+    };
+    Some(data(a)? <= data(b)?)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn routes_by_collection_and_orders_resume_tokens() {
+        use crate::config::Scope;
+        let rec = json!({"namespace": {"db": "shop", "coll": "orders"}});
+        let db = Scope::Database {
+            database: "shop".into(),
+        };
+        assert_eq!(namespace_table(&db, &rec), Some("orders".into()));
+        assert_eq!(
+            namespace_table(&Scope::Cluster, &rec),
+            Some("shop.orders".into())
+        );
+        assert_eq!(namespace_table(&db, &json!({"namespace": null})), None);
+        let t = |d: &str| json!({"resume_token": {"_data": d}, "invalidate": false});
+        assert_eq!(token_le(&t("8264A1"), &t("8264b2")), Some(true));
+        assert_eq!(token_le(&t("8264B2"), &t("8264A1")), Some(false));
+        assert_eq!(token_le(&t("8264A1"), &json!({})), None);
+    }
 
     #[test]
     fn token_cluster_secs_decodes_the_leading_timestamp() {

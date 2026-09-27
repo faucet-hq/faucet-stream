@@ -326,6 +326,8 @@ fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
         (Method::POST, "/v1/changes/{id}/reject"),
         (Method::GET, "/v1/status"),
         (Method::POST, "/v1/status"),
+        (Method::GET, "/v1/mirror/{name}"),
+        (Method::POST, "/v1/mirror/{name}"),
         (Method::GET, "/v1/state/{pipeline}/{row}"),
         (Method::PUT, "/v1/state/{pipeline}/{row}"),
         (Method::DELETE, "/v1/state/{pipeline}/{row}"),
@@ -415,7 +417,15 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     // - `/v1/status` — assembles a health report from state, history and the
     //   DLQ; the POST form only carries the config in a body. `--probe` builds
     //   the sink for its read-only watermark read, nothing more.
-    const READ_ONLY_POSTS: &[&str] = &["/mcp", "/v1/dlq/inspect", "/v1/plan", "/v1/status"];
+    // - `/v1/mirror/{name}` — reads a mirror's state store (#731); the POST
+    //   form only carries the config in a body.
+    const READ_ONLY_POSTS: &[&str] = &[
+        "/mcp",
+        "/v1/dlq/inspect",
+        "/v1/plan",
+        "/v1/status",
+        "/v1/mirror/{name}",
+    ];
     if READ_ONLY_POSTS.contains(&path) {
         return false;
     }

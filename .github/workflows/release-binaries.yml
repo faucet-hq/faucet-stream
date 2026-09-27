@@ -159,6 +159,12 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      # Hand edit: the chocolatey NASM package does not put nasm.exe on PATH,
+      # and aws-lc-sys / openssl-src look it up there.
+      - name: Put NASM on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

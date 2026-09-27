@@ -444,6 +444,67 @@ paths:
         "403": { description: Principal's role lacks the required permission }
         "404": { description: Unknown template }
         "422": { description: Config failed validation / expansion, or an unknown row }
+  /v1/mirror/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string }, description: "The mirror's pipeline name (the config's `name:`); must match the resolved config" }
+    get:
+      summary: Per-table status of a mirror (#731)
+      description: >
+        For every table of a multi-table mirror (or the one table of a
+        single-table mirror): phase (`pending` / `snapshotting` / `active` /
+        `paused` / `dropped` / `refused`), snapshot progress, change records
+        routed, the table's committed stream position, lag and whether it is
+        past `tables.lag_warning_secs`, consecutive failures and the last
+        error. Read from the mirror's state store, so it answers whether the
+        mirror runs in this server or in a separate `faucet mirror` process.
+        The config is inline (`config`) or a registered template (`template`).
+        Requires `StatusRead` (viewer+); audited as `mirror.status`.
+      operationId: getMirrorStatus
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: config, in: query, schema: { type: string }, description: Inline config document (URL-encoded) }
+        - { name: config_format, in: query, schema: { type: string, enum: [yaml, json], default: yaml } }
+        - { name: template, in: query, schema: { type: string }, description: Registered template id }
+        - { name: version, in: query, schema: { type: string } }
+        - { name: sink, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The mirror status
+          content: { application/json: { schema: { $ref: "#/components/schemas/MirrorStatus" } } }
+        "400": { description: Neither (or both of) `config` and `template` given, or an unparseable config }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { description: Unknown template }
+        "422": { description: The config names another pipeline, has no `mirror:` block, or the mirror has not started }
+    post:
+      summary: Per-table status of a mirror, config in the body (#731)
+      description: >
+        `GET /v1/mirror/{name}` with the config (and template `params`) in a
+        JSON body. Read-only; `StatusRead` (viewer+).
+      operationId: postMirrorStatus
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config: { type: string }
+                config_format: { type: string, enum: [yaml, json], default: yaml }
+                template: { type: string }
+                version: { type: string }
+                sink: { type: string }
+                params: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: The mirror status
+          content: { application/json: { schema: { $ref: "#/components/schemas/MirrorStatus" } } }
+        "400": { description: Neither (or both of) `config` and `template` given, or an unparseable config }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the required permission }
+        "404": { description: Unknown template }
+        "422": { description: The config names another pipeline, has no `mirror:` block, or the mirror has not started }
   /v1/state/{pipeline}/{row}:
     parameters:
       - { name: pipeline, in: path, required: true, schema: { type: string }, description: "The pipeline name (the config's `name:`); must match the resolved config" }
@@ -3935,6 +3996,49 @@ components:
         params:
           key: value
         deprecated: example
+    MirrorStatus:
+      type: object
+      description: Per-table status of a mirror (#731).
+      required: [name, mode, summary, tables]
+      properties:
+        name: { type: string }
+        mode: { type: string, enum: [tables, single] }
+        updated_at: { type: string, format: date-time, nullable: true }
+        discovered_at: { type: string, format: date-time, nullable: true }
+        summary:
+          type: object
+          properties:
+            tables: { type: integer }
+            by_phase: { type: object, additionalProperties: { type: integer } }
+            lagging: { type: integer }
+        tables:
+          type: array
+          items:
+            type: object
+            required: [table, phase]
+            properties:
+              table: { type: string }
+              phase: { type: string, enum: [pending, snapshotting, active, paused, dropped, refused] }
+              since: { type: string, format: date-time, nullable: true }
+              snapshot:
+                type: object
+                properties:
+                  started_at: { type: string, format: date-time, nullable: true }
+                  finished_at: { type: string, format: date-time, nullable: true }
+                  rows: { type: integer }
+                  estimated_rows: { type: integer, nullable: true }
+                  shards_done: { type: integer }
+                  shards_total: { type: integer }
+                  percent: { type: number, nullable: true }
+                  attempts: { type: integer }
+              changes: { type: integer }
+              position: { description: "The table's committed stream position (source-specific)", nullable: true }
+              lag_secs: { type: integer, nullable: true }
+              lagging: { type: boolean }
+              consecutive_failures: { type: integer }
+              last_error: { type: string, nullable: true }
+              key: { type: array, items: { type: string } }
+              write_mode: { type: string, nullable: true }
     StatusReport:
       type: object
       description: "`faucet status` / `GET /v1/status` (#732)"

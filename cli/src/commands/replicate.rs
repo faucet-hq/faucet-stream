@@ -1,24 +1,73 @@
 //! `faucet mirror` (alias `faucet replicate`) — load a config with a `mirror:` block, validate it,
 //! and run the two-phase snapshot→CDC orchestration.
 
-use crate::cli::ReplicateArgs;
+use crate::cli::{MirrorAction, MirrorStatusArgs, ReplicateArgs};
 use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
 use crate::replication::compiled::CompiledReplication;
 use crate::replication::{ReplicationOptions, run_replication};
 
-/// Execute the `replicate` subcommand.
-pub async fn run(args: ReplicateArgs) -> CliResult<()> {
+async fn load(
+    config: Option<std::path::PathBuf>,
+    env_file: Option<&std::path::Path>,
+    no_env_file: bool,
+    profile: Option<&str>,
+) -> CliResult<(PipelineConfig, std::path::PathBuf)> {
     let cwd = std::env::current_dir()?;
-    let env_path =
-        crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
+    let env_path = crate::env_loader::resolve_env_file(env_file, no_env_file, &cwd)?;
     crate::env_loader::load_env_file_if_present(env_path.as_deref())?;
-    let path = match args.config {
+    let path = match config {
         Some(p) => p,
         None => crate::env_loader::discover_config_path(&cwd).ok_or(CliError::NoConfigOrFromEnv)?,
     };
+    let cfg = PipelineConfig::from_path_async(&path, profile).await?;
+    Ok((cfg, path))
+}
 
-    let cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
+fn pipeline_name(cfg: &PipelineConfig, path: &std::path::Path) -> String {
+    cfg.name.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("pipeline")
+            .to_owned()
+    })
+}
+
+/// `faucet mirror status` — print the per-table view (#731).
+pub async fn status(args: MirrorStatusArgs) -> CliResult<()> {
+    let (cfg, path) = load(
+        args.config,
+        args.env_file.as_deref(),
+        args.no_env_file,
+        args.profile.as_deref(),
+    )
+    .await?;
+    let name = pipeline_name(&cfg, &path);
+    let report = crate::replication::status::read_status(&cfg, &name).await?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|e| CliError::Internal(format!("status serialize: {e}")))?
+        );
+    } else {
+        print!("{}", crate::replication::status::render_human(&report));
+    }
+    Ok(())
+}
+
+/// Execute the `replicate` subcommand.
+pub async fn run(args: ReplicateArgs) -> CliResult<()> {
+    if let Some(MirrorAction::Status(status_args)) = args.action {
+        return status(status_args).await;
+    }
+    let (cfg, path) = load(
+        args.config,
+        args.env_file.as_deref(),
+        args.no_env_file,
+        args.profile.as_deref(),
+    )
+    .await?;
     let spec = cfg.replication.as_ref().ok_or_else(|| {
         CliError::Config(
             "no `mirror:` block in config (formerly `replication:`) — use `faucet run` for a one-shot \
@@ -33,12 +82,7 @@ pub async fn run(args: ReplicateArgs) -> CliResult<()> {
 
     let compiled = CompiledReplication::compile(spec, &cfg)?;
 
-    let pipeline_name = cfg.name.clone().unwrap_or_else(|| {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("pipeline")
-            .to_owned()
-    });
+    let pipeline_name = pipeline_name(&cfg, &path);
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
     let resilience = match &cfg.resilience {
         Some(spec) => Some(spec.to_policy()?),
@@ -126,6 +170,7 @@ mod tests {
 
     fn args(path: std::path::PathBuf) -> ReplicateArgs {
         ReplicateArgs {
+            action: None,
             config: Some(path),
             env_file: None,
             no_env_file: true,
@@ -188,6 +233,83 @@ replication:
         );
     }
 
+    #[test]
+    fn an_unnamed_config_is_named_after_its_file() {
+        let cfg = PipelineConfig::from_text(
+            "version: 1\npipeline:\n  source: { type: rest, config: { base_url: https://a } }\n  sink: { type: stdout, config: {} }\n",
+            std::path::Path::new("orders.yaml"),
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline_name(&cfg, std::path::Path::new("/x/orders.yaml")),
+            "orders"
+        );
+        assert_eq!(pipeline_name(&cfg, std::path::Path::new("/")), "pipeline");
+    }
+
+    /// A valid mirror reaches the orchestrator, which fails on an unreachable
+    /// database rather than at compile time.
+    #[cfg(all(
+        feature = "source-postgres-cdc",
+        feature = "source-postgres",
+        feature = "sink-postgres"
+    ))]
+    #[tokio::test]
+    async fn a_valid_mirror_reaches_the_orchestrator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&format!(
+            r#"
+version: 1
+name: mirror
+pipeline:
+  source: {{ type: postgres-cdc, config: {{ connection_url: "postgres://u@127.0.0.1:1/db", slot_name: s, publication_name: p }} }}
+  sink:   {{ type: postgres, config: {{ connection_url: "postgres://u@127.0.0.1:1/db", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] }} }}
+  state:  {{ type: file, config: {{ path: "{}" }} }}
+mirror:
+  mode: snapshot_then_cdc
+  continuous: false
+  snapshot:
+    source: {{ type: postgres, config: {{ connection_url: "postgres://u@127.0.0.1:1/db", query: "SELECT * FROM t" }} }}
+"#,
+            dir.path().join("st").display()
+        ));
+        let err = run(args(path)).await.unwrap_err();
+        assert!(!err.to_string().contains("durable state"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn status_reads_the_mirror_state_store() {
+        use faucet_core::StateStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let st = dir.path().join("st");
+        let yaml = format!(
+            "version: 1\nname: m\npipeline:\n  source: {{ type: rest, config: {{ base_url: https://a }} }}\n  sink: {{ type: stdout, config: {{}} }}\n  state: {{ type: file, config: {{ path: {} }} }}\nmirror:\n  mode: snapshot_then_cdc\n  snapshot:\n    source: {{ type: rest, config: {{ base_url: https://b }} }}\n  tables: {{ include: [\"*\"] }}\n",
+            st.display()
+        );
+        let path = write_config(&yaml);
+        let status_args = |json| MirrorStatusArgs {
+            config: Some(path.clone()),
+            json,
+            env_file: None,
+            no_env_file: true,
+            profile: None,
+        };
+        let err = status(status_args(false)).await.unwrap_err();
+        assert!(err.to_string().contains("has not started"), "{err}");
+
+        let store = faucet_core::FileStateStore::new(&st);
+        let state = crate::replication::multi_state::MirrorState::new(chrono::Utc::now());
+        store
+            .put("m::__replication__", &state.to_value().unwrap())
+            .await
+            .unwrap();
+        status(status_args(true)).await.unwrap();
+        status(status_args(false)).await.unwrap();
+        let mut args = args(path.clone());
+        args.action = Some(MirrorAction::Status(status_args(false)));
+        run(args).await.unwrap();
+    }
+
     /// #670: `faucet mirror` is the command, `faucet replicate` its alias, and
     /// the block parses under both `mirror:` and `replication:`.
     #[test]
@@ -199,6 +321,19 @@ replication:
                 matches!(cli.command, crate::cli::Command::Replicate(_)),
                 "{verb}"
             );
+        }
+        let cli =
+            crate::cli::Cli::try_parse_from(["faucet", "mirror", "status", "m.yaml", "--json"])
+                .unwrap();
+        match cli.command {
+            crate::cli::Command::Replicate(ReplicateArgs {
+                action: Some(MirrorAction::Status(s)),
+                ..
+            }) => {
+                assert!(s.json);
+                assert_eq!(s.config.as_deref(), Some(std::path::Path::new("m.yaml")));
+            }
+            other => panic!("{other:?}"),
         }
         for target in ["mirror", "replication"] {
             let cli = crate::cli::Cli::try_parse_from(["faucet", "schema", target]).unwrap();

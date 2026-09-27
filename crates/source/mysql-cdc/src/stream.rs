@@ -182,6 +182,14 @@ impl Source for MysqlCdcSource {
         "mysql-cdc"
     }
 
+    fn record_table(&self, record: &Value) -> Option<String> {
+        schema_table(record)
+    }
+
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        bookmark_le(a, b)
+    }
+
     fn dataset_uri(&self) -> String {
         let base = faucet_core::redact_uri_credentials(&self.config.connection_url);
         if self.config.include_tables.is_empty() {
@@ -1070,8 +1078,135 @@ async fn run_preflight(conn: &mut Conn, config: &MysqlCdcSourceConfig) -> Result
 // Unit tests
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// `database.table` of a change envelope, the name the `mysql` source's
+/// discovery reports for the same table.
+fn schema_table(record: &Value) -> Option<String> {
+    let schema = record.get("schema")?.as_str()?;
+    let table = record.get("table")?.as_str()?;
+    Some(format!("{schema}.{table}"))
+}
+
+/// Order two bookmarks: binlog coordinates by (file sequence, position) within
+/// one binlog base name; GTID sets by containment. Mixed shapes are unrelated.
+fn bookmark_le(a: &Value, b: &Value) -> Option<bool> {
+    match (
+        Bookmark::from_value(a.clone()).ok()?,
+        Bookmark::from_value(b.clone()).ok()?,
+    ) {
+        (Bookmark::FilePos { file: fa, pos: pa }, Bookmark::FilePos { file: fb, pos: pb }) => {
+            let (base_a, seq_a) = binlog_seq(&fa)?;
+            let (base_b, seq_b) = binlog_seq(&fb)?;
+            (base_a == base_b).then_some((seq_a, pa) <= (seq_b, pb))
+        }
+        (Bookmark::GtidSet { gtid_set: ga }, Bookmark::GtidSet { gtid_set: gb }) => {
+            let (sa, sb) = (parse_gtid_set(&ga)?, parse_gtid_set(&gb)?);
+            Some(sa.iter().all(|(source, intervals)| {
+                intervals.iter().all(|&(lo, hi)| {
+                    sb.get(source)
+                        .is_some_and(|have| interval_covered(have, lo, hi))
+                })
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn binlog_seq(file: &str) -> Option<(&str, u64)> {
+    let (base, seq) = file.rsplit_once('.')?;
+    Some((base, seq.parse().ok()?))
+}
+
+type GtidSet = std::collections::BTreeMap<String, Vec<(u64, u64)>>;
+
+/// Parse `uuid[:tag]:1-5:7,uuid2:1-3` into merged, sorted intervals per source.
+fn parse_gtid_set(set: &str) -> Option<GtidSet> {
+    let mut out = GtidSet::new();
+    for part in set.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let mut pieces = part.split(':');
+        let uuid = pieces.next()?.trim().to_ascii_lowercase();
+        let mut source = uuid.clone();
+        for piece in pieces {
+            let piece = piece.trim();
+            let interval = match piece.split_once('-') {
+                Some((lo, hi)) => lo.parse().ok().zip(hi.parse().ok()),
+                None => piece.parse().ok().map(|n| (n, n)),
+            };
+            match interval {
+                Some((lo, hi)) if lo <= hi => out.entry(source.clone()).or_default().push((lo, hi)),
+                Some(_) => return None,
+                None => source = format!("{uuid}:{piece}"),
+            }
+        }
+    }
+    for intervals in out.values_mut() {
+        intervals.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+        for &(lo, hi) in intervals.iter() {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        *intervals = merged;
+    }
+    Some(out)
+}
+
+fn interval_covered(have: &[(u64, u64)], lo: u64, hi: u64) -> bool {
+    have.iter().any(|&(a, b)| a <= lo && hi <= b)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn routes_by_schema_table() {
+        assert_eq!(
+            schema_table(&json!({"schema": "shop", "table": "orders"})),
+            Some("shop.orders".into())
+        );
+        assert_eq!(schema_table(&json!({"op": "ddl"})), None);
+    }
+
+    #[test]
+    fn orders_binlog_coordinates_and_gtid_sets() {
+        let fp = |f: &str, p: u64| json!({"file": f, "pos": p});
+        assert_eq!(
+            bookmark_le(&fp("binlog.000009", 900), &fp("binlog.000010", 4)),
+            Some(true)
+        );
+        assert_eq!(
+            bookmark_le(&fp("binlog.000010", 5), &fp("binlog.000010", 4)),
+            Some(false)
+        );
+        assert_eq!(
+            bookmark_le(&fp("binlog.000010", 4), &fp("binlog.000010", 4)),
+            Some(true)
+        );
+        assert_eq!(bookmark_le(&fp("a.000001", 1), &fp("b.000001", 1)), None);
+        assert_eq!(bookmark_le(&fp("noseq", 1), &fp("noseq", 1)), None);
+        let g = |s: &str| json!({"gtid_set": s});
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        assert_eq!(
+            bookmark_le(&g(&format!("{u}:1-5")), &g(&format!("{u}:1-3:4-9"))),
+            Some(true)
+        );
+        assert_eq!(
+            bookmark_le(&g(&format!("{u}:1-9")), &g(&format!("{u}:1-5"))),
+            Some(false)
+        );
+        assert_eq!(
+            bookmark_le(&g(&format!("{u}:1-2,other:1")), &g(&format!("{u}:1-5"))),
+            Some(false)
+        );
+        assert_eq!(
+            bookmark_le(&g(&format!("{u}:tag:3")), &g(&format!("{u}:1-2:tag:1-4"))),
+            Some(true)
+        );
+        assert_eq!(bookmark_le(&g(&format!("{u}:5-1")), &g(u)), None);
+        assert_eq!(bookmark_le(&g(u), &fp("binlog.000001", 1)), None);
+        assert_eq!(bookmark_le(&json!("junk"), &g(u)), None);
+    }
 
     #[test]
     fn binlog_distance_spans_files() {

@@ -1320,13 +1320,47 @@ mirror:
 - A durable [`state:`](../cookbook/state.md#state-stores) backend is required
   (`file` / `redis` / `postgres`) — `memory` is rejected, since the snapshot→CDC
   handoff and resume depend on the persisted phase marker and bookmark.
-- No `matrix:` — replication is a single pipeline in v1.
+- No `matrix:` — a mirror is one pipeline; mirror several tables with `tables:` (below).
 - For `postgres-cdc`, a **permanent** replication slot (`slot_type: permanent`,
   the default) is required so WAL is retained across the snapshot.
 
 See the [replication cookbook](../cookbook/replication.md) for the correctness
 model (capture-before-snapshot + upsert idempotency), the resume behaviour, and
 the per-database log-retention caveats.
+
+### Multi-table mirror (`mirror.tables`)
+
+With a `tables:` block the mirror replicates a **set of tables** over one change
+stream (#731). `pipeline.sink` becomes a template (the table is filled in per
+table) and `snapshot.source` the discovery connection.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tables.include` | list of globs | `["*"]` | Discovered table names to mirror (`*` any run, `?` one character). |
+| `tables.exclude` | list of globs | `[]` | Removed from `include`. |
+| `tables.new_tables` | `follow` / `ignore` | `follow` | Snapshot and stream a matching table created after the mirror started. |
+| `tables.discover_interval_secs` | int | `300` | How often discovery re-runs to notice created / dropped tables (`0` = only when the stream shows an unknown table). |
+| `tables.without_primary_key` | `refuse` / `append` | `refuse` | A table with no primary key is refused (shown in status) or mirrored append-only. |
+| `tables.destination` | mapping | per sink kind | Sink-config patch per table; strings may use `{table}`, `{table_name}`, `{schema}`. Required for sinks without a single table field (file sinks). |
+| `tables.on_table_error` | `pause` / `fail` | `pause` | A table whose pipeline keeps failing is paused (the rest continue) or fails the mirror. |
+| `tables.max_table_failures` | int | `3` | Consecutive failed cycles before a table is paused. |
+| `tables.retry_paused_secs` | int | `300` | Seconds before a paused table is re-snapshotted (`0` = stay paused until restart). |
+| `tables.lag_warning_secs` | int | `300` | Flag an active table as lagging past this many seconds without a confirmed position. |
+| `per_table.<table>.key` | list | discovered PK | Upsert key. |
+| `per_table.<table>.write_mode` | string | template's, else `upsert` | Destination write mode. |
+| `per_table.<table>.sink` | mapping | — | Extra sink-config patch (after `destination`). |
+| `per_table.<table>.snapshot` | mapping | — | Snapshot-source config patch (after the discovered selection). |
+| `per_table.<table>.schema_drift` | `schema:` block | top-level `schema:` | Drift policy for this table. |
+| `snapshot.concurrency` | int | `4` | Tables snapshotted in parallel. |
+| `snapshot.shards` | int | `0` | Primary-key ranges per table snapshot (single-column integer key, a source with `shard:` support). |
+
+Requirements: a CDC source that routes records to tables (`postgres-cdc`,
+`mysql-cdc`, `mongodb-cdc` with a database scope, `mssql-cdc`, `oracle-cdc`,
+`dynamodb` in `mode: streams`), a snapshot source that supports
+[discovery](../cookbook/discover.md), per-transaction CDC pages (no
+`batch_size: 0`), and a durable `state:`. State: the marker lives at
+`{name}::__replication__`, each table's position at `{name}::{table}`. See the
+[cookbook](../cookbook/replication.md#mirroring-a-set-of-tables).
 
 ## `backfill`
 

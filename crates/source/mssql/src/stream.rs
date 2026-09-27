@@ -542,7 +542,45 @@ impl Source for MssqlSource {
             ),
         }
 
-        Ok(descriptors_from_catalog(catalog, &estimates, bracket_quote))
+        const KEY_SQL: &str = "SELECT tc.TABLE_SCHEMA + '.' + tc.TABLE_NAME AS name, \
+                  k.COLUMN_NAME AS col \
+             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
+             JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k \
+               ON k.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+              AND k.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+            WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
+            ORDER BY tc.TABLE_SCHEMA, tc.TABLE_NAME, k.ORDINAL_POSITION";
+        let key_rows = {
+            let run = async {
+                conn.query(KEY_SQL, &[])
+                    .await
+                    .map_err(map_err)?
+                    .into_first_result()
+                    .await
+                    .map_err(map_err)
+            };
+            match self.timeout() {
+                Some(t) => {
+                    with_statement_timeout(t, run, || {
+                        FaucetError::Source("mssql: primary-key discovery timed out".into())
+                    })
+                    .await?
+                }
+                None => run.await?,
+            }
+        };
+        let mut keys: Vec<(String, String)> = Vec::with_capacity(key_rows.len());
+        for row in &key_rows {
+            let v = row_to_json(row)?;
+            if let (Some(name), Some(col)) = (v["name"].as_str(), v["col"].as_str()) {
+                keys.push((name.to_string(), col.to_string()));
+            }
+        }
+
+        Ok(faucet_core::attach_primary_keys(
+            descriptors_from_catalog(catalog, &estimates, bracket_quote),
+            keys,
+        ))
     }
 
     /// Shardable when a [`ShardConfig`](crate::config::ShardConfig) is set.

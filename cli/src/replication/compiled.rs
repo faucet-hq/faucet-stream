@@ -2,7 +2,8 @@
 
 use crate::config::{ConnectorSpec, PipelineConfig};
 use crate::error::{CliError, CliResult};
-use crate::replication::spec::ReplicationSpec;
+use crate::replication::spec::{ReplicationSpec, TableOverride, TablesSpec};
+use std::collections::BTreeMap;
 
 const CDC_SOURCES: &str =
     "postgres-cdc / mysql-cdc / mssql-cdc / mongodb-cdc / oracle-cdc / dynamodb in `mode: streams`";
@@ -31,6 +32,105 @@ pub struct CompiledReplication {
     pub snapshot_source: ConnectorSpec,
     /// Keep streaming CDC after the snapshot completes.
     pub continuous: bool,
+    /// Multi-table mode (#731), when `mirror.tables` is set.
+    pub tables: Option<CompiledTables>,
+}
+
+/// The validated `mirror.tables` / `mirror.per_table` / snapshot fan-out.
+#[derive(Debug, Clone)]
+pub struct CompiledTables {
+    pub spec: TablesSpec,
+    pub per_table: BTreeMap<String, TableOverride>,
+    /// Tables snapshotted in parallel.
+    pub concurrency: usize,
+    /// Primary-key ranges per table snapshot (`<= 1` = whole table).
+    pub shards: usize,
+    /// The CDC source kind.
+    pub cdc_kind: String,
+}
+
+fn compile_tables(
+    spec: &ReplicationSpec,
+    cdc: &ConnectorSpec,
+    sink: &ConnectorSpec,
+) -> CliResult<Option<CompiledTables>> {
+    let snapshot = &spec.snapshot;
+    let Some(tables) = spec.tables.as_ref() else {
+        if !spec.per_table.is_empty() {
+            return Err(CliError::Config(
+                "mirror.per_table needs mirror.tables (a multi-table mirror)".into(),
+            ));
+        }
+        if snapshot.shards > 1 {
+            return Err(CliError::Config(
+                "mirror.snapshot.shards applies to a multi-table mirror (mirror.tables)".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    if !crate::replication::tables::MULTI_TABLE_CDC_KINDS.contains(&cdc.kind.as_str()) {
+        return Err(CliError::Config(format!(
+            "a multi-table mirror needs a CDC source that routes records to tables ({}); got '{}'",
+            crate::replication::tables::MULTI_TABLE_CDC_KINDS.join(" / "),
+            cdc.kind
+        )));
+    }
+    if !crate::registry::source_supports_discover(&snapshot.source.kind) {
+        return Err(CliError::Config(format!(
+            "mirror.snapshot.source '{}' cannot discover tables; a multi-table mirror \
+             resolves its table set from the snapshot source's discovery",
+            snapshot.source.kind
+        )));
+    }
+    if cdc.config.get("batch_size").and_then(|v| v.as_u64()) == Some(0) {
+        return Err(CliError::Config(
+            "a multi-table mirror needs per-transaction CDC pages — remove \
+             `batch_size: 0` from pipeline.source"
+                .into(),
+        ));
+    }
+    if cdc.kind == "mongodb-cdc"
+        && cdc.config.pointer("/scope/type").and_then(|v| v.as_str()) == Some("collection")
+    {
+        return Err(CliError::Config(
+            "a multi-table mongodb-cdc mirror watches a database (scope.type: database), \
+             not one collection"
+                .into(),
+        ));
+    }
+    if tables.include.is_empty() {
+        return Err(CliError::Config(
+            "mirror.tables.include must name at least one glob".into(),
+        ));
+    }
+    if snapshot.concurrency == 0 {
+        return Err(CliError::Config(
+            "mirror.snapshot.concurrency must be at least 1".into(),
+        ));
+    }
+    if tables.destination.is_none()
+        && crate::replication::tables::default_destination(&sink.kind).is_none()
+    {
+        return Err(CliError::Config(format!(
+            "sink '{}' has no default per-table destination — set mirror.tables.destination \
+             (string values may use {{table}}, {{table_name}}, {{schema}})",
+            sink.kind
+        )));
+    }
+    if let Some(d) = &tables.destination
+        && !d.is_object()
+    {
+        return Err(CliError::Config(
+            "mirror.tables.destination must be a mapping of sink-config fields".into(),
+        ));
+    }
+    Ok(Some(CompiledTables {
+        spec: tables.clone(),
+        per_table: spec.per_table.clone(),
+        concurrency: snapshot.concurrency,
+        shards: snapshot.shards,
+        cdc_kind: cdc.kind.clone(),
+    }))
 }
 
 impl CompiledReplication {
@@ -93,7 +193,8 @@ impl CompiledReplication {
             .get("write_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("append");
-        if replay == CdcReplay::Keyed {
+        let tables = compile_tables(spec, cdc, sink)?;
+        if replay == CdcReplay::Keyed && tables.is_none() {
             let has_key = sink
                 .config
                 .get("key")
@@ -108,7 +209,7 @@ impl CompiledReplication {
                 )));
             }
         }
-        if write_mode != "upsert" {
+        if write_mode != "upsert" && tables.is_none() {
             tracing::warn!(
                 write_mode,
                 "mirror sink is not in upsert mode — the snapshot↔CDC boundary may \
@@ -118,6 +219,7 @@ impl CompiledReplication {
         Ok(Self {
             snapshot_source: snap.clone(),
             continuous: spec.continuous,
+            tables,
         })
     }
 }
@@ -324,6 +426,101 @@ replication:
         let c = cfg(&GOOD.replace("postgres-cdc", "postgres"));
         let err = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap_err();
         assert!(format!("{err}").contains("oracle-cdc"), "{err}");
+    }
+
+    const TABLES: &str = r#"
+version: 1
+name: shop
+pipeline:
+  source: { type: postgres-cdc, config: { connection_url: "postgres://x", slot_name: s, publication_name: p } }
+  sink:   { type: postgres, config: { connection_url: "postgres://y", column_mapping: auto_map } }
+  state:  { type: file, config: { path: ./st } }
+mirror:
+  mode: snapshot_then_cdc
+  snapshot:
+    source: { type: postgres, config: { connection_url: "postgres://x", query: "SELECT 1" } }
+    concurrency: 2
+    shards: 4
+  tables:
+    include: ["public.*"]
+  per_table:
+    public.orders: { key: [order_id] }
+"#;
+
+    fn compile_err(yaml: &str) -> String {
+        let c = cfg(yaml);
+        CompiledReplication::compile(c.replication.as_ref().unwrap(), &c)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn accepts_a_multi_table_mirror() {
+        let c = cfg(TABLES);
+        let r = CompiledReplication::compile(c.replication.as_ref().unwrap(), &c).unwrap();
+        let t = r.tables.expect("tables mode");
+        assert_eq!(t.concurrency, 2);
+        assert_eq!(t.shards, 4);
+        assert_eq!(t.cdc_kind, "postgres-cdc");
+        assert!(t.per_table.contains_key("public.orders"));
+        assert!(
+            CompiledReplication::compile(cfg(GOOD).replication.as_ref().unwrap(), &cfg(GOOD))
+                .unwrap()
+                .tables
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multi_table_gates() {
+        let e = compile_err(&TABLES.replace("  tables:\n    include: [\"public.*\"]\n", ""));
+        assert!(e.contains("per_table needs mirror.tables"), "{e}");
+        let e = compile_err(
+            &TABLES
+                .replace("  tables:\n    include: [\"public.*\"]\n", "")
+                .replace("  per_table:\n    public.orders: { key: [order_id] }\n", ""),
+        );
+        assert!(e.contains("shards applies"), "{e}");
+        let e = compile_err(&TABLES.replace(
+            "type: postgres, config: { connection_url: \"postgres://x\", query",
+            "type: rest, config: { url: \"https://a\", query",
+        ));
+        assert!(e.contains("cannot discover"), "{e}");
+        let e = compile_err(&TABLES.replace(
+            "publication_name: p }",
+            "publication_name: p, batch_size: 0 }",
+        ));
+        assert!(e.contains("batch_size: 0"), "{e}");
+        let e = compile_err(&TABLES.replace("include: [\"public.*\"]", "include: []"));
+        assert!(e.contains("at least one glob"), "{e}");
+        let e = compile_err(&TABLES.replace("concurrency: 2", "concurrency: 0"));
+        assert!(e.contains("concurrency"), "{e}");
+        let e = compile_err(&TABLES.replace(
+            "sink:   { type: postgres, config: { connection_url: \"postgres://y\", column_mapping: auto_map } }",
+            "sink:   { type: jsonl, config: { path: out.jsonl } }",
+        ));
+        assert!(e.contains("no default per-table destination"), "{e}");
+        let e = compile_err(&TABLES.replace(
+            "include: [\"public.*\"]",
+            "include: [\"public.*\"]\n    destination: nope",
+        ));
+        assert!(e.contains("mapping"), "{e}");
+    }
+
+    #[test]
+    fn multi_table_cdc_sources_must_route_by_table() {
+        let kafka = TABLES.replace(
+            "{ type: postgres-cdc, config: { connection_url: \"postgres://x\", slot_name: s, publication_name: p } }",
+            "{ type: kafka, config: { brokers: \"b:9092\", topics: [t], group_id: g } }",
+        );
+        let e = compile_err(&kafka);
+        assert!(e.contains("routes records to tables"), "{e}");
+        let mongo = TABLES.replace(
+            "{ type: postgres-cdc, config: { connection_url: \"postgres://x\", slot_name: s, publication_name: p } }",
+            "{ type: mongodb-cdc, config: { connection_uri: \"mongodb://m\", scope: { type: collection, database: d, collection: c } } }",
+        );
+        let e = compile_err(&mongo);
+        assert!(e.contains("watches a database"), "{e}");
     }
 
     #[test]

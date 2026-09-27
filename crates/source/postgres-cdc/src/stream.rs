@@ -225,6 +225,15 @@ impl Source for PostgresCdcSource {
         "postgres-cdc"
     }
 
+    fn record_table(&self, record: &Value) -> Option<String> {
+        schema_table(record)
+    }
+
+    fn position_le(&self, a: &Value, b: &Value) -> Option<bool> {
+        let lsn = |v: &Value| Bookmark::from_value(v.clone()).ok()?.as_u64().ok();
+        Some(lsn(a)? <= lsn(b)?)
+    }
+
     fn dataset_uri(&self) -> String {
         format!(
             "{}?publication={}",
@@ -832,8 +841,42 @@ fn tuple_to_object(rel: &Relation, tup: &TupleData) -> Result<TupleRow, FaucetEr
     })
 }
 
+/// `schema.table` of a change envelope, the name the `postgres` source's
+/// discovery reports for the same table.
+fn schema_table(record: &Value) -> Option<String> {
+    let schema = record.get("schema")?.as_str()?;
+    let table = record.get("table")?.as_str()?;
+    Some(format!("{schema}.{table}"))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn routes_by_schema_table_and_orders_by_lsn() {
+        let src = PostgresCdcSource::new(
+            serde_json::from_value(json!({
+                "connection_url": "postgres://u:p@localhost/db",
+                "slot_name": "s",
+                "publication_name": "p"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            src.record_table(&json!({"schema": "public", "table": "orders"})),
+            Some("public.orders".into())
+        );
+        assert_eq!(src.record_table(&json!({"table": "orders"})), None);
+        let a = json!({"last_lsn": "0/16A4F88"});
+        let b = json!({"last_lsn": "1/0"});
+        assert_eq!(src.position_le(&a, &b), Some(true));
+        assert_eq!(src.position_le(&b, &a), Some(false));
+        assert_eq!(src.position_le(&a, &a), Some(true));
+        assert_eq!(src.position_le(&a, &json!({"last_lsn": "bad"})), None);
+        assert_eq!(src.position_min(&[b.clone(), a.clone()]), Some(a));
+    }
 
     #[test]
     fn slot_lag_bytes_measures_from_the_furthest_known_position() {

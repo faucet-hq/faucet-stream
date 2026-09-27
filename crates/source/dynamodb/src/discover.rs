@@ -11,10 +11,12 @@ pub fn descriptor_from_table(desc: &TableDescription) -> Option<DatasetDescripto
     let name = desc.table_name()?;
     let mut d = DatasetDescriptor::new(name, "table", json!({ "table_name": name }));
     if let Ok(keys) = key_schema(desc) {
-        d = d.with_schema(faucet_core::columns_to_schema(
-            keys.iter()
-                .map(|k| (k.name.clone(), k.scalar.json_schema())),
-        ));
+        d = d
+            .with_schema(faucet_core::columns_to_schema(
+                keys.iter()
+                    .map(|k| (k.name.clone(), k.scalar.json_schema())),
+            ))
+            .with_primary_key(keys.iter().map(|k| k.name.clone()).collect());
     }
     if let Some(rows) = desc.item_count().and_then(|n| u64::try_from(n).ok()) {
         d = d.with_estimated_rows(rows);
@@ -54,6 +56,7 @@ mod tests {
         assert_eq!(d.kind, "table");
         assert_eq!(d.config_patch, json!({"table_name": "orders"}));
         assert_eq!(d.estimated_rows, Some(42));
+        assert_eq!(d.primary_key, Some(vec!["id".to_string()]));
         assert_eq!(
             d.schema.unwrap()["properties"]["id"],
             json!({"type": ["number", "string"]})

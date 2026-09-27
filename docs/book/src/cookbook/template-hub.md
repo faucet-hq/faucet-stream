@@ -266,8 +266,9 @@ faucet run --source acme/billing --sink faucet-hq/bigquery --param api_token="$T
 A remote hub is any GitHub repository laid out like `hub/`:
 `--hub github:owner/repo[@ref][/path]` or a `https://github.com/…[/tree/ref/path]`
 URL. The CLI resolves the ref to a commit with one API request, downloads the
-catalog into `~/.cache/faucet/hub/<repo>/<ref>/<commit>/` the first time, and
-reuses the snapshot until the ref moves. Offline, the last snapshot is used
+catalog into `~/.cache/faucet/hub/<repo>/<ref>/<commit>/` the first time
+(`%LOCALAPPDATA%\faucet\hub\` on Windows; `FAUCET_HUB_CACHE` or
+`XDG_CACHE_HOME` override the location), and reuses the snapshot until the ref moves. Offline, the last snapshot is used
 with a warning (`FAUCET_HUB_OFFLINE=1` skips the network altogether); it never
 falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
 sent when set — needed for a private catalog, and it lifts the anonymous API

@@ -364,6 +364,22 @@ So chains like `s3(parquet) → parquet`, `gcs(parquet) → delta`,
 Arrow end-to-end. See each connector's
 README for the exact config field and feature flag.
 
+## Platform support
+
+Every connector in the default build runs on Linux, macOS and Windows (x86_64; the
+prebuilt binaries cover all three — see
+[Installation](../getting-started/installation.md#windows-notes)), with two
+exceptions on Windows:
+
+- **Kafka** (source, sink, the lineage transport and the queue-depth trigger):
+  Kerberos (`sasl.mechanism: GSSAPI` via `extra_client_config`) needs Cyrus SASL,
+  which does not build on Windows. `PLAIN`, `SCRAM`, `OAUTHBEARER` and TLS work.
+- **Singer** (source and sink): Windows has no `SIGTERM`, so a tap or target still
+  running after the shutdown grace period is terminated rather than signalled.
+
+The Oracle connectors need Oracle Instant Client at runtime on every platform
+(on Windows, put its directory on `PATH`).
+
 ## Data-integrity notes
 
 A few connectors enforce defaults that prevent silent data loss or corruption.

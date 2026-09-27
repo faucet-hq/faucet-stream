@@ -24,6 +24,11 @@ Singer **target** as a faucet sink; the protocol types both share live in
   `STATE` messages; how coarse or fine that is (and whether re-emitted rows
   overlap) is a property of the individual tap. Pair with an idempotent sink for
   clean **effectively-once** (idempotent at-least-once) behavior.
+- **Stopping on Windows.** On Unix the tap gets `SIGTERM` and a grace period
+  before it is killed. Windows has no `SIGTERM`, so the tap gets the same grace
+  period to exit on its own and is then terminated. `executable` must be
+  something Windows can launch directly: an `.exe` (pip's console-script
+  launchers are) or a `.cmd`/`.bat` named with its extension.
 
 ## v0 scope
 

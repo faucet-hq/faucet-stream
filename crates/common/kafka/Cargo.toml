@@ -33,6 +33,10 @@ tokio = { workspace = true, features = ["sync"], optional = true }
 url = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 
+# Cyrus SASL (GSSAPI via `extra_client_config`) only builds on unix.
+[target.'cfg(unix)'.dependencies]
+rdkafka = { workspace = true, features = ["sasl"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 serde_json.workspace = true

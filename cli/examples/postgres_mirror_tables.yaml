@@ -1,0 +1,53 @@
+# Mirror every table of the `shop` schema into a warehouse Postgres over ONE
+# replication slot: each table is snapshotted from a position captured just
+# before it, then streamed from the shared change stream. Tables created later
+# are picked up; dropped ones stop being routed (their destination is kept).
+#
+#   CREATE PUBLICATION shop_pub FOR TABLES IN SCHEMA shop;   -- follows new tables
+#   faucet mirror cli/examples/postgres_mirror_tables.yaml
+#   faucet mirror status cli/examples/postgres_mirror_tables.yaml
+version: 1
+name: shop_mirror
+
+pipeline:
+  source:
+    type: postgres-cdc
+    config:
+      connection_url: "postgres://replicator:replicator@db.internal:5432/shop"
+      slot_name: shop_mirror_slot
+      publication_name: shop_pub
+  transforms:
+    - type: cdc_unwrap
+      config: {}
+  sink:
+    type: postgres
+    config:
+      connection_url: "postgres://loader:loader@warehouse.internal:5432/analytics"
+      schema: shop_mirror
+      column_mapping: auto_map
+      delete_marker: { field: __op, values: [d] }
+  state:
+    type: file
+    config: { path: ./.faucet-state }
+
+mirror:
+  mode: snapshot_then_cdc
+  continuous: true
+  snapshot:
+    source:
+      type: postgres
+      config:
+        connection_url: "postgres://replicator:replicator@db.internal:5432/shop"
+        query: "SELECT 1"                # replaced per table by discovery
+    concurrency: 4                        # tables snapshotted in parallel
+    shards: 8                             # PK ranges per large table
+  tables:
+    include: ["shop.*"]
+    exclude: ["shop.audit_*"]
+    new_tables: follow
+    destination: { table_name: "{table_name}" }
+    without_primary_key: refuse
+    on_table_error: pause
+  per_table:
+    shop.orders:
+      schema_drift: { on_drift: evolve }

@@ -95,7 +95,10 @@ fn phase_failure(summary: &crate::executor::RunSummary, phase: &str) -> CliError
 }
 
 /// Build a fresh `ExecuteOptions` for one phase run.
-fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> ExecuteOptions {
+pub(crate) fn make_opts(
+    opts: &ReplicationOptions,
+    cancel: Option<CancellationToken>,
+) -> ExecuteOptions {
     ExecuteOptions {
         legacy_state_writes: false,
         pipeline_name: opts.pipeline_name.clone(),
@@ -128,29 +131,12 @@ fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> Ex
     }
 }
 
-/// Spawn a task that cancels `token` on SIGTERM (Unix) or Ctrl-C. Shared
-/// with the backfill orchestrator.
+/// Spawn a task that cancels `token` on a stop signal (see
+/// [`crate::signals`]). Shared with the backfill orchestrator.
 pub(crate) fn spawn_cancel_on_signal(token: CancellationToken) {
+    let stop = crate::signals::wait_for_termination();
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            match signal(SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = sigterm.recv() => {}
-                    }
-                }
-                Err(_) => {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        stop.await;
         token.cancel();
     });
 }
@@ -163,6 +149,9 @@ pub async fn run_replication(
     compiled: &CompiledReplication,
     opts: ReplicationOptions,
 ) -> CliResult<()> {
+    if compiled.tables.is_some() {
+        return crate::replication::multi::run_multi(cfg, compiled, opts).await;
+    }
     // expand() runs the generic gates (exactly-once, write_mode×sink). With no
     // matrix (enforced by CompiledReplication) there is exactly one node.
     let mut nodes = expand(cfg)?;
