@@ -8,13 +8,16 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "homebrew"]
+installers = ["shell", "powershell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "faucet-hq/homebrew-faucet-stream"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Windows ships x86_64 only: aws-lc-sys needs clang-cl for aarch64-pc-windows-msvc,
+# which the windows-11-arm runner does not guarantee, and Windows on ARM runs
+# the x86_64 binary under its built-in x64 emulation.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether dist should create a Github Release or use an existing draft
@@ -36,6 +39,11 @@ libssl-dev = '*'
 libcurl4-openssl-dev = '*'
 cmake = '*'
 build-essential = '*'
+
+# Windows build runner: NASM assembles the aws-lc and vendored OpenSSL sources
+# (Strawberry Perl, CMake and the MSVC toolchain are preinstalled on the image).
+[dist.dependencies.chocolatey]
+nasm = '*'
 
 # Build Linux aarch64 natively on GitHub's arm runners instead of
 # cross-compiling (librdkafka/openssl make cross builds painful).
