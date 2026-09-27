@@ -2382,7 +2382,10 @@ impl RestStream {
             });
         }
 
-        let resp_headers = resp.headers().clone();
+        let mut resp_headers = resp.headers().clone();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(resp.url().as_str()) {
+            resp_headers.insert(crate::url_util::REQUEST_URL_HEADER, v);
+        }
 
         // A 204 No Content — or any 2xx with an empty / whitespace-only body —
         // carries no JSON to parse. `resp.json()` on such a response yields a

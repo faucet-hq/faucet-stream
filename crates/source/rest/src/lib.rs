@@ -17,6 +17,7 @@ pub mod pagination;
 pub mod retry;
 pub mod serde_helpers;
 pub mod stream;
+pub mod url_util;
 
 // Re-export core types so users don't need a separate faucet-core dependency.
 pub use faucet_core::{

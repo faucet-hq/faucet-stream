@@ -17,6 +17,18 @@ fn default_true() -> bool {
     true
 }
 
+/// Resolve a next-page link against the URL of the request that returned it
+/// (#750). Without a recorded request URL the link is used as given.
+fn resolve_against_request(headers: &HeaderMap, link: &str) -> Result<String, FaucetError> {
+    match headers
+        .get(crate::url_util::REQUEST_URL_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(base) => crate::url_util::resolve_link_str(base, link),
+        None => Ok(link.to_owned()),
+    }
+}
+
 /// Where a [`PaginationStyle::RecordFieldCursor`] keyset value is injected on the
 /// next request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -303,6 +315,7 @@ impl PaginationStyle {
             }
             PaginationStyle::LinkHeader => match link_header::extract_next_link(headers) {
                 Some(link) => {
+                    let link = resolve_against_request(headers, &link)?;
                     if Some(&link) == state.previous_token.as_ref() {
                         tracing::warn!(
                             "pagination loop detected: link {link:?} repeated — stopping"
@@ -322,6 +335,14 @@ impl PaginationStyle {
             PaginationStyle::NextLinkInBody { next_link_path } => {
                 let has_next = next_link_body::advance(body, next_link_path, &mut state.next_link)?;
                 if has_next {
+                    if let Some(raw) = state.next_link.take() {
+                        state.next_link =
+                            Some(resolve_against_request(headers, &raw).map_err(|e| {
+                                FaucetError::Source(format!(
+                                    "next-link path '{next_link_path}' returned '{raw}': {e}"
+                                ))
+                            })?);
+                    }
                     if state.next_link == state.previous_token {
                         tracing::warn!(
                             "pagination loop detected: next_link {:?} repeated — stopping",
