@@ -1037,3 +1037,434 @@ pub fn render_human(r: &RowsReport) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::IncludeParents;
+
+    const SRC: &str = r#"
+kind: source-template
+name: crm
+params:
+  base: { type: string, required: true }
+source:
+  type: csv
+  config: { path: "${param.base}/accounts.csv" }
+transforms:
+  - { type: rename_field, config: { from: a, to: b } }
+  - { type: drop, config: { fields: [c] } }
+contract:
+  version: "1"
+  fields:
+    - { name: id, type: string }
+streams:
+  - name: accounts
+    description: Customer accounts
+    primary_keys: [id]
+    write: [upsert, append]
+  - name: deals
+    source: { config: { path: "${param.base}/deals.csv", replication_method: incremental, replication_key: updated_at } }
+    primary_keys: [id]
+    write: [overwrite]
+  - name: deal_lines
+    parent: deals
+    source: { config: { path: "/lines-${deals.id}.csv" } }
+    write: append
+  - name: audit
+    primary_keys: [id]
+    write: upsert
+  - name: audit_items
+    parent: audit
+    write: append
+"#;
+
+    const SINK: &str = r#"
+kind: sink-template
+name: files
+params:
+  out: { type: string, default: ./out }
+sink: { type: jsonl, config: { append: false } }
+per_stream: { path: "${param.out}/${stream}.jsonl" }
+write_mode_aliases: { overwrite: append }
+"#;
+
+    fn src() -> SourceTemplate {
+        serde_yaml::from_str(SRC).unwrap()
+    }
+    fn sink() -> SinkTemplate {
+        serde_yaml::from_str(SINK).unwrap()
+    }
+    fn row<'a>(r: &'a RowsReport, id: &str) -> &'a TemplateRow {
+        r.rows.iter().find(|x| x.id == id).unwrap()
+    }
+
+    #[test]
+    fn source_rows_without_sink_describe_every_stream() {
+        let r = rows_for_source(&src(), None, None).unwrap().report;
+        assert_eq!(r.kind, "source-template");
+        assert!(r.selectable);
+        assert_eq!(r.rows.len(), 5);
+        assert!(r.sink.is_none());
+        let accounts = row(&r, "accounts");
+        assert_eq!(accounts.kind, "stream");
+        assert_eq!(accounts.description.as_deref(), Some("Customer accounts"));
+        assert!(accounts.default_selected);
+        assert_eq!(accounts.primary_keys, vec!["id"]);
+        let w = accounts.write.as_ref().unwrap();
+        assert_eq!(w.requested, vec![WriteMode::Upsert, WriteMode::Append]);
+        assert!(w.resolved.is_none() && w.supported.is_none());
+        assert!(accounts.guarantees.is_none());
+        assert_eq!(accounts.params_used, vec!["base"]);
+        assert_eq!(accounts.shape.transforms.count, 2);
+        assert!(accounts.shape.transforms.renames_fields);
+        assert!(accounts.shape.transforms.drops_fields);
+        assert_eq!(accounts.shape.schema_source, Some("contract"));
+        assert_eq!(accounts.read.source_kind, "csv");
+        assert!(!accounts.read.shardable && !accounts.read.resumable);
+        let deals = row(&r, "deals");
+        assert_eq!(deals.read.replication.method, "incremental");
+        assert_eq!(deals.read.replication.field.as_deref(), Some("updated_at"));
+        assert_eq!(deals.children, vec!["deal_lines"]);
+        let lines = row(&r, "deal_lines");
+        assert_eq!(lines.parent.as_deref(), Some("deals"));
+        assert!(lines.per_parent_record);
+        assert_eq!(lines.depth, 1);
+        assert_eq!(deals.depth, 0);
+    }
+
+    #[test]
+    fn source_rows_with_sink_resolve_writes_and_guarantees() {
+        let r = rows_for_source(&src(), Some(&sink()), None).unwrap();
+        assert!(r.composed.is_some());
+        let r = r.report;
+        assert_eq!(r.sink.as_deref(), Some("files"));
+        assert_eq!(r.sink_kind.as_deref(), Some("jsonl"));
+        let accounts = row(&r, "accounts").write.clone().unwrap();
+        assert_eq!(accounts.resolved, Some(WriteMode::Append));
+        assert_eq!(accounts.supported, Some(true));
+        assert_eq!(accounts.offered, Some(vec![WriteMode::Append]));
+        let deals = row(&r, "deals").write.clone().unwrap();
+        assert_eq!(deals.alias_applied.as_deref(), Some("overwrite→append"));
+        let g = row(&r, "accounts").guarantees.clone().unwrap();
+        assert_eq!(g.delivery_guarantee, "at-least-once");
+        assert!(!g.cleanup_capable);
+        let audit = row(&r, "audit");
+        let w = audit.write.clone().unwrap();
+        assert_eq!(w.supported, Some(false));
+        assert!(w.unsupported_reason.unwrap().contains("supports only"));
+        assert!(audit.guarantees.is_none());
+        let items = row(&r, "audit_items").write.clone().unwrap();
+        assert_eq!(items.supported, Some(false));
+        assert!(
+            items
+                .unsupported_reason
+                .unwrap()
+                .contains("parent stream `audit`")
+        );
+    }
+
+    #[test]
+    fn a_sink_no_stream_can_use_composes_nothing() {
+        let mut s = src();
+        s.streams.retain(|x| x.name.starts_with("audit"));
+        let r = rows_for_source(&s, Some(&sink()), None).unwrap();
+        assert!(r.composed.is_none());
+    }
+
+    #[test]
+    fn narrowing_keeps_the_resolved_streams() {
+        let sel = SelectionRequest {
+            select: vec!["deal_lines".into()],
+            include_parents: Some(IncludeParents::Eligible),
+            ..Default::default()
+        };
+        let (n, eff) = narrow_source_template(&src(), &sel).unwrap();
+        assert_eq!(n.stream_names(), vec!["deals", "deal_lines"]);
+        assert_eq!(eff.select, vec!["deals", "deal_lines"]);
+        assert_eq!(eff.include_parents, Some(IncludeParents::Off));
+        let strict = SelectionRequest {
+            select: vec!["deal_lines".into()],
+            ..Default::default()
+        };
+        assert!(narrow_source_template(&src(), &strict).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_marks_pulled_in_and_blocked_rows() {
+        let sel = SelectionRequest {
+            select: vec!["deal_lines".into()],
+            include_parents: Some(IncludeParents::Eligible),
+            ..Default::default()
+        };
+        let r = list_source(
+            &src(),
+            None,
+            None,
+            ListOptions {
+                selection: Some(&sel),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.run_set.clone().unwrap(), vec!["deals", "deal_lines"]);
+        assert!(r.error.is_none());
+        assert_eq!(row(&r, "deal_lines").selected, Some(true));
+        assert_eq!(
+            row(&r, "deals").pulled_in.as_ref().unwrap().because,
+            "deal_lines"
+        );
+        assert!(row(&r, "accounts").excluded.is_some());
+
+        let off = SelectionRequest {
+            select: vec!["deal_lines".into()],
+            ..Default::default()
+        };
+        let r = list_source(
+            &src(),
+            None,
+            None,
+            ListOptions {
+                selection: Some(&off),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(r.error.as_deref().unwrap().contains("deal_lines"));
+        assert!(row(&r, "deals").blocked.is_some());
+        assert_eq!(r.run_set.clone().unwrap(), Vec::<String>::new());
+        let text = render_human(&r);
+        assert!(
+            text.contains("✗ deals") && text.contains("error:"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_state_needs_a_sink_and_a_store() {
+        let opts = || ListOptions {
+            state: true,
+            ..Default::default()
+        };
+        let r = list_source(&src(), None, None, opts()).await.unwrap();
+        assert!(r.notes[0].contains("pass a sink template"));
+        let r = list_source(&src(), Some(&sink()), None, opts())
+            .await
+            .unwrap();
+        assert!(r.notes[0].contains("state omitted"), "{:?}", r.notes);
+        let mut s = src();
+        s.streams.retain(|x| x.name.starts_with("audit"));
+        let r = list_source(&s, Some(&sink()), None, opts()).await.unwrap();
+        assert!(r.notes[0].contains("no stream can run"));
+    }
+
+    const PIPE: &str = r#"
+version: 1
+name: shop
+params:
+  table: { type: string, default: orders }
+pipeline:
+  sources:
+    api: { type: csv, config: { path: ./in.csv } }
+  sinks:
+    db:
+      type: sqlite
+      config:
+        connection_url: "sqlite::memory:"
+        table: "${param.table}"
+        auto_map: true
+        write_mode: upsert
+        key: [id]
+        delete_marker: { field: op, values: [d] }
+  state: { type: file, config: { path: STATE } }
+matrix:
+  - id: dims
+    source: { ref: api, status: available }
+    sink: { ref: db }
+    tags: [core]
+  - id: facts
+    source: { ref: api, config: { replication_method: incremental, replication_key: ts } }
+    sink: { ref: db }
+    depends_on: [dims]
+    tags: [finance]
+"#;
+
+    fn pipe(state: &std::path::Path) -> Value {
+        serde_yaml::from_str(&PIPE.replace("STATE", &state.display().to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pipeline_rows_carry_write_guarantee_and_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = pipe(dir.path());
+        let r = list_pipeline(
+            &doc,
+            "fallback",
+            ListOptions {
+                state: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.template, "shop");
+        assert_eq!(r.kind, "pipeline");
+        let facts = row(&r, "facts");
+        assert_eq!(facts.kind, "row");
+        assert_eq!(facts.depends_on, vec!["dims"]);
+        assert_eq!(facts.depth, 1);
+        assert_eq!(facts.tags, vec!["finance"]);
+        assert_eq!(facts.primary_keys, vec!["id"]);
+        assert!(facts.delete_marker.is_some());
+        let w = facts.write.clone().unwrap();
+        assert_eq!(w.resolved, Some(WriteMode::Upsert));
+        assert_eq!(w.supported, Some(true));
+        let g = facts.guarantees.clone().unwrap();
+        assert!(g.delivery_guarantee.contains("keyed upsert"));
+        assert!(g.cleanup_capable);
+        assert!(facts.read.resumable);
+        assert_eq!(facts.params_used, vec!["table"]);
+        assert!(!row(&r, "dims").default_selected);
+        assert!(facts.state.is_some(), "{:?}", r.notes);
+    }
+
+    #[tokio::test]
+    async fn pipeline_resolve_under_each_include_parents_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = pipe(dir.path());
+        let run = |p: IncludeParents| {
+            let doc = doc.clone();
+            async move {
+                let sel = SelectionRequest {
+                    select: vec!["facts".into()],
+                    include_parents: Some(p),
+                    ..Default::default()
+                };
+                list_pipeline(
+                    &doc,
+                    "x",
+                    ListOptions {
+                        selection: Some(&sel),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let eligible = run(IncludeParents::Eligible).await;
+        assert!(eligible.error.as_deref().unwrap().contains("parked"));
+        assert!(
+            row(&eligible, "dims")
+                .blocked
+                .as_deref()
+                .unwrap()
+                .contains("parked")
+        );
+        let all = run(IncludeParents::All).await;
+        assert!(all.error.is_none());
+        assert_eq!(all.run_set.clone().unwrap(), vec!["dims", "facts"]);
+        assert_eq!(
+            row(&all, "dims").pulled_in.as_ref().unwrap().because,
+            "facts"
+        );
+        let off = run(IncludeParents::Off).await;
+        assert!(off.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn pipeline_state_is_omitted_without_values_or_store() {
+        let mut doc = pipe(std::path::Path::new("/tmp"));
+        doc["params"]["table"] = json!({ "type": "string", "required": true });
+        let r = list_pipeline(
+            &doc,
+            "x",
+            ListOptions {
+                state: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(r.notes[0].contains("needs params"), "{:?}", r.notes);
+        let mut doc = pipe(std::path::Path::new("/tmp"));
+        doc["pipeline"].as_object_mut().unwrap().remove("state");
+        let r = list_pipeline(
+            &doc,
+            "x",
+            ListOptions {
+                state: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(r.notes[0].contains("no `state:` store"), "{:?}", r.notes);
+    }
+
+    #[tokio::test]
+    async fn topology_pipelines_are_not_selectable() {
+        let doc: Value = serde_yaml::from_str(
+            r#"
+version: 1
+name: topo
+pipeline:
+  sources:
+    s: { type: csv, config: { path: ./a.csv } }
+  sinks:
+    o: { type: jsonl, config: { path: ./o.jsonl } }
+  nodes:
+    src: { kind: source, ref: s }
+    w: { kind: sink, ref: o }
+  edges:
+    - { from: src, to: w }
+"#,
+        )
+        .unwrap();
+        let sel = SelectionRequest {
+            select: vec!["src".into()],
+            ..Default::default()
+        };
+        let r = list_pipeline(
+            &doc,
+            "topo",
+            ListOptions {
+                selection: Some(&sel),
+                state: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!r.selectable);
+        assert!(r.rows.is_empty());
+        assert_eq!(r.error.as_deref(), Some(crate::select::TOPOLOGY_REFUSAL));
+        assert!(render_human(&r).contains("topology"));
+    }
+
+    #[test]
+    fn replication_and_names() {
+        assert_eq!(replication_of(&json!({})).method, "full");
+        let r = replication_of(&json!({"replication_method": {"type": "Incremental", "key": "k"}}));
+        assert_eq!((r.method, r.field.as_deref()), ("incremental", Some("k")));
+        assert_eq!(pipeline_name(&json!({"name": "a"}), "b"), "a");
+        assert_eq!(pipeline_name(&json!({}), "b"), "b");
+        assert_eq!(string_list(Some(&json!("k"))), vec!["k"]);
+        assert!(string_list(None).is_empty());
+    }
+
+    #[test]
+    fn human_render_lists_rows_and_facts() {
+        let r = rows_for_source(&src(), Some(&sink()), None).unwrap().report;
+        let text = render_human(&r);
+        assert!(text.contains("source-template crm"));
+        assert!(text.contains("× files"));
+        assert!(text.contains("UNSUPPORTED"));
+        assert!(text.contains("write overwrite→append"));
+        assert!(text.contains("child of deals"));
+        let bare = rows_for_source(&src(), None, None).unwrap().report;
+        assert!(render_human(&bare).contains("wants upsert|append"));
+    }
+}

@@ -1204,4 +1204,205 @@ matrix:
         let out = select_nodes(nodes(yaml), &sel(), true).unwrap();
         assert_eq!(ids(&out), vec!["a", "b", "c"]);
     }
+
+    #[test]
+    fn selection_request_canonical_is_stable() {
+        let a = SelectionRequest {
+            select: vec!["deals".into(), "contacts".into(), "deals".into()],
+            status: vec![SourceStatus::Available],
+            tags: vec!["b".into(), "a".into()],
+            include_parents: Some(IncludeParents::Eligible),
+            ..Default::default()
+        };
+        assert_eq!(
+            a.canonical(),
+            "select=contacts,deals;tags=a,b;status=available;include_parents=eligible"
+        );
+        assert_eq!(SelectionRequest::default().canonical(), "default");
+        assert!(SelectionRequest::default().is_empty());
+        let b = SelectionRequest {
+            only: vec!["a*".into()],
+            skip: vec!["x".into()],
+            ..Default::default()
+        };
+        assert_eq!(b.canonical(), "only=a*;skip=x");
+    }
+
+    #[test]
+    fn selection_request_policy_falls_back_to_config() {
+        let req = SelectionRequest {
+            select: vec!["a".into(), "a".into()],
+            status: vec![SourceStatus::Draft, SourceStatus::Draft],
+            ..Default::default()
+        };
+        let cfg = SelectionSpec {
+            include_parents: IncludeParents::All,
+        };
+        let sel = req.to_run_selection(Some(&cfg));
+        assert_eq!(sel.select, vec!["a"]);
+        assert_eq!(sel.status, vec![SourceStatus::Draft]);
+        assert_eq!(sel.include_parents, IncludeParents::All);
+        assert_eq!(
+            req.to_run_selection(None).include_parents,
+            IncludeParents::Off
+        );
+        let explicit = SelectionRequest {
+            include_parents: Some(IncludeParents::Eligible),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.to_run_selection(Some(&cfg)).include_parents,
+            IncludeParents::Eligible
+        );
+    }
+
+    #[test]
+    fn selection_request_round_trips_cli_flags() {
+        assert!(
+            SelectionRequest::from_flags(&crate::cli::SelectionArgs::default())
+                .unwrap()
+                .is_none()
+        );
+        let args = crate::cli::SelectionArgs {
+            select: vec!["a".into()],
+            status: vec!["draft".into()],
+            include_parents: Some("all".into()),
+            ..Default::default()
+        };
+        let req = SelectionRequest::from_flags(&args).unwrap().unwrap();
+        assert_eq!(req.include_parents, Some(IncludeParents::All));
+        let back = req.to_args();
+        assert_eq!(back.status, vec!["draft"]);
+        assert_eq!(back.include_parents.as_deref(), Some("all"));
+        let no_policy = crate::cli::SelectionArgs {
+            tags: vec!["t".into()],
+            ..Default::default()
+        };
+        let req = SelectionRequest::from_flags(&no_policy).unwrap().unwrap();
+        assert_eq!(req.include_parents, None);
+        let bad = crate::cli::SelectionArgs {
+            status: vec!["nope".into()],
+            ..Default::default()
+        };
+        assert!(SelectionRequest::from_flags(&bad).is_err());
+        let json: SelectionRequest = serde_json::from_value(
+            serde_json::json!({"select": ["a"], "include_parents": "eligible"}),
+        )
+        .unwrap();
+        assert_eq!(json.include_parents, Some(IncludeParents::Eligible));
+        assert!(
+            serde_json::from_value::<SelectionRequest>(serde_json::json!({"rows": ["a"]})).is_err()
+        );
+    }
+
+    #[test]
+    fn apply_refuses_topology_and_selects_matrix_rows() {
+        let topo = parse_with_extension(
+            "version: 1\nname: t\npipeline:\n  sources:\n    s: { type: csv, config: { path: a.csv } }\n  sinks:\n    o: { type: jsonl, config: { path: o.jsonl } }\n  nodes:\n    src: { kind: source, ref: s }\n    w: { kind: sink, ref: o }\n  edges:\n    - { from: src, to: w }\n",
+            "yaml",
+        )
+        .unwrap();
+        let req = SelectionRequest {
+            select: vec!["src".into()],
+            ..Default::default()
+        };
+        let err = req.apply(&topo, Vec::new()).unwrap_err();
+        assert!(is_selection_error(&err));
+        let cfg = parse_with_extension(HIBOB, "yaml").unwrap();
+        let req = SelectionRequest {
+            select: vec!["beta".into()],
+            ..Default::default()
+        };
+        let out = req.apply(&cfg, expand(&cfg).unwrap()).unwrap();
+        assert_eq!(ids(&out), vec!["beta"]);
+        assert!(!is_selection_error(&CliError::Config("x".into())));
+        assert!(is_selection_error(&CliError::EmptyRunSet { rows: vec![] }));
+    }
+
+    #[test]
+    fn resolve_explains_every_row() {
+        let s = RunSelection {
+            tags: vec!["finance".into()],
+            skip: vec!["payroll".into()],
+            select: vec!["people".into()],
+            ..sel()
+        };
+        let r = resolve(&nodes(HIBOB), &s, true);
+        assert!(r.error.is_none());
+        assert_eq!(r.run_set, vec!["people"]);
+        assert_eq!(
+            r.decisions["people"],
+            RowDecision::Selected { by: "select" }
+        );
+        assert!(
+            matches!(&r.decisions["payroll"], RowDecision::Excluded { reason } if reason.contains("skip"))
+        );
+        assert!(
+            matches!(&r.decisions["audit"], RowDecision::Excluded { reason } if reason.contains("tagged"))
+        );
+        assert!(
+            matches!(&r.decisions["beta"], RowDecision::Excluded { reason } if reason == "not selected")
+        );
+        let bare = resolve(&nodes(HIBOB), &sel(), true);
+        assert!(
+            matches!(&bare.decisions["beta"], RowDecision::Excluded { reason } if reason.contains("draft"))
+        );
+        assert_eq!(
+            bare.decisions["people"],
+            RowDecision::Selected { by: "default" }
+        );
+        let by_only = resolve(
+            &nodes(HIBOB),
+            &RunSelection {
+                only: vec!["pay*".into()],
+                ..sel()
+            },
+            true,
+        );
+        assert_eq!(
+            by_only.decisions["payroll"],
+            RowDecision::Selected { by: "only" }
+        );
+        assert!(
+            RowDecision::PulledIn {
+                because: "x".into()
+            }
+            .runs()
+        );
+        assert!(!RowDecision::Blocked { reason: "x".into() }.runs());
+    }
+
+    #[test]
+    fn resolve_orders_the_run_set_by_dependency_level() {
+        let s = RunSelection {
+            select: vec!["facts".into()],
+            include_parents: IncludeParents::Eligible,
+            ..sel()
+        };
+        let n = nodes(DEPS);
+        let r = resolve(&n, &s, true);
+        assert_eq!(r.run_set, vec!["dims", "facts"]);
+        assert_eq!(
+            r.decisions["dims"],
+            RowDecision::PulledIn {
+                because: "facts".into()
+            }
+        );
+        let depths = execution_depths(&n);
+        assert_eq!((depths["dims"], depths["facts"]), (0, 1));
+        let orphan = resolve(
+            &n,
+            &RunSelection {
+                select: vec!["facts".into(), "dims".into()],
+                skip: vec!["dims".into()],
+                ..sel()
+            },
+            true,
+        );
+        assert!(orphan.error.is_some());
+        assert!(matches!(
+            &orphan.decisions["facts"],
+            RowDecision::Blocked { .. }
+        ));
+    }
 }

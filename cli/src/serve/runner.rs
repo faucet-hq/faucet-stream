@@ -207,6 +207,11 @@ pub(crate) async fn load_selected(
     tenant: Option<&str>,
     selection: Option<&crate::select::SelectionRequest>,
 ) -> Result<LoadedSubmission, ServeError> {
+    if selection.is_some() && is_topology_body(body, format) {
+        return Err(ServeError::BadConfig(
+            crate::select::TOPOLOGY_REFUSAL.to_string(),
+        ));
+    }
     let mut loaded = load_for(state, body, format, tenant).await?;
     if let Some(sel) = selection {
         let nodes = std::mem::take(&mut loaded.nodes);
@@ -215,6 +220,20 @@ pub(crate) async fn load_selected(
         })?;
     }
     Ok(loaded)
+}
+
+/// Whether a submitted body is a topology config (`pipeline.nodes`).
+fn is_topology_body(body: &str, format: ConfigFormat) -> bool {
+    let doc: Option<serde_json::Value> = match format {
+        ConfigFormat::Yaml => serde_yaml::from_str(body).ok(),
+        ConfigFormat::Json => serde_json::from_str(body).ok(),
+    };
+    doc.and_then(|d| d.pointer("/pipeline/nodes").cloned())
+        .is_some_and(|n| match n {
+            serde_json::Value::Object(o) => !o.is_empty(),
+            serde_json::Value::Array(a) => !a.is_empty(),
+            _ => false,
+        })
 }
 
 /// Load a submission for a run, scoped to `tenant` when it is set (#709):
