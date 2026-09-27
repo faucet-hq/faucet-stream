@@ -433,4 +433,30 @@ mod tests {
         assert_eq!(group(0), "0");
         assert_eq!(group(1000), "1,000");
     }
+
+    #[tokio::test]
+    async fn read_status_of_a_single_table_mirror() {
+        use faucet_core::StateStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let st = dir.path().join("st");
+        let yaml = format!(
+            "version: 1\nname: one\npipeline:\n  source: {{ type: rest, config: {{ base_url: https://a }} }}\n  sink: {{ type: stdout, config: {{}} }}\n  state: {{ type: file, config: {{ path: {} }} }}\nmirror:\n  mode: snapshot_then_cdc\n  snapshot:\n    source: {{ type: rest, config: {{ base_url: https://b }} }}\n",
+            st.display()
+        );
+        let cfg = crate::config::PipelineConfig::from_text(&yaml, std::path::Path::new("one.yaml"))
+            .unwrap();
+        let marker = ReplicationState {
+            phase: crate::replication::state::Phase::Cdc,
+            snapshot_done: true,
+            position: json!(null),
+        };
+        let store = faucet_core::FileStateStore::new(&st);
+        store
+            .put(&marker_key("one"), &marker.to_value().unwrap())
+            .await
+            .unwrap();
+        let report = read_status(&cfg, "one").await.unwrap();
+        assert_eq!(report.mode, "single");
+        assert_eq!(report.tables[0].phase, "active");
+    }
 }

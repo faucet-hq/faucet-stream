@@ -456,9 +456,11 @@ mod tests {
 
     fn page(bm: u64, tables: &[&str]) -> StreamPage {
         StreamPage {
+            // A record no table claims is skipped by the demux.
             records: tables
                 .iter()
                 .map(|t| json!({"table": t, "v": bm}))
+                .chain(std::iter::once(json!({"v": bm})))
                 .collect(),
             bookmark: Some(json!(bm)),
         }
@@ -696,6 +698,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.dead, BTreeSet::from(["a".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn doubles_fetch_nothing() {
+        let ctx = HashMap::new();
+        assert!(Unordered.fetch_with_context(&ctx).await.unwrap().is_empty());
+        let s = script(Vec::new());
+        assert!(s.fetch_with_context(&ctx).await.unwrap().is_empty());
     }
 
     struct Unordered;

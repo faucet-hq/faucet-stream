@@ -505,6 +505,23 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_sink_template_starts_from_the_destination() {
+        let Resolution::Mirror(p) = resolve(
+            &spec(),
+            "postgres",
+            &Value::Null,
+            &json!({}),
+            true,
+            None,
+            &desc("public.orders", &["id"]),
+        ) else {
+            panic!("expected a plan")
+        };
+        assert_eq!(p.sink_config["table_name"], "orders");
+        assert_eq!(p.sink_config["key"], json!(["id"]));
+    }
+
+    #[test]
     fn keyless_tables_are_refused_or_appended() {
         let sink = json!({});
         let d = desc("public.log", &[]);

@@ -1057,6 +1057,18 @@ mod tests {
         assert_eq!(src.position_min(&[json!(1), json!(2)]), None);
     }
 
+    #[tokio::test]
+    async fn ordered_double_fetches_nothing() {
+        use crate::Source as _;
+        assert!(
+            OrderedSource
+                .fetch_with_context(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     struct OrderedSource;
 
     #[async_trait]

@@ -388,6 +388,32 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn phase_names() {
+        let names: Vec<&str> = [
+            TablePhase::Pending,
+            TablePhase::Snapshotting,
+            TablePhase::Active,
+            TablePhase::Paused,
+            TablePhase::Dropped,
+            TablePhase::Refused,
+        ]
+        .into_iter()
+        .map(TablePhase::as_str)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "pending",
+                "snapshotting",
+                "active",
+                "paused",
+                "dropped",
+                "refused"
+            ]
+        );
+    }
+
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
             .unwrap()

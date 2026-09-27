@@ -708,6 +708,18 @@ async fn run_one_unit(
 mod tests {
 
     /// A change-stream double with its own multi-table hooks (#731).
+    #[tokio::test]
+    async fn routed_double_fetches_nothing() {
+        use faucet_core::Source as _;
+        assert!(
+            RoutedSource
+                .fetch_with_context(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     struct RoutedSource;
 
     #[async_trait::async_trait]

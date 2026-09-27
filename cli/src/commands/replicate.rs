@@ -233,6 +233,50 @@ replication:
         );
     }
 
+    #[test]
+    fn an_unnamed_config_is_named_after_its_file() {
+        let cfg = PipelineConfig::from_text(
+            "version: 1\npipeline:\n  source: { type: rest, config: { base_url: https://a } }\n  sink: { type: stdout, config: {} }\n",
+            std::path::Path::new("orders.yaml"),
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline_name(&cfg, std::path::Path::new("/x/orders.yaml")),
+            "orders"
+        );
+        assert_eq!(pipeline_name(&cfg, std::path::Path::new("/")), "pipeline");
+    }
+
+    /// A valid mirror reaches the orchestrator, which fails on an unreachable
+    /// database rather than at compile time.
+    #[cfg(all(
+        feature = "source-postgres-cdc",
+        feature = "source-postgres",
+        feature = "sink-postgres"
+    ))]
+    #[tokio::test]
+    async fn a_valid_mirror_reaches_the_orchestrator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&format!(
+            r#"
+version: 1
+name: mirror
+pipeline:
+  source: {{ type: postgres-cdc, config: {{ connection_url: "postgres://u@127.0.0.1:1/db", slot_name: s, publication_name: p }} }}
+  sink:   {{ type: postgres, config: {{ connection_url: "postgres://u@127.0.0.1:1/db", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] }} }}
+  state:  {{ type: file, config: {{ path: "{}" }} }}
+mirror:
+  mode: snapshot_then_cdc
+  continuous: false
+  snapshot:
+    source: {{ type: postgres, config: {{ connection_url: "postgres://u@127.0.0.1:1/db", query: "SELECT * FROM t" }} }}
+"#,
+            dir.path().join("st").display()
+        ));
+        let err = run(args(path)).await.unwrap_err();
+        assert!(!err.to_string().contains("durable state"), "{err}");
+    }
+
     #[tokio::test]
     async fn status_reads_the_mirror_state_store() {
         use faucet_core::StateStore as _;

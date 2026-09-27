@@ -688,6 +688,31 @@ mod tests {
     use super::{check_connector_configs, check_transforms, row_line};
     use crate::expand::expand;
 
+    #[cfg(all(
+        feature = "source-postgres-cdc",
+        feature = "source-postgres",
+        feature = "sink-postgres",
+        feature = "transform-cdc-unwrap"
+    ))]
+    #[tokio::test]
+    async fn a_multi_table_mirror_validates_its_per_table_sink_config() {
+        use clap::Parser as _;
+        let example = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/postgres_mirror_tables.yaml"
+        );
+        let args = crate::cli::ValidateArgs::try_parse_from([
+            "validate",
+            "--no-secrets",
+            "--no-env-file",
+            example,
+        ])
+        .unwrap();
+        super::run(args)
+            .await
+            .expect("the shipped mirror example validates");
+    }
+
     #[test]
     fn row_line_renders_role_and_depends_on() {
         let cfg = crate::config::parse_with_extension(

@@ -720,6 +720,18 @@ pub(crate) mod source_tests {
     use std::sync::{Mutex, OnceLock};
 
     /// A change-stream double with its own multi-table hooks (#731).
+    #[tokio::test]
+    async fn routed_double_fetches_nothing() {
+        use crate::Source as _;
+        assert!(
+            RoutedSource
+                .fetch_with_context(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     struct RoutedSource;
 
     #[async_trait::async_trait]
