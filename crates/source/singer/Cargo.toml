@@ -58,3 +58,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+# SingerMessage, parse_line and process::Redactor moved to faucet-common-singer and are
+# re-exported at their original paths (guarded by tests/public_paths.rs). cargo-semver-checks
+# does not follow cross-crate re-exports, so it reports them as removed; warn instead of deny.
+enum_missing = "warn"
+function_missing = "warn"
+struct_missing = "warn"

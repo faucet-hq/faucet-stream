@@ -29,6 +29,7 @@
 | `bigquery` |  | ✓ |
 | `dynamodb` |  | ✓ |
 | `elasticsearch` |  | ✓ |
+| `file` |  | ✓ |
 | `gcs` |  | ✓ |
 | `iceberg` |  | ✓ |
 | `kafka` | ✓ |  |
