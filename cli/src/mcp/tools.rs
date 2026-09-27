@@ -1454,6 +1454,100 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rows_and_selection_through_the_template_tools() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = tpl_ctx(true);
+            std::fs::write(dir.path().join("orders.csv"), "id,total\n1,10\n").unwrap();
+            std::fs::write(dir.path().join("items.csv"), "id,sku\n1,a\n").unwrap();
+            let source = format!(
+                "kind: source-template\nname: shop\nparams:\n  data_dir: {{ type: string, default: {d} }}\nsource:\n  type: csv\n  config:\n    path: \"${{param.data_dir}}/orders.csv\"\nstreams:\n  - {{ name: orders, write: append }}\n  - {{ name: items, source: {{ config: {{ path: \"${{param.data_dir}}/items.csv\" }} }}, write: append }}\n",
+                d = dir.path().display()
+            );
+            let (_, sink) = hub_pair(dir.path());
+            for config in [source, sink] {
+                let out = call_tool(
+                    &ctx,
+                    "register_template",
+                    &json!({"config": config, "launch": true}),
+                )
+                .await;
+                assert_eq!(out["isError"], false, "{out}");
+            }
+            let out = call_tool(
+                &ctx,
+                "list_template_rows",
+                &json!({"id": "shop", "sink": "local-jsonl", "sink_version": "stable", "selection": {"select": ["items"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["run_set"], json!(["items"]));
+            assert_eq!(doc["rows"].as_array().unwrap().len(), 2);
+            let bad = call_tool(
+                &ctx,
+                "list_template_rows",
+                &json!({"id": "shop", "selection": {"rows": []}}),
+            )
+            .await;
+            assert_eq!(bad["isError"], true);
+
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "shop", "sink": "local-jsonl", "dry_run": true, "selection": {"select": ["items"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let doc: Value =
+                serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(doc["run_set"], json!(["items"]));
+            assert_eq!(doc["selection"], "select=items");
+            let out = call_tool(
+                &ctx,
+                "run_template",
+                &json!({"id": "shop", "sink": "local-jsonl", "selection": {"select": ["items"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            assert!(dir.path().join("shop/items.jsonl").exists());
+            assert!(!dir.path().join("shop/orders.jsonl").exists());
+        }
+
+        #[tokio::test]
+        async fn run_pipeline_honours_a_selection() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("in.csv"), "id\n1\n").unwrap();
+            let config = format!(
+                "version: 1\nname: m\npipeline:\n  source: {{ type: csv, config: {{ path: {d}/in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: {d}/x.jsonl }} }}\nmatrix:\n  - {{ id: a, sink: {{ config: {{ path: {d}/a.jsonl }} }} }}\n  - {{ id: b, sink: {{ config: {{ path: {d}/b.jsonl }} }} }}\n",
+                d = dir.path().display()
+            );
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "selection": {"select": ["b"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            assert!(dir.path().join("b.jsonl").exists());
+            assert!(!dir.path().join("a.jsonl").exists());
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "selection": {"select": ["zz"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "selection": "b"}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
+        }
+
+        #[tokio::test]
         async fn run_template_composes_a_source_with_a_sink() {
             let dir = tempfile::tempdir().unwrap();
             let ctx = tpl_ctx(true);
