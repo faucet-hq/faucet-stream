@@ -1,6 +1,6 @@
 # Connector catalog
 
-faucet-stream ships **<!--COUNT:sources-->43<!--/COUNT--> sources** and **<!--COUNT:sinks-->34<!--/COUNT--> sinks**. Each is a Cargo feature
+faucet-stream ships **<!--COUNT:sources-->43<!--/COUNT--> sources** and **<!--COUNT:sinks-->35<!--/COUNT--> sinks**. Each is a Cargo feature
 (`source-<name>` / `sink-<name>`) and an independently published crate. Full API
 docs are on [docs.rs](https://docs.rs/faucet-stream).
 
@@ -228,6 +228,7 @@ config this project treats as a defect.
 | BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | per-row (`batch_size: 0`); atomic keyed | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
 | PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | atomic (JSONB + `batch_size: 0`; keyed when journaled) | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
 | JSON Lines | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file append |
+| Local files | T1 ✅ | `sink-file` | no-op | ✓ | ✗ | ✗ | atomic (no rollover) | [file sink](../cookbook/file-formats.md#the-local-file-sink): JSONL / JSON / CSV / XML / Excel / Avro / Parquet by extension; temp-then-rename finalisation, record/byte rollover with a `{part}` template, `write_mode: overwrite` swaps the whole output set; Parquet (and Avro) take the columnar path |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | atomic (`batch_size: 0`) | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
 | Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | atomic (COPY + `batch_size: 0`) | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
 | ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | atomic (`batch_size: 0` or staged) | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
@@ -300,7 +301,9 @@ Iceberg upsert is not yet supported (a follow-up, blocked on `iceberg-rust`).
 `write_mode: overwrite` (full-refresh: atomically replace the whole
 destination each run) is additionally supported by **PostgreSQL, SQLite, MySQL,
 MSSQL, Oracle, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias
-swap — the configured `index` must be an alias) — not Spanner or DynamoDB. See
+swap — the configured `index` must be an alias), and by the append-only **local file**
+sink (files staged in a hidden directory and moved into place on success) — not
+Spanner or DynamoDB. See
 [Upsert / mirror tables](../cookbook/upsert.md).
 
 Every sink in this column except **DynamoDB**, **Databricks** and **Oracle** also supports

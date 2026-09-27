@@ -18,7 +18,7 @@
   </div>
 </div>
 
-faucet-stream wires **<!--COUNT:sources-->43<!--/COUNT--> source** and **<!--COUNT:sinks-->34<!--/COUNT--> sink** connectors together with a single
+faucet-stream wires **<!--COUNT:sources-->43<!--/COUNT--> source** and **<!--COUNT:sinks-->35<!--/COUNT--> sink** connectors together with a single
 `faucet` binary that runs pipelines declaratively from a YAML/JSON file — no Rust
 code required. Or skip the binary and embed the same engine in your own service
 through the typed `Source` / `Sink` traits.

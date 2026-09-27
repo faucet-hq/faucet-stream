@@ -330,6 +330,49 @@ Parquet stream; the other formats are read whole per file. See the
 for sharding, discovery and HTTP retries. The older `csv` source stays for
 existing configs; the `file` source is the general one.
 
+## The local file sink
+
+The `file` sink writes any writable format to a local path — the general local
+sink, and the fastest way to look at what a source produces while you build
+it. Point a pipeline at `path: ./out/x.jsonl` and change the extension to get
+`.csv`, `.json`, `.xml`, `.xlsx`, `.avro` or `.parquet` instead (`.gz` /
+`.zst` add compression):
+
+```yaml
+sink:
+  type: file
+  config:
+    path: ./out/contacts/${now.date}/contacts-{part}.csv.gz
+    max_records_per_file: 100000   # or max_bytes_per_file; `{part}` numbers the files
+    mode: overwrite                # an existing file is replaced; append | error_if_exists
+    write_mode: overwrite          # replace the whole part set, only when the run succeeds
+```
+
+Every file is written to `<name>.faucet-tmp` and renamed into place when the
+pipeline flushes, and the bookmark advances only after that flush — so a run
+that is killed leaves no complete-looking partial file, and the next run
+resumes from the last bookmark and removes the leftover temporary file.
+`write_mode: overwrite` stages the run's files in a hidden directory beside the
+destination and swaps them in (removing stale parts of the previous run) only
+after a successful run; a failed run leaves the previous output as it was.
+
+Whole-document formats (JSON array, XML, Excel, Avro) cannot be appended to, so
+`mode: append` is refused for them — use JSON Lines or CSV, or rollover. ORC is
+read-only and refused. Parquet goes through the Arrow writer: the schema comes
+from the first page, a later field widens the file, and a type change is an
+error naming the field. Two matrix rows writing the same path, or a fan-out row
+without a per-invocation token in its path, are refused at load time. The
+`jsonl`, `csv` and `parquet` sinks stay for existing configs; see the
+[crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/file)
+for every field.
+
+### Run it locally
+
+```bash
+faucet run cli/examples/rest_to_file.yaml        # REST API → ./out/posts/<date>/posts-00001.jsonl …
+faucet run cli/examples/file_to_jsonl.yaml       # and read files back in the next pipeline
+```
+
 ## Parquet is separate on purpose
 
 `parquet` is columnar and self-describing, and each connector reads and writes
@@ -341,5 +384,6 @@ silently cost that fast path, so the shared helper refuses it.
 
 - [Compression](./compression.md) — gzip / zstd, independent of format
 - [`cli/examples/file_to_jsonl.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/file_to_jsonl.yaml) — a local inbox read incrementally
+- [`cli/examples/rest_to_file.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/rest_to_file.yaml) — a REST API into dated, rolled local files
 - [Connector reference](../reference/connectors.md) — the capability matrix
 - [Transforms](./transforms.md) — `cast` and `json_parse` for text-format values

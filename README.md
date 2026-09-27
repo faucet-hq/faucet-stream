@@ -23,7 +23,7 @@
 No Python runtime, no platform to stand up, no daemon to babysit.
 
 faucet-stream is a **data-movement platform** for Rust — with governance built in: **<!--COUNT:sources-->43<!--/COUNT--> source**
-and **<!--COUNT:sinks-->34<!--/COUNT--> sink** connectors (**<!--COUNT:connectors-->77<!--/COUNT--> in total**) plus in-flight transforms, including a page-level
+and **<!--COUNT:sinks-->35<!--/COUNT--> sink** connectors (**<!--COUNT:connectors-->78<!--/COUNT--> in total**) plus in-flight transforms, including a page-level
 embedded-DuckDB `sql` transform — wired by a single `faucet` binary that runs pipelines
 declaratively from YAML/JSON (no Rust code required), or embedded in your own service through
 the typed `Source` / `Sink` traits. One platform, whether you want a CLI you can drop on any
@@ -69,7 +69,7 @@ cargo add faucet-stream           # the library
   sink sees a row), schema-drift detection & policy, column-level lineage (OpenLineage) + a
   data-movement catalog, and freshness/volume SLA monitoring.
 - **📦 Pay only for what you use** — every connector is a Cargo feature, so a slim build can
-  be just REST + JSONL, or pull in all <!--COUNT:connectors-->77<!--/COUNT--> connectors with `--features full`.
+  be just REST + JSONL, or pull in all <!--COUNT:connectors-->78<!--/COUNT--> connectors with `--features full`.
 
 **Documentation:** the [faucet-stream guide](https://faucet-hq.github.io/faucet-stream/)
 (getting started, tutorials, cookbook, operations) · API reference on
@@ -319,7 +319,7 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-source-file`](crates/source/file) | **T1 ✅** | Local files — a path, directory, glob or `http(s)://` URL; JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC resolved per file, incremental by mtime or name |
 | [`faucet-source-singer`](crates/source/singer) | T2 ⚠️ | **Singer tap bridge** — run any Singer tap and adapt its output. Passes the battery, but **experimental (v0, single-stream)** |
 
-### Sinks (<!--COUNT:sinks-->34<!--/COUNT-->)
+### Sinks (<!--COUNT:sinks-->35<!--/COUNT-->)
 
 | Crate | Tier | Description |
 |-------|------|-------------|
@@ -354,6 +354,7 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-sink-parquet`](crates/sink/parquet) | T1 ✅ | Apache Parquet — local file or S3; schema inference, row/byte rollover |
 | [`faucet-sink-delta`](crates/sink/delta) | T1 ✅ | Apache Delta Lake — append-only; local FS or S3/Azure/GCS; one commit per flush |
 | [`faucet-sink-jsonl`](crates/sink/jsonl) | **T1 ✅** | JSON Lines — file output with append/truncate |
+| [`faucet-sink-file`](crates/sink/file) | **T1 ✅** | Local files — JSONL / JSON / CSV / XML / Excel / Avro / Parquet by extension; rollover, temp-then-rename finalisation, atomic overwrite |
 | [`faucet-sink-csv`](crates/sink/csv) | T1 ✅ | CSV — write JSON records as CSV rows |
 | [`faucet-sink-http`](crates/sink/http) | T1 ✅ᵐ | HTTP — POST records to any endpoint |
 | [`faucet-sink-stdout`](crates/sink/stdout) | T1 ✅ | Stdout/stderr — JSON Lines, pretty JSON, or TSV |
@@ -514,7 +515,7 @@ flowchart LR
     class K sink
 ```
 
-faucet-stream is a Cargo workspace with **<!--COUNT:crates-->110<!--/COUNT--> crates** — <!--COUNT:sources-->43<!--/COUNT--> sources, <!--COUNT:sinks-->34<!--/COUNT--> sinks, <!--COUNT:common-->23<!--/COUNT--> shared
+faucet-stream is a Cargo workspace with **<!--COUNT:crates-->111<!--/COUNT--> crates** — <!--COUNT:sources-->43<!--/COUNT--> sources, <!--COUNT:sinks-->35<!--/COUNT--> sinks, <!--COUNT:common-->23<!--/COUNT--> shared
 connector libraries, the shared auth-provider library, 2 state-store backends, the lineage
 crate, the SQL transform crate, the conformance test battery, the shared core, the umbrella
 crate, and the CLI binary. See
@@ -622,6 +623,7 @@ Default features: `source-rest`, `transform-flatten`, `transform-rename-keys`,
 | `sink-azure-blob` | no | Azure Blob / ADLS Gen2 file sink |
 | `sink-parquet` | no | Apache Parquet file sink (local, S3) |
 | `sink-jsonl` | no | JSON Lines file sink |
+| `sink-file` | no | Local file sink (every writable file format, rollover, atomic overwrite) |
 | `sink-csv` | no | CSV file sink |
 | `sink-http` | no | HTTP POST sink |
 | `sink-stdout` | no | Stdout/stderr sink (JSON Lines, pretty JSON, TSV) |
@@ -885,12 +887,12 @@ and the runnable [`cli/examples/custom-cli/`](cli/examples/custom-cli/main.rs).
 ## Project structure
 
 ```
-Cargo.toml                    — workspace manifest (<!--COUNT:crates-->110<!--/COUNT--> crates)
+Cargo.toml                    — workspace manifest (<!--COUNT:crates-->111<!--/COUNT--> crates)
 crates/
   core/                       — faucet-core: shared types, traits, pipeline, transforms, config
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
   source/                     — <!--COUNT:sources-->43<!--/COUNT--> source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, file, …)
-  sink/                       — <!--COUNT:sinks-->34<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
+  sink/                       — <!--COUNT:sinks-->35<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
   common/                     — <!--COUNT:common-->23<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, file)
   state/                      — Redis- and Postgres-backed StateStore backends
   lineage/                    — faucet-lineage: OpenLineage event emission
