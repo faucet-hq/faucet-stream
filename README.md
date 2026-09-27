@@ -23,7 +23,7 @@
 No Python runtime, no platform to stand up, no daemon to babysit.
 
 faucet-stream is a **data-movement platform** for Rust — with governance built in: **<!--COUNT:sources-->42<!--/COUNT--> source**
-and **<!--COUNT:sinks-->33<!--/COUNT--> sink** connectors (**<!--COUNT:connectors-->75<!--/COUNT--> in total**) plus in-flight transforms, including a page-level
+and **<!--COUNT:sinks-->34<!--/COUNT--> sink** connectors (**<!--COUNT:connectors-->76<!--/COUNT--> in total**) plus in-flight transforms, including a page-level
 embedded-DuckDB `sql` transform — wired by a single `faucet` binary that runs pipelines
 declaratively from YAML/JSON (no Rust code required), or embedded in your own service through
 the typed `Source` / `Sink` traits. One platform, whether you want a CLI you can drop on any
@@ -52,10 +52,11 @@ cargo add faucet-stream           # the library
   (~96× faster, ~62× less memory, exact row parity); sink-bound moves like
   Postgres→Postgres narrow the gap. See [`BENCHMARKS.md`](BENCHMARKS.md) for the
   methodology, the sink-bound scenario, and honest caveats.
-- **🔌 Adopt incrementally — bring your Singer taps** — the `singer` source runs any
-  existing Singer/Meltano tap unchanged, so you can start with the taps you already
-  have and move to native connectors where throughput matters. _Experimental (v0):
-  single-stream today, and a bridged tap still runs its own Python process._
+- **🔌 Adopt incrementally — bring your Singer taps and targets** — the `singer` source runs any
+  existing Singer/Meltano tap unchanged, and the `singer` sink feeds any existing
+  Singer target, so you can move a Meltano pipeline one side at a time and switch to
+  native connectors where throughput matters. _Experimental: the tap bridge is
+  single-stream today, and a bridged tap or target still runs its own Python process._
 - **🧩 Config-driven _or_ embeddable** — run `faucet run pipeline.yaml`, or call
   `Pipeline::new(&source, &sink).run().await?` from Rust. Same orchestration either way.
 - **⚙️ A runtime, not just connectors** — incremental + resumable replication, change-data-capture,
@@ -68,7 +69,7 @@ cargo add faucet-stream           # the library
   sink sees a row), schema-drift detection & policy, column-level lineage (OpenLineage) + a
   data-movement catalog, and freshness/volume SLA monitoring.
 - **📦 Pay only for what you use** — every connector is a Cargo feature, so a slim build can
-  be just REST + JSONL, or pull in all <!--COUNT:connectors-->75<!--/COUNT--> connectors with `--features full`.
+  be just REST + JSONL, or pull in all <!--COUNT:connectors-->76<!--/COUNT--> connectors with `--features full`.
 
 **Documentation:** the [faucet-stream guide](https://faucet-hq.github.io/faucet-stream/)
 (getting started, tutorials, cookbook, operations) · API reference on
@@ -317,7 +318,7 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-source-csv`](crates/source/csv) | **T1 ✅** | CSV — read CSV files as JSON objects |
 | [`faucet-source-singer`](crates/source/singer) | T2 ⚠️ | **Singer tap bridge** — run any Singer tap and adapt its output. Passes the battery, but **experimental (v0, single-stream)** |
 
-### Sinks (<!--COUNT:sinks-->33<!--/COUNT-->)
+### Sinks (<!--COUNT:sinks-->34<!--/COUNT-->)
 
 | Crate | Tier | Description |
 |-------|------|-------------|
@@ -335,6 +336,7 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-sink-nats`](crates/sink/nats) | T2 | NATS — publish records to a subject (optional subject-per-record), flush per batch |
 | [`faucet-sink-rabbitmq`](crates/sink/rabbitmq) | T2 | RabbitMQ (AMQP 0.9.1) — publish to an exchange with a static or per-record routing key; publisher confirms; unroutable rows are DLQ-routable |
 | [`faucet-sink-sftp`](crates/sink/sftp) | T2 | SFTP — write JSONL files over SSH with atomic temp-then-rename |
+| [`faucet-sink-singer`](crates/sink/singer) | T2 ⚠️ | **Singer target bridge** — run any Singer target as a sink; bookmarks advance only after the target confirms (echoed `STATE` or clean exit). **Experimental** |
 | [`faucet-sink-snowflake`](crates/sink/snowflake) | T2 | Snowflake — SQL REST API with JWT/OAuth |
 | [`faucet-sink-redshift`](crates/sink/redshift) | T1 ✅ | Amazon Redshift — COPY-from-S3 (staged) or multi-row `INSERT`; append-only |
 | [`faucet-sink-clickhouse`](crates/sink/clickhouse) | T1 ✅ | ClickHouse — `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only |
@@ -435,7 +437,7 @@ own service.
 | Config-driven (YAML/JSON) | ✓ | ✓ | via UI/API | ✓ | ✓ | via UI |
 | Embeddable as a library | ✓ (Rust) | ✗ | ✗ | ✓ (Go) | ✗ | ✗ |
 | Connector count | 58, growing | 600+ taps | 350+ | dozens | dozens | 500+ |
-| Runs existing Singer taps | ✓ bridge (experimental) | ✓ native | ✗ | ✗ | ✗ | ✗ |
+| Runs existing Singer taps / targets | ✓ bridges (experimental) | ✓ native | ✗ | ✗ | ✗ | ✗ |
 | Change data capture | ✓ Postgres / MySQL / Mongo / SQL Server | partial¹ | ✓ | partial | ✗ | ✓ |
 | Incremental + resumable state | ✓ | ✓ | ✓ | partial | n/a | ✓ |
 | Effectively-once delivery³ | ✓ (13 sinks incl. Kafka, Iceberg, BigQuery, Databricks, Oracle) | ✗ | partial | ✗ | ✗ | ✓ |
@@ -510,7 +512,7 @@ flowchart LR
     class K sink
 ```
 
-faucet-stream is a Cargo workspace with **<!--COUNT:crates-->106<!--/COUNT--> crates** — <!--COUNT:sources-->42<!--/COUNT--> sources, <!--COUNT:sinks-->33<!--/COUNT--> sinks, <!--COUNT:common-->21<!--/COUNT--> shared
+faucet-stream is a Cargo workspace with **<!--COUNT:crates-->108<!--/COUNT--> crates** — <!--COUNT:sources-->42<!--/COUNT--> sources, <!--COUNT:sinks-->34<!--/COUNT--> sinks, <!--COUNT:common-->22<!--/COUNT--> shared
 connector libraries, the shared auth-provider library, 2 state-store backends, the lineage
 crate, the SQL transform crate, the conformance test battery, the shared core, the umbrella
 crate, and the CLI binary. See
@@ -879,13 +881,13 @@ and the runnable [`cli/examples/custom-cli/`](cli/examples/custom-cli/main.rs).
 ## Project structure
 
 ```
-Cargo.toml                    — workspace manifest (<!--COUNT:crates-->106<!--/COUNT--> crates)
+Cargo.toml                    — workspace manifest (<!--COUNT:crates-->108<!--/COUNT--> crates)
 crates/
   core/                       — faucet-core: shared types, traits, pipeline, transforms, config
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
   source/                     — <!--COUNT:sources-->42<!--/COUNT--> source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, …)
-  sink/                       — <!--COUNT:sinks-->33<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, …)
-  common/                     — <!--COUNT:common-->21<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle)
+  sink/                       — <!--COUNT:sinks-->34<!--/COUNT--> sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
+  common/                     — <!--COUNT:common-->22<!--/COUNT--> shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer)
   state/                      — Redis- and Postgres-backed StateStore backends
   lineage/                    — faucet-lineage: OpenLineage event emission
   transform-sql/              — faucet-transform-sql: embedded DuckDB SQL transform

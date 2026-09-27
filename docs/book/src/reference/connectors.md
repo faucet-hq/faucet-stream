@@ -1,6 +1,6 @@
 # Connector catalog
 
-faucet-stream ships **<!--COUNT:sources-->42<!--/COUNT--> sources** and **<!--COUNT:sinks-->33<!--/COUNT--> sinks**. Each is a Cargo feature
+faucet-stream ships **<!--COUNT:sources-->42<!--/COUNT--> sources** and **<!--COUNT:sinks-->34<!--/COUNT--> sinks**. Each is a Cargo feature
 (`source-<name>` / `sink-<name>`) and an independently published crate. Full API
 docs are on [docs.rs](https://docs.rs/faucet-stream).
 
@@ -128,8 +128,10 @@ individual tap — pair it with a keyed/upsert sink for clean, effectively-once
 > against the emulator; the **webhook** source is buffer-shaped (no bounded-memory
 > page check); and the **Iceberg** sink is append-only with a terminal `flush`
 > that does not fit the effectively-once replay check on iceberg-rust 0.10.0. The
-> **Singer bridge ⚠️** passes the battery but is additionally **experimental
-> (v0, single-stream)**.
+> **Singer bridge ⚠️** source passes the battery but is additionally **experimental
+> (v0, single-stream)**; the Singer bridge **sink** is experimental too — its
+> guarantees are only as strong as the target it runs (upsert is handed to the
+> target as `key_properties`, so faucet does not count it as key-deduplicating).
 
 ### Streaming: native vs. buffered
 
@@ -237,6 +239,7 @@ config this project treats as a defect.
 | NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to a subject (optional subject-per-record), flush per batch |
 | RabbitMQ | T2 | `sink-rabbitmq` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to an exchange with a static / field / JSONPath routing key; publisher confirms per batch; `mandatory` returns surface as per-row (DLQ-routable) errors |
 | SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | best-effort | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Singer bridge ⚠️ | T2 ⚠️ | `sink-singer` | no-op | ✗ | `key_properties` | ✗ | best-effort | runs an external Singer target; `SCHEMA`/`RECORD` over stdin with back-pressure, bookmarks advance only after the target confirms (echoed `STATE` or clean exit, `flush_on`); `write_mode: overwrite` → `ACTIVATE_VERSION`. **Tier-2 / experimental** |
 | AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
 | Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
 | Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | best-effort | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
