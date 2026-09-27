@@ -36,6 +36,7 @@ pipeline:
   sink: {{ type: sqlite, config: {{ database_url: "sqlite://{db}?mode=rwc", table_name: t, column_mapping: auto_map, create_table: true }} }}
   state: {state}
 {extra_top}
+execution: {{ max_concurrent: 1 }}
 matrix:
   - id: a
   - id: b

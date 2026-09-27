@@ -136,8 +136,30 @@ async fn status_reads_real_runs_dlq_and_exit_codes() {
     run(&["status", &cfgs, "--row", "good"]).await.unwrap();
 }
 
-#[tokio::test]
-async fn topology_configs_report_per_sink_node() {
+fn on_big_stack<F>(f: impl FnOnce() -> F + Send + 'static)
+where
+    F: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(f())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn topology_configs_report_per_sink_node() {
+    on_big_stack(topology_configs_report_per_sink_node_body);
+}
+
+async fn topology_configs_report_per_sink_node_body() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("in.csv"), "id\n1\n2\n3\n").unwrap();
     let text = format!(
