@@ -72,6 +72,7 @@ With a header row of `id,name,email`, the file produces records like
 | `delimiter` | int (byte) | `44` (`,`) | Field delimiter, as a byte value. `9` = tab, `124` = pipe (`\|`), `59` = semicolon. |
 | `quote` | int (byte) | `34` (`"`) | Quote character, as a byte value. `39` = single quote (`'`). |
 | `flexible` | bool | `false` | Whether to tolerate rows whose field count differs from the header (or, when headerless, from the first data row). **Strict by default**: a ragged row aborts the run with `FaucetError::Source` naming the line — silently emitting an incomplete record would corrupt downstream data. Set `true` to accept short rows (records missing trailing columns) and long rows (extra `column_N` keys). |
+| `null_values` | list of strings | `[]` | Fields equal to any listed string decode as JSON `null` instead of a string (`[""]` for empty-as-null, or sentinels such as `"NULL"`). Headers are never mapped; a quoted empty field maps like an unquoted one. |
 
 ### Batching
 

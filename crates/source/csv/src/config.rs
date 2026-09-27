@@ -32,6 +32,13 @@ pub struct CsvSourceConfig {
     /// long rows gain `column_N` keys).
     #[serde(default)]
     pub flexible: bool,
+    /// Fields equal to any of these strings decode as JSON `null` instead of a
+    /// string (default: none, every field is a string). `[""]` treats empty
+    /// fields as null; sentinels such as `"NULL"` or `"#N/A"` can be listed.
+    /// Headers are never mapped, and a quoted empty field is mapped like an
+    /// unquoted one (the reader does not report quoting per field).
+    #[serde(default)]
+    pub null_values: Vec<String>,
     /// Records per emitted [`StreamPage`](faucet_core::StreamPage). Rows are
     /// parsed line-by-line from a tokio `BufReader` and yielded whenever the
     /// buffer reaches this size. Defaults to [`DEFAULT_BATCH_SIZE`].
@@ -76,6 +83,7 @@ impl CsvSourceConfig {
             delimiter: b',',
             quote: b'"',
             flexible: false,
+            null_values: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::Auto,
@@ -106,6 +114,12 @@ impl CsvSourceConfig {
     /// to opt in to lenient parsing where short/long rows are accepted.
     pub fn flexible(mut self, v: bool) -> Self {
         self.flexible = v;
+        self
+    }
+
+    /// Set the field values that decode as JSON `null`.
+    pub fn null_values(mut self, values: Vec<String>) -> Self {
+        self.null_values = values;
         self
     }
 

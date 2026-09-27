@@ -975,15 +975,17 @@ impl RestStream {
                         use futures::TryStreamExt as _;
                         let body = resp.bytes_stream().map_err(std::io::Error::other);
                         let reader = tokio_util::io::StreamReader::new(body);
-                        let mut pages = Box::pin(crate::format::csv_reader_to_value_pages_with(
-                            reader,
-                            crate::format::CsvDialect {
-                                delimiter: plan.delimiter,
-                                has_headers: plan.has_headers,
-                                quote: self.config.csv_quote,
-                            },
-                            csv_page_size,
-                        ));
+                        let mut pages =
+                            Box::pin(crate::format::csv_reader_to_value_pages_with_nulls(
+                                reader,
+                                crate::format::CsvDialect {
+                                    delimiter: plan.delimiter,
+                                    has_headers: plan.has_headers,
+                                    quote: self.config.csv_quote,
+                                },
+                                csv_page_size,
+                                self.config.csv_null_values.clone(),
+                            ));
                         use futures::StreamExt as _;
                         let mut emitted = false;
                         while let Some(page) = pages.next().await {
@@ -1839,7 +1841,12 @@ impl RestStream {
         job: &crate::async_job::AsyncJobConfig,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         if !self.config.decode.is_empty() {
-            let records = crate::decode::run_decode(bytes, &self.config.decode).await?;
+            let records = crate::decode::run_decode_with_nulls(
+                bytes,
+                &self.config.decode,
+                &self.config.csv_null_values,
+            )
+            .await?;
             return Ok((records, None));
         }
         match self.config.response_format {
@@ -1854,13 +1861,14 @@ impl RestStream {
                 Ok((records, Some(v)))
             }
             crate::config::ResponseFormat::Csv => {
-                let records = crate::format::parse_csv_with(
+                let records = crate::format::parse_csv_with_nulls(
                     bytes,
                     crate::format::CsvDialect {
                         delimiter: self.config.csv_delimiter,
                         has_headers: self.config.csv_has_headers,
                         quote: self.config.csv_quote,
                     },
+                    &self.config.csv_null_values,
                 )
                 .await?;
                 Ok((records, None))
@@ -2405,7 +2413,12 @@ impl RestStream {
         // `none`. The records land as an array the downstream
         // (records_path-less) extraction passes straight through.
         if !self.config.decode.is_empty() {
-            let records = crate::decode::run_decode(&bytes, &self.config.decode).await?;
+            let records = crate::decode::run_decode_with_nulls(
+                &bytes,
+                &self.config.decode,
+                &self.config.csv_null_values,
+            )
+            .await?;
             return Ok((Value::Array(records), resp_headers));
         }
         // For file response formats the whole body is a tabular file — parse it
@@ -2415,13 +2428,14 @@ impl RestStream {
         let body: Value = match self.config.response_format {
             crate::config::ResponseFormat::Json => serde_json::from_slice(&bytes)?,
             crate::config::ResponseFormat::Csv => Value::Array(
-                crate::format::parse_csv_with(
+                crate::format::parse_csv_with_nulls(
                     &bytes,
                     crate::format::CsvDialect {
                         delimiter: self.config.csv_delimiter,
                         has_headers: self.config.csv_has_headers,
                         quote: self.config.csv_quote,
                     },
+                    &self.config.csv_null_values,
                 )
                 .await?,
             ),
@@ -2796,8 +2810,12 @@ impl faucet_core::Source for RestStream {
                     .bytes_stream()
                     .map_err(std::io::Error::other);
                 let reader = tokio_util::io::StreamReader::new(body);
-                let ndjson_chunks =
-                    crate::format::csv_reader_to_ndjson_stream(reader, delimiter, has_headers);
+                let ndjson_chunks = crate::format::csv_reader_to_ndjson_stream_with_nulls(
+                    reader,
+                    delimiter,
+                    has_headers,
+                    self.config.csv_null_values.clone(),
+                );
                 yield faucet_core::NativeBatch {
                     format: faucet_core::NativeFormat::NdJson,
                     payload: faucet_core::NativePayload::Stream(Box::pin(ndjson_chunks)),
@@ -2895,10 +2913,11 @@ impl faucet_core::Source for RestStream {
                 let quote = self.config.csv_quote;
                 let body = resp.bytes_stream().map_err(std::io::Error::other);
                 let reader = tokio_util::io::StreamReader::new(body);
-                let batches = crate::format::csv_reader_to_record_batches_with(
+                let batches = crate::format::csv_reader_to_record_batches_with_nulls(
                     reader,
                     crate::format::CsvDialect { delimiter, has_headers, quote },
                     rows_per_batch,
+                    self.config.csv_null_values.clone(),
                 );
                 futures::pin_mut!(batches);
                 use futures::StreamExt as _;

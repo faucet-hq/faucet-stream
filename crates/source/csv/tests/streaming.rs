@@ -224,3 +224,26 @@ async fn stream_pages_first_page_completes_without_parsing_full_file() {
          first page took {first_elapsed:?}, full drain took {full_elapsed:?}"
     );
 }
+
+#[tokio::test]
+async fn null_values_map_listed_fields_to_null_but_never_headers() {
+    let mut tmp = NamedTempFile::new().expect("tempfile");
+    write!(tmp, "id,NULL,amount\n1,,NULL\n2,x,5\n").expect("write");
+    tmp.flush().expect("flush");
+    let config = CsvSourceConfig::new(tmp.path().to_str().unwrap())
+        .null_values(vec![String::new(), "NULL".into()]);
+    let source = CsvSource::new(config);
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let mut rows = Vec::new();
+    while let Some(page) = pages.next().await {
+        rows.extend(page.expect("page ok").records);
+    }
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!({"id": "1", "NULL": null, "amount": null}),
+            serde_json::json!({"id": "2", "NULL": "x", "amount": "5"}),
+        ]
+    );
+}

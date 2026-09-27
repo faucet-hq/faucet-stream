@@ -176,6 +176,7 @@ By default the REST source parses a **JSON** body and extracts records via `reco
 | `response_format` | `json` \| `csv` \| `excel` | `json` | How to parse the body. `csv`/`excel` parse a whole tabular file into records. `excel` requires the crate's `excel` feature. |
 | `csv_delimiter` | int (byte) / char | `,` | CSV field delimiter. `response_format: csv` only. |
 | `csv_has_headers` | bool | `true` | Whether the first CSV row supplies field names (else `column_0`, `column_1`, …). `csv` only. |
+| `csv_null_values` | list of strings | `[]` | CSV fields equal to any listed string decode as JSON `null` rather than a string — on the `Value`, native NDJSON, columnar and streaming decode paths alike. Salesforce Bulk API 2.0 writes a null as an empty field, so set `[""]` for it; list sentinels such as `"NULL"` / `"#N/A"` for other APIs. Headers are never mapped, and a quoted empty field maps like an unquoted one. Applies to `response_format: csv` and to a `parse: { format: csv }` decode step; set anywhere else it is a config error. |
 | `excel_sheet` | string / null | first sheet | Worksheet name, or a 0-based index as a string. `excel` only. |
 | `excel_header_row` | int | `0` | 0-based index of the Excel header row. `excel` only. |
 

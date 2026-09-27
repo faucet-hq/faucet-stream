@@ -194,7 +194,12 @@ impl faucet_core::Source for CsvSource {
                     } else {
                         format!("column_{col_idx}")
                     };
-                    obj.insert(key, Value::String(field.to_string()));
+                    let value = if config.null_values.iter().any(|n| n == field) {
+                        Value::Null
+                    } else {
+                        Value::String(field.to_string())
+                    };
+                    obj.insert(key, value);
                 }
                 buffer.push(Value::Object(obj));
                 row_idx += 1;

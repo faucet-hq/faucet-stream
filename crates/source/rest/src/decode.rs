@@ -152,6 +152,16 @@ pub fn csv_stream_plan(steps: &[DecodeStep]) -> Option<CsvStreamPlan> {
 
 /// Run the decode chain over the response body, returning records.
 pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>, FaucetError> {
+    run_decode_with_nulls(body, steps, &[]).await
+}
+
+/// [`run_decode`], with a `parse: csv` step mapping fields equal to any of
+/// `csv_null_values` to JSON `null` (#754).
+pub async fn run_decode_with_nulls(
+    body: &[u8],
+    steps: &[DecodeStep],
+    csv_null_values: &[String],
+) -> Result<Vec<Value>, FaucetError> {
     let mut buf = body.to_vec();
     for step in steps {
         match step {
@@ -185,7 +195,7 @@ pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>,
                 buf = unzip_member(&buf, unzip.member.as_deref())?;
             }
             DecodeStep::Parse { parse } => {
-                return parse_records(&buf, parse).await;
+                return parse_records(&buf, parse, csv_null_values).await;
             }
         }
     }
@@ -200,6 +210,7 @@ pub async fn run_decode(body: &[u8], steps: &[DecodeStep]) -> Result<Vec<Value>,
             sheet: None,
             header_row: 0,
         },
+        &[],
     )
     .await
 }
@@ -280,7 +291,11 @@ fn unzip_member(bytes: &[u8], member: Option<&str>) -> Result<Vec<u8>, FaucetErr
     Ok(out)
 }
 
-async fn parse_records(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, FaucetError> {
+async fn parse_records(
+    bytes: &[u8],
+    spec: &ParseSpec,
+    csv_null_values: &[String],
+) -> Result<Vec<Value>, FaucetError> {
     match spec.format {
         ParseFormat::Json => {
             let v: Value = serde_json::from_slice(bytes)
@@ -288,7 +303,12 @@ async fn parse_records(bytes: &[u8], spec: &ParseSpec) -> Result<Vec<Value>, Fau
             Ok(records_from_value(v, spec.records_path.as_deref()))
         }
         ParseFormat::Csv => {
-            crate::format::parse_csv(bytes, spec.delimiter.unwrap_or(b','), spec.has_headers)
+            let dialect = crate::format::CsvDialect {
+                delimiter: spec.delimiter.unwrap_or(b','),
+                has_headers: spec.has_headers,
+                ..Default::default()
+            };
+            crate::format::parse_csv_with_nulls(bytes, dialect, csv_null_values)
                 .await
                 .map_err(|e| FaucetError::Source(format!("decode `parse` csv: {e}")))
         }

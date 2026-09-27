@@ -311,6 +311,14 @@ pub struct RestStreamConfig {
     /// and the `parse: csv` decode step both honour it.
     #[serde(default = "default_csv_quote")]
     pub csv_quote: u8,
+    /// CSV fields equal to any of these strings decode as JSON `null` instead
+    /// of a string (default: none). Salesforce Bulk API 2.0 results write a
+    /// null as an empty field, so its templates set `[""]`; other APIs list
+    /// sentinels such as `"NULL"` or `"#N/A"`. Headers are never mapped, and a
+    /// quoted empty field (`""`) is mapped like an unquoted one — the CSV
+    /// reader does not report quoting per field. `response_format: csv` only.
+    #[serde(default)]
+    pub csv_null_values: Vec<String>,
     /// Excel worksheet to read: a sheet name, or a 0-based index as a string.
     /// When omitted, the first worksheet is used. `response_format: excel` only.
     #[serde(default)]
@@ -734,6 +742,7 @@ impl Default for RestStreamConfig {
             csv_delimiter: b',',
             csv_has_headers: true,
             csv_quote: b'"',
+            csv_null_values: Vec::new(),
             excel_sheet: None,
             excel_header_row: 0,
             replication_bind: None,
@@ -770,6 +779,19 @@ impl RestStreamConfig {
         if let Some(key) = &self.replication_key {
             ReplicationKey::parse(key)
                 .map_err(|e| faucet_core::FaucetError::Config(format!("rest: {e}")))?;
+        }
+        if !self.csv_null_values.is_empty() {
+            let csv_decode = self.decode.iter().any(|s| {
+                matches!(s, crate::decode::DecodeStep::Parse { parse }
+                    if parse.format == crate::decode::ParseFormat::Csv)
+            });
+            if !matches!(self.response_format, ResponseFormat::Csv) && !csv_decode {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `csv_null_values` applies only to CSV bodies — set \
+                     `response_format: csv` or a `parse: { format: csv }` decode step"
+                        .into(),
+                ));
+            }
         }
         if !matches!(self.response_format, ResponseFormat::Json) {
             if !matches!(self.pagination, PaginationStyle::None) {
