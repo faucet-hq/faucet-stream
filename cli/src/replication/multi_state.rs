@@ -453,11 +453,10 @@ mod tests {
             d.added.is_empty(),
             "ignore: no new tables after the first run"
         );
-        let d = reconcile_discovery(&mut s, &two, true, t0());
-        assert_eq!(d.added, vec!["c"]);
         assert_eq!(d.refused, vec!["b"], "refused again with the new reason");
         assert_eq!(s.tables["b"].last_error.as_deref(), Some("x"));
         let d = reconcile_discovery(&mut s, &two, true, t0());
+        assert_eq!(d.added, vec!["c"]);
         assert!(
             d.refused.is_empty(),
             "an unchanged refusal is not reported again"

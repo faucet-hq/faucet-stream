@@ -34,6 +34,8 @@ use tokio_util::sync::CancellationToken;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 /// Delay before a failed snapshot is retried.
 const SNAPSHOT_RETRY: Duration = Duration::from_secs(30);
+/// How often a running stream cycle checks for due snapshots and discovery.
+const HOUSEKEEPING: Duration = Duration::from_secs(5);
 
 struct Shared {
     cfg: PipelineConfig,
@@ -295,13 +297,12 @@ fn summary_error(summary: &RunSummary) -> Option<String> {
 
 /// Snapshot one table. `Ok(true)` = done and active, `Ok(false)` = interrupted
 /// by shutdown (redone on the next run).
-async fn snapshot_table(
-    shared: Arc<Shared>,
-    table: String,
-    cancel: CancellationToken,
-) -> CliResult<bool> {
-    let plan = shared.plan(&table)?;
-    let mates = shared.stream_mates(&table).await;
+/// Capture the stream position `table` will join from and record it. Runs in
+/// the driver while no stream cycle is open, so the position is part of the
+/// next cycle's resume floor before any cycle can move the stream past it.
+async fn prepare_snapshot(shared: &Shared, table: &str) -> CliResult<Vec<ShardRun>> {
+    let plan = shared.plan(table)?;
+    let mates = shared.stream_mates(table).await;
     let cdc = shared.build_cdc(&mates).await?;
     let position = cdc.capture_resume_position().await?.ok_or_else(|| {
         CliError::Config(format!(
@@ -309,23 +310,36 @@ async fn snapshot_table(
             shared.cdc.kind
         ))
     })?;
-    seed_position(&shared, &plan, cdc.as_ref(), &position).await?;
+    seed_position(shared, &plan, cdc.as_ref(), &position).await?;
     drop(cdc);
-
     let cdc_node = shared.table_node(&plan)?;
     let snap = shared.snapshot_node(&plan, &cdc_node);
-    let shards = plan_shards(&shared, &plan, &snap).await?;
+    let shards = plan_shards(shared, &plan, &snap).await?;
     {
         let mut state = shared.state.lock().await;
         multi_state::mark_snapshot_started(
             &mut state,
-            &table,
+            table,
             position,
             shards.len() as u64,
             Utc::now(),
         );
     }
     shared.persist().await?;
+    Ok(shards)
+}
+
+/// Snapshot one prepared table. `Ok(true)` = done and active, `Ok(false)` =
+/// interrupted by shutdown (redone on the next run).
+async fn snapshot_table(
+    shared: Arc<Shared>,
+    table: String,
+    shards: Vec<ShardRun>,
+    cancel: CancellationToken,
+) -> CliResult<bool> {
+    let plan = shared.plan(&table)?;
+    let cdc_node = shared.table_node(&plan)?;
+    let snap = shared.snapshot_node(&plan, &cdc_node);
     tracing::info!(pipeline = %shared.opts.pipeline_name, table = %table, shards = shards.len(), "mirror: snapshotting table");
 
     let missing = !plan.key.is_empty()
@@ -517,14 +531,29 @@ async fn run_cycle(
     active: Vec<String>,
     cancel: CancellationToken,
 ) -> CycleResult {
-    let known: BTreeSet<String> = shared.state.lock().await.tables.keys().cloned().collect();
+    let (known, floors) = {
+        let state = shared.state.lock().await;
+        let floors: Vec<Value> = if shared.tables.cdc_kind == "dynamodb" {
+            Vec::new()
+        } else {
+            state
+                .tables
+                .values()
+                .filter(|t| t.phase == TablePhase::Snapshotting)
+                .filter_map(|t| t.position.clone())
+                .collect()
+        };
+        let known: BTreeSet<String> = state.tables.keys().cloned().collect();
+        (known, floors)
+    };
     let groups = tables::stream_groups(&shared.tables.cdc_kind, &active);
     let mut runs = JoinSet::new();
     for group in groups {
         let shared = shared.clone();
         let known = known.clone();
         let cancel = cancel.clone();
-        runs.spawn(async move { run_group(shared, group, known, cancel).await });
+        let floors = floors.clone();
+        runs.spawn(async move { run_group(shared, group, known, floors, cancel).await });
     }
     let mut out = CycleResult::default();
     while let Some(joined) = runs.join_next().await {
@@ -546,6 +575,7 @@ async fn run_group(
     shared: Arc<Shared>,
     group: Vec<String>,
     known: BTreeSet<String>,
+    floors: Vec<Value>,
     cancel: CancellationToken,
 ) -> CycleResult {
     let mut out = CycleResult::default();
@@ -585,7 +615,7 @@ async fn run_group(
         });
     }
     let router = shared.router(&streamed, known);
-    let demux = feed::run_demux(source, feeds, router, cancel, shared.live.clone()).await;
+    let demux = feed::run_demux(source, feeds, router, floors, cancel, shared.live.clone()).await;
     while let Some(joined) = runs.join_next().await {
         match joined {
             Ok((table, result)) => {
@@ -671,25 +701,43 @@ struct Driver {
 }
 
 impl Driver {
-    fn spawn_due(&mut self, due: Vec<String>) {
+    /// Tables due for a snapshot that can start now (capacity, retry delay).
+    fn startable(&self, due: &[String]) -> Vec<String> {
         let now = Instant::now();
-        for table in due {
-            if self.running.len() >= self.shared.tables.concurrency {
-                break;
-            }
-            if self.running.contains(&table)
-                || self.retry_at.get(&table).is_some_and(|at| *at > now)
-            {
-                continue;
-            }
+        let room = self
+            .shared
+            .tables
+            .concurrency
+            .saturating_sub(self.running.len());
+        due.iter()
+            .filter(|t| {
+                !self.running.contains(*t) && self.retry_at.get(*t).is_none_or(|at| *at <= now)
+            })
+            .take(room)
+            .cloned()
+            .collect()
+    }
+
+    /// Capture positions for, then start, every startable due table. Must run
+    /// while no stream cycle is open (see [`prepare_snapshot`]).
+    async fn spawn_due(&mut self, due: Vec<String>) -> CliResult<()> {
+        for table in self.startable(&due) {
+            let shards = match prepare_snapshot(&self.shared, &table).await {
+                Ok(shards) => shards,
+                Err(e) => {
+                    self.on_snapshot(table, Err(e)).await?;
+                    continue;
+                }
+            };
             self.running.insert(table.clone());
             let shared = self.shared.clone();
             let cancel = self.cancel.clone();
             self.snapshots.spawn(async move {
-                let r = snapshot_table(shared, table.clone(), cancel).await;
+                let r = snapshot_table(shared, table.clone(), shards, cancel).await;
                 (table, r)
             });
         }
+        Ok(())
     }
 
     async fn on_snapshot(&mut self, table: String, result: CliResult<bool>) -> CliResult<()> {
@@ -830,9 +878,9 @@ impl Driver {
 }
 
 /// Aborts a helper task when the cycle (or the whole mirror future) ends.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -875,7 +923,7 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
                 let state = d.shared.state.lock().await;
                 due_for_snapshot(&state, retry_paused, Utc::now())
             };
-            d.spawn_due(due.clone());
+            d.spawn_due(due.clone()).await?;
 
             if !continuous && (!d.snapshots.is_empty() || !due.is_empty()) {
                 if d.snapshots.is_empty() {
@@ -899,25 +947,6 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
             let active = d.shared.state.lock().await.in_phase(TablePhase::Active);
             if !active.is_empty() {
                 let cycle_cancel = d.cancel.child_token();
-                let watcher = {
-                    let joined = d.joined.clone();
-                    let token = cycle_cancel.clone();
-                    let until = (continuous && interval > 0).then_some(next_discovery);
-                    tokio::spawn(async move {
-                        let discovery = async {
-                            match until {
-                                Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
-                                None => std::future::pending().await,
-                            }
-                        };
-                        tokio::select! {
-                            _ = joined.notified() => {}
-                            _ = discovery => {}
-                            _ = token.cancelled() => {}
-                        }
-                        token.cancel();
-                    })
-                };
                 let ticker = {
                     let shared = d.shared.clone();
                     tokio::spawn(async move {
@@ -929,10 +958,53 @@ async fn drive(shared: Arc<Shared>, cancel: CancellationToken) -> CliResult<()> 
                         }
                     })
                 };
-                let _guards = (AbortOnDrop(watcher), AbortOnDrop(ticker));
-                let cycle = run_cycle(&d.shared, active, cycle_cancel.clone()).await;
+                let _ticker = AbortOnDrop(ticker);
+                let mut cycle_task = AbortOnDrop({
+                    let shared = d.shared.clone();
+                    let token = cycle_cancel.clone();
+                    tokio::spawn(async move { run_cycle(&shared, active, token).await })
+                });
+                // While the stream runs the driver keeps discovering and
+                // snapshotting; a table whose snapshot completes ends the cycle
+                // so the next one streams it too.
+                let cycle = loop {
+                    let tick = if continuous {
+                        let at = if interval > 0 {
+                            next_discovery.min(Instant::now() + HOUSEKEEPING)
+                        } else {
+                            Instant::now() + HOUSEKEEPING
+                        };
+                        Some(tokio::time::Instant::from_std(at))
+                    } else {
+                        None
+                    };
+                    tokio::select! {
+                        joined = &mut cycle_task.0 => {
+                            break joined.map_err(|e| CliError::Internal(format!("stream cycle: {e}")))?;
+                        }
+                        _ = d.joined.notified() => cycle_cancel.cancel(),
+                        Some(joined) = d.snapshots.join_next(), if !d.snapshots.is_empty() => {
+                            let (table, result) = joined
+                                .map_err(|e| CliError::Internal(format!("snapshot task: {e}")))?;
+                            d.on_snapshot(table, result).await?;
+                        }
+                        _ = async { tokio::time::sleep_until(tick.unwrap_or_else(tokio::time::Instant::now)).await }, if tick.is_some() => {
+                            if interval > 0 && Instant::now() >= next_discovery {
+                                d.rediscover().await?;
+                                next_discovery = Instant::now() + Duration::from_secs(interval.max(1));
+                            }
+                            let due = {
+                                let state = d.shared.state.lock().await;
+                                due_for_snapshot(&state, retry_paused, Utc::now())
+                            };
+                            if !d.startable(&due).is_empty() {
+                                cycle_cancel.cancel();
+                            }
+                        }
+                    }
+                };
                 let interrupted = cycle_cancel.is_cancelled();
-                drop(_guards);
+                drop(_ticker);
                 let ok = d.apply_cycle(&cycle).await?;
                 if !cycle.new_tables.is_empty() {
                     tracing::info!(pipeline = %d.shared.opts.pipeline_name, tables = ?cycle.new_tables, "mirror: new tables seen on the stream; re-discovering");

@@ -190,12 +190,15 @@ struct FeedState {
 
 /// Run one cycle of the shared stream: wait for every table pipeline to open
 /// (reporting its committed position), resume the source from the earliest
-/// one, route each record to its table, and close every feed when the source
-/// ends, `cancel` fires, or a new matching table appears.
+/// one — never past a `floor` (the join position of a table still
+/// snapshotting, which the stream must keep for it) — route each record to
+/// its table, and close every feed when the source ends, `cancel` fires, or a
+/// new matching table appears.
 pub async fn run_demux(
     source: Arc<dyn Source>,
     feeds: Vec<TableFeed>,
     router: Router,
+    floors: Vec<Value>,
     cancel: CancellationToken,
     live: LiveStats,
 ) -> Result<DemuxOutcome, FaucetError> {
@@ -224,7 +227,11 @@ pub async fn run_demux(
         return Ok(outcome);
     }
 
-    let positions: Vec<Value> = states.iter().filter_map(|s| s.position.clone()).collect();
+    let positions: Vec<Value> = states
+        .iter()
+        .filter_map(|s| s.position.clone())
+        .chain(floors)
+        .collect();
     if !positions.is_empty() {
         let start = source.position_min(&positions).ok_or_else(|| {
             FaucetError::Config(format!(
@@ -495,6 +502,7 @@ mod tests {
             src.clone(),
             vec![fa, fb],
             router(&["a", "b"], false),
+            vec![],
             CancellationToken::new(),
             live.clone(),
         )
@@ -528,6 +536,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn floors_hold_the_resume_point_back() {
+        let src = script(vec![page(1, &["a"]), page(2, &["a"]), page(3, &["a"])]);
+        let (fa, ca) = channel("a", src.clone());
+        let a = tokio::spawn(consume(ca, Some(2)));
+        let out = run_demux(
+            src.clone(),
+            vec![fa],
+            router(&["a"], false),
+            vec![json!(1)],
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.started_at,
+            Some(json!(1)),
+            "a snapshotting table's floor wins"
+        );
+        let got: Vec<u64> = a
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|p| p.records.iter().map(|r| r["v"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got, vec![3], "the active table still skips what it applied");
+    }
+
+    #[tokio::test]
     async fn a_new_matching_table_ends_the_cycle() {
         let src = script(vec![page(1, &["a"]), page(2, &["fresh"]), page(3, &["a"])]);
         let (fa, ca) = channel("a", src.clone());
@@ -536,6 +573,7 @@ mod tests {
             src.clone(),
             vec![fa],
             router(&["a"], true),
+            vec![],
             CancellationToken::new(),
             Default::default(),
         )
@@ -561,6 +599,7 @@ mod tests {
             src.clone(),
             vec![fa, fb],
             router(&["a", "b"], false),
+            vec![],
             CancellationToken::new(),
             Default::default(),
         )
@@ -587,6 +626,7 @@ mod tests {
             src.clone(),
             vec![fa, fb],
             router(&["a", "b"], false),
+            vec![],
             CancellationToken::new(),
             Default::default(),
         )
@@ -611,6 +651,7 @@ mod tests {
             src.clone(),
             vec![fa],
             router(&["a"], false),
+            vec![],
             CancellationToken::new(),
             Default::default(),
         )
@@ -636,6 +677,7 @@ mod tests {
             src.clone(),
             vec![fa],
             router(&["a"], false),
+            vec![],
             cancel,
             Default::default(),
         )
@@ -667,6 +709,7 @@ mod tests {
             src,
             vec![fa, fb],
             router(&["a", "b"], false),
+            vec![],
             CancellationToken::new(),
             Default::default(),
         )

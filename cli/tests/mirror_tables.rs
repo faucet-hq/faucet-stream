@@ -526,3 +526,81 @@ async fn new_tables_are_picked_up_and_dropped_tables_retired() {
         1
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_table_pauses_without_stalling_the_rest_then_resyncs() {
+    let (_pg, url) = start_postgres().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    sql(
+        &url,
+        "CREATE SCHEMA shop; \
+         CREATE TABLE shop.good (id int8 PRIMARY KEY, v int8); \
+         CREATE TABLE shop.bad (id int8 PRIMARY KEY, v text); \
+         CREATE PUBLICATION shop_pub FOR TABLES IN SCHEMA shop; \
+         INSERT INTO shop.good VALUES (1, 1); \
+         INSERT INTO shop.bad VALUES (1, '1'); \
+         CREATE TABLE public.mirror_bad (id int8 PRIMARY KEY, v int8);",
+    )
+    .await;
+    let extra = "    max_table_failures: 1\n    retry_paused_secs: 3\n";
+    let yaml = config(&url, &state, true, "at_least_once", extra);
+    let handle = spawn_run(&yaml);
+    wait_for("both tables active", Duration::from_secs(90), async || {
+        marker(&state)
+            .await
+            .is_some_and(|m| m.in_phase(TablePhase::Active).len() == 2)
+    })
+    .await;
+
+    sql(
+        &url,
+        "INSERT INTO shop.bad VALUES (2, 'not a number'); INSERT INTO shop.good VALUES (2, 2);",
+    )
+    .await;
+    wait_for(
+        "bad paused while good keeps streaming",
+        Duration::from_secs(60),
+        async || {
+            let paused = marker(&state).await.is_some_and(|m| {
+                m.tables
+                    .get("shop.bad")
+                    .is_some_and(|t| t.phase == TablePhase::Paused)
+            });
+            paused && count(&url, "SELECT count(*) FROM mirror_good").await == 2
+        },
+    )
+    .await;
+    let (cfg, _) = load(&yaml);
+    let status = faucet_cli::replication::status::read_status(&cfg, "shop")
+        .await
+        .unwrap();
+    let bad = status
+        .tables
+        .iter()
+        .find(|t| t.table == "shop.bad")
+        .unwrap();
+    assert_eq!(bad.phase, "paused");
+    assert!(bad.last_error.is_some(), "{bad:?}");
+
+    sql(&url, "DROP TABLE public.mirror_bad;").await;
+    wait_for("bad re-synced", Duration::from_secs(90), async || {
+        marker(&state).await.is_some_and(|m| {
+            m.tables
+                .get("shop.bad")
+                .is_some_and(|t| t.phase == TablePhase::Active && t.snapshot.attempts >= 2)
+        })
+    })
+    .await;
+    sql(&url, "INSERT INTO shop.bad VALUES (3, 'three');").await;
+    wait_for(
+        "changes after the re-sync applied",
+        Duration::from_secs(60),
+        async || count(&url, "SELECT count(*) FROM mirror_bad").await == 3,
+    )
+    .await;
+    handle.abort();
+    let _ = handle.await;
+    verify_table(&url, &state, "shop.bad", "mirror_bad", "id").await;
+    verify_table(&url, &state, "shop.good", "mirror_good", "id").await;
+}
