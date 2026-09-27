@@ -3021,6 +3021,12 @@ components:
         signals:
           type: array
           items: { $ref: "#/components/schemas/CostSignal" }
+        throttled: { type: integer, description: "Rate-limit responses (HTTP 429 and equivalents) the source received (#734). Omitted when zero." }
+        throttle_wait_secs: { type: number, description: "Seconds the source actually slept because of them. Omitted when zero." }
+        source_retries:
+          type: object
+          description: Source-side retries by class (`rate_limited`, `http_5xx`, `connection`, `timeout`).
+          additionalProperties: { type: integer }
     CostEstimate:
       type: object
       description: The priced view of a `UsageSnapshot` — an estimate, in the deployment's configured currency.
@@ -3075,6 +3081,8 @@ components:
         bytes_written: { type: integer }
         duration_ms: { type: integer }
         roundtrips: { type: integer }
+        throttled: { type: integer, description: "Rate-limit responses the sources received (#734)." }
+        throttle_wait_secs: { type: number, description: "Seconds the sources slept on those rate limits." }
         cost: { type: number }
         hosted_equivalent: { type: number }
         not_reported: { type: array, items: { type: string } }

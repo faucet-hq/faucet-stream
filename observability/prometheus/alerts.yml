@@ -73,6 +73,20 @@ groups:
             slot this far behind also pins WAL/binlog on the source database.
             Check `faucet status --probe` and the sink's throughput.
 
+      - alert: FaucetSourceThrottled
+        expr: sum by (pipeline, row, connector) (rate(faucet_source_throttle_wait_seconds_sum[15m])) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline {{ $labels.pipeline }} spends over a quarter of its time rate-limited ({{ $labels.connector }})"
+          description: >
+            Row {{ $labels.row }} has been sleeping on 429 / Retry-After
+            responses for more than 25% of the last 15 minutes. Lower
+            request concurrency, stagger schedules that share the API quota,
+            or raise the quota. `faucet usage` shows the per-run throttled
+            count and wait.
+
       - alert: FaucetBatchesRoutedWhole
         expr: increase(faucet_batch_outcomes_total{outcome=~"dlq_all|failed"}[1h]) > 0
         labels:
