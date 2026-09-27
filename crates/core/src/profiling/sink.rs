@@ -140,6 +140,9 @@ impl Sink for ProfilingSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
     fn supports_rollback(&self) -> bool {
         self.inner.supports_rollback()
     }
@@ -294,6 +297,7 @@ mod tests {
         assert!(sink.begin_overwrite().await.is_err(), "the default rejects");
         assert!(sink.commit_overwrite().await.is_err());
         assert!(sink.abort_overwrite().await.is_ok());
+        assert!(sink.complete_run().await.is_ok());
         assert!(sink.forget_run("r").await.is_ok());
         assert!(
             sink.rewind_commit_token("s", None).await.is_err(),

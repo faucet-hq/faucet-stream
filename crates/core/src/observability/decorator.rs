@@ -708,6 +708,9 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
 }
 
 #[cfg(test)]

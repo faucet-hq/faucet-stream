@@ -919,6 +919,21 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 
+    /// Finalize this run's output after [`Pipeline::run`](crate::Pipeline::run)
+    /// finished **successfully and uncancelled**, on every transfer path
+    /// (`Value`, columnar, native), after the terminal flush.
+    ///
+    /// A sink whose destination must reflect *this* run even when it wrote
+    /// nothing uses it: the file sinks with `append: false` truncate (or, for
+    /// a fixed-path Parquet file, remove) the previous run's output here when
+    /// no record arrived, so a source that became empty never leaves stale
+    /// rows presented as current (#753). Never called after a failed or
+    /// cancelled run, so the previous good output survives those. Decorators
+    /// must forward it. Default: no-op.
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        Ok(())
+    }
+
     /// Whether an overwrite staging object (the `…__faucet_ovw` table or
     /// collection a [`begin_overwrite`](Self::begin_overwrite) creates) exists
     /// right now — a read-only probe used by `faucet status --probe` to report

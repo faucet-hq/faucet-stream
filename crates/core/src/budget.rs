@@ -418,6 +418,9 @@ impl Sink for BudgetSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
     fn supports_rollback(&self) -> bool {
         self.inner.supports_rollback()
     }
@@ -618,6 +621,7 @@ mod tests {
         let _ = sink.begin_overwrite().await;
         let _ = sink.commit_overwrite().await;
         let _ = sink.abort_overwrite().await;
+        let _ = sink.complete_run().await;
         assert!(!sink.supports_rollback());
         let opts = crate::rollback::RollbackOptions {
             run_id_column: "_faucet_run_id".into(),

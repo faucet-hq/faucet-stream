@@ -425,6 +425,8 @@ enum NodeOutcome {
         node_id: String,
         records: usize,
         bookmark: Option<Value>,
+        /// Kept so a fully successful graph can finalize it (#753).
+        sink: Box<dyn Sink>,
     },
     /// A source node and how many records it emitted. Needed so a lineage /
     /// catalog edge can report the volume *that input* contributed rather than
@@ -951,7 +953,9 @@ impl Topology {
                 if let Some(e) = first_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
                     return Err(e);
                 }
-                let (result, per_source) = aggregate(outcomes.into_iter().flatten().collect());
+                let outcomes: Vec<NodeOutcome> = outcomes.into_iter().flatten().collect();
+                complete_sinks(&outcomes, &opts.cancel).await?;
+                let (result, per_source) = aggregate(outcomes);
                 let failed = failures.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 let nodes = reports(&order, &result, &per_source, &failed);
                 Ok(TopologyRun {
@@ -978,6 +982,9 @@ impl Topology {
                             failed.push((node_id, e.to_string(), NodeErrorKind::classify(&e)));
                         }
                     }
+                }
+                if errs.is_empty() {
+                    complete_sinks(&ok, &opts.cancel).await?;
                 }
                 let (mut result, per_source) = aggregate(ok);
                 result.errors = errs;
@@ -1023,6 +1030,25 @@ fn reports(
         .collect()
 }
 
+/// Finalize every sink node of a graph in which **no** node failed and the run
+/// was not cancelled (#753) — the graph analogue of `Pipeline::run` calling
+/// [`Sink::complete_run`]. A sink node only sees its input channel close, which
+/// also happens when an upstream node failed, so the decision is graph-wide.
+async fn complete_sinks(
+    outcomes: &[NodeOutcome],
+    cancel: &Option<CancellationToken>,
+) -> Result<(), FaucetError> {
+    if cancelled(cancel) {
+        return Ok(());
+    }
+    for o in outcomes {
+        if let NodeOutcome::Sink { sink, .. } = o {
+            sink.complete_run().await?;
+        }
+    }
+    Ok(())
+}
+
 /// Aggregate node outcomes into a [`TopologyResult`] plus the per-source counts
 /// (which live on [`TopologyRun`], not the result).
 fn aggregate(outcomes: Vec<NodeOutcome>) -> (TopologyResult, HashMap<String, usize>) {
@@ -1034,6 +1060,7 @@ fn aggregate(outcomes: Vec<NodeOutcome>) -> (TopologyResult, HashMap<String, usi
                 node_id,
                 records,
                 bookmark,
+                ..
             } => {
                 result.records_written += records;
                 result.per_sink.insert(node_id.clone(), records);
@@ -1485,6 +1512,7 @@ async fn run_sink_node(
         node_id,
         records: result.records_written,
         bookmark: result.bookmark,
+        sink,
     })
 }
 
@@ -2051,6 +2079,68 @@ mod tests {
             .unwrap();
         let err = topo.run(TopologyOptions::new("p")).await.unwrap_err();
         assert!(matches!(err, FaucetError::Source(_)));
+    }
+
+    struct CompletingSink(Arc<Mutex<u32>>);
+    #[async_trait]
+    impl Sink for CompletingSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        async fn complete_run(&self) -> Result<(), FaucetError> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_run_fires_only_for_a_fully_successful_graph() {
+        let done = Arc::new(Mutex::new(0));
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(2)))
+            .sink("k", Box::new(CompletingSink(done.clone())))
+            .edge("s", "k")
+            .build()
+            .unwrap();
+        topo.run(TopologyOptions::new("p")).await.unwrap();
+        assert_eq!(*done.lock().unwrap(), 1);
+
+        let failed = Arc::new(Mutex::new(0));
+        let topo = Topology::builder()
+            .source("s", Box::new(FailingSource))
+            .sink("k", Box::new(CompletingSink(failed.clone())))
+            .edge("s", "k")
+            .build()
+            .unwrap();
+        assert!(topo.run(TopologyOptions::new("p")).await.is_err());
+        assert_eq!(*failed.lock().unwrap(), 0);
+
+        let partial = Arc::new(Mutex::new(0));
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(4)))
+            .tee("t", 4, Some(2))
+            .sink("bad", Box::new(FailingSink))
+            .sink("good", Box::new(CompletingSink(partial.clone())))
+            .edge("s", "t")
+            .edge("t", "bad")
+            .edge("t", "good")
+            .build()
+            .unwrap();
+        let opts = TopologyOptions::new("p").with_on_error(TopologyOnError::Continue);
+        topo.run(opts).await.unwrap();
+        assert_eq!(*partial.lock().unwrap(), 0);
+
+        let cancelled = Arc::new(Mutex::new(0));
+        let token = CancellationToken::new();
+        token.cancel();
+        let topo = Topology::builder()
+            .source("s", VecSource::boxed(recs(2)))
+            .sink("k", Box::new(CompletingSink(cancelled.clone())))
+            .edge("s", "k")
+            .build()
+            .unwrap();
+        let _ = topo.run(TopologyOptions::new("p").with_cancel(token)).await;
+        assert_eq!(*cancelled.lock().unwrap(), 0);
     }
 
     #[tokio::test]

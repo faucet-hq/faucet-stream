@@ -307,6 +307,9 @@ impl Sink for SamplingSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
     // Native byte-passthrough passthrough (#639). Without forwarding these, the
     // wrapper's trait defaults would report "no native load capability", forcing
     // the pipeline onto the `Value` path whenever sampling is active — the exact
@@ -716,6 +719,7 @@ mod tests {
         s.begin_overwrite().await.unwrap();
         s.commit_overwrite().await.unwrap();
         s.abort_overwrite().await.unwrap();
+        s.complete_run().await.unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["begin", "commit", "abort"]);
     }
 
