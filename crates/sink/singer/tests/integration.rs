@@ -526,6 +526,61 @@ async fn interrupted_write_after_unconfirmed_pages_poisons_the_sink() {
 }
 
 #[tokio::test]
+async fn stderr_tail_keeps_the_last_lines() {
+    let fx = Fixture::new();
+    let mut cfg =
+        fx.config(json!({"mode": "crash", "crash_after": 1, "secret": "abcd", "stderr_lines": 30}));
+    cfg.flush_on = FlushOn::State;
+    let sink = SingerSink::new(cfg).unwrap();
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    let err = sink.flush().await.unwrap_err().to_string();
+    assert!(err.contains("noise line 29"), "{err}");
+    assert!(
+        !err.contains("noise line 5\n"),
+        "only the tail is kept: {err}"
+    );
+}
+
+#[tokio::test]
+async fn exit_without_reading_input_is_not_a_confirmation() {
+    let fx = Fixture::new();
+    let sink = SingerSink::new(fx.config(json!({"mode": "stale_state"}))).unwrap();
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    let err = sink.flush().await.unwrap_err().to_string();
+    assert!(
+        err.contains("without echoing the final flush STATE") || err.contains("closed its stdin"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn target_that_never_exits_is_killed_after_the_timeout() {
+    let fx = Fixture::new();
+    let mut cfg = fx.config(json!({"mode": "hang"}));
+    cfg.flush_timeout_secs = 1;
+    let sink = SingerSink::new(cfg).unwrap();
+    sink.write_batch(&[json!({"id": 1})]).await.unwrap();
+    let err = sink.flush().await.unwrap_err().to_string();
+    assert!(err.contains("did not exit within 1s"), "{err}");
+    assert_eq!(fx.records().len(), 1);
+}
+
+#[test]
+fn dropping_outside_a_runtime_kills_the_target() {
+    let fx = Fixture::new();
+    let mut cfg = fx.config(json!({"mode": "hang"}));
+    cfg.flush_on = FlushOn::State;
+    let sink = SingerSink::new(cfg).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(sink.write_batch(&[json!({"id": 1})])).unwrap();
+    drop(rt);
+    drop(sink);
+}
+
+#[tokio::test]
 async fn echo_at_exit_target_works_with_flush_on_exit() {
     let fx = Fixture::new();
     let sink = SingerSink::new(fx.config(json!({"mode": "echo_at_exit"}))).unwrap();

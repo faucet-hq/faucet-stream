@@ -127,6 +127,14 @@ mod tests {
     }
 
     #[test]
+    fn untyped_page_fields_add_nothing() {
+        let mut cur = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+        let page = json!({"type": "object", "properties": {"x": {}}});
+        assert!(!widen(&mut cur, &page));
+        assert_eq!(cur["properties"]["x"]["type"], json!("string"));
+    }
+
+    #[test]
     fn non_object_property_schemas_are_left_alone() {
         let mut cur = json!({"type": "object", "properties": {"x": true}});
         let page = json!({"type": "object", "properties": {"x": {"type": "string"}}});

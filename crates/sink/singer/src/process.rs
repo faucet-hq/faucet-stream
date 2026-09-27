@@ -68,7 +68,7 @@ pub struct TargetProcess {
     redactor: Redactor,
     command: String,
     _config_file: tempfile::NamedTempFile,
-    _stdout_task: JoinHandle<()>,
+    stdout_task: Option<JoinHandle<()>>,
 }
 
 impl TargetProcess {
@@ -143,7 +143,7 @@ impl TargetProcess {
             redactor: redactor.clone(),
             command: cfg.target_command.clone(),
             _config_file: config_file,
-            _stdout_task: stdout_task,
+            stdout_task: Some(stdout_task),
         })
     }
 
@@ -202,8 +202,33 @@ impl TargetProcess {
         }
     }
 
+    /// Close stdin, wait (up to `timeout`) for a successful exit, and confirm
+    /// flush marker `seq`: a target that reports `STATE` at all must have
+    /// echoed that last marker — otherwise it exited without reading all of
+    /// its input. A target that never emits `STATE` is confirmed by its clean
+    /// exit alone.
+    pub async fn finish_confirmed(
+        mut self,
+        seq: u64,
+        timeout: Duration,
+    ) -> Result<(), FaucetError> {
+        self.finish(timeout).await?;
+        if let Some(task) = self.stdout_task.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
+        let echo = self.echo.borrow().clone();
+        if echo.states > 0 && echo.confirmed < seq {
+            return Err(self.status_error(&format!(
+                "exited without echoing the final flush STATE (it reported STATE {} time(s), \
+                 but not the last one sent), so it may not have read all of its input",
+                echo.states
+            )));
+        }
+        Ok(())
+    }
+
     /// Close stdin and wait (up to `timeout`) for a successful exit.
-    pub async fn finish(mut self, timeout: Duration) -> Result<(), FaucetError> {
+    pub async fn finish(&mut self, timeout: Duration) -> Result<(), FaucetError> {
         if let Some(mut stdin) = self.stdin.take() {
             if let Err(e) = stdin.flush().await {
                 return Err(self.failure(&format!("closed its stdin ({e})")).await);

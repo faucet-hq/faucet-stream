@@ -4,7 +4,10 @@
 Reads Singer messages from stdin. Config (`--config FILE`) keys:
   path       JSON Lines file every RECORD is appended to (with `_version`)
   log        file each event is appended to: spawn / schema / state / activate / exit
-  mode       echo (default) | silent | echo_at_exit | crash | exit_early
+  mode       echo (default) | silent | echo_at_exit | crash | exit_early | hang | stale_state
+             (stale_state: echoes a STATE that is not the flush marker and exits 0 unread)
+             (hang: ignores SIGTERM and never exits after end of input)
+  stderr_lines  extra stderr lines written before a crash
   crash_after  records to accept before crashing (mode crash)
   secret     echoed to stderr by mode crash (the sink must redact it)
   delay_start  seconds to sleep before reading stdin (back-pressure tests)
@@ -12,6 +15,7 @@ Environment: FAKE_TARGET_TAG, when set, is logged on spawn.
 """
 import json
 import os
+import signal
 import sys
 import time
 
@@ -32,6 +36,12 @@ def main():
     if mode == "exit_early":
         sys.stderr.write("refusing input\n")
         sys.exit(0)
+    if mode == "stale_state":
+        print(json.dumps({"type": "STATE", "value": {"not": "yours"}}), flush=True)
+        sys.exit(0)
+    print("fake target ready (not a Singer message)", flush=True)
+    if mode == "hang":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if cfg.get("delay_start"):
         time.sleep(float(cfg["delay_start"]))
 
@@ -53,6 +63,8 @@ def main():
             records += 1
             if mode == "crash" and records >= int(cfg.get("crash_after", 1)):
                 out.flush()
+                for i in range(int(cfg.get("stderr_lines", 0))):
+                    sys.stderr.write("noise line %d\n" % i)
                 sys.stderr.write("fatal: cannot load record with key %s\n" % cfg.get("secret"))
                 sys.stderr.flush()
                 sys.exit(3)
@@ -76,6 +88,9 @@ def main():
     if mode == "echo_at_exit" and last_state is not None:
         print(json.dumps({"type": "STATE", "value": last_state}), flush=True)
     log({"event": "exit", "records": records})
+    if mode == "hang":
+        while True:
+            time.sleep(60)
 
 
 if __name__ == "__main__":

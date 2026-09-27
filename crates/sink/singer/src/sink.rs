@@ -156,9 +156,10 @@ impl SingerSink {
         if inner.unconfirmed_pages == 0 {
             return Ok(());
         }
-        let Some(mut process) = inner.process.take() else {
-            return Ok(());
-        };
+        let mut process = inner
+            .process
+            .take()
+            .expect("unconfirmed pages imply a running target");
         inner.flush_seq += 1;
         let seq = inner.flush_seq;
         let mut buf = Vec::new();
@@ -171,7 +172,7 @@ impl SingerSink {
                 inner.process = Some(process);
             }
             FlushOn::Exit => {
-                process.finish(self.timeout()).await?;
+                process.finish_confirmed(seq, self.timeout()).await?;
                 inner.sent_schema = None;
             }
         }
@@ -298,7 +299,9 @@ impl Sink for SingerSink {
         inner.flush_seq += 1;
         write_state(&mut buf, &flush_marker(stream, inner.flush_seq));
         process.write(&buf).await?;
-        process.finish(self.timeout()).await
+        process
+            .finish_confirmed(inner.flush_seq, self.timeout())
+            .await
     }
 
     /// Stop the target without activating: the previous version stays live,
