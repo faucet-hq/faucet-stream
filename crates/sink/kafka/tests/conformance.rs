@@ -96,6 +96,7 @@ mod idempotent {
         let sink = KafkaSink::new(eo_config(&brokers, "conformance_dest"))
             .await
             .expect("kafka sink new");
+        faucet_conformance::assert_batch_atomicity_declared(&sink);
         (container, brokers, sink)
     }
 

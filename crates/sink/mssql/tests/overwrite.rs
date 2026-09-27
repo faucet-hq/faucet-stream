@@ -133,7 +133,17 @@ async fn overwrite_abort_leaves_previous_data_intact() {
     sink.write_batch(&[json!({"id": 99, "name": "doomed"})])
         .await
         .expect("w");
+    assert_eq!(
+        sink.overwrite_staging_exists().await.unwrap(),
+        Some(true),
+        "the staging probe sees the in-flight staging"
+    );
     sink.abort_overwrite().await.expect("abort");
+    assert_eq!(
+        sink.overwrite_staging_exists().await.unwrap(),
+        Some(false),
+        "the staging probe sees it gone after abort"
+    );
 
     assert_eq!(names(&pool, "dbo.t").await, vec!["old_a", "old_b"]);
 }

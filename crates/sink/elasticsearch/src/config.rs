@@ -104,6 +104,17 @@ impl ElasticsearchSinkConfig {
     }
 }
 
+impl ElasticsearchSinkConfig {
+    /// What a failed batch write leaves behind (#737): per-item outcomes come from one _bulk request per chunk; an outer error after the first chunk leaves earlier chunks indexed.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.batch_size == 0 {
+            faucet_core::BatchAtomicity::PerRow
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +202,13 @@ mod tests {
         // canonical `ElasticsearchAuth` type. Removed in 0.4.0 together with
         // the alias itself.
         let _: ElasticsearchSinkAuth = ElasticsearchAuth::None;
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: ElasticsearchSinkConfig = serde_json::from_value(serde_json::json!({"base_url": "http://localhost:9200", "index": "idx", "auth": {"type": "none"}})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: ElasticsearchSinkConfig = serde_json::from_value(serde_json::json!({"base_url": "http://localhost:9200", "index": "idx", "auth": {"type": "none"}, "batch_size": 0})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
     }
 }

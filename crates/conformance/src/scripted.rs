@@ -105,12 +105,15 @@ impl EventLog {
             .sum()
     }
 
-    /// The values persisted by `StateStore::put`, in order.
+    /// The bookmarks persisted by `StateStore::put`, in order — the payload of
+    /// the versioned state envelope (#736).
     pub fn bookmarks(&self) -> Vec<Value> {
         self.events()
             .iter()
             .filter_map(|e| match e {
-                Event::StatePut { value, .. } => Some(value.clone()),
+                Event::StatePut { value, .. } => {
+                    Some(faucet_core::state_version::peel_versioned(value))
+                }
                 _ => None,
             })
             .collect()
@@ -172,6 +175,7 @@ pub fn assert_bookmarks_backed_by_writes(
         match event {
             Event::Write(n) | Event::IdempotentWrite { records: n, .. } => confirmed += n,
             Event::StatePut { ref value, .. } => {
+                let value = &faucet_core::state_version::peel_versioned(value);
                 let claimed = records_claimed(value);
                 assert!(
                     claimed <= confirmed,
@@ -306,6 +310,9 @@ pub struct ScriptedSink {
     write_delay: Option<Duration>,
     /// Log writes as [`Event::DlqWrite`] — this instance is the DLQ sink.
     dlq: bool,
+    /// What a failed write leaves behind (#737). The double lands nothing on
+    /// an outer failure, so it is truthfully per-row unless told otherwise.
+    atomicity: faucet_core::BatchAtomicity,
 }
 
 impl ScriptedSink {
@@ -326,6 +333,7 @@ impl ScriptedSink {
             tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
             write_delay: None,
             dlq: false,
+            atomicity: faucet_core::BatchAtomicity::PerRow,
         }
     }
 
@@ -338,6 +346,13 @@ impl ScriptedSink {
     /// before the bookmark that covers them.
     pub fn as_dlq(mut self) -> Self {
         self.dlq = true;
+        self
+    }
+
+    /// Declare the sink best-effort (#737): a failed write may have landed
+    /// some rows, so `on_batch_error: dlq_all` must be refused against it.
+    pub fn best_effort(mut self) -> Self {
+        self.atomicity = faucet_core::BatchAtomicity::BestEffort;
         self
     }
 
@@ -549,6 +564,10 @@ impl Sink for ScriptedSink {
 
     fn dedups_by_key(&self) -> bool {
         self.keyed
+    }
+
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.atomicity
     }
 
     async fn write_batch_idempotent(
@@ -819,8 +838,18 @@ impl ScriptedStateStore {
         self
     }
 
-    /// The value currently stored under `key` — what a *restart* would read.
+    /// The bookmark currently stored under `key` — what a *restart* would read,
+    /// out of its versioned envelope (#736).
     pub fn stored(&self, key: &str) -> Option<Value> {
+        self.values
+            .lock()
+            .expect("value lock")
+            .get(key)
+            .map(faucet_core::state_version::peel_versioned)
+    }
+
+    /// The raw value stored under `key`, envelope and all.
+    pub fn stored_raw(&self, key: &str) -> Option<Value> {
         self.values.lock().expect("value lock").get(key).cloned()
     }
 
@@ -870,6 +899,17 @@ mod tests {
 
     fn rec(n: usize) -> Vec<Value> {
         (0..n).map(|i| json!({ "n": i })).collect()
+    }
+
+    #[tokio::test]
+    async fn versioned_bookmarks_read_back_as_their_payload() {
+        let log = EventLog::new();
+        let store = ScriptedSink::new(log.clone()).state_store();
+        let envelope = faucet_core::state_version::wrap_versioned("paged", 0, &json!({"page": 3}));
+        store.put("k", &envelope).await.expect("put");
+        assert_eq!(store.stored("k"), Some(json!({"page": 3})));
+        assert_eq!(store.stored_raw("k"), Some(envelope));
+        assert_eq!(log.bookmarks(), vec![json!({"page": 3})]);
     }
 
     #[tokio::test]

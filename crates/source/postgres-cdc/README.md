@@ -376,6 +376,14 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 - [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) · [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) · [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)
 - [faucet-source-postgres](https://crates.io/crates/faucet-source-postgres) (query-mode snapshots, not CDC) · [faucet-state-postgres](https://crates.io/crates/faucet-state-postgres) (pair as a `StateStore`) · `cli/examples/postgres_cdc_to_jsonl.yaml`
 
+## Source lag
+
+`Source::lag` (#733) reports **bytes**: `pg_current_wal_lsn()` minus the furthest of the slot's `confirmed_flush_lsn` and the position this run has reached. A slot that does not exist reports no lag. The query reads `pg_replication_slots` — readable by the replication role. The pipeline polls it on the first page, at most every
+15 s after, and when the run ends, exporting `faucet_source_lag_*{pipeline,row,connector}`;
+`faucet status --probe` and `faucet doctor` ask it from the stored bookmark,
+and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
+logged once and reported as no lag — it never fails a run.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

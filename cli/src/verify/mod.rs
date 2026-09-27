@@ -687,6 +687,7 @@ async fn run_repair(
     let summary = crate::executor::run_expanded_boxed(
         vec![repair],
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: format!("{}-verify-repair", inputs.pipeline_name),
             run_id: None,
             execution: inputs.execution.clone(),

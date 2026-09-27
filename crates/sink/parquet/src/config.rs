@@ -236,6 +236,13 @@ impl ParquetCompression {
     }
 }
 
+impl ParquetSinkConfig {
+    /// What a failed batch write leaves behind (#737): rows stream into an open file that may roll over mid-batch.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +393,14 @@ mod tests {
         }"#;
         let cfg: ParquetSinkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: ParquetSinkConfig = serde_json::from_value(
+            serde_json::json!({"destination": {"type": "local_path", "path": "/tmp/out"}}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

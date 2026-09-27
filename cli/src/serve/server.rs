@@ -2,6 +2,7 @@
 
 use crate::error::{CliError, CliResult};
 use crate::serve::config::ServeConfig;
+use crate::serve::handlers::state as state_h;
 use crate::serve::handlers::{
     audit, backfill, changes, dlq, doctor, health, logs, plan, reload, runs, schemas, verify,
     whoami,
@@ -59,6 +60,16 @@ pub fn build_router(
         .route("/v1/audit", get(audit::list_audit))
         .route("/v1/reload", post(reload::reload))
         .route("/v1/whoami", get(whoami::whoami))
+        .route(
+            "/v1/status",
+            get(state_h::get_status).post(state_h::post_status),
+        )
+        .route(
+            "/v1/state/{pipeline}/{row}",
+            get(state_h::get_state)
+                .put(state_h::put_state)
+                .delete(state_h::delete_state),
+        )
         // Change requests (#703): plan → approve → run.
         .route(
             "/v1/changes",
@@ -400,6 +411,30 @@ fn lease_interval(lease_ttl: Duration) -> Duration {
 /// heartbeat, a live-member refresh (`member_ttl = period * 3`), and a
 /// failover `reclaim_orphans` that re-queues an expired-lease peer's runs
 /// (capped at `max_attempts`) rather than failing them outright.
+/// Heartbeat this member and refresh the live-member view: the member count
+/// and the state format every member reads (#736).
+pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration) {
+    let cluster = state.cluster();
+    let beat = crate::serve::history::InstanceHeartbeat {
+        started_at: cluster.started_at(),
+        listen: Some(cluster.listen().to_string()),
+        max_concurrent: cluster.max_concurrent(),
+        in_flight: state.registry().in_flight() as u32,
+        state_format: faucet_core::state_version::STATE_FORMAT,
+    };
+    if let Err(e) = state.history().heartbeat_instance(&beat).await {
+        tracing::warn!(error = %e, "cluster: heartbeat_instance failed");
+    }
+    match state.history().live_instances(member_ttl).await {
+        Ok(members) => {
+            cluster.set_members(members.len());
+            cluster.set_state_format(crate::serve::history::cluster_state_format(&members));
+            crate::serve::metrics::set_cluster_instances(members.len());
+        }
+        Err(e) => tracing::warn!(error = %e, "cluster: live_instances failed"),
+    }
+}
+
 pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: CancellationToken) {
     let cluster = state.cluster().clone();
     // Member-liveness window ≈ the real lease TTL (period == lease_ttl/3), so a
@@ -416,23 +451,7 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                     tracing::warn!(error = %e, "lease heartbeat (renew_leases) failed");
                 }
                 if cluster.enabled() {
-                    // Membership heartbeat.
-                    let beat = crate::serve::history::InstanceHeartbeat {
-                        started_at: cluster.started_at(),
-                        listen: Some(cluster.listen().to_string()),
-                        max_concurrent: cluster.max_concurrent(),
-                        in_flight: state.registry().in_flight() as u32,
-                    };
-                    if let Err(e) = state.history().heartbeat_instance(&beat).await {
-                        tracing::warn!(error = %e, "cluster: heartbeat_instance failed");
-                    }
-                    match state.history().live_instances(member_ttl).await {
-                        Ok(members) => {
-                            cluster.set_members(members.len());
-                            crate::serve::metrics::set_cluster_instances(members.len());
-                        }
-                        Err(e) => tracing::warn!(error = %e, "cluster: live_instances failed"),
-                    }
+                    refresh_membership(&state, member_ttl).await;
                     // Failover reclaim (re-run orphans).
                     match state.history().reclaim_orphans(cluster.max_attempts()).await {
                         Ok(r) if r.requeued > 0 || r.failed > 0 => {
@@ -777,7 +796,10 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     ));
 
     // Cluster claim loop: pulls Pending runs from the shared DB (cluster only).
+    // Membership is read first, so the first claimed run already knows whether
+    // an older member still needs bare bookmarks (#736).
     let claim = if config.cluster.enabled {
+        refresh_membership(&state, lease_period.saturating_mul(3)).await;
         tracing::info!(
             poll_secs = config.cluster.poll.as_secs(),
             max_attempts = config.cluster.max_attempts,

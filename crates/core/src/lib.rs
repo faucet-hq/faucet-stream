@@ -39,6 +39,7 @@ pub mod error;
 pub mod file_format;
 pub mod idempotency;
 pub mod join;
+pub mod lag;
 pub mod local_outputs;
 #[cfg(feature = "masking")]
 pub mod masking;
@@ -62,6 +63,7 @@ pub mod shard;
 pub mod stage;
 pub mod staging;
 pub mod state;
+pub mod state_version;
 pub mod tls;
 pub mod topology;
 pub mod traits;
@@ -108,8 +110,9 @@ pub use diff::{
 };
 pub use discover::{DatasetDescriptor, columns_to_schema, nullable_type, sql_type_to_json_schema};
 pub use dlq::{
-    DlqConfig, DlqReason, DlqStats, EnvelopeError, OnBatchError, UnwrappedEnvelope, build_envelope,
-    unwrap_envelope,
+    BatchAtomicity, BatchOutcome, BatchOutcomeCounters, BatchOutcomes, DlqConfig, DlqReason,
+    DlqStats, EnvelopeError, OnBatchError, UnwrappedEnvelope, build_envelope, check_dlq_all_policy,
+    dlq_all_is_safe, dlq_all_refusal, unwrap_envelope,
 };
 pub use drift::{
     ColumnChange, OnDrift, OnIncompatible, SchemaDiff, SchemaDriftPolicy, SchemaDriftSpec,
@@ -127,6 +130,7 @@ pub use idempotency::{
 pub use join::{
     HashJoin, JoinConfig, JoinMode, JoinStats, KeyNormalize, OnCollision, OnDuplicate, Projection,
 };
+pub use lag::{LagObserver, SourceLag};
 pub use local_outputs::{LocalOutput, LocalOutputLog, probe_pre_existing};
 pub use metadata::{
     CompiledMetadata, MetadataColumn, MetadataColumnsSpec, MetadataContext, MetadataSink,
@@ -190,7 +194,11 @@ pub use staging::{
     StagedFile, StagingCleanup, StagingCompression, StagingFormat, StagingLocation, StagingScheme,
     StagingSpec, serialize_records,
 };
-pub use state::{FileStateStore, MemoryStateStore, StateStore};
+pub use state::{FileStateStore, MemoryStateStore, StateExport, StateStore};
+pub use state_version::{
+    ResolvedState, STATE_FORMAT, StateCompat, StoredState, check_compat, peel_versioned,
+    resolve_for_source, wrap_versioned,
+};
 pub use tls::TlsClientConfig;
 pub use topology::{
     Edge, JoinNode, Node, NodeKind, Topology, TopologyBuilder, TopologyOnError, TopologyOptions,

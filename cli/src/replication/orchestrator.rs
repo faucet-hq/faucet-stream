@@ -97,6 +97,7 @@ fn phase_failure(summary: &crate::executor::RunSummary, phase: &str) -> CliError
 /// Build a fresh `ExecuteOptions` for one phase run.
 fn make_opts(opts: &ReplicationOptions, cancel: Option<CancellationToken>) -> ExecuteOptions {
     ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: opts.pipeline_name.clone(),
         run_id: None,
         execution: opts.execution.clone(),

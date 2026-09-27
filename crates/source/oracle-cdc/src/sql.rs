@@ -58,6 +58,15 @@ pub(crate) const ONLINE_LOGS_SQL: &str = "SELECT MIN(f.MEMBER), l.THREAD#, l.SEQ
 pub(crate) const POSITION_SQL: &str =
     "SELECT d.CURRENT_SCN, (SELECT MIN(t.START_SCN) FROM V$TRANSACTION t) FROM V$DATABASE d";
 
+/// The database's current SCN, for source lag.
+pub(crate) const CURRENT_SCN_SQL: &str = "SELECT CURRENT_SCN FROM V$DATABASE";
+
+/// Seconds between two SCNs' commit times (`:1` newer, `:2` older); raises
+/// ORA-08181 for an SCN older than the SCN-to-time mapping keeps.
+pub(crate) const SCN_AGE_SQL: &str = "SELECT EXTRACT(DAY FROM d) * 86400 + EXTRACT(HOUR FROM d) \
+    * 3600 + EXTRACT(MINUTE FROM d) * 60 + EXTRACT(SECOND FROM d) FROM (SELECT \
+    SCN_TO_TIMESTAMP(:1) - SCN_TO_TIMESTAMP(:2) AS d FROM DUAL)";
+
 /// CDB / container detection.
 pub(crate) const CONTAINER_SQL: &str =
     "SELECT d.CDB, SYS_CONTEXT('USERENV', 'CON_NAME') FROM V$DATABASE d";
@@ -188,6 +197,8 @@ mod tests {
             ARCHIVED_LOGS_SQL,
             ONLINE_LOGS_SQL,
             POSITION_SQL,
+            CURRENT_SCN_SQL,
+            SCN_AGE_SQL,
             CONTAINER_SQL,
             SUPPLEMENTAL_SQL,
         ] {

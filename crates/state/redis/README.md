@@ -121,6 +121,8 @@ The three `StateStore` methods map directly onto Redis commands on a namespaced 
 - `get(key)` → `GET {namespace}:{key}`, then parse the JSON; a missing key returns `None`.
 - `put(key, value)` → `SET {namespace}:{key} <serialized JSON>`.
 - `delete(key)` → `DEL {namespace}:{key}`; deleting a missing key is not an error.
+- `list(prefix)` → `SCAN MATCH {namespace}:{prefix}*`, namespace stripped, sorted — how `faucet state show|export` enumerates a pipeline's keys.
+- `put_batch(entries)` → one `MSET`, so a `faucet state import` lands all-or-nothing (`supports_atomic_batch() == true`).
 
 Connections use `redis::aio::MultiplexedConnection`, which is cheaply cloneable and safe to share across concurrent tasks — the store clones it per call, so no locking or pooling is needed on the caller's side. The connection is opened once in `connect()` and reused for the lifetime of the store.
 

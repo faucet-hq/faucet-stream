@@ -1092,6 +1092,10 @@ impl MysqlSink {
 
 #[async_trait]
 impl faucet_core::Sink for MysqlSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn connector_name(&self) -> &'static str {
         "mysql"
     }
@@ -1264,6 +1268,15 @@ impl faucet_core::Sink for MysqlSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("mysql overwrite: drop old table: {e}")))?;
         Ok(())
+    }
+
+    /// Probe for the `<table>__faucet_ovw` staging table, or the
+    /// `<table>__faucet_ovw_old` a swap interrupted mid-`RENAME` leaves (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(Some(
+            self.table_exists(&self.staging_table_name()).await?
+                || self.table_exists(&self.old_table_name()).await?,
+        ))
     }
 
     /// Drop the staging (and any old) table so a failed/cancelled overwrite

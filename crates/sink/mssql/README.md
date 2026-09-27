@@ -388,6 +388,14 @@ the field (narrowing later is the `schema:` drift policy's job). In `json_column
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **atomic** for `write_mode: upsert|delete`, otherwise **best-effort** — keyed writes run in one transaction; appends commit per chunk and isolate failing rows. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
@@ -400,3 +408,6 @@ swapped in one transaction (`DELETE` + `INSERT` over the explicit non-IDENTITY
 column list + `DROP`) only after the run succeeds, so a mid-run failure leaves
 the previous rows intact. No `key` is needed; the target table must already
 exist.
+
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). The next overwrite run replaces it.

@@ -350,6 +350,7 @@ pub(crate) async fn execute(
     let run_fut = run_expanded(
         nodes,
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: pipeline_name.clone(),
             run_id: None,
             execution: cfg.execution.clone(),
@@ -626,6 +627,12 @@ pub(crate) struct RunRowSummary {
     /// Cost & usage of the invocation (#704), estimates labelled as such.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::usage::UsageRecord>,
+    /// How the sink writes ended (#737).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batches: Option<faucet_core::BatchOutcomes>,
+    /// The source's lag at the end of the run (#733).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_lag: Option<faucet_core::SourceLag>,
 }
 
 /// Aggregate counters across every row.
@@ -670,6 +677,8 @@ pub(crate) fn summary_rows(summary: &RunSummary) -> Vec<RunRowSummary> {
                 bookmark: m.bookmark,
                 error: o.error.clone(),
                 usage: o.usage.clone(),
+                batches: m.batches,
+                source_lag: m.source_lag,
             }
         })
         .collect()
@@ -784,6 +793,7 @@ mod tests {
         eprintln!("commands::run::execute future: {size} bytes");
         let nodes = crate::expand::expand(&cfg).unwrap();
         let opts = crate::executor::ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: "p".into(),
             run_id: None,
             execution: None,
@@ -836,6 +846,8 @@ mod tests {
                 records_read: Some(written as u64),
                 dlq_count: 0,
                 bookmark: None,
+                batches: None,
+                source_lag: None,
             }),
             usage: None,
         }

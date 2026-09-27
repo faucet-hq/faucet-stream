@@ -70,6 +70,7 @@ async fn fresh_sink() -> (
         rollback: None,
     };
     let sink = MysqlSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     (container, permit, url, sink)
 }
 

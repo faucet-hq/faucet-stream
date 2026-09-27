@@ -123,6 +123,10 @@ impl GcsSink {
 
 #[async_trait]
 impl faucet_core::Sink for GcsSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn set_roundtrip_recorder(
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,

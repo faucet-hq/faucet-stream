@@ -1,0 +1,1 @@
+{"faucet_state": 1, "owner": "kafka", "schema": 0, "data": {"__faucet_eo": 1, "bookmark": {"partition_offsets": [{"topic": "orders", "partition": 0, "offset": 1234}, {"topic": "orders", "partition": 1, "offset": 987}]}, "seq": 7}}

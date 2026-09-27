@@ -162,6 +162,12 @@ impl std::fmt::Debug for DatabricksSinkConfig {
 }
 
 impl DatabricksSinkConfig {
+    /// What a failed write leaves behind: a page may span several statements,
+    /// and the statements before the failing one have committed.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+
     /// A config with every optional field at its default.
     pub fn new(
         workspace_url: impl Into<String>,
@@ -261,6 +267,10 @@ mod tests {
 
     #[test]
     fn defaults_validate() {
+        assert_eq!(
+            base().batch_atomicity(),
+            faucet_core::BatchAtomicity::BestEffort
+        );
         let c = base();
         c.validate().unwrap();
         assert!(c.create_table);

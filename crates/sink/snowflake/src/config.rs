@@ -227,6 +227,17 @@ impl SnowflakeSinkConfig {
     }
 }
 
+impl SnowflakeSinkConfig {
+    /// What a failed batch write leaves behind (#737): a commit group is one INSERT only when unchunked.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.batch_size == 0 {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +367,13 @@ mod tests {
         }"#;
         let config: SnowflakeSinkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.batch_size, faucet_core::DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: SnowflakeSinkConfig = serde_json::from_value(serde_json::json!({"account": "xy12345", "warehouse": "W", "database": "D", "schema": "S", "table": "events", "auth": {"type": "oauth", "config": {"token": "tok"}}})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: SnowflakeSinkConfig = serde_json::from_value(serde_json::json!({"account": "xy12345", "warehouse": "W", "database": "D", "schema": "S", "table": "events", "auth": {"type": "oauth", "config": {"token": "tok"}}, "batch_size": 0})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

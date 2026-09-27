@@ -40,9 +40,11 @@ pipeline:
         type: service_account_key
         config:
           json: ${env:GCP_KEY_JSON}
-      # batch_size here is the initial write size; the controller will tune it
-      # at runtime between `min` and `max` (capped at the source page size).
-      batch_size: 1000
+      # One insertAll request per write: the adaptive controller picks the
+      # write size, and a failed write lands nothing — which is what makes
+      # `on_batch_error: dlq_all` below safe (a chunked write could land part
+      # of a batch and the DLQ replay would duplicate it; faucet refuses that).
+      batch_size: 0
 
   dlq:
     # BigQuery's insertAll API reports per-row failures; the DLQ captures just

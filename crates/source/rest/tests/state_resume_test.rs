@@ -86,7 +86,11 @@ async fn rest_source_resumes_from_file_state_store_across_runs() {
     assert_eq!(result1.records_written, 3, "first run sees all records");
     assert_eq!(result1.bookmark, Some(json!("2026-03-01")));
     assert_eq!(
-        store.get("rest_events_stream").await.unwrap(),
+        store
+            .get("rest_events_stream")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!("2026-03-01")),
         "bookmark persisted to the file state store"
     );
@@ -127,7 +131,11 @@ async fn rest_source_resumes_from_file_state_store_across_runs() {
     );
     assert_eq!(result2.bookmark, Some(json!("2026-04-01")));
     assert_eq!(
-        store.get("rest_events_stream").await.unwrap(),
+        store
+            .get("rest_events_stream")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!("2026-04-01")),
         "bookmark advances to the new max"
     );
@@ -169,7 +177,11 @@ async fn rest_source_with_state_store_but_no_stored_bookmark_emits_all_records()
 
     assert_eq!(result.records_written, 2);
     assert_eq!(
-        store.get("rest_events_stream").await.unwrap(),
+        store
+            .get("rest_events_stream")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(json!("2026-06-01"))
     );
 }

@@ -232,7 +232,9 @@ async fn pipeline_persists_and_resumes_the_bookmark() {
         "second run reads only the new append"
     );
     assert_eq!(sink.rows.lock().unwrap().len(), 2);
-    let saved = store.get("iceberg:db.pipe").await.unwrap().unwrap();
+    let saved = faucet_core::state_version::peel_versioned(
+        &store.get("iceberg:db.pipe").await.unwrap().unwrap(),
+    );
     assert_eq!(
         saved["snapshot_id"],
         json!(lake.snapshots("pipe").await[1].0)

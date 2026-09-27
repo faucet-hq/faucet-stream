@@ -360,6 +360,14 @@ the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **atomic** for an unchunked Parquet write (`format: parquet`, `batch_size: 0`, no `max_records_per_file`), otherwise **best-effort** — only an unchunked Parquet batch is one object upload. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

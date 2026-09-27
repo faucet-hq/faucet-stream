@@ -82,6 +82,12 @@ fn default_concurrency() -> usize {
 }
 
 impl DynamoDbSinkConfig {
+    /// What a failed write leaves behind: every row gets its own outcome, and
+    /// an outer error means nothing was sent.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::PerRow
+    }
+
     /// Append config with defaults for everything but the table name.
     pub fn new(table_name: impl Into<String>) -> Self {
         Self {
@@ -162,6 +168,14 @@ impl DynamoDbSinkConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        assert_eq!(
+            DynamoDbSinkConfig::new("t").batch_atomicity(),
+            faucet_core::BatchAtomicity::PerRow
+        );
+    }
 
     #[test]
     fn defaults_and_validation() {

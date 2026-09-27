@@ -156,6 +156,13 @@ impl PubsubSinkConfig {
     }
 }
 
+impl PubsubSinkConfig {
+    /// What a failed batch write leaves behind (#737): every publish reports its own outcome; there is no batch-level error.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::PerRow
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +235,13 @@ concurrency: 8
         assert_eq!(c.attributes_field.as_deref(), Some("__attributes"));
         assert_eq!(c.batch_size, 250);
         assert_eq!(c.concurrency, 8);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        assert_eq!(
+            PubsubSinkConfig::new("orders").batch_atomicity(),
+            faucet_core::BatchAtomicity::PerRow
+        );
     }
 }

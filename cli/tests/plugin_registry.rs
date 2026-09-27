@@ -77,6 +77,10 @@ async fn custom_connectors_flow_from_yaml() {
         );
     registry.install().expect("registry installs cleanly");
 
+    // A plugin source's bookmarks are owned by its own connector name (#736).
+    let codec = registry::state_codec_for(Some(("mock-source", &json!({}))));
+    assert_eq!((codec.owner.as_str(), codec.schema), ("mock-source", 0));
+
     // `faucet list` / `faucet schema` surface the custom connectors.
     assert!(
         registry::source_descriptions()

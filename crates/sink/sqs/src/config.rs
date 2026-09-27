@@ -161,6 +161,13 @@ impl SqsSinkConfig {
     }
 }
 
+impl SqsSinkConfig {
+    /// What a failed batch write leaves behind (#737): SendMessageBatch requests run concurrently and retry per entry.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +251,13 @@ retry_max_attempts: 3
         let r = blocked.retry_spec();
         assert_eq!(r.max_backoff_ms, 25);
         assert_eq!(r.max_attempts, 5, "block default, not the flat 9");
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: SqsSinkConfig =
+            serde_json::from_value(serde_json::json!({"queue_url": "https://sqs.example/q"}))
+                .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

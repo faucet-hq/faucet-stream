@@ -17,6 +17,7 @@ use serde_json::json;
 
 fn opts(name: &str, concurrency: Option<usize>) -> ExecuteOptions {
     ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: name.into(),
         run_id: None,
         execution: None,

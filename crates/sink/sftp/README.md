@@ -115,3 +115,10 @@ the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
 
+## Batch atomicity
+
+What a failed write leaves behind (#737): **best-effort** — each file is atomic, but one batch can span several files. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).

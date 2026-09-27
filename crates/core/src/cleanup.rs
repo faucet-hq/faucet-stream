@@ -344,6 +344,9 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn sink_guarantee(&self) -> crate::idempotency::SinkGuarantee {
         self.inner.sink_guarantee()
     }
@@ -457,6 +460,10 @@ mod tests {
         let policy = CleanupPolicy::new(scope(), vec!["id".into()], 10).unwrap();
         let tracker = CleanupTracker::new(&inner, &policy);
         assert!(tracker.is_overwrite());
+        assert_eq!(
+            tracker.batch_atomicity(),
+            crate::dlq::BatchAtomicity::BestEffort
+        );
         // A write through the tracker must forward to the inner sink too.
         assert_eq!(tracker.write_batch(&[json!({"id": 1})]).await.unwrap(), 1);
         tracker.begin_overwrite().await.unwrap();

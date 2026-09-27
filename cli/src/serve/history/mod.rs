@@ -95,6 +95,12 @@ pub struct InvocationRecord {
     /// before it existed still load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::usage::UsageRecord>,
+    /// How the invocation's sink writes ended (#737).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batches: Option<faucet_core::BatchOutcomes>,
+    /// The source's lag when the invocation ended (#733).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_lag: Option<faucet_core::SourceLag>,
 }
 
 impl From<&InvocationOutcome> for InvocationRecord {
@@ -107,6 +113,8 @@ impl From<&InvocationOutcome> for InvocationRecord {
             duration_ms: o.metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
             error: o.error.clone(),
             usage: o.usage.clone(),
+            batches: o.metrics.as_ref().and_then(|m| m.batches),
+            source_lag: o.metrics.as_ref().and_then(|m| m.source_lag),
         }
     }
 }
@@ -241,6 +249,8 @@ pub struct InstanceHeartbeat {
     pub listen: Option<String>,
     pub max_concurrent: u32,
     pub in_flight: u32,
+    /// The newest state format this instance reads (#736).
+    pub state_format: u32,
 }
 
 /// One live cluster member (for `/readyz` + metrics).
@@ -252,6 +262,19 @@ pub struct InstanceRecord {
     pub listen: Option<String>,
     pub max_concurrent: u32,
     pub in_flight: u32,
+    /// The newest state format the member reads (#736); `0` for a member that
+    /// predates versioned state (it never advertised one).
+    pub state_format: u32,
+}
+
+/// The state format every live member reads (#736): the lowest any of them
+/// advertises, or this release's when there are none.
+pub fn cluster_state_format(members: &[InstanceRecord]) -> u32 {
+    members
+        .iter()
+        .map(|m| m.state_format)
+        .min()
+        .unwrap_or(faucet_core::state_version::STATE_FORMAT)
 }
 
 /// Filter + pagination for `list`. `limit`/`cursor` are resolved by the handler.

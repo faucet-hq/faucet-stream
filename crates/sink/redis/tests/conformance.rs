@@ -70,6 +70,7 @@ mod idempotent {
         ))
         .await
         .expect("sink build");
+        faucet_conformance::assert_batch_atomicity_declared(&sink);
         (container, url, sink)
     }
 

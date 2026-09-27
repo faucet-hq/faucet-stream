@@ -1089,6 +1089,11 @@ pub struct DlqSpec {
     /// Include each failed record's original payload in its DLQ envelope.
     #[serde(default = "default_true")]
     pub include_original_payload: bool,
+    /// Accept `on_batch_error: dlq_all` on a sink that may commit part of a
+    /// failed batch. Rows that already landed are sent to the DLQ too, so a
+    /// replay writes them twice. Without it that combination is refused.
+    #[serde(default)]
+    pub allow_duplicates_on_dlq_all: bool,
 }
 
 /// User-facing `resilience:` config. Maps to `faucet_core::ResiliencePolicy`.

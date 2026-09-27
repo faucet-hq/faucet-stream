@@ -148,6 +148,17 @@ impl MysqlSinkConfig {
     }
 }
 
+impl MysqlSinkConfig {
+    /// What a failed batch write leaves behind (#737): keyed writes run in one transaction; appends are autocommit statements.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.write.dedups_by_key() {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +273,16 @@ mod tests {
             MysqlColumnMapping::Json { .. }
         ));
         assert_eq!(config.batch_size, DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: MysqlSinkConfig = serde_json::from_value(
+            serde_json::json!({"connection_url": "mysql://localhost/test", "table_name": "events"}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: MysqlSinkConfig = serde_json::from_value(serde_json::json!({"connection_url": "mysql://localhost/test", "table_name": "events", "write_mode": "delete", "key": ["id"]})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

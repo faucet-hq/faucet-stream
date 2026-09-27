@@ -118,6 +118,24 @@ pub enum FaucetError {
     #[error("State error: {0}")]
     State(String),
 
+    /// A stored state value this release or this source cannot read (#736):
+    /// written by a newer faucet (a newer state format or bookmark schema) or
+    /// by a different source. Raised before anything is read from the source,
+    /// instead of guessing at the shape — which would silently re-sync or skip.
+    #[error(
+        "state '{key}' is incompatible: found {found}, expected {expected} — it was written by a \
+         newer faucet or by a different source; run the release that wrote it, or reset the row \
+         (`faucet state reset`) after confirming where it should resume"
+    )]
+    StateIncompatible {
+        /// The state key.
+        key: String,
+        /// What is stored.
+        found: String,
+        /// What this release and source read.
+        expected: String,
+    },
+
     /// The resilience circuit breaker opened after repeated failures; the run
     /// is aborted fast. `cooldown` is advisory for the orchestration layer
     /// (e.g. `faucet schedule` delays re-entry by this duration).

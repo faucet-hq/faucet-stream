@@ -129,6 +129,13 @@ impl SpannerSinkConfig {
     }
 }
 
+impl SpannerSinkConfig {
+    /// What a failed batch write leaves behind (#737): mutations commit in 60,000-cell chunks.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +241,11 @@ mod tests {
                 .with_create_table(false)
                 .create_table
         );
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: SpannerSinkConfig = serde_json::from_value(serde_json::json!({"project_id": "p", "instance": "i", "database": "d", "table_name": "t"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

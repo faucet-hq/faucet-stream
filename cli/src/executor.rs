@@ -90,6 +90,9 @@ impl StateScope {
 
 /// Knobs passed to [`run_expanded`].
 pub struct ExecuteOptions {
+    /// Store bookmarks bare instead of in the versioned envelope (#736): a
+    /// `faucet serve --cluster` member that predates it is still live.
+    pub legacy_state_writes: bool,
     /// Pipeline name — used in log lines and as the first segment of every
     /// state key.
     pub pipeline_name: String,
@@ -360,6 +363,27 @@ pub struct InvocationMetrics {
     pub records_read: Option<u64>,
     pub dlq_count: u64,
     pub bookmark: Option<Value>,
+    /// How the sink writes ended (#737); `None` when nothing was written.
+    pub batches: Option<faucet_core::BatchOutcomes>,
+    /// The source's lag at the end of the run (#733), when it reports one.
+    pub source_lag: Option<faucet_core::SourceLag>,
+}
+
+/// Counters one invocation's pipeline fills in and the caller reads afterwards
+/// — on failure too: usage (#704), batch outcomes (#737) and source lag (#733).
+#[derive(Clone, Default)]
+pub(crate) struct RunObservers {
+    pub(crate) meter: Arc<faucet_core::UsageMeter>,
+    pub(crate) batches: Arc<faucet_core::BatchOutcomeCounters>,
+    pub(crate) lag: Arc<faucet_core::LagObserver>,
+}
+
+impl RunObservers {
+    /// Batch outcomes, when any write was attempted.
+    pub(crate) fn batch_outcomes(&self) -> Option<faucet_core::BatchOutcomes> {
+        let b = self.batches.snapshot();
+        (!b.is_empty()).then_some(b)
+    }
 }
 
 /// What [`run_one_invocation`] hands back on success alongside the captured
@@ -1274,7 +1298,18 @@ async fn run_unit(
     // inside `run_one_invocation`, so a failed invocation still gets a usage
     // record: what it read and wrote before failing cost something too.
     let run_id = uuid::Uuid::now_v7().to_string();
-    let meter = Arc::new(faucet_core::UsageMeter::default());
+    let observers = RunObservers::default();
+    let meter = Arc::clone(&observers.meter);
+    // Run lease + run-outcome marker (#732 / #735): what `faucet status`
+    // reports and what `faucet state` refuses to change under a live run.
+    let cancel_seen = cancel.clone();
+    let markers = crate::pipeline_state::markers::RunMarkers::begin(
+        markers_store(&unit.node, opts).await,
+        &unit.state_key,
+        &run_id,
+        matches!(unit.node.role, NodeRole::Root | NodeRole::Product { .. }),
+    )
+    .await;
     let result = boxed_run_one_invocation(
         &unit.node,
         unit.parent_record.as_deref(),
@@ -1286,10 +1321,27 @@ async fn run_unit(
         suppress_overwrite,
         overwrite_grouped,
         run_id.clone(),
-        Arc::clone(&meter),
+        observers.clone(),
+        markers.store.clone(),
     )
     .await;
     let duration_ms = started.elapsed().as_millis() as u64;
+    markers
+        .finish(
+            unit.state_key.clone(),
+            run_id.clone(),
+            match &result {
+                Ok((_, stats)) => Ok(stats.records_written as u64),
+                Err(e) => Err((crate::pipeline_state::markers::error_kind(e), e.to_string())),
+            },
+            duration_ms,
+            !cancel_seen.is_cancelled(),
+            crate::pipeline_state::markers::OutcomeExtras {
+                batches: observers.batch_outcomes(),
+                lag: observers.lag.last(),
+            },
+        )
+        .await;
     let row_id = unit.node.id.clone();
     let parent_record_key = unit.parent_record_key.clone();
     let usage = build_usage_record(
@@ -1320,6 +1372,8 @@ async fn run_unit(
         source_kind: unit.node.source.kind.clone(),
         sink_kind: unit.node.sink.kind.clone(),
         duration_ms,
+        batches: observers.batch_outcomes(),
+        source_lag: observers.lag.last(),
         ..Default::default()
     };
     match result {
@@ -1458,7 +1512,8 @@ fn boxed_run_one_invocation<'a>(
     suppress_overwrite: bool,
     overwrite_grouped: bool,
     run_id: String,
-    meter: Arc<faucet_core::UsageMeter>,
+    observers: RunObservers,
+    prebuilt_state: Option<Arc<dyn StateStore>>,
 ) -> futures::future::BoxFuture<'a, CliResult<(Vec<Value>, PipelineStats)>> {
     Box::pin(run_one_invocation(
         node,
@@ -1471,8 +1526,32 @@ fn boxed_run_one_invocation<'a>(
         suppress_overwrite,
         overwrite_grouped,
         run_id,
-        meter,
+        observers,
+        prebuilt_state,
     ))
+}
+
+/// The durable store the run lease and run-outcome marker are written to —
+/// `None` for preview / `--limit` / shard runs and memory or absent state,
+/// whose markers would describe nothing durable.
+fn markers_store<'a>(
+    node: &'a ExpandedNode,
+    opts: &'a ExecuteOptions,
+) -> futures::future::BoxFuture<'a, Option<Arc<dyn StateStore>>> {
+    Box::pin(async move {
+        let durable = opts.state_path_override.is_some()
+            || node.state.as_ref().is_some_and(|s| s.kind != "memory");
+        if !durable || opts.dry_run || opts.limit.is_some() || opts.shard.is_some() {
+            return None;
+        }
+        match build_state_for_node(node, opts.state_path_override.as_deref()).await {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!(row = %node.id, error = %e, "run markers skipped: state store unavailable");
+                None
+            }
+        }
+    })
 }
 
 /// Run a discovery row (#501): build its source, drain it, project `select`,
@@ -1776,19 +1855,24 @@ async fn build_pipeline<'a>(
     run_id: &str,
     cleanup_scope: Option<Value>,
     suppress_overwrite: bool,
-    meter: Arc<faucet_core::UsageMeter>,
+    observers: RunObservers,
 ) -> CliResult<Pipeline<'a, dyn Source + 'a, dyn Sink + 'a>> {
     let mut pipeline = Pipeline::new(source, sink)
         .with_name(pipeline_name.to_owned())
         .with_row(row_id.to_owned())
         .with_run_id(run_id.to_owned())
-        .with_usage_meter(meter);
+        .with_usage_meter(observers.meter)
+        .with_batch_outcomes(observers.batches)
+        .with_lag_observer(observers.lag)
+        .with_legacy_state_writes(opts.legacy_state_writes);
     if let Some(store) = state {
         pipeline = pipeline.with_state_store(store);
     }
     if let Some(ref dlq_spec) = node.dlq {
         let dlq_cfg = build_dlq_config(dlq_spec).await?;
-        pipeline = pipeline.with_dlq(dlq_cfg);
+        pipeline = pipeline
+            .with_dlq(dlq_cfg)
+            .allow_dlq_all_duplicates(dlq_spec.allow_duplicates_on_dlq_all);
     }
     // Cooperative cancellation: a cancelled token makes the streaming loop stop
     // at the next page boundary and flush the sink (#146 H16). The pipeline takes
@@ -1924,7 +2008,8 @@ async fn run_one_invocation(
     suppress_overwrite: bool,
     overwrite_grouped: bool,
     run_id: String,
-    meter: Arc<faucet_core::UsageMeter>,
+    observers: RunObservers,
+    prebuilt_state: Option<Arc<dyn StateStore>>,
 ) -> CliResult<(Vec<Value>, PipelineStats)> {
     // Observability identity for this invocation — created by the caller
     // (`run_unit`), reused by both the Pipeline builder and the transform
@@ -2231,7 +2316,10 @@ async fn run_one_invocation(
     // 4) Build state store. If the source opts into state, wrap it so the
     //    executor's per-row state key is used instead of the source's natural
     //    one (which is shared across all matrix rows of the same kind).
-    let state = build_state_for_node(node, opts.state_path_override.as_deref()).await?;
+    let state = match prebuilt_state {
+        Some(store) => Some(store),
+        None => build_state_for_node(node, opts.state_path_override.as_deref()).await?,
+    };
     // Preview modes must not persist bookmarks: the counting/truncating sinks
     // return `Ok` without a real write, so a persisted (advanced) bookmark would
     // make the next real run skip unwritten records (#321 H1). Wrap the store so
@@ -2380,7 +2468,7 @@ async fn run_one_invocation(
         &run_id,
         cleanup_scope,
         suppress_overwrite,
-        Arc::clone(&meter),
+        observers.clone(),
     )
     .await?;
     // ── Lineage: START + heartbeat + terminal ────────────────────────────────
@@ -2646,7 +2734,7 @@ async fn run_one_invocation(
             },
             Err(_) => crate::sla::RunOutcome::Failure,
         };
-        crate::sla::evaluate_post_run(
+        let mut v = crate::sla::evaluate_post_run(
             spec,
             sla_store.as_ref(),
             state_key,
@@ -2655,7 +2743,14 @@ async fn run_one_invocation(
             outcome,
             chrono::Utc::now().timestamp(),
         )
-        .await
+        .await;
+        v.extend(crate::sla::evaluate_lag_post_run(
+            spec,
+            &obs_labels.pipeline,
+            &obs_labels.row,
+            observers.lag.last().as_ref(),
+        ));
+        v
     } else {
         Vec::new()
     };
@@ -3187,6 +3282,17 @@ impl Source for StateKeyOverride {
     async fn capture_resume_position(&self) -> Result<Option<Value>, FaucetError> {
         self.inner.capture_resume_position().await
     }
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        self.inner.lag().await
+    }
+
+    fn state_schema(&self) -> u32 {
+        self.inner.state_schema()
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        self.inner.migrate_state(from, data)
+    }
     // Forward the fast-path capabilities so wrapping the source for a per-row
     // state key never silently disables the columnar (#375) or native
     // byte-passthrough (#633) transfer paths.
@@ -3293,6 +3399,9 @@ impl Sink for CapturingSink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn supported_write_modes(&self) -> &'static [faucet_core::WriteMode] {
         self.inner.supported_write_modes()
     }
@@ -3369,6 +3478,12 @@ impl Sink for LimitedSink {
     async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
         self.inner.local_outputs().await
     }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
+    fn dedups_by_key(&self) -> bool {
+        self.inner.dedups_by_key()
+    }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         let remaining = self.remaining.load(Ordering::Relaxed);
         if remaining == 0 {
@@ -3404,6 +3519,9 @@ impl CountingSink {
 impl Sink for CountingSink {
     fn connector_name(&self) -> &'static str {
         "dry-run"
+    }
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::Atomic
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         self.seen.fetch_add(records.len(), Ordering::Relaxed);
@@ -3795,6 +3913,7 @@ mod tests {
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "t".into(),
                 run_id: None,
                 execution: None,
@@ -3841,6 +3960,7 @@ mod tests {
 
     fn exec_opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -4044,7 +4164,8 @@ mod tests {
             false,
             false,
             "size".to_string(),
-            Arc::new(faucet_core::UsageMeter::default()),
+            RunObservers::default(),
+            None,
         );
         let size = std::mem::size_of_val(&fut);
         drop(fut);
@@ -4349,6 +4470,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "matrix".into(),
                 run_id: None,
                 execution: None,
@@ -4419,6 +4541,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "dagtest".into(),
                 run_id: None,
                 execution: None,
@@ -4654,6 +4777,7 @@ execution:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "stoptest".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -4749,6 +4873,7 @@ pipeline:
         let err = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "bad name".into(), // space is illegal in a state key
                 run_id: None,
                 execution: None,
@@ -4818,6 +4943,7 @@ matrix:
         let err = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "ok".into(),
                 run_id: None,
                 execution: None,
@@ -4896,6 +5022,7 @@ execution:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "stop_parallel".into(),
                 run_id: None,
                 execution: cfg.execution.clone(),
@@ -4975,6 +5102,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "continuetest".into(),
                 run_id: None,
                 execution: None,
@@ -5263,6 +5391,7 @@ matrix:
     /// Helper: minimal `ExecuteOptions` with all optional knobs cleared.
     fn opts(name: &str) -> ExecuteOptions {
         ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name: name.into(),
             run_id: None,
             execution: None,
@@ -5469,6 +5598,7 @@ matrix:
             max_failures_per_page: Some(7),
             max_failures_total: Some(42),
             include_original_payload: false,
+            allow_duplicates_on_dlq_all: false,
         };
         let cfg = build_dlq_config(&spec).await.unwrap();
         assert!(matches!(cfg.on_batch_error, OnBatchError::DlqAll));
@@ -5626,6 +5756,7 @@ matrix:
             faucet_core::ReplayGuarantee::NonDeterministic
         );
         assert_eq!(ov.capture_resume_position().await.unwrap(), None);
+        assert_eq!(ov.lag().await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -5738,6 +5869,10 @@ matrix:
         // inner sink's delivery semantics.
         assert!(sink.supports_idempotent_writes());
         assert!(sink.dedups_by_key());
+        assert_eq!(
+            sink.batch_atomicity(),
+            faucet_core::BatchAtomicity::BestEffort
+        );
         assert_eq!(
             sink.sink_guarantee(),
             faucet_core::SinkGuarantee::AtomicWatermark
@@ -5979,6 +6114,7 @@ matrix:
         let summary = run_expanded(
             nodes,
             ExecuteOptions {
+                legacy_state_writes: false,
                 pipeline_name: "projtest".into(),
                 run_id: None,
                 execution: None,

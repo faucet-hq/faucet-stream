@@ -298,6 +298,28 @@ impl S3SinkConfig {
     }
 }
 
+impl S3SinkConfig {
+    fn single_parquet_object(&self) -> bool {
+        #[cfg(feature = "arrow")]
+        {
+            matches!(self.format, S3SinkFormat::Parquet) && self.effective_chunk_cap().is_none()
+        }
+        #[cfg(not(feature = "arrow"))]
+        {
+            false
+        }
+    }
+
+    /// What a failed batch write leaves behind (#737): only an unchunked Parquet batch is one object upload.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.single_parquet_object() {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +552,17 @@ mod tests {
         // Both are caps, so the tighter one binds — in either direction.
         assert_eq!(with(100, Some(500)), Some(100));
         assert_eq!(with(500, Some(100)), Some(100));
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        #[cfg(feature = "arrow")]
+        {
+            let c: S3SinkConfig = serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "p/", "file_extension": ".parquet", "concurrency": 10, "format": "parquet", "batch_size": 0})).unwrap();
+            assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        }
+        let c: S3SinkConfig =
+            serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "", "file_extension": ".jsonl", "concurrency": 10})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

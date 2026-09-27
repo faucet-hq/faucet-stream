@@ -378,6 +378,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
     // transform *config* fails validation too.
     check_transforms(&nodes)?;
     check_connector_configs(&nodes)?;
+    check_dlq_all_safety(&nodes)?;
 
     // Data-flow policy (#702): the static verdict per row. Reported in both
     // output modes; any violation makes the config invalid (exit code =
@@ -611,6 +612,42 @@ fn check_connector_configs(nodes: &[crate::expand::ExpandedNode]) -> CliResult<(
         }
     }
     Ok(())
+}
+
+/// Refuse `on_batch_error: dlq_all` on a row whose sink may commit part of a
+/// failed batch (#737), unless it writes by key or the DLQ block sets
+/// `allow_duplicates_on_dlq_all`. `faucet run` refuses the same combination
+/// before reading anything; this surfaces it offline.
+pub(crate) fn check_dlq_all_safety(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
+    for n in nodes {
+        let Some(dlq) = &n.dlq else { continue };
+        if dlq.on_batch_error != crate::config::OnBatchErrorSpec::DlqAll
+            || dlq.allow_duplicates_on_dlq_all
+            || matches!(n.role, crate::expand::NodeRole::Discovery { .. })
+        {
+            continue;
+        }
+        let atomicity =
+            crate::registry::sink_batch_atomicity(&n.sink.kind, &n.sink.config).unwrap_or_default();
+        if !faucet_core::dlq_all_is_safe(atomicity, sink_writes_by_key(&n.sink)) {
+            return Err(CliError::Config(format!(
+                "row '{}': {}",
+                n.id,
+                faucet_core::dlq_all_refusal(&n.sink.kind, atomicity)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the sink config asks for a keyed write (`write_mode: upsert|delete`
+/// with a `key`) the sink kind supports — a replayed row then overwrites itself.
+fn sink_writes_by_key(sink: &crate::config::ConnectorSpec) -> bool {
+    let Ok(spec) = serde_json::from_value::<faucet_core::WriteSpec>(sink.config.clone()) else {
+        return false;
+    };
+    spec.dedups_by_key()
+        && crate::registry::sink_supported_write_modes(&sink.kind).contains(&spec.write_mode)
 }
 
 /// Compile every row's transform chain.
@@ -881,5 +918,72 @@ matrix:
         )
         .unwrap();
         check_connector_configs(&expand(&cfg).unwrap()).expect("a declared-key config must pass");
+    }
+
+    fn dlq_nodes(sink: &str, dlq_extra: &str) -> Vec<crate::expand::ExpandedNode> {
+        let cfg = crate::config::parse_with_extension(
+            &format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: ./in.csv }} }}\n  sink: {sink}\n  dlq:\n    sink: {{ type: jsonl, config: {{ path: ./dlq.jsonl }} }}\n{dlq_extra}matrix:\n  - id: rowA\n"
+            ),
+            "yaml",
+        )
+        .unwrap();
+        expand(&cfg).unwrap()
+    }
+
+    #[cfg(all(feature = "sink-jsonl", feature = "sink-sqlite"))]
+    #[test]
+    fn dlq_all_is_refused_on_a_best_effort_sink_unless_safe_or_opted_in() {
+        let jsonl = "{ type: jsonl, config: { path: ./o } }";
+        let err = super::check_dlq_all_safety(&dlq_nodes(jsonl, "    on_batch_error: dlq_all\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rowA") && err.contains("'jsonl'"), "{err}");
+        assert!(err.contains("best_effort"), "{err}");
+
+        super::check_dlq_all_safety(&dlq_nodes(jsonl, "")).unwrap();
+        super::check_dlq_all_safety(&dlq_nodes(
+            jsonl,
+            "    on_batch_error: dlq_all\n    allow_duplicates_on_dlq_all: true\n",
+        ))
+        .unwrap();
+
+        let sqlite_atomic = "{ type: sqlite, config: { database_url: \"sqlite::memory:\", table_name: t, column_mapping: auto_map, batch_size: 0 } }";
+        super::check_dlq_all_safety(&dlq_nodes(sqlite_atomic, "    on_batch_error: dlq_all\n"))
+            .unwrap();
+
+        let sqlite_chunked = "{ type: sqlite, config: { database_url: \"sqlite::memory:\", table_name: t, column_mapping: auto_map } }";
+        assert!(
+            super::check_dlq_all_safety(&dlq_nodes(
+                sqlite_chunked,
+                "    on_batch_error: dlq_all\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn keyed_writes_make_dlq_all_safe() {
+        let keyed = crate::config::ConnectorSpec {
+            kind: "sqlite".into(),
+            config: serde_json::json!({"write_mode": "upsert", "key": ["id"]}),
+            transforms: None,
+            inherit_transforms: true,
+            status: None,
+            tags: Vec::new(),
+            complete_for: None,
+            attributes: Default::default(),
+        };
+        assert!(super::sink_writes_by_key(&keyed));
+        let unsupported = crate::config::ConnectorSpec {
+            kind: "jsonl".into(),
+            ..keyed.clone()
+        };
+        assert!(!super::sink_writes_by_key(&unsupported));
+        let broken = crate::config::ConnectorSpec {
+            config: serde_json::json!({"write_mode": 7}),
+            ..keyed
+        };
+        assert!(!super::sink_writes_by_key(&broken));
     }
 }

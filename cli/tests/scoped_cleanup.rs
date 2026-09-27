@@ -83,6 +83,7 @@ pipeline:
 
 fn opts(name: &str) -> ExecuteOptions {
     ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: name.into(),
         run_id: None,
         execution: None,

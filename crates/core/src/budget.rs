@@ -372,6 +372,9 @@ impl Sink for BudgetSink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
         self.inner.supported_write_modes()
     }
@@ -584,6 +587,7 @@ mod tests {
         let inner = CountingSink(AtomicUsize::new(0));
         sink.flush().await.unwrap();
         assert_eq!(sink.connector_name(), inner.connector_name());
+        assert_eq!(sink.batch_atomicity(), inner.batch_atomicity());
         assert_eq!(sink.dataset_uri(), inner.dataset_uri());
         assert!(sink.local_outputs().await.is_empty());
         assert_eq!(

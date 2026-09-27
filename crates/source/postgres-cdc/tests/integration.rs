@@ -504,3 +504,59 @@ async fn capture_resume_position_rejects_temporary_slot() {
         "expected a permanent-slot error, got: {err}"
     );
 }
+
+/// #733 — a stuck consumer's slot lag grows as WAL piles up behind it, and
+/// shrinks once the changes are read; a slot that does not exist has no lag.
+#[tokio::test(flavor = "multi_thread")]
+async fn slot_lag_grows_while_unconsumed_and_shrinks_once_read() {
+    let (_pg, url) = start_postgres().await;
+    ddl(
+        &url,
+        "CREATE TABLE public.lagged (id int4 PRIMARY KEY, pad text); \
+         CREATE PUBLICATION lag_pub FOR TABLE public.lagged;",
+    )
+    .await;
+
+    let missing = PostgresCdcSource::new(PostgresCdcSourceConfig {
+        create_slot_if_missing: false,
+        ..cfg(&url, "no_such_slot", "lag_pub")
+    })
+    .await
+    .expect("source");
+    assert_eq!(missing.lag().await.expect("lag"), None);
+
+    let source = PostgresCdcSource::new(cfg(&url, "lag_slot", "lag_pub"))
+        .await
+        .expect("source");
+    let _ = source.fetch_all_incremental().await.expect("warm-up");
+    let idle = source.lag().await.expect("lag").expect("slot exists");
+
+    ddl(
+        &url,
+        "INSERT INTO public.lagged SELECT g, repeat('x', 512) FROM generate_series(1, 500) g;",
+    )
+    .await;
+    let stuck = source.lag().await.expect("lag").expect("slot exists");
+    assert!(
+        stuck.bytes.unwrap() > idle.bytes.unwrap() + 500 * 512,
+        "the unread insert shows up as slot lag: {stuck:?} vs {idle:?}"
+    );
+    ddl(
+        &url,
+        "INSERT INTO public.lagged SELECT g, repeat('y', 512) FROM generate_series(501, 1000) g;",
+    )
+    .await;
+    let stuck_more = source.lag().await.expect("lag").expect("slot exists");
+    assert!(
+        stuck_more.bytes > stuck.bytes,
+        "lag keeps growing while nothing consumes: {stuck_more:?} vs {stuck:?}"
+    );
+
+    let (records, _) = source.fetch_all_incremental().await.expect("fetch");
+    assert_eq!(records.iter().filter(|r| r["op"] == "insert").count(), 1000);
+    let caught_up = source.lag().await.expect("lag").expect("slot exists");
+    assert!(
+        caught_up.bytes < stuck_more.bytes,
+        "reading the changes shrinks the lag: {caught_up:?} vs {stuck_more:?}"
+    );
+}

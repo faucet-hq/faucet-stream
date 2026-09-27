@@ -45,9 +45,18 @@ pub struct MysqlCdcSource {
     /// Bookmark provided by `apply_start_bookmark`, applied at the start of
     /// the next fetch cycle to skip already-consumed events.
     pending_bookmark: Mutex<Option<Bookmark>>,
+    /// Last binlog position handed to the pipeline on a page bookmark this
+    /// run — where [`Source::lag`] measures from (#733).
+    emitted: std::sync::Mutex<Option<(String, u64)>>,
 }
 
 impl MysqlCdcSource {
+    fn note_emitted(&self, bm: &Bookmark) {
+        if let (Bookmark::FilePos { file, pos }, Ok(mut g)) = (bm, self.emitted.lock()) {
+            *g = Some((file.clone(), *pos));
+        }
+    }
+
     /// Build and preflight-check the source.
     ///
     /// Runs `config.validate()`, builds TLS-aware `Opts`, then opens a
@@ -71,6 +80,7 @@ impl MysqlCdcSource {
             opts,
             state_key_value: key,
             pending_bookmark: Mutex::new(None),
+            emitted: std::sync::Mutex::new(None),
         })
     }
 }
@@ -130,6 +140,35 @@ impl Source for MysqlCdcSource {
         let (file, pos) = current_binlog_position(&mut conn).await?;
         drop(conn);
         Ok(Some(Bookmark::FilePos { file, pos }.to_value()?))
+    }
+
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        let emitted = self.emitted.lock().ok().and_then(|g| g.clone());
+        let from = match emitted {
+            Some(p) => Some(p),
+            None => match &*self.pending_bookmark.lock().await {
+                Some(Bookmark::FilePos { file, pos }) => Some((file.clone(), *pos)),
+                _ => None,
+            },
+        };
+        let Some((file, pos)) = from else {
+            return Ok(None);
+        };
+        let mut conn = Conn::new(self.opts.clone())
+            .await
+            .map_err(|e| FaucetError::Source(format!("mysql-cdc: lag connect: {e}")))?;
+        let head = current_binlog_position(&mut conn).await?;
+        let logs: Vec<Row> = conn
+            .query("SHOW BINARY LOGS")
+            .await
+            .map_err(|e| FaucetError::Source(format!("mysql-cdc: SHOW BINARY LOGS: {e}")))?;
+        drop(conn);
+        let logs: Vec<(String, u64)> = logs
+            .into_iter()
+            .filter_map(|r| Some((r.get::<String, _>(0)?, r.get::<u64, _>(1)?)))
+            .collect();
+        Ok(binlog_distance(&logs, (&file, pos), (&head.0, head.1))
+            .map(faucet_core::SourceLag::bytes))
     }
 
     fn supports_exactly_once(&self) -> bool {
@@ -279,6 +318,7 @@ impl MysqlCdcSource {
                     let bm: Bookmark = $bm;
                     if per_transaction {
                         // Always yield — even an empty page advances the bookmark.
+                        self.note_emitted(&bm);
                         yield StreamPage {
                             records: std::mem::take(&mut buffer),
                             bookmark: Some(bm.to_value()?),
@@ -389,6 +429,7 @@ impl MysqlCdcSource {
                                             pos: log_pos,
                                         };
                                         if per_transaction {
+                                            self.note_emitted(&bm);
                                             yield StreamPage {
                                                 records: vec![envelope],
                                                 bookmark: Some(bm.to_value()?),
@@ -494,6 +535,7 @@ impl MysqlCdcSource {
                             && let Some(bm) = last_commit_bookmark.take()
                             && !agg_records.is_empty()
                         {
+                            self.note_emitted(&bm);
                             yield StreamPage {
                                 records: std::mem::take(&mut agg_records),
                                 bookmark: Some(bm.to_value()?),
@@ -599,6 +641,23 @@ async fn resolve_current(
     }
     let (file, pos) = current_binlog_position(conn).await?;
     Ok(ResolvedStart::FilePos { file, pos })
+}
+
+/// Bytes of binlog between `from` and `head`, across files: the rest of
+/// `from`'s file, every file in between, and `head`'s offset. `None` when
+/// `from`'s file is no longer listed (purged) or sits after the head.
+fn binlog_distance(logs: &[(String, u64)], from: (&str, u64), head: (&str, u64)) -> Option<u64> {
+    if from.0 == head.0 {
+        return Some(head.1.saturating_sub(from.1));
+    }
+    let start = logs.iter().position(|(n, _)| n == from.0)?;
+    let end = logs.iter().position(|(n, _)| n == head.0)?;
+    if end < start {
+        return None;
+    }
+    let rest_of_first = logs[start].1.saturating_sub(from.1);
+    let middle: u64 = logs[start + 1..end].iter().map(|(_, size)| *size).sum();
+    Some(rest_of_first + middle + head.1)
 }
 
 /// Read the server's current binlog coordinates.
@@ -1013,6 +1072,36 @@ async fn run_preflight(conn: &mut Conn, config: &MysqlCdcSourceConfig) -> Result
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn binlog_distance_spans_files() {
+        let logs = vec![
+            ("binlog.000001".to_string(), 1000),
+            ("binlog.000002".to_string(), 500),
+            ("binlog.000003".to_string(), 300),
+        ];
+        assert_eq!(
+            binlog_distance(&logs, ("binlog.000003", 100), ("binlog.000003", 300)),
+            Some(200)
+        );
+        assert_eq!(
+            binlog_distance(&logs, ("binlog.000001", 900), ("binlog.000003", 50)),
+            Some(100 + 500 + 50)
+        );
+        assert_eq!(
+            binlog_distance(&logs, ("binlog.000000", 4), ("binlog.000003", 50)),
+            None
+        );
+        assert_eq!(
+            binlog_distance(&logs, ("binlog.000003", 4), ("binlog.000001", 50)),
+            None
+        );
+        assert_eq!(
+            binlog_distance(&logs, ("binlog.000002", 600), ("binlog.000002", 10)),
+            Some(0)
+        );
+    }
+
     use super::*;
     use crate::state::Bookmark;
     use serde_json::json;

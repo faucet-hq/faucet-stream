@@ -667,7 +667,7 @@ tower = { version = "0.5", features = ["util"] }
 # faucet replicate snapshot→CDC integration tests (#189): real Postgres via
 # testcontainers; versions match crates/source/postgres-cdc/Cargo.toml.
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 # faucet backfill end-to-end tests (#282): seed/inspect the SQLite source and
 # destination DBs directly (offline — no Docker).
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }

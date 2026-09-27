@@ -486,6 +486,10 @@ impl OracleSink {
 
 #[async_trait]
 impl Sink for OracleSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.inner.config.batch_atomicity()
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);

@@ -116,6 +116,8 @@ faucet test tests/*.yaml                                    # offline fixture te
 faucet run pipeline.yaml                                    # one-shot run to completion
 faucet discover conn.yaml -o pipeline.yaml                  # introspect a database and generate a config
 faucet backfill pipeline.yaml --from 2026-06-01 --to 2026-07-01 --window 1d   # resumable historical replay
+faucet status pipeline.yaml                                 # one-screen health: last success, bookmark, DLQ, exit 0/1/2
+faucet state export pipeline.yaml -o backup.json            # back up / move / reset durable state (faucet state …)
 faucet schedule pipeline.yaml                               # run on a cron schedule (add a schedule: block)
 faucet serve --no-auth                                      # HTTP control plane: submit/poll/cancel runs over REST
 ```
@@ -210,6 +212,7 @@ one-block addition to your YAML:
 | **Upsert / delete write modes** | `write_mode: upsert \| delete` with a `key` + `delete_marker` — merge by key on Postgres / MySQL / SQL Server / SQLite / Mongo / Elasticsearch. | [upsert](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) |
 | **Data-quality checks** | 13 per-record and per-batch assertions (not-null, regex, ranges, uniqueness, row-count, JSON Schema, …) with quarantine routing or abort policies. | [quality](https://faucet-hq.github.io/faucet-stream/cookbook/quality.html) |
 | **Data contracts** | A versioned promise about the output shape (types, nullability, enums, patterns, bounds) enforced per page — breaches fail, quarantine, or warn; export as JSON Schema / OpenLineage via `faucet contract`. | [contracts](https://faucet-hq.github.io/faucet-stream/cookbook/contracts.html) |
+| **Pipeline status & state tooling** | `faucet status` prints one screen per pipeline — per row: last success / failure, bookmark and where the next run resumes, how far a CDC / streaming source is behind its head, the exactly-once watermark (with `--probe`, checked against the sink's), DLQ backlog, SLA / profiling verdicts — with exit codes for cron checks. `faucet state show / set / reset / export / import` moves or resets a row's bookmark safely (confirmation, run-lease guard, exactly-once envelopes kept sink-safe) and backs up or migrates state between file / Redis / Postgres stores. Also over `/v1/status` and `/v1/state`. | [state & status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html) |
 | **SLA monitoring** | Declared freshness (`max_staleness_secs`) + volume floors and learned-baseline anomaly detection (z-score / IQR) per pipeline — violations emit metrics + warnings and surface in `faucet doctor`, never failing the run. | [SLA](https://faucet-hq.github.io/faucet-stream/cookbook/sla.html) |
 | **Data-flow policies** | Label columns (by name, pattern, or value detector) and say which sinks a label may reach — `require` sink attributes such as `residency: eu`, accept a mask, or `deny`. Decided before any data moves (`validate` / `plan` / `doctor` report; `run` and `serve` refuse) and backed at run time by value detectors on the real records. | [policies](https://faucet-hq.github.io/faucet-stream/cookbook/policies.html) |
 | **Change impact analysis** | `faucet plan --impact` diffs the planned output schema against the catalog and walks the lineage graph downstream: which datasets, contracts, owners and declared consumers a dropped / retyped / renamed column breaks, with a severity each — before the change ships. | [impact](https://faucet-hq.github.io/faucet-stream/cookbook/impact.html) |
@@ -372,7 +375,7 @@ wired into the battery (see the support-tiers note above).
 | [`faucet-transform-sql`](crates/transform-sql) | Embedded DuckDB SQL transform — run DuckDB SQL over each page (`batch` relation) |
 | [`faucet-transform-wasm`](crates/transform-wasm) | WebAssembly transform — run a user-provided sandboxed `.wasm` module per record (wasmtime) |
 | [`faucet-stream`](faucet-stream) | Umbrella crate — feature-gated re-exports of all connectors and state backends |
-| [`faucet-cli`](cli) | `faucet` binary — YAML/JSON config-driven pipeline runner (`run`, `validate`, `schema`, `list`, `preview`, `init`, `doctor`, `test`, `schedule`, `serve`) |
+| [`faucet-cli`](cli) | `faucet` binary — YAML/JSON config-driven pipeline runner (`run`, `validate`, `schema`, `list`, `preview`, `init`, `doctor`, `test`, `status`, `state`, `schedule`, `serve`) |
 
 </details>
 

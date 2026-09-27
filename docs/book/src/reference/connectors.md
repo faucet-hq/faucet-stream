@@ -220,41 +220,41 @@ create a collection/index on first write and cannot be told not to, so the
 field would be inert in one direction, which is exactly the silently-ignored
 config this project treats as a defect.
 
-| Connector | Tier¹¹ | Feature | `batch_size` | Compression | Upsert⁸ | Effectively-once⁷ | Write unit |
-|-----------|:---:|---------|:---:|:---:|:---:|:---:|------------|
-| BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
-| PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
-| JSON Lines | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | buffered file append |
-| Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
-| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
-| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
-| MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` |
-| Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |
-| Oracle Database | T1 ✅ | `sink-oracle` | ✓ | ✗ | **✓** | **✓** | array DML per page (per-row DLQ), keyed `MERGE` upsert / `DELETE`, `_faucet_commit_token` in the same transaction; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
-| SQLite | T1 ✅ | `sink-sqlite` | ✓ | ✗ | **✓** | **✓** | transaction-wrapped batch |
-| DuckDB | T2 | `sink-duckdb` | ✓ | ✗ | ✗ | ✗ | transaction-wrapped multi-row `INSERT` (JSON column or auto-mapped); append-only |
-| AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
-| NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | publish to a subject (optional subject-per-record), flush per batch |
-| RabbitMQ | T2 | `sink-rabbitmq` | ✓ | ✗ | ✗ | ✗ | publish to an exchange with a static / field / JSONPath routing key; publisher confirms per batch; `mandatory` returns surface as per-row (DLQ-routable) errors |
-| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | JSONL objects, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
-| MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | `insert_many`; multi-document transaction for effectively-once (replica set required) |
-| Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
-| CSV | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |
-| Elasticsearch | T2 | `sink-elasticsearch` | ✓ | ✗ | **✓** | ✗ | `_bulk` NDJSON (per-row DLQ) |
-| HTTP | T1 ✅ᵐ | `sink-http` | ✓ | ✗ | ✗ | ✗ | POST, concurrent under a semaphore |
-| Stdout | T1 ✅ | `sink-stdout` | no-op | ✗ | ✗ | ✗ | JSON Lines / pretty JSON / TSV |
-| Apache Kafka | T1 ✅ | `sink-kafka` | ✓ | ✗ | ✗ | **✓** | producer, batched sends, multi-topic routing; transactional producer + compacted watermark side-topic for effectively-once |
-| AWS Kinesis | T1 ✅ | `sink-kinesis` | ✓ | ✗ | ✗ | ✗ | batched PutRecords; partition-key routing, per-entry partial-failure retry (DLQ-routable) |
-| Google Cloud Pub/Sub | T1 ✅ᵉ | `sink-pubsub` | ✓ | ✗ | ✗ | ✗ | batched publish; optional ordering key, per-entry partial-failure retry (DLQ-routable) |
-| Cloud Spanner | T1 ✅ᵉ | `sink-spanner` | ✓ | ✗ | **✓** | **✓** | batched mutations (`insert` / `insert_or_update` / `delete`), cell-budget chunking, commit-token transaction for effectively-once |
-| Apache Parquet | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | local/S3, schema inference (re-inferred per file on rollover), row/byte rollover |
-| Apache Delta Lake | T1 ✅ | `sink-delta` | ✓ | ✗⁶ | ✗ | ✗ | append-only; local FS or S3/Azure/GCS; schema-inferred table creation, partitioning, one commit per flush |
-| Apache Iceberg | T2 | `sink-iceberg` | ✓ | ✗⁶ | ✗ | **✓** | REST/Glue/SQL/HMS catalog, local + cloud (S3/GCS) warehouses, `fast_append` snapshot, Parquet data files |
-| Amazon DynamoDB | T1 ✅ᵉ | `sink-dynamodb` | ✓ | ✗ | **✓** | ✗ | `BatchWriteItem` (25 items / 16 MiB per request) with unprocessed-item retry, bounded concurrency; `write_mode: upsert\|delete` by the table key; optional `condition_expression` writes (`on_condition_failure`) |
-| Databricks SQL | T1 ✅ᵐ | `sink-databricks` | ✓ | ✗ | **✓** | **✓** | Statement Execution API into a Delta table: multi-row `INSERT` / `MERGE`, or staged `COPY INTO` (Unity Catalog volume, or `s3://`/`gs://`/`abfss://` with the `sink-databricks-staging` feature); per-token idempotent page write + commit-token table for effectively-once |
+| Connector | Tier¹¹ | Feature | `batch_size` | Compression | Upsert⁸ | Effectively-once⁷ | Batch atomicity⁹ | Write unit |
+|-----------|:---:|---------|:---:|:---:|:---:|:---:|:---:|------------|
+| BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | per-row (`batch_size: 0`); atomic keyed | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
+| PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | atomic (JSONB + `batch_size: 0`; keyed when journaled) | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
+| JSON Lines | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file append |
+| Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | atomic (`batch_size: 0`) | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
+| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | atomic (COPY + `batch_size: 0`) | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
+| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | atomic (`batch_size: 0` or staged) | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
+| MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | atomic keyed | multi-row `INSERT` |
+| Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | atomic keyed | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |
+| Oracle Database | T1 ✅ | `sink-oracle` | ✓ | ✗ | **✓** | **✓** | atomic | array DML per page (per-row DLQ), keyed `MERGE` upsert / `DELETE`, `_faucet_commit_token` in the same transaction; needs Oracle Instant Client at runtime ([installation](../getting-started/installation.md#oracle-instant-client)) |
+| SQLite | T1 ✅ | `sink-sqlite` | ✓ | ✗ | **✓** | **✓** | atomic (`batch_size: 0` or keyed) | transaction-wrapped batch |
+| DuckDB | T2 | `sink-duckdb` | ✓ | ✗ | ✗ | ✗ | atomic | transaction-wrapped multi-row `INSERT` (JSON column or auto-mapped); append-only |
+| AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | best-effort | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
+| NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to a subject (optional subject-per-record), flush per batch |
+| RabbitMQ | T2 | `sink-rabbitmq` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to an exchange with a static / field / JSONPath routing key; publisher confirms per batch; `mandatory` returns surface as per-row (DLQ-routable) errors |
+| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | best-effort | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, Parquet; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | best-effort | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel via [file formats](../cookbook/file-formats.md) |
+| MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | best-effort | `insert_many`; multi-document transaction for effectively-once (replica set required) |
+| Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | best-effort | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
+| CSV | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |
+| Elasticsearch | T2 | `sink-elasticsearch` | ✓ | ✗ | **✓** | ✗ | per-row (`batch_size: 0`) | `_bulk` NDJSON (per-row DLQ) |
+| HTTP | T1 ✅ᵐ | `sink-http` | ✓ | ✗ | ✗ | ✗ | per-row | POST, concurrent under a semaphore |
+| Stdout | T1 ✅ | `sink-stdout` | no-op | ✗ | ✗ | ✗ | best-effort | JSON Lines / pretty JSON / TSV |
+| Apache Kafka | T1 ✅ | `sink-kafka` | ✓ | ✗ | ✗ | **✓** | best-effort | producer, batched sends, multi-topic routing; transactional producer + compacted watermark side-topic for effectively-once |
+| AWS Kinesis | T1 ✅ | `sink-kinesis` | ✓ | ✗ | ✗ | ✗ | best-effort | batched PutRecords; partition-key routing, per-entry partial-failure retry (DLQ-routable) |
+| Google Cloud Pub/Sub | T1 ✅ᵉ | `sink-pubsub` | ✓ | ✗ | ✗ | ✗ | per-row | batched publish; optional ordering key, per-entry partial-failure retry (DLQ-routable) |
+| Cloud Spanner | T1 ✅ᵉ | `sink-spanner` | ✓ | ✗ | **✓** | **✓** | best-effort | batched mutations (`insert` / `insert_or_update` / `delete`), cell-budget chunking, commit-token transaction for effectively-once |
+| Apache Parquet | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | best-effort | local/S3, schema inference (re-inferred per file on rollover), row/byte rollover |
+| Apache Delta Lake | T1 ✅ | `sink-delta` | ✓ | ✗⁶ | ✗ | ✗ | atomic (unless `target_file_size` splits a page) | append-only; local FS or S3/Azure/GCS; schema-inferred table creation, partitioning, one commit per flush |
+| Apache Iceberg | T2 | `sink-iceberg` | ✓ | ✗⁶ | ✗ | **✓** | per-row | REST/Glue/SQL/HMS catalog, local + cloud (S3/GCS) warehouses, `fast_append` snapshot, Parquet data files |
+| Amazon DynamoDB | T1 ✅ᵉ | `sink-dynamodb` | ✓ | ✗ | **✓** | ✗ | per-row | `BatchWriteItem` (25 items / 16 MiB per request) with unprocessed-item retry, bounded concurrency; `write_mode: upsert\|delete` by the table key; optional `condition_expression` writes (`on_condition_failure`) |
+| Databricks SQL | T1 ✅ᵐ | `sink-databricks` | ✓ | ✗ | **✓** | **✓** | best-effort | Statement Execution API into a Delta table: multi-row `INSERT` / `MERGE`, or staged `COPY INTO` (Unity Catalog volume, or `s3://`/`gs://`/`abfss://` with the `sink-databricks-staging` feature); per-token idempotent page write + commit-token table for effectively-once |
 
 ⁶ Parquet and Iceberg both handle compression internally at the Parquet column
 level, so the file-level `compression` feature doesn't apply to either.
@@ -276,6 +276,15 @@ row in the page's transaction. Sinks configured with
 `write_mode: upsert` + `key` also reach effectively-once via keyed dedup, with
 any source. See
 [Effectively-once delivery](../cookbook/state.md#effectively-once-delivery).
+⁹ **Batch atomicity** (#737) = what a failed sink write leaves behind: **atomic**
+(nothing lands), **per-row** (per-row outcomes; a whole-write error means nothing
+from that write landed), or **best-effort** (some rows may already have
+landed). `on_batch_error: dlq_all` is refused on a best-effort sink — replaying
+the DLQ would write the landed rows a second time — unless the sink writes by
+key (`write_mode: upsert|delete`) or the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true`. The conditions in brackets are the sink
+config that makes a write all-or-nothing; see
+[Batch atomicity and `dlq_all`](../cookbook/dlq.md#batch-atomicity-and-dlq_all).
 ⁸ **Upsert** = supports `write_mode: upsert` / `delete` (insert-or-update and
 delete by `key`) in addition to plain `append`. The SQL sinks require
 column-mapping mode (`auto_map`, or `auto_columns` for mssql) and a

@@ -99,3 +99,11 @@ very large group is split into reasonably-sized requests.
 path commit per page, because a commit token must land atomically with its own
 page, and a DLQ must report which rows of *this* page failed — neither is
 expressible once pages are merged.
+
+## Batch atomicity
+
+What a failed write leaves behind (#737): **atomic** for `write_strategy: copy` with `batch_size: 0`, otherwise **best-effort** — a commit group is one COPY only when unchunked; INSERT splits by bind parameters. `on_batch_error: dlq_all`
+is refused on a best-effort configuration unless the `dlq:` block sets
+`allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
+already landed a second time). See
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).

@@ -108,6 +108,7 @@ async fn conformance_connector_name_nonempty() {
         .endpoint_url("http://127.0.0.1:1".to_string())
         .region(REGION.to_string());
     let sink = S3Sink::new(config).await.expect("sink builds lazily");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     faucet_conformance::assert_connector_name_nonempty_value(
         sink.connector_name(),
         sink.connector_name(),

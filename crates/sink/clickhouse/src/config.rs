@@ -190,6 +190,17 @@ impl ClickHouseSinkConfig {
     }
 }
 
+impl ClickHouseSinkConfig {
+    /// What a failed batch write leaves behind (#737): a commit group is one INSERT only when unchunked or staged.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.staging.is_some() || self.batch_size == 0 {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +279,19 @@ mod tests {
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("***"));
         assert!(!dbg.contains("s3cret"));
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: ClickHouseSinkConfig = serde_json::from_value(
+            serde_json::json!({"url": "http://localhost:8123", "table": "events"}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: ClickHouseSinkConfig = serde_json::from_value(
+            serde_json::json!({"url": "http://localhost:8123", "table": "events", "batch_size": 0}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

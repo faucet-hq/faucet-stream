@@ -109,6 +109,7 @@ async fn conformance_capabilities_truthful() {
     cfg.connection = conn(&host);
     cfg.value_format = ValueFormat::Json;
     let sink = PubsubSink::new(cfg).await.expect("sink builds");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
 
     // Check 10: connector_name is non-empty (metric-cardinality contract).
     faucet_conformance::assert_connector_name_nonempty_value(

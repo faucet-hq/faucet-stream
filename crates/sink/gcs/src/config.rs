@@ -249,6 +249,30 @@ impl GcsSinkConfig {
     }
 }
 
+impl GcsSinkConfig {
+    fn single_parquet_object(&self) -> bool {
+        #[cfg(feature = "arrow")]
+        {
+            matches!(self.format, GcsSinkFormat::Parquet)
+                && self.batch_size == 0
+                && self.max_records_per_file.is_none()
+        }
+        #[cfg(not(feature = "arrow"))]
+        {
+            false
+        }
+    }
+
+    /// What a failed batch write leaves behind (#737): only an unchunked Parquet batch is one object upload.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.single_parquet_object() {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +468,17 @@ mod tests {
             .max_records_per_file(10);
         assert_eq!(both.max_bytes_per_file, Some(4096));
         assert_eq!(both.max_records_per_file, Some(10));
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        #[cfg(feature = "arrow")]
+        {
+            let c: GcsSinkConfig = serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "p/", "format": "parquet", "batch_size": 0})).unwrap();
+            assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        }
+        let c: GcsSinkConfig =
+            serde_json::from_value(serde_json::json!({"bucket": "b", "prefix": "p/"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

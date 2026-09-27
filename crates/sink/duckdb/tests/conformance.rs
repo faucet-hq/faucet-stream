@@ -27,6 +27,7 @@ async fn conformance_capabilities_truthful() {
     )
     .await
     .expect("sink");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
 
     // Check 10: connector_name() is non-empty (reuses this offline instance).
     faucet_conformance::assert_connector_name_nonempty_value(

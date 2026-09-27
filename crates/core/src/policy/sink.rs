@@ -283,6 +283,9 @@ impl Sink for PolicySink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
         self.inner.supported_write_modes()
     }
@@ -554,6 +557,7 @@ mod tests {
         assert_eq!(s.sink_guarantee(), SinkGuarantee::AtLeastOnce);
         assert!(!s.write_batch_is_replay_safe());
         assert!(!s.dedups_by_key());
+        assert_eq!(s.batch_atomicity(), crate::dlq::BatchAtomicity::BestEffort);
         assert_eq!(s.supported_write_modes(), &[WriteMode::Append]);
         assert!(s.last_committed_token("scope").await.unwrap().is_none());
         assert!(!s.supports_schema_evolution());

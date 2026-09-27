@@ -53,6 +53,7 @@ pub mod notify;
 pub mod obs;
 pub mod params;
 pub mod partition;
+pub mod pipeline_state;
 pub mod pipeline_test;
 #[cfg(feature = "policy")]
 pub mod policy;
@@ -74,6 +75,7 @@ pub mod select;
 pub mod serve;
 pub mod sla;
 pub mod state;
+pub mod status;
 #[cfg(feature = "templates")]
 pub mod templates;
 pub mod tenant_tokens;
@@ -198,6 +200,8 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
             Err(CliError::RollbackBlocked { conflicts }) => {
                 ExitCode::from(conflicts.clamp(1, 255) as u8)
             }
+            // `status` printed its screen; 1 = degraded / unknown, 2 = failed.
+            Err(CliError::StatusUnhealthy { code, .. }) => ExitCode::from(code),
             Err(err) => {
                 commands::report(&err);
                 ExitCode::from(1)
@@ -211,6 +215,10 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
 /// programmatically-built `Cli` (and a registry installed via
 /// [`PluginRegistry::install`]).
 pub async fn run_command(cli: Cli) -> CliResult<()> {
+    Box::pin(dispatch(cli)).await
+}
+
+async fn dispatch(cli: Cli) -> CliResult<()> {
     #[cfg(feature = "serve")]
     let serve_log_level = cli.log_level.clone();
     let log_format = cli.log_format;
@@ -237,6 +245,8 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
         Command::Verify(args) => commands::verify::run(args).await,
         Command::Rollback(args) => commands::rollback::run(args).await,
         Command::Profiling(args) => commands::profiling::run(args).await,
+        Command::State(args) => commands::state::run(args).await,
+        Command::Status(args) => commands::status::run(args).await,
         Command::Hub(args) => commands::hub::run(args).await,
         #[cfg(feature = "contract")]
         Command::Contract(args) => commands::contract::run(args).await,
@@ -358,6 +368,7 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
     executor::run_expanded(
         nodes,
         executor::ExecuteOptions {
+            legacy_state_writes: false,
             pipeline_name,
             run_id: None,
             execution: cfg.execution.clone(),

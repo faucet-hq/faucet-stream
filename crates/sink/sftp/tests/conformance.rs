@@ -46,6 +46,7 @@ fn conformance_connector_name_nonempty() {
         known_hosts: HostKeyPolicy::Insecure,
     };
     let sink = SftpSink::new(SftpSinkConfig::new(conn, "/data")).expect("sink builds lazily");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     faucet_conformance::assert_connector_name_nonempty_value(
         sink.connector_name(),
         sink.connector_name(),

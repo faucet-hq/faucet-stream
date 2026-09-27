@@ -38,6 +38,12 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     ("GET", "/v1/audit"),
     ("POST", "/v1/reload"),
     ("GET", "/v1/whoami"),
+    // Pipeline health + durable state (#732, #735).
+    ("GET", "/v1/status"),
+    ("POST", "/v1/status"),
+    ("GET", "/v1/state/{pipeline}/{row}"),
+    ("PUT", "/v1/state/{pipeline}/{row}"),
+    ("DELETE", "/v1/state/{pipeline}/{row}"),
     // Change requests (#703).
     ("POST", "/v1/changes"),
     ("GET", "/v1/changes"),

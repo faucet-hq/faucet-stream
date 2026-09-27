@@ -267,6 +267,7 @@ async fn dry_run_and_limit_do_not_touch_the_baseline() {
     let cfg = parse(&text);
     let nodes = expand(&cfg).unwrap();
     let opts = |dry_run: bool, limit: Option<usize>| faucet_cli::executor::ExecuteOptions {
+        legacy_state_writes: false,
         pipeline_name: "proftest".into(),
         run_id: None,
         execution: None,

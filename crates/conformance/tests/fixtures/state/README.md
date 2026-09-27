@@ -22,3 +22,16 @@ catch it, because both sides change together.
 - **Add** a new file when a new state shape ships. Name it
   `<shape>-v<version-that-first-wrote-it>.json`.
 - Keep each file byte-exact as the writer emitted it, including key order.
+
+## Index
+
+- `state-export-v1.json` — a `faucet state export` document (#735): the
+  versioned `{ version, pipeline, exported_at, keys }` snapshot of a pipeline's
+  namespace, holding a bare bookmark, an SLA marker, and an exactly-once
+  envelope. `faucet state import` of a release's export must keep working.
+- `state-envelope-v1.json` — the versioned state envelope (#736):
+  `{ faucet_state, owner, schema, data }` around a bare bookmark.
+- `eo-state-envelope-v1.json` — the versioned envelope around an exactly-once
+  wrapper (the wrapper lives inside `data`).
+- `scalar-state-envelope-v1.json` — the versioned envelope around a scalar
+  bookmark.

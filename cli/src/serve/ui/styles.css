@@ -1789,6 +1789,30 @@ select {
 .chg-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
 .chg-actions input { flex: 1 1 180px; min-width: 140px; }
 
+/* Template health card (#732): the launched version's `faucet status`. */
+.health-card { margin-top: 26px; }
+.health-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.health-head .tpl-h2 { margin: 0 2px 0 0; }
+.health-head .run-meta { margin-left: auto; }
+.ds-table.health-table { min-width: 720px; }
+.ds-table.health-table thead th { position: static; }
+.ds-table.health-table th, .ds-table.health-table td { text-align: left; padding: 10px 14px; }
+.ds-table.health-table th:nth-child(1), .ds-table.health-table td:nth-child(1) { width: 18%; padding-right: 14px; }
+.ds-table.health-table th:nth-child(2), .ds-table.health-table td:nth-child(2) { width: 112px; }
+.ds-table.health-table th:nth-child(3), .ds-table.health-table td:nth-child(3) { width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ds-table.health-table th:nth-child(4), .ds-table.health-table td:nth-child(4) { width: 22%; }
+.ds-table.health-table th:nth-child(5), .ds-table.health-table td:nth-child(5) { width: 56px; text-align: right; }
+.ds-table.health-table th:nth-child(6), .ds-table.health-table td:nth-child(6) { width: auto; }
+.health-bm, .health-resume { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.health-num { font-variant-numeric: tabular-nums; }
+.health-lag { white-space: nowrap; }
+.batch-cell { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.batch-warn { color: var(--queued); }
+.batch-bad { color: var(--fail); }
+.ds-table.health-table tr.health-row:has(+ tr.health-why) td { border-bottom: none; padding-bottom: 4px; }
+.ds-table.health-table tr.health-why td { padding-top: 0; color: var(--ink-dim); font-size: 0.8rem; }
+.ds-table.health-table tr.health-failed td:first-child { box-shadow: inset 3px 0 0 var(--fail); }
+.ds-table.health-table tr.health-degraded td:first-child { box-shadow: inset 3px 0 0 var(--queued); }
 /* Tenants (#709) */
 .tn-create, .tn-connect { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 8px 0 4px; }
 .tn-create input { flex: 1 1 200px; min-width: 0; }

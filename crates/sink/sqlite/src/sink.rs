@@ -882,6 +882,10 @@ impl SqliteSink {
 
 #[async_trait]
 impl faucet_core::Sink for SqliteSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn connector_name(&self) -> &'static str {
         "sqlite"
     }
@@ -1074,6 +1078,11 @@ impl faucet_core::Sink for SqliteSink {
             .await
             .map_err(|e| FaucetError::Sink(format!("sqlite overwrite: commit swap: {e}")))?;
         Ok(())
+    }
+
+    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(Some(self.table_exists(&self.staging_table()).await?))
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing

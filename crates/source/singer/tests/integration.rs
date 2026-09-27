@@ -89,7 +89,11 @@ async fn clean_run_writes_all_rows_once() {
     assert_eq!(result.records_written, 6, "all 6 rows written");
     assert_eq!(sink.ids(), vec![1, 2, 3, 4, 5, 6]);
     // Bookmark persisted at the final STATE.
-    let saved = store.get("singer_it").await.unwrap();
+    let saved = store
+        .get("singer_it")
+        .await
+        .unwrap()
+        .map(|v| faucet_core::state_version::peel_versioned(&v));
     assert_eq!(saved, Some(serde_json::json!({"last_id": 6})));
 }
 
@@ -128,7 +132,11 @@ async fn crash_then_resume_produces_no_duplicates() {
         "only checkpointed rows are visible"
     );
     assert_eq!(
-        store.get("singer_it").await.unwrap(),
+        store
+            .get("singer_it")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(serde_json::json!({"last_id": 3}))
     );
     let writes_after_run1 = sink.total_writes();
@@ -167,7 +175,11 @@ async fn crash_then_resume_produces_no_duplicates() {
         "no duplicates after crash + resume"
     );
     assert_eq!(
-        store.get("singer_it").await.unwrap(),
+        store
+            .get("singer_it")
+            .await
+            .unwrap()
+            .map(|v| faucet_core::state_version::peel_versioned(&v)),
         Some(serde_json::json!({"last_id": 6}))
     );
 }

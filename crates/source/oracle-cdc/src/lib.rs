@@ -19,6 +19,7 @@
 //! all-column logging for full update images).
 
 mod config;
+mod lag;
 mod logs;
 mod miner;
 mod redo;

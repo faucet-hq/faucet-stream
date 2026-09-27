@@ -232,6 +232,44 @@ pub trait Source: Send + Sync {
         Ok(None)
     }
 
+    /// How far this source is behind its head (#733) — unread WAL bytes, binlog
+    /// distance, unconsumed messages, or the age of the oldest unread change.
+    ///
+    /// The pipeline polls it at page boundaries and exports
+    /// `faucet_source_lag_{bytes,events,seconds}`; `faucet status --probe`
+    /// asks for it on demand after applying the stored bookmark. It must be a
+    /// cheap, read-only query. An `Err` is logged once and reported as no lag;
+    /// it never fails a run. Default: `Ok(None)` (no notion of a head).
+    /// Decorators must forward this.
+    async fn lag(&self) -> Result<Option<crate::lag::SourceLag>, FaucetError> {
+        Ok(None)
+    }
+
+    /// The version of this source's bookmark shape (#736). Stored state carries
+    /// it; bump it whenever the shape changes and teach
+    /// [`migrate_state`](Self::migrate_state) the step. Default `0`. Decorators
+    /// must forward this.
+    fn state_schema(&self) -> u32 {
+        0
+    }
+
+    /// Bring a bookmark stored at shape version `from` up to
+    /// [`state_schema`](Self::state_schema) (#736). Must be pure — the
+    /// migrated value is only persisted by the next bookmark write, so a crash
+    /// in between re-runs it. The default knows only its own version. Decorators
+    /// must forward this.
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        if from == self.state_schema() {
+            Ok(data)
+        } else {
+            Err(FaucetError::State(format!(
+                "{} has no migration from bookmark schema {from} to {}",
+                self.connector_name(),
+                self.state_schema()
+            )))
+        }
+    }
+
     /// Whether this source **deterministically replays** the same page sequence
     /// from a given bookmark — the requirement for the atomic-watermark
     /// effectively-once path (a non-deterministic replay could cause the pipeline
@@ -451,6 +489,19 @@ pub trait Sink: Send + Sync {
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         self.write_batch(records).await?;
         Ok(records.iter().map(|_| Ok(())).collect())
+    }
+
+    /// What a failed batch write leaves behind (#737): nothing
+    /// ([`Atomic`](crate::BatchAtomicity::Atomic)), per-row outcomes with
+    /// nothing committed on an outer `Err`
+    /// ([`PerRow`](crate::BatchAtomicity::PerRow)), or possibly some rows
+    /// ([`BestEffort`](crate::BatchAtomicity::BestEffort), the default).
+    ///
+    /// `on_batch_error: dlq_all` is refused on a best-effort sink unless it
+    /// writes by key or the user opts in to the duplicates. Decorators must
+    /// forward this.
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        crate::dlq::BatchAtomicity::BestEffort
     }
 
     /// Whether this sink can consume **columnar** (`arrow::RecordBatch`) writes
@@ -823,6 +874,17 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 
+    /// Whether an overwrite staging object (the `…__faucet_ovw` table or
+    /// collection a [`begin_overwrite`](Self::begin_overwrite) creates) exists
+    /// right now — a read-only probe used by `faucet status --probe` to report
+    /// staging a crashed or aborted overwrite left behind.
+    ///
+    /// `Ok(None)` means the sink cannot tell (the default); overwrite-capable
+    /// sinks return `Ok(Some(_))`.
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(None)
+    }
+
     /// Return a JSON Schema describing the configuration this sink accepts.
     ///
     /// The schema is auto-generated from the config struct using `schemars`.
@@ -923,6 +985,21 @@ mod tests {
         ) -> Result<Vec<Value>, FaucetError> {
             Ok(self.records.clone())
         }
+    }
+
+    #[test]
+    fn default_migrate_state_accepts_only_its_own_schema() {
+        let src = MockSource { records: vec![] };
+        assert_eq!(src.state_schema(), 0);
+        assert_eq!(
+            src.migrate_state(0, json!({"id": 1})).unwrap(),
+            json!({"id": 1})
+        );
+        let err = src.migrate_state(3, json!({})).unwrap_err().to_string();
+        assert!(
+            err.contains("no migration from bookmark schema 3 to 0"),
+            "{err}"
+        );
     }
 
     struct IncrementalSource {
@@ -1090,6 +1167,7 @@ mod tests {
         assert!(sink.begin_overwrite().await.is_err());
         assert!(sink.commit_overwrite().await.is_err());
         assert!(sink.abort_overwrite().await.is_ok());
+        assert_eq!(sink.overwrite_staging_exists().await.unwrap(), None);
     }
 
     // ── Source tests ────────────────────────────────────────────────────────

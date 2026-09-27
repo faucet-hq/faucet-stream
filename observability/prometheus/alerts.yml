@@ -58,7 +58,31 @@ groups:
           summary: "SLA violation on pipeline {{ $labels.pipeline }} ({{ $labels.kind }})"
           description: >
             The `sla:` monitor recorded a {{ $labels.kind }} violation
-            (staleness / min_rows / volume anomaly) in the last hour.
+            (staleness / min_rows / volume anomaly / lag) in the last hour.
+
+      - alert: FaucetSourceLagHigh
+        expr: max by (pipeline, row, connector) (faucet_source_lag_bytes) > 1073741824 or max by (pipeline, row, connector) (faucet_source_lag_seconds) > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline {{ $labels.pipeline }} is far behind its source ({{ $labels.connector }})"
+          description: >
+            The source reports over 1 GiB of unread change log or an oldest
+            unread change over an hour old for row {{ $labels.row }}. A CDC
+            slot this far behind also pins WAL/binlog on the source database.
+            Check `faucet status --probe` and the sink's throughput.
+
+      - alert: FaucetBatchesRoutedWhole
+        expr: increase(faucet_batch_outcomes_total{outcome=~"dlq_all|failed"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sink writes failing whole on pipeline {{ $labels.pipeline }} ({{ $labels.sink }}, {{ $labels.outcome }})"
+          description: >
+            Whole sink writes failed in the last hour — routed to the DLQ by
+            `on_batch_error: dlq_all`, or failed the run. Inspect the DLQ with
+            `faucet dlq inspect` and the run's errors.
 
       - alert: FaucetProfileDrift
         expr: increase(faucet_profile_drift_total[1h]) > 0

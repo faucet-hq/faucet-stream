@@ -81,6 +81,14 @@ config:
   credentials: { type: access_key, config: { access_key_id: test, secret_access_key: test } }
 ```
 
+## Source lag
+
+`Source::lag` (#733) reports **seconds**: the worst shard's `MillisBehindLatest` from this run's `GetRecords` calls — or, before any, from one single-record probing read per shard at the resume position. The pipeline polls it on the first page, at most every
+15 s after, and when the run ends, exporting `faucet_source_lag_*{pipeline,row,connector}`;
+`faucet status --probe` and `faucet doctor` ask it from the stored bookmark,
+and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
+logged once and reported as no lag — it never fails a run.
+
 ## License
 
 MIT OR Apache-2.0

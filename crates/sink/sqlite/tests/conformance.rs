@@ -51,6 +51,7 @@ async fn fresh_sink() -> (TempDir, String, SqliteSink) {
         },
     };
     let sink = SqliteSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     (dir, url, sink)
 }
 

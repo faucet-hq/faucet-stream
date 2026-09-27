@@ -126,7 +126,17 @@ async fn overwrite_abort_leaves_collection_intact() {
     sink.write_batch(&[serde_json::json!({"_id": 99, "name": "doomed"})])
         .await
         .unwrap();
+    assert_eq!(
+        sink.overwrite_staging_exists().await.unwrap(),
+        Some(true),
+        "the staging probe sees the in-flight staging"
+    );
     sink.abort_overwrite().await.unwrap();
+    assert_eq!(
+        sink.overwrite_staging_exists().await.unwrap(),
+        Some(false),
+        "the staging probe sees it gone after abort"
+    );
 
     assert_eq!(names(&uri, "docs").await, vec!["old_a", "old_b"]);
     assert!(!collection_exists(&uri, "docs__faucet_ovw").await);

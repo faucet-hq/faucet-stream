@@ -799,6 +799,22 @@ pub async fn assert_preflight_check_wellformed<S: Source + ?Sized>(
     assert_report_wellformed(source.check(ctx).await, source.connector_name());
 }
 
+/// A sink's batch atomicity (#737) is a pure function of its configuration:
+/// `faucet validate` reads it offline from the config and the pipeline reads it
+/// from the built sink, and `on_batch_error: dlq_all` is allowed or refused on
+/// that answer — so repeated reads must agree. Returns the declaration so the
+/// caller can pin it.
+pub fn assert_batch_atomicity_declared<S: Sink + ?Sized>(sink: &S) -> faucet_core::BatchAtomicity {
+    let first = sink.batch_atomicity();
+    assert_eq!(
+        first,
+        sink.batch_atomicity(),
+        "[{}] batch_atomicity() must not change between calls",
+        sink.connector_name()
+    );
+    first
+}
+
 /// The sink counterpart of [`assert_preflight_check_wellformed`].
 pub async fn assert_sink_preflight_check_wellformed<S: Sink + ?Sized>(
     sink: &S,

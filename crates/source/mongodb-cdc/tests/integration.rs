@@ -435,3 +435,185 @@ async fn capture_resume_position_cluster_scope() {
         "resume_token present: {pos}"
     );
 }
+
+/// #733 — `lag()` reports how old the oldest undelivered change is, against the
+/// cluster's current time: none before a position is known, near zero once a
+/// cycle has caught up, and the age of a change sitting unread behind a stored
+/// bookmark (what `faucet status --probe` asks on a fresh source).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lag_reports_the_age_of_the_oldest_unread_change() {
+    let (_container, uri) = start_repl_set().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let coll = client.database(DB).collection::<Document>(COLL);
+    coll.insert_one(doc! { "_id": 0, "seed": true })
+        .await
+        .expect("seed insert");
+
+    let source = MongoCdcSource::new(config(&uri)).await.expect("source");
+    assert_eq!(source.lag().await.expect("lag"), None);
+
+    let writer_uri = uri.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let client = Client::with_uri_str(&writer_uri).await.expect("writer");
+        client
+            .database(DB)
+            .collection::<Document>(COLL)
+            .insert_one(doc! { "_id": 1 })
+            .await
+            .expect("insert");
+    });
+    let (records, bookmark) = drain(&source).await;
+    writer.await.expect("writer task");
+    assert_eq!(records.len(), 1);
+    let caught_up = source.lag().await.expect("lag").expect("a reading");
+    assert!(
+        caught_up.seconds.unwrap() < 30.0,
+        "an idle, caught-up stream is not behind: {caught_up:?}"
+    );
+
+    coll.insert_one(doc! { "_id": 2 }).await.expect("insert");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    client
+        .database(DB)
+        .collection::<Document>("other")
+        .insert_one(doc! { "tick": 1 })
+        .await
+        .expect("advance the cluster time");
+    let probe = MongoCdcSource::new(config(&uri)).await.expect("source");
+    probe
+        .apply_start_bookmark(bookmark.expect("bookmark"))
+        .await
+        .expect("apply");
+    let behind = probe.lag().await.expect("lag").expect("a reading");
+    assert!(
+        behind.seconds.unwrap() >= 2.0,
+        "the unread insert is at least as old as the pause: {behind:?}"
+    );
+}
+
+/// #733 — the lag probe opens its one-shot change stream on the configured
+/// scope (database and cluster, not only a collection), and honours an
+/// invalidate bookmark by resuming with `startAfter`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lag_probe_covers_database_and_cluster_scopes_and_invalidate_tokens() {
+    let (_container, uri) = start_repl_set().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let coll = client.database(DB).collection::<Document>(COLL);
+    coll.insert_one(doc! { "_id": 0 })
+        .await
+        .expect("seed insert");
+    for scope in [
+        json!({ "type": "database", "database": DB }),
+        json!({ "type": "cluster" }),
+    ] {
+        let cfg = |uri: &str| -> MongoCdcSourceConfig {
+            serde_json::from_value(json!({
+                "connection_uri": uri,
+                "scope": scope.clone(),
+                "start_from": { "type": "now" },
+                "idle_timeout": 5,
+                "max_await_time_ms": 500,
+                "batch_size": 0
+            }))
+            .expect("config")
+        };
+        let capture = MongoCdcSource::new(cfg(&uri)).await.expect("source");
+        let position = capture
+            .capture_resume_position()
+            .await
+            .expect("capture")
+            .expect("a position");
+        coll.insert_one(doc! { "scope": scope.to_string() })
+            .await
+            .expect("insert");
+        for invalidate in [false, true] {
+            let mut bm = position.clone();
+            bm["invalidate"] = json!(invalidate);
+            let probe = MongoCdcSource::new(cfg(&uri)).await.expect("source");
+            probe.apply_start_bookmark(bm).await.expect("apply");
+            let lag = probe.lag().await.expect("lag");
+            if let Some(l) = lag {
+                assert!(
+                    l.seconds.expect("seconds") < 600.0,
+                    "{scope} invalidate={invalidate}: {l:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Records every row a pipeline writes.
+#[derive(Default)]
+struct Capture(std::sync::Mutex<Vec<Value>>);
+
+#[faucet_core::async_trait]
+impl faucet_core::Sink for Capture {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+        self.0.lock().unwrap().extend_from_slice(records);
+        Ok(records.len())
+    }
+}
+
+/// #736: a pipeline resumes from a bookmark a release before versioned state
+/// stored — bare, in the schema-0 shape (no `invalidate` flag) — migrates it,
+/// delivers only what came after it, and stores the next bookmark in the
+/// envelope at schema 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pipeline_resumes_from_a_released_schema_zero_bookmark() {
+    use faucet_core::state_version::{STATE_FORMAT, StoredState};
+    use faucet_core::{MemoryStateStore, Pipeline, StateStore};
+    use std::sync::Arc;
+
+    let (_container, uri) = start_repl_set().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let coll = client.database(DB).collection::<Document>(COLL);
+    coll.insert_one(doc! { "_id": 0, "seed": true })
+        .await
+        .expect("seed");
+
+    let first = MongoCdcSource::new(config(&uri)).await.expect("source");
+    let writer_uri = uri.clone();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let client = Client::with_uri_str(&writer_uri).await.expect("writer");
+        client
+            .database(DB)
+            .collection::<Document>(COLL)
+            .insert_one(doc! { "_id": 1, "name": "alice" })
+            .await
+            .expect("insert");
+    });
+    let (_records, bookmark) = drain(&first).await;
+    writer.await.expect("writer");
+    let mut legacy = bookmark.expect("a bookmark");
+    legacy.as_object_mut().unwrap().remove("invalidate");
+    assert!(legacy.get("invalidate").is_none(), "the schema-0 shape");
+
+    let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+    let key = first.state_key().expect("state key");
+    store.put(&key, &legacy).await.unwrap();
+
+    coll.insert_one(doc! { "_id": 2, "name": "carol" })
+        .await
+        .expect("insert after the bookmark");
+
+    let source = MongoCdcSource::new(config(&uri)).await.expect("source");
+    let sink = Capture::default();
+    Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .expect("the legacy bookmark resumes");
+
+    let written = sink.0.lock().unwrap().clone();
+    assert!(!written.is_empty(), "the post-bookmark insert is delivered");
+    for r in &written {
+        assert_eq!(r["document_key"]["_id"], json!(2), "replayed: {r}");
+    }
+    let stored = StoredState::parse(&store.get(&key).await.unwrap().expect("stored"));
+    assert_eq!(stored.format, STATE_FORMAT);
+    assert_eq!(stored.owner.as_deref(), Some("mongodb-cdc"));
+    assert_eq!(stored.schema, 1);
+    assert_eq!(stored.data["invalidate"], json!(false));
+}

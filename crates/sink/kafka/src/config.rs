@@ -463,6 +463,13 @@ impl KafkaSinkConfig {
     }
 }
 
+impl KafkaSinkConfig {
+    /// What a failed batch write leaves behind (#737): each record is its own send.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        faucet_core::BatchAtomicity::BestEffort
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,5 +767,14 @@ mod tests {
             from_serde.commit_token_topic_replication,
             d.commit_token_topic_replication
         );
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: KafkaSinkConfig = serde_json::from_value(
+            serde_json::json!({"brokers": "b:9092", "topic": {"type": "fixed", "name": "out"}}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

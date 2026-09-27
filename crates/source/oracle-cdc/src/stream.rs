@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -12,21 +13,22 @@ use async_trait::async_trait;
 use faucet_common_oracle::oracle::Connection;
 use faucet_common_oracle::{
     NLS_SESSION_SQL, OraclePool, Side, TypeFamily, blocking, call_timeout, checkout, connect_pool,
-    ora_err,
+    ora_code, ora_err,
 };
 use faucet_core::check::{CheckContext, CheckReport, Probe};
-use faucet_core::{FaucetError, Source, Stream, StreamPage};
+use faucet_core::{FaucetError, Source, SourceLag, Stream, StreamPage};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 
 use crate::config::{OracleCdcSourceConfig, StartPosition};
+use crate::lag::{LagPlan, commit_scn, from_age};
 use crate::logs::{LogFile, oldest_available_scn, plan_log_files};
 use crate::miner::{Assembler, LogRow, Miner, TableMeta, to_envelope};
 use crate::sql::{
-    ADD_LOGFILE_SQL, ARCHIVED_LOGS_SQL, CONTAINER_SQL, DatabaseLogging, END_LOGMNR_SQL,
-    LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL, POSITION_SQL, START_LOGMNR_SQL,
-    SUPPLEMENTAL_SQL, columns_sql, contents_sql, flush_sql, flush_table_ddl, log_groups_sql,
-    logging_report, needs_logfiles,
+    ADD_LOGFILE_SQL, ARCHIVED_LOGS_SQL, CONTAINER_SQL, CURRENT_SCN_SQL, DatabaseLogging,
+    END_LOGMNR_SQL, LOGFILE_ADD, LOGFILE_NEW, LoggingReport, ONLINE_LOGS_SQL, POSITION_SQL,
+    SCN_AGE_SQL, START_LOGMNR_SQL, SUPPLEMENTAL_SQL, columns_sql, contents_sql, flush_sql,
+    flush_table_ddl, log_groups_sql, logging_report, needs_logfiles,
 };
 use crate::state::Position;
 
@@ -34,6 +36,8 @@ use crate::state::Position;
 pub struct OracleCdcSource {
     shared: Arc<Shared>,
     pending: Mutex<Option<Position>>,
+    emitted: Mutex<Option<u64>>,
+    lag_warned: AtomicBool,
 }
 
 struct Shared {
@@ -428,7 +432,50 @@ impl OracleCdcSource {
                 add_logfiles,
             }),
             pending: Mutex::new(None),
+            emitted: Mutex::new(None),
+            lag_warned: AtomicBool::new(false),
         })
+    }
+
+    fn set_emitted(&self, scn: u64) {
+        if let Ok(mut g) = self.emitted.lock() {
+            *g = Some(scn);
+        }
+    }
+
+    /// The commit SCN capture has reached: the last emitted bookmark, else
+    /// the applied start bookmark.
+    fn lag_position(&self) -> Option<u64> {
+        self.emitted.lock().ok().and_then(|g| *g).or_else(|| {
+            self.pending
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|p| p.commit_scn))
+        })
+    }
+
+    async fn measure_lag(&self, position: u64) -> Result<Option<SourceLag>, FaucetError> {
+        let shared = self.shared.clone();
+        blocking(move || {
+            let conn = shared.conn()?;
+            let current: u64 = conn
+                .query_row_as(CURRENT_SCN_SQL, &[])
+                .map_err(|e| src_err("lag current SCN", &e))?;
+            match crate::lag::plan(position, current) {
+                LagPlan::CaughtUp => Ok(Some(SourceLag::seconds(0.0))),
+                LagPlan::Measure { current, position } => {
+                    match conn
+                        .query_row_as::<f64>(SCN_AGE_SQL, &[&i64_scn(current), &i64_scn(position)])
+                    {
+                        Ok(age) => Ok(Some(SourceLag::seconds(age))),
+                        Err(e) => {
+                            from_age(Err(ora_code(&e))).map_err(|_| src_err("lag SCN age", &e))
+                        }
+                    }
+                }
+            }
+        })
+        .await
     }
 
     fn pages(
@@ -436,11 +483,17 @@ impl OracleCdcSource {
         per_txn: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + '_>> {
         let start = self.pending.lock().expect("pending mutex").take();
+        if let Some(p) = &start {
+            self.set_emitted(p.commit_scn);
+        }
         let shared = self.shared.clone();
         Box::pin(async_stream::try_stream! {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamPage>(4);
             let handle = tokio::task::spawn_blocking(move || shared.capture(start, per_txn, tx));
             while let Some(page) = rx.recv().await {
+                if let Some(scn) = page.bookmark.as_ref().and_then(commit_scn) {
+                    self.set_emitted(scn);
+                }
                 yield page;
             }
             handle
@@ -496,6 +549,25 @@ impl Source for OracleCdcSource {
             Ok(Some(shared.position_now(&conn)?.to_value()))
         })
         .await
+    }
+
+    /// Seconds of commit time between the capture position and the current
+    /// SCN (`SCN_TO_TIMESTAMP`); `None` before a position exists or when the
+    /// position is older than the SCN-to-time mapping (ORA-08181). A failed
+    /// query is logged once and reported as no lag.
+    async fn lag(&self) -> Result<Option<SourceLag>, FaucetError> {
+        let Some(position) = self.lag_position() else {
+            return Ok(None);
+        };
+        match self.measure_lag(position).await {
+            Ok(lag) => Ok(lag),
+            Err(e) => {
+                if !self.lag_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(error = %e, "oracle-cdc: lag query failed; lag is not reported (logged once)");
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn supports_exactly_once(&self) -> bool {

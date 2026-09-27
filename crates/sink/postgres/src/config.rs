@@ -217,6 +217,23 @@ impl PostgresSinkConfig {
     }
 }
 
+impl PostgresSinkConfig {
+    /// What a failed batch write leaves behind (#737): appends are autocommit statements (one per chunk), keyed writes are transactional only when journaled for rollback.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        let atomic = if self.write.dedups_by_key() {
+            self.write.journals()
+        } else {
+            self.batch_size == 0
+                && matches!(self.column_mapping, PostgresColumnMapping::Jsonb { .. })
+        };
+        if atomic {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +390,15 @@ mod tests {
         let config = PostgresSinkConfig::new("postgres://localhost/test", "events")
             .with_write_method(PostgresWriteMethod::Copy);
         assert_eq!(config.write_method, PostgresWriteMethod::Copy);
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: PostgresSinkConfig = serde_json::from_value(serde_json::json!({"connection_url": "postgres://localhost/test", "table_name": "events"})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: PostgresSinkConfig = serde_json::from_value(serde_json::json!({"connection_url": "postgres://localhost/test", "table_name": "events", "batch_size": 0})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        let c: PostgresSinkConfig = serde_json::from_value(serde_json::json!({"connection_url": "postgres://localhost/test", "table_name": "events", "write_mode": "upsert", "key": ["id"]})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

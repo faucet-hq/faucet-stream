@@ -208,6 +208,7 @@ async fn probe_sink(kind: &'static str) -> bool {
         return false;
     };
     let cfg = minimal_config(&format!("sink:{kind}"), &schema);
+    let offline_atomicity = registry::sink_batch_atomicity(kind, &cfg);
     // Isolate construction in a task: a `new()` that *panics* (e.g. a reqwest
     // client hitting rustls' "no process-level CryptoProvider" when
     // `--all-features` pulls in two crypto backends) surfaces as a `JoinError`
@@ -240,7 +241,37 @@ async fn probe_sink(kind: &'static str) -> bool {
         sink.supported_write_modes(),
         "{kind}: sink_supported_write_modes() disagrees with Sink::supported_write_modes()",
     );
+    // #737: `faucet validate` decides `dlq_all` safety from the offline answer.
+    assert_eq!(
+        offline_atomicity,
+        Some(sink.batch_atomicity()),
+        "{kind}: registry::sink_batch_atomicity disagrees with Sink::batch_atomicity",
+    );
     true
+}
+
+/// Every compiled sink kind answers `sink_batch_atomicity` from its typed
+/// config without being built (#737) — the answer `faucet validate` uses to
+/// refuse `on_batch_error: dlq_all` on a sink that can land part of a batch.
+#[test]
+fn every_sink_kind_declares_batch_atomicity_offline() {
+    let mut answered = Vec::new();
+    for kind in registry::sink_kinds() {
+        let schema = registry::sink_schema(kind).expect("schema");
+        let cfg = minimal_config(&format!("sink:{kind}"), &schema);
+        if registry::sink_batch_atomicity(kind, &cfg).is_some() {
+            answered.push(kind);
+        }
+    }
+    for must in MUST_CHECK_SINKS {
+        if registry::sink_kinds().contains(must) {
+            assert!(answered.contains(must), "{must} must answer offline");
+        }
+    }
+    assert_eq!(
+        registry::sink_batch_atomicity("no-such-sink", &json!({})),
+        None
+    );
 }
 
 /// Try to build a source and, if it builds, assert allowlist == trait on both

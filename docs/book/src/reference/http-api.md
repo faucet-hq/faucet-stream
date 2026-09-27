@@ -27,9 +27,9 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status`, `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
 | `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
-| `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete) and `GET /v1/audit` |
+| `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete), pipeline state (`/v1/state/{pipeline}/{row}`) and `GET /v1/audit` |
 
 ```yaml
 # auth.yaml
@@ -112,6 +112,8 @@ someone does.
 | `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
 | `POST /v1/catalog/datasets/{id}/consumers` | — | ✓ | ✓ |
 | `GET /v1/usage` | ✓ | ✓ | ✓ |
+| `GET`/`POST /v1/status` | ✓ | ✓ | ✓ |
+| `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` | — | — | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
 | `GET /v1/templates`, `/v1/templates/{id}` | ✓ | ✓ | ✓ |
@@ -211,6 +213,10 @@ for the SQL backends; an in-memory ring otherwise) and expire with the
 | `POST` | `/v1/templates/sync` | `200` | Pull the `--templates-sync` origins into the registry — `{origin?, dry_run?}`; one report per origin, appends only (admin / `TemplateAdmin`; requires the `templates-sync` feature; `422` when the server has no origins) |
 | `POST` | `/v1/templates/{id}/publish` | `200` | Write one version back to an origin — `{origin, version?}` (admin / `TemplateAdmin`; `templates-sync`) |
 | `GET` | `/v1/whoami` | `200` | The caller's `principal`, `role` and `permissions` (every role / `Identity`) |
+| `GET` / `POST` | `/v1/status` | `200` | [Pipeline health](#pipeline-status-and-state) per row, from an inline `config` or a registered `template` (viewer / `StatusRead`) |
+| `GET` | `/v1/state/{pipeline}/{row}` | `200` | A row's bookmark, envelope sequence and markers (admin / `StateAdmin`) |
+| `PUT` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Move the row's bookmark (admin / `StateAdmin`); `409` while a run holds the row |
+| `DELETE` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Reset the row so its next run re-syncs (admin / `StateAdmin`); `409` while a run holds the row |
 | `POST` | `/v1/changes` | `201` | Propose a [change request](../cookbook/approvals.md) (`kind` = `run` / `template_register` / `template_launch`, `payload`, `reason`, `budget`); planned now, executed on approval — operator / `ChangeRequest` |
 | `GET` | `/v1/changes` | `200` | List change requests (`status`, `kind`, `requester`, `limit`), newest first, plan rows omitted — viewer / `ChangeRead` |
 | `GET` | `/v1/changes/{id}` | `200` | One change request with its plan — viewer / `ChangeRead` |
@@ -308,7 +314,9 @@ is the last `run_id` from the previous page.
   "elapsed_secs": 12.4,
   "records_written": 4096,
   "invocations": [
-    {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null}
+    {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
+     "batches": {"attempted": 5, "committed": 5, "dlq_partial": 0, "dlq_all": 0, "failed": 0},
+     "source_lag": {"bytes": 4096}}
   ],
   "error": null,
   "idempotency_key": "airflow-task-123-attempt-2",
@@ -317,7 +325,10 @@ is the last `run_id` from the previous page.
 ```
 
 `status` is one of `queued`, `running`, `completed`, `failed`, `cancelled`.
-`elapsed_secs` is filled live for running runs.
+`elapsed_secs` is filled live for running runs. Each invocation carries
+`batches` — how its sink writes ended (`committed` / `dlq_partial` / `dlq_all` /
+`failed`, #737) — and, for a source with a head, `source_lag` at the end of the
+invocation (`bytes` / `events` / `seconds`, #733).
 
 > **Bookmarks:** run records carry record counts + per-row outcomes, not
 > replication bookmarks. Bookmark state is per-row/per-state-key and lives in the
@@ -416,6 +427,43 @@ A refused approval is a `403` naming the rule (role, named principals,
 self-approval); a request that is not `pending`, or a second approval by the
 same principal, is a `409`. Audited as `change.requested` / `approved` /
 `rejected` / `executed` / `invalidated` / `expired` / `failed`.
+
+### Pipeline status and state
+
+`GET /v1/status` (and `POST /v1/status` with the same fields in a JSON body)
+returns the `StatusReport` behind [`faucet status`](cli.md#status): per row,
+`health` (`ok` / `running` / `warming` / `unknown` / `degraded` / `failed`),
+`last_success` / `last_failure` (from the state store's run-outcome marker,
+the SLA history, and this server's run history — each tagged with its
+`source`), `bookmark` and `bookmark_age_secs`, `exactly_once`
+(`state_seq`, and with `probe=true` the sink's watermark, `agreement` and which
+side the next run `trusted`), `overwrite_staging` (`state` present / absent /
+unknown, `verified` only with `probe=true`), `lag` (the source's lag reported
+when the last run ended, or with `probe=true` queried now — `measured`
+`last_run` / `probe`, plus `human`), `batches` (the last run's sink-write
+outcomes), `dlq` backlog, `sla` verdicts (including `lag`), `profiling`,
+`rollback`, `children`, the `resume` sentence, and per-field `errors`. The
+top-level `health` / `exit_code` are the worst row's. A run in flight on this
+server shows as `running` — every submitted run carries a `pipeline` label
+(the config's `name`, else `serve`, unless the caller set one) that ties it
+to its pipeline whatever the run is named. Name the config with `config` (inline YAML / JSON,
+`config_format`) **or** `template` (+ `version`, a number or channel,
+default `stable`; `sink` for a source template; `params` in the POST body).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  --get --data-urlencode "template=orders" http://localhost:8080/v1/status | jq '.rows[] | {row, health, resume}'
+```
+
+`/v1/state/{pipeline}/{row}` reads (`GET`), moves (`PUT` with `bookmark`,
+optional `parent_key`, `dry_run`, `force`, `skip_watermark_check`) or resets
+(`DELETE` with `parent_key`, `include_markers`, `rewind_token`, `dry_run`,
+`force`, `skip_watermark_check` as query parameters) one row's durable state,
+with the same exactly-once rules as [`faucet state`](cli.md#state). The config
+is named the same way, and its pipeline name must equal `{pipeline}`. A
+mutation answers `409` while the row's run lease is live or this server has a
+run of the pipeline in flight, unless `force`. Every call is admin-only and
+audited (`state.get` / `state.set` / `state.reset`; status as `status`).
 
 ### `/v1/tenants*` (multi-tenant embedded integrations)
 
@@ -917,7 +965,7 @@ Every error is a JSON `ApiError`:
 | `401` | Missing/invalid bearer token |
 | `403` | Authenticated, but the principal's role lacks the required permission (RBAC) |
 | `404` | Unknown `run_id` |
-| `409` | `DELETE` on a running run; idempotency key reused with a different payload |
+| `409` | `DELETE` on a running run; idempotency key reused with a different payload; a pipeline-state change while a run holds the row |
 | `413` | Body exceeds `--body-limit-bytes` |
 | `422` | Expand/validation failure; `doctor_first` failed (report in `details`) |
 | `429` | Run queue full (carries `Retry-After`) |

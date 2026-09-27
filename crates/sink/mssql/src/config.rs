@@ -201,6 +201,17 @@ impl MssqlSinkConfig {
     }
 }
 
+impl MssqlSinkConfig {
+    /// What a failed batch write leaves behind (#737): keyed writes run in one transaction; appends commit per chunk and isolate failing rows.
+    pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        if self.write.dedups_by_key() {
+            faucet_core::BatchAtomicity::Atomic
+        } else {
+            faucet_core::BatchAtomicity::BestEffort
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +321,16 @@ mod tests {
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("***"));
         assert!(!dbg.contains("secret"));
+    }
+
+    #[test]
+    fn batch_atomicity_matches_the_write_path() {
+        let c: MssqlSinkConfig = serde_json::from_value(
+            serde_json::json!({"connection_url": "mssql://sa:pw@h/db", "table": "dbo.events"}),
+        )
+        .unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let c: MssqlSinkConfig = serde_json::from_value(serde_json::json!({"connection_url": "mssql://sa:pw@h/db", "table": "dbo.events", "write_mode": "upsert", "key": ["id"]})).unwrap();
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
     }
 }

@@ -358,6 +358,7 @@ async fn insert_id_field_populates_per_row_insert_id() {
     .with_batch_size(0)
     .with_insert_id_field("event_id");
     let sink = BigQuerySink::from_parts(config, client);
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
 
     // First row has a string event_id, second a numeric one (stringified),
     // third lacks the field entirely.

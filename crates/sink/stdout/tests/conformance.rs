@@ -66,6 +66,7 @@ fn conformance_config_schema_valid() {
 #[test]
 fn conformance_connector_name_nonempty() {
     let sink = StdoutSink::new(StdoutSinkConfig::new());
+    faucet_conformance::assert_batch_atomicity_declared(&sink);
     faucet_conformance::assert_connector_name_nonempty_value(
         sink.connector_name(),
         sink.connector_name(),

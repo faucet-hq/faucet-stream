@@ -719,6 +719,11 @@
           "description": "Include each failed record's original payload in its DLQ envelope.",
           "type": "boolean",
           "default": true
+        },
+        "allow_duplicates_on_dlq_all": {
+          "description": "Accept `on_batch_error: dlq_all` on a sink that may commit part of a\nfailed batch. Rows that already landed are sent to the DLQ too, so a\nreplay writes them twice. Without it that combination is refused.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
@@ -2340,6 +2345,33 @@
               "type": "null"
             }
           ]
+        },
+        "max_lag_bytes": {
+          "description": "Maximum source lag in bytes (unread Postgres WAL, MySQL binlog) before\nthe pipeline counts as behind. Checked against the lag the source\nreports at the end of each run and by `faucet status --probe`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_lag_events": {
+          "description": "Maximum source lag in events (unconsumed Kafka messages, SQL Server\nchange rows).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_lag_seconds": {
+          "description": "Maximum age, in seconds, of the oldest change the source has not yet\ndelivered (MongoDB, SQL Server, Kinesis).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": false

@@ -21,9 +21,19 @@ cardinality and never a Prometheus label.
 
 - **Source:** `faucet_source_records_total`, `faucet_source_errors_total{kind}`,
   `faucet_source_page_duration_seconds`, `faucet_source_in_flight`.
+- **Source lag** (#733): `faucet_source_lag_bytes`, `faucet_source_lag_events`,
+  `faucet_source_lag_seconds{pipeline,row,connector}` — how far a CDC or
+  streaming source is behind its head (unread WAL / binlog, unconsumed
+  messages, age of the oldest unread change), polled at page boundaries and at
+  the end of a run. Sources without a head (query sources) emit nothing. See
+  [Source lag](../cookbook/sla.md#source-lag).
 - **Sink:** `faucet_sink_records_total`, `faucet_sink_writes_total`,
   `faucet_sink_errors_total`, `faucet_sink_write_duration_seconds`,
   `faucet_sink_flush_duration_seconds`, `faucet_sink_in_flight`.
+- **Batch outcomes** (#737): `faucet_batch_outcomes_total{pipeline,row,sink,outcome}`
+  — one increment per sink write, `outcome` ∈ `committed` \| `dlq_partial` \|
+  `dlq_all` \| `failed`; their sum is the writes attempted. See
+  [batch atomicity](../cookbook/dlq.md#batch-atomicity-and-dlq_all).
 - **Upstream round trips** (#638): `faucet_source_roundtrips_total{op}` and
   `faucet_sink_roundtrips_total{op}` — how many calls a connector actually made
   to its backend, with companion `*_roundtrip_duration_seconds{op}` histograms.

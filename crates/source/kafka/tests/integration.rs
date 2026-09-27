@@ -315,3 +315,45 @@ async fn state_key_is_deterministic_and_present() {
         .unwrap();
     assert_eq!(source.state_key().as_deref(), Some("kafka:group-x:topic-a"));
 }
+
+/// #733 — `lag()` counts the messages between the next offset to read and each
+/// partition's high watermark: everything before a position is known (under
+/// `earliest`), the rest after part of the topic is consumed, and the gap from
+/// a stored bookmark on a fresh consumer (what `faucet status --probe` asks).
+#[tokio::test(flavor = "multi_thread")]
+async fn lag_counts_unconsumed_messages_across_partitions() {
+    let (_container, brokers) = start_kafka().await;
+    let topic = "lagging";
+    create_topic(&brokers, topic, 2).await;
+    for i in 0..3 {
+        produce_to_partition(&brokers, topic, 0, &format!(r#"{{"id":{i}}}"#)).await;
+    }
+    for i in 3..5 {
+        produce_to_partition(&brokers, topic, 1, &format!(r#"{{"id":{i}}}"#)).await;
+    }
+
+    let source = KafkaSource::new(source_config(&brokers, topic, "g-lag", 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        source.lag().await.unwrap(),
+        Some(faucet_core::SourceLag::events(5)),
+        "nothing consumed yet: every message counts"
+    );
+    let (records, bookmark) = source.fetch_all_incremental().await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        source.lag().await.unwrap(),
+        Some(faucet_core::SourceLag::events(3))
+    );
+
+    let probe = KafkaSource::new(source_config(&brokers, topic, "g-lag-probe", 1))
+        .await
+        .unwrap();
+    probe.apply_start_bookmark(bookmark.unwrap()).await.unwrap();
+    assert_eq!(
+        probe.lag().await.unwrap(),
+        Some(faucet_core::SourceLag::events(3)),
+        "a fresh consumer measures from the stored bookmark"
+    );
+}

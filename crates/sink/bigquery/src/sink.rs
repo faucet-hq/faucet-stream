@@ -1792,6 +1792,10 @@ impl BigQuerySink {
 
 #[async_trait]
 impl faucet_core::Sink for BigQuerySink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn set_roundtrip_recorder(
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
@@ -2310,6 +2314,11 @@ impl faucet_core::Sink for BigQuerySink {
         };
         self.run_ddl(sql).await?;
         self.run_ddl(format!("DROP TABLE IF EXISTS {temp}")).await
+    }
+
+    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(Some(self.table_exists(&self.overwrite_temp_id()).await?))
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing

@@ -13,7 +13,7 @@ pipeline:                  # required
   transforms: []           # optional list
   sink:   { type: …, config: { … } }
   state:  { type: …, config: { … } }   # optional
-  dlq:    { … }            # optional dead-letter queue
+  dlq:    { … }            # optional dead-letter queue (see below)
 matrix: []                 # optional per-row overrides / DAG
 execution:                 # optional
   max_concurrent: 4
@@ -972,6 +972,20 @@ explicitly; otherwise the injected policy's `max_attempts` + `base` apply (its
 `retry_on` / `max` / `jitter` are inert on REST, honored on `xml` / `graphql`
 and on every sink-side write).
 
+## `dlq`
+
+Optional dead-letter queue under `pipeline:` (or per matrix row). See the
+[DLQ cookbook](../cookbook/dlq.md).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sink` | connector | — | Where failed and quarantined records go (usually `jsonl`). |
+| `on_batch_error` | `propagate` \| `dlq_all` | `propagate` | When a whole sink write fails: fail the run, or send every row of it to the DLQ and continue. `dlq_all` is refused on a sink whose failed write can land part of a batch — see [batch atomicity](../cookbook/dlq.md#batch-atomicity-and-dlq_all). |
+| `allow_duplicates_on_dlq_all` | bool | `false` | Accept `dlq_all` on such a sink anyway: rows that already landed also go to the DLQ, so a replay writes them twice. |
+| `max_failures_per_page` | int | — | Fail the run once one page sends more records than this to the DLQ. |
+| `max_failures_total` | int | — | Fail the run once more records than this have gone to the DLQ in total. |
+| `include_original_payload` | bool | `true` | Keep each failed record's payload in its envelope. |
+
 ## `sla`
 
 Optional top-level block declaring a freshness/volume SLA for the pipeline
@@ -990,6 +1004,7 @@ sla:
     sensitivity: 3.0           # zscore default 3.0; iqr default 1.5
     min_history: 5             # successful runs before detection starts
     window: 20                 # rolling baseline size
+  max_lag_bytes: 1073741824    # the source may be at most 1 GiB behind its head
 ```
 
 | Field | Type | Default | Description |
@@ -1000,8 +1015,17 @@ sla:
 | `volume_anomaly.sensitivity` | float | `3.0` / `1.5` | `zscore`: max \|x − mean\| / std. `iqr`: Tukey fence multiplier. Defaults per method. |
 | `volume_anomaly.min_history` | int | `5` | Cold-start guard: successful runs of history required before detection fires (min 2). |
 | `volume_anomaly.window` | int | `20` | Rolling window of successful-run volumes kept as the baseline (≥ `min_history`). |
+| `max_lag_bytes` | int | — | Maximum source lag in bytes — unread Postgres WAL or MySQL binlog (#733). |
+| `max_lag_events` | int | — | Maximum source lag in events — unconsumed Kafka messages, SQL Server change transactions. |
+| `max_lag_seconds` | int | — | Maximum age of the oldest change the source has not delivered — MongoDB, SQL Server, Oracle, Kinesis, DynamoDB Streams. |
 
-At least one of the three checks must be set. `max_staleness_secs` /
+The `max_lag_*` thresholds are checked against the lag the source reports when
+each run ends (`kind="lag"` on the violations counter), by `faucet status`
+(`--probe` queries the source now) and by `faucet doctor`'s `lag` probe. A unit
+the source does not report is not checked, and a source with no notion of a
+head (a query source) never breaches them. They need no `state:` block.
+
+At least one check must be set. `max_staleness_secs` /
 `volume_anomaly` require a `state:` block (enforced at config load); the
 history is persisted next to the pipeline's bookmarks under
 `{name}::{row}::__sla__`. With a `memory` state store the history only

@@ -490,6 +490,10 @@ fn build_create_table_sql(
 
 #[async_trait]
 impl faucet_core::Sink for SnowflakeSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     fn connector_name(&self) -> &'static str {
         "snowflake"
     }

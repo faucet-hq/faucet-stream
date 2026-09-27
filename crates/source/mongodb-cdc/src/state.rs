@@ -41,16 +41,25 @@ pub struct Bookmark {
     /// MongoDB forbids `resumeAfter` on an invalidate token — only `startAfter`
     /// — so on resume the source must open the next stream with `start_after`,
     /// or every subsequent watch open fails and the CDC pipeline wedges
-    /// permanently (audit #321 M3). Absent from older bookmarks (defaults
-    /// `false`) and omitted from the serialized state when `false`.
-    #[serde(default, skip_serializing_if = "is_false")]
+    /// permanently (audit #321 M3). Absent from schema-0 bookmarks (defaults
+    /// `false`); always written from schema 1 (#736).
+    #[serde(default)]
     pub invalidate: bool,
 }
 
-/// `skip_serializing_if` predicate keeping non-invalidate bookmarks byte-compatible
-/// with the pre-#321 state format.
-fn is_false(b: &bool) -> bool {
-    !*b
+/// The bookmark shape version (#736). Schema 1 always writes `invalidate`;
+/// schema 0 omitted it when `false`, so an absent flag was ambiguous.
+pub const STATE_SCHEMA: u32 = 1;
+
+/// Bring a bookmark stored at shape version `from` up to [`STATE_SCHEMA`].
+pub fn migrate_state(from: u32, data: Value) -> Result<Value, FaucetError> {
+    match from {
+        0 => Bookmark::from_value(data)?.to_value(),
+        STATE_SCHEMA => Ok(data),
+        other => Err(FaucetError::State(format!(
+            "mongodb-cdc has no bookmark schema {other} (this release reads up to {STATE_SCHEMA})"
+        ))),
+    }
 }
 
 impl Bookmark {
@@ -155,7 +164,9 @@ mod tests {
             invalidate: false,
         };
         let v = normal.to_value().unwrap();
-        assert!(v.get("invalidate").is_none(), "false flag is omitted: {v}");
+        // Schema 1 (#736) writes the flag explicitly; versioned state replaces
+        // the byte-compatibility schema 0 kept by omitting it.
+        assert_eq!(v["invalidate"], json!(false), "{v}");
         // An invalidate bookmark serializes the flag and round-trips.
         let inv = Bookmark {
             resume_token: json!({ "_data": "BB" }),
@@ -163,5 +174,23 @@ mod tests {
         };
         let back = Bookmark::from_value(inv.to_value().unwrap()).unwrap();
         assert!(back.invalidate);
+    }
+
+    #[test]
+    fn schema_zero_bookmarks_migrate_to_an_explicit_flag() {
+        let migrated = migrate_state(0, json!({ "resume_token": { "_data": "AA" } })).unwrap();
+        assert_eq!(
+            migrated,
+            json!({ "resume_token": { "_data": "AA" }, "invalidate": false })
+        );
+        let inv = migrate_state(
+            0,
+            json!({ "resume_token": { "_data": "AA" }, "invalidate": true }),
+        )
+        .unwrap();
+        assert_eq!(inv["invalidate"], json!(true));
+        assert_eq!(migrate_state(1, json!({"x": 1})).unwrap(), json!({"x": 1}));
+        assert!(migrate_state(0, json!("garbage")).is_err());
+        assert!(migrate_state(2, json!({})).is_err());
     }
 }

@@ -1079,6 +1079,10 @@ const TRANSIENT_RETRY_BASE: Duration = Duration::from_millis(50);
 
 #[async_trait]
 impl Sink for MssqlSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
@@ -1376,6 +1380,11 @@ impl Sink for MssqlSink {
         }
         control(&mut conn, "COMMIT TRAN").await?;
         Ok(())
+    }
+
+    /// Probe for the `<table>__faucet_ovw` staging table (read-only).
+    async fn overwrite_staging_exists(&self) -> Result<Option<bool>, FaucetError> {
+        Ok(Some(self.table_exists(&self.staging_literal()).await?))
     }
 
     /// Drop the staging table so a failed/cancelled overwrite leaves nothing

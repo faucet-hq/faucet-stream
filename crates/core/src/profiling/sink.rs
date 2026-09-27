@@ -94,6 +94,9 @@ impl Sink for ProfilingSink {
     fn dedups_by_key(&self) -> bool {
         self.inner.dedups_by_key()
     }
+    fn batch_atomicity(&self) -> crate::dlq::BatchAtomicity {
+        self.inner.batch_atomicity()
+    }
     fn supported_write_modes(&self) -> &'static [crate::write_mode::WriteMode] {
         self.inner.supported_write_modes()
     }
@@ -277,6 +280,10 @@ mod tests {
         assert!(sink.flush().await.is_ok());
         assert!(sink.local_outputs().await.is_empty());
         assert!(!sink.dedups_by_key());
+        assert_eq!(
+            sink.batch_atomicity(),
+            crate::dlq::BatchAtomicity::BestEffort
+        );
         assert!(!sink.is_overwrite());
         assert!(!sink.supports_rollback());
         assert!(!sink.supports_cleanup());

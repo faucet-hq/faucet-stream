@@ -455,6 +455,14 @@ In the CLI / umbrella, enable the connector with `source-kafka`, and the registr
 - [`faucet-sink-kafka`](https://crates.io/crates/faucet-sink-kafka) — produce records to Kafka topics.
 - [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka) — shared auth modes, value formats, Schema Registry client, and policy enums.
 
+## Source lag
+
+`Source::lag` (#733) reports **events**: each partition's high watermark minus the next offset to read (the bookmark; with no position, where `auto_offset_reset` starts), summed over the subscribed topics. The pipeline polls it on the first page, at most every
+15 s after, and when the run ends, exporting `faucet_source_lag_*{pipeline,row,connector}`;
+`faucet status --probe` and `faucet doctor` ask it from the stored bookmark,
+and `sla.max_lag_*` thresholds turn it into an SLA. A failing lag query is
+logged once and reported as no lag — it never fails a run.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

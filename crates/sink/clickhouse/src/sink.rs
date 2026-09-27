@@ -254,6 +254,10 @@ impl ClickHouseSink {
 
 #[async_trait]
 impl Sink for ClickHouseSink {
+    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
+        self.config.batch_atomicity()
+    }
+
     /// Insert records via `INSERT … FORMAT JSONEachRow`.
     ///
     /// When `batch_size > 0` and the page is larger, it is split into

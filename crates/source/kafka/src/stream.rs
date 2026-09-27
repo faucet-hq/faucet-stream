@@ -40,8 +40,24 @@ pub struct KafkaSource {
     /// or `None` for a plain single-consumer run. `Mutex` so
     /// `apply_shard(&self, …)` can record it before streaming.
     member_shard: std::sync::Mutex<Option<MemberShard>>,
+    /// The offsets last handed to the pipeline on a page bookmark — where
+    /// [`Source::lag`] measures from (#733).
+    emitted: std::sync::Mutex<Option<Bookmark>>,
     #[cfg(feature = "schema-registry")]
     sr_client: Option<SchemaRegistryClient>,
+}
+
+/// Messages left in one partition: from the next offset to read (or, with no
+/// position, where `auto_offset_reset` starts) up to the high watermark. A
+/// position below the low watermark has been truncated away, so it counts
+/// from the low watermark.
+fn partition_lag(low: i64, high: i64, position: Option<i64>, earliest: bool) -> u64 {
+    let from = match position {
+        Some(p) => p.max(low),
+        None if earliest => low,
+        None => high,
+    };
+    high.saturating_sub(from).max(0) as u64
 }
 
 impl KafkaSource {
@@ -87,6 +103,7 @@ impl KafkaSource {
             state_key_value,
             assigned_floor: std::sync::Mutex::new(HashMap::new()),
             member_shard: std::sync::Mutex::new(None),
+            emitted: std::sync::Mutex::new(None),
             #[cfg(feature = "schema-registry")]
             sr_client,
         })
@@ -207,6 +224,14 @@ impl KafkaSource {
 
     /// The start bookmark applied via [`apply_start_bookmark`], retained for
     /// carry-forward (cloned, not consumed). `None` on a fresh run.
+    fn note_emitted(&self, bookmark: Option<&Value>) {
+        if let Some(b) = bookmark.and_then(|v| Bookmark::from_value(v.clone()).ok())
+            && let Ok(mut g) = self.emitted.lock()
+        {
+            *g = Some(b);
+        }
+    }
+
     fn start_bookmark(&self) -> Option<Bookmark> {
         self.context
             .start_offsets
@@ -517,6 +542,7 @@ impl Source for KafkaSource {
         }
 
         let bookmark_value = self.build_bookmark(&pending_offsets).await?;
+        self.note_emitted(bookmark_value.as_ref());
         Ok((records, bookmark_value))
     }
 
@@ -664,6 +690,7 @@ impl Source for KafkaSource {
                         Vec::with_capacity(initial_capacity),
                     );
                     let bookmark = self.build_bookmark(&pending_offsets).await?;
+                    self.note_emitted(bookmark.as_ref());
                     let durable_snapshot = pending_offsets.clone();
                     yield StreamPage { records: page_records, bookmark };
                     // Resumed ⇒ the page above is durable; commit its offsets
@@ -681,6 +708,7 @@ impl Source for KafkaSource {
             // page carrying the cumulative bookmark.
             if !buffer.is_empty() {
                 let bookmark = self.build_bookmark(&pending_offsets).await?;
+                self.note_emitted(bookmark.as_ref());
                 yield StreamPage { records: buffer, bookmark };
             }
 
@@ -725,6 +753,61 @@ impl Source for KafkaSource {
         })?;
         *guard = Some(parsed);
         Ok(())
+    }
+
+    /// Unconsumed messages across every partition of the subscribed topics
+    /// (#733): each partition's high watermark minus the offset this source
+    /// would read next.
+    async fn lag(&self) -> Result<Option<faucet_core::SourceLag>, FaucetError> {
+        let position = self
+            .emitted
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.start_bookmark());
+        let positions: HashMap<(String, i32), i64> = position
+            .map(|b| {
+                b.partition_offsets
+                    .into_iter()
+                    .map(|p| ((p.topic, p.partition), p.offset))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let earliest = matches!(
+            self.config.auto_offset_reset,
+            crate::config::OffsetReset::Earliest
+        );
+        let consumer = Arc::clone(&self.consumer);
+        let topics = self.config.topics.clone();
+        tokio::task::spawn_blocking(move || {
+            let timeout = Duration::from_secs(5);
+            let mut total = 0u64;
+            for topic in &topics {
+                let md = consumer
+                    .fetch_metadata(Some(topic), timeout)
+                    .map_err(|e| FaucetError::Source(format!("kafka lag metadata: {e}")))?;
+                let partitions: Vec<i32> = md
+                    .topics()
+                    .iter()
+                    .filter(|t| t.name() == topic)
+                    .flat_map(|t| t.partitions().iter().map(|p| p.id()))
+                    .collect();
+                for partition in partitions {
+                    let (low, high) = consumer
+                        .fetch_watermarks(topic, partition, timeout)
+                        .map_err(|e| FaucetError::Source(format!("kafka lag watermarks: {e}")))?;
+                    total += partition_lag(
+                        low,
+                        high,
+                        positions.get(&(topic.clone(), partition)).copied(),
+                        earliest,
+                    );
+                }
+            }
+            Ok(Some(faucet_core::SourceLag::events(total)))
+        })
+        .await
+        .map_err(|e| FaucetError::Source(format!("kafka lag task: {e}")))?
     }
 
     /// Kafka partitions are immutable, ordered logs and every emitted page
@@ -872,6 +955,16 @@ impl Source for KafkaSource {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn partition_lag_counts_from_the_next_offset() {
+        assert_eq!(partition_lag(0, 100, Some(40), false), 60);
+        assert_eq!(partition_lag(50, 100, Some(10), false), 50);
+        assert_eq!(partition_lag(0, 100, None, true), 100);
+        assert_eq!(partition_lag(0, 100, None, false), 0);
+        assert_eq!(partition_lag(0, 100, Some(150), false), 0);
+    }
+
     use super::*;
     use crate::config::OffsetReset;
     use std::collections::BTreeMap;
