@@ -4862,6 +4862,11 @@
           "description": "Excel (`.xlsx`/`.xls`) — parse a workbook body. Requires the crate's\n`excel` feature.",
           "type": "string",
           "const": "excel"
+        },
+        {
+          "description": "JSON Lines — one JSON object per line (a Shopify bulk-operation\nresult, #768). An async-job fetch is decoded line by line into pages\nof `batch_size`, so the file is never held in memory whole.",
+          "type": "string",
+          "const": "jsonl"
         }
       ]
     },
@@ -5346,6 +5351,28 @@
               "type": "null"
             }
           ]
+        },
+        "incremental": {
+          "description": "How an incremental run pushes its bookmark into the submit body (#768).\nAbsent means `inject: { mode: sql }` — the `WHERE` predicate at\n[`query_path`](Self::query_path).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__AsyncJobIncremental"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "submit_errors": {
+          "description": "Errors a submit can return with a `200` and no job id — GraphQL\n`userErrors`, or a \"job already running\" rejection (#768).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__SubmitErrors"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": true
@@ -5458,6 +5485,9 @@
             "type": "string"
           }
         },
+        "json": {
+          "description": "JSON request body (#768) — for status checks that are a `POST` with a\nquery body, such as a GraphQL `node(id:)` lookup. `${job_id}` is\nsubstituted in every string leaf."
+        },
         "interval_secs": {
           "description": "Ceiling on the poll cadence in seconds (default `5`). Polling starts at\n1s and doubles up to this cap, so a job that finishes seconds after\nsubmit is noticed quickly while a long-running one isn't hammered. Set\nit to the slowest acceptable poll rate — it is the maximum gap between\npolls, not a fixed wait.",
           "type": [
@@ -5502,6 +5532,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "error_path": {
+          "description": "JSONPath to an error code or message in the poll response (e.g. a\nShopify bulk operation's `$.data.node.errorCode`), named in the error a\nfailed job raises (#768).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": true
@@ -14500,6 +14537,17 @@
                       "type": [
                         "string",
                         "null"
+                      ]
+                    },
+                    "records_route": {
+                      "description": "Route each record to a named stream by its GID type or a discriminator\nfield, stamping the stream into `stream_field` — so one bulk job's\nparents and children reach separate sinks. See\n[`RecordsRoute`](crate::route::RecordsRoute).",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_rest__RecordsRoute"
+                        },
+                        {
+                          "type": "null"
+                        }
                       ]
                     },
                     "persist_cursor": {
@@ -28689,6 +28737,183 @@
           "const": "number"
         }
       ]
+    },
+    "source_rest__AsyncJobIncremental": {
+      "description": "The `async_job.incremental:` block (#768).",
+      "type": "object",
+      "properties": {
+        "inject": {
+          "description": "Where and how the bookmark is written into the submit body.",
+          "$ref": "#/$defs/source_rest__IncrementalInject",
+          "default": {
+            "mode": "sql",
+            "format": "raw",
+            "initial": ""
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__IncrementalInject": {
+      "description": "The `inject:` block of [`AsyncJobIncremental`].",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "`sql` (default) or `template`.",
+          "$ref": "#/$defs/source_rest__InjectMode",
+          "default": "sql"
+        },
+        "template": {
+          "description": "`template` mode: the filter text, with `${bookmark}` replaced by the\nformatted bookmark — e.g. `updated_at:>'${bookmark}'`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format": {
+          "description": "`template` mode: how the bookmark is formatted (default `raw`).",
+          "$ref": "#/$defs/source_rest__BindFormat",
+          "default": "raw"
+        },
+        "initial": {
+          "description": "`template` mode: what `${faucet.filter}` renders to when there is no\nbookmark yet (the first run, or `full_table`). Default empty.",
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__InjectMode": {
+      "description": "How the incremental bookmark reaches the submit body.",
+      "oneOf": [
+        {
+          "description": "`WHERE <replication_key> > <bookmark>` injected into the SQL statement\nat `query_path` (#630). The default.",
+          "type": "string",
+          "const": "sql"
+        },
+        {
+          "description": "Render [`IncrementalInject::template`] and substitute it for every\n`${faucet.filter}` placeholder in the submit body — for search-syntax\nfilters such as Shopify's `updated_at:>'…'`.",
+          "type": "string",
+          "const": "template"
+        }
+      ]
+    },
+    "source_rest__SubmitErrors": {
+      "description": "Submit-time rejections (#768).",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "JSONPath to the error messages in the submit response, e.g.\n`$.data.bulkOperationRunQuery.userErrors[*].message`. A non-empty match\nfails the run with those messages.",
+          "type": "string"
+        },
+        "retry_on": {
+          "description": "Substrings marking a \"busy\" rejection — another job is still running —\nthat is retried after [`retry_interval_secs`](Self::retry_interval_secs)\ninstead of failing. Matched case-insensitively.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "retry_interval_secs": {
+          "description": "Wait between busy retries (default `30`).",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 30
+        },
+        "retry_timeout_secs": {
+          "description": "Stop retrying a busy rejection after this many seconds (default `900`).",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": 900
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__RecordsRoute": {
+      "description": "The `records_route:` block.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "`id_type` (default) or `field`.",
+          "$ref": "#/$defs/source_rest__RouteBy",
+          "default": "id_type"
+        },
+        "field": {
+          "description": "`by: field` only: the top-level discriminator field.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "routes": {
+          "description": "Route key → target. Keys are object types (`Order`), `child_of:<Type>`\nfor id-less children, or discriminator values under `by: field`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/source_rest__RouteTarget"
+          }
+        },
+        "stream_field": {
+          "description": "Column each routed row is stamped with its stream name (default `_stream`).",
+          "type": "string",
+          "default": "_stream"
+        },
+        "only": {
+          "description": "Emit only these streams; rows of the other configured routes are\nskipped deliberately (not counted as unknown). Empty = every route.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "strict": {
+          "description": "Fail the run on a row no route names, instead of dropping it with a\none-shot warning per type. Default `false`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__RouteBy": {
+      "description": "What a route key is read from.",
+      "oneOf": [
+        {
+          "description": "The object type in a GID (`gid://<app>/<Type>/<id>`) in the row's `id`.\nA row without one is keyed `child_of:<ParentType>` from `__parentId`.",
+          "type": "string",
+          "const": "id_type"
+        },
+        {
+          "description": "The value of a top-level [`RecordsRoute::field`] (e.g. `__typename`).",
+          "type": "string",
+          "const": "field"
+        }
+      ]
+    },
+    "source_rest__RouteTarget": {
+      "description": "Where one route's rows go.",
+      "type": "object",
+      "properties": {
+        "stream": {
+          "description": "Stream name stamped into [`RecordsRoute::stream_field`].",
+          "type": "string"
+        },
+        "parent_key_as": {
+          "description": "Copy `__parentId` into this column so the child stream joins back.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
     }
   }
 }
