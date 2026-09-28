@@ -2307,7 +2307,13 @@ pipeline:
 "#);
         let nodes = expand(&c).unwrap();
         assert_eq!(nodes.len(), 1);
-        assert!(nodes[0].source.config.to_string().contains("${faucet.filter}"));
+        assert!(
+            nodes[0]
+                .source
+                .config
+                .to_string()
+                .contains("${faucet.filter}")
+        );
         assert!(RESERVED_IDS.contains(&"faucet"));
     }
 

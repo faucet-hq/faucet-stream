@@ -2,7 +2,11 @@
 //! Shopify-style bulk operation's parents and children reach separate JSONL
 //! sinks through `tee` + `filter`, and the shared job-start bookmark makes the
 //! next run push the template filter down.
-#![cfg(all(feature = "source-rest", feature = "sink-jsonl", feature = "transforms"))]
+#![cfg(all(
+    feature = "source-rest",
+    feature = "sink-jsonl",
+    feature = "transforms"
+))]
 
 use faucet_cli::auth_catalog::build_auth_catalog;
 use faucet_cli::config::PipelineConfig;
@@ -156,12 +160,20 @@ async fn one_bulk_job_fans_out_to_a_sink_per_stream() {
 
     let first = submit_bodies(&server).await;
     assert_eq!(first.len(), 1, "one bulk job for both streams");
-    assert!(first[0].contains("orders(query: 'status:any')"), "{}", first[0]);
+    assert!(
+        first[0].contains("orders(query: 'status:any')"),
+        "{}",
+        first[0]
+    );
 
     faucet_cli::topology::run_topology(&cfg, &auth, Default::default())
         .await
         .unwrap();
     let both = submit_bodies(&server).await;
     assert_eq!(both.len(), 2);
-    assert!(both[1].contains("orders(query: 'updated_at:>20"), "{}", both[1]);
+    assert!(
+        both[1].contains("orders(query: 'updated_at:>20"),
+        "{}",
+        both[1]
+    );
 }
