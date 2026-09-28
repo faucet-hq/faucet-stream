@@ -52,6 +52,50 @@ Nodes run concurrently, connected by bounded channels: the slowest sink paces
 its producer (backpressure). The `tee` clones each page to every downstream
 edge.
 
+### Fan one bulk job out to several sinks
+
+A REST `async_job` with `records_route` (for example a Shopify bulk
+operation, see the [REST source README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/rest#shopify-style-bulk-operations-768))
+returns parents and children in one file and stamps each row with its stream
+in `_stream`. Shopify runs one bulk operation per shop at a time, so the
+streams must share one job: fetch once, `tee`, and give each branch a
+`filter` on `_stream` plus a `drop` of the marker before its sink.
+
+```yaml
+pipeline:
+  sources:
+    shopify: { type: rest, config: { … async_job + records_route … } }
+  sinks:
+    orders: { type: postgres, config: { table: orders, write_mode: upsert, key: [id] } }
+    line_items: { type: postgres, config: { table: order_line_items, write_mode: upsert, key: [id] } }
+  nodes:
+    bulk:  { kind: source, ref: shopify }
+    split: { kind: tee, fanout: 2 }
+    only_orders:
+      kind: transform
+      transforms:
+        - { type: filter, config: { path: _stream, op: eq, value: orders } }
+        - { type: drop, config: { fields: [_stream] } }
+    only_items:
+      kind: transform
+      transforms:
+        - { type: filter, config: { path: _stream, op: eq, value: order_line_items } }
+        - { type: drop, config: { fields: [_stream, __parentId] } }
+    write_orders: { kind: sink, ref: orders }
+    write_items:  { kind: sink, ref: line_items }
+  edges:
+    - { from: bulk,        to: split }
+    - { from: split,       to: only_orders }
+    - { from: split,       to: only_items }
+    - { from: only_orders, to: write_orders }
+    - { from: only_items,  to: write_items }
+```
+
+The bulk job's bookmark (the job's start time) rides the final page through
+every branch, so both sinks store the same bookmark and the next run resumes
+from it. `records_route.only` selects a subset of streams when one run should
+emit only some of them.
+
 ## Fan-in (merge)
 
 ```yaml
