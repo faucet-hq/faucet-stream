@@ -176,7 +176,7 @@ By default the REST source parses a **JSON** body and extracts records via `reco
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `response_format` | `json` \| `csv` \| `excel` | `json` | How to parse the body. `csv`/`excel` parse a whole tabular file into records. `excel` requires the crate's `excel` feature. |
+| `response_format` | `json` \| `csv` \| `excel` \| `jsonl` | `json` | How to parse the body. `csv`/`excel` parse a whole tabular file into records; `jsonl` reads one JSON object per line (streamed line by line on an `async_job` fetch). `excel` requires the crate's `excel` feature. |
 | `csv_delimiter` | int (byte) / char | `,` | CSV field delimiter. `response_format: csv` only. |
 | `csv_has_headers` | bool | `true` | Whether the first CSV row supplies field names (else `column_0`, `column_1`, …). `csv` only. |
 | `csv_null_values` | list of strings | `[]` | CSV fields equal to any listed string decode as JSON `null` rather than a string — on the `Value`, native NDJSON, columnar and streaming decode paths alike. Salesforce Bulk API 2.0 writes a null as an empty field, so set `[""]` for it; list sentinels such as `"NULL"` / `"#N/A"` for other APIs. Headers are never mapped, and a quoted empty field maps like an unquoted one. Applies to `response_format: csv` and to a `parse: { format: csv }` decode step; set anywhere else it is a config error. |
@@ -621,6 +621,98 @@ async_job:
 The same pointer names the dataset for catalog and lineage, so pointing it at
 the real statement is what keeps one object per dataset rather than every
 object collapsing onto one.
+
+#### Shopify-style bulk operations (#768)
+
+A Shopify Admin API **bulk operation** is an async job over GraphQL: submit a
+`bulkOperationRunQuery` mutation, poll the operation with a `POST` query body
+until `COMPLETED`, download the JSONL file at `url`, and split its rows —
+child rows (`LineItem`) carry `__parentId` and are interleaved with their
+parents (`Order`). Four pieces make that expressible in config:
+
+| Field | Purpose |
+|-------|---------|
+| `poll.json` | Request body for the poll; `${job_id}` is substituted in every string leaf. |
+| `status.error_path` | JSONPath to an error code, named in the error a `FAILED` / `CANCELED` job raises. |
+| `submit_errors: { path, retry_on, retry_interval_secs, retry_timeout_secs }` | Messages at `path` (e.g. GraphQL `userErrors`) fail the submit with the server's text; a message containing a `retry_on` substring ("already in progress" — one bulk operation per shop) is retried every `retry_interval_secs` (30) until `retry_timeout_secs` (900). |
+| `incremental.inject: { mode: template, template, format, initial }` | Renders `template` with `${bookmark}` (formatted by `format`: `raw` / `iso8601` / `date` / `epoch_s` / `epoch_ms`) and writes it over every `${faucet.filter}` in `submit.json`. Without a bookmark (first run) it writes `initial` (default empty). `mode: sql` (default) is the `WHERE` injection above. `replication_key` is optional in template mode. |
+| `response_format: jsonl` | The result is decoded line by line into pages of `batch_size`; the file is never held whole. |
+| `records_route` | Stamps each row with its stream (see below). |
+
+`fetch.url_from` resolving to an explicit `null` (a `COMPLETED` operation that
+matched nothing) is an empty result: zero records, a clean run, and the
+bookmark still advances. A download refused with `401` / `403` / `404` / `410`
+(the signed URL expired) fails the run naming the cause — transient errors are
+retried under the normal policy first, and the job is never resubmitted
+silently. The bookmark is the job's start time minus `lookback`, as above —
+not a row maximum, because child rows carry no `updated_at`.
+
+```yaml
+source:
+  type: rest
+  config:
+    base_url: https://my-shop.myshopify.com/admin/api/2026-07
+    headers: { X-Shopify-Access-Token: "${env:SHOPIFY_TOKEN}" }
+    response_format: jsonl
+    replication_method: { type: Incremental }
+    async_job:
+      submit:
+        method: POST
+        url: /graphql.json
+        json:
+          query: >-
+            mutation { bulkOperationRunQuery(query: """
+              { orders(query: "${faucet.filter}") { edges { node {
+                  id name updatedAt
+                  lineItems { edges { node { id sku quantity } } } } } } }
+            """) { bulkOperation { id status } userErrors { field message } } }
+      job_id: "$.data.bulkOperationRunQuery.bulkOperation.id"
+      submit_errors:
+        path: "$.data.bulkOperationRunQuery.userErrors[*].message"
+        retry_on: ["already in progress"]
+      poll:
+        method: POST
+        url: /graphql.json
+        json:
+          query: 'query { node(id: "${job_id}") { ... on BulkOperation { status errorCode url } } }'
+        interval_secs: 10
+        timeout_secs: 7200
+      status:
+        path: "$.data.node.status"
+        success: [COMPLETED]
+        failure: [FAILED, CANCELED, EXPIRED]
+        error_path: "$.data.node.errorCode"
+      fetch: { url_from: "$.data.node.url" }
+      incremental:
+        inject:
+          mode: template
+          template: "updated_at:>'${bookmark}'"
+          format: iso8601
+    records_route:
+      by: id_type
+      routes:
+        Order:    { stream: orders }
+        LineItem: { stream: order_line_items, parent_key_as: order_id }
+```
+
+**`records_route`** — `by: id_type` (default) keys each row by the object type
+in its GID (`gid://shopify/<Type>/<n>` in `id`); a row with no GID of its own
+is keyed `child_of:<ParentType>` from `__parentId`. `by: field` keys by a
+top-level discriminator (`field: __typename`). Each route names a `stream`,
+stamped into `stream_field` (default `_stream`), and optionally
+`parent_key_as` — `__parentId` copied into that column so the child stream
+joins back (the ordering of parents and children in the file does not
+matter). A row of a type no route names is dropped and counted, with a
+one-shot warning per type and a run total; `strict: true` fails the run
+instead. `only: [stream, …]` emits a subset of the routes on purpose.
+`records_route` applies to every read path and requires a JSON or JSONL body.
+
+**One job, several sinks.** Shopify runs one bulk operation per shop at a
+time, so each stream must not submit its own job. Run the source once in
+[topology mode](../../docs/book/src/cookbook/topology.md) and fan it out with
+a `tee` and one `filter` per stream (`path: _stream, op: eq, value: orders`),
+dropping `_stream` before each sink — see the cookbook's "Fan one bulk job out
+to several sinks" section.
 
 #### Native byte passthrough (#633)
 

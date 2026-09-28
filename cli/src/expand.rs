@@ -38,6 +38,7 @@ pub const RESERVED_IDS: &[&str] = &[
     "bookmark",
     "job_id",
     "window",
+    "faucet",
 ];
 
 /// One fully-merged matrix row, ready for the executor.
@@ -1784,6 +1785,7 @@ fn check_refs(
                 && id != "bookmark"
                 && id != "job_id"
                 && id != "window"
+                && id != "faucet"
                 // Discovery-recipe naming tokens, resolved by the source's
                 // discovery engine at `discover()` time (before the executor
                 // sees them) — allowed only when the config actually carries a
@@ -1892,6 +1894,7 @@ fn collect_deferred(value: &Value, out: &mut Vec<DeferredRef>) {
                     || id == "bookmark"
                     || id == "job_id"
                     || id == "window"
+                    || id == "faucet"
                 {
                     continue;
                 }
@@ -2286,6 +2289,26 @@ pipeline:
 "#);
         let nodes = expand(&c).unwrap();
         assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn faucet_filter_token_is_reserved_and_passes_through() {
+        // `${faucet.filter}` is filled in by the REST source's async-job
+        // template push-down (#768); expand must pass it through untouched.
+        let c = cfg(r#"
+version: 1
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: https://x
+      async_job: { submit: { url: /jobs, json: { query: "orders(query: \"${faucet.filter}\")" } }, job_id: "$.id", poll: { url: "/jobs/${job_id}" }, status: { path: "$.s", success: [Done] }, fetch: { url: "/jobs/${job_id}/r" } }
+  sink: { type: jsonl, config: { path: ./o } }
+"#);
+        let nodes = expand(&c).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].source.config.to_string().contains("${faucet.filter}"));
+        assert!(RESERVED_IDS.contains(&"faucet"));
     }
 
     #[test]
