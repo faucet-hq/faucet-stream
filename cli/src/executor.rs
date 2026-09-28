@@ -4226,7 +4226,7 @@ mod tests {
         // sequential — sqlite is single-writer, so this avoids SQLITE_BUSY
         // flakiness while still proving begin-once / commit-once.
         format!(
-            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\npipeline:\n  sources:\n    parents:\n      type: csv\n      config: {{ path: \"{parents}\" }}\n    child:\n      type: csv\n      config: {{ path: \"{child}\" }}\n  sinks:\n    trash:\n      type: jsonl\n      config: {{ path: \"{trash}\", append: false }}\n    t:\n      type: sqlite\n      config:\n        database_url: \"{db_url}\"\n        table_name: t\n        column_mapping: auto_map\n        write_mode: overwrite\nmatrix:\n  - id: p\n    source: {{ ref: parents }}\n    sink: {{ ref: trash }}\n  - id: c\n    parent: p\n    parent_key: id\n    source: {{ ref: child }}\n    sink: {{ ref: t }}\n",
+            "version: 1\nname: ow\nexecution:\n  max_concurrent: 1\npipeline:\n  sources:\n    parents:\n      type: csv\n      config: {{ path: '{parents}' }}\n    child:\n      type: csv\n      config: {{ path: '{child}' }}\n  sinks:\n    trash:\n      type: jsonl\n      config: {{ path: '{trash}', append: false }}\n    t:\n      type: sqlite\n      config:\n        database_url: '{db_url}'\n        table_name: t\n        column_mapping: auto_map\n        write_mode: overwrite\nmatrix:\n  - id: p\n    source: {{ ref: parents }}\n    sink: {{ ref: trash }}\n  - id: c\n    parent: p\n    parent_key: id\n    source: {{ ref: child }}\n    sink: {{ ref: t }}\n",
             parents = dir.join("parents.csv").display(),
             child = dir.join("child_${p.id}.csv").display(),
             trash = dir.join("trash.jsonl").display(),
@@ -4238,7 +4238,7 @@ mod tests {
     /// a `${p.id}` token). Pure config expansion — no connector I/O.
     fn overwrite_child_node(dir: &Path, child_table: &str) -> ExpandedNode {
         let yaml = format!(
-            "version: 1\nname: t\nexecution:\n  max_concurrent: 1\npipeline:\n  sources:\n    parents: {{ type: csv, config: {{ path: \"{p}\" }} }}\n    child: {{ type: csv, config: {{ path: \"{c}\" }} }}\n  sinks:\n    trash: {{ type: jsonl, config: {{ path: \"{t}\" }} }}\n    dst: {{ type: sqlite, config: {{ database_url: \"sqlite:{db}\", table_name: \"{child_table}\", column_mapping: auto_map, write_mode: overwrite }} }}\nmatrix:\n  - id: p\n    source: {{ ref: parents }}\n    sink: {{ ref: trash }}\n  - id: c\n    parent: p\n    parent_key: id\n    source: {{ ref: child }}\n    sink: {{ ref: dst }}\n",
+            "version: 1\nname: t\nexecution:\n  max_concurrent: 1\npipeline:\n  sources:\n    parents: {{ type: csv, config: {{ path: '{p}' }} }}\n    child: {{ type: csv, config: {{ path: '{c}' }} }}\n  sinks:\n    trash: {{ type: jsonl, config: {{ path: '{t}' }} }}\n    dst: {{ type: sqlite, config: {{ database_url: 'sqlite:{db}', table_name: \"{child_table}\", column_mapping: auto_map, write_mode: overwrite }} }}\nmatrix:\n  - id: p\n    source: {{ ref: parents }}\n    sink: {{ ref: trash }}\n  - id: c\n    parent: p\n    parent_key: id\n    source: {{ ref: child }}\n    sink: {{ ref: dst }}\n",
             p = dir.join("parents.csv").display(),
             c = dir.join("child.csv").display(),
             t = dir.join("trash.jsonl").display(),
@@ -4717,7 +4717,7 @@ matrix:
   - id: child
     parent: parents
     source: {{ config: {{ path: {child} }} }}
-    sink:   {{ config: {{ path: "{child_out}" }} }}
+    sink:   {{ config: {{ path: '{child_out}' }} }}
 "#,
             parent = parent_csv.display(),
             parent_out = parent_out.display(),
@@ -4899,7 +4899,7 @@ matrix:
             r#"version: 1
 pipeline:
   source: {{ type: csv, config: {{ path: {good} }} }}
-  sink:   {{ type: jsonl, config: {{ path: {out} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}, append: true }} }}
 matrix:
   - id: p
     source: {{ config: {{ path: {missing} }} }}
@@ -5119,7 +5119,7 @@ matrix:
   - id: child
     parent: parents
     source: {{ config: {{ path: {child} }} }}
-    sink:   {{ config: {{ path: {child_out} }} }}
+    sink:   {{ config: {{ path: {child_out}, append: true }} }}
 "#,
             parent = parent_csv.display(),
             parent_out = parent_out.display(),
@@ -5722,7 +5722,7 @@ matrix:
   - id: child
     parent: parents
     source: {{ config: {{ path: {child} }} }}
-    sink:   {{ config: {{ path: {child_out} }} }}
+    sink:   {{ config: {{ path: {child_out}, append: true }} }}
 "#,
             parent = parent_csv.display(),
             parent_out = parent_out.display(),
@@ -6290,7 +6290,7 @@ matrix:
   - id: child
     parent: parents
     source: {{ config: {{ path: {child} }} }}
-    sink:   {{ config: {{ path: "{child_out}" }} }}
+    sink:   {{ config: {{ path: '{child_out}' }} }}
 "#,
             parent = parent_csv.display(),
             parent_out = parent_out.display(),

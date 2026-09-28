@@ -2437,7 +2437,7 @@ matrix:
         format!(
             r#"
 version: 1
-pipeline: {{ source: {{ type: rest, config: {{}} }}, sink: {{ type: jsonl, config: {{ path: ./o }} }} }}
+pipeline: {{ source: {{ type: rest, config: {{}} }}, sink: {{ type: jsonl, config: {{ path: ./o, append: true }} }} }}
 matrix:
 {matrix}
 "#
@@ -2620,7 +2620,7 @@ version: 1
 pipeline:
   sources:
     api: { type: rest, config: { base_url: https://x, path: /list } }
-  sink: { type: jsonl, config: { path: ./o } }
+  sink: { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: subs
     discover:
@@ -2645,7 +2645,7 @@ matrix:
         // only after every one of the child's invocations completes.
         let c = cfg(r#"
 version: 1
-pipeline: { source: { type: rest, config: {} }, sink: { type: jsonl, config: { path: ./o } } }
+pipeline: { source: { type: rest, config: {} }, sink: { type: jsonl, config: { path: ./o, append: true } } }
 matrix:
   - { id: users }
   - { id: posts, parent: users }
@@ -2694,7 +2694,7 @@ pipeline:
 version: 1
 pipeline:
   source: { type: rest, config: {} }
-  sink:   { type: jsonl, config: { path: ./o } }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: users
   - id: posts
@@ -2714,7 +2714,7 @@ matrix:
 version: 1
 pipeline:
   source: { type: rest, config: {} }
-  sink:   { type: jsonl, config: { path: ./o } }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: users
   - id: addrs
@@ -2732,7 +2732,7 @@ matrix:
 version: 1
 pipeline:
   source: { type: rest, config: {} }
-  sink:   { type: jsonl, config: { path: ./o } }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: posts
     parent: users
@@ -2750,7 +2750,7 @@ matrix:
 version: 1
 pipeline:
   source: { type: rest, config: {} }
-  sink:   { type: jsonl, config: { path: ./o } }
+  sink:   { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: users
   - id: posts

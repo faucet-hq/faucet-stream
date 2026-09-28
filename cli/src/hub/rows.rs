@@ -1085,7 +1085,7 @@ kind: sink-template
 name: files
 params:
   out: { type: string, default: ./out }
-sink: { type: jsonl, config: { append: false } }
+sink: { type: jsonl, config: { append: true } }
 per_stream: { path: "${param.out}/${stream}.jsonl" }
 write_mode_aliases: { overwrite: append }
 "#;

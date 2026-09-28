@@ -392,7 +392,7 @@ version: 1
 name: pc
 pipeline:
   source: { type: rest, config: {} }
-  sink: { type: jsonl, config: { path: o } }
+  sink: { type: jsonl, config: { path: o, append: true } }
 matrix:
   - id: dims
   - id: facts
