@@ -64,3 +64,6 @@ matrix:
         path: "/crm/v3/objects/${types.name}"
         query_params:
           properties: "${props.name}"
+    # One file per object type: every type writes on its own invocation.
+    sink:
+      config: { path: "./out/hubspot-${types.name}.jsonl" }
