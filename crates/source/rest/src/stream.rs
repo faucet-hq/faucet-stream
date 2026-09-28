@@ -237,6 +237,24 @@ fn jsonpath_first_value(v: &Value, path: &str) -> Option<Value> {
     v.query(path).ok()?.first().map(|x| (*x).clone())
 }
 
+/// Name the likely cause when a signed `fetch.url_from` download is refused
+/// (#768): transient failures were already retried, and the job is never
+/// resubmitted behind the caller's back.
+fn fetch_url_error(e: FaucetError, job: &crate::async_job::AsyncJobConfig) -> FaucetError {
+    match e {
+        FaucetError::HttpStatus { status, .. }
+            if job.fetch.url_from.is_some() && matches!(status, 401 | 403 | 404 | 410) =>
+        {
+            FaucetError::Source(format!(
+                "async_job: the result download from `fetch.url_from` was refused (HTTP \
+                 {status}) — signed result URLs expire; the job is not resubmitted \
+                 automatically, re-run the pipeline"
+            ))
+        }
+        other => other,
+    }
+}
+
 /// A locator value counts as "no more pages" when it is empty, or when it
 /// matches one of the configured `locator_terminal_values` (default `["null"]`
 /// — Salesforce Bulk sends `Sforce-Locator: null` when done). Comparison is
@@ -951,7 +969,7 @@ impl RestStream {
         use crate::config::ResponseFormat;
         matches!(
             self.config.response_format,
-            ResponseFormat::Csv | ResponseFormat::Excel
+            ResponseFormat::Csv | ResponseFormat::Excel | ResponseFormat::Jsonl
         )
         .then_some(csv_page_size)
         .filter(|n| *n > 0)
@@ -1001,6 +1019,30 @@ impl RestStream {
         &self,
         context: Option<&HashMap<String, Value>>,
         range_filter: Option<String>,
+        csv_page_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
+        let inner = self.stream_pages_unrouted(context, range_filter, csv_page_size);
+        let Some(route) = self.config.records_route.as_ref() else {
+            return inner;
+        };
+        // Row routing (#768) applies to every read path, after extraction.
+        Box::pin(async_stream::try_stream! {
+            use futures::StreamExt as _;
+            let mut router = crate::route::Router::new(route);
+            let mut inner = inner;
+            while let Some(page) = inner.next().await {
+                let page = page?;
+                let records = router.route_page(page.records)?;
+                yield faucet_core::StreamPage { records, bookmark: page.bookmark };
+            }
+            router.finish();
+        })
+    }
+
+    fn stream_pages_unrouted(
+        &self,
+        context: Option<&HashMap<String, Value>>,
+        range_filter: Option<String>,
         // Records per emitted page for the bounded-memory CSV path (#626).
         // `0` is the house "no batching" sentinel. Ignored by the HTTP-paged
         // paths, which chunk on upstream page boundaries.
@@ -1041,7 +1083,10 @@ impl RestStream {
                 // reflects the query's start time (conservative — a small re-read
                 // overlap next run, deduped by an upsert sink). `None` for full-table.
                 let new_bookmark = self.async_job_new_bookmark();
-                let fetch_url = self.prepare_async_job().await?;
+                let Some(fetch_url) = self.prepare_async_job().await? else {
+                    yield faucet_core::StreamPage { records: Vec::new(), bookmark: new_bookmark };
+                    return;
+                };
                 let mut locator: Option<String> = None;
                 loop {
                     // Send the locator (when we have one) as the configured query param.
@@ -1063,7 +1108,12 @@ impl RestStream {
                         .filter(|_| job.fetch.locator_body.is_none());
                     // Each branch returns the response headers (for the locator
                     // advance) and, for the buffered path only, the parsed body.
-                    let (body_value, resp_headers) = if let Some(plan) = plan {
+                    let jsonl_stream = self.config.decode.is_empty()
+                        && self.config.response_format == crate::config::ResponseFormat::Jsonl
+                        && job.fetch.locator_body.is_none();
+                    let (body_value, resp_headers) = if jsonl_stream {
+                        // JSONL (#768): decode line by line off the body so a
+                        // multi-GB bulk result is never held whole.
                         let resp = self
                             .job_request_response(
                                 "fetch",
@@ -1073,7 +1123,38 @@ impl RestStream {
                                 &query,
                                 job.fetch.json.as_ref(),
                             )
-                            .await?;
+                            .await
+                            .map_err(|e| fetch_url_error(e, job))?;
+                        let resp_headers_streamed = resp.headers().clone();
+                        use futures::TryStreamExt as _;
+                        let body = resp.bytes_stream().map_err(std::io::Error::other);
+                        let reader = tokio_util::io::StreamReader::new(body);
+                        let mut pages = Box::pin(crate::format::jsonl_reader_to_value_pages(
+                            reader,
+                            csv_page_size,
+                        ));
+                        use futures::StreamExt as _;
+                        let mut emitted = false;
+                        while let Some(page) = pages.next().await {
+                            emitted = true;
+                            yield faucet_core::StreamPage { records: page?, bookmark: None };
+                        }
+                        if !emitted {
+                            yield faucet_core::StreamPage { records: Vec::new(), bookmark: None };
+                        }
+                        (None, resp_headers_streamed)
+                    } else if let Some(plan) = plan {
+                        let resp = self
+                            .job_request_response(
+                                "fetch",
+                                &job.fetch.method,
+                                &fetch_url,
+                                &job.fetch.headers,
+                                &query,
+                                job.fetch.json.as_ref(),
+                            )
+                            .await
+                            .map_err(|e| fetch_url_error(e, job))?;
                         // Read the locator before the body is consumed.
                         let resp_headers_streamed = resp.headers().clone();
                         use futures::TryStreamExt as _;
@@ -1118,7 +1199,8 @@ impl RestStream {
                                 &query,
                                 job.fetch.json.as_ref(),
                             )
-                            .await?;
+                            .await
+                            .map_err(|e| fetch_url_error(e, job))?;
                         let (records, body_value) =
                             self.parse_fetch_page(&bytes, job).await?;
                         // Stream this locator page immediately — peak memory is
@@ -1803,24 +1885,48 @@ impl RestStream {
     async fn incremental_submit_json(
         &self,
         job: &crate::async_job::AsyncJobConfig,
-    ) -> Option<Value> {
-        if self.config.replication_method != ReplicationMethod::Incremental {
-            return None;
-        }
-        let key = self.config.replication_key.as_ref()?;
+    ) -> Result<Option<Value>, FaucetError> {
         let start = {
             let guard = self.runtime_start.lock().await;
             guard
                 .clone()
                 .or_else(|| self.config.start_replication_value.clone())
-        }?;
-        let submit = job.submit.json.as_ref()?;
-        let query = job.submit_query()?;
+        };
+        // Template mode (#768) always renders — `initial` when there is no
+        // bookmark — so the placeholder never reaches the server verbatim.
+        if let Some(inc) = job
+            .incremental
+            .as_ref()
+            .filter(|i| i.inject.mode == crate::async_job::InjectMode::Template)
+        {
+            let Some(submit) = job.submit.json.as_ref() else {
+                return Ok(None);
+            };
+            let filter = crate::async_job::render_filter(&inc.inject, start.as_ref())?;
+            return Ok(Some(crate::async_job::substitute_in_value(
+                submit,
+                crate::async_job::FILTER_PLACEHOLDER,
+                &filter,
+            )));
+        }
+        if self.config.replication_method != ReplicationMethod::Incremental {
+            return Ok(None);
+        }
+        let (Some(key), Some(start), Some(submit), Some(query)) = (
+            self.config.replication_key.as_ref(),
+            start,
+            job.submit.json.as_ref(),
+            job.submit_query(),
+        ) else {
+            return Ok(None);
+        };
         let predicate = format!("{key} > {}", sql_literal(&start));
         let mut cloned = submit.clone();
-        *cloned.pointer_mut(&job.query_path)? =
-            Value::String(inject_sql_predicate(query, &predicate));
-        Some(cloned)
+        let Some(slot) = cloned.pointer_mut(&job.query_path) else {
+            return Ok(None);
+        };
+        *slot = Value::String(inject_sql_predicate(query, &predicate));
+        Ok(Some(cloned))
     }
 
     /// The bookmark to persist after an incremental async-job run: the run's
@@ -1836,13 +1942,17 @@ impl RestStream {
     /// full export would be a lie (`validate()` rejects that config shape;
     /// this is the backstop for callers that skipped validation).
     fn async_job_new_bookmark(&self) -> Option<Value> {
-        if self.config.replication_method != ReplicationMethod::Incremental
-            || self.config.replication_key.is_none()
-        {
+        if self.config.replication_method != ReplicationMethod::Incremental {
             return None;
         }
         let job = self.config.async_job.as_ref()?;
-        if !job.supports_incremental_query() {
+        let pushes_down = match job.inject_mode() {
+            crate::async_job::InjectMode::Template => true,
+            crate::async_job::InjectMode::Sql => {
+                self.config.replication_key.is_some() && job.supports_incremental_query()
+            }
+        };
+        if !pushes_down {
             return None;
         }
         let now = self.run_now() - job.lookback_duration();
@@ -1851,7 +1961,65 @@ impl RestStream {
         ))
     }
 
-    async fn prepare_async_job(&self) -> Result<String, FaucetError> {
+    /// Submit the job and return its id. A `submit_errors` match fails with the
+    /// server's messages; a "busy" match is retried until `retry_timeout_secs`
+    /// (#768 — Shopify allows one bulk operation per shop at a time).
+    async fn submit_async_job(
+        &self,
+        job: &crate::async_job::AsyncJobConfig,
+        submit_url: &str,
+        submit_json: Option<&Value>,
+    ) -> Result<String, FaucetError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let body = self
+                .job_request_json(
+                    "submit",
+                    &job.submit.method,
+                    submit_url,
+                    &job.submit.headers,
+                    &job.submit.query,
+                    submit_json,
+                )
+                .await?;
+            let errors = job
+                .submit_errors
+                .as_ref()
+                .map(|se| (se, crate::async_job::error_messages(&body, &se.path)))
+                .filter(|(_, msgs)| !msgs.is_empty());
+            let Some((se, msgs)) = errors else {
+                return jsonpath_first_string(&body, &job.job_id).ok_or_else(|| {
+                    FaucetError::Source(format!(
+                        "async_job: submit response had no job id at '{}'",
+                        job.job_id
+                    ))
+                });
+            };
+            let joined = msgs.join("; ");
+            let waited = started.elapsed();
+            let limit = Duration::from_secs(se.retry_timeout_secs);
+            if !se.is_busy(&msgs) {
+                return Err(FaucetError::Source(format!(
+                    "async_job: submit was rejected: {joined}"
+                )));
+            }
+            if waited >= limit {
+                return Err(FaucetError::Source(format!(
+                    "async_job: submit still rejected as busy after {}s: {joined}",
+                    se.retry_timeout_secs
+                )));
+            }
+            tracing::warn!(
+                reason = %joined,
+                retry_in_secs = se.retry_interval_secs,
+                "async_job: submit rejected while another job runs; retrying"
+            );
+            let wait = Duration::from_secs(se.retry_interval_secs).min(limit - waited);
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn prepare_async_job(&self) -> Result<Option<String>, FaucetError> {
         use crate::async_job::{JobOutcome, resolve_url, substitute_job_id};
         let job = self
             .config
@@ -1865,24 +2033,9 @@ impl RestStream {
         // when replicating incrementally with a start bookmark; falls back to the
         // unmodified submit body on the first run / full-table.
         let submit_url = resolve_url(base, job.submit.url.as_deref().unwrap_or_default());
-        let injected = self.incremental_submit_json(job).await;
+        let injected = self.incremental_submit_json(job).await?;
         let submit_json = injected.as_ref().or(job.submit.json.as_ref());
-        let submit_body = self
-            .job_request_json(
-                "submit",
-                &job.submit.method,
-                &submit_url,
-                &job.submit.headers,
-                &job.submit.query,
-                submit_json,
-            )
-            .await?;
-        let job_id = jsonpath_first_string(&submit_body, &job.job_id).ok_or_else(|| {
-            FaucetError::Source(format!(
-                "async_job: submit response had no job id at '{}'",
-                job.job_id
-            ))
-        })?;
+        let job_id = self.submit_async_job(job, &submit_url, submit_json).await?;
 
         // 2) Poll until a terminal state (with interval + timeout).
         let poll_url = resolve_url(base, &substitute_job_id(&job.poll.url, &job_id));
@@ -1900,6 +2053,11 @@ impl RestStream {
         );
         // Retain the last poll response so `fetch.url_from` (#543) can source the
         // download URL from the terminal (success) poll body.
+        let poll_json = job
+            .poll
+            .json
+            .as_ref()
+            .map(|j| crate::async_job::substitute_job_id_value(j, &job_id));
         let last_poll_body: Value = loop {
             let body = self
                 .job_request_json(
@@ -1908,15 +2066,23 @@ impl RestStream {
                     &poll_url,
                     &job.poll.headers,
                     &job.poll.query,
-                    None,
+                    poll_json.as_ref(),
                 )
                 .await?;
             let status = jsonpath_first_string(&body, &job.status.path).unwrap_or_default();
             match job.status.classify(&status) {
                 JobOutcome::Success => break body,
                 JobOutcome::Failure => {
+                    let detail = job
+                        .status
+                        .error_path
+                        .as_deref()
+                        .map(|p| crate::async_job::error_messages(&body, p).join("; "))
+                        .filter(|d| !d.is_empty())
+                        .map(|d| format!(" (error: {d})"))
+                        .unwrap_or_default();
                     return Err(FaucetError::Source(format!(
-                        "async_job: job failed with status '{status}'"
+                        "async_job: job failed with status '{status}'{detail}"
                     )));
                 }
                 JobOutcome::Pending => {
@@ -1936,6 +2102,15 @@ impl RestStream {
         // by rendering the templated `url`. Exactly one is set (validated).
         let fetch_url = match (&job.fetch.url_from, &job.fetch.url) {
             (Some(path), _) => {
+                // An explicit `null` is an empty result (a Shopify bulk
+                // operation that matched nothing), not a misconfigured path.
+                if jsonpath_first_value(&last_poll_body, path).is_some_and(|v| v.is_null()) {
+                    tracing::info!(
+                        url_from = %path,
+                        "async_job: completed with no result file; zero records"
+                    );
+                    return Ok(None);
+                }
                 let resolved = jsonpath_first_string(&last_poll_body, path).ok_or_else(|| {
                     FaucetError::Source(format!(
                         "async_job: fetch.url_from '{path}' matched no string in the poll response"
@@ -1953,7 +2128,7 @@ impl RestStream {
 
         // Steps 1-3 done; the caller fetches the (locator-paged) result and
         // streams it page-by-page. See `stream_pages_inner` (#623).
-        Ok(fetch_url)
+        Ok(Some(fetch_url))
     }
 
     /// Parse one async-job fetch page into records, returning the parsed JSON
@@ -2006,6 +2181,7 @@ impl RestStream {
                 )?;
                 Ok((records, None))
             }
+            crate::config::ResponseFormat::Jsonl => Ok((crate::format::parse_jsonl(bytes)?, None)),
         }
     }
 
@@ -2585,6 +2761,9 @@ impl RestStream {
                 self.config.excel_sheet.as_deref(),
                 self.config.excel_header_row,
             )?),
+            crate::config::ResponseFormat::Jsonl => {
+                Value::Array(crate::format::parse_jsonl(&bytes)?)
+            }
         };
         Ok((body, resp_headers))
     }
@@ -2776,7 +2955,10 @@ impl faucet_core::Source for RestStream {
         // key stable across Rust releases.
         self.config.state_key.clone().or_else(|| {
             (self.config.replication_method == ReplicationMethod::Incremental
-                && self.config.replication_key.is_some())
+                && (self.config.replication_key.is_some()
+                    || self.config.async_job.as_ref().is_some_and(|j| {
+                        j.inject_mode() == crate::async_job::InjectMode::Template
+                    })))
             .then(|| {
                 format!(
                     "rest:{:016x}",
@@ -2942,7 +3124,13 @@ impl faucet_core::Source for RestStream {
             // Incremental bookmark (#630) captured before submit — same semantics
             // as the Value path; emitted on a final empty batch below.
             let new_bookmark = self.async_job_new_bookmark();
-            let fetch_url = self.prepare_async_job().await?;
+            let Some(fetch_url) = self.prepare_async_job().await? else {
+                if let Some(bm) = new_bookmark {
+                    yield faucet_core::NativeBatch::bytes(faucet_core::NativeFormat::NdJson, Vec::new())
+                        .with_bookmark(Some(bm));
+                }
+                return;
+            };
             let mut locator: Option<String> = None;
             loop {
                 let mut query = job.fetch.query.clone();
@@ -3045,7 +3233,14 @@ impl faucet_core::Source for RestStream {
             // only the per-page decoder differs.
             use futures::TryStreamExt as _;
             let new_bookmark = self.async_job_new_bookmark();
-            let fetch_url = self.prepare_async_job().await?;
+            let Some(fetch_url) = self.prepare_async_job().await? else {
+                if let Some(bm) = new_bookmark {
+                    let schema = std::sync::Arc::new(arrow::datatypes::Schema::empty());
+                    let empty = arrow::record_batch::RecordBatch::new_empty(schema);
+                    yield faucet_core::columnar::ColumnarPage::new(empty, Some(bm));
+                }
+                return;
+            };
             let mut locator: Option<String> = None;
             // `batch_size = 0` is the documented "no batching" sentinel: one
             // batch per locator page.
@@ -3942,6 +4137,75 @@ mod tests {
         cfg2.state_key = Some("mykey".into());
         let ex = RestStream::new(cfg2).unwrap();
         assert_eq!(ex.state_key().as_deref(), Some("mykey"));
+    }
+
+    fn template_job() -> crate::async_job::AsyncJobConfig {
+        serde_json::from_value(json!({
+            "submit": { "method": "POST", "url": "/g", "json": { "q": "orders(query: \"${faucet.filter}\")" } },
+            "job_id": "$.id",
+            "poll": { "url": "/g" },
+            "status": { "path": "$.s", "success": ["COMPLETED"] },
+            "fetch": { "url_from": "$.url" },
+            "incremental": { "inject": { "mode": "template", "template": "updated_at:>${bookmark}" } }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn template_push_down_opts_into_state_and_bookmarks_without_a_key() {
+        use faucet_core::{ReplicationMethod, Source};
+        let mut cfg = RestStreamConfig::new("https://shop.example", "/g");
+        cfg.replication_method = ReplicationMethod::Incremental;
+        cfg.async_job = Some(template_job());
+        let s = RestStream::new(cfg)
+            .unwrap()
+            .with_now_override_rfc3339("2026-09-29T12:00:00Z");
+        assert!(s.state_key().is_some());
+        assert_eq!(
+            s.async_job_new_bookmark(),
+            Some(json!("2026-09-29T11:55:00Z"))
+        );
+    }
+
+    #[tokio::test]
+    async fn template_push_down_without_submit_body_is_untouched() {
+        let mut job = template_job();
+        job.submit.json = None;
+        let mut cfg = RestStreamConfig::new("https://shop.example", "/g");
+        cfg.replication_method = faucet_core::ReplicationMethod::Incremental;
+        let s = RestStream::new(cfg).unwrap();
+        assert_eq!(s.incremental_submit_json(&job).await.unwrap(), None);
+        let bad = RestStream::new(RestStreamConfig::new("https://shop.example", "/g")).unwrap();
+        *bad.runtime_start.lock().await = Some(json!({ "not": "a scalar" }));
+        assert!(bad.incremental_submit_json(&template_job()).await.is_err());
+    }
+
+    #[test]
+    fn fetch_url_error_names_an_expired_signed_url() {
+        let job = template_job();
+        let e = |status| FaucetError::HttpStatus {
+            status,
+            url: "u".into(),
+            body: "b".into(),
+        };
+        for status in [401, 403, 404, 410] {
+            let msg = fetch_url_error(e(status), &job).to_string();
+            assert!(
+                msg.contains("expire") && msg.contains(&status.to_string()),
+                "{msg}"
+            );
+        }
+        assert!(matches!(
+            fetch_url_error(e(500), &job),
+            FaucetError::HttpStatus { .. }
+        ));
+        let mut templated = job.clone();
+        templated.fetch.url_from = None;
+        templated.fetch.url = Some("/r".into());
+        assert!(matches!(
+            fetch_url_error(e(403), &templated),
+            FaucetError::HttpStatus { .. }
+        ));
     }
 
     #[test]

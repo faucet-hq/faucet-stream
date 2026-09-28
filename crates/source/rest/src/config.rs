@@ -28,6 +28,10 @@ pub enum ResponseFormat {
     /// Excel (`.xlsx`/`.xls`) — parse a workbook body. Requires the crate's
     /// `excel` feature.
     Excel,
+    /// JSON Lines — one JSON object per line (a Shopify bulk-operation
+    /// result, #768). An async-job fetch is decoded line by line into pages
+    /// of `batch_size`, so the file is never held in memory whole.
+    Jsonl,
 }
 
 fn default_method() -> Method {
@@ -437,6 +441,14 @@ pub struct RestStreamConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_field: Option<String>,
 
+    // ── Row routing (#768) ──────────────────────────────────────────────────────
+    /// Route each record to a named stream by its GID type or a discriminator
+    /// field, stamping the stream into `stream_field` — so one bulk job's
+    /// parents and children reach separate sinks. See
+    /// [`RecordsRoute`](crate::route::RecordsRoute).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records_route: Option<crate::route::RecordsRoute>,
+
     // ── Resumable cursor (#547) ─────────────────────────────────────────────────
     /// Persist the terminal pagination cursor as this run's bookmark (riding the
     /// existing `StreamPage.bookmark` / `StateStore` path — no core trait change)
@@ -767,6 +779,7 @@ impl Default for RestStreamConfig {
             record_ancestors: None,
             records_multi: Vec::new(),
             op_field: None,
+            records_route: None,
             persist_cursor: false,
             discovery: None,
         }
@@ -818,14 +831,14 @@ impl RestStreamConfig {
         if !matches!(self.response_format, ResponseFormat::Json) {
             if !matches!(self.pagination, PaginationStyle::None) {
                 return Err(faucet_core::FaucetError::Config(
-                    "rest: `response_format: csv|excel` fetches a single file body and does not \
+                    "rest: `response_format: csv|excel|jsonl` fetches a single file body and does not \
                      paginate — set `pagination: none`"
                         .into(),
                 ));
             }
             if self.records_path.is_some() {
                 return Err(faucet_core::FaucetError::Config(
-                    "rest: `records_path` (JSONPath) does not apply to `response_format: csv|excel` \
+                    "rest: `records_path` (JSONPath) does not apply to `response_format: csv|excel|jsonl` \
                      — the whole file body becomes the record set"
                         .into(),
                 ));
@@ -881,7 +894,15 @@ impl RestStreamConfig {
                         .into(),
                 ));
             }
-            if matches!(self.replication_method, ReplicationMethod::Incremental) {
+            let template_mode = job.inject_mode() == crate::async_job::InjectMode::Template;
+            if template_mode && !matches!(self.replication_method, ReplicationMethod::Incremental) {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `async_job.incremental.inject.mode: template` requires \
+                     `replication_method: incremental`"
+                        .into(),
+                ));
+            }
+            if matches!(self.replication_method, ReplicationMethod::Incremental) && !template_mode {
                 // The async-job incremental predicate (#630) is injected into
                 // the submit body's top-level string `query`. Without one the
                 // predicate can never apply: every run would silently stay a
@@ -975,6 +996,19 @@ impl RestStreamConfig {
                 return Err(faucet_core::FaucetError::Config(format!(
                     "rest: `{other}` and `{label}` both write '{p}'"
                 )));
+            }
+        }
+        if let Some(route) = &self.records_route {
+            route.validate()?;
+            if matches!(
+                self.response_format,
+                ResponseFormat::Csv | ResponseFormat::Excel
+            ) {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `records_route` routes JSON objects — use `response_format: json` or \
+                     `jsonl`"
+                        .into(),
+                ));
             }
         }
         // #548: multi-array fan-out is its own extraction mode.
@@ -1792,5 +1826,66 @@ mod tests {
             serde_json::json!(["partitions", "partition_concurrency"])
         );
         assert!(schema["properties"].get("requests").is_some());
+    }
+
+    fn shopify_bulk(extra: serde_json::Value) -> RestStreamConfig {
+        let mut v = serde_json::json!({
+            "base_url": "https://shop.example/admin/api/2026-07",
+            "response_format": "jsonl",
+            "async_job": {
+                "submit": { "method": "POST", "url": "/graphql.json",
+                            "json": { "query": "orders(query: \"${faucet.filter}\")" } },
+                "job_id": "$.id",
+                "poll": { "url": "/graphql.json" },
+                "status": { "path": "$.s", "success": ["COMPLETED"] },
+                "fetch": { "url_from": "$.url" },
+                "incremental": { "inject": { "mode": "template",
+                                             "template": "updated_at:>'${bookmark}'" } }
+            },
+            "replication_method": { "type": "Incremental" }
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn template_push_down_needs_no_replication_key_but_needs_incremental() {
+        assert!(shopify_bulk(serde_json::json!({})).validate().is_ok());
+        let full =
+            shopify_bulk(serde_json::json!({ "replication_method": { "type": "FullTable" } }));
+        let err = full.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("requires `replication_method: incremental`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn records_route_is_validated_and_needs_json_objects() {
+        let routed = shopify_bulk(serde_json::json!({
+            "records_route": { "routes": { "Order": { "stream": "orders" } } }
+        }));
+        assert!(routed.validate().is_ok());
+        let mut csv = routed.clone();
+        csv.response_format = ResponseFormat::Csv;
+        assert!(
+            csv.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("records_route")
+        );
+        let bad = shopify_bulk(serde_json::json!({ "records_route": { "routes": {} } }));
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn jsonl_is_a_single_body_format() {
+        let mut c = RestStreamConfig::new("https://a", "/x");
+        c.response_format = ResponseFormat::Jsonl;
+        assert!(c.validate().is_ok());
+        c.records_path = Some("$.x".into());
+        assert!(c.validate().unwrap_err().to_string().contains("jsonl"));
     }
 }
