@@ -698,6 +698,7 @@ mod tests {
             path: "$.state".into(),
             success: vec!["JobComplete".into()],
             failure: vec!["Failed".into(), "Aborted".into()],
+            error_path: None,
         };
         assert_eq!(s.classify("JobComplete"), JobOutcome::Success);
         assert_eq!(s.classify("Failed"), JobOutcome::Failure);
@@ -926,5 +927,115 @@ mod tests {
             !mk(serde_json::json!({ "url": "/jobs", "json": { "query": 7 } }))
                 .supports_incremental_query()
         );
+    }
+
+    fn bulk(extra: Value) -> Result<AsyncJobConfig, serde_json::Error> {
+        let mut base = json!({
+            "submit": { "method": "POST", "url": "/graphql.json",
+                        "json": { "query": "orders(query: \"${faucet.filter}\")" } },
+            "job_id": "$.id",
+            "poll": { "method": "POST", "url": "/graphql.json",
+                      "json": { "query": "node(id: \"${job_id}\")" } },
+            "status": { "path": "$.s", "success": ["COMPLETED"], "error_path": "$.code" },
+            "fetch": { "url_from": "$.url" }
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base)
+    }
+
+    fn template() -> Value {
+        json!({ "inject": { "mode": "template", "template": "updated_at:>'${bookmark}'" } })
+    }
+
+    #[test]
+    fn template_inject_validates_placeholder_and_template() {
+        assert!(bulk(json!({ "incremental": template() })).unwrap().validate().is_ok());
+        let err = bulk(json!({})).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("sent verbatim"), "{err}");
+        let err = bulk(json!({ "incremental": { "inject": { "mode": "template" } } }))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must contain `${bookmark}`"), "{err}");
+        let mut no_ph = bulk(json!({ "incremental": template() })).unwrap();
+        no_ph.submit.json = Some(json!({ "query": "orders" }));
+        let err = no_ph.validate().unwrap_err().to_string();
+        assert!(err.contains("needs a `${faucet.filter}`"), "{err}");
+        let mut sql = no_ph.clone();
+        sql.incremental = Some(serde_json::from_value(json!({ "inject": { "initial": "x" } })).unwrap());
+        assert!(sql.validate().unwrap_err().to_string().contains("only to"));
+        assert_eq!(sql.inject_mode(), InjectMode::Sql);
+    }
+
+    #[test]
+    fn render_filter_uses_template_or_initial() {
+        let inject: IncrementalInject = serde_json::from_value(json!({
+            "mode": "template", "template": "updated_at:>'${bookmark}'",
+            "format": "date", "initial": "status:any"
+        }))
+        .unwrap();
+        assert_eq!(
+            render_filter(&inject, Some(&json!("2026-09-01T10:00:00Z"))).unwrap(),
+            "updated_at:>'2026-09-01'"
+        );
+        assert_eq!(render_filter(&inject, None).unwrap(), "status:any");
+        assert!(render_filter(&inject, Some(&json!("nope"))).is_err());
+    }
+
+    #[test]
+    fn value_helpers_walk_every_leaf() {
+        let v = json!({ "a": ["${job_id}", { "b": "x${job_id}" }], "n": 1 });
+        assert_eq!(
+            substitute_job_id_value(&v, "7"),
+            json!({ "a": ["7", { "b": "x7" }], "n": 1 })
+        );
+        assert!(value_contains(&v, "x${job_id}"));
+        assert!(!value_contains(&json!({ "n": 1 }), "x"));
+    }
+
+    #[test]
+    fn error_messages_collects_strings_and_objects() {
+        let body = json!({ "e": [{ "message": "busy" }, { "message": "other" }], "c": "ACCESS_DENIED",
+                           "empty": [], "nil": null, "blank": " ", "num": 5, "mixed": [null, 1] });
+        assert_eq!(error_messages(&body, "$.e[*].message"), vec!["busy", "other"]);
+        assert_eq!(error_messages(&body, "$.c"), vec!["ACCESS_DENIED"]);
+        assert!(error_messages(&body, "$.empty").is_empty());
+        assert!(error_messages(&body, "$.nil").is_empty());
+        assert!(error_messages(&body, "$.blank").is_empty());
+        assert_eq!(error_messages(&body, "$.num"), vec!["5"]);
+        assert_eq!(error_messages(&body, "$.mixed"), vec!["1"]);
+        assert_eq!(error_messages(&body, "$.e[0]"), vec![r#"{"message":"busy"}"#]);
+        assert!(error_messages(&body, "not a path [").is_empty());
+    }
+
+    #[test]
+    fn submit_errors_and_error_path_validate() {
+        let se = |v: Value| bulk(json!({ "incremental": template(), "submit_errors": v })).unwrap();
+        assert!(se(json!({ "path": "$.e" })).validate().is_ok());
+        assert!(se(json!({ "path": " " })).validate().is_err());
+        assert!(
+            se(json!({ "path": "$.e", "retry_on": ["busy"], "retry_interval_secs": 0 }))
+                .validate()
+                .is_err()
+        );
+        let mut bad = se(json!({ "path": "$.e" }));
+        bad.status.error_path = Some("".into());
+        assert!(bad.validate().is_err());
+        let s: SubmitErrors =
+            serde_json::from_value(json!({ "path": "$.e", "retry_on": ["Already In Progress"] }))
+                .unwrap();
+        assert_eq!((s.retry_interval_secs, s.retry_timeout_secs), (30, 900));
+        assert!(s.is_busy(&["A bulk query operation is already in progress".into()]));
+        assert!(!s.is_busy(&["invalid query".into()]));
+    }
+
+    #[test]
+    fn poll_json_deserializes() {
+        let cfg = bulk(json!({ "incremental": template() })).unwrap();
+        assert_eq!(cfg.poll.json, Some(json!({ "query": "node(id: \"${job_id}\")" })));
+        assert_eq!(cfg.status.error_path.as_deref(), Some("$.code"));
     }
 }

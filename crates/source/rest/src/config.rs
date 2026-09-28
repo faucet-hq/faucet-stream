@@ -1822,4 +1822,56 @@ mod tests {
         );
         assert!(schema["properties"].get("requests").is_some());
     }
+
+    fn shopify_bulk(extra: serde_json::Value) -> RestStreamConfig {
+        let mut v = serde_json::json!({
+            "base_url": "https://shop.example/admin/api/2026-07",
+            "response_format": "jsonl",
+            "async_job": {
+                "submit": { "method": "POST", "url": "/graphql.json",
+                            "json": { "query": "orders(query: \"${faucet.filter}\")" } },
+                "job_id": "$.id",
+                "poll": { "url": "/graphql.json" },
+                "status": { "path": "$.s", "success": ["COMPLETED"] },
+                "fetch": { "url_from": "$.url" },
+                "incremental": { "inject": { "mode": "template",
+                                             "template": "updated_at:>'${bookmark}'" } }
+            },
+            "replication_method": { "type": "Incremental" }
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn template_push_down_needs_no_replication_key_but_needs_incremental() {
+        assert!(shopify_bulk(serde_json::json!({})).validate().is_ok());
+        let full = shopify_bulk(serde_json::json!({ "replication_method": { "type": "FullTable" } }));
+        let err = full.validate().unwrap_err().to_string();
+        assert!(err.contains("requires `replication_method: incremental`"), "{err}");
+    }
+
+    #[test]
+    fn records_route_is_validated_and_needs_json_objects() {
+        let routed = shopify_bulk(serde_json::json!({
+            "records_route": { "routes": { "Order": { "stream": "orders" } } }
+        }));
+        assert!(routed.validate().is_ok());
+        let mut csv = routed.clone();
+        csv.response_format = ResponseFormat::Csv;
+        assert!(csv.validate().unwrap_err().to_string().contains("records_route"));
+        let bad = shopify_bulk(serde_json::json!({ "records_route": { "routes": {} } }));
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn jsonl_is_a_single_body_format() {
+        let mut c = RestStreamConfig::new("https://a", "/x");
+        c.response_format = ResponseFormat::Jsonl;
+        assert!(c.validate().is_ok());
+        c.records_path = Some("$.x".into());
+        assert!(c.validate().unwrap_err().to_string().contains("jsonl"));
+    }
 }
