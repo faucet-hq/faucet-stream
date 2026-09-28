@@ -283,6 +283,8 @@ async fn offset_in_body_pointer_fields() {
                 limit_field: "/page/limit".into(),
                 limit: 2,
                 stop_when_short: true,
+                rows_path: None,
+                total_path: None,
             }),
     )
     .unwrap();

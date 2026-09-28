@@ -126,6 +126,8 @@ the secrets/redaction boundary like any other config string.
 ```yaml
 # OffsetInBody — POST-query APIs that carry offset/limit in the JSON body.
 pagination: { type: OffsetInBody, offset_field: offset, limit_field: limit, limit: 500, stop_when_short: true }
+# Report APIs (one record per response): count `rows_path` matches and stop at `total_path`.
+pagination: { type: OffsetInBody, offset_field: offset, limit_field: limit, limit: 10000, rows_path: "$.rows", total_path: "$.rowCount" }
 
 # RecordFieldCursor — keyset: page by the running max (or min) of a record field.
 pagination: { type: RecordFieldCursor, field: JournalNumber, into: query, param: offset, agg: max, page_size: 100, stop_when_short: true }

@@ -109,6 +109,25 @@ pagination:
   stop_when_short: true                # default
 ```
 
+Report APIs return the whole response as **one** record (headers plus a `rows`
+array, e.g. GA4 `runReport` with `records_path: "$"`). Counting records would
+read every page as short and stop after page 1, so count the rows instead, and
+stop at the reported total:
+
+```yaml
+pagination:
+  type: OffsetInBody
+  offset_field: offset
+  limit_field: limit
+  limit: 10000
+  rows_path: "$.rows"                  # advance by the rows on each page
+  total_path: "$.rowCount"             # stop once offset reaches the total
+```
+
+`rows_path` counts an array's elements, 1 for an object, 0 for null or no match
+(which ends paging). A missing or non-numeric `total_path` falls back to the
+short-page rule.
+
 ## Keyset (record-field cursor)
 
 Page by the running **max** (or **min**) of a record field — the pattern APIs like Xero's `journals` use (`offset = max(JournalNumber)` of the last page). Stops on a short page.
