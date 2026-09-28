@@ -237,6 +237,24 @@ fn jsonpath_first_value(v: &Value, path: &str) -> Option<Value> {
     v.query(path).ok()?.first().map(|x| (*x).clone())
 }
 
+/// Name the likely cause when a signed `fetch.url_from` download is refused
+/// (#768): transient failures were already retried, and the job is never
+/// resubmitted behind the caller's back.
+fn fetch_url_error(e: FaucetError, job: &crate::async_job::AsyncJobConfig) -> FaucetError {
+    match e {
+        FaucetError::HttpStatus { status, .. }
+            if job.fetch.url_from.is_some() && matches!(status, 401 | 403 | 404 | 410) =>
+        {
+            FaucetError::Source(format!(
+                "async_job: the result download from `fetch.url_from` was refused (HTTP \
+                 {status}) — signed result URLs expire; the job is not resubmitted \
+                 automatically, re-run the pipeline"
+            ))
+        }
+        other => other,
+    }
+}
+
 /// A locator value counts as "no more pages" when it is empty, or when it
 /// matches one of the configured `locator_terminal_values` (default `["null"]`
 /// — Salesforce Bulk sends `Sforce-Locator: null` when done). Comparison is
@@ -960,6 +978,30 @@ impl RestStream {
         &self,
         context: Option<&HashMap<String, Value>>,
         range_filter: Option<String>,
+        csv_page_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
+        let inner = self.stream_pages_unrouted(context, range_filter, csv_page_size);
+        let Some(route) = self.config.records_route.as_ref() else {
+            return inner;
+        };
+        // Row routing (#768) applies to every read path, after extraction.
+        Box::pin(async_stream::try_stream! {
+            use futures::StreamExt as _;
+            let mut router = crate::route::Router::new(route);
+            let mut inner = inner;
+            while let Some(page) = inner.next().await {
+                let page = page?;
+                let records = router.route_page(page.records)?;
+                yield faucet_core::StreamPage { records, bookmark: page.bookmark };
+            }
+            router.finish();
+        })
+    }
+
+    fn stream_pages_unrouted(
+        &self,
+        context: Option<&HashMap<String, Value>>,
+        range_filter: Option<String>,
         // Records per emitted page for the bounded-memory CSV path (#626).
         // `0` is the house "no batching" sentinel. Ignored by the HTTP-paged
         // paths, which chunk on upstream page boundaries.
@@ -1025,7 +1067,12 @@ impl RestStream {
                         .filter(|_| job.fetch.locator_body.is_none());
                     // Each branch returns the response headers (for the locator
                     // advance) and, for the buffered path only, the parsed body.
-                    let (body_value, resp_headers) = if let Some(plan) = plan {
+                    let jsonl_stream = self.config.decode.is_empty()
+                        && self.config.response_format == crate::config::ResponseFormat::Jsonl
+                        && job.fetch.locator_body.is_none();
+                    let (body_value, resp_headers) = if jsonl_stream {
+                        // JSONL (#768): decode line by line off the body so a
+                        // multi-GB bulk result is never held whole.
                         let resp = self
                             .job_request_response(
                                 "fetch",
@@ -1035,7 +1082,38 @@ impl RestStream {
                                 &query,
                                 job.fetch.json.as_ref(),
                             )
-                            .await?;
+                            .await
+                            .map_err(|e| fetch_url_error(e, job))?;
+                        let resp_headers_streamed = resp.headers().clone();
+                        use futures::TryStreamExt as _;
+                        let body = resp.bytes_stream().map_err(std::io::Error::other);
+                        let reader = tokio_util::io::StreamReader::new(body);
+                        let mut pages = Box::pin(crate::format::jsonl_reader_to_value_pages(
+                            reader,
+                            csv_page_size,
+                        ));
+                        use futures::StreamExt as _;
+                        let mut emitted = false;
+                        while let Some(page) = pages.next().await {
+                            emitted = true;
+                            yield faucet_core::StreamPage { records: page?, bookmark: None };
+                        }
+                        if !emitted {
+                            yield faucet_core::StreamPage { records: Vec::new(), bookmark: None };
+                        }
+                        (None, resp_headers_streamed)
+                    } else if let Some(plan) = plan {
+                        let resp = self
+                            .job_request_response(
+                                "fetch",
+                                &job.fetch.method,
+                                &fetch_url,
+                                &job.fetch.headers,
+                                &query,
+                                job.fetch.json.as_ref(),
+                            )
+                            .await
+                            .map_err(|e| fetch_url_error(e, job))?;
                         // Read the locator before the body is consumed.
                         let resp_headers_streamed = resp.headers().clone();
                         use futures::TryStreamExt as _;
@@ -1080,7 +1158,8 @@ impl RestStream {
                                 &query,
                                 job.fetch.json.as_ref(),
                             )
-                            .await?;
+                            .await
+                            .map_err(|e| fetch_url_error(e, job))?;
                         let (records, body_value) =
                             self.parse_fetch_page(&bytes, job).await?;
                         // Stream this locator page immediately — peak memory is
