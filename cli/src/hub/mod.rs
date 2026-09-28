@@ -1060,7 +1060,10 @@ mod tests {
         ] {
             assert!(split_qualified(plain).is_none(), "{plain}");
         }
-        let file = dir.path().join("a:b.yaml");
+        // Windows forbids `:` in a file name; its drive letter supplies one.
+        let file = dir
+            .path()
+            .join(if cfg!(windows) { "ab.yaml" } else { "a:b.yaml" });
         std::fs::write(&file, "x").unwrap();
         assert!(
             split_qualified(file.to_str().unwrap()).is_none(),

@@ -782,7 +782,7 @@ mod run_tests {
         std::fs::write(
             &cfg,
             format!(
-                "version: 1\nname: conn\npipeline:\n  source:\n    type: sqlite\n    config:\n      database_url: \"sqlite://{db}\"\n      query: SELECT 1\n  sink:\n    type: jsonl\n    config: {{ path: ./out.jsonl }}\n"
+                "version: 1\nname: conn\npipeline:\n  source:\n    type: sqlite\n    config:\n      database_url: 'sqlite://{db}'\n      query: SELECT 1\n  sink:\n    type: jsonl\n    config: {{ path: ./out.jsonl }}\n"
             ),
         )
         .unwrap();
