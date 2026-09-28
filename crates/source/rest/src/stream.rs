@@ -2136,9 +2136,7 @@ impl RestStream {
                 )?;
                 Ok((records, None))
             }
-            crate::config::ResponseFormat::Jsonl => {
-                Ok((crate::format::parse_jsonl(bytes)?, None))
-            }
+            crate::config::ResponseFormat::Jsonl => Ok((crate::format::parse_jsonl(bytes)?, None)),
         }
     }
 

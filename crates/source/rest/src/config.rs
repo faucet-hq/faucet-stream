@@ -888,9 +888,7 @@ impl RestStreamConfig {
                 ));
             }
             let template_mode = job.inject_mode() == crate::async_job::InjectMode::Template;
-            if template_mode
-                && !matches!(self.replication_method, ReplicationMethod::Incremental)
-            {
+            if template_mode && !matches!(self.replication_method, ReplicationMethod::Incremental) {
                 return Err(faucet_core::FaucetError::Config(
                     "rest: `async_job.incremental.inject.mode: template` requires \
                      `replication_method: incremental`"
@@ -1848,9 +1846,13 @@ mod tests {
     #[test]
     fn template_push_down_needs_no_replication_key_but_needs_incremental() {
         assert!(shopify_bulk(serde_json::json!({})).validate().is_ok());
-        let full = shopify_bulk(serde_json::json!({ "replication_method": { "type": "FullTable" } }));
+        let full =
+            shopify_bulk(serde_json::json!({ "replication_method": { "type": "FullTable" } }));
         let err = full.validate().unwrap_err().to_string();
-        assert!(err.contains("requires `replication_method: incremental`"), "{err}");
+        assert!(
+            err.contains("requires `replication_method: incremental`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1861,7 +1863,12 @@ mod tests {
         assert!(routed.validate().is_ok());
         let mut csv = routed.clone();
         csv.response_format = ResponseFormat::Csv;
-        assert!(csv.validate().unwrap_err().to_string().contains("records_route"));
+        assert!(
+            csv.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("records_route")
+        );
         let bad = shopify_bulk(serde_json::json!({ "records_route": { "routes": {} } }));
         assert!(bad.validate().is_err());
     }

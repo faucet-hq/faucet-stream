@@ -662,7 +662,10 @@ mod tests {
         #[test]
         fn parse_jsonl_skips_blank_lines_and_bom() {
             let recs = parse_jsonl(b"\xEF\xBB\xBF{\"a\":1}\n\n  \r\n{\"a\":2}\r\n").unwrap();
-            assert_eq!(recs, vec![serde_json::json!({"a":1}), serde_json::json!({"a":2})]);
+            assert_eq!(
+                recs,
+                vec![serde_json::json!({"a":1}), serde_json::json!({"a":2})]
+            );
             assert!(parse_jsonl(b"").unwrap().is_empty());
         }
 
@@ -694,7 +697,13 @@ mod tests {
             let got = pages(b"{\"i\":1}\n{oops\n", 10).await;
             assert!(got[0].as_ref().unwrap_err().to_string().contains("line 2"));
             let got = pages(b"\xff\xfe\n", 10).await;
-            assert!(got[0].as_ref().unwrap_err().to_string().contains("read error"));
+            assert!(
+                got[0]
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("read error")
+            );
         }
     }
 

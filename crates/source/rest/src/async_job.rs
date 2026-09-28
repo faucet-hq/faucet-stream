@@ -951,7 +951,12 @@ mod tests {
 
     #[test]
     fn template_inject_validates_placeholder_and_template() {
-        assert!(bulk(json!({ "incremental": template() })).unwrap().validate().is_ok());
+        assert!(
+            bulk(json!({ "incremental": template() }))
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
         let err = bulk(json!({})).unwrap().validate().unwrap_err().to_string();
         assert!(err.contains("sent verbatim"), "{err}");
         let err = bulk(json!({ "incremental": { "inject": { "mode": "template" } } }))
@@ -965,7 +970,8 @@ mod tests {
         let err = no_ph.validate().unwrap_err().to_string();
         assert!(err.contains("needs a `${faucet.filter}`"), "{err}");
         let mut sql = no_ph.clone();
-        sql.incremental = Some(serde_json::from_value(json!({ "inject": { "initial": "x" } })).unwrap());
+        sql.incremental =
+            Some(serde_json::from_value(json!({ "inject": { "initial": "x" } })).unwrap());
         assert!(sql.validate().unwrap_err().to_string().contains("only to"));
         assert_eq!(sql.inject_mode(), InjectMode::Sql);
     }
@@ -1000,14 +1006,20 @@ mod tests {
     fn error_messages_collects_strings_and_objects() {
         let body = json!({ "e": [{ "message": "busy" }, { "message": "other" }], "c": "ACCESS_DENIED",
                            "empty": [], "nil": null, "blank": " ", "num": 5, "mixed": [null, 1] });
-        assert_eq!(error_messages(&body, "$.e[*].message"), vec!["busy", "other"]);
+        assert_eq!(
+            error_messages(&body, "$.e[*].message"),
+            vec!["busy", "other"]
+        );
         assert_eq!(error_messages(&body, "$.c"), vec!["ACCESS_DENIED"]);
         assert!(error_messages(&body, "$.empty").is_empty());
         assert!(error_messages(&body, "$.nil").is_empty());
         assert!(error_messages(&body, "$.blank").is_empty());
         assert_eq!(error_messages(&body, "$.num"), vec!["5"]);
         assert_eq!(error_messages(&body, "$.mixed"), vec!["1"]);
-        assert_eq!(error_messages(&body, "$.e[0]"), vec![r#"{"message":"busy"}"#]);
+        assert_eq!(
+            error_messages(&body, "$.e[0]"),
+            vec![r#"{"message":"busy"}"#]
+        );
         assert!(error_messages(&body, "not a path [").is_empty());
     }
 
@@ -1035,7 +1047,10 @@ mod tests {
     #[test]
     fn poll_json_deserializes() {
         let cfg = bulk(json!({ "incremental": template() })).unwrap();
-        assert_eq!(cfg.poll.json, Some(json!({ "query": "node(id: \"${job_id}\")" })));
+        assert_eq!(
+            cfg.poll.json,
+            Some(json!({ "query": "node(id: \"${job_id}\")" }))
+        );
         assert_eq!(cfg.status.error_path.as_deref(), Some("$.code"));
     }
 }

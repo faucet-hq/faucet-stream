@@ -278,7 +278,11 @@ mod tests {
             Some("LineItem")
         );
         assert_eq!(
-            route_key(&r, &json!({"note": "x", "__parentId": "gid://shopify/Order/1"})).as_deref(),
+            route_key(
+                &r,
+                &json!({"note": "x", "__parentId": "gid://shopify/Order/1"})
+            )
+            .as_deref(),
             Some("child_of:Order")
         );
         assert_eq!(route_key(&r, &json!({"id": 5})), None);
@@ -296,7 +300,10 @@ mod tests {
             route_key(&r, &json!({"__typename": "Order"})).as_deref(),
             Some("Order")
         );
-        assert_eq!(route_key(&r, &json!({"__typename": 3})).as_deref(), Some("3"));
+        assert_eq!(
+            route_key(&r, &json!({"__typename": 3})).as_deref(),
+            Some("3")
+        );
         assert_eq!(route_key(&r, &json!({"__typename": null})), None);
         assert_eq!(route_key(&r, &json!({})), None);
     }
@@ -378,7 +385,11 @@ mod tests {
     #[test]
     fn validate_rejects_bad_shapes() {
         assert!(shopify().validate().is_ok());
-        let bad = |v: Value| serde_json::from_value::<RecordsRoute>(v).unwrap().validate();
+        let bad = |v: Value| {
+            serde_json::from_value::<RecordsRoute>(v)
+                .unwrap()
+                .validate()
+        };
         let r = json!({ "stream": "s" });
         assert!(
             bad(json!({"by": "field", "routes": {"A": r}}))
