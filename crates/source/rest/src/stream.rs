@@ -4075,6 +4075,75 @@ mod tests {
         assert_eq!(ex.state_key().as_deref(), Some("mykey"));
     }
 
+    fn template_job() -> crate::async_job::AsyncJobConfig {
+        serde_json::from_value(json!({
+            "submit": { "method": "POST", "url": "/g", "json": { "q": "orders(query: \"${faucet.filter}\")" } },
+            "job_id": "$.id",
+            "poll": { "url": "/g" },
+            "status": { "path": "$.s", "success": ["COMPLETED"] },
+            "fetch": { "url_from": "$.url" },
+            "incremental": { "inject": { "mode": "template", "template": "updated_at:>${bookmark}" } }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn template_push_down_opts_into_state_and_bookmarks_without_a_key() {
+        use faucet_core::{ReplicationMethod, Source};
+        let mut cfg = RestStreamConfig::new("https://shop.example", "/g");
+        cfg.replication_method = ReplicationMethod::Incremental;
+        cfg.async_job = Some(template_job());
+        let s = RestStream::new(cfg)
+            .unwrap()
+            .with_now_override_rfc3339("2026-09-29T12:00:00Z");
+        assert!(s.state_key().is_some());
+        assert_eq!(
+            s.async_job_new_bookmark(),
+            Some(json!("2026-09-29T11:55:00Z"))
+        );
+    }
+
+    #[tokio::test]
+    async fn template_push_down_without_submit_body_is_untouched() {
+        let mut job = template_job();
+        job.submit.json = None;
+        let mut cfg = RestStreamConfig::new("https://shop.example", "/g");
+        cfg.replication_method = faucet_core::ReplicationMethod::Incremental;
+        let s = RestStream::new(cfg).unwrap();
+        assert_eq!(s.incremental_submit_json(&job).await.unwrap(), None);
+        let bad = RestStream::new(RestStreamConfig::new("https://shop.example", "/g")).unwrap();
+        *bad.runtime_start.lock().await = Some(json!({ "not": "a scalar" }));
+        assert!(bad.incremental_submit_json(&template_job()).await.is_err());
+    }
+
+    #[test]
+    fn fetch_url_error_names_an_expired_signed_url() {
+        let job = template_job();
+        let e = |status| FaucetError::HttpStatus {
+            status,
+            url: "u".into(),
+            body: "b".into(),
+        };
+        for status in [401, 403, 404, 410] {
+            let msg = fetch_url_error(e(status), &job).to_string();
+            assert!(
+                msg.contains("expire") && msg.contains(&status.to_string()),
+                "{msg}"
+            );
+        }
+        assert!(matches!(
+            fetch_url_error(e(500), &job),
+            FaucetError::HttpStatus { .. }
+        ));
+        let mut templated = job.clone();
+        templated.fetch.url_from = None;
+        templated.fetch.url = Some("/r".into());
+        assert!(matches!(
+            fetch_url_error(e(403), &templated),
+            FaucetError::HttpStatus { .. }
+        ));
+    }
+
     #[test]
     fn sql_literal_quotes_by_type() {
         use serde_json::json;
