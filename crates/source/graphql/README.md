@@ -146,7 +146,7 @@ source:
     pagination:
       has_next_page_path: "$.data.orders.pageInfo.hasNextPage"
       cursor_path: "$.data.orders.pageInfo.endCursor"
-    replication_method: incremental
+    replication_method: { type: Incremental }
     replication_key: updatedAt
     replication_bind: { variable: query, template: "updated_at:>${bookmark}", format: iso8601 }
 ```

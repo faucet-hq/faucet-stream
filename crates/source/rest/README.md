@@ -229,7 +229,7 @@ net). Requires `replication_method: incremental` + `replication_key`.
 | `advance_from` | string / null | `null` | JSONPath into the **response** to advance the bookmark from, instead of `max(record[replication_key])`. |
 
 ```yaml
-replication_method: { type: incremental }
+replication_method: { type: Incremental }
 replication_key: updated_at
 start_replication_value: "2024-01-01T00:00:00Z"
 replication_bind:
@@ -314,7 +314,7 @@ body window bind may use `path` (a JSON Pointer) instead of `name`, and
 `value_type`.
 
 ```yaml
-replication_method: { type: incremental }
+replication_method: { type: Incremental }
 replication_key: date
 start_replication_value: "2024-01-01"
 window:
