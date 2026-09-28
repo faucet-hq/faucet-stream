@@ -1631,6 +1631,7 @@ async fn run_discovery(
             opts.resilience.as_ref().map(|r| &r.retry),
         )
         .await?;
+        source.set_run_clock(opts.clock.to_utc());
         let records = source.fetch_all().await?;
         let values = crate::discovery_matrix::project_dedup(&records, select);
         let n = values.len();
@@ -2208,6 +2209,8 @@ async fn run_one_invocation(
             .await?
         }
     };
+    // The run clock bounds "now"-relative reads (REST window slicing, #769).
+    source.set_run_clock(opts.clock.to_utc());
 
     // Catalog identity (#279): read the dataset URIs off the *raw* connectors,
     // before any wrapper is layered on.
@@ -3314,6 +3317,10 @@ impl Source for StateKeyOverride {
     fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
         self.inner.set_roundtrip_recorder(recorder);
     }
+
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
+    }
     fn state_key(&self) -> Option<String> {
         Some(self.key.clone())
     }
@@ -3665,6 +3672,7 @@ mod tests {
             key: "p::r".into(),
         };
         assert_forwards_multi_table_hooks(&wrapped);
+        wrapped.set_run_clock(chrono::Utc::now());
     }
 
     /// #644 — dispatch order.

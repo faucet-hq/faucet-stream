@@ -458,6 +458,15 @@ pub trait Source: Send + Sync {
     ) {
     }
 
+    /// Receive the run clock (#769): the instant `${now.*}` renders from —
+    /// `faucet run --clock`, a schedule tick, a backfill unit's start — so a
+    /// source that bounds reads by "now" (REST window slicing) reproduces the
+    /// run as of that instant rather than the wall clock.
+    ///
+    /// Called once before streaming. Defaulted to a no-op; a connector opts in
+    /// by storing the instant behind interior mutability.
+    fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {}
+
     /// Logical dataset identity for lineage emission, following OpenLineage
     /// naming conventions (<https://openlineage.io/docs/spec/naming>).
     ///

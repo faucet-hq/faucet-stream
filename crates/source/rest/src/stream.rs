@@ -50,10 +50,10 @@ pub struct RestStream {
     /// empty when no `window:` block is configured. Each entry is
     /// `(target, name, rendered-value)`.
     window_binds: Arc<AsyncMutex<Vec<ResolvedBind>>>,
-    /// Test-only override for the "now" upper bound of datetime window slicing
-    /// (#527). `None` in production (uses `Utc::now()`); set by unit tests so the
-    /// window enumeration is deterministic.
-    now_override: Option<chrono::DateTime<chrono::Utc>>,
+    /// The run clock (#769): the "now" upper bound of datetime window slicing
+    /// (#527) and the async-job lookback. Set by the pipeline from `--clock` /
+    /// the schedule tick via [`faucet_core::Source::set_run_clock`]; `None` uses `Utc::now()`.
+    run_clock: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     /// Retry policy for transient request failures. Built in `new()` from the
     /// REST source's own `config.max_retries` / `config.retry_backoff`. Fed into
     /// the REST `retry::execute_with_retry` runner (which keeps its 429 /
@@ -521,7 +521,7 @@ impl RestStream {
             auth_provider: None,
             runtime_start: Arc::new(AsyncMutex::new(None)),
             window_binds: Arc::new(AsyncMutex::new(Vec::new())),
-            now_override: None,
+            run_clock: std::sync::Mutex::new(None),
             retry_policy,
             static_headers,
             metadata_xml_cache: tokio::sync::OnceCell::new(),
@@ -643,16 +643,31 @@ impl RestStream {
         self
     }
 
-    /// Test-only: pin the "now" upper bound used by datetime window slicing (#527)
-    /// to a fixed RFC 3339 instant, so the window enumeration is deterministic in
-    /// tests. No effect in production (which uses `Utc::now()`). Hidden from docs;
-    /// takes a string so callers need not depend on `chrono`.
-    #[doc(hidden)]
-    pub fn with_now_override_rfc3339(mut self, rfc3339: &str) -> Self {
-        self.now_override = chrono::DateTime::parse_from_rfc3339(rfc3339)
-            .ok()
-            .map(|d| d.with_timezone(&chrono::Utc));
+    /// Pin the run clock — the "now" upper bound of datetime window slicing
+    /// (#527) and the async-job lookback — to an RFC 3339 instant. An
+    /// unparseable value leaves the wall clock in use. Takes a string so callers
+    /// need not depend on `chrono`; the pipeline sets it via
+    /// [`faucet_core::Source::set_run_clock`].
+    pub fn with_run_clock_rfc3339(self, rfc3339: &str) -> Self {
+        if let Ok(d) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
+            faucet_core::Source::set_run_clock(&self, d.with_timezone(&chrono::Utc));
+        }
         self
+    }
+
+    /// Alias of [`with_run_clock_rfc3339`](Self::with_run_clock_rfc3339).
+    #[doc(hidden)]
+    pub fn with_now_override_rfc3339(self, rfc3339: &str) -> Self {
+        self.with_run_clock_rfc3339(rfc3339)
+    }
+
+    /// The run clock, or the wall clock when none was set.
+    fn run_now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.run_clock
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or_else(chrono::Utc::now)
     }
 
     /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
@@ -1139,7 +1154,7 @@ impl RestStream {
                     )
                 })?;
                 let start_instant = faucet_core::parse_instant(&start_val)?;
-                let now = self.now_override.unwrap_or_else(chrono::Utc::now);
+                let now = self.run_now();
                 let step = win.step_duration()?;
                 let lookback = win.lookback_duration()?;
                 let (windows, truncated) =
@@ -1785,7 +1800,7 @@ impl RestStream {
         if !job.supports_incremental_query() {
             return None;
         }
-        let now = self.now_override.unwrap_or_else(chrono::Utc::now) - job.lookback_duration();
+        let now = self.run_now() - job.lookback_duration();
         Some(Value::String(
             now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         ))
@@ -2641,6 +2656,12 @@ impl faucet_core::Source for RestStream {
 
     fn connector_name(&self) -> &'static str {
         "rest"
+    }
+
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        if let Ok(mut g) = self.run_clock.lock() {
+            *g = Some(now);
+        }
     }
 
     fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {

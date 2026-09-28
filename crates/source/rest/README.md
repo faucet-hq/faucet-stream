@@ -296,6 +296,13 @@ parity with Airbyte's `DatetimeBasedCursor`. Requires `replication_method:
 incremental` + `replication_key`, and a start bookmark (from a `state:` store or
 `start_replication_value`).
 
+`now` is the **run clock**: `faucet run --clock`, a `faucet schedule` tick's
+time, or a `faucet backfill` unit's start, so a replay fetches the windows it
+would have fetched then (process start when no clock is set). A clock before the
+stored bookmark fetches nothing and keeps the bookmark. The async-job lookback
+bound uses the same clock. Library callers pass it with
+`Source::set_run_clock` or `RestStream::with_run_clock_rfc3339`.
+
 Each boundary is rendered through a `WindowBind` (same placement/formatting as
 `replication_bind`, with the placeholder `${window}`): the `lower` bind renders
 the window start, the `upper` bind the window end.

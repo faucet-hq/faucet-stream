@@ -440,6 +440,10 @@ impl Source for SamplingSource {
     ) {
         self.inner.set_roundtrip_recorder(recorder);
     }
+
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
+    }
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         self.inner.apply_start_bookmark(bookmark).await
     }
@@ -788,6 +792,7 @@ mod tests {
             ),
         ));
         assert!(got.load(std::sync::atomic::Ordering::Relaxed));
+        s.set_run_clock(chrono::Utc::now());
     }
 
     /// An idempotent, upsert-capable sink: the sampler must forward every
