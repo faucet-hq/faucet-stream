@@ -14295,7 +14295,7 @@
                       "default": []
                     },
                     "retry_on_response": {
-                      "description": "Non-2xx responses to treat as throttling and retry with backoff, for\nAPIs that signal a rate limit with a 4xx other than 429 plus an error\ncode in the body (e.g. HTTP 400 with `error.code` 17 / 80004). A\nmatching response counts as a rate-limit response\n(`faucet_source_throttled_total`, `faucet_source_retries_total{class=\"rate_limited\"}`)\nand is retried up to `max_retries` times in a row before the original\nerror is surfaced. Checked before `tolerated_http_errors`. Applies to\ndata pages, `async_job` requests and discovery requests.",
+                      "description": "Responses to treat as throttling and retry, for APIs that signal a rate\nlimit with a 4xx other than 429 plus an error code in the body (e.g.\nHTTP 400 with `error.code` 17 / 80004), or inside a 2xx\n(`match_success`). A rule's `backoff_from` reads the wait from the\nresponse (a reset header, a JSON header, the body). A matching response\ncounts as a rate-limit response (`faucet_source_throttled_total`,\n`faucet_source_retries_total{class=\"rate_limited\"}`) and is retried up\nto `max_retries` times in a row before the original error is surfaced.\nChecked before `tolerated_http_errors`. Applies to data pages,\n`async_job` submit/poll requests and discovery requests.",
                       "type": "array",
                       "items": {
                         "$ref": "#/$defs/source_rest__RetryMatcher"
@@ -14711,6 +14711,13 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "retry_on_response": {
+                      "description": "Responses to treat as throttling and retry — including a `200` whose\nbody reports it (`match_success: true` with\n`body_path: \"$.errors[*].extensions.code\"`, `values: [THROTTLED]`). A\nrule's `backoff_from` reads the wait from the response (`cost_bucket`\nfor Shopify-style cost reports, or a reset header / body value).\nChecked before the response's `errors[]` are classified; a match\nretries the whole request, so partial `data` is never emitted.",
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/source_graphql__RetryMatcher"
+                      }
                     }
                   },
                   "title": "GraphqlStreamConfig",
@@ -28653,11 +28660,11 @@
       ]
     },
     "source_rest__RetryMatcher": {
-      "description": "One `retry_on_response` rule: a non-2xx response that matches every set\ncondition is treated as throttling.",
+      "description": "One `retry_on_response` rule: a response that matches every set condition\nis treated as throttling.",
       "type": "object",
       "properties": {
         "status": {
-          "description": "HTTP statuses this rule applies to (empty = any non-2xx).",
+          "description": "HTTP statuses this rule applies to (empty = any non-2xx, or any status\nwith `match_success`).",
           "type": "array",
           "items": {
             "type": [
@@ -28670,8 +28677,15 @@
           },
           "default": []
         },
+        "match_success": {
+          "description": "Also match 2xx responses, for APIs that report throttling inside a\nsuccessful response (GraphQL `THROTTLED` errors, `x-ratelimit-remaining:\n0`). Requires `body_path` or `header`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
         "body_path": {
-          "description": "JSONPath into the (JSON) error body; its first match is compared with\n`values`. A non-JSON body never matches.",
+          "description": "JSONPath into the (JSON) response body; any match equal to one of\n`values` satisfies the rule. A non-JSON body never matches.",
           "type": [
             "string",
             "null"
@@ -28690,8 +28704,29 @@
             "null"
           ]
         },
+        "backoff_from": {
+          "description": "Where the response says how long to wait. Takes precedence over\n`backoff_secs`; when the value is missing or unreadable the rule falls\nback to `backoff_secs`, then `Retry-After`, then exponential backoff.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_rest__BackoffFrom"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "backoff_secs": {
-          "description": "Fixed wait before retrying. Without it the server's `Retry-After` is\nhonoured, else the exponential `retry_backoff` policy applies.",
+          "description": "Fixed wait before retrying. Without it the server's `Retry-After` is\nhonoured, else exponential backoff applies.",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_wait_secs": {
+          "description": "Longest wait `backoff_from` may ask for (default 3600). A longer one\nfails the run with an error naming the reset instead of parking it.",
           "type": [
             "integer",
             "null",
@@ -28914,6 +28949,365 @@
         }
       },
       "additionalProperties": true
+    },
+    "source_rest__BackoffFrom": {
+      "description": "Where a matched response states its wait.",
+      "oneOf": [
+        {
+          "description": "A response header (`x-ratelimit-reset`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "header"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Header name.",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "How to read the value.",
+                  "$ref": "#/$defs/source_rest__WaitUnit"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A JSON-valued response header, read at a JSONPath\n(`x-business-use-case-usage`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "header_json"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Header name.",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "JSONPath into the parsed header value; the first number or string\nfound is used.",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "How to read the value.",
+                  "$ref": "#/$defs/source_rest__WaitUnit"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A value in the JSON response body.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "body"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "JSONPath into the body; the first number or string found is used.",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "How to read the value.",
+                  "$ref": "#/$defs/source_rest__WaitUnit"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A leaky-bucket cost report (Shopify GraphQL): wait\n`ceil((requested - available) / restore_rate)` seconds, at least 1.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "cost_bucket"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "requested": {
+                  "description": "JSONPath to the cost the request asked for.",
+                  "type": "string"
+                },
+                "available": {
+                  "description": "JSONPath to the points currently available.",
+                  "type": "string"
+                },
+                "restore_rate": {
+                  "description": "JSONPath to the points restored per second.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "source_rest__WaitUnit": {
+      "description": "How a `backoff_from` value is read.",
+      "oneOf": [
+        {
+          "description": "A wait in seconds.",
+          "type": "string",
+          "const": "seconds"
+        },
+        {
+          "description": "A wait in milliseconds.",
+          "type": "string",
+          "const": "ms"
+        },
+        {
+          "description": "A wait in minutes.",
+          "type": "string",
+          "const": "minutes"
+        },
+        {
+          "description": "An absolute Unix time in seconds.",
+          "type": "string",
+          "const": "epoch_s"
+        },
+        {
+          "description": "An absolute Unix time in milliseconds.",
+          "type": "string",
+          "const": "epoch_ms"
+        },
+        {
+          "description": "An absolute RFC 3339 instant.",
+          "type": "string",
+          "const": "rfc3339"
+        }
+      ]
+    },
+    "source_graphql__RetryMatcher": {
+      "description": "One `retry_on_response` rule: a response that matches every set condition\nis treated as throttling.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "HTTP statuses this rule applies to (empty = any non-2xx, or any status\nwith `match_success`).",
+          "type": "array",
+          "items": {
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "default": []
+        },
+        "match_success": {
+          "description": "Also match 2xx responses, for APIs that report throttling inside a\nsuccessful response (GraphQL `THROTTLED` errors, `x-ratelimit-remaining:\n0`). Requires `body_path` or `header`.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        "body_path": {
+          "description": "JSONPath into the (JSON) response body; any match equal to one of\n`values` satisfies the rule. A non-JSON body never matches.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "values": {
+          "description": "Values that match (numbers and strings compare by their text, so `17`\nmatches `\"17\"`). Required with `body_path`; with only `header`, they\nare compared against the header value.",
+          "type": "array",
+          "items": true,
+          "default": []
+        },
+        "header": {
+          "description": "A response header that must be present (and, without `body_path`,\nequal one of `values` when any are listed).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backoff_from": {
+          "description": "Where the response says how long to wait. Takes precedence over\n`backoff_secs`; when the value is missing or unreadable the rule falls\nback to `backoff_secs`, then `Retry-After`, then exponential backoff.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/source_graphql__BackoffFrom"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "backoff_secs": {
+          "description": "Fixed wait before retrying. Without it the server's `Retry-After` is\nhonoured, else exponential backoff applies.",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_wait_secs": {
+          "description": "Longest wait `backoff_from` may ask for (default 3600). A longer one\nfails the run with an error naming the reset instead of parking it.",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_graphql__BackoffFrom": {
+      "description": "Where a matched response states its wait.",
+      "oneOf": [
+        {
+          "description": "A response header (`x-ratelimit-reset`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "header"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Header name.",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "How to read the value.",
+                  "$ref": "#/$defs/source_graphql__WaitUnit"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A JSON-valued response header, read at a JSONPath\n(`x-business-use-case-usage`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "header_json"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Header name.",
+                  "type": "string"
+                },
+                "path": {
+                  "description": "JSONPath into the parsed header value; the first number or string\nfound is used.",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "How to read the value.",
+                  "$ref": "#/$defs/source_graphql__WaitUnit"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A value in the JSON response body.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "body"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "JSONPath into the body; the first number or string found is used.",
+                  "type": "string"
+                },
+                "unit": {
+                  "description": "How to read the value.",
+                  "$ref": "#/$defs/source_graphql__WaitUnit"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A leaky-bucket cost report (Shopify GraphQL): wait\n`ceil((requested - available) / restore_rate)` seconds, at least 1.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "cost_bucket"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "requested": {
+                  "description": "JSONPath to the cost the request asked for.",
+                  "type": "string"
+                },
+                "available": {
+                  "description": "JSONPath to the points currently available.",
+                  "type": "string"
+                },
+                "restore_rate": {
+                  "description": "JSONPath to the points restored per second.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "source_graphql__WaitUnit": {
+      "description": "How a `backoff_from` value is read.",
+      "oneOf": [
+        {
+          "description": "A wait in seconds.",
+          "type": "string",
+          "const": "seconds"
+        },
+        {
+          "description": "A wait in milliseconds.",
+          "type": "string",
+          "const": "ms"
+        },
+        {
+          "description": "A wait in minutes.",
+          "type": "string",
+          "const": "minutes"
+        },
+        {
+          "description": "An absolute Unix time in seconds.",
+          "type": "string",
+          "const": "epoch_s"
+        },
+        {
+          "description": "An absolute Unix time in milliseconds.",
+          "type": "string",
+          "const": "epoch_ms"
+        },
+        {
+          "description": "An absolute RFC 3339 instant.",
+          "type": "string",
+          "const": "rfc3339"
+        }
+      ]
     }
   }
 }
