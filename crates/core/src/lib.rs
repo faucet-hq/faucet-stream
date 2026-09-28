@@ -232,7 +232,8 @@ pub use usage::{CostSignal, UsageMeter, UsageSide, UsageSnapshot, estimate_json_
 pub use util::redact_uri_credentials;
 pub use verify::{IntegrityCheck, LengthCheck, VerifyingReader};
 pub use window::{
-    WINDOW_PLACEHOLDER, Window, WindowBind, WindowSpec, enumerate_windows, parse_step,
+    WINDOW_END_PLACEHOLDER, WINDOW_PLACEHOLDER, WINDOW_START_PLACEHOLDER, Window, WindowBind,
+    WindowSpec, enumerate_windows, parse_step,
 };
 pub use write_mode::{
     DeleteMarker, KeyTuple, OverwriteScope, WriteMode, WritePlan, WriteSpec, key_to_doc_id,

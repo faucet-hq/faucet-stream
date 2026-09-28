@@ -302,7 +302,7 @@ the window start, the `upper` bind the window end.
 |-------|------|---------|-------------|
 | `step` | string | — | Window size: `45s` / `30m` / `6h` / `30d` (absolute UTC; `d` = 24h), or a bare integer (= seconds). |
 | `lower` | `WindowBind` | — | Bind rendered with the window **start**. |
-| `upper` | `WindowBind` | — | Bind rendered with the window **end**. |
+| `upper` | `WindowBind` / omitted | — | Bind rendered with the window **end**. Omit it when `lower.template` renders both bounds (`${window.end}`). |
 | `granularity` | string / null | `null` | Subtract from each *rendered* upper bound so `[start, end]` is non-overlapping for inclusive-inclusive APIs (Airbyte `cursor_granularity`). The persisted bookmark stays the true half-open boundary. |
 | `lookback` | string / null | `null` | Re-scan this much *before* the bookmark on the first window, for late-arriving rows. |
 | `max_windows` | integer | `10000` | Safety cap; on overflow the sweep is truncated (logged) and the next run resumes. |
@@ -322,6 +322,26 @@ window:
   lookback: 1d
   lower: { into: query, name: start_date, template: "${window}", format: date }
   upper: { into: query, name: end_date,   template: "${window}", format: date }
+```
+
+Some APIs take both bounds in **one** string — the Google Ads query language
+(`segments.date BETWEEN 'a' AND 'b'`), Lucene `date:[a TO b]`, `range=a..b`. Any
+bind's template may use `${window.start}` and `${window.end}` (the end is
+granularity-adjusted, like `upper`); `${window}` stays "this bind's own
+boundary". Omit `upper` and only `lower` is applied — it must then contain
+`${window.end}`, or the config is rejected as unbounded above. The rendered
+value is the formatted date/instant only and is not escaped for the query
+language; the template is the whole statement.
+
+```yaml
+window:
+  step: 7d
+  granularity: 1d
+  lower:
+    into: body
+    path: /query
+    format: date
+    template: "SELECT campaign.id, metrics.clicks, segments.date FROM campaign WHERE segments.date BETWEEN '${window.start}' AND '${window.end}'"
 ```
 
 ### OData (`odata`)

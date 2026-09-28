@@ -1171,9 +1171,11 @@ impl RestStream {
                         .window
                         .as_ref()
                         .expect("a window pass implies a `window:` block");
-                    let lower = ResolvedBind::window(&win.lower, win.render_lower(w));
-                    let upper = ResolvedBind::window(&win.upper, win.render_upper(w)?);
-                    *self.window_binds.lock().await = vec![lower, upper];
+                    *self.window_binds.lock().await = win
+                        .render_binds(w)?
+                        .into_iter()
+                        .map(|(bind, rendered)| ResolvedBind::window(bind, rendered))
+                        .collect();
                 }
 
                 // The bookmark this pass persists on its final page: the window's

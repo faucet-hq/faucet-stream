@@ -1026,6 +1026,8 @@ prints the full list.
 | `replication_bind.path` | — | `into: body` only: a JSON Pointer into `body` (`/filterGroups/0/filters/0/value`) instead of a top-level `name`. Set exactly one of `name` / `path`; the pointer must resolve to an existing value or a new key of an existing object. |
 | `replication_bind.value_type` | `string` | `number` writes the rendered bookmark as a JSON number. |
 | `window.lower` / `window.upper` `.path`, `.value_type` | — | Same as the two above, for window bounds (e.g. `/dateRanges/0/startDate`). |
+| `window.*.template` placeholders | `${window}` | `${window}` is the bind's own boundary; `${window.start}` / `${window.end}` render the window's start and granularity-adjusted end in any bind, so one bind can carry both (GAQL `segments.date BETWEEN '${window.start}' AND '${window.end}'`). |
+| `window.upper` | — | Optional when `lower.template` contains `${window.end}`; only `lower` is then applied. Omitting it otherwise is rejected (unbounded above). |
 
 **`rest` — pagination and CSV**
 

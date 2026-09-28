@@ -305,3 +305,49 @@ async fn number_value_type_rejects_a_non_numeric_render() {
         .unwrap_err();
     assert!(err.to_string().contains("not a number"), "{err}");
 }
+
+#[tokio::test]
+async fn combined_window_bind_renders_a_gaql_between_per_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(|_req: &Request| {
+            ResponseTemplate::new(200).set_body_json(json!({"results": [{"d": "2024-01-01"}]}))
+        })
+        .mount(&server)
+        .await;
+    let window: WindowSpec = serde_json::from_value(json!({
+        "step": "7d",
+        "granularity": "1d",
+        "lower": {
+            "into": "body", "path": "/query", "format": "date",
+            "template": "SELECT c.id FROM campaign WHERE segments.date BETWEEN '${window.start}' AND '${window.end}'"
+        }
+    }))
+    .unwrap();
+    let stream = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/search")
+            .method(Method::POST)
+            .body(json!({"query": ""}))
+            .records_path("$.results[*]")
+            .replication_method(ReplicationMethod::Incremental)
+            .replication_key("d")
+            .start_replication_value(json!("2024-01-01"))
+            .window(window),
+    )
+    .unwrap()
+    .with_now_override_rfc3339("2024-01-15T00:00:00Z");
+    drain(&stream).await.unwrap();
+    let queries: Vec<String> = bodies(&server)
+        .await
+        .iter()
+        .map(|b| b["query"].as_str().unwrap().to_owned())
+        .collect();
+    let q = |a: &str, b: &str| {
+        format!("SELECT c.id FROM campaign WHERE segments.date BETWEEN '{a}' AND '{b}'")
+    };
+    assert_eq!(
+        queries,
+        vec![q("2024-01-01", "2024-01-07"), q("2024-01-08", "2024-01-14")]
+    );
+}
