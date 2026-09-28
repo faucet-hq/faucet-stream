@@ -562,14 +562,55 @@ impl RestStream {
         let retry_after = headers
             .contains_key(reqwest::header::RETRY_AFTER)
             .then(|| parse_retry_after(headers));
-        let wait =
-            crate::retry::matcher::matched_wait(m, retry_after, self.retry_policy.base, hits);
+        let wait = match m.wait(headers, body, retry_after, self.retry_policy.base, hits) {
+            Ok(w) => w,
+            Err(e) => {
+                self.reset_matcher_hits();
+                return Some(e);
+            }
+        };
         tracing::warn!(
             status,
             ?wait,
             "response matched retry_on_response; treating as throttling"
         );
         Some(FaucetError::RateLimited(wait))
+    }
+
+    fn has_success_rules(&self) -> bool {
+        self.config
+            .retry_on_response
+            .iter()
+            .any(|m| m.match_success)
+    }
+
+    /// A 2xx whose body/headers match a `match_success` rule, as a rate limit.
+    fn classify_success_response(
+        &self,
+        status: u16,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Option<FaucetError> {
+        if !self.has_success_rules() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(body);
+        if crate::retry::matcher::find_match(&self.config.retry_on_response, status, headers, &text)
+            .is_none()
+        {
+            self.reset_matcher_hits();
+            return None;
+        }
+        Some(
+            self.classify_retry_response(status, headers, &text)
+                .unwrap_or_else(|| {
+                    FaucetError::Source(format!(
+                        "rest: HTTP {status} response still matched retry_on_response after \
+                         {} retries",
+                        self.retry_policy.max_attempts.saturating_sub(1)
+                    ))
+                }),
+        )
     }
 
     fn reset_matcher_hits(&self) {
@@ -1626,8 +1667,12 @@ impl RestStream {
                 let resp = self
                     .job_request_response_once(op, method, url, headers, query, json)
                     .await?;
+                let status = resp.status().as_u16();
                 let resp_headers = resp.headers().clone();
                 let bytes = resp.bytes().await.map_err(FaucetError::Http)?;
+                if let Some(e) = self.classify_success_response(status, &resp_headers, &bytes) {
+                    return Err(e);
+                }
                 Ok((bytes.to_vec(), resp_headers))
             },
         )
@@ -1715,7 +1760,7 @@ impl RestStream {
                 body: format!("async_job: {url} returned HTTP {}", status.as_u16()),
             });
         }
-        if status.is_success() {
+        if status.is_success() && !self.has_success_rules() {
             self.reset_matcher_hits();
         }
         if !status.is_success() {
@@ -2416,8 +2461,11 @@ impl RestStream {
         let resp = req.send().await?;
         let status = resp.status();
 
-        // 429 Too Many Requests: honour Retry-After before retrying.
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // 429 Too Many Requests: honour Retry-After before retrying, unless a
+        // `retry_on_response` rule says where the wait is (#771).
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            && self.config.retry_on_response.is_empty()
+        {
             let wait = parse_retry_after(resp.headers());
             return Err(FaucetError::RateLimited(wait));
         }
@@ -2431,6 +2479,9 @@ impl RestStream {
             let text = resp.text().await.unwrap_or_default();
             if let Some(e) = self.classify_retry_response(status.as_u16(), &headers, &text) {
                 return Err(e);
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(FaucetError::RateLimited(parse_retry_after(&headers)));
             }
             if is_first_page && self.config.tolerated_http_errors.contains(&status.as_u16()) {
                 return Ok((Value::Array(vec![]), HeaderMap::new()));
@@ -2473,7 +2524,9 @@ impl RestStream {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(http_status_error(status.as_u16(), resp_url, body_text));
         }
-        self.reset_matcher_hits();
+        if !self.has_success_rules() {
+            self.reset_matcher_hits();
+        }
 
         let mut resp_headers = resp.headers().clone();
         if let Ok(v) = reqwest::header::HeaderValue::from_str(resp.url().as_str()) {
@@ -2485,10 +2538,13 @@ impl RestStream {
         // non-retriable decode error ("EOF while parsing a value") that aborts
         // the run; treat it as an empty page ("no data") instead (#146 M10). A
         // non-empty body that isn't valid JSON still surfaces as a parse error.
+        let bytes = resp.bytes().await?;
+        if let Some(e) = self.classify_success_response(status.as_u16(), &resp_headers, &bytes) {
+            return Err(e);
+        }
         if status == reqwest::StatusCode::NO_CONTENT {
             return Ok((Value::Array(vec![]), resp_headers));
         }
-        let bytes = resp.bytes().await?;
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok((Value::Array(vec![]), resp_headers));
         }
@@ -3198,10 +3254,18 @@ impl RestStream {
                 status.as_u16()
             )));
         }
-        self.reset_matcher_hits();
-        resp.text()
+        let resp_headers = resp.headers().clone();
+        let text = resp
+            .text()
             .await
-            .map_err(|e| FaucetError::Source(format!("rest: reading {what} failed: {e}")))
+            .map_err(|e| FaucetError::Source(format!("rest: reading {what} failed: {e}")))?;
+        if let Some(e) =
+            self.classify_success_response(status.as_u16(), &resp_headers, text.as_bytes())
+        {
+            return Err(e);
+        }
+        self.reset_matcher_hits();
+        Ok(text)
     }
 
     /// Authed GET returning a parsed JSON body (discovery probes).
