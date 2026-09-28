@@ -120,11 +120,16 @@ where
         match outcome {
             Ok(val) => return Ok(val),
             Err(e) if policy.is_retriable(&e) && attempt + 1 < max_attempts => {
-                let base = policy.backoff.delay(policy.base, policy.max, attempt);
-                let wait = if policy.jitter {
-                    crate::retry::apply_jitter(base)
-                } else {
-                    base
+                let wait = match &e {
+                    FaucetError::RateLimited(stated) => *stated,
+                    _ => {
+                        let base = policy.backoff.delay(policy.base, policy.max, attempt);
+                        if policy.jitter {
+                            crate::retry::apply_jitter(base)
+                        } else {
+                            base
+                        }
+                    }
                 };
                 tracing::warn!(
                     "operation failed (attempt {}/{}), retrying in {wait:?}: {e}",
@@ -498,6 +503,35 @@ mod tests {
         let usage = meter.snapshot();
         assert_eq!(usage.source_retries["rate_limited"], 2);
         assert_eq!(usage.source_retries["http_5xx"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_stated_rate_limit_wait_replaces_the_policy_backoff() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffKind::Fixed,
+            base: Duration::from_millis(1),
+            max: Duration::from_millis(1),
+            jitter: false,
+            ..RetryPolicy::default()
+        };
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = calls.clone();
+        let started = std::time::Instant::now();
+        let r = execute_with_policy(&policy, None, move || {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err::<i32, _>(FaucetError::RateLimited(Duration::from_millis(80)))
+                } else {
+                    Ok(1)
+                }
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 1);
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
