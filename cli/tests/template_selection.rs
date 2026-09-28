@@ -196,7 +196,7 @@ params:
   out_dir: {{ type: string, default: "{o}" }}
 sink:
   type: jsonl
-  config: {{ append: false }}
+  config: {{ append: true }}
 per_stream:
   path: "${{param.out_dir}}/${{stream}}.jsonl"
 write_mode_aliases:
