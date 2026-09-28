@@ -28,6 +28,10 @@ pub enum ResponseFormat {
     /// Excel (`.xlsx`/`.xls`) — parse a workbook body. Requires the crate's
     /// `excel` feature.
     Excel,
+    /// JSON Lines — one JSON object per line (a Shopify bulk-operation
+    /// result, #768). An async-job fetch is decoded line by line into pages
+    /// of `batch_size`, so the file is never held in memory whole.
+    Jsonl,
 }
 
 fn default_method() -> Method {
@@ -435,6 +439,14 @@ pub struct RestStreamConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_field: Option<String>,
 
+    // ── Row routing (#768) ──────────────────────────────────────────────────────
+    /// Route each record to a named stream by its GID type or a discriminator
+    /// field, stamping the stream into `stream_field` — so one bulk job's
+    /// parents and children reach separate sinks. See
+    /// [`RecordsRoute`](crate::route::RecordsRoute).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records_route: Option<crate::route::RecordsRoute>,
+
     // ── Resumable cursor (#547) ─────────────────────────────────────────────────
     /// Persist the terminal pagination cursor as this run's bookmark (riding the
     /// existing `StreamPage.bookmark` / `StateStore` path — no core trait change)
@@ -765,6 +777,7 @@ impl Default for RestStreamConfig {
             record_ancestors: None,
             records_multi: Vec::new(),
             op_field: None,
+            records_route: None,
             persist_cursor: false,
             discovery: None,
         }
@@ -811,14 +824,14 @@ impl RestStreamConfig {
         if !matches!(self.response_format, ResponseFormat::Json) {
             if !matches!(self.pagination, PaginationStyle::None) {
                 return Err(faucet_core::FaucetError::Config(
-                    "rest: `response_format: csv|excel` fetches a single file body and does not \
+                    "rest: `response_format: csv|excel|jsonl` fetches a single file body and does not \
                      paginate — set `pagination: none`"
                         .into(),
                 ));
             }
             if self.records_path.is_some() {
                 return Err(faucet_core::FaucetError::Config(
-                    "rest: `records_path` (JSONPath) does not apply to `response_format: csv|excel` \
+                    "rest: `records_path` (JSONPath) does not apply to `response_format: csv|excel|jsonl` \
                      — the whole file body becomes the record set"
                         .into(),
                 ));
@@ -874,7 +887,17 @@ impl RestStreamConfig {
                         .into(),
                 ));
             }
-            if matches!(self.replication_method, ReplicationMethod::Incremental) {
+            let template_mode = job.inject_mode() == crate::async_job::InjectMode::Template;
+            if template_mode
+                && !matches!(self.replication_method, ReplicationMethod::Incremental)
+            {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `async_job.incremental.inject.mode: template` requires \
+                     `replication_method: incremental`"
+                        .into(),
+                ));
+            }
+            if matches!(self.replication_method, ReplicationMethod::Incremental) && !template_mode {
                 // The async-job incremental predicate (#630) is injected into
                 // the submit body's top-level string `query`. Without one the
                 // predicate can never apply: every run would silently stay a
@@ -968,6 +991,19 @@ impl RestStreamConfig {
                 return Err(faucet_core::FaucetError::Config(format!(
                     "rest: `{other}` and `{label}` both write '{p}'"
                 )));
+            }
+        }
+        if let Some(route) = &self.records_route {
+            route.validate()?;
+            if matches!(
+                self.response_format,
+                ResponseFormat::Csv | ResponseFormat::Excel
+            ) {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `records_route` routes JSON objects — use `response_format: json` or \
+                     `jsonl`"
+                        .into(),
+                ));
             }
         }
         // #548: multi-array fan-out is its own extraction mode.

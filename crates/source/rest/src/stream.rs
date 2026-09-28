@@ -910,7 +910,7 @@ impl RestStream {
         use crate::config::ResponseFormat;
         matches!(
             self.config.response_format,
-            ResponseFormat::Csv | ResponseFormat::Excel
+            ResponseFormat::Csv | ResponseFormat::Excel | ResponseFormat::Jsonl
         )
         .then_some(csv_page_size)
         .filter(|n| *n > 0)
@@ -1961,6 +1961,9 @@ impl RestStream {
                 )?;
                 Ok((records, None))
             }
+            crate::config::ResponseFormat::Jsonl => {
+                Ok((crate::format::parse_jsonl(bytes)?, None))
+            }
         }
     }
 
@@ -2529,6 +2532,9 @@ impl RestStream {
                 self.config.excel_sheet.as_deref(),
                 self.config.excel_header_row,
             )?),
+            crate::config::ResponseFormat::Jsonl => {
+                Value::Array(crate::format::parse_jsonl(&bytes)?)
+            }
         };
         Ok((body, resp_headers))
     }
