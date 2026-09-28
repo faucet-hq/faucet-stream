@@ -201,6 +201,80 @@ matches the original error (status and body) is surfaced, so a permanent error
 that happens to match still fails. A `header:` condition (present, or equal to
 one of `values`) covers APIs that flag throttling in a header instead.
 
+#### Waiting until the stated reset (`backoff_from`)
+
+Many APIs say exactly when the limit resets. Waiting until then is cheaper
+than exponential backoff, which either gives up before the window reopens or
+keeps hitting the API while it is locked out. `backoff_from` reads that wait
+from the response:
+
+```yaml
+retry_on_response:
+  # GitHub: 403/429 with x-ratelimit-remaining: 0 and an epoch-seconds reset.
+  - status: [403, 429]
+    header: x-ratelimit-remaining
+    values: ["0"]
+    backoff_from:
+      type: header
+      config: { name: x-ratelimit-reset, unit: epoch_s }
+  # Meta: minutes to wait, inside a JSON-valued header.
+  - status: [400, 403]
+    body_path: $.error.code
+    values: [80004, 17, 4, 32]
+    backoff_from:
+      type: header_json
+      config:
+        name: x-business-use-case-usage
+        path: "$.*[0].estimated_time_to_regain_access"
+        unit: minutes
+```
+
+| `backoff_from.type` | Reads |
+|---|---|
+| `header` | A header value (`name`, `unit`). |
+| `header_json` | A JSON-valued header, at a JSONPath (`name`, `path`, `unit`). |
+| `body` | A value in the JSON body (`path`, `unit`). |
+| `cost_bucket` | A leaky-bucket cost report (`requested`, `available`, `restore_rate` paths): wait `ceil((requested − available) / restore_rate)` seconds. |
+
+`unit` is `seconds`, `ms` or `minutes` for a relative wait, or `epoch_s`,
+`epoch_ms` or `rfc3339` for an absolute instant. An instant is measured from
+the response's `Date` header when present, so a skewed local clock does not
+change the wait, and an instant already in the past retries immediately. The
+order is `backoff_from`, then `backoff_secs`, then `Retry-After`, then
+exponential backoff; a missing or unreadable value falls through to the next.
+A stated wait longer than `max_wait_secs` (default 3600) fails the run with the
+reset named instead of parking it for hours.
+
+#### Throttling inside a successful response (`match_success`)
+
+Some APIs answer a throttled call with `200`. Shopify's Admin GraphQL API
+returns `errors[].extensions.code: THROTTLED` plus a cost report. With
+`match_success: true` a rule also matches 2xx responses; the `graphql` source
+supports `retry_on_response` for exactly this:
+
+```yaml
+source:
+  type: graphql
+  config:
+    # …
+    retry_on_response:
+      - match_success: true
+        body_path: "$.errors[*].extensions.code"
+        values: [THROTTLED]
+        backoff_from:
+          type: cost_bucket
+          config:
+            requested: $.extensions.cost.requestedQueryCost
+            available: $.extensions.cost.throttleStatus.currentlyAvailable
+            restore_rate: $.extensions.cost.throttleStatus.restoreRate
+```
+
+A match retries the whole request, so any partial `data` in the throttled
+response is never emitted; other GraphQL errors still fail immediately. A
+success rule must set `body_path` or `header`, since retrying every success
+would loop. On `rest`, a 2xx that still matches after `max_retries` retries
+fails the run rather than being read as data.
+
 Other sources with their own throttle handling — `databricks`, `dynamodb`,
 `kinesis` — do not report through these metrics yet. A connector (including a
 third-party one) opts in through the round-trip recorder the pipeline installs:
