@@ -1000,7 +1000,10 @@ impl RestStream {
                 // reflects the query's start time (conservative — a small re-read
                 // overlap next run, deduped by an upsert sink). `None` for full-table.
                 let new_bookmark = self.async_job_new_bookmark();
-                let fetch_url = self.prepare_async_job().await?;
+                let Some(fetch_url) = self.prepare_async_job().await? else {
+                    yield faucet_core::StreamPage { records: Vec::new(), bookmark: new_bookmark };
+                    return;
+                };
                 let mut locator: Option<String> = None;
                 loop {
                     // Send the locator (when we have one) as the configured query param.
@@ -1758,24 +1761,48 @@ impl RestStream {
     async fn incremental_submit_json(
         &self,
         job: &crate::async_job::AsyncJobConfig,
-    ) -> Option<Value> {
-        if self.config.replication_method != ReplicationMethod::Incremental {
-            return None;
-        }
-        let key = self.config.replication_key.as_ref()?;
+    ) -> Result<Option<Value>, FaucetError> {
         let start = {
             let guard = self.runtime_start.lock().await;
             guard
                 .clone()
                 .or_else(|| self.config.start_replication_value.clone())
-        }?;
-        let submit = job.submit.json.as_ref()?;
-        let query = job.submit_query()?;
+        };
+        // Template mode (#768) always renders — `initial` when there is no
+        // bookmark — so the placeholder never reaches the server verbatim.
+        if let Some(inc) = job
+            .incremental
+            .as_ref()
+            .filter(|i| i.inject.mode == crate::async_job::InjectMode::Template)
+        {
+            let Some(submit) = job.submit.json.as_ref() else {
+                return Ok(None);
+            };
+            let filter = crate::async_job::render_filter(&inc.inject, start.as_ref())?;
+            return Ok(Some(crate::async_job::substitute_in_value(
+                submit,
+                crate::async_job::FILTER_PLACEHOLDER,
+                &filter,
+            )));
+        }
+        if self.config.replication_method != ReplicationMethod::Incremental {
+            return Ok(None);
+        }
+        let (Some(key), Some(start), Some(submit), Some(query)) = (
+            self.config.replication_key.as_ref(),
+            start,
+            job.submit.json.as_ref(),
+            job.submit_query(),
+        ) else {
+            return Ok(None);
+        };
         let predicate = format!("{key} > {}", sql_literal(&start));
         let mut cloned = submit.clone();
-        *cloned.pointer_mut(&job.query_path)? =
-            Value::String(inject_sql_predicate(query, &predicate));
-        Some(cloned)
+        let Some(slot) = cloned.pointer_mut(&job.query_path) else {
+            return Ok(None);
+        };
+        *slot = Value::String(inject_sql_predicate(query, &predicate));
+        Ok(Some(cloned))
     }
 
     /// The bookmark to persist after an incremental async-job run: the run's
@@ -1791,13 +1818,17 @@ impl RestStream {
     /// full export would be a lie (`validate()` rejects that config shape;
     /// this is the backstop for callers that skipped validation).
     fn async_job_new_bookmark(&self) -> Option<Value> {
-        if self.config.replication_method != ReplicationMethod::Incremental
-            || self.config.replication_key.is_none()
-        {
+        if self.config.replication_method != ReplicationMethod::Incremental {
             return None;
         }
         let job = self.config.async_job.as_ref()?;
-        if !job.supports_incremental_query() {
+        let pushes_down = match job.inject_mode() {
+            crate::async_job::InjectMode::Template => true,
+            crate::async_job::InjectMode::Sql => {
+                self.config.replication_key.is_some() && job.supports_incremental_query()
+            }
+        };
+        if !pushes_down {
             return None;
         }
         let now = self.run_now() - job.lookback_duration();
@@ -1806,7 +1837,65 @@ impl RestStream {
         ))
     }
 
-    async fn prepare_async_job(&self) -> Result<String, FaucetError> {
+    /// Submit the job and return its id. A `submit_errors` match fails with the
+    /// server's messages; a "busy" match is retried until `retry_timeout_secs`
+    /// (#768 — Shopify allows one bulk operation per shop at a time).
+    async fn submit_async_job(
+        &self,
+        job: &crate::async_job::AsyncJobConfig,
+        submit_url: &str,
+        submit_json: Option<&Value>,
+    ) -> Result<String, FaucetError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let body = self
+                .job_request_json(
+                    "submit",
+                    &job.submit.method,
+                    submit_url,
+                    &job.submit.headers,
+                    &job.submit.query,
+                    submit_json,
+                )
+                .await?;
+            let errors = job
+                .submit_errors
+                .as_ref()
+                .map(|se| (se, crate::async_job::error_messages(&body, &se.path)))
+                .filter(|(_, msgs)| !msgs.is_empty());
+            let Some((se, msgs)) = errors else {
+                return jsonpath_first_string(&body, &job.job_id).ok_or_else(|| {
+                    FaucetError::Source(format!(
+                        "async_job: submit response had no job id at '{}'",
+                        job.job_id
+                    ))
+                });
+            };
+            let joined = msgs.join("; ");
+            let waited = started.elapsed();
+            let limit = Duration::from_secs(se.retry_timeout_secs);
+            if !se.is_busy(&msgs) {
+                return Err(FaucetError::Source(format!(
+                    "async_job: submit was rejected: {joined}"
+                )));
+            }
+            if waited >= limit {
+                return Err(FaucetError::Source(format!(
+                    "async_job: submit still rejected as busy after {}s: {joined}",
+                    se.retry_timeout_secs
+                )));
+            }
+            tracing::warn!(
+                reason = %joined,
+                retry_in_secs = se.retry_interval_secs,
+                "async_job: submit rejected while another job runs; retrying"
+            );
+            let wait = Duration::from_secs(se.retry_interval_secs).min(limit - waited);
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn prepare_async_job(&self) -> Result<Option<String>, FaucetError> {
         use crate::async_job::{JobOutcome, resolve_url, substitute_job_id};
         let job = self
             .config
@@ -1820,24 +1909,9 @@ impl RestStream {
         // when replicating incrementally with a start bookmark; falls back to the
         // unmodified submit body on the first run / full-table.
         let submit_url = resolve_url(base, job.submit.url.as_deref().unwrap_or_default());
-        let injected = self.incremental_submit_json(job).await;
+        let injected = self.incremental_submit_json(job).await?;
         let submit_json = injected.as_ref().or(job.submit.json.as_ref());
-        let submit_body = self
-            .job_request_json(
-                "submit",
-                &job.submit.method,
-                &submit_url,
-                &job.submit.headers,
-                &job.submit.query,
-                submit_json,
-            )
-            .await?;
-        let job_id = jsonpath_first_string(&submit_body, &job.job_id).ok_or_else(|| {
-            FaucetError::Source(format!(
-                "async_job: submit response had no job id at '{}'",
-                job.job_id
-            ))
-        })?;
+        let job_id = self.submit_async_job(job, &submit_url, submit_json).await?;
 
         // 2) Poll until a terminal state (with interval + timeout).
         let poll_url = resolve_url(base, &substitute_job_id(&job.poll.url, &job_id));
@@ -1855,6 +1929,11 @@ impl RestStream {
         );
         // Retain the last poll response so `fetch.url_from` (#543) can source the
         // download URL from the terminal (success) poll body.
+        let poll_json = job
+            .poll
+            .json
+            .as_ref()
+            .map(|j| crate::async_job::substitute_job_id_value(j, &job_id));
         let last_poll_body: Value = loop {
             let body = self
                 .job_request_json(
@@ -1863,15 +1942,23 @@ impl RestStream {
                     &poll_url,
                     &job.poll.headers,
                     &job.poll.query,
-                    None,
+                    poll_json.as_ref(),
                 )
                 .await?;
             let status = jsonpath_first_string(&body, &job.status.path).unwrap_or_default();
             match job.status.classify(&status) {
                 JobOutcome::Success => break body,
                 JobOutcome::Failure => {
+                    let detail = job
+                        .status
+                        .error_path
+                        .as_deref()
+                        .map(|p| crate::async_job::error_messages(&body, p).join("; "))
+                        .filter(|d| !d.is_empty())
+                        .map(|d| format!(" (error: {d})"))
+                        .unwrap_or_default();
                     return Err(FaucetError::Source(format!(
-                        "async_job: job failed with status '{status}'"
+                        "async_job: job failed with status '{status}'{detail}"
                     )));
                 }
                 JobOutcome::Pending => {
@@ -1891,6 +1978,15 @@ impl RestStream {
         // by rendering the templated `url`. Exactly one is set (validated).
         let fetch_url = match (&job.fetch.url_from, &job.fetch.url) {
             (Some(path), _) => {
+                // An explicit `null` is an empty result (a Shopify bulk
+                // operation that matched nothing), not a misconfigured path.
+                if jsonpath_first_value(&last_poll_body, path).is_some_and(|v| v.is_null()) {
+                    tracing::info!(
+                        url_from = %path,
+                        "async_job: completed with no result file; zero records"
+                    );
+                    return Ok(None);
+                }
                 let resolved = jsonpath_first_string(&last_poll_body, path).ok_or_else(|| {
                     FaucetError::Source(format!(
                         "async_job: fetch.url_from '{path}' matched no string in the poll response"
@@ -1908,7 +2004,7 @@ impl RestStream {
 
         // Steps 1-3 done; the caller fetches the (locator-paged) result and
         // streams it page-by-page. See `stream_pages_inner` (#623).
-        Ok(fetch_url)
+        Ok(Some(fetch_url))
     }
 
     /// Parse one async-job fetch page into records, returning the parsed JSON
@@ -2726,7 +2822,10 @@ impl faucet_core::Source for RestStream {
         // key stable across Rust releases.
         self.config.state_key.clone().or_else(|| {
             (self.config.replication_method == ReplicationMethod::Incremental
-                && self.config.replication_key.is_some())
+                && (self.config.replication_key.is_some()
+                    || self.config.async_job.as_ref().is_some_and(|j| {
+                        j.inject_mode() == crate::async_job::InjectMode::Template
+                    })))
             .then(|| {
                 format!(
                     "rest:{:016x}",
@@ -2892,7 +2991,13 @@ impl faucet_core::Source for RestStream {
             // Incremental bookmark (#630) captured before submit — same semantics
             // as the Value path; emitted on a final empty batch below.
             let new_bookmark = self.async_job_new_bookmark();
-            let fetch_url = self.prepare_async_job().await?;
+            let Some(fetch_url) = self.prepare_async_job().await? else {
+                if let Some(bm) = new_bookmark {
+                    yield faucet_core::NativeBatch::bytes(faucet_core::NativeFormat::NdJson, Vec::new())
+                        .with_bookmark(Some(bm));
+                }
+                return;
+            };
             let mut locator: Option<String> = None;
             loop {
                 let mut query = job.fetch.query.clone();
@@ -2995,7 +3100,14 @@ impl faucet_core::Source for RestStream {
             // only the per-page decoder differs.
             use futures::TryStreamExt as _;
             let new_bookmark = self.async_job_new_bookmark();
-            let fetch_url = self.prepare_async_job().await?;
+            let Some(fetch_url) = self.prepare_async_job().await? else {
+                if let Some(bm) = new_bookmark {
+                    let schema = std::sync::Arc::new(arrow::datatypes::Schema::empty());
+                    let empty = arrow::record_batch::RecordBatch::new_empty(schema);
+                    yield faucet_core::columnar::ColumnarPage::new(empty, Some(bm));
+                }
+                return;
+            };
             let mut locator: Option<String> = None;
             // `batch_size = 0` is the documented "no batching" sentinel: one
             // batch per locator page.
