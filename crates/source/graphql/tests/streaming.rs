@@ -511,3 +511,39 @@ async fn multi_cursor_cycle_terminates() {
     );
     assert_eq!(records.len(), 3);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn config_without_variables_defaults_to_object_and_paginates() {
+    let server = MockServer::start().await;
+    mount_multi_page(&server, 5, 2).await;
+
+    let config: GraphqlStreamConfig = serde_json::from_value(json!({
+        "endpoint": server.uri(),
+        "query": "query($first: Int, $after: String) { users(first: $first, after: $after) { edges { node { id } } pageInfo { hasNextPage endCursor } } }",
+        "auth": {"type": "none"},
+        "records_path": "$.data.users.edges[*].node",
+        "pagination": {
+            "has_next_page_path": "$.data.users.pageInfo.hasNextPage",
+            "cursor_path": "$.data.users.pageInfo.endCursor",
+            "cursor_variable": "after",
+            "page_size_variable": "first"
+        },
+        "batch_size": 2
+    }))
+    .expect("config without variables deserializes");
+    assert_eq!(config.variables, json!({}));
+
+    let records = GraphqlStream::new(config)
+        .fetch_all()
+        .await
+        .expect("run ok");
+    assert_eq!(records.len(), 5);
+
+    let requests = server.received_requests().await.expect("recorded");
+    let cursors: Vec<Option<String>> = requests.iter().map(request_cursor).collect();
+    assert_eq!(
+        cursors,
+        vec![None, Some("cursor-1".into()), Some("cursor-2".into())]
+    );
+    assert!(requests.iter().all(|r| request_variables(r).is_object()));
+}

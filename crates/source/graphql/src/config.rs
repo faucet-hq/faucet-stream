@@ -164,6 +164,10 @@ fn default_bind_template() -> String {
     BIND_PLACEHOLDER.to_string()
 }
 
+fn empty_object() -> Value {
+    Value::Object(Default::default())
+}
+
 fn default_replication_method() -> ReplicationMethod {
     ReplicationMethod::FullTable
 }
@@ -175,7 +179,8 @@ pub struct GraphqlStreamConfig {
     pub endpoint: String,
     /// The GraphQL query string.
     pub query: String,
-    /// Variables to pass with the query.
+    /// Variables to pass with the query. Defaults to an empty object.
+    #[serde(default = "empty_object")]
     pub variables: Value,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
@@ -726,5 +731,24 @@ mod tests {
             serde_json::from_value::<GraphqlReplicationBind>(json!({ "variable": "a", "x": 1 }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn variables_default_to_empty_object() {
+        let c: GraphqlStreamConfig = serde_json::from_value(json!({
+            "endpoint": "https://x/graphql", "query": "{ a }", "auth": {"type": "none"}
+        }))
+        .unwrap();
+        assert_eq!(c.variables, json!({}));
+        assert!(c.validate().is_ok());
+        let schema = serde_json::to_value(schemars::schema_for!(GraphqlStreamConfig)).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!("variables")));
+        let null: GraphqlStreamConfig = serde_json::from_value(json!({
+            "endpoint": "https://x/graphql", "query": "{ a }", "auth": {"type": "none"},
+            "variables": null
+        }))
+        .unwrap();
+        assert!(null.variables.is_null());
     }
 }

@@ -79,7 +79,7 @@ faucet run pipeline.yaml
 |-------|------|---------|-------------|
 | `endpoint` | string | — *(required)* | GraphQL endpoint URL. |
 | `query` | string | — *(required)* | The GraphQL query string. Declare cursor/page-size variables (`$after`, `$first`) to enable pagination. |
-| `variables` | object | `{}` | Static variables merged into every request. Cursor, page-size, and parent-context values are layered on top per request. |
+| `variables` | object | `{}` *(optional)* | Static variables merged into every request; omit the key for a query that takes none. Cursor, page-size, and parent-context values are layered on top per request. |
 | `records_path` | string | *(unset)* | JSONPath plucking the record array out of the response (e.g. `$.data.users.edges[*].node`). When unset, the whole `data` object is emitted as one record. |
 | `auth` | `GraphqlAuth` \| `{ ref }` | `none` | Authentication — inline `{ type, config }` or a shared-provider reference. See [Authentication](#authentication). |
 

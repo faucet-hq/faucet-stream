@@ -232,3 +232,40 @@ async fn a_graphql_error_never_advances_the_bookmark() {
         Some(json!("2026-01-01T00:00:00Z"))
     );
 }
+
+#[tokio::test]
+async fn replication_bind_writes_into_defaulted_variables() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "orders": { "edges": [
+                { "node": { "id": 1, "updatedAt": "2026-01-02T00:00:00Z" } }
+            ] } }
+        })))
+        .mount(&server)
+        .await;
+    let config: GraphqlStreamConfig = serde_json::from_value(json!({
+        "endpoint": server.uri(),
+        "query": "query($since: String) { orders(since: $since) { edges { node { id updatedAt } } } }",
+        "auth": { "type": "none" },
+        "records_path": "$.data.orders.edges[*].node",
+        "replication_method": { "type": "Incremental" },
+        "replication_key": "updatedAt",
+        "replication_bind": { "variable": "since", "template": "updated_at:>${bookmark}" }
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    let source = GraphqlStream::new(config);
+    source
+        .apply_start_bookmark(json!("2026-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    let records = source.fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body["variables"],
+        json!({ "since": "updated_at:>2026-01-01T00:00:00Z" })
+    );
+}

@@ -14553,7 +14553,8 @@
                       "type": "string"
                     },
                     "variables": {
-                      "description": "Variables to pass with the query."
+                      "description": "Variables to pass with the query. Defaults to an empty object.",
+                      "default": {}
                     },
                     "auth": {
                       "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
