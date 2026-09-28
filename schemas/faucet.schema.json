@@ -4682,6 +4682,20 @@
               ],
               "default": true
             },
+            "rows_path": {
+              "description": "JSONPath whose matches are counted to advance the offset and detect a\nshort page, instead of the extracted record count — for report APIs\nwhose whole response is one record (`$.rows`). An array counts its\nelements, an object 1, null or no match 0 (which ends pagination).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "total_path": {
+              "description": "JSONPath to the total row count; pagination stops once the offset\nreaches it. A missing or non-numeric total falls back to the\nshort-page rule.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "type": "string",
               "const": "OffsetInBody"
@@ -5590,7 +5604,7 @@
           "$ref": "#/$defs/source_rest__WindowBind"
         },
         "upper": {
-          "description": "Upper-bound bind, rendered with the window **end**.",
+          "description": "Upper-bound bind, rendered with the window **end**. Optional: omit it when\n`lower.template` renders both bounds through `${window.end}`; only the\n`lower` bind is then applied.",
           "$ref": "#/$defs/source_rest__WindowBind"
         },
         "granularity": {
@@ -5634,16 +5648,6 @@
           "type": "string",
           "default": ""
         },
-        "template": {
-          "description": "Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the\nformatted boundary. Defaults to the bare `${window}`; set e.g.\n`\"gte|${window}\"` or `\"[${window} TO *]\"`.",
-          "type": "string",
-          "default": "${window}"
-        },
-        "format": {
-          "description": "How to format the boundary before substitution.",
-          "$ref": "#/$defs/source_rest__BindFormat",
-          "default": "raw"
-        },
         "path": {
           "description": "`into: body` only: an RFC 6901 JSON Pointer into the configured `body`\n(`/dateRanges/0/startDate`) instead of a top-level `name` (#748).",
           "type": [
@@ -5655,6 +5659,16 @@
           "description": "JSON type written by a body bind: `string` (default) or `number`.",
           "$ref": "#/$defs/source_rest__BindValueType",
           "default": "string"
+        },
+        "template": {
+          "description": "Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the\nformatted boundary. Defaults to the bare `${window}`; set e.g.\n`\"gte|${window}\"` or `\"[${window} TO *]\"`. `${window.start}` and\n`${window.end}` render the window's start and (granularity-adjusted) end\nin any bind, so one bind can carry both bounds\n(`\"segments.date BETWEEN '${window.start}' AND '${window.end}'\"`). The\nrendered value is not escaped for any query language.",
+          "type": "string",
+          "default": "${window}"
+        },
+        "format": {
+          "description": "How to format the boundary before substitution.",
+          "$ref": "#/$defs/source_rest__BindFormat",
+          "default": "raw"
         }
       },
       "additionalProperties": true
