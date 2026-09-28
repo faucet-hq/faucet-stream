@@ -31,7 +31,7 @@ them are listed in `faucet list` and dispatchable as `type:` values.
 | `json_encode` | Serialize a nested field to a JSON string (inverse of `json_parse`) | `fields: [..]` |
 | `unpivot` | Reshape wide columns or a map field into long key/value rows (1→N) | `id_fields`, `key_name`, `value_name`, `columns?` \| `from?`, `drop_nulls?` |
 | `lookup` | Enrich records by joining an inline / JSONL reference table | `values` \| `jsonl`, `on: {record, ref}`, `add: {out: ref_col}`, `on_missing?` |
-| `tree_flatten` | Flatten a recursive report tree / matrix (nested `Rows`) into one row per leaf (1→N) | `children`, `columns: {from, header?, value}`, `root?`, `leaf?`, `ancestors?`, `path_as?` |
+| `tree_flatten` | Flatten a recursive report tree / matrix (nested `Rows`) into one row per leaf (1→N) | `children`, `columns: {from, header?, value}` or `groups: [{from, header, header_label?, value?}]`, `root?`, `leaf?`, `ancestors?`, `path_as?` |
 | `cross_join` | Cartesian product of two or more sibling array fields → one row per combination (1→N) | `arrays`, `prefix?`, `keep_parent?`, `on_empty?`, `drop_arrays?`, `max_product?` |
 | `zip_columns` | Zip a columnar payload (`{columns, rows}`, or several header + cell-array groups such as GA4 `runReport`) into one object per row (1→N) | `rows_path`, `columns_path` or `groups: [{from, header, header_label?, value?}]` |
 | `sql` | Run DuckDB SQL over the whole page; records are the `batch` relation | `query`, `relations?`, `memory_limit?`, `threads?` · page-level (sees the whole batch) · needs `transform-sql` feature · [cookbook](./sql-transform.md) |
@@ -562,6 +562,30 @@ a malformed/cyclic tree is truncated at `max_depth` (logged) rather than
 overflowing the stack. It also flattens any generic `children` tree (org charts,
 category trees, BOM explosions). Column-lineage is opaque (structure-changing).
 Needs the `transform-tree-flatten` feature.
+
+### Several column groups per leaf (`groups`)
+
+When each leaf splits its cells into several positional arrays, each named by
+its own header list, use `groups` instead of `columns` — the same shape as
+[`zip_columns` groups](#several-column-groups-groups), but each group's
+`header` is a path within the record and `header` is required:
+
+```yaml
+- type: tree_flatten
+  config:
+    root: rows
+    children: rows
+    groups:
+      - { from: dims, header: dimHeaders, header_label: name }   # value: value (default)
+      - { from: mets, header: metHeaders, header_label: name }
+    ancestors: { field: label, as: [section] }
+```
+
+Every group's columns are merged into one row per leaf. Set exactly one of
+`columns` or `groups`. Unlike the lenient single `columns` form, groups are
+strict: a leaf missing a group's array, a group whose cell count differs from
+its header count, a header path that is not an array, and a column two groups
+both name each fail the page, with the group and row named.
 
 ## `cross_join` — cartesian product of sibling arrays (1→N)
 
