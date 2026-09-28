@@ -817,7 +817,9 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         let future = std::time::SystemTime::now() + Duration::from_secs(3600);
-        std::fs::File::open(&path)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(future))
             .unwrap();

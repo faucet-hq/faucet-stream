@@ -597,10 +597,11 @@ pub fn rows_for_source(
         let supported = crate::registry::sink_supported_write_modes(&sink.sink.kind);
         let aliases = sink.aliases();
         offered = supported.to_vec();
+        let truncates = sink.truncates_per_invocation();
         for s in &src.streams {
             plans.insert(
                 s.name.clone(),
-                resolve_mode(s, &sink.sink.kind, supported, &aliases),
+                resolve_mode(s, &sink.sink.kind, supported, &aliases, truncates),
             );
         }
         // A stream runs only when it and every ancestor resolve.
@@ -1084,7 +1085,7 @@ kind: sink-template
 name: files
 params:
   out: { type: string, default: ./out }
-sink: { type: jsonl, config: { append: false } }
+sink: { type: jsonl, config: { append: true } }
 per_stream: { path: "${param.out}/${stream}.jsonl" }
 write_mode_aliases: { overwrite: append }
 "#;

@@ -31,9 +31,9 @@ them are listed in `faucet list` and dispatchable as `type:` values.
 | `json_encode` | Serialize a nested field to a JSON string (inverse of `json_parse`) | `fields: [..]` |
 | `unpivot` | Reshape wide columns or a map field into long key/value rows (1→N) | `id_fields`, `key_name`, `value_name`, `columns?` \| `from?`, `drop_nulls?` |
 | `lookup` | Enrich records by joining an inline / JSONL reference table | `values` \| `jsonl`, `on: {record, ref}`, `add: {out: ref_col}`, `on_missing?` |
-| `tree_flatten` | Flatten a recursive report tree / matrix (nested `Rows`) into one row per leaf (1→N) | `children`, `columns: {from, header?, value}`, `root?`, `leaf?`, `ancestors?`, `path_as?` |
+| `tree_flatten` | Flatten a recursive report tree / matrix (nested `Rows`) into one row per leaf (1→N) | `children`, `columns: {from, header?, value}` or `groups: [{from, header, header_label?, value?}]`, `root?`, `leaf?`, `ancestors?`, `path_as?` |
 | `cross_join` | Cartesian product of two or more sibling array fields → one row per combination (1→N) | `arrays`, `prefix?`, `keep_parent?`, `on_empty?`, `drop_arrays?`, `max_product?` |
-| `zip_columns` | Zip a columnar payload (`{columns, rows}`) into one object per row (1→N) | `columns_path`, `rows_path` |
+| `zip_columns` | Zip a columnar payload (`{columns, rows}`, or several header + cell-array groups such as GA4 `runReport`) into one object per row (1→N) | `rows_path`, `columns_path` or `groups: [{from, header, header_label?, value?}]` |
 | `sql` | Run DuckDB SQL over the whole page; records are the `batch` relation | `query`, `relations?`, `memory_limit?`, `threads?` · page-level (sees the whole batch) · needs `transform-sql` feature · [cookbook](./sql-transform.md) |
 | `wasm` | Run a user-provided sandboxed `.wasm` module over each record | `module`, `function?`, `memory_limit_mb?`, `fuel_limit?`, `on_error?`, `reload_on_change?` · per-record · needs `transform-wasm` feature · [cookbook](./wasm-transforms.md) |
 
@@ -563,6 +563,30 @@ overflowing the stack. It also flattens any generic `children` tree (org charts,
 category trees, BOM explosions). Column-lineage is opaque (structure-changing).
 Needs the `transform-tree-flatten` feature.
 
+### Several column groups per leaf (`groups`)
+
+When each leaf splits its cells into several positional arrays, each named by
+its own header list, use `groups` instead of `columns` — the same shape as
+[`zip_columns` groups](#several-column-groups-groups), but each group's
+`header` is a path within the record and `header` is required:
+
+```yaml
+- type: tree_flatten
+  config:
+    root: rows
+    children: rows
+    groups:
+      - { from: dims, header: dimHeaders, header_label: name }   # value: value (default)
+      - { from: mets, header: metHeaders, header_label: name }
+    ancestors: { field: label, as: [section] }
+```
+
+Every group's columns are merged into one row per leaf. Set exactly one of
+`columns` or `groups`. Unlike the lenient single `columns` form, groups are
+strict: a leaf missing a group's array, a group whose cell count differs from
+its header count, a header path that is not an array, and a column two groups
+both name each fail the page, with the group and row named.
+
 ## `cross_join` — cartesian product of sibling arrays (1→N)
 
 ```yaml
@@ -683,6 +707,43 @@ Analytics / report APIs (e.g. Shopify ShopifyQL `tableData`) return results *pos
 ```
 
 `{columns: [{name: day}, {name: sessions}], rows: [["2026-01-01", 12]]}` → `{day: "2026-01-01", sessions: 12}`. A row whose width differs from the column count fails loudly rather than misaligning fields. Gated on the `transform-zip-columns` feature (in `transforms` / `full`).
+
+### Several column groups (`groups`)
+
+Some report APIs split every row into **several** positional cell arrays, each named by its **own** header list. The Google Analytics 4 Data API `runReport` response is the common case:
+
+```json
+{
+  "dimensionHeaders": [{"name": "date"}, {"name": "country"}],
+  "metricHeaders":    [{"name": "sessions", "type": "TYPE_INTEGER"}, {"name": "bounceRate", "type": "TYPE_FLOAT"}],
+  "rows": [
+    {"dimensionValues": [{"value": "20260901"}, {"value": "DE"}],
+     "metricValues":    [{"value": "1204"},     {"value": "0.41"}]}
+  ]
+}
+```
+
+Use `groups` instead of `columns_path`. Each group is zipped against its own headers, and the groups are merged into one record:
+
+```yaml
+- type: zip_columns
+  config:
+    rows_path: "$.rows[*]"
+    groups:
+      - { from: dimensionValues, header: "$.dimensionHeaders[*].name", value: value }
+      - { from: metricValues, header: "$.metricHeaders[*]", header_label: name, value: value }
+```
+
+→ `{date: "20260901", country: "DE", sessions: "1204", bounceRate: "0.41"}`. Add a `cast` transform afterwards to type the metrics.
+
+| Group field | Meaning |
+|---|---|
+| `from` | Dot path, inside each row, of this group's cell array. A row without it fails the page (a schema change, not "no data"). |
+| `header` | JSONPath, evaluated against the **record**, to this group's header list. |
+| `header_label` | Field of each header object to use as the column name, when `header` matches objects. |
+| `value` | Dot path, inside each cell, of the value. Omit when the cells are the values. A cell without it (or a `null` cell) yields `null`. |
+
+Set exactly one of `columns_path` or `groups`. Two groups naming the same column, a header that is not a string, and a row whose group width differs from that group's header count each fail the page with the group and row named — a value never lands under the wrong column. A record with no rows (GA4 omits `rows` from an empty report) yields no records. The runnable fixture is `cli/examples/tests/zip_columns_groups_tests.yaml`.
 
 ### Ordering: explode early, filter late (usually)
 

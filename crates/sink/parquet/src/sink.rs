@@ -62,6 +62,9 @@ pub struct ParquetSink {
     /// directory holding them. Empty for an S3 destination (nothing local to
     /// collect). See `faucet_core::local_outputs`.
     outputs: faucet_core::LocalOutputLog,
+    /// Whether this run opened any writer, so a successful empty run in
+    /// single-file mode removes the previous run's file (#753).
+    opened: std::sync::atomic::AtomicBool,
 }
 
 /// Bookkeeping that mutates as we write.
@@ -136,6 +139,7 @@ impl ParquetSink {
             single_file,
             state: Mutex::new(WriterState::new()),
             outputs: faucet_core::LocalOutputLog::new(),
+            opened: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -212,6 +216,8 @@ impl ParquetSink {
             self.outputs.record_open_probing_with(local.clone(), true);
         }
         let writer = ParquetObjectWriter::new(self.store.clone(), obj_path);
+        self.opened
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let boxed: Box<dyn AsyncFileWriter> = Box::new(writer);
         AsyncArrowWriter::try_new(boxed, schema, Some(self.writer_properties()))
             .map_err(|e| FaucetError::Sink(format!("could not open parquet writer: {e}")))
@@ -576,6 +582,25 @@ impl faucet_core::Sink for ParquetSink {
             tracing::debug!(files = state.files_written, "Parquet sink flushed");
         }
         Ok(())
+    }
+
+    /// A fixed `*.parquet` path must hold exactly this run's output, and an
+    /// empty run has no schema to write a valid file from, so a successful run
+    /// that wrote no record removes the previous run's file (#753). Rollover,
+    /// directory and S3 destinations write a new UUID-named object per file and
+    /// have nothing stale at a fixed name. Only reached after a successful,
+    /// uncancelled run.
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        if !self.single_file || self.opened.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let (obj_path, _) = self.next_object_path()?;
+        match object_store::ObjectStoreExt::delete(&self.store, &obj_path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(FaucetError::Sink(format!(
+                "could not remove the previous run's parquet file: {e}"
+            ))),
+        }
     }
 
     /// Preflight probe for `faucet doctor`.

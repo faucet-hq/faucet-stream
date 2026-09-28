@@ -52,6 +52,28 @@ The first request sends `body` unchanged; each later request adds
 `body[body_cursor_field] = <cursor>`. Pagination stops when the cursor is
 null/absent or repeats.
 
+`body_cursor_field` may be a JSON Pointer for a nested location, so a GraphQL
+API reached through the REST source can page by `variables.after`:
+
+```yaml
+    method: POST
+    body:
+      query: "query($first: Int, $after: String) { orders(first: $first, after: $after) { nodes { id } pageInfo { endCursor } } }"
+      variables: { first: 250 }
+    records_path: $.data.orders.nodes[*]
+    pagination:
+      type: CursorInBody
+      next_token_path: $.data.orders.pageInfo.endCursor
+      body_cursor_field: /variables/after
+```
+
+A pointer must resolve to an existing value or to a new key of an existing
+object (here `variables`); intermediate objects and array elements are never
+created, and a pointer that does not resolve fails the request. The same
+applies to `OffsetInBody`'s `offset_field` / `limit_field`, and to
+`replication_bind` / `window` binds with `into: body` + `path` (see the
+[state cookbook](state.md)).
+
 ## Page number
 
 ```yaml
@@ -86,6 +108,25 @@ pagination:
   limit: 500
   stop_when_short: true                # default
 ```
+
+Report APIs return the whole response as **one** record (headers plus a `rows`
+array, e.g. GA4 `runReport` with `records_path: "$"`). Counting records would
+read every page as short and stop after page 1, so count the rows instead, and
+stop at the reported total:
+
+```yaml
+pagination:
+  type: OffsetInBody
+  offset_field: offset
+  limit_field: limit
+  limit: 10000
+  rows_path: "$.rows"                  # advance by the rows on each page
+  total_path: "$.rowCount"             # stop once offset reaches the total
+```
+
+`rows_path` counts an array's elements, 1 for an object, 0 for null or no match
+(which ends paging). A missing or non-numeric `total_path` falls back to the
+short-page rule.
 
 ## Keyset (record-field cursor)
 

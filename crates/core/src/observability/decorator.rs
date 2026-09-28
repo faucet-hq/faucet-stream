@@ -111,6 +111,10 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         self.inner.set_roundtrip_recorder(recorder);
     }
 
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
+    }
+
     fn state_key(&self) -> Option<String> {
         self.inner.state_key()
     }
@@ -708,6 +712,9 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
 }
 
 #[cfg(test)]
@@ -781,6 +788,7 @@ pub(crate) mod source_tests {
         let inner = RoutedSource;
         let wrapped = InstrumentedSource::new(&inner, labels());
         assert_forwards_multi_table_hooks(&wrapped);
+        wrapped.set_run_clock(chrono::Utc::now());
     }
 
     // Process-global recorder shared across all observability tests in this

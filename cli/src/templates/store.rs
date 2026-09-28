@@ -2304,7 +2304,7 @@ write_mode_aliases:
         register(&s, req_launched(PARAMETERIZED)).await.unwrap();
         let state_dir = dir.path().join("state");
         let overlay_yaml = format!(
-            "kind: deployment\nname: prod-ops\ndescription: prod\nstate: {{ type: file, config: {{ path: \"{}\" }} }}\nstreams:\n  orders: {{ delivery: at_least_once }}\n",
+            "kind: deployment\nname: prod-ops\ndescription: prod\nstate: {{ type: file, config: {{ path: '{}' }} }}\nstreams:\n  orders: {{ delivery: at_least_once }}\n",
             state_dir.display()
         );
         let rec = register(&s, req_launched(&overlay_yaml)).await.unwrap();

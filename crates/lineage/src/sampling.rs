@@ -307,6 +307,9 @@ impl Sink for SamplingSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
     // Native byte-passthrough passthrough (#639). Without forwarding these, the
     // wrapper's trait defaults would report "no native load capability", forcing
     // the pipeline onto the `Value` path whenever sampling is active — the exact
@@ -436,6 +439,10 @@ impl Source for SamplingSource {
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
     ) {
         self.inner.set_roundtrip_recorder(recorder);
+    }
+
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
     }
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         self.inner.apply_start_bookmark(bookmark).await
@@ -716,6 +723,7 @@ mod tests {
         s.begin_overwrite().await.unwrap();
         s.commit_overwrite().await.unwrap();
         s.abort_overwrite().await.unwrap();
+        s.complete_run().await.unwrap();
         assert_eq!(*log.lock().unwrap(), vec!["begin", "commit", "abort"]);
     }
 
@@ -784,6 +792,7 @@ mod tests {
             ),
         ));
         assert!(got.load(std::sync::atomic::Ordering::Relaxed));
+        s.set_run_clock(chrono::Utc::now());
     }
 
     /// An idempotent, upsert-capable sink: the sampler must forward every

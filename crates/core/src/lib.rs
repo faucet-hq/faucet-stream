@@ -173,8 +173,9 @@ pub use profiling::{
     ProfilingSpec, RunProfile, detect_drift,
 };
 pub use replication::{
-    BindFormat, BindTarget, ReplicationBind, ReplicationMethod, format_bookmark, format_instant,
-    json_gt, parse_instant,
+    BindFormat, BindTarget, BindValueType, IncrementalFilter, OnMissingKey, ReplicationBind,
+    ReplicationKey, ReplicationMethod, format_bookmark, format_instant, json_gt, parse_instant,
+    set_body_pointer,
 };
 pub use resilience::{
     BackoffKind, CircuitBreaker, CircuitBreakerConfig, PoisonAction, PoisonPolicy,
@@ -231,14 +232,15 @@ pub use usage::{CostSignal, UsageMeter, UsageSide, UsageSnapshot, estimate_json_
 pub use util::redact_uri_credentials;
 pub use verify::{IntegrityCheck, LengthCheck, VerifyingReader};
 pub use window::{
-    WINDOW_PLACEHOLDER, Window, WindowBind, WindowSpec, enumerate_windows, parse_step,
+    WINDOW_END_PLACEHOLDER, WINDOW_PLACEHOLDER, WINDOW_START_PLACEHOLDER, Window, WindowBind,
+    WindowSpec, enumerate_windows, parse_step,
 };
 pub use write_mode::{
     DeleteMarker, KeyTuple, OverwriteScope, WriteMode, WritePlan, WriteSpec, key_to_doc_id,
     key_to_filter, plan_writes, sql_literal,
 };
 #[cfg(feature = "transform-zip-columns")]
-pub use zip_columns::{CompiledZipColumns, ZipColumnsSpec};
+pub use zip_columns::{ColumnGroupSpec, CompiledZipColumns, ZipColumnsSpec};
 
 // Re-export dependencies that connector authors need, so they only depend on
 // `faucet-core` instead of adding `async-trait` and `serde_json` themselves.

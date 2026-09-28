@@ -19,32 +19,213 @@ pub enum ReplicationMethod {
     Incremental,
 }
 
-/// Filter `records` to only those where `record[key] > start`.
+/// What to do with a record whose replication key is missing or `null` (#747).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMissingKey {
+    /// Keep the record, count it, and warn (default): dropping it would be
+    /// silent data loss.
+    #[default]
+    Keep,
+    /// Drop the record (counted and warned, never silent).
+    Drop,
+    /// Fail the run.
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyForm {
+    TopLevel,
+    DotPath(Vec<String>),
+    Pointer,
+}
+
+/// A compiled replication key: a top-level field name, a dot path
+/// (`fields.updated`, numeric segments index arrays), or an RFC 6901 JSON
+/// Pointer (`/fields/updated`, for field names that contain a dot) (#747).
 ///
-/// Records missing the key are excluded. Strings compare lexicographically
-/// (ISO-8601 dates compare correctly this way); integers compare exactly
-/// (no `f64` precision loss); floats compare as `f64`.
+/// A dot path first tries the whole string as a literal top-level field, so a
+/// flat column literally named `Account.LastModifiedDate` (a CSV header) still
+/// resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationKey {
+    raw: String,
+    form: KeyForm,
+}
+
+impl ReplicationKey {
+    /// Parse a user-facing key (see the type docs for the accepted forms).
+    pub fn parse(raw: &str) -> Result<Self, FaucetError> {
+        if raw.trim().is_empty() {
+            return Err(FaucetError::Config(
+                "replication_key must not be empty".to_owned(),
+            ));
+        }
+        if raw.starts_with('/') {
+            return Ok(Self {
+                raw: raw.to_owned(),
+                form: KeyForm::Pointer,
+            });
+        }
+        if !raw.contains('.') {
+            return Ok(Self::top_level(raw));
+        }
+        let segments: Vec<String> = raw.split('.').map(str::to_owned).collect();
+        if segments.iter().any(String::is_empty) {
+            return Err(FaucetError::Config(format!(
+                "replication_key '{raw}': empty path segment (use the JSON Pointer form \
+                 `/a/b` for field names that contain dots)"
+            )));
+        }
+        Ok(Self {
+            raw: raw.to_owned(),
+            form: KeyForm::DotPath(segments),
+        })
+    }
+
+    /// A literal top-level field name, never interpreted as a path.
+    pub fn top_level(name: &str) -> Self {
+        Self {
+            raw: name.to_owned(),
+            form: KeyForm::TopLevel,
+        }
+    }
+
+    /// The key as configured.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Whether the key is a JSON Pointer (`/a/b`).
+    pub fn is_pointer(&self) -> bool {
+        self.form == KeyForm::Pointer
+    }
+
+    /// Whether the key addresses a nested value (dot path or pointer).
+    pub fn is_nested(&self) -> bool {
+        self.form != KeyForm::TopLevel
+    }
+
+    /// Resolve the key against one record.
+    pub fn resolve<'a>(&self, record: &'a Value) -> Option<&'a Value> {
+        match &self.form {
+            KeyForm::TopLevel => record.get(&self.raw),
+            KeyForm::Pointer => record.pointer(&self.raw),
+            KeyForm::DotPath(segments) => {
+                if let Some(v) = record.get(&self.raw) {
+                    return Some(v);
+                }
+                segments.iter().try_fold(record, |cur, seg| match cur {
+                    Value::Object(m) => m.get(seg),
+                    Value::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get(i)),
+                    _ => None,
+                })
+            }
+        }
+    }
+
+    fn resolve_present<'a>(&self, record: &'a Value) -> Option<&'a Value> {
+        self.resolve(record).filter(|v| !v.is_null())
+    }
+}
+
+/// The result of [`filter_incremental_path`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct IncrementalFilter {
+    /// Records to write.
+    pub records: Vec<Value>,
+    /// Records whose key was missing or `null` (kept or dropped per policy).
+    pub missing: usize,
+}
+
+/// Filter `records` to those where `key > start`, using a compiled key.
 ///
-/// If a record's key value is a *different JSON type* than `start` (e.g. a
-/// numeric key against a string bookmark), the comparison is not meaningful;
-/// rather than silently dropping the record — which is data loss (#78/#27) —
-/// it is **kept** and a warning is logged.
-pub fn filter_incremental(records: Vec<Value>, key: &str, start: &Value) -> Vec<Value> {
-    records
-        .into_iter()
-        .filter(|r| match r.get(key) {
-            None => false,
+/// A record whose key is missing or `null` is handled per `on_missing`
+/// (counted in [`IncrementalFilter::missing`] either way); a record whose key
+/// has a different JSON type than `start` is kept with a warning. Returns
+/// `Err` only for [`OnMissingKey::Fail`].
+pub fn filter_incremental_path(
+    records: Vec<Value>,
+    key: &ReplicationKey,
+    start: &Value,
+    on_missing: OnMissingKey,
+) -> Result<IncrementalFilter, FaucetError> {
+    let mut missing = 0usize;
+    let mut kept = Vec::with_capacity(records.len());
+    for r in records {
+        let keep = match key.resolve_present(&r) {
+            None => {
+                missing += 1;
+                match on_missing {
+                    OnMissingKey::Keep => true,
+                    OnMissingKey::Drop => false,
+                    OnMissingKey::Fail => {
+                        return Err(FaucetError::Source(format!(
+                            "incremental replication: a record lacks replication_key '{}' \
+                             (on_missing_key: fail)",
+                            key.as_str()
+                        )));
+                    }
+                }
+            }
             Some(v) if type_rank(v) != type_rank(start) => {
                 tracing::warn!(
-                    key,
+                    key = key.as_str(),
                     "incremental replication: record key type does not match the bookmark \
                      type; keeping the record to avoid silently dropping data"
                 );
                 true
             }
             Some(v) => json_gt(v, start),
-        })
-        .collect()
+        };
+        if keep {
+            kept.push(r);
+        }
+    }
+    Ok(IncrementalFilter {
+        records: kept,
+        missing,
+    })
+}
+
+/// Filter `records` to only those where `record[key] > start`.
+///
+/// `key` is a literal top-level field. Strings compare lexicographically
+/// (ISO-8601 dates compare correctly this way); integers compare exactly
+/// (no `f64` precision loss); floats compare as `f64`.
+///
+/// Records missing the key (or holding `null`) are **kept** and a warning is
+/// logged (#747): dropping them silently is data loss. Likewise a record whose
+/// key value is a *different JSON type* than `start` is kept (#78/#27).
+pub fn filter_incremental(records: Vec<Value>, key: &str, start: &Value) -> Vec<Value> {
+    let out = filter_incremental_path(
+        records,
+        &ReplicationKey::top_level(key),
+        start,
+        OnMissingKey::Keep,
+    )
+    .unwrap_or_default();
+    if out.missing > 0 {
+        tracing::warn!(
+            key,
+            missing = out.missing,
+            "incremental replication: {} record(s) lacked replication_key '{key}'; kept to \
+             avoid silent data loss",
+            out.missing
+        );
+    }
+    out.records
+}
+
+/// Return the maximum non-null value of `key` across all records, if any.
+pub fn max_replication_value_path<'a>(
+    records: &'a [Value],
+    key: &ReplicationKey,
+) -> Option<&'a Value> {
+    records
+        .iter()
+        .filter_map(|r| key.resolve_present(r))
+        .max_by(|a, b| json_compare(a, b))
 }
 
 /// Return the maximum value of `record[key]` across all records, if any.
@@ -162,7 +343,9 @@ pub enum BindTarget {
     Query,
     /// A request header — e.g. `If-Modified-Since: …`.
     Header,
-    /// A top-level field of the JSON request body (POST-search APIs).
+    /// A field of the JSON request body (POST-search APIs): a top-level field
+    /// named by `name`, or any existing location addressed by a JSON Pointer
+    /// `path` (#748).
     Body,
     /// A `{name}` placeholder in the request path.
     Path,
@@ -194,6 +377,126 @@ pub enum BindFormat {
     Date,
 }
 
+/// The JSON type a body-target bind writes (#748).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BindValueType {
+    /// A JSON string (default).
+    #[default]
+    String,
+    /// A JSON number (e.g. an `epoch_ms` bookmark an API requires unquoted).
+    Number,
+}
+
+impl BindValueType {
+    /// Convert a rendered bind value into the JSON value to write.
+    pub fn to_value(self, rendered: &str) -> Result<Value, FaucetError> {
+        match self {
+            Self::String => Ok(Value::String(rendered.to_owned())),
+            Self::Number => {
+                let n: Option<serde_json::Number> = rendered
+                    .parse::<i64>()
+                    .map(serde_json::Number::from)
+                    .ok()
+                    .or_else(|| rendered.parse::<u64>().ok().map(serde_json::Number::from))
+                    .or_else(|| {
+                        rendered
+                            .parse::<f64>()
+                            .ok()
+                            .and_then(serde_json::Number::from_f64)
+                    });
+                n.map(Value::Number).ok_or_else(|| {
+                    FaucetError::Source(format!(
+                        "bind: rendered value '{rendered}' is not a number (value_type: number)"
+                    ))
+                })
+            }
+        }
+    }
+}
+
+fn unescape_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+/// Write `value` into `body` at the RFC 6901 JSON Pointer `pointer` (#748).
+///
+/// The pointer must address an existing scalar (or `null`) — or a missing
+/// final key whose parent is an existing object. Intermediate objects and
+/// array elements are never created, and an object/array target is refused
+/// (a bind replaces a value; it does not merge).
+pub fn set_body_pointer(body: &mut Value, pointer: &str, value: Value) -> Result<(), FaucetError> {
+    if !pointer.starts_with('/') {
+        return Err(FaucetError::Config(format!(
+            "JSON Pointer '{pointer}' must start with '/'"
+        )));
+    }
+    if let Some(slot) = body.pointer_mut(pointer) {
+        if slot.is_object() || slot.is_array() {
+            return Err(FaucetError::Source(format!(
+                "request body location '{pointer}' holds an object or array; a bind replaces \
+                 a scalar value"
+            )));
+        }
+        *slot = value;
+        return Ok(());
+    }
+    let cut = pointer.rfind('/').unwrap_or(0);
+    let (parent, leaf) = (&pointer[..cut], &pointer[cut + 1..]);
+    let parent_value = if parent.is_empty() {
+        Some(body)
+    } else {
+        body.pointer_mut(parent)
+    };
+    match parent_value {
+        Some(Value::Object(map)) => {
+            map.insert(unescape_pointer_token(leaf), value);
+            Ok(())
+        }
+        _ => Err(FaucetError::Source(format!(
+            "request body has no location '{pointer}' (the pointer must resolve to an \
+             existing value, or to a new key of an existing object)"
+        ))),
+    }
+}
+
+/// Load-time check of a bind's placement: a body bind needs exactly one of
+/// `name` / `path`; every other target needs `name` and refuses `path`.
+pub(crate) fn validate_bind_placement(
+    what: &str,
+    into: BindTarget,
+    name: &str,
+    path: Option<&str>,
+) -> Result<(), FaucetError> {
+    let has_name = !name.trim().is_empty();
+    match (into, path) {
+        (BindTarget::Body, Some(p)) => {
+            if has_name {
+                return Err(FaucetError::Config(format!(
+                    "{what}: set either `name` (top-level body field) or `path` (JSON Pointer), \
+                     not both"
+                )));
+            }
+            if !p.starts_with('/') || p.len() < 2 {
+                return Err(FaucetError::Config(format!(
+                    "{what}: `path` must be a JSON Pointer such as `/filters/0/value`, got '{p}'"
+                )));
+            }
+            Ok(())
+        }
+        (_, Some(_)) => Err(FaucetError::Config(format!(
+            "{what}: `path` applies only to `into: body`"
+        ))),
+        (BindTarget::Body, None) if !has_name => Err(FaucetError::Config(format!(
+            "{what}: `into: body` needs `name` (top-level field) or `path` (JSON Pointer)"
+        ))),
+        (_, None) if !has_name => Err(FaucetError::Config(format!(
+            "{what}: `name` must not be empty"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Declarative binding of the stored bookmark into the **outgoing request** —
 /// "server-side incremental push-down" (#513).
 ///
@@ -208,8 +511,19 @@ pub struct ReplicationBind {
     /// Where to place the rendered value.
     #[serde(default)]
     pub into: BindTarget,
-    /// The parameter / header / body-field / path-placeholder name.
+    /// The parameter / header / body-field / path-placeholder name. Optional
+    /// only for `into: body` with a `path`.
+    #[serde(default)]
     pub name: String,
+    /// `into: body` only: an RFC 6901 JSON Pointer into the configured `body`
+    /// (`/filterGroups/0/filters/0/value`) instead of a top-level `name` (#748).
+    /// It must resolve to an existing scalar or to a new key of an existing
+    /// object; array elements are never created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// JSON type written by a body bind: `string` (default) or `number`.
+    #[serde(default)]
+    pub value_type: BindValueType,
     /// Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by
     /// the formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.
     /// `"gte|${bookmark}"` (Greenhouse) or `"[${bookmark} TO *]"` (Lucene).
@@ -227,11 +541,12 @@ pub struct ReplicationBind {
 impl ReplicationBind {
     /// Validate the binding at config-load time.
     pub fn validate(&self) -> Result<(), FaucetError> {
-        if self.name.trim().is_empty() {
-            return Err(FaucetError::Config(
-                "replication bind: `name` must not be empty".to_owned(),
-            ));
-        }
+        validate_bind_placement(
+            "replication bind",
+            self.into,
+            &self.name,
+            self.path.as_deref(),
+        )?;
         if !self.template.contains(BIND_PLACEHOLDER) {
             return Err(FaucetError::Config(format!(
                 "replication bind: `template` must contain the `{BIND_PLACEHOLDER}` placeholder"
@@ -359,15 +674,106 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_incremental_missing_key_excluded() {
+    fn test_filter_incremental_missing_key_kept() {
+        // #747: a record without the key used to be dropped silently.
         let records = vec![
             json!({"id": 1}),
             json!({"id": 2, "updated_at": "2024-12-01"}),
+            json!({"id": 3, "updated_at": null}),
         ];
         let start = json!("2024-01-01");
         let filtered = filter_incremental(records, "updated_at", &start);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0]["id"], 2);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn replication_key_parse_forms() {
+        assert!(!ReplicationKey::parse("updated").unwrap().is_nested());
+        let dot = ReplicationKey::parse("fields.updated").unwrap();
+        assert!(dot.is_nested() && !dot.is_pointer());
+        assert_eq!(dot.as_str(), "fields.updated");
+        let ptr = ReplicationKey::parse("/a.b/c").unwrap();
+        assert!(ptr.is_pointer() && ptr.is_nested());
+        assert!(ReplicationKey::parse(" ").is_err());
+        assert!(ReplicationKey::parse("a..b").is_err());
+        assert!(ReplicationKey::parse(".a").is_err());
+    }
+
+    #[test]
+    fn replication_key_resolves_nested_array_and_pointer() {
+        let r = json!({
+            "fields": {"updated": "2024-06-01"},
+            "items": [{"date": 1}, {"date": 2}],
+            "a.b": {"c": 7},
+            "x": 5
+        });
+        let k = |s: &str| ReplicationKey::parse(s).unwrap();
+        assert_eq!(k("fields.updated").resolve(&r), Some(&json!("2024-06-01")));
+        assert_eq!(k("items.1.date").resolve(&r), Some(&json!(2)));
+        assert_eq!(k("items.x.date").resolve(&r), None);
+        assert_eq!(k("items.9.date").resolve(&r), None);
+        assert_eq!(k("x.y").resolve(&r), None);
+        assert_eq!(k("/a.b/c").resolve(&r), Some(&json!(7)));
+        assert_eq!(k("x").resolve(&r), Some(&json!(5)));
+        let flat = json!({"Account.LastModifiedDate": "2024"});
+        assert_eq!(
+            k("Account.LastModifiedDate").resolve(&flat),
+            Some(&json!("2024"))
+        );
+        assert_eq!(
+            ReplicationKey::top_level("a.b").resolve(&r),
+            Some(&json!({"c": 7}))
+        );
+    }
+
+    #[test]
+    fn filter_incremental_path_nested_and_policies() {
+        let records = || {
+            vec![
+                json!({"id": 1, "fields": {"updated": "2024-01-01"}}),
+                json!({"id": 2, "fields": {"updated": "2024-12-01"}}),
+                json!({"id": 3, "fields": {}}),
+                json!({"id": 4, "fields": {"updated": 5}}),
+            ]
+        };
+        let key = ReplicationKey::parse("fields.updated").unwrap();
+        let start = json!("2024-06-01");
+        let keep = filter_incremental_path(records(), &key, &start, OnMissingKey::Keep).unwrap();
+        let ids: Vec<i64> = keep
+            .records
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4]);
+        assert_eq!(keep.missing, 1);
+        let drop = filter_incremental_path(records(), &key, &start, OnMissingKey::Drop).unwrap();
+        assert_eq!(drop.records.len(), 2);
+        assert_eq!(drop.missing, 1);
+        let err = filter_incremental_path(records(), &key, &start, OnMissingKey::Fail).unwrap_err();
+        assert!(err.to_string().contains("fields.updated"), "{err}");
+    }
+
+    #[test]
+    fn max_replication_value_path_skips_missing_and_null() {
+        let key = ReplicationKey::parse("fields.updated").unwrap();
+        let records = vec![
+            json!({"fields": {"updated": "2024-01-01"}}),
+            json!({"fields": {"updated": null}}),
+            json!({"fields": {"updated": "2024-12-01"}}),
+            json!({}),
+        ];
+        assert_eq!(
+            max_replication_value_path(&records, &key),
+            Some(&json!("2024-12-01"))
+        );
+        assert!(max_replication_value_path(&records[1..2], &key).is_none());
+    }
+
+    #[test]
+    fn on_missing_key_serde() {
+        assert_eq!(OnMissingKey::default(), OnMissingKey::Keep);
+        let v: OnMissingKey = serde_json::from_value(json!("fail")).unwrap();
+        assert_eq!(v, OnMissingKey::Fail);
     }
 
     #[test]
@@ -472,6 +878,8 @@ mod tests {
             template: template.to_owned(),
             format,
             advance_from: None,
+            path: None,
+            value_type: BindValueType::String,
         }
     }
 
@@ -575,6 +983,75 @@ mod tests {
 
         let ok = bind(BindTarget::Query, "gte|${bookmark}", BindFormat::Raw);
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn bind_placement_validation() {
+        let mut b = bind(BindTarget::Body, "${bookmark}", BindFormat::Raw);
+        assert!(b.validate().is_ok());
+        b.path = Some("/a/0/b".into());
+        assert!(b.validate().unwrap_err().to_string().contains("not both"));
+        b.name.clear();
+        assert!(b.validate().is_ok());
+        b.path = Some("a".into());
+        assert!(b.validate().is_err());
+        b.path = Some("/".into());
+        assert!(b.validate().is_err());
+        b.path = None;
+        assert!(
+            b.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("needs `name`")
+        );
+        let mut q = bind(BindTarget::Query, "${bookmark}", BindFormat::Raw);
+        q.path = Some("/a".into());
+        assert!(
+            q.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("only to `into: body`")
+        );
+        let parsed: ReplicationBind = serde_json::from_value(json!({
+            "into": "body", "path": "/f/0/v", "value_type": "number"
+        }))
+        .unwrap();
+        assert!(parsed.validate().is_ok());
+        assert_eq!(parsed.value_type, BindValueType::Number);
+    }
+
+    #[test]
+    fn value_type_conversion() {
+        assert_eq!(BindValueType::String.to_value("5").unwrap(), json!("5"));
+        assert_eq!(BindValueType::Number.to_value("5").unwrap(), json!(5));
+        assert_eq!(
+            BindValueType::Number
+                .to_value("18446744073709551615")
+                .unwrap(),
+            json!(18_446_744_073_709_551_615_u64)
+        );
+        assert_eq!(BindValueType::Number.to_value("1.5").unwrap(), json!(1.5));
+        assert!(BindValueType::Number.to_value("x").is_err());
+    }
+
+    #[test]
+    fn set_body_pointer_rules() {
+        let mut body = json!({"filterGroups": [{"filters": [{"value": null}]}], "v": {}, "a/b": 1});
+        set_body_pointer(&mut body, "/filterGroups/0/filters/0/value", json!("x")).unwrap();
+        assert_eq!(body["filterGroups"][0]["filters"][0]["value"], json!("x"));
+        set_body_pointer(&mut body, "/v/after", json!("c")).unwrap();
+        assert_eq!(body["v"]["after"], json!("c"));
+        set_body_pointer(&mut body, "/top", json!(1)).unwrap();
+        assert_eq!(body["top"], json!(1));
+        set_body_pointer(&mut body, "/a~1b", json!(2)).unwrap();
+        assert_eq!(body["a/b"], json!(2));
+        set_body_pointer(&mut body, "/v/x~1y~0z", json!(3)).unwrap();
+        assert_eq!(body["v"]["x/y~z"], json!(3));
+        assert!(set_body_pointer(&mut body, "/filterGroups/1/filters", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "/missing/leaf", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "/v", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "/filterGroups/0/filters/5", json!(1)).is_err());
+        assert!(set_body_pointer(&mut body, "nope", json!(1)).is_err());
     }
 
     #[test]

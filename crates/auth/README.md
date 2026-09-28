@@ -40,6 +40,7 @@ The `faucet-cli` binary always links `faucet-auth` to power the top-level `auth:
 | `oauth2` | [`OAuth2ClientCredentialsProvider`] | OAuth2 `client_credentials` grant. Fetches a token from the token endpoint, caches it, refreshes single-flight. |
 | `oauth2_refresh` | [`OAuth2RefreshProvider`] | OAuth2 `refresh_token` grant with refresh-token **rotation capture** (a single active access token + a rotating refresh token, shared safely). |
 | `token_endpoint` | [`TokenEndpointProvider`] | Fetches a token from any HTTP endpoint and extracts it from the JSON response via JSONPath. The escape hatch for non-standard token APIs. |
+| `google_service_account` | `GoogleServiceAccountProvider` | Google service-account key → RS256 JWT-bearer assertion (RFC 7523) → cached bearer token, single-flight refresh. Requires the `google-sa` crate feature. |
 | `oauth1` | `OAuth1Provider` | OAuth1 one-legged **request signing** (HMAC-SHA256) — signs each request's method + URL + query per RFC 5849 (no token to fetch). For NetSuite Token-Based Auth and similar. Requires the `oauth1` crate feature. |
 
 `build_provider(&Value)` is the entry point: it reads a `{ type, config }` spec and returns a `SharedAuthProvider` (`Arc<dyn AuthProvider>`).
@@ -229,6 +230,47 @@ auth:
         template: "B1SESSION={token}; CompanyDB=${param.company_db}"
 ```
 
+### `google_service_account` (RFC 7523 JWT-bearer)
+
+Authenticates as a Google service account — the machine credential for the
+`googleapis.com` family (GA4 Data API, Google Ads, Search Console, Sheets,
+Drive, …) when no human-held refresh token is available. Each refresh signs an
+RS256 assertion (`kid` = the key's `private_key_id`; claims `iss`, `scope`,
+`aud` = token URI, `iat` back-dated 30 s for clock skew, `exp` = `iat` + 1 h,
+and `sub` when set) and exchanges it with
+`grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`. The access token is
+cached and refreshed single-flight. Requires the `google-sa` feature (on in the
+CLI default build).
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `key_json` | one of | The key file's contents, as a string (e.g. `${secret:GOOGLE_SA_KEY}`) or an inline object. |
+| `key_file` | one of | Path to the key file. Set exactly one of `key_json` / `key_file`. |
+| `scopes` | yes | OAuth scopes, e.g. `["https://www.googleapis.com/auth/analytics.readonly"]`. |
+| `subject` | no | User to impersonate (domain-wide delegation). |
+| `token_uri` | no | Overrides the key's `token_uri` (default `https://oauth2.googleapis.com/token`). |
+| `expiry_ratio` | no | Fraction of `expires_in` before a proactive refresh (default `0.9`). |
+
+```yaml
+auth:
+  google:
+    type: google_service_account
+    config:
+      key_json: "${secret:GOOGLE_SA_KEY}"
+      scopes: ["https://www.googleapis.com/auth/analytics.readonly"]
+      subject: reports@example.com   # optional
+```
+
+A malformed key (not a service-account JSON, or an unparseable PEM) fails at
+config load. A rejected grant surfaces as `Auth: google_service_account token
+request failed (HTTP 400): {"error":"invalid_grant",…}` naming the service
+account, subject and scopes — which `faucet serve` tenants treat as a revoked
+connection. The private key never appears in `Debug` output or errors, and the
+CLI registers it for log redaction even when written inline.
+
+This crate ships the Google preset only; a generic `jwt_bearer` provider for
+other IdPs is not exposed.
+
 ### `oauth1` (HMAC-SHA256 request signing)
 
 Unlike the token providers, OAuth1 has **no token to fetch** — it signs every
@@ -360,7 +402,12 @@ The internal HTTP client has a bounded 30 s request timeout so a hung or unreach
 
 ## Feature flags
 
-This crate has no optional Cargo features of its own. It is pulled in by:
+| Feature | Enables |
+|---------|---------|
+| `google-sa` | The `google_service_account` provider (pulls `jsonwebtoken`). On in the `faucet-cli` default build; `faucet-stream` forwards it as `google-sa`. |
+| `oauth1` | The `oauth1` request-signing provider. |
+
+It is pulled in by:
 
 - the **`faucet-cli`** binary (always — for the top-level `auth:` catalog);
 - the **`faucet-stream`** umbrella crate's `auth` feature, for library callers who want `build_provider` available alongside the connectors.

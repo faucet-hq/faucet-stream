@@ -1150,7 +1150,7 @@ pipeline:
   sources:
     api: { type: rest, config: { base_url: https://x } }
   sinks:
-    wh: { type: jsonl, config: { path: ./o } }
+    wh: { type: jsonl, config: { path: ./o, append: true } }
 matrix:
   - id: users
     source: { ref: api, status: active }

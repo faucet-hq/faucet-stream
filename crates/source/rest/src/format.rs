@@ -37,7 +37,17 @@ impl Default for CsvDialect {
 
 /// Parse CSV bytes with an explicit dialect (#670 L29).
 pub async fn parse_csv_with(bytes: &[u8], dialect: CsvDialect) -> Result<Vec<Value>, FaucetError> {
-    parse_csv_inner(bytes, dialect).await
+    parse_csv_inner(bytes, dialect, &[]).await
+}
+
+/// [`parse_csv_with`], mapping any field equal to one of `null_values` to JSON
+/// `null` (`csv_null_values`, #754). Headers are never mapped.
+pub async fn parse_csv_with_nulls(
+    bytes: &[u8],
+    dialect: CsvDialect,
+    null_values: &[String],
+) -> Result<Vec<Value>, FaucetError> {
+    parse_csv_inner(bytes, dialect, null_values).await
 }
 
 pub async fn parse_csv(
@@ -52,11 +62,16 @@ pub async fn parse_csv(
             has_headers,
             ..Default::default()
         },
+        &[],
     )
     .await
 }
 
-async fn parse_csv_inner(bytes: &[u8], dialect: CsvDialect) -> Result<Vec<Value>, FaucetError> {
+async fn parse_csv_inner(
+    bytes: &[u8],
+    dialect: CsvDialect,
+    nulls: &[String],
+) -> Result<Vec<Value>, FaucetError> {
     let CsvDialect {
         delimiter,
         has_headers,
@@ -81,6 +96,7 @@ async fn parse_csv_inner(bytes: &[u8], dialect: CsvDialect) -> Result<Vec<Value>
         out.push(Value::Object(csv_record_to_object(
             &rec,
             headers.as_deref(),
+            nulls,
         )));
     }
     Ok(out)
@@ -93,23 +109,34 @@ async fn parse_csv_inner(bytes: &[u8], dialect: CsvDialect) -> Result<Vec<Value>
 fn csv_record_to_object(
     rec: &csv_async::StringRecord,
     headers: Option<&[String]>,
+    nulls: &[String],
 ) -> Map<String, Value> {
     let mut obj = Map::new();
     for (i, field) in rec.iter().enumerate() {
         let key = headers
             .and_then(|h| h.get(i).cloned())
             .unwrap_or_else(|| format!("column_{i}"));
-        obj.insert(key, Value::String(field.to_string()));
+        let value = if is_null_field(field, nulls) {
+            Value::Null
+        } else {
+            Value::String(field.to_string())
+        };
+        obj.insert(key, value);
     }
     obj
+}
+
+fn is_null_field(field: &str, nulls: &[String]) -> bool {
+    nulls.iter().any(|n| n == field)
 }
 
 /// [`csv_record_to_object`] serialized as one NDJSON line (no trailing newline).
 fn csv_record_to_ndjson_line(
     rec: &csv_async::StringRecord,
     headers: Option<&[String]>,
+    nulls: &[String],
 ) -> Result<String, FaucetError> {
-    serde_json::to_string(&Value::Object(csv_record_to_object(rec, headers)))
+    serde_json::to_string(&Value::Object(csv_record_to_object(rec, headers, nulls)))
         .map_err(|e| FaucetError::Source(format!("rest: CSV→NDJSON encode error: {e}")))
 }
 
@@ -128,6 +155,16 @@ pub async fn csv_to_ndjson(
     delimiter: u8,
     has_headers: bool,
 ) -> Result<(Vec<u8>, u64), FaucetError> {
+    csv_to_ndjson_with_nulls(bytes, delimiter, has_headers, &[]).await
+}
+
+/// [`csv_to_ndjson`] with `csv_null_values` mapping (#754).
+pub async fn csv_to_ndjson_with_nulls(
+    bytes: &[u8],
+    delimiter: u8,
+    has_headers: bool,
+    null_values: &[String],
+) -> Result<(Vec<u8>, u64), FaucetError> {
     use futures::StreamExt as _;
     let mut rdr = csv_async::AsyncReaderBuilder::new()
         .has_headers(false)
@@ -144,7 +181,7 @@ pub async fn csv_to_ndjson(
             headers = Some(rec.iter().map(str::to_string).collect());
             continue;
         }
-        let line = csv_record_to_ndjson_line(&rec, headers.as_deref())?;
+        let line = csv_record_to_ndjson_line(&rec, headers.as_deref(), null_values)?;
         out.extend_from_slice(line.as_bytes());
         out.push(b'\n');
         count += 1;
@@ -170,6 +207,19 @@ pub fn csv_reader_to_ndjson_stream<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    csv_reader_to_ndjson_stream_with_nulls(reader, delimiter, has_headers, Vec::new())
+}
+
+/// [`csv_reader_to_ndjson_stream`] with `csv_null_values` mapping (#754).
+pub fn csv_reader_to_ndjson_stream_with_nulls<R>(
+    reader: R,
+    delimiter: u8,
+    has_headers: bool,
+    null_values: Vec<String>,
+) -> impl futures::Stream<Item = Result<Vec<u8>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     use futures::StreamExt as _;
     async_stream::try_stream! {
         let mut rdr = csv_async::AsyncReaderBuilder::new()
@@ -187,7 +237,7 @@ where
                 headers = Some(rec.iter().map(str::to_string).collect());
                 continue;
             }
-            let line = csv_record_to_ndjson_line(&rec, headers.as_deref())?;
+            let line = csv_record_to_ndjson_line(&rec, headers.as_deref(), &null_values)?;
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
             if buf.len() >= NDJSON_STREAM_CHUNK {
@@ -240,6 +290,19 @@ pub fn csv_reader_to_value_pages_with<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    csv_reader_to_value_pages_with_nulls(reader, dialect, page_size, Vec::new())
+}
+
+/// [`csv_reader_to_value_pages_with`] with `csv_null_values` mapping (#754).
+pub fn csv_reader_to_value_pages_with_nulls<R>(
+    reader: R,
+    dialect: CsvDialect,
+    page_size: usize,
+    null_values: Vec<String>,
+) -> impl futures::Stream<Item = Result<Vec<Value>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     let CsvDialect {
         delimiter,
         has_headers,
@@ -263,7 +326,11 @@ where
                 headers = Some(rec.iter().map(str::to_string).collect());
                 continue;
             }
-            page.push(Value::Object(csv_record_to_object(&rec, headers.as_deref())));
+            page.push(Value::Object(csv_record_to_object(
+                &rec,
+                headers.as_deref(),
+                &null_values,
+            )));
             if page_size != 0 && page.len() >= page_size {
                 yield std::mem::replace(&mut page, Vec::with_capacity(page_size));
             }
@@ -432,6 +499,20 @@ pub fn csv_reader_to_record_batches_with<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    csv_reader_to_record_batches_with_nulls(reader, dialect, batch_size, Vec::new())
+}
+
+/// [`csv_reader_to_record_batches_with`] with `csv_null_values` mapping (#754).
+#[cfg(feature = "arrow")]
+pub fn csv_reader_to_record_batches_with_nulls<R>(
+    reader: R,
+    dialect: CsvDialect,
+    batch_size: usize,
+    null_values: Vec<String>,
+) -> impl futures::Stream<Item = Result<arrow::record_batch::RecordBatch, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     let CsvDialect {
         delimiter,
         has_headers,
@@ -480,7 +561,11 @@ where
             }
             for (i, col) in cols.iter_mut().enumerate() {
                 // A field the row does not have is null, never a silent shift.
-                col.push(rec.get(i).map(str::to_string));
+                col.push(
+                    rec.get(i)
+                        .filter(|f| !is_null_field(f, &null_values))
+                        .map(str::to_string),
+                );
             }
             rows += 1;
             if batch_size != 0 && rows >= batch_size {
@@ -966,6 +1051,91 @@ mod tests {
             let via_default = parse_csv_with(csv, CsvDialect::default()).await.unwrap();
             let via_legacy = parse_csv(csv, b',', true).await.unwrap();
             assert_eq!(via_default, via_legacy);
+        }
+    }
+
+    mod null_values {
+        use super::*;
+        use futures::StreamExt as _;
+        use serde_json::json;
+
+        const BULK: &[u8] = b"Id,CloseDate,Amount\n001,,NULL\n002,2024-06-01,5\n";
+
+        fn nulls() -> Vec<String> {
+            vec![String::new(), "NULL".into()]
+        }
+
+        #[tokio::test]
+        async fn every_path_maps_listed_values_to_null_identically() {
+            let value = parse_csv_with_nulls(BULK, CsvDialect::default(), &nulls())
+                .await
+                .unwrap();
+            assert_eq!(
+                value[0],
+                json!({"Id": "001", "CloseDate": null, "Amount": null})
+            );
+            assert_eq!(value[1]["CloseDate"], json!("2024-06-01"));
+
+            let (ndjson, n) = csv_to_ndjson_with_nulls(BULK, b',', true, &nulls())
+                .await
+                .unwrap();
+            assert_eq!(n, 2);
+            let mut streamed = Vec::new();
+            let mut s = Box::pin(csv_reader_to_ndjson_stream_with_nulls(
+                BULK,
+                b',',
+                true,
+                nulls(),
+            ));
+            while let Some(chunk) = s.next().await {
+                streamed.extend(chunk.unwrap());
+            }
+            assert_eq!(ndjson, streamed);
+            let from_ndjson: Vec<Value> = ndjson
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_slice(l).unwrap())
+                .collect();
+            assert_eq!(from_ndjson, value);
+
+            let mut pages = Box::pin(csv_reader_to_value_pages_with_nulls(
+                BULK,
+                CsvDialect::default(),
+                1,
+                nulls(),
+            ));
+            let mut paged = Vec::new();
+            while let Some(p) = pages.next().await {
+                paged.extend(p.unwrap());
+            }
+            assert_eq!(paged, value);
+        }
+
+        #[tokio::test]
+        async fn headers_are_never_mapped_and_the_default_is_unchanged() {
+            let csv = b"NULL,b\nNULL,\n";
+            let out = parse_csv_with_nulls(csv, CsvDialect::default(), &["NULL".into()])
+                .await
+                .unwrap();
+            assert_eq!(out[0], json!({"NULL": null, "b": ""}));
+            let legacy = parse_csv(csv, b',', true).await.unwrap();
+            assert_eq!(legacy[0], json!({"NULL": "NULL", "b": ""}));
+        }
+
+        #[cfg(feature = "arrow")]
+        #[tokio::test]
+        async fn record_batches_carry_nulls() {
+            use arrow::array::Array as _;
+            let mut s = Box::pin(csv_reader_to_record_batches_with_nulls(
+                BULK,
+                CsvDialect::default(),
+                0,
+                nulls(),
+            ));
+            let batch = s.next().await.unwrap().unwrap();
+            assert!(batch.column(1).is_null(0));
+            assert!(batch.column(2).is_null(0));
+            assert!(!batch.column(1).is_null(1));
         }
     }
 }

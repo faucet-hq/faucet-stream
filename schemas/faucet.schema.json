@@ -4556,7 +4556,7 @@
           }
         },
         {
-          "description": "POST-search pagination: the next-page cursor is read from the response\nbody via `next_token_path` and written **into the request JSON body** at\n`body_cursor_field` for the next request (rather than a query param).\n\nThe first request uses `config.body` unchanged; each subsequent request\nsets `body[body_cursor_field] = <extracted cursor>`. Pagination stops when\n`next_token_path` is null/absent, and a repeated cursor trips the same\nloop guard as [`PaginationStyle::Cursor`]. Used by e.g. HubSpot CRM\n`POST /crm/v3/objects/{obj}/search` (`$.paging.next.after` → `after`).",
+          "description": "POST-search pagination: the next-page cursor is read from the response\nbody via `next_token_path` and written **into the request JSON body** at\n`body_cursor_field` for the next request (rather than a query param).\n\nThe first request uses `config.body` unchanged; each subsequent request\nsets `body[body_cursor_field] = <extracted cursor>`. Pagination stops when\n`next_token_path` is null/absent, and a repeated cursor trips the same\nloop guard as [`PaginationStyle::Cursor`]. Used by e.g. HubSpot CRM\n`POST /crm/v3/objects/{obj}/search` (`$.paging.next.after` → `after`).\n\n`body_cursor_field` may also be an RFC 6901 JSON Pointer\n(`/variables/after`) for a nested location — e.g. a GraphQL request\nsent through the REST source. The pointer must resolve to an existing\nvalue, or to a new key of an existing object (#751).",
           "type": "object",
           "properties": {
             "next_token_path": {
@@ -4658,7 +4658,7 @@
           }
         },
         {
-          "description": "Offset/limit pagination that writes the offset and limit into the JSON\n**request body** (POST-query APIs), rather than the query string\n([`Offset`](Self::Offset)) or a cursor token\n([`CursorInBody`](Self::CursorInBody)). Each request sends\n`body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the\noffset advances by the page's record count. With `stop_when_short`\n(default `true`) a page shorter than `limit` ends pagination; a zero-record\npage always ends it, and a repeated identical page trips a loop guard.",
+          "description": "Offset/limit pagination that writes the offset and limit into the JSON\n**request body** (POST-query APIs), rather than the query string\n([`Offset`](Self::Offset)) or a cursor token\n([`CursorInBody`](Self::CursorInBody)). Each request sends\n`body[offset_field] = <offset>` and `body[limit_field] = <limit>`; the\noffset advances by the page's record count. With `stop_when_short`\n(default `true`) a page shorter than `limit` ends pagination; a zero-record\npage always ends it, and a repeated identical page trips a loop guard.\nEither field may be a JSON Pointer (`/page/offset`) for a nested\nlocation, with the same rules as `CursorInBody.body_cursor_field`.",
           "type": "object",
           "properties": {
             "offset_field": {
@@ -4681,6 +4681,20 @@
                 "string"
               ],
               "default": true
+            },
+            "rows_path": {
+              "description": "JSONPath whose matches are counted to advance the offset and detect a\nshort page, instead of the extracted record count — for report APIs\nwhose whole response is one record (`$.rows`). An array counts its\nelements, an object 1, null or no match 0 (which ends pagination).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "total_path": {
+              "description": "JSONPath to the total row count; pagination stops once the offset\nreaches it. A missing or non-numeric total falls back to the\nshort-page rule.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "type": "string",
@@ -4861,8 +4875,9 @@
           "default": "query"
         },
         "name": {
-          "description": "The parameter / header / body-field / path-placeholder name.",
-          "type": "string"
+          "description": "The parameter / header / body-field / path-placeholder name. Optional\nonly for `into: body` with a `path`.",
+          "type": "string",
+          "default": ""
         },
         "template": {
           "description": "Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by\nthe formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.\n`\"gte|${bookmark}\"` (Greenhouse) or `\"[${bookmark} TO *]\"` (Lucene).",
@@ -4880,6 +4895,18 @@
             "string",
             "null"
           ]
+        },
+        "path": {
+          "description": "`into: body` only: an RFC 6901 JSON Pointer into the configured `body`\n(`/filterGroups/0/filters/0/value`) instead of a top-level `name` (#748).\nIt must resolve to an existing scalar or to a new key of an existing\nobject; array elements are never created.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value_type": {
+          "description": "JSON type written by a body bind: `string` (default) or `number`.",
+          "$ref": "#/$defs/source_rest__BindValueType",
+          "default": "string"
         }
       },
       "additionalProperties": true
@@ -4898,7 +4925,7 @@
           "const": "header"
         },
         {
-          "description": "A top-level field of the JSON request body (POST-search APIs).",
+          "description": "A field of the JSON request body (POST-search APIs): a top-level field\nnamed by `name`, or any existing location addressed by a JSON Pointer\n`path` (#748).",
           "type": "string",
           "const": "body"
         },
@@ -5577,7 +5604,7 @@
           "$ref": "#/$defs/source_rest__WindowBind"
         },
         "upper": {
-          "description": "Upper-bound bind, rendered with the window **end**.",
+          "description": "Upper-bound bind, rendered with the window **end**. Optional: omit it when\n`lower.template` renders both bounds through `${window.end}`; only the\n`lower` bind is then applied.",
           "$ref": "#/$defs/source_rest__WindowBind"
         },
         "granularity": {
@@ -5617,11 +5644,24 @@
           "default": "query"
         },
         "name": {
-          "description": "The parameter / header / body-field / path-placeholder name.",
-          "type": "string"
+          "description": "The parameter / header / body-field / path-placeholder name. Optional\nonly for `into: body` with a `path`.",
+          "type": "string",
+          "default": ""
+        },
+        "path": {
+          "description": "`into: body` only: an RFC 6901 JSON Pointer into the configured `body`\n(`/dateRanges/0/startDate`) instead of a top-level `name` (#748).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value_type": {
+          "description": "JSON type written by a body bind: `string` (default) or `number`.",
+          "$ref": "#/$defs/source_rest__BindValueType",
+          "default": "string"
         },
         "template": {
-          "description": "Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the\nformatted boundary. Defaults to the bare `${window}`; set e.g.\n`\"gte|${window}\"` or `\"[${window} TO *]\"`.",
+          "description": "Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the\nformatted boundary. Defaults to the bare `${window}`; set e.g.\n`\"gte|${window}\"` or `\"[${window} TO *]\"`. `${window.start}` and\n`${window.end}` render the window's start and (granularity-adjusted) end\nin any bind, so one bind can carry both bounds\n(`\"segments.date BETWEEN '${window.start}' AND '${window.end}'\"`). The\nrendered value is not escaped for any query language.",
           "type": "string",
           "default": "${window}"
         },
@@ -14217,6 +14257,14 @@
                       },
                       "default": []
                     },
+                    "retry_on_response": {
+                      "description": "Non-2xx responses to treat as throttling and retry with backoff, for\nAPIs that signal a rate limit with a 4xx other than 429 plus an error\ncode in the body (e.g. HTTP 400 with `error.code` 17 / 80004). A\nmatching response counts as a rate-limit response\n(`faucet_source_throttled_total`, `faucet_source_retries_total{class=\"rate_limited\"}`)\nand is retried up to `max_retries` times in a row before the original\nerror is surfaced. Checked before `tolerated_http_errors`. Applies to\ndata pages, `async_job` requests and discovery requests.",
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/source_rest__RetryMatcher"
+                      },
+                      "default": []
+                    },
                     "replication_method": {
                       "description": "`full_table` (default) re-reads everything each run; `incremental`\nfilters on [`replication_key`](Self::replication_key) and emits a\nbookmark so the next run resumes.",
                       "$ref": "#/$defs/source_rest__ReplicationMethod",
@@ -14225,12 +14273,17 @@
                       }
                     },
                     "replication_key": {
-                      "description": "Field name (not a JSONPath) used for incremental replication bookmarking.",
+                      "description": "Field used for incremental replication bookmarking: a top-level field\nname (`updated_at`), a dot path into nested objects (`fields.updated`;\nnumeric segments index arrays, and a literal top-level field of that\nexact name wins), or a JSON Pointer (`/fields/updated`) for field names\nthat contain dots. Not a JSONPath: it must resolve to one value.",
                       "type": [
                         "string",
                         "null"
                       ],
                       "default": null
+                    },
+                    "on_missing_key": {
+                      "description": "What to do with a record whose `replication_key` is missing or `null`\nonce a start bookmark exists: `keep` (default — kept, counted in\n`faucet_source_replication_key_missing_total`, warned once per run),\n`drop` (counted and warned), or `fail` the run.",
+                      "$ref": "#/$defs/source_rest__OnMissingKey",
+                      "default": "keep"
                     },
                     "start_replication_value": {
                       "description": "Bookmark value: records where `record[replication_key] <= start_replication_value`\nare filtered out when `replication_method` is `Incremental`.",
@@ -14340,6 +14393,14 @@
                       "minimum": 0,
                       "maximum": 255,
                       "default": 34
+                    },
+                    "csv_null_values": {
+                      "description": "CSV fields equal to any of these strings decode as JSON `null` instead\nof a string (default: none). Salesforce Bulk API 2.0 results write a\nnull as an empty field, so its templates set `[\"\"]`; other APIs list\nsentinels such as `\"NULL\"` or `\"#N/A\"`. Headers are never mapped, and a\nquoted empty field (`\"\"`) is mapped like an unquoted one — the CSV\nreader does not report quoting per field. `response_format: csv` only.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "default": []
                     },
                     "excel_sheet": {
                       "description": "Excel worksheet to read: a sheet name, or a 0-based index as a string.\nWhen omitted, the first worksheet is used. `response_format: excel` only.",
@@ -14506,7 +14567,8 @@
                       "type": "string"
                     },
                     "variables": {
-                      "description": "Variables to pass with the query."
+                      "description": "Variables to pass with the query. Defaults to an empty object.",
+                      "default": {}
                     },
                     "auth": {
                       "description": "Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`\npointer to a shared provider in the CLI's top-level `auth:` catalog.",
@@ -14561,6 +14623,46 @@
                         }
                       ],
                       "default": null
+                    },
+                    "replication_method": {
+                      "description": "`full_table` (default) re-reads everything each run; `incremental`\nfilters on [`replication_key`](Self::replication_key) and emits a\nbookmark on the final page so the next run resumes (#751).",
+                      "$ref": "#/$defs/source_graphql__ReplicationMethod",
+                      "default": {
+                        "type": "FullTable"
+                      }
+                    },
+                    "replication_key": {
+                      "description": "Field used for incremental replication bookmarking: a top-level field\n(`updatedAt`), a dot path into nested objects (`node.updatedAt`), or a\nJSON Pointer (`/node/updatedAt`). Must resolve to one value per record.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "on_missing_key": {
+                      "description": "What to do with a record whose `replication_key` is missing or `null`\nonce a start bookmark exists: `keep` (default), `drop`, or `fail`.",
+                      "$ref": "#/$defs/source_graphql__OnMissingKey",
+                      "default": "keep"
+                    },
+                    "start_replication_value": {
+                      "description": "Initial bookmark used when no stored bookmark exists: records whose\n`replication_key` is not greater than it are filtered out, and a\n`replication_bind` renders it into the request."
+                    },
+                    "state_key": {
+                      "description": "Identifier the pipeline persists this stream's bookmark under. Derived\nfrom the endpoint when unset and replicating incrementally.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "replication_bind": {
+                      "description": "Bind the bookmark into a GraphQL variable (see [`GraphqlReplicationBind`]).\nRequires `replication_method: incremental` + `replication_key`.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_graphql__GraphqlReplicationBind"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
                   "title": "GraphqlStreamConfig",
@@ -18132,6 +18234,14 @@
                         "string"
                       ],
                       "default": false
+                    },
+                    "null_values": {
+                      "description": "Fields equal to any of these strings decode as JSON `null` instead of a\nstring (default: none, every field is a string). `[\"\"]` treats empty\nfields as null; sentinels such as `\"NULL\"` or `\"#N/A\"` can be listed.\nHeaders are never mapped, and a quoted empty field is mapped like an\nunquoted one (the reader does not report quoting per field).",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "default": []
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). Rows are\nparsed line-by-line from a tokio `BufReader` and yielded whenever the\nbuffer reaches this size. Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the file is fully\ndrained and the entire result set is emitted in a single page. Useful\nfor small lookup tables or for sinks (e.g. SQL `COPY`, BigQuery load\njobs) that prefer one large request to many small ones.",
@@ -28377,6 +28487,208 @@
         }
       },
       "additionalProperties": false
+    },
+    "source_graphql__ReplicationMethod": {
+      "description": "Determines how records are replicated from the source.",
+      "oneOf": [
+        {
+          "description": "All records are fetched on every run (default).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "FullTable"
+            }
+          }
+        },
+        {
+          "description": "Only records where the `replication_key` field is strictly greater than\nthe stored bookmark (`start_replication_value`) are kept.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "Incremental"
+            }
+          }
+        }
+      ]
+    },
+    "source_graphql__OnMissingKey": {
+      "description": "What to do with a record whose replication key is missing or `null` (#747).",
+      "oneOf": [
+        {
+          "description": "Keep the record, count it, and warn (default): dropping it would be\nsilent data loss.",
+          "type": "string",
+          "const": "keep"
+        },
+        {
+          "description": "Drop the record (counted and warned, never silent).",
+          "type": "string",
+          "const": "drop"
+        },
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "fail"
+        }
+      ]
+    },
+    "source_graphql__GraphqlReplicationBind": {
+      "description": "Binds the stored bookmark into a GraphQL **variable** (#751), so the server\nreturns only newer records. The client-side `replication_key` filter stays\nactive as a safety net.\n\n```yaml\nreplication_bind:\n  variable: since                    # or a JSON Pointer: /filter/updatedAt/gte\n  template: \"updated_at:>${bookmark}\"\n  format: iso8601\n```",
+      "type": "object",
+      "properties": {
+        "variable": {
+          "description": "The variable to set: a top-level variable name (`since`), or an RFC 6901\nJSON Pointer into `variables` (`/filter/updatedAt/gte`) that resolves to\nan existing value or to a new key of an existing object.",
+          "type": "string"
+        },
+        "template": {
+          "description": "Template rendered with `${bookmark}` replaced by the formatted bookmark.\nDefaults to the bare `${bookmark}`. When the bookmark sits inside a\nquery-language string (Shopify `query: \"updated_at:>…\"`), escaping is\nthe template author's job.",
+          "type": "string",
+          "default": "${bookmark}"
+        },
+        "format": {
+          "description": "How to format the bookmark before substitution.",
+          "$ref": "#/$defs/source_graphql__BindFormat",
+          "default": "raw"
+        },
+        "value_type": {
+          "description": "JSON type of the variable: `string` (default) or `number`.",
+          "$ref": "#/$defs/source_graphql__BindValueType",
+          "default": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_graphql__BindFormat": {
+      "description": "How the bookmark value is formatted before it is substituted into the\n[`ReplicationBind::template`].\n\nFor every non-[`Raw`](BindFormat::Raw) format the bookmark is first parsed\ninto an instant: a string is read as RFC 3339, a bare `YYYY-MM-DD` date\n(midnight UTC), or a naive `YYYY-MM-DDTHH:MM:SS` (assumed UTC); a JSON\nnumber is read as **epoch seconds**. It is then re-emitted in the target\nrepresentation, so `epoch_ms` ← ISO string and `iso8601` ← epoch number both\nwork.",
+      "oneOf": [
+        {
+          "description": "Emit the scalar verbatim (string as-is, number as its decimal form).\nThe default; no timestamp parsing.",
+          "type": "string",
+          "const": "raw"
+        },
+        {
+          "description": "RFC 3339 / ISO-8601 UTC timestamp, e.g. `2024-06-01T00:00:00Z`.",
+          "type": "string",
+          "const": "iso8601"
+        },
+        {
+          "description": "Unix epoch **seconds** (integer).",
+          "type": "string",
+          "const": "epoch_s"
+        },
+        {
+          "description": "Unix epoch **milliseconds** (integer).",
+          "type": "string",
+          "const": "epoch_ms"
+        },
+        {
+          "description": "Calendar date `YYYY-MM-DD` (UTC).",
+          "type": "string",
+          "const": "date"
+        }
+      ]
+    },
+    "source_graphql__BindValueType": {
+      "description": "The JSON type a body-target bind writes (#748).",
+      "oneOf": [
+        {
+          "description": "A JSON string (default).",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A JSON number (e.g. an `epoch_ms` bookmark an API requires unquoted).",
+          "type": "string",
+          "const": "number"
+        }
+      ]
+    },
+    "source_rest__RetryMatcher": {
+      "description": "One `retry_on_response` rule: a non-2xx response that matches every set\ncondition is treated as throttling.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "HTTP statuses this rule applies to (empty = any non-2xx).",
+          "type": "array",
+          "items": {
+            "type": [
+              "integer",
+              "string"
+            ],
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "default": []
+        },
+        "body_path": {
+          "description": "JSONPath into the (JSON) error body; its first match is compared with\n`values`. A non-JSON body never matches.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "values": {
+          "description": "Values that match (numbers and strings compare by their text, so `17`\nmatches `\"17\"`). Required with `body_path`; with only `header`, they\nare compared against the header value.",
+          "type": "array",
+          "items": true,
+          "default": []
+        },
+        "header": {
+          "description": "A response header that must be present (and, without `body_path`,\nequal one of `values` when any are listed).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backoff_secs": {
+          "description": "Fixed wait before retrying. Without it the server's `Retry-After` is\nhonoured, else the exponential `retry_backoff` policy applies.",
+          "type": [
+            "integer",
+            "null",
+            "string"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_rest__OnMissingKey": {
+      "description": "What to do with a record whose replication key is missing or `null` (#747).",
+      "oneOf": [
+        {
+          "description": "Keep the record, count it, and warn (default): dropping it would be\nsilent data loss.",
+          "type": "string",
+          "const": "keep"
+        },
+        {
+          "description": "Drop the record (counted and warned, never silent).",
+          "type": "string",
+          "const": "drop"
+        },
+        {
+          "description": "Fail the run.",
+          "type": "string",
+          "const": "fail"
+        }
+      ]
+    },
+    "source_rest__BindValueType": {
+      "description": "The JSON type a body-target bind writes (#748).",
+      "oneOf": [
+        {
+          "description": "A JSON string (default).",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A JSON number (e.g. an `epoch_ms` bookmark an API requires unquoted).",
+          "type": "string",
+          "const": "number"
+        }
+      ]
     }
   }
 }

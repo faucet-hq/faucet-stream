@@ -1411,7 +1411,12 @@ mod tests {
     async fn a_changed_plan_invalidates_and_an_unchanged_one_executes() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::serve::test_support::test_state();
-        let notify = "notifications:\n  - name: log\n    on: [change_requested]\n    channel:\n      type: webhook\n      config:\n        url: http://127.0.0.1:9/hook\n";
+        // The notifications block only parses with the notify feature.
+        let notify = if cfg!(feature = "notify") {
+            "notifications:\n  - name: log\n    on: [change_requested]\n    channel:\n      type: webhook\n      config:\n        url: http://127.0.0.1:9/hook\n"
+        } else {
+            ""
+        };
         let created = create(
             &state,
             &actor("bob"),

@@ -14,6 +14,7 @@ Reach for it when you want to pull a paginated GraphQL collection (users, reposi
 - **Native streaming** — overrides `Source::stream_pages`: every upstream GraphQL response is emitted as one `StreamPage` and written to the sink immediately, so a million-row collection never buffers client-side.
 - **Relay cursor pagination** — follows `pageInfo { hasNextPage, endCursor }`, injecting the `endCursor` back into the query's `after:` variable on each request. Stops cleanly when `hasNextPage` is false, the cursor is absent, the same cursor repeats (loop guard), or `max_pages` is reached. If `has_next_page_path` can't be resolved to a boolean on a page, the signal is treated as "unknown" and pagination **defers to cursor presence** (and warns once) rather than silently stopping — so a missing has-next field never drops the remaining pages.
 - **Offset pagination** — for query languages that page with `LIMIT … OFFSET …` (ShopifyQL and similar). Injects an integer offset into a GraphQL variable (starting at `0`, advancing by `page_size` after each page) and terminates on a **short page** — fewer than `page_size` records — rather than a `pageInfo` boolean. Set `stop_when_short: false` to keep paginating until a fully empty page instead. See [Offset pagination](#offset-pagination).
+- **Incremental replication** — `replication_method: incremental` + `replication_key` filters every page against the stored bookmark and persists a new one on the final page only; `replication_bind` renders the bookmark into a GraphQL variable (a name or a JSON Pointer into `variables`) so the server returns only newer rows. See [Incremental replication](#incremental-replication).
 - **Variable injection** — static `variables` from config, plus per-request cursor / page-size variables, plus parent-record context values (`${parent.path}` matrix fan-out) merged into the GraphQL variables map at runtime.
 - **JSONPath record extraction** — `records_path` plucks the record array out of any response shape (`$.data.users.edges[*].node`). When unset, the whole `data` object is returned as a single record.
 - **Pluggable authentication** — inline Bearer or custom-header auth, or a `{ ref: <name> }` pointer to a shared `auth:` provider so many sources share one token with single-flight refresh.
@@ -78,7 +79,7 @@ faucet run pipeline.yaml
 |-------|------|---------|-------------|
 | `endpoint` | string | — *(required)* | GraphQL endpoint URL. |
 | `query` | string | — *(required)* | The GraphQL query string. Declare cursor/page-size variables (`$after`, `$first`) to enable pagination. |
-| `variables` | object | `{}` | Static variables merged into every request. Cursor, page-size, and parent-context values are layered on top per request. |
+| `variables` | object | `{}` *(optional)* | Static variables merged into every request; omit the key for a query that takes none. Cursor, page-size, and parent-context values are layered on top per request. |
 | `records_path` | string | *(unset)* | JSONPath plucking the record array out of the response (e.g. `$.data.users.edges[*].node`). When unset, the whole `data` object is emitted as one record. |
 | `auth` | `GraphqlAuth` \| `{ ref }` | `none` | Authentication — inline `{ type, config }` or a shared-provider reference. See [Authentication](#authentication). |
 
@@ -113,6 +114,55 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `batch_size` | int | `1000` | Records per emitted `StreamPage` **and** the value injected as the page-size variable (`first:`). Max `1_000_000`. **`0` = no batching**: the page-size variable is omitted so the upstream uses its own default page size, and the whole response is emitted as a single page. See [Streaming & batching](#streaming--batching). Validated at config load: an empty `endpoint` / `query`, or a `batch_size` above `MAX_BATCH_SIZE` (1,000,000), is rejected with `FaucetError::Config`. |
+
+### Incremental replication
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `replication_method` | `full_table` \| `incremental` | `full_table` | `incremental` filters on `replication_key` and emits a bookmark so the next run resumes. |
+| `replication_key` | string | — | Field compared against the bookmark: a top-level name (`updatedAt`), a dot path (`node.updatedAt`), or a JSON Pointer (`/node/updatedAt`). Required for `incremental`. |
+| `on_missing_key` | `keep` \| `drop` \| `fail` | `keep` | A record whose key is missing or `null` once a bookmark exists. |
+| `start_replication_value` | any | — | Bookmark used when none is stored yet. |
+| `state_key` | string | *(derived)* | Key the bookmark is stored under; derived from endpoint + query + variables when unset. The CLI sets a per-row key itself. |
+| `replication_bind.variable` | string | — | The GraphQL variable to set: a name (`since`) or a JSON Pointer into `variables` (`/filter/updatedAt/gte`). |
+| `replication_bind.template` | string | `${bookmark}` | Rendered with `${bookmark}` replaced, e.g. `updated_at:>${bookmark}`. |
+| `replication_bind.format` | `raw` \| `iso8601` \| `epoch_s` \| `epoch_ms` \| `date` | `raw` | How the bookmark is formatted first. |
+| `replication_bind.value_type` | `string` \| `number` | `string` | JSON type of the variable. |
+
+```yaml
+source:
+  type: graphql
+  config:
+    endpoint: https://shop.example.com/admin/api/2025-07/graphql.json
+    query: |
+      query($after: String, $first: Int, $query: String) {
+        orders(first: $first, after: $after, query: $query, sortKey: UPDATED_AT) {
+          edges { node { id updatedAt totalPriceSet { shopMoney { amount } } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    variables: { query: "updated_at:>2020-01-01T00:00:00Z" }
+    records_path: "$.data.orders.edges[*].node"
+    pagination:
+      has_next_page_path: "$.data.orders.pageInfo.hasNextPage"
+      cursor_path: "$.data.orders.pageInfo.endCursor"
+    replication_method: { type: Incremental }
+    replication_key: updatedAt
+    replication_bind: { variable: query, template: "updated_at:>${bookmark}", format: iso8601 }
+```
+
+- Add a durable `state:` block to the pipeline. The first run sends `variables` as configured; later runs replace the bound
+  variable with the rendered bookmark. The client-side `replication_key`
+  filter always runs too, so a server that ignores the filter never
+  re-delivers old rows.
+- The bookmark is attached to the **final** page only (and to a trailing empty
+  page when `max_pages` truncates), so a crash between cursor pages re-reads
+  the run instead of skipping rows. A GraphQL `errors[]` response fails the
+  run before any bookmark is written.
+- When the bookmark sits inside a query-language string (Shopify's `query:
+  "updated_at:>…"`), escaping it is the template author's job.
+- Delivery stays at-least-once: pair it with an upsert sink (`write_mode:
+  upsert` + `key`) to make re-reads harmless.
 
 ## Authentication
 

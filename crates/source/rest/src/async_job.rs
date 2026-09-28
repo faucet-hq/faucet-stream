@@ -424,17 +424,11 @@ pub fn substitute_job_id(template: &str, job_id: &str) -> String {
     template.replace("${job_id}", job_id)
 }
 
-/// Resolve a possibly-relative URL against `base_url`.
+/// Resolve a possibly-relative URL against `base_url` (see
+/// [`crate::url_util::resolve_job_url`]; a root-relative URL that already
+/// carries the base's path prefix no longer duplicates it, #750).
 pub fn resolve_url(base_url: &str, url: &str) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        url.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            url.trim_start_matches('/')
-        )
-    }
+    crate::url_util::resolve_job_url(base_url, url)
 }
 
 #[cfg(test)]

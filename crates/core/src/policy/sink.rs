@@ -329,6 +329,9 @@ impl Sink for PolicySink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
     fn supports_rollback(&self) -> bool {
         self.inner.supports_rollback()
     }
@@ -593,6 +596,7 @@ mod tests {
             s.abort_overwrite().await.is_ok(),
             plain.abort_overwrite().await.is_ok()
         );
+        assert!(s.complete_run().await.is_ok());
         assert!(!s.supports_rollback());
         assert!(
             s.rollback_run(

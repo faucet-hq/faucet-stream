@@ -7,7 +7,7 @@ a **state store** to persist the bookmark between runs.
 ## Replication methods
 
 - `FullTable` — fetch everything every run.
-- `Incremental` — track a high-water mark on a `cursor_field` (e.g. `updated_at`,
+- `Incremental` — track a high-water mark on a `replication_key` (e.g. `updated_at`,
   an auto-increment id) and only emit records past the last seen value.
 
 ```yaml
@@ -17,9 +17,119 @@ source:
     # …
     replication_method:
       type: Incremental
-      cursor_field: updated_at
-    primary_keys: [id]
+    replication_key: updated_at
 ```
+
+### Nested replication keys
+
+Many APIs put the cursor inside a nested object (Jira `fields.updated`, GitHub
+`commit.committer.date`, Google Ads `segments.date`). `replication_key` accepts
+three forms:
+
+| Form | Example | Resolves |
+|------|---------|----------|
+| Field name | `updated_at` | a top-level field |
+| Dot path | `fields.updated`, `items.0.date` | nested objects; numeric segments index arrays. A top-level field literally named `fields.updated` still wins, so flat CSV columns such as `Account.LastModifiedDate` keep working |
+| JSON Pointer | `/fields/updated`, `/a.b/c` | RFC 6901, for field names that themselves contain dots |
+
+The key must resolve to a single value; it is not a JSONPath. It is resolved on
+the raw records, before transforms run, so no `flatten` is needed.
+
+### Pushing the bookmark into a nested request body
+
+A `replication_bind` with `into: body` writes the bookmark into the JSON request
+body — as a top-level field (`name`) or at any location addressed by a JSON
+Pointer (`path`):
+
+```yaml
+replication_bind:
+  into: body
+  path: /filterGroups/0/filters/0/value   # HubSpot CRM search filter
+  format: epoch_ms
+  value_type: number                      # write 1717200000000, not "1717200000000"
+```
+
+The pointer must resolve to an existing scalar (or `null`) in the configured
+`body`, or to a new key of an existing object; array elements are never
+created. `window` binds accept the same `path` / `value_type`, so GA4-style
+`dateRanges[0].startDate` / `endDate` can be windowed. Set exactly one of
+`name` or `path`, configure a JSON object `body`, and don't point two binds at
+the same location — all three are checked at load time.
+
+### Incremental GraphQL
+
+GraphQL APIs are synced incrementally two ways.
+
+**The `graphql` source** takes the same `replication_method` /
+`replication_key` / `on_missing_key` / `start_replication_value` / `state_key`
+fields as `rest`, and its `replication_bind` names a GraphQL **variable** — a
+top-level name, or a JSON Pointer into `variables`:
+
+```yaml
+source:
+  type: graphql
+  config:
+    query: |
+      query($after: String, $first: Int, $query: String) {
+        orders(first: $first, after: $after, query: $query) {
+          edges { node { id updatedAt } } pageInfo { hasNextPage endCursor }
+        }
+      }
+    variables: { query: "updated_at:>2020-01-01T00:00:00Z" }   # first run
+    records_path: "$.data.orders.edges[*].node"
+    pagination:
+      has_next_page_path: "$.data.orders.pageInfo.hasNextPage"
+      cursor_path: "$.data.orders.pageInfo.endCursor"
+    replication_method: { type: Incremental }
+    replication_key: updatedAt                # dot path / JSON Pointer also accepted
+    replication_bind:
+      variable: query                         # or /filter/updatedAt/gte
+      template: "updated_at:>${bookmark}"
+      format: iso8601
+```
+
+The bookmark is written only after the last cursor page (a crash mid-run
+re-reads rather than skipping rows), the client-side filter stays on as a
+safety net, and a GraphQL `errors[]` response fails the run before any
+bookmark is stored. When the bookmark lands inside a query-language string, as
+above, escaping it is the template's job.
+
+**GraphQL through the `rest` source** pages too: `CursorInBody.body_cursor_field`
+(and `OffsetInBody`'s `offset_field` / `limit_field`) accept a JSON Pointer, so
+the cursor lands in `variables`:
+
+```yaml
+source:
+  type: rest
+  config:
+    method: POST
+    body: { query: "query($after: String) { … }", variables: {} }
+    records_path: "$.data.orders.edges[*].node"
+    pagination:
+      type: CursorInBody
+      next_token_path: "$.data.orders.pageInfo.endCursor"
+      body_cursor_field: /variables/after
+```
+
+Combine it with a `replication_bind` of `into: body, path: /variables/since`
+for incremental reads.
+
+### Records without the key
+
+A record whose key is missing or `null` is **kept** by default — dropping it
+would be silent data loss. Each one is counted in
+`faucet_source_replication_key_missing_total{pipeline,row,connector}` and the
+source logs one warning per run. Choose explicitly with `on_missing_key`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `keep` (default) | Write the record; counted and warned |
+| `drop` | Skip the record; counted and warned |
+| `fail` | Fail the run |
+
+When every record on a run lacks the key, the bookmark does not advance (and the
+warning fires), so a misspelled key shows up immediately instead of as an empty
+incremental run.
 
 ## State stores
 

@@ -386,6 +386,9 @@ impl<S: Sink + ?Sized> Sink for CleanupTracker<'_, S> {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +472,7 @@ mod tests {
         tracker.begin_overwrite().await.unwrap();
         tracker.commit_overwrite().await.unwrap();
         tracker.abort_overwrite().await.unwrap();
+        tracker.complete_run().await.unwrap();
         assert_eq!(*inner.log.lock().unwrap(), vec!["begin", "commit", "abort"]);
     }
 

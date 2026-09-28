@@ -197,6 +197,8 @@ rabbitmq-tls = [
 ]
 ## OAuth1 (HMAC-SHA256) request-signing auth provider (#496).
 oauth1 = ["auth", "faucet-auth?/oauth1"]
+## Google service-account (RFC 7523 JWT-bearer) auth provider (#755).
+google-sa = ["auth", "faucet-auth?/google-sa"]
 ## Opt-in Arrow columnar record path (RFC 0002 / #375). Activates the columnar
 ## fast path on whichever Arrow-capable connectors the user has already enabled
 ## (optional-dep `?` syntax, so this flag never pulls a connector itself) and
@@ -258,7 +260,7 @@ transform-wasm = ["dep:faucet-transform-wasm"]
 ## syntax, so this flag never pulls the connector itself).
 encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption"]
 ## Every connector and state backend.
-full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-xml-excel", "file-formats"]
+full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "google-sa", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-xml-excel", "file-formats"]
 
 ## Individual source connectors.
 source-rest = ["dep:faucet-source-rest"]

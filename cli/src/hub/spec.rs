@@ -835,6 +835,20 @@ impl SinkTemplate {
             .filter_map(|(k, v)| parse_mode(k).map(|m| (m, *v)))
             .collect()
     }
+
+    /// Whether every invocation of this sink replaces its output (#752) — the
+    /// base config with the per-stream keys laid over it. A child stream runs
+    /// once per parent record, so on such a sink it keeps only the last
+    /// parent's rows.
+    pub fn truncates_per_invocation(&self) -> bool {
+        let mut cfg = self.sink.config.clone();
+        if let Value::Object(map) = &mut cfg {
+            for (k, v) in &self.per_stream {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        crate::registry::sink_truncating_path(&self.sink.kind, &cfg).is_some()
+    }
 }
 
 fn value_mentions(v: &Value, needle: &str) -> bool {

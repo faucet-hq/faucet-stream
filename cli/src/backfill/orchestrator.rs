@@ -304,6 +304,10 @@ impl faucet_core::Source for BoundedSource {
     ) {
         self.inner.set_roundtrip_recorder(recorder);
     }
+
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
+    }
 }
 
 /// Build a fresh `ExecuteOptions` for one unit run.
@@ -1046,5 +1050,6 @@ matrix:
                 "fixture",
             ),
         ));
+        bounded.set_run_clock(chrono::Utc::now());
     }
 }

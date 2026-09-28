@@ -140,6 +140,42 @@ never written to logs or error messages.
 > shared `auth: { ref }` provider uses that provider's own client and does not
 > present the source's certificate — use inline auth for mTLS endpoints.
 
+## Google service accounts (JWT-bearer)
+
+Google APIs (GA4 Data API, Google Ads, Search Console, Sheets, Drive, …) accept a
+**service-account key** instead of a user's refresh token — the right credential
+for `faucet schedule`, `faucet serve` and tenants, where no human is around to
+re-consent. Declare it once in the top-level `auth:` catalog and reference it:
+
+```yaml
+auth:
+  google:
+    type: google_service_account
+    config:
+      key_json: "${secret:GOOGLE_SA_KEY}"        # or key_file: /etc/faucet/sa.json
+      scopes: ["https://www.googleapis.com/auth/analytics.readonly"]
+      subject: reports@example.com               # optional: domain-wide delegation
+      # token_uri: defaults to the key's own token_uri
+
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: https://analyticsdata.googleapis.com
+      path: /v1beta/properties/123456:runReport
+      method: POST
+      auth: { ref: google }
+      # …
+```
+
+Each refresh signs an RS256 assertion with the key (RFC 7523) and exchanges it
+at Google's token endpoint; the access token is cached and shared single-flight
+by every row that references `google`. A malformed key fails at load time, and
+an `invalid_grant` (disabled key, delegation not granted) names the service
+account, subject and scopes. The private key is redacted from logs even when
+written inline, but prefer a secrets-manager reference. The provider ships in
+the default CLI build (`google-sa` feature).
+
 ## OAuth1 request signing (HMAC-SHA256)
 
 Some APIs (e.g. NetSuite Token-Based Auth) authenticate by **signing each

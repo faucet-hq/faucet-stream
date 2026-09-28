@@ -21,6 +21,10 @@ cardinality and never a Prometheus label.
 
 - **Source:** `faucet_source_records_total`, `faucet_source_errors_total{kind}`,
   `faucet_source_page_duration_seconds`, `faucet_source_in_flight`.
+- **Incremental key coverage** (#747): `faucet_source_replication_key_missing_total{pipeline,row,connector}`
+  — records an incremental source received without its `replication_key` (kept,
+  dropped or failed per `on_missing_key`). A non-zero rate usually means a
+  misspelled or wrongly nested key.
 - **Source lag** (#733): `faucet_source_lag_bytes`, `faucet_source_lag_events`,
   `faucet_source_lag_seconds{pipeline,row,connector}` — how far a CDC or
   streaming source is behind its head (unread WAL / binlog, unconsumed

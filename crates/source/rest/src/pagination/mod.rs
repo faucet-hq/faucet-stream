@@ -17,6 +17,18 @@ fn default_true() -> bool {
     true
 }
 
+/// Resolve a next-page link against the URL of the request that returned it
+/// (#750). Without a recorded request URL the link is used as given.
+fn resolve_against_request(headers: &HeaderMap, link: &str) -> Result<String, FaucetError> {
+    match headers
+        .get(crate::url_util::REQUEST_URL_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(base) => crate::url_util::resolve_link_str(base, link),
+        None => Ok(link.to_owned()),
+    }
+}
+
 /// Where a [`PaginationStyle::RecordFieldCursor`] keyset value is injected on the
 /// next request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -59,6 +71,11 @@ pub enum PaginationStyle {
     /// `next_token_path` is null/absent, and a repeated cursor trips the same
     /// loop guard as [`PaginationStyle::Cursor`]. Used by e.g. HubSpot CRM
     /// `POST /crm/v3/objects/{obj}/search` (`$.paging.next.after` → `after`).
+    ///
+    /// `body_cursor_field` may also be an RFC 6901 JSON Pointer
+    /// (`/variables/after`) for a nested location — e.g. a GraphQL request
+    /// sent through the REST source. The pointer must resolve to an existing
+    /// value, or to a new key of an existing object (#751).
     CursorInBody {
         next_token_path: String,
         body_cursor_field: String,
@@ -91,12 +108,25 @@ pub enum PaginationStyle {
     /// offset advances by the page's record count. With `stop_when_short`
     /// (default `true`) a page shorter than `limit` ends pagination; a zero-record
     /// page always ends it, and a repeated identical page trips a loop guard.
+    /// Either field may be a JSON Pointer (`/page/offset`) for a nested
+    /// location, with the same rules as `CursorInBody.body_cursor_field`.
     OffsetInBody {
         offset_field: String,
         limit_field: String,
         limit: usize,
         #[serde(default = "default_true")]
         stop_when_short: bool,
+        /// JSONPath whose matches are counted to advance the offset and detect a
+        /// short page, instead of the extracted record count — for report APIs
+        /// whose whole response is one record (`$.rows`). An array counts its
+        /// elements, an object 1, null or no match 0 (which ends pagination).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows_path: Option<String>,
+        /// JSONPath to the total row count; pagination stops once the offset
+        /// reaches it. A missing or non-numeric total falls back to the
+        /// short-page rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_path: Option<String>,
     },
     /// Keyset pagination by the running max/min of a record field (#554). After
     /// each page the aggregate of `field` over its records is injected into the
@@ -296,6 +326,7 @@ impl PaginationStyle {
             }
             PaginationStyle::LinkHeader => match link_header::extract_next_link(headers) {
                 Some(link) => {
+                    let link = resolve_against_request(headers, &link)?;
                     if Some(&link) == state.previous_token.as_ref() {
                         tracing::warn!(
                             "pagination loop detected: link {link:?} repeated — stopping"
@@ -315,6 +346,14 @@ impl PaginationStyle {
             PaginationStyle::NextLinkInBody { next_link_path } => {
                 let has_next = next_link_body::advance(body, next_link_path, &mut state.next_link)?;
                 if has_next {
+                    if let Some(raw) = state.next_link.take() {
+                        state.next_link =
+                            Some(resolve_against_request(headers, &raw).map_err(|e| {
+                                FaucetError::Source(format!(
+                                    "next-link path '{next_link_path}' returned '{raw}': {e}"
+                                ))
+                            })?);
+                    }
                     if state.next_link == state.previous_token {
                         tracing::warn!(
                             "pagination loop detected: next_link {:?} repeated — stopping",
@@ -391,15 +430,30 @@ impl PaginationStyle {
             PaginationStyle::OffsetInBody {
                 limit,
                 stop_when_short,
+                rows_path,
+                total_path,
                 ..
             } => {
                 // Mirror `Offset` (record-count driven), but the offset lands in
-                // the body via `body_params`. A zero-record page always stops.
-                if record_count == 0 {
+                // the body via `body_params`. A zero-row page always stops.
+                let count = match rows_path {
+                    Some(rp) => count_rows(body, rp)?,
+                    None => record_count,
+                };
+                if count == 0 {
                     return Ok(false);
                 }
-                state.offset += record_count;
-                if *stop_when_short && record_count < *limit {
+                state.offset += count;
+                if let Some(total) = total_path
+                    .as_deref()
+                    .map(|tp| read_total(body, tp))
+                    .transpose()?
+                    .flatten()
+                {
+                    if state.offset >= total {
+                        return Ok(false);
+                    }
+                } else if *stop_when_short && count < *limit {
                     return Ok(false);
                 }
                 // Content-stagnation guard: a server ignoring the body offset
@@ -537,6 +591,41 @@ impl PaginationStyle {
     }
 }
 
+/// Rows matched by `path` in `body`: an array's length, 1 for any other value,
+/// 0 for null or no match.
+fn count_rows(body: &Value, path: &str) -> Result<usize, FaucetError> {
+    use jsonpath_rust::JsonPath;
+    let hits = body
+        .query(path)
+        .map_err(|e| FaucetError::JsonPath(format!("rows_path '{path}': {e}")))?;
+    Ok(match hits.as_slice() {
+        [] => 0,
+        [Value::Array(a)] => a.len(),
+        [Value::Null] => 0,
+        many => many.iter().filter(|v| !v.is_null()).count(),
+    })
+}
+
+/// The numeric total at `path`, or `None` (with a warning when non-numeric).
+fn read_total(body: &Value, path: &str) -> Result<Option<usize>, FaucetError> {
+    use jsonpath_rust::JsonPath;
+    let hits = body
+        .query(path)
+        .map_err(|e| FaucetError::JsonPath(format!("total_path '{path}': {e}")))?;
+    let Some(v) = hits.first() else {
+        return Ok(None);
+    };
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
+    if n.is_none() {
+        tracing::warn!(
+            "total_path '{path}' resolved to non-numeric {v}; using the short-page rule"
+        );
+    }
+    Ok(n.map(|n| n as usize))
+}
+
 #[cfg(test)]
 mod new_style_tests {
     use super::*;
@@ -549,6 +638,8 @@ mod new_style_tests {
             limit_field: "limit".into(),
             limit: 2,
             stop_when_short: true,
+            rows_path: None,
+            total_path: None,
         }
     }
 
@@ -607,6 +698,8 @@ mod new_style_tests {
             limit_field: "l".into(),
             limit: 2,
             stop_when_short: false,
+            rows_path: None,
+            total_path: None,
         };
         let mut state = PaginationState::default();
         let body = json!([{"id": 1}, {"id": 2}]);
@@ -623,6 +716,51 @@ mod new_style_tests {
                 .unwrap()
         );
         assert!(state.current_page_is_duplicate);
+    }
+
+    #[test]
+    fn rows_path_counts_and_total_path_stops() {
+        let style = PaginationStyle::OffsetInBody {
+            offset_field: "o".into(),
+            limit_field: "l".into(),
+            limit: 2,
+            stop_when_short: true,
+            rows_path: Some("$.rows".into()),
+            total_path: Some("$.total".into()),
+        };
+        let h = HeaderMap::new();
+        let mut state = PaginationState::default();
+        let body = json!({"rows": [1, 2], "total": "5"});
+        assert!(style.advance(&body, &h, &mut state, 1).unwrap());
+        assert_eq!(state.offset, 2);
+        // A short page below the total continues: the total is authoritative.
+        let body = json!({"rows": [3], "total": 5});
+        assert!(style.advance(&body, &h, &mut state, 1).unwrap());
+        let body = json!({"rows": [4, 5], "total": 5});
+        assert!(!style.advance(&body, &h, &mut state, 1).unwrap());
+        assert_eq!(state.offset, 5);
+        // A non-numeric total falls back to the short-page rule.
+        let mut state = PaginationState::default();
+        let body = json!({"rows": [1], "total": "many"});
+        assert!(!style.advance(&body, &h, &mut state, 1).unwrap());
+        // Missing rows end pagination.
+        let mut state = PaginationState::default();
+        assert!(!style.advance(&json!({}), &h, &mut state, 1).unwrap());
+    }
+
+    #[test]
+    fn count_rows_shapes() {
+        assert_eq!(count_rows(&json!({"r": [1, 2, 3]}), "$.r").unwrap(), 3);
+        assert_eq!(count_rows(&json!({"r": {"a": 1}}), "$.r").unwrap(), 1);
+        assert_eq!(count_rows(&json!({"r": null}), "$.r").unwrap(), 0);
+        assert_eq!(count_rows(&json!({}), "$.r").unwrap(), 0);
+        assert_eq!(
+            count_rows(&json!({"r": [1, null, 2]}), "$.r[*]").unwrap(),
+            2
+        );
+        assert!(count_rows(&json!({}), "$[").is_err());
+        assert_eq!(read_total(&json!({}), "$.t").unwrap(), None);
+        assert!(read_total(&json!({}), "$[").is_err());
     }
 
     fn keyset(into: RecordCursorTarget) -> PaginationStyle {

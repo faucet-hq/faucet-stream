@@ -592,9 +592,13 @@ jobs:
     name: Windows (x86_64-pc-windows-msvc)
     runs-on: windows-2022
     needs: changes
-    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    # On hold with #565: Windows is not a supported platform yet.
+    if: false
     env:
       SHIPPED_FEATURES: "serve,serve-ui,schedule,lineage,templates"
+      # openssl-src must run Strawberry Perl; the Git Bash (MSYS) perl lacks
+      # Locale::Maketext::Simple and misdetects the target.
+      OPENSSL_SRC_PERL: C:/Strawberry/perl/bin/perl.exe
     defaults:
       run:
         shell: bash

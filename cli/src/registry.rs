@@ -1084,6 +1084,48 @@ pub fn sink_supports_overwrite(kind: &str) -> bool {
     OVERWRITE_SINK_KINDS.contains(&kind)
 }
 
+/// File sinks that replace their output every time an invocation writes to it
+/// (#752), outside the grouped `write_mode: overwrite` lifecycle: `jsonl` /
+/// `csv` with `append: false` (the default), `parquet` writing one fixed
+/// `*.parquet` file (no rollover), and `file` in `mode: overwrite` (the
+/// default) without `write_mode: overwrite`. Run once per parent record at one
+/// path, each invocation wipes the previous one's rows.
+pub const TRUNCATING_FILE_SINK_KINDS: &[&str] = &["jsonl", "csv", "parquet", "file"];
+
+/// The destination path of a [`TRUNCATING_FILE_SINK_KINDS`] sink config, when
+/// that config replaces its output on every invocation; `None` otherwise.
+pub fn sink_truncating_path<'a>(kind: &str, cfg: &'a Value) -> Option<&'a str> {
+    let flag = |k: &str| cfg.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let text = |v: Option<&'a Value>| v.and_then(Value::as_str);
+    match kind {
+        "jsonl" | "csv" if !flag("append") => text(cfg.get("path")),
+        "parquet" => {
+            let dest = cfg.get("destination")?;
+            let path = text(dest.get("path"))?;
+            let rolls = ["max_rows_per_file", "max_bytes_per_file"]
+                .iter()
+                .any(|k| cfg.get(*k).is_some_and(|v| !v.is_null()));
+            (dest.get("type").and_then(Value::as_str) == Some("local_path")
+                && path.ends_with(".parquet")
+                && !rolls)
+                .then_some(path)
+        }
+        "file" => {
+            let mode = cfg
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("overwrite");
+            let staged = cfg.get("write_mode").and_then(Value::as_str) == Some("overwrite");
+            if mode == "overwrite" && !staged {
+                text(cfg.get("path"))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Sinks that support a **scoped/windowed** overwrite (#518) — replacing only
 /// the rows matching a `scope` (a date window) instead of the whole table. A
 /// subset of [`OVERWRITE_SINK_KINDS`]; the others still support full overwrite.
@@ -3799,5 +3841,54 @@ mod tests {
             override_sink_concurrency("not-a-connector", &mut cfg, 4),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod truncating_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn truncating_path_by_kind() {
+        let p = |k: &str, v: Value| sink_truncating_path(k, &v).map(str::to_string);
+        assert_eq!(
+            p("jsonl", json!({"path": "a.jsonl"})).as_deref(),
+            Some("a.jsonl")
+        );
+        assert_eq!(
+            p("csv", json!({"path": "a.csv", "append": false})).as_deref(),
+            Some("a.csv")
+        );
+        assert_eq!(p("jsonl", json!({"path": "a.jsonl", "append": true})), None);
+        let pq = json!({"destination": {"type": "local_path", "path": "o/a.parquet"}});
+        assert_eq!(p("parquet", pq).as_deref(), Some("o/a.parquet"));
+        let rolled = json!({
+            "destination": {"type": "local_path", "path": "o/a.parquet"},
+            "max_rows_per_file": 10
+        });
+        assert_eq!(p("parquet", rolled), None);
+        let dir = json!({"destination": {"type": "local_path", "path": "o/"}});
+        assert_eq!(p("parquet", dir), None);
+        let s3 = json!({"destination": {"type": "s3", "bucket": "b"}});
+        assert_eq!(p("parquet", s3), None);
+        assert_eq!(p("parquet", json!({})), None);
+        assert_eq!(
+            p("file", json!({"path": "a.jsonl"})).as_deref(),
+            Some("a.jsonl")
+        );
+        assert_eq!(
+            p("file", json!({"path": "a.jsonl", "mode": "append"})),
+            None
+        );
+        assert_eq!(
+            p(
+                "file",
+                json!({"path": "a.jsonl", "write_mode": "overwrite"})
+            ),
+            None
+        );
+        assert_eq!(p("postgres", json!({"path": "x"})), None);
+        assert!(TRUNCATING_FILE_SINK_KINDS.contains(&"jsonl"));
     }
 }

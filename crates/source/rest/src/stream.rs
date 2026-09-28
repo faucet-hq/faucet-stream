@@ -9,7 +9,8 @@ use crate::pagination::{PaginationState, PaginationStyle};
 use crate::retry;
 use async_trait::async_trait;
 use faucet_core::replication::{
-    BindTarget, ReplicationMethod, filter_incremental, max_replication_value, max_value,
+    BindTarget, OnMissingKey, ReplicationKey, ReplicationMethod, filter_incremental_path,
+    max_replication_value_path, max_value,
 };
 use faucet_core::schema;
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
@@ -48,11 +49,11 @@ pub struct RestStream {
     /// by the window loop in `stream_pages_inner` before each window's pages;
     /// empty when no `window:` block is configured. Each entry is
     /// `(target, name, rendered-value)`.
-    window_binds: Arc<AsyncMutex<Vec<(BindTarget, String, String)>>>,
-    /// Test-only override for the "now" upper bound of datetime window slicing
-    /// (#527). `None` in production (uses `Utc::now()`); set by unit tests so the
-    /// window enumeration is deterministic.
-    now_override: Option<chrono::DateTime<chrono::Utc>>,
+    window_binds: Arc<AsyncMutex<Vec<ResolvedBind>>>,
+    /// The run clock (#769): the "now" upper bound of datetime window slicing
+    /// (#527) and the async-job lookback. Set by the pipeline from `--clock` /
+    /// the schedule tick via [`faucet_core::Source::set_run_clock`]; `None` uses `Utc::now()`.
+    run_clock: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     /// Retry policy for transient request failures. Built in `new()` from the
     /// REST source's own `config.max_retries` / `config.retry_backoff`. Fed into
     /// the REST `retry::execute_with_retry` runner (which keeps its 429 /
@@ -75,6 +76,34 @@ pub struct RestStream {
     /// the config because the labels are only known at run time, and because
     /// the hook takes `&self`.
     roundtrips: std::sync::OnceLock<Arc<faucet_core::observability::RoundtripRecorder>>,
+    /// `config.replication_key`, compiled once (#747).
+    replication_key: Option<ReplicationKey>,
+    /// Set once the missing-key warning has been logged (once per instance).
+    missing_key_warned: std::sync::atomic::AtomicBool,
+    /// Consecutive `retry_on_response` matches (#756); reset by any success.
+    matcher_hits: std::sync::atomic::AtomicU32,
+}
+
+/// A bookmark or window bind rendered for the current request (#513/#527/#748).
+#[derive(Debug, Clone)]
+struct ResolvedBind {
+    target: BindTarget,
+    name: String,
+    path: Option<String>,
+    value_type: faucet_core::BindValueType,
+    rendered: String,
+}
+
+impl ResolvedBind {
+    fn window(bind: &faucet_core::WindowBind, rendered: String) -> Self {
+        Self {
+            target: bind.into,
+            name: bind.name.clone(),
+            path: bind.path.clone(),
+            value_type: bind.value_type,
+            rendered,
+        }
+    }
 }
 
 /// Default value of [`RestStreamConfig::max_retries`]. When the user leaves this
@@ -479,6 +508,11 @@ impl RestStream {
         // Static custom headers (#539): validated once here (also validated in
         // `config.validate()` above, so this cannot fail) and reused per request.
         let static_headers = crate::config::build_header_map(&config.headers)?;
+        let replication_key = config
+            .replication_key
+            .as_deref()
+            .map(ReplicationKey::parse)
+            .transpose()?;
         Ok(Self {
             config,
             client: builder.build()?,
@@ -487,12 +521,115 @@ impl RestStream {
             auth_provider: None,
             runtime_start: Arc::new(AsyncMutex::new(None)),
             window_binds: Arc::new(AsyncMutex::new(Vec::new())),
-            now_override: None,
+            run_clock: std::sync::Mutex::new(None),
             retry_policy,
             static_headers,
             metadata_xml_cache: tokio::sync::OnceCell::new(),
             roundtrips: std::sync::OnceLock::new(),
+            replication_key,
+            missing_key_warned: std::sync::atomic::AtomicBool::new(false),
+            matcher_hits: std::sync::atomic::AtomicU32::new(0),
         })
+    }
+
+    /// Map a non-2xx response to a rate limit when a `retry_on_response` rule
+    /// matches (#756). `None` surfaces the original error: no rule matched, or
+    /// `max_retries` consecutive matches were already retried.
+    fn classify_retry_response(
+        &self,
+        status: u16,
+        headers: &HeaderMap,
+        body: &str,
+    ) -> Option<FaucetError> {
+        let m = crate::retry::matcher::find_match(
+            &self.config.retry_on_response,
+            status,
+            headers,
+            body,
+        )?;
+        let hits = self
+            .matcher_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if hits >= self.retry_policy.max_attempts.saturating_sub(1) {
+            self.reset_matcher_hits();
+            tracing::warn!(
+                status,
+                "retry_on_response matched {hits} consecutive time(s); retries exhausted, \
+                 surfacing the error"
+            );
+            return None;
+        }
+        let retry_after = headers
+            .contains_key(reqwest::header::RETRY_AFTER)
+            .then(|| parse_retry_after(headers));
+        let wait =
+            crate::retry::matcher::matched_wait(m, retry_after, self.retry_policy.base, hits);
+        tracing::warn!(
+            status,
+            ?wait,
+            "response matched retry_on_response; treating as throttling"
+        );
+        Some(FaucetError::RateLimited(wait))
+    }
+
+    fn reset_matcher_hits(&self) {
+        self.matcher_hits
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Count (and warn once about) records that lacked the replication key.
+    fn note_missing_key(&self, missing: usize) {
+        if missing == 0 {
+            return;
+        }
+        if let Some(r) = self.roundtrips.get() {
+            r.replication_key_missing(missing as u64);
+        }
+        if !self
+            .missing_key_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let key = self.config.replication_key.as_deref().unwrap_or_default();
+            let action = match self.config.on_missing_key {
+                OnMissingKey::Drop => "dropped (on_missing_key: drop)",
+                _ => "kept to avoid silent data loss",
+            };
+            tracing::warn!(
+                key,
+                missing,
+                "incremental replication: {missing} record(s) lacked replication_key '{key}'; \
+                 {action} (further occurrences are counted in \
+                 faucet_source_replication_key_missing_total)"
+            );
+        }
+    }
+
+    /// Client-side incremental filter over one page (#747).
+    fn filter_incremental_page(
+        &self,
+        records: Vec<Value>,
+        start: &Value,
+    ) -> Result<Vec<Value>, FaucetError> {
+        let Some(key) = &self.replication_key else {
+            return Ok(records);
+        };
+        let out = filter_incremental_path(records, key, start, self.config.on_missing_key)?;
+        self.note_missing_key(out.missing);
+        Ok(out.records)
+    }
+
+    /// The page's max replication value. `count_missing` reports records
+    /// lacking the key when the filter did not already count them.
+    fn page_replication_max(&self, records: &[Value], count_missing: bool) -> Option<Value> {
+        let key = self.replication_key.as_ref()?;
+        if count_missing {
+            let missing = records
+                .iter()
+                .filter(|r| key.resolve(r).is_none_or(Value::is_null))
+                .count();
+            self.note_missing_key(missing);
+        }
+        max_replication_value_path(records, key).cloned()
     }
 
     /// Attach a shared [`AuthProvider`](faucet_core::AuthProvider). When set, the
@@ -506,16 +643,31 @@ impl RestStream {
         self
     }
 
-    /// Test-only: pin the "now" upper bound used by datetime window slicing (#527)
-    /// to a fixed RFC 3339 instant, so the window enumeration is deterministic in
-    /// tests. No effect in production (which uses `Utc::now()`). Hidden from docs;
-    /// takes a string so callers need not depend on `chrono`.
-    #[doc(hidden)]
-    pub fn with_now_override_rfc3339(mut self, rfc3339: &str) -> Self {
-        self.now_override = chrono::DateTime::parse_from_rfc3339(rfc3339)
-            .ok()
-            .map(|d| d.with_timezone(&chrono::Utc));
+    /// Pin the run clock — the "now" upper bound of datetime window slicing
+    /// (#527) and the async-job lookback — to an RFC 3339 instant. An
+    /// unparseable value leaves the wall clock in use. Takes a string so callers
+    /// need not depend on `chrono`; the pipeline sets it via
+    /// [`faucet_core::Source::set_run_clock`].
+    pub fn with_run_clock_rfc3339(self, rfc3339: &str) -> Self {
+        if let Ok(d) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
+            faucet_core::Source::set_run_clock(&self, d.with_timezone(&chrono::Utc));
+        }
         self
+    }
+
+    /// Alias of [`with_run_clock_rfc3339`](Self::with_run_clock_rfc3339).
+    #[doc(hidden)]
+    pub fn with_now_override_rfc3339(self, rfc3339: &str) -> Self {
+        self.with_run_clock_rfc3339(rfc3339)
+    }
+
+    /// The run clock, or the wall clock when none was set.
+    fn run_now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.run_clock
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or_else(chrono::Utc::now)
     }
 
     /// Attach a custom [`RetryPolicy`](faucet_core::RetryPolicy) for transient
@@ -628,12 +780,7 @@ impl RestStream {
     /// [`fetch_all`](Self::fetch_all) and the bookmark is `None`.
     pub async fn fetch_all_incremental(&self) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let records = self.fetch_all().await?;
-        let bookmark = self
-            .config
-            .replication_key
-            .as_deref()
-            .and_then(|key| max_replication_value(&records, key))
-            .cloned();
+        let bookmark = self.page_replication_max(&records, false);
         Ok((records, bookmark))
     }
 
@@ -891,15 +1038,17 @@ impl RestStream {
                         use futures::TryStreamExt as _;
                         let body = resp.bytes_stream().map_err(std::io::Error::other);
                         let reader = tokio_util::io::StreamReader::new(body);
-                        let mut pages = Box::pin(crate::format::csv_reader_to_value_pages_with(
-                            reader,
-                            crate::format::CsvDialect {
-                                delimiter: plan.delimiter,
-                                has_headers: plan.has_headers,
-                                quote: self.config.csv_quote,
-                            },
-                            csv_page_size,
-                        ));
+                        let mut pages =
+                            Box::pin(crate::format::csv_reader_to_value_pages_with_nulls(
+                                reader,
+                                crate::format::CsvDialect {
+                                    delimiter: plan.delimiter,
+                                    has_headers: plan.has_headers,
+                                    quote: self.config.csv_quote,
+                                },
+                                csv_page_size,
+                                self.config.csv_null_values.clone(),
+                            ));
                         use futures::StreamExt as _;
                         let mut emitted = false;
                         while let Some(page) = pages.next().await {
@@ -1005,7 +1154,7 @@ impl RestStream {
                     )
                 })?;
                 let start_instant = faucet_core::parse_instant(&start_val)?;
-                let now = self.now_override.unwrap_or_else(chrono::Utc::now);
+                let now = self.run_now();
                 let step = win.step_duration()?;
                 let lookback = win.lookback_duration()?;
                 let (windows, truncated) =
@@ -1037,10 +1186,11 @@ impl RestStream {
                         .window
                         .as_ref()
                         .expect("a window pass implies a `window:` block");
-                    let lower = (win.lower.into, win.lower.name.clone(), win.render_lower(w));
-                    let upper_rendered = win.render_upper(w)?;
-                    let upper = (win.upper.into, win.upper.name.clone(), upper_rendered);
-                    *self.window_binds.lock().await = vec![lower, upper];
+                    *self.window_binds.lock().await = win
+                        .render_binds(w)?
+                        .into_iter()
+                        .map(|(bind, rendered)| ResolvedBind::window(bind, rendered))
+                        .collect();
                 }
 
                 // The bookmark this pass persists on its final page: the window's
@@ -1143,18 +1293,12 @@ impl RestStream {
                     // Client-side incremental filter. Skipped for windowed passes:
                     // the server already bounds each window, and filtering by the
                     // overall start would drop `lookback` rows that fall before it.
-                    let records = if !windowed
+                    let filtered = !windowed
                         && self.config.replication_method == ReplicationMethod::Incremental
-                    {
-                        if let (Some(key), Some(start)) =
-                            (&self.config.replication_key, effective_start.as_ref())
-                        {
-                            filter_incremental(raw_records, key, start)
-                        } else {
-                            raw_records
-                        }
-                    } else {
-                        raw_records
+                        && effective_start.is_some();
+                    let records = match effective_start.as_ref() {
+                        Some(start) if filtered => self.filter_incremental_page(raw_records, start)?,
+                        _ => raw_records,
                     };
 
                     // Track the running max replication value across pages so the
@@ -1175,11 +1319,7 @@ impl RestStream {
                             Some(path) => faucet_core::util::extract_records(&body, Some(path))
                                 .ok()
                                 .and_then(|vs| vs.into_iter().next()),
-                            None => self
-                                .config
-                                .replication_key
-                                .as_deref()
-                                .and_then(|key| max_replication_value(&records, key).cloned()),
+                            None => self.page_replication_max(&records, !filtered),
                         };
                         if let Some(page_max) = page_max {
                             running_max = Some(match running_max.take() {
@@ -1440,7 +1580,7 @@ impl RestStream {
     /// Resolve the server-side push-down binding for this run:
     /// `(target, name, rendered-value)`. Returns `None` when no `replication_bind`
     /// is configured or there is no bookmark yet (first run — a full pull).
-    async fn resolved_bind(&self) -> Result<Option<(BindTarget, String, String)>, FaucetError> {
+    async fn resolved_bind(&self) -> Result<Option<ResolvedBind>, FaucetError> {
         let Some(bind) = &self.config.replication_bind else {
             return Ok(None);
         };
@@ -1450,7 +1590,13 @@ impl RestStream {
         }
         .or_else(|| self.config.start_replication_value.clone());
         match bookmark {
-            Some(bm) => Ok(Some((bind.into, bind.name.clone(), bind.render(&bm)?))),
+            Some(bm) => Ok(Some(ResolvedBind {
+                target: bind.into,
+                name: bind.name.clone(),
+                path: bind.path.clone(),
+                value_type: bind.value_type,
+                rendered: bind.render(&bm)?,
+            })),
             None => Ok(None),
         }
     }
@@ -1557,6 +1703,21 @@ impl RestStream {
         // transient network blip fatal to a 30-minute bulk job.
         let resp = req.send().await.map_err(FaucetError::Http)?;
         let status = resp.status();
+        if !status.is_success() && !self.config.retry_on_response.is_empty() {
+            let headers = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            if let Some(e) = self.classify_retry_response(status.as_u16(), &headers, &text) {
+                return Err(e);
+            }
+            return Err(FaucetError::HttpStatus {
+                status: status.as_u16(),
+                url: url.to_string(),
+                body: format!("async_job: {url} returned HTTP {}", status.as_u16()),
+            });
+        }
+        if status.is_success() {
+            self.reset_matcher_hits();
+        }
         if !status.is_success() {
             return Err(FaucetError::HttpStatus {
                 status: status.as_u16(),
@@ -1639,7 +1800,7 @@ impl RestStream {
         if !job.supports_incremental_query() {
             return None;
         }
-        let now = self.now_override.unwrap_or_else(chrono::Utc::now) - job.lookback_duration();
+        let now = self.run_now() - job.lookback_duration();
         Some(Value::String(
             now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         ))
@@ -1760,7 +1921,12 @@ impl RestStream {
         job: &crate::async_job::AsyncJobConfig,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         if !self.config.decode.is_empty() {
-            let records = crate::decode::run_decode(bytes, &self.config.decode).await?;
+            let records = crate::decode::run_decode_with_nulls(
+                bytes,
+                &self.config.decode,
+                &self.config.csv_null_values,
+            )
+            .await?;
             return Ok((records, None));
         }
         match self.config.response_format {
@@ -1775,13 +1941,14 @@ impl RestStream {
                 Ok((records, Some(v)))
             }
             crate::config::ResponseFormat::Csv => {
-                let records = crate::format::parse_csv_with(
+                let records = crate::format::parse_csv_with_nulls(
                     bytes,
                     crate::format::CsvDialect {
                         delimiter: self.config.csv_delimiter,
                         has_headers: self.config.csv_has_headers,
                         quote: self.config.csv_quote,
                     },
+                    &self.config.csv_null_values,
                 )
                 .await?;
                 Ok((records, None))
@@ -1898,7 +2065,7 @@ impl RestStream {
         // #513 server-side push-down + #527 window slicing: the outgoing request
         // carries the bookmark binding (0 or 1) plus the current window's rendered
         // lower/upper bounds (0 or 2). They apply at the same four placement sites.
-        let mut binds: Vec<(BindTarget, String, String)> = Vec::new();
+        let mut binds: Vec<ResolvedBind> = Vec::new();
         if let Some(b) = self.resolved_bind().await? {
             binds.push(b);
         }
@@ -1959,9 +2126,9 @@ impl RestStream {
                 format!("{}/{}", base_url, path.trim_start_matches('/'))
             }
         };
-        for (target, name, rendered) in &binds {
-            if *target == BindTarget::Path {
-                url = url.replace(&format!("{{{name}}}"), rendered);
+        for b in &binds {
+            if b.target == BindTarget::Path {
+                url = url.replace(&format!("{{{}}}", b.name), &b.rendered);
             }
         }
         // #567: substitute flow-captured `${name}` values into the URL (a
@@ -2079,9 +2246,9 @@ impl RestStream {
             insert_header(&mut headers, "Cookie", &cookie)?;
         }
         // #513/#527 header-target bindings.
-        for (target, name, rendered) in &binds {
-            if *target == BindTarget::Header {
-                insert_header(&mut headers, name, rendered)?;
+        for b in &binds {
+            if b.target == BindTarget::Header {
+                insert_header(&mut headers, &b.name, &b.rendered)?;
             }
         }
 
@@ -2136,16 +2303,26 @@ impl RestStream {
                 .collect();
             req = req.query(&pairs);
         }
-        // #513/#527 query-target bindings.
-        for (target, name, rendered) in &binds {
-            if *target == BindTarget::Query {
-                req = req.query(&[(name.as_str(), rendered.as_str())]);
+        // #513/#527 query-target bindings — first requests only. A server-given
+        // next-page URL already carries the filter from the first request, so
+        // re-appending it duplicates (or, per window, contradicts) it and some
+        // APIs reject any extra filter next to their page token (#749). Auth
+        // placements (flow provider, ApiKeyQuery) are still sent on every page.
+        for b in binds.iter().filter(|_| !use_override) {
+            if b.target == BindTarget::Query {
+                req = req.query(&[(b.name.as_str(), b.rendered.as_str())]);
             }
         }
 
         // ApiKeyQuery: inject the API key as a query parameter.
+        // A next-page link that already echoes the key keeps its single copy.
         if let AuthSpec::Inline(Auth::ApiKeyQuery { param, value }) = &self.config.auth {
-            req = req.query(&[(param.as_str(), value.as_str())]);
+            let echoed = use_override
+                && reqwest::Url::parse(&url)
+                    .is_ok_and(|u| u.query_pairs().any(|(k, _)| k == param.as_str()));
+            if !echoed {
+                req = req.query(&[(param.as_str(), value.as_str())]);
+            }
         }
 
         // Build the request JSON body, if any. Substitute context into body
@@ -2181,9 +2358,13 @@ impl RestStream {
         if !body_params.is_empty() {
             let obj = body_value.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
             match obj.as_object_mut() {
-                Some(map) => {
+                Some(_) => {
                     for (field, value) in body_params {
-                        map.insert(field.clone(), value.clone());
+                        if field.starts_with('/') {
+                            faucet_core::set_body_pointer(obj, field, value.clone())?;
+                        } else if let Some(map) = obj.as_object_mut() {
+                            map.insert(field.clone(), value.clone());
+                        }
                     }
                 }
                 None => {
@@ -2196,7 +2377,7 @@ impl RestStream {
             }
         }
         // #511 body-field placements + #513/#527 body-target bindings.
-        let has_body_bind = binds.iter().any(|(t, _, _)| *t == BindTarget::Body);
+        let has_body_bind = binds.iter().any(|b| b.target == BindTarget::Body);
         if !ra_body.is_empty() || has_body_bind {
             let obj = body_value.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
             match obj.as_object_mut() {
@@ -2204,9 +2385,15 @@ impl RestStream {
                     for (name, value) in &ra_body {
                         map.insert(name.clone(), Value::String(value.clone()));
                     }
-                    for (target, name, rendered) in &binds {
-                        if *target == BindTarget::Body {
-                            map.insert(name.clone(), Value::String(rendered.clone()));
+                    for b in binds.iter().filter(|b| b.target == BindTarget::Body) {
+                        let value = b.value_type.to_value(&b.rendered)?;
+                        match &b.path {
+                            Some(pointer) => faucet_core::set_body_pointer(obj, pointer, value)?,
+                            None => {
+                                if let Some(map) = obj.as_object_mut() {
+                                    map.insert(b.name.clone(), value);
+                                }
+                            }
                         }
                     }
                 }
@@ -2233,6 +2420,22 @@ impl RestStream {
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let wait = parse_retry_after(resp.headers());
             return Err(FaucetError::RateLimited(wait));
+        }
+
+        // #756: throttling signalled by another status + a body/header marker.
+        // Checked before `tolerated_http_errors`; the body read here is reused
+        // for the error below.
+        if !status.is_success() && !self.config.retry_on_response.is_empty() {
+            let headers = resp.headers().clone();
+            let resp_url = redact_error_url(resp.url(), &self.config.auth);
+            let text = resp.text().await.unwrap_or_default();
+            if let Some(e) = self.classify_retry_response(status.as_u16(), &headers, &text) {
+                return Err(e);
+            }
+            if is_first_page && self.config.tolerated_http_errors.contains(&status.as_u16()) {
+                return Ok((Value::Array(vec![]), HeaderMap::new()));
+            }
+            return Err(http_status_error(status.as_u16(), resp_url, text));
         }
 
         // Tolerated errors: treat as an empty page ONLY on the first request,
@@ -2268,22 +2471,14 @@ impl RestStream {
             // any 4xx/5xx (audit #321 L2).
             let resp_url = redact_error_url(resp.url(), &self.config.auth);
             let body_text = resp.text().await.unwrap_or_default();
-            // Truncate very long error bodies to avoid bloating logs/errors.
-            let truncated = if body_text.len() > 1024 {
-                // Find a safe UTF-8 boundary at or before 1024 bytes.
-                let end = body_text.floor_char_boundary(1024);
-                format!("{}...(truncated)", &body_text[..end])
-            } else {
-                body_text
-            };
-            return Err(FaucetError::HttpStatus {
-                status: status.as_u16(),
-                url: resp_url,
-                body: truncated,
-            });
+            return Err(http_status_error(status.as_u16(), resp_url, body_text));
         }
+        self.reset_matcher_hits();
 
-        let resp_headers = resp.headers().clone();
+        let mut resp_headers = resp.headers().clone();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(resp.url().as_str()) {
+            resp_headers.insert(crate::url_util::REQUEST_URL_HEADER, v);
+        }
 
         // A 204 No Content — or any 2xx with an empty / whitespace-only body —
         // carries no JSON to parse. `resp.json()` on such a response yields a
@@ -2303,7 +2498,12 @@ impl RestStream {
         // `none`. The records land as an array the downstream
         // (records_path-less) extraction passes straight through.
         if !self.config.decode.is_empty() {
-            let records = crate::decode::run_decode(&bytes, &self.config.decode).await?;
+            let records = crate::decode::run_decode_with_nulls(
+                &bytes,
+                &self.config.decode,
+                &self.config.csv_null_values,
+            )
+            .await?;
             return Ok((Value::Array(records), resp_headers));
         }
         // For file response formats the whole body is a tabular file — parse it
@@ -2313,13 +2513,14 @@ impl RestStream {
         let body: Value = match self.config.response_format {
             crate::config::ResponseFormat::Json => serde_json::from_slice(&bytes)?,
             crate::config::ResponseFormat::Csv => Value::Array(
-                crate::format::parse_csv_with(
+                crate::format::parse_csv_with_nulls(
                     &bytes,
                     crate::format::CsvDialect {
                         delimiter: self.config.csv_delimiter,
                         has_headers: self.config.csv_has_headers,
                         quote: self.config.csv_quote,
                     },
+                    &self.config.csv_null_values,
                 )
                 .await?,
             ),
@@ -2366,6 +2567,18 @@ fn redact_error_url(url: &reqwest::Url, auth: &AuthSpec<Auth>) -> String {
 /// **or** an HTTP-date; we honour both. An HTTP-date in the past yields a zero
 /// wait (retry now). Falls back to 60 s only when the header is absent or in
 /// neither form.
+/// A non-2xx data-page error carrying the server's message, truncated to keep
+/// logs bounded.
+fn http_status_error(status: u16, url: String, body: String) -> FaucetError {
+    let body = if body.len() > 1024 {
+        let end = body.floor_char_boundary(1024);
+        format!("{}...(truncated)", &body[..end])
+    } else {
+        body
+    };
+    FaucetError::HttpStatus { status, url, body }
+}
+
 fn parse_retry_after(headers: &HeaderMap) -> Duration {
     const DEFAULT: Duration = Duration::from_secs(60);
     let Some(raw) = headers
@@ -2437,17 +2650,18 @@ impl faucet_core::Source for RestStream {
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let records = self.fetch_with_context(context).await?;
-        let bookmark = self
-            .config
-            .replication_key
-            .as_deref()
-            .and_then(|key| faucet_core::replication::max_replication_value(&records, key))
-            .cloned();
+        let bookmark = self.page_replication_max(&records, false);
         Ok((records, bookmark))
     }
 
     fn connector_name(&self) -> &'static str {
         "rest"
+    }
+
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        if let Ok(mut g) = self.run_clock.lock() {
+            *g = Some(now);
+        }
     }
 
     fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
@@ -2699,8 +2913,12 @@ impl faucet_core::Source for RestStream {
                     .bytes_stream()
                     .map_err(std::io::Error::other);
                 let reader = tokio_util::io::StreamReader::new(body);
-                let ndjson_chunks =
-                    crate::format::csv_reader_to_ndjson_stream(reader, delimiter, has_headers);
+                let ndjson_chunks = crate::format::csv_reader_to_ndjson_stream_with_nulls(
+                    reader,
+                    delimiter,
+                    has_headers,
+                    self.config.csv_null_values.clone(),
+                );
                 yield faucet_core::NativeBatch {
                     format: faucet_core::NativeFormat::NdJson,
                     payload: faucet_core::NativePayload::Stream(Box::pin(ndjson_chunks)),
@@ -2798,10 +3016,11 @@ impl faucet_core::Source for RestStream {
                 let quote = self.config.csv_quote;
                 let body = resp.bytes_stream().map_err(std::io::Error::other);
                 let reader = tokio_util::io::StreamReader::new(body);
-                let batches = crate::format::csv_reader_to_record_batches_with(
+                let batches = crate::format::csv_reader_to_record_batches_with_nulls(
                     reader,
                     crate::format::CsvDialect { delimiter, has_headers, quote },
                     rows_per_batch,
+                    self.config.csv_null_values.clone(),
                 );
                 futures::pin_mut!(batches);
                 use futures::StreamExt as _;
@@ -2938,6 +3157,20 @@ impl RestStream {
     /// Authed GET for a discovery probe, returning the response body as text.
     /// Shared by the OData `$metadata` and Salesforce `/sobjects` paths.
     async fn discover_get_text(&self, url: &str, what: &str) -> Result<String, FaucetError> {
+        if self.config.retry_on_response.is_empty() {
+            return self.discover_get_text_once(url, what).await;
+        }
+        // Only a `retry_on_response` match (a rate limit) is retried here.
+        retry::execute_with_retry_recorded(
+            0,
+            self.retry_policy.base,
+            self.roundtrips.get().cloned(),
+            || self.discover_get_text_once(url, what),
+        )
+        .await
+    }
+
+    async fn discover_get_text_once(&self, url: &str, what: &str) -> Result<String, FaucetError> {
         // Static config headers (#539) form the base; auth is applied on top.
         let mut headers = self.static_headers.clone();
         for (k, v) in self.metadata_headers(url).await?.iter() {
@@ -2953,11 +3186,19 @@ impl RestStream {
             .map_err(|e| FaucetError::Source(format!("rest: {what} request failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
+            if !self.config.retry_on_response.is_empty() {
+                let headers = resp.headers().clone();
+                let text = resp.text().await.unwrap_or_default();
+                if let Some(e) = self.classify_retry_response(status.as_u16(), &headers, &text) {
+                    return Err(e);
+                }
+            }
             return Err(FaucetError::Source(format!(
                 "rest: {what} returned HTTP {}",
                 status.as_u16()
             )));
         }
+        self.reset_matcher_hits();
         resp.text()
             .await
             .map_err(|e| FaucetError::Source(format!("rest: reading {what} failed: {e}")))

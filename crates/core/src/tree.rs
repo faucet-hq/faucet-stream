@@ -58,6 +58,23 @@ pub struct ColumnsSpec {
     pub value: String,
 }
 
+impl Default for ColumnsSpec {
+    fn default() -> Self {
+        Self {
+            from: String::new(),
+            header: None,
+            header_label: None,
+            value: default_value_field(),
+        }
+    }
+}
+
+impl ColumnsSpec {
+    fn is_unset(&self) -> bool {
+        self.from.trim().is_empty()
+    }
+}
+
 /// Which ancestor labels to carry down onto each emitted row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -88,8 +105,17 @@ pub struct TreeFlattenSpec {
     /// carrying `<name>` is a leaf even if it also has children).
     #[serde(default = "default_leaf")]
     pub leaf: String,
-    /// How the value columns are read from a leaf.
+    /// How the value columns are read from a leaf. Set exactly one of
+    /// `columns` or `groups`.
+    #[serde(default, skip_serializing_if = "ColumnsSpec::is_unset")]
     pub columns: ColumnsSpec,
+    /// Several positional cell arrays per leaf, each named by its own header
+    /// list (#746) — the `zip_columns` `groups` shape. Each group needs a
+    /// `header`; the groups' columns are merged into one row, and a width
+    /// mismatch, a missing cell array or a column two groups both name fails
+    /// the page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ColumnsSpec>,
     /// Ancestor/group labels carried onto every row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ancestors: Option<AncestorsSpec>,
@@ -116,11 +142,22 @@ impl TreeFlattenSpec {
         CompiledTreeFlatten::compile(self)
     }
 
-    /// Compile and wrap as a [`TransformStage::Custom`] (1→0..N).
+    /// Compile and wrap as a [`TransformStage::Custom`] (1→0..N). With
+    /// `groups` the stage is a [`TransformStage::PageFn`], so a record that
+    /// cannot be zipped fails the page instead of passing through.
     pub fn into_stage(&self) -> Result<TransformStage, FaucetError> {
         let compiled = self.compile()?;
-        Ok(TransformStage::Custom(Arc::new(move |rec| {
-            compiled.apply(rec)
+        if compiled.spec.groups.is_empty() {
+            return Ok(TransformStage::Custom(Arc::new(move |rec| {
+                compiled.apply(rec)
+            })));
+        }
+        Ok(TransformStage::PageFn(Arc::new(move |page: Vec<Value>| {
+            let mut out = Vec::with_capacity(page.len());
+            for rec in page {
+                out.extend(compiled.try_apply(rec)?);
+            }
+            Ok(out)
         })))
     }
 }
@@ -145,10 +182,22 @@ impl CompiledTreeFlatten {
                 "tree_flatten: `children` must be non-empty".to_owned(),
             ));
         }
-        if spec.columns.from.trim().is_empty() {
+        if spec.groups.is_empty() && spec.columns.is_unset() {
             return Err(FaucetError::Transform(
                 "tree_flatten: `columns.from` must be non-empty".to_owned(),
             ));
+        }
+        if !spec.groups.is_empty() && !spec.columns.is_unset() {
+            return Err(FaucetError::Transform(
+                "tree_flatten: set exactly one of `columns` or `groups`".to_owned(),
+            ));
+        }
+        for (i, g) in spec.groups.iter().enumerate() {
+            if g.is_unset() || g.header.as_deref().is_none_or(|h| h.trim().is_empty()) {
+                return Err(FaucetError::Transform(format!(
+                    "tree_flatten: group {i} needs a non-empty `from` and `header`"
+                )));
+            }
         }
         if spec.max_depth == 0 {
             return Err(FaucetError::Transform(
@@ -178,36 +227,44 @@ impl CompiledTreeFlatten {
 
     /// Flatten one record (a report) into 0..N leaf rows. Non-object records and
     /// records with no resolvable root pass through unchanged (never silently
-    /// dropped).
+    /// dropped). With `groups`, a record that cannot be zipped (see
+    /// [`try_apply`](Self::try_apply)) is also passed through, with an error
+    /// logged; the pipeline stage uses `try_apply` and fails instead.
     pub fn apply(&self, rec: Value) -> Vec<Value> {
-        if !rec.is_object() {
-            return vec![rec];
+        match self.flatten(&rec) {
+            Ok(Some(rows)) => rows,
+            Ok(None) => vec![rec],
+            Err(e) => {
+                tracing::error!(error = %e, "tree_flatten: record passed through unflattened");
+                vec![rec]
+            }
         }
-        // Header labels for naming value columns.
-        let header_labels: Vec<String> = self
-            .spec
-            .columns
-            .header
-            .as_deref()
-            .and_then(|h| path_get(&rec, h))
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(|el| self.header_label(el))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    }
+
+    /// [`apply`](Self::apply), failing on a record whose `groups` cannot be
+    /// zipped: a leaf missing a group's cell array, a group whose width differs
+    /// from its header count, or a column two groups both name.
+    pub fn try_apply(&self, rec: Value) -> Result<Vec<Value>, FaucetError> {
+        Ok(self.flatten(&rec)?.unwrap_or_else(|| vec![rec]))
+    }
+
+    /// `Ok(None)` = pass the record through unchanged.
+    fn flatten(&self, rec: &Value) -> Result<Option<Vec<Value>>, FaucetError> {
+        if !rec.is_object() {
+            return Ok(None);
+        }
+        let sources = self.column_sources(rec)?;
 
         // Resolve the root node list. A root that resolves to an (even empty)
         // array/node is used as-is — an empty report yields zero rows. Only a
         // *missing* root path passes the record through (never silently dropped).
         let roots: Vec<&Value> = match &self.spec.root {
-            Some(path) => match path_get(&rec, path) {
+            Some(path) => match path_get(rec, path) {
                 Some(Value::Array(a)) => a.iter().collect(),
                 Some(v) => vec![v],
-                None => return vec![rec],
+                None => return Ok(None),
             },
-            None => vec![&rec],
+            None => vec![rec],
         };
 
         let mut out: Vec<Value> = Vec::new();
@@ -218,21 +275,68 @@ impl CompiledTreeFlatten {
                 node,
                 &mut ancestors,
                 0,
-                &header_labels,
+                &sources,
                 &mut out,
                 &mut depth_exceeded,
-            );
+            )?;
         }
-        out
+        Ok(Some(out))
     }
 
-    fn header_label(&self, el: &Value) -> String {
-        if let Some(field) = &self.spec.columns.header_label
-            && let Some(v) = path_get(el, field)
-        {
-            return scalar_string(v);
+    /// Each column source with its header labels. `columns` is lenient
+    /// (unnamed cells become `col_<i>`); every group is strict.
+    fn column_sources<'s>(
+        &'s self,
+        rec: &Value,
+    ) -> Result<Vec<(&'s ColumnsSpec, Vec<String>)>, FaucetError> {
+        if self.spec.groups.is_empty() {
+            let labels = self
+                .spec
+                .columns
+                .header
+                .as_deref()
+                .and_then(|h| path_get(rec, h))
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|el| header_label(&self.spec.columns, el))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(vec![(&self.spec.columns, labels)]);
         }
-        scalar_string(el)
+        let mut owner: Map<String, Value> = Map::new();
+        let mut out = Vec::with_capacity(self.spec.groups.len());
+        for g in &self.spec.groups {
+            let header = g.header.as_deref().unwrap_or_default();
+            let labels: Vec<String> = path_get(rec, header)
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    FaucetError::Transform(format!(
+                        "tree_flatten: group '{}': header `{header}` is not an array",
+                        g.from
+                    ))
+                })?
+                .iter()
+                .map(|el| header_label(g, el))
+                .collect();
+            for n in &labels {
+                if let Some(Value::String(prev)) =
+                    owner.insert(n.clone(), Value::String(g.from.clone()))
+                {
+                    let which = if prev == g.from {
+                        format!("group '{prev}' names it twice")
+                    } else {
+                        format!("groups '{prev}' and '{}' both name it", g.from)
+                    };
+                    return Err(FaucetError::Transform(format!(
+                        "tree_flatten: duplicate column '{n}': {which}"
+                    )));
+                }
+            }
+            out.push((g, labels));
+        }
+        Ok(out)
     }
 
     fn is_leaf(&self, node: &Value, has_children: bool) -> bool {
@@ -248,10 +352,10 @@ impl CompiledTreeFlatten {
         node: &Value,
         ancestors: &mut Vec<Value>,
         depth: usize,
-        header_labels: &[String],
+        sources: &[(&ColumnsSpec, Vec<String>)],
         out: &mut Vec<Value>,
         depth_exceeded: &mut bool,
-    ) {
+    ) -> Result<(), FaucetError> {
         if depth >= self.spec.max_depth {
             if !*depth_exceeded {
                 *depth_exceeded = true;
@@ -260,19 +364,21 @@ impl CompiledTreeFlatten {
                     "tree_flatten: max_depth exceeded — branch truncated (malformed or cyclic tree?)"
                 );
             }
-            return;
+            return Ok(());
         }
         let children = path_get(node, &self.spec.children).and_then(Value::as_array);
         let has_children = children.is_some_and(|c| !c.is_empty());
         let leaf = self.is_leaf(node, has_children);
+        let group_row =
+            self.spec.emit_group_rows && sources.iter().any(|(c, _)| node_has_cells(node, &c.from));
 
-        if (leaf || (self.spec.emit_group_rows && node_has_cells(node, &self.spec.columns.from)))
-            && let Some(row) = self.emit_row(node, ancestors, header_labels)
+        if (leaf || group_row)
+            && let Some(row) = self.emit_row(node, ancestors, sources, out.len())?
         {
             out.push(row);
         }
 
-        if has_children {
+        if let Some(children) = children.filter(|c| !c.is_empty()) {
             // Push this node's label, recurse, pop.
             let label = self
                 .spec
@@ -281,26 +387,21 @@ impl CompiledTreeFlatten {
                 .and_then(|a| path_get(node, &a.field).cloned())
                 .unwrap_or(Value::Null);
             ancestors.push(label);
-            for child in children.unwrap() {
-                self.walk(
-                    child,
-                    ancestors,
-                    depth + 1,
-                    header_labels,
-                    out,
-                    depth_exceeded,
-                );
+            for child in children {
+                self.walk(child, ancestors, depth + 1, sources, out, depth_exceeded)?;
             }
             ancestors.pop();
         }
+        Ok(())
     }
 
     fn emit_row(
         &self,
         node: &Value,
         ancestors: &[Value],
-        header_labels: &[String],
-    ) -> Option<Value> {
+        sources: &[(&ColumnsSpec, Vec<String>)],
+        row_index: usize,
+    ) -> Result<Option<Value>, FaucetError> {
         let mut row = Map::new();
 
         // Ancestor columns.
@@ -324,18 +425,35 @@ impl CompiledTreeFlatten {
             row.insert(path_col.clone(), Value::String(joined));
         }
 
-        // Value columns from the leaf's cell array.
-        let cells = path_get(node, &self.spec.columns.from).and_then(Value::as_array);
+        // Value columns from the node's cell array(s).
+        let strict = !self.spec.groups.is_empty();
         let mut all_empty = true;
-        if let Some(cells) = cells {
-            for (i, cell) in cells.iter().enumerate() {
-                let value = path_get(cell, &self.spec.columns.value)
+        for (spec, labels) in sources {
+            let cells = path_get(node, &spec.from).and_then(Value::as_array);
+            if strict {
+                let Some(cells) = cells else {
+                    return Err(FaucetError::Transform(format!(
+                        "tree_flatten: row {row_index} has no `{}` array (group '{}')",
+                        spec.from, spec.from
+                    )));
+                };
+                if cells.len() != labels.len() {
+                    return Err(FaucetError::Transform(format!(
+                        "tree_flatten: row {row_index}, group '{}': {} cell(s) but {} header(s)",
+                        spec.from,
+                        cells.len(),
+                        labels.len()
+                    )));
+                }
+            }
+            for (i, cell) in cells.into_iter().flatten().enumerate() {
+                let value = path_get(cell, &spec.value)
                     .cloned()
                     .unwrap_or_else(|| cell.clone());
                 if !is_empty_value(&value) {
                     all_empty = false;
                 }
-                let name = header_labels
+                let name = labels
                     .get(i)
                     .cloned()
                     .filter(|s| !s.is_empty())
@@ -345,10 +463,19 @@ impl CompiledTreeFlatten {
         }
 
         if self.spec.drop_empty && all_empty {
-            return None;
+            return Ok(None);
         }
-        Some(Value::Object(row))
+        Ok(Some(Value::Object(row)))
     }
+}
+
+fn header_label(spec: &ColumnsSpec, el: &Value) -> String {
+    if let Some(field) = &spec.header_label
+        && let Some(v) = path_get(el, field)
+    {
+        return scalar_string(v);
+    }
+    scalar_string(el)
 }
 
 fn node_has_cells(node: &Value, from: &str) -> bool {
@@ -424,6 +551,7 @@ mod tests {
                 header_label: Some("ColTitle".to_owned()),
                 value: "value".to_owned(),
             },
+            groups: vec![],
             ancestors: Some(AncestorsSpec {
                 field: "Header.ColData[0].value".to_owned(),
                 as_names: vec!["section".to_owned(), "subsection".to_owned()],
@@ -645,5 +773,140 @@ mod tests {
     fn into_stage_produces_a_custom_stage() {
         let stage = spec().into_stage().unwrap();
         assert!(matches!(stage, TransformStage::Custom(_)));
+    }
+
+    /// #746: a leaf carrying two positional cell arrays, each named by its own
+    /// header list.
+    fn grouped() -> TreeFlattenSpec {
+        serde_json::from_value(json!({
+            "root": "rows",
+            "children": "rows",
+            "groups": [
+                {"from": "dims", "header": "dimHeaders", "header_label": "name"},
+                {"from": "mets", "header": "metHeaders", "header_label": "name"}
+            ],
+            "ancestors": {"field": "label", "as": ["section"]}
+        }))
+        .unwrap()
+    }
+
+    fn grouped_report() -> Value {
+        json!({
+            "dimHeaders": [{"name": "date"}, {"name": "country"}],
+            "metHeaders": [{"name": "sessions"}],
+            "rows": [
+                {"label": "Web", "rows": [
+                    {"dims": [{"value": "20260901"}, {"value": "DE"}], "mets": [{"value": "12"}]},
+                    {"dims": [{"value": "20260902"}, {}], "mets": [{"value": "7"}]}
+                ]}
+            ]
+        })
+    }
+
+    #[test]
+    fn groups_merge_into_one_row_per_leaf() {
+        let c = grouped().compile().unwrap();
+        let out = c.try_apply(grouped_report()).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                json!({"section": "Web", "date": "20260901", "country": "DE", "sessions": "12"}),
+                json!({"section": "Web", "date": "20260902", "country": {}, "sessions": "7"}),
+            ]
+        );
+        assert_eq!(c.apply(grouped_report()), out);
+    }
+
+    #[test]
+    fn groups_fail_loudly_and_apply_passes_through() {
+        let c = grouped().compile().unwrap();
+        let err = |r: Value| c.try_apply(r).unwrap_err().to_string();
+
+        let mut r = grouped_report();
+        r["rows"][0]["rows"][1]["mets"] = json!([]);
+        let e = err(r.clone());
+        assert!(
+            e.contains("row 1, group 'mets': 0 cell(s) but 1 header(s)"),
+            "{e}"
+        );
+        assert_eq!(c.apply(r.clone()), vec![r]);
+
+        let mut r = grouped_report();
+        r["rows"][0]["rows"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("dims");
+        assert!(err(r).contains("row 0 has no `dims` array"));
+
+        let mut r = grouped_report();
+        r["metHeaders"][0]["name"] = json!("date");
+        let e = err(r);
+        assert!(
+            e.contains("duplicate column 'date'") && e.contains("'dims' and 'mets'"),
+            "{e}"
+        );
+
+        let mut r = grouped_report();
+        r["dimHeaders"][1]["name"] = json!("date");
+        assert!(err(r).contains("group 'dims' names it twice"));
+
+        let mut r = grouped_report();
+        r["metHeaders"] = json!("sessions");
+        assert!(err(r).contains("group 'mets': header `metHeaders` is not an array"));
+
+        // Non-objects and a missing root still pass through.
+        assert_eq!(c.try_apply(json!(7)).unwrap(), vec![json!(7)]);
+        let bare = json!({"dimHeaders": [], "metHeaders": []});
+        assert_eq!(c.try_apply(bare.clone()).unwrap(), vec![bare]);
+    }
+
+    #[test]
+    fn groups_compile_validation_and_stage() {
+        let bad = |v: Value| {
+            serde_json::from_value::<TreeFlattenSpec>(v)
+                .unwrap()
+                .compile()
+                .unwrap_err()
+                .to_string()
+        };
+        let g = json!({"from": "a", "header": "h"});
+        assert!(bad(json!({"children": "rows"})).contains("`columns.from`"));
+        assert!(
+            bad(json!({"children": "rows", "columns": {"from": "c"}, "groups": [g]}))
+                .contains("exactly one")
+        );
+        assert!(bad(json!({"children": "rows", "groups": [{"from": "a"}]})).contains("group 0"));
+        assert!(
+            bad(json!({"children": "rows", "groups": [{"from": "a", "header": " "}]}))
+                .contains("group 0")
+        );
+        let s = grouped();
+        let back: TreeFlattenSpec =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        assert!(serde_json::to_value(&s).unwrap().get("columns").is_none());
+
+        match s.into_stage().unwrap() {
+            TransformStage::PageFn(f) => {
+                assert_eq!(f(vec![grouped_report()]).unwrap().len(), 2);
+                let mut r = grouped_report();
+                r["rows"][0]["rows"][0]["mets"] = json!([]);
+                assert!(f(vec![r]).is_err());
+            }
+            other => panic!("expected PageFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_rows_count_any_groups_cells() {
+        let mut s = grouped();
+        s.emit_group_rows = true;
+        let c = s.compile().unwrap();
+        let mut r = grouped_report();
+        r["rows"][0]["dims"] = json!([{"value": "total"}, {"value": "*"}]);
+        r["rows"][0]["mets"] = json!([{"value": "19"}]);
+        let out = c.try_apply(r).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["sessions"], json!("19"));
     }
 }

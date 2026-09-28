@@ -126,6 +126,8 @@ the secrets/redaction boundary like any other config string.
 ```yaml
 # OffsetInBody — POST-query APIs that carry offset/limit in the JSON body.
 pagination: { type: OffsetInBody, offset_field: offset, limit_field: limit, limit: 500, stop_when_short: true }
+# Report APIs (one record per response): count `rows_path` matches and stop at `total_path`.
+pagination: { type: OffsetInBody, offset_field: offset, limit_field: limit, limit: 10000, rows_path: "$.rows", total_path: "$.rowCount" }
 
 # RecordFieldCursor — keyset: page by the running max (or min) of a record field.
 pagination: { type: RecordFieldCursor, field: JournalNumber, into: query, param: offset, agg: max, page_size: 100, stop_when_short: true }
@@ -162,6 +164,7 @@ record_ancestors: { event_id: id, event_created: created }
 | `max_retries` | int | `3` | Max retries on transient failures. |
 | `retry_backoff` | int (seconds) | `1` | Base for exponential backoff. Per-attempt sleep is `retry_backoff × 2^attempt`, **capped at 60 s** and scaled by random jitter in `[0.5, 1.5)` (decorrelated across concurrent retries). On `429`, the server's `Retry-After` (delta-seconds **or** an RFC 7231 HTTP-date) is honoured instead. |
 | `tolerated_http_errors` | array<int> | `[]` | HTTP status codes treated as an empty page **on the first request only**. Mid-pagination, a tolerated status surfaces as an error instead of silently ending the stream (otherwise a transient failure on page _N_ would drop every later page as a "successful" run). Only safe for genuinely-empty resources. |
+| `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), and optional `backoff_secs` (fixed wait; else `Retry-After`, else the exponential `retry_backoff`). A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests and discovery requests. After `max_retries` consecutive matches the original error (status + body) is surfaced. A non-JSON body never matches. |
 
 **Throttling is metered (#734):** every `429` counts in `faucet_source_throttled_total`, the time actually slept on it (not the header's value — a cancelled sleep records the partial wait) in `faucet_source_throttle_wait_seconds`, and every retry by class in `faucet_source_retries_total{class}`. The totals land on the run's usage record, so `faucet run` / `faucet usage` print `throttled 312× · waited 41 min`, and a run that spent more than 10 % of its time rate-limited logs a warning. See [source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html#source-side-throttling).
 
@@ -176,6 +179,7 @@ By default the REST source parses a **JSON** body and extracts records via `reco
 | `response_format` | `json` \| `csv` \| `excel` | `json` | How to parse the body. `csv`/`excel` parse a whole tabular file into records. `excel` requires the crate's `excel` feature. |
 | `csv_delimiter` | int (byte) / char | `,` | CSV field delimiter. `response_format: csv` only. |
 | `csv_has_headers` | bool | `true` | Whether the first CSV row supplies field names (else `column_0`, `column_1`, …). `csv` only. |
+| `csv_null_values` | list of strings | `[]` | CSV fields equal to any listed string decode as JSON `null` rather than a string — on the `Value`, native NDJSON, columnar and streaming decode paths alike. Salesforce Bulk API 2.0 writes a null as an empty field, so set `[""]` for it; list sentinels such as `"NULL"` / `"#N/A"` for other APIs. Headers are never mapped, and a quoted empty field maps like an unquoted one. Applies to `response_format: csv` and to a `parse: { format: csv }` decode step; set anywhere else it is a config error. |
 | `excel_sheet` | string / null | first sheet | Worksheet name, or a 0-based index as a string. `excel` only. |
 | `excel_header_row` | int | `0` | 0-based index of the Excel header row. `excel` only. |
 
@@ -204,7 +208,8 @@ Because the REST source keeps its own `429`/`Retry-After`-aware retry runner, it
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `replication_method` | `{ type: FullTable \| Incremental }` | `FullTable` | `FullTable` fetches all records; `Incremental` filters by bookmark. |
-| `replication_key` | string / null | `null` | Record **field name** (not a JSONPath) used for incremental bookmarking. |
+| `replication_key` | string / null | `null` | Field used for incremental bookmarking: a top-level name (`updated_at`), a dot path into nested objects (`fields.updated`, `items.0.date` — a literal top-level field of that exact name wins), or a JSON Pointer (`/fields/updated`) for names containing dots. Not a JSONPath. With `async_job`, it is injected into the submit query verbatim, so use a field name or a dotted relationship path there. |
+| `on_missing_key` | `keep \| drop \| fail` | `keep` | A record whose key is missing or `null` is kept (default), dropped, or fails the run. Kept and dropped records are counted in `faucet_source_replication_key_missing_total` and warned about once per run — never dropped silently. |
 | `start_replication_value` | JSON / null | `null` | Bookmark value; records where `record[replication_key] <= start_replication_value` are filtered out in `Incremental` mode. |
 | `state_key` | string / null | `null` | Stable key used by `Pipeline::with_state_store` to persist this stream's bookmark across runs. See [Resume & state](#resume--state). |
 
@@ -218,13 +223,15 @@ net). Requires `replication_method: incremental` + `replication_key`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `into` | `query \| header \| body \| path` | `query` | Where to place the rendered bookmark. |
-| `name` | string | — | Query param / header / body-field / path-placeholder name. |
+| `name` | string | — | Query param / header / top-level body-field / path-placeholder name. Omit it for `into: body` with a `path`. |
+| `path` | string / null | `null` | `into: body` only: an RFC 6901 JSON Pointer into the configured `body` (`/filterGroups/0/filters/0/value`) instead of a top-level `name`. Set exactly one of `name` / `path`. The pointer must resolve to an existing scalar (or `null`), or to a new key of an existing object — array elements and intermediate objects are never created, and an unresolvable pointer fails the request naming it. Requires a JSON object `body`; two binds may not write the same pointer. |
+| `value_type` | `string \| number` | `string` | JSON type a body bind writes — `number` for an `epoch_ms` / `epoch_s` value an API wants unquoted. |
 | `template` | string | `${bookmark}` | Rendered with `${bookmark}` → the formatted value, e.g. `"gte\|${bookmark}"`, `"[${bookmark} TO *]"`. |
 | `format` | `raw \| iso8601 \| epoch_s \| epoch_ms \| date` | `raw` | Value formatting (string↔epoch conversion via a parsed instant). |
 | `advance_from` | string / null | `null` | JSONPath into the **response** to advance the bookmark from, instead of `max(record[replication_key])`. |
 
 ```yaml
-replication_method: { type: incremental }
+replication_method: { type: Incremental }
 replication_key: updated_at
 start_replication_value: "2024-01-01T00:00:00Z"
 replication_bind:
@@ -233,6 +240,48 @@ replication_bind:
   template: "gte|${bookmark}"
   format: iso8601
 ```
+
+**Next-page links.** With `LinkHeader` / `NextLinkInBody` pagination the
+server's next-page URL is used as given: static `query_params`, query-target
+`replication_bind` values and query-target `window` bounds are sent on the first
+request only, because the link already carries them (Shopify rejects any filter
+next to `page_info`; a duplicated window bound can select the wrong window).
+Credentials are still sent on every page — an `ApiKeyQuery` key is appended
+unless the link already echoes it, and a flow provider's query placements are
+always re-applied. A server that does *not* echo its filter into the link
+degrades to over-fetching on page 2+, which the client-side incremental filter
+then trims — never to data loss. Header / body / path binds are unaffected.
+
+Relative links are resolved per RFC 3986 against the URL of the request that
+returned them: root-relative (`/services/data/v60.0/query/01g…-2000`, Salesforce
+`nextRecordsUrl`), path-relative (`page2`), protocol-relative (`//host/p`) and
+query-only (`?page=2`) links all work, and the loop guard compares resolved
+URLs. A link to a different host is followed (logged at debug) with the same
+credentials, since it came from the authenticated API; an unparseable link
+fails the run naming the path and the value. `async_job` URLs that already
+carry the `base_url` path prefix (`/services/data/v60.0/jobs/…` under
+`base_url: https://x/services/data/v60.0`) no longer duplicate it.
+
+A POST-search API whose filter sits deep in the body (HubSpot CRM search) takes
+the bookmark through a JSON Pointer. The value is written after any
+`${parent.*}` substitution, on the first request and on every paginated one:
+
+```yaml
+method: POST
+body:
+  filterGroups:
+    - filters: [{ propertyName: hs_lastmodifieddate, operator: GTE, value: null }]
+replication_key: updatedAt
+replication_bind:
+  into: body
+  path: /filterGroups/0/filters/0/value
+  format: epoch_ms
+  value_type: number
+```
+
+A windowed report API (GA4 `runReport`) can place both bounds the same way:
+`lower: { into: body, path: /dateRanges/0/startDate, format: date }` and
+`upper: { into: body, path: /dateRanges/0/endDate, format: date }`.
 
 #### Datetime window slicing (`window`)
 
@@ -247,6 +296,13 @@ parity with Airbyte's `DatetimeBasedCursor`. Requires `replication_method:
 incremental` + `replication_key`, and a start bookmark (from a `state:` store or
 `start_replication_value`).
 
+`now` is the **run clock**: `faucet run --clock`, a `faucet schedule` tick's
+time, or a `faucet backfill` unit's start, so a replay fetches the windows it
+would have fetched then (process start when no clock is set). A clock before the
+stored bookmark fetches nothing and keeps the bookmark. The async-job lookback
+bound uses the same clock. Library callers pass it with
+`Source::set_run_clock` or `RestStream::with_run_clock_rfc3339`.
+
 Each boundary is rendered through a `WindowBind` (same placement/formatting as
 `replication_bind`, with the placeholder `${window}`): the `lower` bind renders
 the window start, the `upper` bind the window end.
@@ -255,17 +311,19 @@ the window start, the `upper` bind the window end.
 |-------|------|---------|-------------|
 | `step` | string | — | Window size: `45s` / `30m` / `6h` / `30d` (absolute UTC; `d` = 24h), or a bare integer (= seconds). |
 | `lower` | `WindowBind` | — | Bind rendered with the window **start**. |
-| `upper` | `WindowBind` | — | Bind rendered with the window **end**. |
+| `upper` | `WindowBind` / omitted | — | Bind rendered with the window **end**. Omit it when `lower.template` renders both bounds (`${window.end}`). |
 | `granularity` | string / null | `null` | Subtract from each *rendered* upper bound so `[start, end]` is non-overlapping for inclusive-inclusive APIs (Airbyte `cursor_granularity`). The persisted bookmark stays the true half-open boundary. |
 | `lookback` | string / null | `null` | Re-scan this much *before* the bookmark on the first window, for late-arriving rows. |
 | `max_windows` | integer | `10000` | Safety cap; on overflow the sweep is truncated (logged) and the next run resumes. |
 
 A `WindowBind` has `into` (`query \| header \| body \| path`, default `query`),
 `name`, `template` (default `${window}`, e.g. `"[${window} TO *]"`), and `format`
-(`raw \| iso8601 \| epoch_s \| epoch_ms \| date`).
+(`raw \| iso8601 \| epoch_s \| epoch_ms \| date`). Like `replication_bind`, a
+body window bind may use `path` (a JSON Pointer) instead of `name`, and
+`value_type`.
 
 ```yaml
-replication_method: { type: incremental }
+replication_method: { type: Incremental }
 replication_key: date
 start_replication_value: "2024-01-01"
 window:
@@ -273,6 +331,26 @@ window:
   lookback: 1d
   lower: { into: query, name: start_date, template: "${window}", format: date }
   upper: { into: query, name: end_date,   template: "${window}", format: date }
+```
+
+Some APIs take both bounds in **one** string — the Google Ads query language
+(`segments.date BETWEEN 'a' AND 'b'`), Lucene `date:[a TO b]`, `range=a..b`. Any
+bind's template may use `${window.start}` and `${window.end}` (the end is
+granularity-adjusted, like `upper`); `${window}` stays "this bind's own
+boundary". Omit `upper` and only `lower` is applied — it must then contain
+`${window.end}`, or the config is rejected as unbounded above. The rendered
+value is the formatted date/instant only and is not escaped for the query
+language; the template is the whole statement.
+
+```yaml
+window:
+  step: 7d
+  granularity: 1d
+  lower:
+    into: body
+    path: /query
+    format: date
+    template: "SELECT campaign.id, metrics.clicks, segments.date FROM campaign WHERE segments.date BETWEEN '${window.start}' AND '${window.end}'"
 ```
 
 ### OData (`odata`)
@@ -780,7 +858,7 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 |----------------|--------|------------|
 | `None` | — | After the first page. |
 | `Cursor` | `next_token_path`, `param_name` | Next-token JSONPath is null/absent, or the same cursor repeats (loop detection). |
-| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. HubSpot CRM `POST …/search` — `$.paging.next.after` → `after`. |
+| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. HubSpot CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |

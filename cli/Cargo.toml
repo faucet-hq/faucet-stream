@@ -24,7 +24,7 @@ path = "src/main.rs"
 # `serve` (HTTP control plane; links a web-server dependency tree and opens a
 # network listener). Opt in with `--features schedule` / `--features serve`, or
 # take everything with `--features full`.
-default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "policy", "cli-progress", "hub-remote"]
+default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "policy", "cli-progress", "hub-remote", "google-sa"]
 
 # Everything the default build ships, plus the long-running runtime modes:
 # `schedule` (cron scheduler) and `serve` (HTTP control plane).
@@ -360,6 +360,9 @@ rabbitmq-tls = [
 # OAuth1 (HMAC-SHA256) request-signing auth provider (#496), e.g. NetSuite TBA.
 # `cargo install faucet-cli --features oauth1`.
 oauth1 = ["faucet-auth/oauth1"]
+
+# Google service-account (RFC 7523 JWT-bearer) auth provider (#755). In `default`.
+google-sa = ["faucet-auth/google-sa"]
 
 # Opt-in Arrow columnar record path (RFC 0002 / #375). Activates the columnar
 # fast path on the Arrow-capable connectors the user has enabled (optional-dep

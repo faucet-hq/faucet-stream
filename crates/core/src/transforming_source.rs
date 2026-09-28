@@ -293,6 +293,10 @@ impl Source for TransformingSource {
     ) {
         self.inner.set_roundtrip_recorder(recorder);
     }
+
+    fn set_run_clock(&self, now: chrono::DateTime<chrono::Utc>) {
+        self.inner.set_run_clock(now);
+    }
 }
 
 #[cfg(test)]
@@ -663,6 +667,22 @@ mod tests {
         fn set_roundtrip_recorder(&self, _recorder: Arc<crate::observability::RoundtripRecorder>) {
             self.0.store(true, Ordering::Relaxed);
         }
+        fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn run_clock_reaches_the_wrapped_source() {
+        let got = Arc::new(AtomicBool::new(false));
+        let wrapped = TransformingSource::new(
+            Box::new(RecorderProbe(got.clone())),
+            vec![],
+            Labels::for_named("test"),
+        )
+        .unwrap();
+        wrapped.set_run_clock(chrono::Utc::now());
+        assert!(got.load(Ordering::Relaxed));
     }
 
     #[test]

@@ -131,6 +131,34 @@ be one the connector supports, an alias for a natively supported mode is
 refused as redundant, and keyed modes (`upsert`, `delete`) cannot be aliased —
 only a sink that dedups by key can honour them.
 
+### Child streams and truncating sinks
+
+A child stream (`parent:`) runs once **per parent record** into the same
+destination. On a sink that replaces its output on every invocation — `jsonl`
+/ `csv` with `append: false`, a fixed-path `parquet` file, a `file` sink in
+`mode: overwrite` — every parent's invocation would wipe the previous one's
+rows, leaving only the last parent's. So the composer refuses:
+
+- a child stream on a truncating sink, whatever mode it asks for; and
+- a child stream's `overwrite` satisfied through an alias (`overwrite: append`)
+  on any sink.
+
+A **native** overwrite (postgres, sqlite, mysql, mssql, mongodb, bigquery) is
+allowed: the executor stages it once for all of a row's invocations and swaps
+once. When a child stream lists several modes, a refused one falls through to
+the next (`write: [overwrite, upsert]` → `upsert`); if none remains the pairing
+fails with the stream named:
+
+```text
+child stream 'bill_lines' (parent: bills) cannot satisfy overwrite via append on sink 'jsonl':
+each parent invocation would replace the output, keeping only the last parent's rows
+```
+
+`faucet validate` / `run` apply the same rule to hand-written configs and to
+deployment overlays: a `parent:` or `fan_out:` row whose truncating file sink
+writes one fixed path (no `${parent.*}`-style token; `${now.*}` does not count)
+is refused. Set `append: true`, or put a per-parent token in the path.
+
 ## Composition and the compatibility matrix
 
 `faucet run --source X --sink Y` (and `faucet validate --source X --sink Y`,
@@ -273,6 +301,39 @@ with a warning (`FAUCET_HUB_OFFLINE=1` skips the network altogether); it never
 falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
 sent when set — needed for a private catalog, and it lifts the anonymous API
 rate limit.
+
+### The official starter set
+
+The `faucet-hq` namespace carries ten maintained SaaS source templates. Each
+has a README beside it (scopes, run times, changelog), a `faucet template test`
+suite and recorded API fixtures, and composes with all four official sinks
+(`bigquery`, `postgres`, `sqlite`, `jsonl`):
+
+| Template | API | Streams | Incremental (column) |
+|---|---|---|---|
+| `faucet-hq/salesforce` | Bulk API 2.0 (v62.0) | accounts, contacts, leads, opportunities, users, campaigns, tasks | every stream (`SystemModstamp`, plus soft deletes) |
+| `faucet-hq/hubspot` | CRM v3 | contacts, companies, deals, tickets, products, owners, deal_pipelines | — full refresh |
+| `faucet-hq/stripe` | API 2024-06-20 | customers, subscriptions, invoices, charges, refunds, payment_intents, products, prices, payouts, balance_transactions, events | balance_transactions, events (`created`) |
+| `faucet-hq/jira` | Jira Cloud REST v3 | issues, projects, users, fields, statuses, issue_types | — full refresh |
+| `faucet-hq/zendesk` | Support API v2 | tickets, users, organizations, satisfaction_ratings, groups, ticket_metrics, ticket_fields | tickets, users, organizations, satisfaction_ratings (`updated_at`) |
+| `faucet-hq/shopify` | Admin REST 2025-07 | orders, customers, products, custom_collections, smart_collections, locations | orders, customers, products (`updated_at`) |
+| `faucet-hq/github` | REST 2022-11-28 | repository, issues, issue_comments, pull_requests, commits, releases, workflow_runs, contributors | issues, issue_comments (`updated_at`) |
+| `faucet-hq/google-ads` | Google Ads API v22 (GAQL) | campaigns, ad_groups, ads, campaign_performance, ad_group_performance, keyword_performance | rolling window (performance streams) |
+| `faucet-hq/meta-ads` | Marketing API v24.0 | ad_account, campaigns, ad_sets, ads, ad_creatives, ad_insights | rolling window (`ad_insights`) |
+| `faucet-hq/google-analytics-4` | GA4 Data API v1beta | daily_traffic, pages, events, devices, geography, acquisition | rolling window (every stream) |
+
+Incremental streams keep their bookmark in the pipeline's `state:` store —
+supply one with a [deployment overlay](#deployment-overlays), or they re-read
+everything each run. Rolling-window streams re-read a fixed trailing window
+every run and upsert on date + dimensions, because the upstream keeps
+revising recent days.
+
+```bash
+faucet hub check --source faucet-hq/shopify --sink faucet-hq/postgres
+faucet run --source faucet-hq/google-analytics-4 --sink faucet-hq/sqlite \
+  --param ga4_property_id=123456789 --param google_client_id=… \
+  --param google_client_secret="$SECRET" --param google_refresh_token="$REFRESH"
+```
 
 ### A private source with the public sinks
 

@@ -149,11 +149,18 @@ fn mode_list(modes: &[WriteMode]) -> String {
 /// one of the sink template's `write_mode_aliases`. `upsert` / `delete`
 /// require `primary_keys`; listing one without keys is an error rather than
 /// a silent fall-through, because it is almost always a template mistake.
+///
+/// A child stream (`parent:`) runs once per parent record into the same
+/// destination (#752): on a sink that replaces its output per invocation
+/// (`truncates`) no mode is safe, and anywhere an aliased `overwrite` (a
+/// truncating stand-in) is refused — only a native overwrite, which the
+/// executor groups into one swap (#552), may satisfy it.
 pub fn resolve_mode(
     stream: &Stream,
     sink_kind: &str,
     supported: &[WriteMode],
     aliases: &[(WriteMode, WriteMode)],
+    truncates: bool,
 ) -> Result<StreamPlan, StreamIncompatibility> {
     let requested = stream.write.candidates();
     for m in &requested {
@@ -168,8 +175,24 @@ pub fn resolve_mode(
         }
     }
     let mut resolved: Option<(WriteMode, Option<WriteMode>)> = None;
+    let mut refused_child: Option<String> = None;
     for m in &requested {
         if supported.contains(m) {
+            if truncates
+                && *m != WriteMode::Overwrite
+                && let Some(parent) = &stream.parent
+            {
+                refused_child.get_or_insert_with(|| {
+                    format!(
+                        "child stream '{}' (parent: {parent}) cannot write {} to sink \
+                         '{sink_kind}': the sink replaces its output on every invocation, so only \
+                         the last parent's rows would survive",
+                        stream.name,
+                        m.as_str()
+                    )
+                });
+                continue;
+            }
             resolved = Some((*m, None));
             break;
         }
@@ -177,9 +200,36 @@ pub fn resolve_mode(
             .iter()
             .find(|(from, to)| from == m && supported.contains(to))
         {
+            // #752: a child stream runs once per parent record into the same
+            // destination, so an aliased overwrite (a truncating write) would
+            // keep only the last parent's rows. Only a native overwrite is
+            // safe, because the executor groups those into one swap (#552).
+            if (*m == WriteMode::Overwrite || truncates)
+                && let Some(parent) = &stream.parent
+            {
+                refused_child.get_or_insert_with(|| {
+                    format!(
+                        "child stream '{}' (parent: {parent}) cannot satisfy {} via {} on \
+                         sink '{sink_kind}': each parent invocation would replace the output, \
+                         keeping only the last parent's rows",
+                        stream.name,
+                        m.as_str(),
+                        to.as_str()
+                    )
+                });
+                continue;
+            }
             resolved = Some((*to, Some(*m)));
             break;
         }
+    }
+    if resolved.is_none()
+        && let Some(reason) = refused_child
+    {
+        return Err(StreamIncompatibility {
+            stream: stream.name.clone(),
+            reason,
+        });
     }
     match resolved {
         Some((chosen, satisfies)) => Ok(StreamPlan {
@@ -343,10 +393,11 @@ pub fn compose_with(
             )));
         }
     }
+    let truncates = sink.truncates_per_invocation();
     let mut plans = Vec::with_capacity(source.streams.len());
     let mut failures = Vec::new();
     for s in &source.streams {
-        match resolve_mode(s, &sink.sink.kind, supported, &aliases) {
+        match resolve_mode(s, &sink.sink.kind, supported, &aliases, truncates) {
             Ok(p) => plans.push(p),
             Err(e) => failures.push(e),
         }
@@ -769,6 +820,96 @@ per_stream:
                 && d["matrix"][0].get("inherit_transforms").is_none()
         );
         crate::config::PipelineConfig::from_value(c.document.clone()).unwrap();
+    }
+
+    fn child(write: WriteChoice) -> Stream {
+        Stream {
+            name: "bill_lines".into(),
+            description: None,
+            source: StreamSource {
+                r#ref: None,
+                config: json!({ "path": "/bills/${bills.id}/lines" }),
+            },
+            transforms: vec![],
+            primary_keys: vec!["id".into()],
+            write,
+            parent: Some("bills".into()),
+            parent_key: Some("id".into()),
+            inherit_transforms: true,
+        }
+    }
+
+    /// #752: a child stream runs once per parent record into one destination,
+    /// so a truncating file sink (or an aliased overwrite) keeps only the last
+    /// parent's rows — the composer refuses it and names the stream.
+    #[test]
+    fn child_streams_never_resolve_to_a_truncating_write() {
+        let mut jsonl: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        jsonl
+            .write_mode_aliases
+            .insert("overwrite".into(), WriteMode::Append);
+        let mut s = src();
+        s.streams
+            .push(child(WriteChoice::One(WriteMode::Overwrite)));
+        let err = compose_with(&s, &jsonl, &[WriteMode::Append])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("child stream 'bill_lines' (parent: bills)"),
+            "{err}"
+        );
+        assert!(err.contains("overwrite via append"), "{err}");
+
+        let mut s = src();
+        s.streams.push(child(WriteChoice::One(WriteMode::Append)));
+        let err = compose_with(&s, &jsonl, &[WriteMode::Append])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot write append"), "{err}");
+
+        // An appending file sink keeps every parent's rows; a root stream may
+        // still use the alias.
+        let mut appending = jsonl.clone();
+        appending.sink.config = json!({ "append": true });
+        let c = compose_with(&s, &appending, &[WriteMode::Append]).unwrap();
+        assert_eq!(c.streams[2].chosen, WriteMode::Append);
+        let err = {
+            let mut s = src();
+            s.streams
+                .push(child(WriteChoice::One(WriteMode::Overwrite)));
+            compose_with(&s, &appending, &[WriteMode::Append])
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err.contains("overwrite via append"), "{err}");
+
+        // A native overwrite is grouped by the executor (#552): allowed, and
+        // a refused alias falls through to the next listed mode.
+        let bq: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let mut s = src();
+        s.streams
+            .push(child(WriteChoice::One(WriteMode::Overwrite)));
+        let c = compose_with(&s, &bq, ALL).unwrap();
+        assert_eq!(c.streams[2].chosen, WriteMode::Overwrite);
+        let mut aliased = bq.clone();
+        aliased
+            .write_mode_aliases
+            .insert("overwrite".into(), WriteMode::Append);
+        let mut s = src();
+        s.streams.push(child(WriteChoice::Many(vec![
+            WriteMode::Overwrite,
+            WriteMode::Upsert,
+        ])));
+        let c = compose_with(&s, &aliased, &[WriteMode::Append, WriteMode::Upsert]).unwrap();
+        assert_eq!(c.streams[2].chosen, WriteMode::Upsert);
+    }
+
+    #[test]
+    fn truncating_sink_templates_are_recognised() {
+        let jsonl: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        assert!(jsonl.truncates_per_invocation());
+        let bq: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        assert!(!bq.truncates_per_invocation());
     }
 
     /// A file sink rewritten on every run *is* a full refresh: the template

@@ -30,6 +30,14 @@ use serde::{Deserialize, Serialize};
 /// `upper` bind renders the window **end**.
 pub const WINDOW_PLACEHOLDER: &str = "${window}";
 
+/// The placeholder replaced by the formatted window **start** inside any
+/// [`WindowBind::template`], so one bind can carry both bounds (#772).
+pub const WINDOW_START_PLACEHOLDER: &str = "${window.start}";
+
+/// The placeholder replaced by the formatted window **end** (minus
+/// [`WindowSpec::granularity`]) inside any [`WindowBind::template`] (#772).
+pub const WINDOW_END_PLACEHOLDER: &str = "${window.end}";
+
 fn default_window_template() -> String {
     WINDOW_PLACEHOLDER.to_owned()
 }
@@ -62,11 +70,24 @@ pub struct WindowBind {
     /// path placeholder).
     #[serde(default)]
     pub into: BindTarget,
-    /// The parameter / header / body-field / path-placeholder name.
+    /// The parameter / header / body-field / path-placeholder name. Optional
+    /// only for `into: body` with a `path`.
+    #[serde(default)]
     pub name: String,
+    /// `into: body` only: an RFC 6901 JSON Pointer into the configured `body`
+    /// (`/dateRanges/0/startDate`) instead of a top-level `name` (#748).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// JSON type written by a body bind: `string` (default) or `number`.
+    #[serde(default)]
+    pub value_type: crate::replication::BindValueType,
     /// Template rendered with [`WINDOW_PLACEHOLDER`] (`${window}`) replaced by the
     /// formatted boundary. Defaults to the bare `${window}`; set e.g.
-    /// `"gte|${window}"` or `"[${window} TO *]"`.
+    /// `"gte|${window}"` or `"[${window} TO *]"`. `${window.start}` and
+    /// `${window.end}` render the window's start and (granularity-adjusted) end
+    /// in any bind, so one bind can carry both bounds
+    /// (`"segments.date BETWEEN '${window.start}' AND '${window.end}'"`). The
+    /// rendered value is not escaped for any query language.
     #[serde(default = "default_window_template")]
     pub template: String,
     /// How to format the boundary before substitution.
@@ -74,18 +95,45 @@ pub struct WindowBind {
     pub format: BindFormat,
 }
 
+impl Default for WindowBind {
+    fn default() -> Self {
+        Self {
+            into: BindTarget::default(),
+            name: String::new(),
+            path: None,
+            value_type: crate::replication::BindValueType::default(),
+            template: default_window_template(),
+            format: BindFormat::default(),
+        }
+    }
+}
+
 impl WindowBind {
+    /// Whether this bind is the unset default (an omitted [`WindowSpec::upper`]).
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Validate the bind at config-load time. `side` names the field for errors
     /// (`"lower"` / `"upper"`).
     pub fn validate(&self, side: &str) -> Result<(), FaucetError> {
-        if self.name.trim().is_empty() {
+        crate::replication::validate_bind_placement(
+            &format!("window slicing `{side}`"),
+            self.into,
+            &self.name,
+            self.path.as_deref(),
+        )?;
+        if ![
+            WINDOW_PLACEHOLDER,
+            WINDOW_START_PLACEHOLDER,
+            WINDOW_END_PLACEHOLDER,
+        ]
+        .iter()
+        .any(|p| self.template.contains(p))
+        {
             return Err(FaucetError::Config(format!(
-                "window slicing: `{side}.name` must not be empty"
-            )));
-        }
-        if !self.template.contains(WINDOW_PLACEHOLDER) {
-            return Err(FaucetError::Config(format!(
-                "window slicing: `{side}.template` must contain the `{WINDOW_PLACEHOLDER}` placeholder"
+                "window slicing: `{side}.template` must contain a `{WINDOW_PLACEHOLDER}`, \
+                 `{WINDOW_START_PLACEHOLDER}` or `{WINDOW_END_PLACEHOLDER}` placeholder"
             )));
         }
         Ok(())
@@ -95,6 +143,23 @@ impl WindowBind {
     pub fn render(&self, boundary: DateTime<Utc>) -> String {
         let formatted = format_instant(boundary, self.format);
         self.template.replace(WINDOW_PLACEHOLDER, &formatted)
+    }
+
+    /// Render the bind for a window: `${window}` becomes `own`, `${window.start}`
+    /// the window start and `${window.end}` the rendered end.
+    pub fn render_window(
+        &self,
+        own: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> String {
+        self.template
+            .replace(
+                WINDOW_START_PLACEHOLDER,
+                &format_instant(start, self.format),
+            )
+            .replace(WINDOW_END_PLACEHOLDER, &format_instant(end, self.format))
+            .replace(WINDOW_PLACEHOLDER, &format_instant(own, self.format))
     }
 }
 
@@ -108,7 +173,10 @@ pub struct WindowSpec {
     pub step: String,
     /// Lower-bound bind, rendered with the window **start**.
     pub lower: WindowBind,
-    /// Upper-bound bind, rendered with the window **end**.
+    /// Upper-bound bind, rendered with the window **end**. Optional: omit it when
+    /// `lower.template` renders both bounds through `${window.end}`; only the
+    /// `lower` bind is then applied.
+    #[serde(default, skip_serializing_if = "WindowBind::is_unset")]
     pub upper: WindowBind,
     /// Subtract this from each window's *rendered* upper bound so `[start, end]`
     /// is non-overlapping for inclusive-inclusive APIs (Airbyte
@@ -169,7 +237,14 @@ impl WindowSpec {
             parse_step(l)?;
         }
         self.lower.validate("lower")?;
-        self.upper.validate("upper")?;
+        if self.has_upper() {
+            self.upper.validate("upper")?;
+        } else if !self.lower.template.contains(WINDOW_END_PLACEHOLDER) {
+            return Err(FaucetError::Config(format!(
+                "window slicing: `upper` may be omitted only when `lower.template` renders the \
+                 window end with `{WINDOW_END_PLACEHOLDER}`; otherwise the window is unbounded above"
+            )));
+        }
         if self.max_windows == 0 {
             return Err(FaucetError::Config(
                 "window slicing: `max_windows` must be greater than zero".to_owned(),
@@ -193,19 +268,44 @@ impl WindowSpec {
         self.lookback.as_deref().map(parse_step).transpose()
     }
 
-    /// The rendered lower-bound value for a window (the window **start**).
+    /// Whether an `upper` bind is configured (it is optional when `lower`
+    /// renders both bounds).
+    pub fn has_upper(&self) -> bool {
+        !self.upper.is_unset()
+    }
+
+    /// The window end as sent to the server: `w.end` minus `granularity`.
+    pub fn rendered_end(&self, w: &Window) -> Result<DateTime<Utc>, FaucetError> {
+        Ok(match self.granularity_duration()? {
+            Some(g) => w.end - g,
+            None => w.end,
+        })
+    }
+
+    /// The rendered lower-bound value for a window (the window **start**). A
+    /// `${window.end}` in the template renders [`Self::rendered_end`], or the
+    /// raw end if `granularity` does not parse (it is validated at load time).
     pub fn render_lower(&self, w: &Window) -> String {
-        self.lower.render(w.start)
+        let end = self.rendered_end(w).unwrap_or(w.end);
+        self.lower.render_window(w.start, w.start, end)
     }
 
     /// The rendered upper-bound value for a window, applying `granularity` (the
     /// window **end**, minus `granularity` if set, for inclusive-inclusive APIs).
     pub fn render_upper(&self, w: &Window) -> Result<String, FaucetError> {
-        let end = match self.granularity_duration()? {
-            Some(g) => w.end - g,
-            None => w.end,
-        };
-        Ok(self.upper.render(end))
+        let end = self.rendered_end(w)?;
+        Ok(self.upper.render_window(end, w.start, end))
+    }
+
+    /// Every configured bind with its rendered value for a window: `lower`, then
+    /// `upper` when one is configured.
+    pub fn render_binds(&self, w: &Window) -> Result<Vec<(&WindowBind, String)>, FaucetError> {
+        let end = self.rendered_end(w)?;
+        let mut out = vec![(&self.lower, self.lower.render_window(w.start, w.start, end))];
+        if self.has_upper() {
+            out.push((&self.upper, self.upper.render_window(end, w.start, end)));
+        }
+        Ok(out)
     }
 }
 
@@ -357,12 +457,16 @@ mod tests {
                 name: "start".into(),
                 template: "${window}".into(),
                 format: BindFormat::Date,
+                path: None,
+                value_type: Default::default(),
             },
             upper: WindowBind {
                 into: BindTarget::Query,
                 name: "end".into(),
                 template: "${window}".into(),
                 format: BindFormat::Date,
+                path: None,
+                value_type: Default::default(),
             },
             granularity: Some("1d".into()),
             lookback: None,
@@ -384,6 +488,8 @@ mod tests {
             name: "since".into(),
             template: "gte|${window}".into(),
             format: BindFormat::EpochS,
+            path: None,
+            value_type: Default::default(),
         };
         let ts = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         assert_eq!(bind.render(ts), "gte|1700000000");
@@ -398,12 +504,16 @@ mod tests {
                 name: "start".into(),
                 template: "${window}".into(),
                 format: BindFormat::Iso8601,
+                path: None,
+                value_type: Default::default(),
             },
             upper: WindowBind {
                 into: BindTarget::Query,
                 name: "end".into(),
                 template: "${window}".into(),
                 format: BindFormat::Iso8601,
+                path: None,
+                value_type: Default::default(),
             },
             granularity: None,
             lookback: None,
@@ -441,5 +551,70 @@ mod tests {
         assert_eq!(spec.lower.template, WINDOW_PLACEHOLDER); // defaulted
         assert_eq!(spec.max_windows, DEFAULT_MAX_WINDOWS); // defaulted
         spec.validate().unwrap();
+    }
+
+    fn combined_spec() -> WindowSpec {
+        serde_json::from_value(json!({
+            "step": "7d",
+            "granularity": "1d",
+            "lower": {
+                "into": "body", "path": "/query", "format": "date",
+                "template": "WHERE d BETWEEN '${window.start}' AND '${window.end}'"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn combined_bind_renders_both_bounds_with_granularity() {
+        let spec = combined_spec();
+        spec.validate().unwrap();
+        assert!(!spec.has_upper());
+        let w = Window {
+            start: dt("2026-09-01T00:00:00Z"),
+            end: dt("2026-09-08T00:00:00Z"),
+        };
+        let want = "WHERE d BETWEEN '2026-09-01' AND '2026-09-07'";
+        assert_eq!(spec.render_lower(&w), want);
+        let binds = spec.render_binds(&w).unwrap();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].1, want);
+        let back = serde_json::to_value(&spec).unwrap();
+        assert!(back.get("upper").is_none());
+    }
+
+    #[test]
+    fn omitted_upper_requires_window_end_in_lower() {
+        let mut spec = combined_spec();
+        spec.lower.template = "d >= '${window.start}'".into();
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("unbounded above"), "{err}");
+        spec.lower.template = "d >= '${window}'".into();
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn two_bind_spec_renders_both_and_accepts_named_placeholders() {
+        let mut spec: WindowSpec = serde_json::from_value(json!({
+            "step": "1d",
+            "granularity": "1s",
+            "lower": {"into": "query", "name": "from"},
+            "upper": {"into": "query", "name": "to", "template": "${window.start}..${window.end}"}
+        }))
+        .unwrap();
+        spec.validate().unwrap();
+        let w = Window {
+            start: dt("2026-01-01T00:00:00Z"),
+            end: dt("2026-01-02T00:00:00Z"),
+        };
+        let binds = spec.render_binds(&w).unwrap();
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[0].1, spec.render_lower(&w));
+        assert_eq!(binds[1].1, spec.render_upper(&w).unwrap());
+        assert!(binds[1].1.contains(".."));
+        spec.granularity = Some("bad".into());
+        assert!(spec.render_binds(&w).is_err());
+        assert_eq!(spec.render_lower(&w), spec.lower.render(w.start));
+        assert!(WindowBind::default().is_unset());
     }
 }

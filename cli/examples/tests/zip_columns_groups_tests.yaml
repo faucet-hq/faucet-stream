@@ -1,0 +1,68 @@
+# Fixture-based offline tests for `zip_columns` column groups (#746) — run with:
+#
+#   faucet test cli/examples/tests/zip_columns_groups_tests.yaml
+#
+# A Google Analytics 4 `runReport` response names its cells with two header
+# lists (`dimensionHeaders`, `metricHeaders`) and splits every row into two
+# positional cell arrays. Each group is zipped against its own headers and the
+# groups are merged into one flat record per row.
+version: 1
+tests:
+  - name: ga4 runReport rows become flat records
+    pipeline:
+      transforms:
+        - type: zip_columns
+          config:
+            rows_path: "$.rows[*]"
+            groups:
+              - { from: dimensionValues, header: "$.dimensionHeaders[*].name", value: value }
+              - { from: metricValues, header: "$.metricHeaders[*]", header_label: name, value: value }
+    input:
+      - dimensionHeaders: [ { name: date }, { name: country } ]
+        metricHeaders:
+          - { name: sessions, type: TYPE_INTEGER }
+          - { name: bounceRate, type: TYPE_FLOAT }
+        rows:
+          - dimensionValues: [ { value: "20260901" }, { value: DE } ]
+            metricValues: [ { value: "1204" }, { value: "0.41" } ]
+          - dimensionValues: [ { value: "20260902" }, { value: FR } ]
+            metricValues: [ { value: "88" }, {} ]
+      - dimensionHeaders: [ { name: date }, { name: country } ]
+        metricHeaders: [ { name: sessions }, { name: bounceRate } ]
+    expect:
+      records:
+        - { date: "20260901", country: DE, sessions: "1204", bounceRate: "0.41" }
+        - { date: "20260902", country: FR, sessions: "88", bounceRate: null }
+
+  - name: a dimension and a metric with the same name fail the page
+    pipeline:
+      transforms:
+        - type: zip_columns
+          config:
+            rows_path: "$.rows[*]"
+            groups:
+              - { from: dimensionValues, header: "$.dimensionHeaders[*].name", value: value }
+              - { from: metricValues, header: "$.metricHeaders[*].name", value: value }
+    input:
+      - dimensionHeaders: [ { name: date } ]
+        metricHeaders: [ { name: date } ]
+        rows:
+          - dimensionValues: [ { value: "20260901" } ]
+            metricValues: [ { value: "1" } ]
+    expect:
+      error: "duplicate column 'date'"
+
+  - name: a row whose group width differs from its headers fails the page
+    pipeline:
+      transforms:
+        - type: zip_columns
+          config:
+            rows_path: "$.rows[*]"
+            groups:
+              - { from: metricValues, header: "$.metricHeaders[*].name", value: value }
+    input:
+      - metricHeaders: [ { name: sessions }, { name: users } ]
+        rows:
+          - metricValues: [ { value: "1" } ]
+    expect:
+      error: "row 0, group 'metricValues'"

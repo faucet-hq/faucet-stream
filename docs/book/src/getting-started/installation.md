@@ -5,7 +5,7 @@
 ### Prebuilt binaries (no Rust required)
 
 Every `faucet-cli` release ships prebuilt binaries for macOS (Apple Silicon +
-Intel), Linux (x86_64 + aarch64) and Windows (x86_64), so you don't need a Rust
+Intel) and Linux (x86_64 + aarch64), so you don't need a Rust
 toolchain to try it.
 
 **Homebrew (macOS / Linux):**
@@ -23,21 +23,9 @@ binary.)
 curl -LsSf https://github.com/faucet-hq/faucet-stream/releases/latest/download/faucet-cli-installer.sh | sh
 ```
 
-**PowerShell installer (Windows):**
-
-```powershell
-irm https://github.com/faucet-hq/faucet-stream/releases/latest/download/faucet-cli-installer.ps1 | iex
-```
-
-It installs `faucet.exe` into `%USERPROFILE%\.cargo\bin` and adds that
-directory to your user `PATH` (open a new terminal afterwards). Windows on ARM
-runs the x86_64 binary under Windows' built-in x64 emulation; there is no
-native `aarch64-pc-windows-msvc` build yet.
-
 **Direct download:** grab the archive for your platform from the latest
 [`faucet-cli` GitHub Release](https://github.com/faucet-hq/faucet-stream/releases?q=faucet-cli&expanded=true)
-(e.g. `faucet-cli-aarch64-apple-darwin.tar.xz`, or
-`faucet-cli-x86_64-pc-windows-msvc.zip` on Windows), verify it against the
+(e.g. `faucet-cli-aarch64-apple-darwin.tar.xz`), verify it against the
 published `.sha256` checksum, and put `faucet` on your `PATH`.
 
 The prebuilt binary includes the CLI **default** feature set (every first-party
@@ -50,10 +38,12 @@ needs a `serve-history-*` backend). Not included — build from source for these
 `source-oracle-cdc`, `sink-oracle`), which need Oracle Instant Client at runtime
 (see [Oracle Instant Client](#oracle-instant-client)).
 
-### Windows notes
+### Windows
 
-Every connector in the prebuilt binary works on Windows, with these
-platform differences:
+Windows is not a supported platform yet: there is no prebuilt Windows binary,
+and faucet is run on macOS or Linux (including Linux containers on Kubernetes).
+Building from source on Windows is possible; if you do, expect these platform
+differences:
 
 - **Kafka:** `PLAIN`, `SCRAM-SHA-256/512`, `OAUTHBEARER` and TLS work. Kerberos
   (`sasl.mechanism: GSSAPI` set through `extra_client_config`) is not available —
@@ -72,10 +62,6 @@ platform differences:
   State-store keys are percent-encoded on disk, so `::` in a key is safe.
 - **Template Hub cache:** remote hubs are cached under
   `%LOCALAPPDATA%\faucet\hub` (override with `FAUCET_HUB_CACHE`).
-
-> **Windows SmartScreen:** the binaries are not code-signed yet, so the first
-> run of a downloaded `faucet.exe` may show a SmartScreen prompt ("More info" →
-> "Run anyway"). The PowerShell installer is not affected.
 
 > **macOS Gatekeeper:** the binaries are not currently notarized. If macOS
 > blocks the downloaded binary, clear the quarantine attribute:

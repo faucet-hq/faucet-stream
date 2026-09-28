@@ -978,6 +978,7 @@ pipeline:
         }
     }
 
+    #[cfg(feature = "serve-history-sqlite")]
     #[tokio::test]
     async fn source_and_sink_templates_register_list_and_run_from_the_cli() {
         let dir = tempfile::tempdir().unwrap();
@@ -1713,6 +1714,7 @@ suite:
     /// fresh store per call, so a template registered in the test would be
     /// invisible to `test_suite`'s own connection. A sqlite file is the
     /// smallest store that actually persists between the two.
+    #[cfg(feature = "serve-history-sqlite")]
     #[tokio::test]
     async fn a_registered_template_is_resolved_and_its_suite_runs() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1762,6 +1764,7 @@ pipeline:
         test_suite(args).await.expect("registered suite passes");
     }
 
+    #[cfg(feature = "serve-history-sqlite")]
     #[tokio::test]
     async fn a_registered_suite_resolves_its_overlay_through_the_store() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

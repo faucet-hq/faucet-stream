@@ -133,6 +133,8 @@ async fn offset_in_body_paginates_and_advances_offset_in_body() {
                 limit_field: "limit".into(),
                 limit: 2,
                 stop_when_short: true,
+                rows_path: None,
+                total_path: None,
             }),
     )
     .unwrap()
@@ -152,6 +154,78 @@ async fn offset_in_body_paginates_and_advances_offset_in_body() {
     assert_eq!(
         b1["offset"], 2,
         "second request offset advanced by the page size"
+    );
+}
+
+// ── #770: OffsetInBody rows_path / total_path ────────────────────────────────
+
+/// A report API: every response is one record whose `rows` page by offset.
+struct ReportPages;
+impl Respond for ReportPages {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        let offset = body["offset"].as_u64().unwrap();
+        let rows: Vec<Value> = (offset..(offset + 2).min(5)).map(|i| json!([i])).collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "dimensionHeaders": [{"name": "date"}],
+            "rows": rows,
+            "rowCount": 5
+        }))
+    }
+}
+
+async fn report(rows_path: Option<&str>, total_path: Option<&str>) -> (usize, Vec<u64>) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ReportPages)
+        .mount(&server)
+        .await;
+    let records = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/report")
+            .method(Method::POST)
+            .body(json!({}))
+            .records_path("$")
+            .pagination(PaginationStyle::OffsetInBody {
+                offset_field: "offset".into(),
+                limit_field: "limit".into(),
+                limit: 2,
+                stop_when_short: true,
+                rows_path: rows_path.map(Into::into),
+                total_path: total_path.map(Into::into),
+            }),
+    )
+    .unwrap()
+    .fetch_all()
+    .await
+    .unwrap();
+    let offsets = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["offset"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    (records.len(), offsets)
+}
+
+#[tokio::test]
+async fn rows_path_pages_a_one_record_report() {
+    assert_eq!(report(Some("$.rows"), None).await, (3, vec![0, 2, 4]));
+    // Without rows_path the single record reads as a short page: truncated.
+    assert_eq!(report(None, None).await, (1, vec![0]));
+}
+
+#[tokio::test]
+async fn total_path_stops_exactly_at_the_total() {
+    // Rows 4..5 fill the total, so no fourth request is made.
+    assert_eq!(
+        report(Some("$.rows"), Some("$.rowCount")).await,
+        (3, vec![0, 2, 4])
     );
 }
 

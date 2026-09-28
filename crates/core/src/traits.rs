@@ -458,6 +458,15 @@ pub trait Source: Send + Sync {
     ) {
     }
 
+    /// Receive the run clock (#769): the instant `${now.*}` renders from —
+    /// `faucet run --clock`, a schedule tick, a backfill unit's start — so a
+    /// source that bounds reads by "now" (REST window slicing) reproduces the
+    /// run as of that instant rather than the wall clock.
+    ///
+    /// Called once before streaming. Defaulted to a no-op; a connector opts in
+    /// by storing the instant behind interior mutability.
+    fn set_run_clock(&self, _now: chrono::DateTime<chrono::Utc>) {}
+
     /// Logical dataset identity for lineage emission, following OpenLineage
     /// naming conventions (<https://openlineage.io/docs/spec/naming>).
     ///
@@ -916,6 +925,21 @@ pub trait Sink: Send + Sync {
     /// left exactly as it was before the run. Default: no-op — a leftover
     /// staging object is untidy but never data loss, so a sink may skip it.
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+        Ok(())
+    }
+
+    /// Finalize this run's output after [`Pipeline::run`](crate::Pipeline::run)
+    /// finished **successfully and uncancelled**, on every transfer path
+    /// (`Value`, columnar, native), after the terminal flush.
+    ///
+    /// A sink whose destination must reflect *this* run even when it wrote
+    /// nothing uses it: the file sinks with `append: false` truncate (or, for
+    /// a fixed-path Parquet file, remove) the previous run's output here when
+    /// no record arrived, so a source that became empty never leaves stale
+    /// rows presented as current (#753). Never called after a failed or
+    /// cancelled run, so the previous good output survives those. Decorators
+    /// must forward it. Default: no-op.
+    async fn complete_run(&self) -> Result<(), FaucetError> {
         Ok(())
     }
 

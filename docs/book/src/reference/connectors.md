@@ -24,7 +24,7 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | Connector | Tier¹¹ | Feature | Streams¹ | Resumable² | Effectively-once³ | Compression | Discover¹⁰ | Underlying primitive |
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|:---:|----------------------|
 | REST | T1 ✅ᵐ | `source-rest` | ✓ | ✓ | ✗ | ✗ | ✓ᵒ | HTTP + 6 pagination styles, JSONPath extraction; `response_format: csv\|excel` parses an authed file body (Graph/OneDrive/signed URL), Excel via `source-rest-excel`; `odata:` block adds OData paging/query + `$metadata` discovery; `replication_bind` pushes the bookmark server-side; `window` slices incremental into rolling `[start,end)` datetime windows |
-| GraphQL | T1 ✅ᵐ | `source-graphql` | ✓ | ✗ | ✗ | ✗ | ✗ | cursor pagination, variable injection |
+| GraphQL | T1 ✅ᵐ | `source-graphql` | ✓ | ✓ | ✗ | ✗ | ✗ | cursor / offset pagination, variable injection; `replication_method: incremental` + `replication_bind` binds the bookmark into a GraphQL variable |
 | XML / SOAP | T1 ✅ᵐ | `source-xml` | ✓ | ✗ | ✗ | ✗ | ✗ | streaming XML→JSON, dot-path extraction, first-class `soap:` block (envelope + headers + fault handling) |
 | gRPC | T1 ✅ | `source-grpc` | ✓⁴ | ✗ | ✗ | ✗ | ✗ | dynamic protobuf; unary + server-streaming |
 | PostgreSQL | T1 ✅ | `source-postgres` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL query, rows as JSON |

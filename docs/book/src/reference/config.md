@@ -72,6 +72,12 @@ each. Highlights:
 
 - `filter` — keep records where a JSONPath predicate is true. See the cookbook for the operator set and path syntax.
 - `explode` — expand an array field into one record per element. See the cookbook for the merge rule and `on_missing` semantics.
+- `zip_columns` — zip a positional report into one object per row: one header list (`columns_path`) or several header + cell-array `groups` (`from`, `header`, `header_label?`, `value?` — GA4 `runReport`'s dimensions and metrics). A width mismatch or a column two groups both name fails the page.
+
+Source-side incremental replication (`replication_method`, `replication_key`,
+`replication_bind`) is configured per connector: `rest` binds the bookmark into
+a query param / header / body field / path, `graphql` into a GraphQL variable —
+see [state & incremental](../cookbook/state.md#incremental-graphql).
 
 ## Config composition
 
@@ -580,7 +586,8 @@ errors (no partial run).
 ## `auth`
 
 A map of named auth providers, each `{ type, config }` (`type` ∈ `static` /
-`oauth2` / `oauth2_refresh` / `token_endpoint`). A connector references one with
+`oauth2` / `oauth2_refresh` / `token_endpoint` / `google_service_account` /
+`flow` / `oauth1`). A connector references one with
 `auth: { ref: <name> }` instead of inline auth; faucet builds each provider once
 and shares it across every connector that references it (one token, single-flight
 refresh). See the [authentication cookbook](../cookbook/auth.md).
@@ -602,6 +609,21 @@ refresh token so later runs survive rotation. `token_endpoint` accepts
 `encoding: form` (urlencoded body) and `apply_as: { header, template }` (place
 the token in a custom header, e.g. a session cookie). See the
 [authentication cookbook](../cookbook/auth.md).
+
+`google_service_account` authenticates with a Google service-account key
+(RFC 7523 JWT-bearer): `key_json` (the key file's contents, e.g.
+`${secret:GOOGLE_SA_KEY}`) **or** `key_file` (a path), `scopes` (required),
+optional `subject` (domain-wide delegation), `token_uri` (defaults to the key's)
+and `expiry_ratio`. A malformed key fails at load time.
+
+```yaml
+auth:
+  google:
+    type: google_service_account
+    config:
+      key_json: ${secret:GOOGLE_SA_KEY}
+      scopes: ["https://www.googleapis.com/auth/analytics.readonly"]
+```
 
 ## `delivery`
 
@@ -971,6 +993,59 @@ The `rest` source's legacy `max_retries` / `retry_backoff` fields win when set
 explicitly; otherwise the injected policy's `max_attempts` + `base` apply (its
 `retry_on` / `max` / `jitter` are inert on REST, honored on `xml` / `graphql`
 and on every sink-side write).
+
+For APIs that signal a rate limit with a 4xx other than `429` plus a code in the
+body, the `rest` source's own `retry_on_response` list turns matching responses
+into throttling (counted in `faucet_source_throttled_total` and retried up to
+`max_retries` times in a row):
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `status` | `[]` | Statuses the rule applies to (empty = any non-2xx). |
+| `body_path` | — | JSONPath into the JSON error body; its first match is compared with `values`. |
+| `values` | `[]` | Matching values (numbers and strings compare by text). Required with `body_path`. |
+| `header` | — | A header that must be present (compared with `values` when there is no `body_path`). |
+| `backoff_secs` | — | Fixed wait; otherwise `Retry-After`, otherwise the exponential `retry_backoff`. |
+
+Rules are checked before `tolerated_http_errors` and apply to data pages,
+`async_job` requests and discovery requests. See the
+[resilience cookbook](../cookbook/resilience.md).
+
+## Source fields: incremental keys, body targets, CSV nulls
+
+A few connector-level fields change how records are selected and decoded. They
+live in the source's `config`, not at the top level; `faucet schema source rest`
+prints the full list.
+
+**`rest` — incremental replication**
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `replication_key` | — | A top-level field (`updated_at`), a dot path (`fields.updated`, `items.0.date`; a literal top-level field of that name wins), or a JSON Pointer (`/fields/updated`) for names containing dots. With `async_job` it is injected into the submit query, so a pointer is rejected there. |
+| `on_missing_key` | `keep` | A record whose key is missing or `null`: `keep` (counted in `faucet_source_replication_key_missing_total`, warned once per run), `drop` (counted and warned), or `fail`. |
+| `replication_bind.path` | — | `into: body` only: a JSON Pointer into `body` (`/filterGroups/0/filters/0/value`) instead of a top-level `name`. Set exactly one of `name` / `path`; the pointer must resolve to an existing value or a new key of an existing object. |
+| `replication_bind.value_type` | `string` | `number` writes the rendered bookmark as a JSON number. |
+| `window.lower` / `window.upper` `.path`, `.value_type` | — | Same as the two above, for window bounds (e.g. `/dateRanges/0/startDate`). |
+| `window.*.template` placeholders | `${window}` | `${window}` is the bind's own boundary; `${window.start}` / `${window.end}` render the window's start and granularity-adjusted end in any bind, so one bind can carry both (GAQL `segments.date BETWEEN '${window.start}' AND '${window.end}'`). |
+| `window.upper` | — | Optional when `lower.template` contains `${window.end}`; only `lower` is then applied. Omitting it otherwise is rejected (unbounded above). |
+
+**`rest` — pagination and CSV**
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `pagination.body_cursor_field` (`CursorInBody`) | — | A top-level body field, or a JSON Pointer such as `/variables/after`. |
+| `pagination.offset_field` / `limit_field` (`OffsetInBody`) | — | Likewise a field name or a JSON Pointer. |
+| `csv_null_values` | `[]` | CSV fields equal to a listed string decode as `null` (`[""]` for Salesforce Bulk results). Applies to `response_format: csv` and `parse: { format: csv }` decode steps. |
+
+With `LinkHeader` / `NextLinkInBody` pagination, next-page links are resolved
+against the request URL (relative links work), and query binds are sent on the
+first request only — the link already carries them.
+
+**`csv` source**
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `null_values` | `[]` | Fields equal to a listed string decode as `null`. Headers are never mapped. |
 
 ## `dlq`
 

@@ -165,6 +165,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
+      # Hand edit: openssl-src must run Strawberry Perl, not the MSYS perl of the bash shell.
+      - name: Use Strawberry Perl for OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

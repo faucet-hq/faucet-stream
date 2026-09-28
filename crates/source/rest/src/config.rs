@@ -2,8 +2,9 @@
 
 use crate::auth::Auth;
 use crate::pagination::PaginationStyle;
+pub use crate::retry::RetryMatcher;
 use faucet_core::AuthSpec;
-use faucet_core::{ReplicationBind, ReplicationMethod};
+use faucet_core::{OnMissingKey, ReplicationBind, ReplicationKey, ReplicationMethod};
 use reqwest::{
     Method,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -203,6 +204,16 @@ pub struct RestStreamConfig {
     /// these codes are treated as empty pages (no records, no further pages).
     #[serde(default)]
     pub tolerated_http_errors: Vec<u16>,
+    /// Non-2xx responses to treat as throttling and retry with backoff, for
+    /// APIs that signal a rate limit with a 4xx other than 429 plus an error
+    /// code in the body (e.g. HTTP 400 with `error.code` 17 / 80004). A
+    /// matching response counts as a rate-limit response
+    /// (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`)
+    /// and is retried up to `max_retries` times in a row before the original
+    /// error is surfaced. Checked before `tolerated_http_errors`. Applies to
+    /// data pages, `async_job` requests and discovery requests.
+    #[serde(default)]
+    pub retry_on_response: Vec<RetryMatcher>,
 
     // ── Replication ───────────────────────────────────────────────────────────
     /// `full_table` (default) re-reads everything each run; `incremental`
@@ -210,9 +221,19 @@ pub struct RestStreamConfig {
     /// bookmark so the next run resumes.
     #[serde(default = "default_replication_method")]
     pub replication_method: ReplicationMethod,
-    /// Field name (not a JSONPath) used for incremental replication bookmarking.
+    /// Field used for incremental replication bookmarking: a top-level field
+    /// name (`updated_at`), a dot path into nested objects (`fields.updated`;
+    /// numeric segments index arrays, and a literal top-level field of that
+    /// exact name wins), or a JSON Pointer (`/fields/updated`) for field names
+    /// that contain dots. Not a JSONPath: it must resolve to one value.
     #[serde(default)]
     pub replication_key: Option<String>,
+    /// What to do with a record whose `replication_key` is missing or `null`
+    /// once a start bookmark exists: `keep` (default — kept, counted in
+    /// `faucet_source_replication_key_missing_total`, warned once per run),
+    /// `drop` (counted and warned), or `fail` the run.
+    #[serde(default)]
+    pub on_missing_key: OnMissingKey,
     /// Bookmark value: records where `record[replication_key] <= start_replication_value`
     /// are filtered out when `replication_method` is `Incremental`.
     #[serde(default)]
@@ -301,6 +322,14 @@ pub struct RestStreamConfig {
     /// and the `parse: csv` decode step both honour it.
     #[serde(default = "default_csv_quote")]
     pub csv_quote: u8,
+    /// CSV fields equal to any of these strings decode as JSON `null` instead
+    /// of a string (default: none). Salesforce Bulk API 2.0 results write a
+    /// null as an empty field, so its templates set `[""]`; other APIs list
+    /// sentinels such as `"NULL"` or `"#N/A"`. Headers are never mapped, and a
+    /// quoted empty field (`""`) is mapped like an unquoted one — the CSV
+    /// reader does not report quoting per field. `response_format: csv` only.
+    #[serde(default)]
+    pub csv_null_values: Vec<String>,
     /// Excel worksheet to read: a sheet name, or a 0-based index as a string.
     /// When omitted, the first worksheet is used. `response_format: excel` only.
     #[serde(default)]
@@ -708,9 +737,11 @@ impl Default for RestStreamConfig {
             max_retries: 3,
             retry_backoff: Duration::from_secs(1),
             tolerated_http_errors: Vec::new(),
+            retry_on_response: Vec::new(),
             replication_method: ReplicationMethod::FullTable,
             replication_key: None,
             start_replication_value: None,
+            on_missing_key: OnMissingKey::Keep,
             state_key: None,
             name: None,
             primary_keys: Vec::new(),
@@ -723,6 +754,7 @@ impl Default for RestStreamConfig {
             csv_delimiter: b',',
             csv_has_headers: true,
             csv_quote: b'"',
+            csv_null_values: Vec::new(),
             excel_sheet: None,
             excel_header_row: 0,
             replication_bind: None,
@@ -756,6 +788,26 @@ impl RestStreamConfig {
         // Static custom headers: reject an invalid header name/value at load
         // time rather than panicking on the first request (#539).
         build_header_map(&self.headers)?;
+        if let Some(key) = &self.replication_key {
+            ReplicationKey::parse(key)
+                .map_err(|e| faucet_core::FaucetError::Config(format!("rest: {e}")))?;
+        }
+        for (i, m) in self.retry_on_response.iter().enumerate() {
+            m.validate(i)?;
+        }
+        if !self.csv_null_values.is_empty() {
+            let csv_decode = self.decode.iter().any(|s| {
+                matches!(s, crate::decode::DecodeStep::Parse { parse }
+                    if parse.format == crate::decode::ParseFormat::Csv)
+            });
+            if !matches!(self.response_format, ResponseFormat::Csv) && !csv_decode {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `csv_null_values` applies only to CSV bodies — set \
+                     `response_format: csv` or a `parse: { format: csv }` decode step"
+                        .into(),
+                ));
+            }
+        }
         if !matches!(self.response_format, ResponseFormat::Json) {
             if !matches!(self.pagination, PaginationStyle::None) {
                 return Err(faucet_core::FaucetError::Config(
@@ -835,6 +887,18 @@ impl RestStreamConfig {
                             .into(),
                     ));
                 }
+                if self
+                    .replication_key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with('/'))
+                {
+                    return Err(faucet_core::FaucetError::Config(
+                        "rest: `replication_method: incremental` with `async_job` injects \
+                         `replication_key` verbatim into the submit query, so it must be a field \
+                         name or a dotted relationship path, not a JSON Pointer"
+                            .into(),
+                    ));
+                }
                 if !job.supports_incremental_query() {
                     return Err(faucet_core::FaucetError::Config(
                         "rest: `replication_method: incremental` with `async_job` requires a \
@@ -873,6 +937,37 @@ impl RestStreamConfig {
                      lifecycle fetches a single result and does not slice by window"
                         .into(),
                 ));
+            }
+        }
+        // #748: JSON Pointer body binds write into the configured `body`, and
+        // two binds must never write the same location.
+        let mut pointers: Vec<(&str, &str)> = Vec::new();
+        if let Some(b) = &self.replication_bind
+            && let Some(p) = &b.path
+        {
+            pointers.push(("replication_bind.path", p));
+        }
+        if let Some(w) = &self.window {
+            for (label, bind) in [
+                ("window.lower.path", &w.lower),
+                ("window.upper.path", &w.upper),
+            ] {
+                if let Some(p) = &bind.path {
+                    pointers.push((label, p));
+                }
+            }
+        }
+        for (i, (label, p)) in pointers.iter().enumerate() {
+            if !self.body.as_ref().is_some_and(Value::is_object) {
+                return Err(faucet_core::FaucetError::Config(format!(
+                    "rest: `{label}` points into the request body, so a JSON object `body` \
+                     must be configured"
+                )));
+            }
+            if let Some((other, _)) = pointers[..i].iter().find(|(_, q)| q == p) {
+                return Err(faucet_core::FaucetError::Config(format!(
+                    "rest: `{other}` and `{label}` both write '{p}'"
+                )));
             }
         }
         // #548: multi-array fan-out is its own extraction mode.
@@ -1268,6 +1363,8 @@ mod tests {
             template: "${bookmark}".to_owned(),
             format: BindFormat::Raw,
             advance_from: None,
+            path: None,
+            value_type: Default::default(),
         }
     }
 

@@ -26,14 +26,19 @@ sha2.workspace = true
 base64.workspace = true
 # RFC 3986 percent-encoding — only OAuth1's signature base string needs it.
 percent-encoding = { workspace = true, optional = true }
+# RS256 JWT assertions for the Google service-account provider.
+jsonwebtoken = { workspace = true, optional = true }
 
 [features]
 # OAuth1 (one-legged, HMAC-SHA256) request-signing provider.
 oauth1 = ["dep:percent-encoding"]
+# Google service-account (RFC 7523 JWT-bearer) provider (#755).
+google-sa = ["dep:jsonwebtoken"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
+url.workspace = true
 futures.workspace = true
 tempfile.workspace = true
 

@@ -960,6 +960,15 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         }
         .instrument(span)
         .await;
+        // #753: finalize only a fully successful, uncancelled run, whichever
+        // transfer path it took — a failed or cancelled run keeps the previous
+        // output intact.
+        let result = match result {
+            Ok(r) if !self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) => {
+                wrapped_sink.complete_run().await.map(|()| r)
+            }
+            other => other,
+        };
         if result.is_ok() {
             lag_poller.poll(true).await;
         }
@@ -3007,6 +3016,10 @@ mod tests {
             self.log("abort");
             Ok(())
         }
+        async fn complete_run(&self) -> Result<(), FaucetError> {
+            self.log("complete");
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -3017,9 +3030,67 @@ mod tests {
         assert!(result.is_ok());
         let log = events.lock().unwrap().clone();
         assert_eq!(log.first().map(String::as_str), Some("begin"));
-        assert_eq!(log.last().map(String::as_str), Some("commit"));
+        assert_eq!(
+            &log[log.len() - 2..],
+            ["commit".to_string(), "complete".to_string()]
+        );
         assert!(log.contains(&"write:2".to_string()));
         assert!(!log.contains(&"abort".to_string()));
+    }
+
+    #[tokio::test]
+    async fn complete_run_is_called_only_after_a_successful_uncancelled_run() {
+        let source = MockSource(vec![json!({"id": 1})]);
+        let (ok, ok_events) = OverwriteRecordingSink::new(false, false);
+        Pipeline::new(&source, &ok).run().await.unwrap();
+        assert_eq!(
+            ok_events.lock().unwrap().last().map(String::as_str),
+            Some("complete")
+        );
+
+        let (failing, fail_events) = OverwriteRecordingSink::new(false, true);
+        assert!(Pipeline::new(&source, &failing).run().await.is_err());
+        assert!(
+            !fail_events
+                .lock()
+                .unwrap()
+                .contains(&"complete".to_string())
+        );
+
+        let (cancelled, cancel_events) = OverwriteRecordingSink::new(false, false);
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        Pipeline::new(&source, &cancelled)
+            .with_cancel(token)
+            .run()
+            .await
+            .unwrap();
+        assert!(
+            !cancel_events
+                .lock()
+                .unwrap()
+                .contains(&"complete".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_complete_run_fails_the_run() {
+        struct CompleteFails;
+        #[async_trait]
+        impl Sink for CompleteFails {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                Ok(records.len())
+            }
+            async fn complete_run(&self) -> Result<(), FaucetError> {
+                Err(FaucetError::Sink("finalize failed".into()))
+            }
+        }
+        let source = MockSource(vec![json!({"id": 1})]);
+        let err = Pipeline::new(&source, &CompleteFails)
+            .run()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("finalize failed"), "{err}");
     }
 
     #[tokio::test]

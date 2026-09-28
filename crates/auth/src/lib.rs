@@ -23,6 +23,8 @@
 //! [`Arc`]: std::sync::Arc
 
 mod flow;
+#[cfg(feature = "google-sa")]
+mod google_sa;
 #[cfg(feature = "oauth1")]
 mod oauth1;
 mod oauth2;
@@ -50,6 +52,8 @@ pub(crate) fn auth_http_client() -> reqwest::Client {
 }
 
 pub use flow::FlowProvider;
+#[cfg(feature = "google-sa")]
+pub use google_sa::{GoogleServiceAccountProvider, JWT_BEARER_GRANT};
 #[cfg(feature = "oauth1")]
 pub use oauth1::OAuth1Provider;
 pub use oauth2::{OAuth2ClientCredentialsProvider, OAuth2RefreshProvider};
@@ -65,7 +69,8 @@ pub const DEFAULT_EXPIRY_RATIO: f64 = 0.9;
 /// catalog.
 ///
 /// Supported `type` values: `flow` (composable multi-step, #511), `static`,
-/// `oauth2` (client-credentials), `oauth2_refresh`, `token_endpoint`, `oauth1`.
+/// `oauth2` (client-credentials), `oauth2_refresh`, `token_endpoint`,
+/// `google_service_account` (RFC 7523 JWT-bearer, `google-sa` feature), `oauth1`.
 pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, FaucetError> {
     let kind = spec
         .get("type")
@@ -81,6 +86,22 @@ pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, FaucetError> {
         )?)),
         "oauth2_refresh" => Ok(Arc::new(OAuth2RefreshProvider::from_config(&config)?)),
         "token_endpoint" => Ok(Arc::new(TokenEndpointProvider::from_config(&config)?)),
+        "google_service_account" => {
+            #[cfg(feature = "google-sa")]
+            {
+                Ok(Arc::new(GoogleServiceAccountProvider::from_config(
+                    &config,
+                )?))
+            }
+            #[cfg(not(feature = "google-sa"))]
+            {
+                Err(FaucetError::Config(
+                    "auth provider: `google_service_account` requires the `google-sa` feature — \
+                     rebuild with `--features google-sa`"
+                        .into(),
+                ))
+            }
+        }
         "oauth1" => {
             #[cfg(feature = "oauth1")]
             {
@@ -96,7 +117,7 @@ pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, FaucetError> {
             }
         }
         other => Err(FaucetError::Config(format!(
-            "auth provider: unknown type `{other}` (expected one of: flow, static, oauth2, oauth2_refresh, token_endpoint, oauth1)"
+            "auth provider: unknown type `{other}` (expected one of: flow, static, oauth2, oauth2_refresh, token_endpoint, google_service_account, oauth1)"
         ))),
     }
 }

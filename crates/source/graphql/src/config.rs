@@ -1,7 +1,9 @@
 //! GraphQL source configuration.
 
+use faucet_core::replication::BIND_PLACEHOLDER;
 use faucet_core::{
-    AuthSpec, DEFAULT_BATCH_SIZE, FaucetError, TlsClientConfig, validate_batch_size,
+    AuthSpec, BindFormat, BindValueType, DEFAULT_BATCH_SIZE, FaucetError, OnMissingKey,
+    ReplicationKey, ReplicationMethod, TlsClientConfig, validate_batch_size,
 };
 use reqwest::header::HeaderMap;
 use schemars::JsonSchema;
@@ -127,6 +129,49 @@ pub enum GraphqlPaginationSpec {
     Offset(GraphqlOffsetPagination),
 }
 
+/// Binds the stored bookmark into a GraphQL **variable** (#751), so the server
+/// returns only newer records. The client-side `replication_key` filter stays
+/// active as a safety net.
+///
+/// ```yaml
+/// replication_bind:
+///   variable: since                    # or a JSON Pointer: /filter/updatedAt/gte
+///   template: "updated_at:>${bookmark}"
+///   format: iso8601
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GraphqlReplicationBind {
+    /// The variable to set: a top-level variable name (`since`), or an RFC 6901
+    /// JSON Pointer into `variables` (`/filter/updatedAt/gte`) that resolves to
+    /// an existing value or to a new key of an existing object.
+    pub variable: String,
+    /// Template rendered with `${bookmark}` replaced by the formatted bookmark.
+    /// Defaults to the bare `${bookmark}`. When the bookmark sits inside a
+    /// query-language string (Shopify `query: "updated_at:>…"`), escaping is
+    /// the template author's job.
+    #[serde(default = "default_bind_template")]
+    pub template: String,
+    /// How to format the bookmark before substitution.
+    #[serde(default)]
+    pub format: BindFormat,
+    /// JSON type of the variable: `string` (default) or `number`.
+    #[serde(default)]
+    pub value_type: BindValueType,
+}
+
+fn default_bind_template() -> String {
+    BIND_PLACEHOLDER.to_string()
+}
+
+fn empty_object() -> Value {
+    Value::Object(Default::default())
+}
+
+fn default_replication_method() -> ReplicationMethod {
+    ReplicationMethod::FullTable
+}
+
 /// Configuration for the GraphQL source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GraphqlStreamConfig {
@@ -134,7 +179,8 @@ pub struct GraphqlStreamConfig {
     pub endpoint: String,
     /// The GraphQL query string.
     pub query: String,
-    /// Variables to pass with the query.
+    /// Variables to pass with the query. Defaults to an empty object.
+    #[serde(default = "empty_object")]
     pub variables: Value,
     /// Authentication: either inline (`{ type, config }`) or a `{ ref: <name> }`
     /// pointer to a shared provider in the CLI's top-level `auth:` catalog.
@@ -167,6 +213,34 @@ pub struct GraphqlStreamConfig {
     /// request). Requires the crate's `mtls` feature.
     #[serde(default)]
     pub tls: Option<TlsClientConfig>,
+
+    /// `full_table` (default) re-reads everything each run; `incremental`
+    /// filters on [`replication_key`](Self::replication_key) and emits a
+    /// bookmark on the final page so the next run resumes (#751).
+    #[serde(default = "default_replication_method")]
+    pub replication_method: ReplicationMethod,
+    /// Field used for incremental replication bookmarking: a top-level field
+    /// (`updatedAt`), a dot path into nested objects (`node.updatedAt`), or a
+    /// JSON Pointer (`/node/updatedAt`). Must resolve to one value per record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_key: Option<String>,
+    /// What to do with a record whose `replication_key` is missing or `null`
+    /// once a start bookmark exists: `keep` (default), `drop`, or `fail`.
+    #[serde(default)]
+    pub on_missing_key: OnMissingKey,
+    /// Initial bookmark used when no stored bookmark exists: records whose
+    /// `replication_key` is not greater than it are filtered out, and a
+    /// `replication_bind` renders it into the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_replication_value: Option<Value>,
+    /// Identifier the pipeline persists this stream's bookmark under. Derived
+    /// from the endpoint when unset and replicating incrementally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_key: Option<String>,
+    /// Bind the bookmark into a GraphQL variable (see [`GraphqlReplicationBind`]).
+    /// Requires `replication_method: incremental` + `replication_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_bind: Option<GraphqlReplicationBind>,
 }
 
 fn default_batch_size() -> usize {
@@ -187,6 +261,12 @@ impl GraphqlStreamConfig {
             max_pages: None,
             batch_size: DEFAULT_BATCH_SIZE,
             tls: None,
+            replication_method: ReplicationMethod::FullTable,
+            replication_key: None,
+            on_missing_key: OnMissingKey::default(),
+            start_replication_value: None,
+            state_key: None,
+            replication_bind: None,
         }
     }
 
@@ -278,6 +358,57 @@ impl GraphqlStreamConfig {
         }
         if let Some(tls) = &self.tls {
             tls.validate()?;
+        }
+        self.validate_replication()
+    }
+
+    /// Replication settings are consistent: incremental needs a parseable
+    /// `replication_key`, and a bind needs incremental mode, a variable, a
+    /// template carrying `${bookmark}`, and `variables` that are an object.
+    fn validate_replication(&self) -> Result<(), FaucetError> {
+        let incremental = self.replication_method == ReplicationMethod::Incremental;
+        match (&self.replication_key, incremental) {
+            (Some(k), _) => {
+                ReplicationKey::parse(k)?;
+            }
+            (None, true) => {
+                return Err(FaucetError::Config(
+                    "GraphQL source: `replication_method: incremental` requires a \
+                     `replication_key`"
+                        .into(),
+                ));
+            }
+            (None, false) => {}
+        }
+        if let Some(state_key) = &self.state_key {
+            faucet_core::state::validate_state_key(state_key)?;
+        }
+        let Some(bind) = &self.replication_bind else {
+            return Ok(());
+        };
+        if !incremental {
+            return Err(FaucetError::Config(
+                "GraphQL source: `replication_bind` requires `replication_method: incremental`"
+                    .into(),
+            ));
+        }
+        let var = bind.variable.trim();
+        if var.is_empty() || var == "/" {
+            return Err(FaucetError::Config(
+                "GraphQL source: `replication_bind.variable` must name a variable or be a JSON \
+                 Pointer into `variables`"
+                    .into(),
+            ));
+        }
+        if !bind.template.contains(BIND_PLACEHOLDER) {
+            return Err(FaucetError::Config(format!(
+                "GraphQL source: `replication_bind.template` must contain {BIND_PLACEHOLDER}"
+            )));
+        }
+        if !self.variables.is_object() && !self.variables.is_null() {
+            return Err(FaucetError::Config(
+                "GraphQL source: `replication_bind` needs `variables` to be an object".into(),
+            ));
         }
         Ok(())
     }
@@ -526,5 +657,98 @@ mod tests {
                 substitute_in_query: false,
             });
         assert!(config.validate().is_ok());
+    }
+
+    fn incremental() -> GraphqlStreamConfig {
+        let mut c = GraphqlStreamConfig::new("https://x/graphql", "{ a }")
+            .variables(json!({ "filter": {} }));
+        c.replication_method = ReplicationMethod::Incremental;
+        c.replication_key = Some("node.updatedAt".into());
+        c
+    }
+
+    fn bind(variable: &str, template: &str) -> GraphqlReplicationBind {
+        serde_json::from_value(json!({ "variable": variable, "template": template })).unwrap()
+    }
+
+    #[test]
+    fn replication_validation() {
+        assert!(incremental().validate().is_ok());
+        let err = |c: GraphqlStreamConfig| c.validate().unwrap_err().to_string();
+
+        let mut c = incremental();
+        c.replication_key = None;
+        assert!(err(c).contains("requires a `replication_key`"));
+
+        let mut c = incremental();
+        c.replication_key = Some("  ".into());
+        assert!(c.validate().is_err());
+
+        let mut c = incremental();
+        c.state_key = Some("bad key with spaces\n".into());
+        assert!(c.validate().is_err());
+
+        let mut c = incremental();
+        c.replication_bind = Some(bind("/filter/since", "gt:${bookmark}"));
+        assert!(c.validate().is_ok());
+
+        let mut c = incremental();
+        c.replication_bind = Some(bind(" ", "${bookmark}"));
+        assert!(err(c).contains("replication_bind.variable"));
+        let mut c = incremental();
+        c.replication_bind = Some(bind("/", "${bookmark}"));
+        assert!(err(c).contains("replication_bind.variable"));
+
+        let mut c = incremental();
+        c.replication_bind = Some(bind("since", "no placeholder"));
+        assert!(err(c).contains("must contain"));
+
+        let mut c = incremental();
+        c.variables = json!([1]);
+        c.replication_bind = Some(bind("since", "${bookmark}"));
+        assert!(err(c).contains("to be an object"));
+
+        let mut c = incremental();
+        c.replication_method = ReplicationMethod::FullTable;
+        c.replication_bind = Some(bind("since", "${bookmark}"));
+        assert!(err(c).contains("requires `replication_method: incremental`"));
+    }
+
+    #[test]
+    fn replication_fields_default_and_round_trip() {
+        let c: GraphqlStreamConfig = serde_json::from_value(json!({
+            "endpoint": "https://x/graphql", "query": "{ a }", "variables": {},
+            "auth": { "type": "none" }, "records_path": null, "pagination": null,
+            "max_pages": null
+        }))
+        .unwrap();
+        assert_eq!(c.replication_method, ReplicationMethod::FullTable);
+        assert!(c.replication_bind.is_none());
+        let b: GraphqlReplicationBind =
+            serde_json::from_value(json!({ "variable": "since" })).unwrap();
+        assert_eq!(b.template, "${bookmark}");
+        assert!(
+            serde_json::from_value::<GraphqlReplicationBind>(json!({ "variable": "a", "x": 1 }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn variables_default_to_empty_object() {
+        let c: GraphqlStreamConfig = serde_json::from_value(json!({
+            "endpoint": "https://x/graphql", "query": "{ a }", "auth": {"type": "none"}
+        }))
+        .unwrap();
+        assert_eq!(c.variables, json!({}));
+        assert!(c.validate().is_ok());
+        let schema = serde_json::to_value(schemars::schema_for!(GraphqlStreamConfig)).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!("variables")));
+        let null: GraphqlStreamConfig = serde_json::from_value(json!({
+            "endpoint": "https://x/graphql", "query": "{ a }", "auth": {"type": "none"},
+            "variables": null
+        }))
+        .unwrap();
+        assert!(null.variables.is_null());
     }
 }

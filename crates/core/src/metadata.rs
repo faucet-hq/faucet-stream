@@ -293,6 +293,9 @@ impl Sink for MetadataSink {
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.inner.abort_overwrite().await
     }
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        self.inner.complete_run().await
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +444,7 @@ mod tests {
         let _ = sink.begin_overwrite().await;
         let _ = sink.commit_overwrite().await;
         sink.abort_overwrite().await.unwrap();
+        sink.complete_run().await.unwrap();
 
         assert!(format!("{sink:?}").contains("MetadataSink"));
     }

@@ -41,3 +41,43 @@ tests:
       records:
         - { section: "Income", group_path: "Income", col_0: "Sales",    "Jan 2024": "100", "Feb 2024": "120" }
         - { section: "Income", group_path: "Income", col_0: "Services", "Jan 2024": "50",  "Feb 2024": "60" }
+
+  # #746: each leaf carries two positional cell arrays, each named by its own
+  # header list; the groups merge into one row per leaf.
+  - name: column groups merge per leaf
+    pipeline:
+      transforms:
+        - type: tree_flatten
+          config:
+            root: rows
+            children: rows
+            groups:
+              - { from: dims, header: dimHeaders, header_label: name }
+              - { from: mets, header: metHeaders, header_label: name }
+            ancestors: { field: label, as: [section] }
+    input:
+      - dimHeaders: [ { name: date }, { name: country } ]
+        metHeaders: [ { name: sessions } ]
+        rows:
+          - label: Web
+            rows:
+              - { dims: [ { value: "20260901" }, { value: DE } ], mets: [ { value: "12" } ] }
+              - { dims: [ { value: "20260902" }, { value: FR } ], mets: [ { value: "7" } ] }
+    expect:
+      records:
+        - { section: Web, date: "20260901", country: DE, sessions: "12" }
+        - { section: Web, date: "20260902", country: FR, sessions: "7" }
+
+  - name: a group narrower than its headers fails the page
+    pipeline:
+      transforms:
+        - type: tree_flatten
+          config:
+            children: rows
+            groups:
+              - { from: mets, header: metHeaders, header_label: name }
+    input:
+      - metHeaders: [ { name: sessions }, { name: users } ]
+        mets: [ { value: "1" } ]
+    expect:
+      error: "group 'mets': 1 cell(s) but 2 header(s)"
