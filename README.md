@@ -44,18 +44,30 @@ brew install faucet-hq/faucet-stream/faucet-cli
 
 ## A governed ETL pipeline in one file
 
-This pipeline pulls orders from a billing API every 15 minutes. It reads only what changed
-since the last run, reshapes the records and hashes customer emails. It checks the data
-against quality rules and the contract the analytics team depends on, then merges the result
-into BigQuery by order id. Rows that fail go to a dead-letter file, and the rest of the run
-continues.
+This pipeline loads orders from a billing API into BigQuery every 15 minutes. Every row passes
+the governance the analytics team relies on before anything is written.
 
-It also handles the surrounding work:
-- **Secrets:** credentials come from AWS Secrets Manager and GCP Secret Manager, never from the file.
-- **Metrics and tracing:** Prometheus metrics are served on `:9090`, and traces go to your OTLP collector.
-- **Lineage:** column-level lineage is sent to OpenLineage.
-- **Alerts:** failures, SLA breaches, DLQ spikes and column drift post to Slack.
-- **Budget:** a single run can't exceed its row or time limit.
+- **Extract and load**
+  - Reads only what changed since the last run, keyed on `updated_at`, with retries.
+  - Merges into BigQuery by order id (`write_mode: upsert`), so an updated order replaces its old row.
+- **Transform**
+  - Converts keys to snake_case and casts `amount` to a number.
+- **Govern in flight**
+  - Hashes customer emails before any sink, dead-letter file or lineage event sees them.
+  - Checks every row against quality rules and the contract the analytics team depends on.
+  - Adds new source columns to the table instead of failing (`schema: evolve`).
+  - Allows PII only into sinks marked `residency: eu`, which is checked before the run starts.
+  - Sends rows that fail to a dead-letter file, and lets the rest of the run continue.
+- **Run and control**
+  - Runs on a 15-minute cron with `faucet schedule`, and skips a run if the previous one is still going.
+  - Caps each run's rows and duration with a budget.
+- **Observe and alert**
+  - Serves Prometheus metrics on `127.0.0.1:9090/metrics` and sends traces to your OTLP collector.
+  - Sends column-level lineage to OpenLineage, and records each dataset in a catalog for impact analysis.
+  - Watches freshness with an SLA, and learns per-column profiles to spot drift.
+  - Posts failures, SLA breaches, DLQ spikes and column drift to Slack.
+- **Secure**
+  - Reads credentials from AWS Secrets Manager and GCP Secret Manager, never from the file.
 
 ```yaml
 # orders.yaml
@@ -255,7 +267,7 @@ warehouse is dbt's job, and the two work well together
 | **Effectively-once** | On supported sinks, a per-page commit token is written atomically with the data, so a resumed run writes no duplicates. This is idempotent at-least-once, not distributed-consensus exactly-once. |
 | **Upsert and delete** | `write_mode: upsert \| delete` with a key and a delete marker ([upsert](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)). |
 | **Failure handling** | Retries with backoff and `Retry-After`, a circuit breaker, and a dead-letter queue you can inspect and replay. Each sink declares whether a failed batch is all-or-nothing, and `on_batch_error: dlq_all` is refused on sinks where a failed write may have partly landed, so replaying the DLQ can't duplicate rows ([resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html) · [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html)). |
-| **Change data capture** | Row-level CDC from PostgreSQL, MySQL, SQL Server, MongoDB, Oracle (LogMiner) and DynamoDB Streams. `faucet mirror` runs a snapshot and hands it off to CDC without gaps ([replication](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html)). |
+| **Change data capture** | Row-level CDC from PostgreSQL, MySQL, SQL Server, MongoDB, Oracle (LogMiner) and DynamoDB Streams. `faucet mirror` runs a snapshot and hands it off to CDC without gaps, for one table or a whole table set ([replication](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html)). |
 | **Status and state** | `faucet status` shows each pipeline on one screen: last success or failure, where the next run resumes, how far a CDC or streaming source is behind, the DLQ backlog, and SLA and profiling verdicts. Exit codes 0 / 1 / 2 make it a cron or Nagios check. `faucet state show / set / reset / export / import` moves, resets, backs up or migrates a bookmark safely, including between file, Redis and Postgres stores ([state and status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html)). |
 | **Backfills** | Resumable, windowed historical replays with `faucet backfill` ([backfill](https://faucet-hq.github.io/faucet-stream/cookbook/backfill.html)). |
 | **Observability** | Prometheus metrics and `tracing` / OTLP spans for every source, sink, transform and state operation, including source lag (`faucet_source_lag_seconds`, `_bytes`, `_events`) and API throttling (`faucet_source_throttled_total`, `faucet_source_throttle_wait_seconds`) ([observability](https://faucet-hq.github.io/faucet-stream/operations/observability.html)). |
