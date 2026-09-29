@@ -36,6 +36,17 @@ pub enum AzureSinkFormat {
     /// variant: ORC is read-only.
     #[cfg(feature = "file-format-avro")]
     Avro,
+    /// Apache Parquet: each object is a complete, self-contained Parquet
+    /// file, written with the `parquet` options; enables the columnar fast
+    /// path. Requires the `arrow` feature (#777).
+    #[cfg(feature = "arrow")]
+    Parquet,
+    /// Unparsed text: each record's `content` field (or the record as JSON)
+    /// on its own line (#777).
+    RawText,
+    /// Take the format from the object name's extension — `path`'s, else
+    /// `file_extension` — looking through a compression suffix (#777).
+    Auto,
 }
 
 impl AzureSinkFormat {
@@ -52,12 +63,26 @@ impl AzureSinkFormat {
             Self::Xlsx => faucet_core::FileFormat::Xlsx,
             #[cfg(feature = "file-format-avro")]
             Self::Avro => faucet_core::FileFormat::Avro,
+            #[cfg(feature = "arrow")]
+            Self::Parquet => faucet_core::FileFormat::Parquet,
+            Self::RawText => faucet_core::FileFormat::RawText,
+            Self::Auto => faucet_core::FileFormat::JsonLines,
         }
     }
 
-    /// Whether an object of this format can be built one record at a time.
-    pub(crate) fn appends_per_record(self) -> bool {
-        matches!(self, Self::JsonLines)
+    /// The format objects are written in; `name` resolves `auto`.
+    pub(crate) fn resolve(
+        self,
+        name: &str,
+    ) -> Result<faucet_core::FileFormat, faucet_core::FaucetError> {
+        match self {
+            #[cfg(feature = "arrow")]
+            Self::Parquet => Ok(faucet_core::FileFormat::Parquet),
+            Self::Auto => faucet_common_file::FileFormatChoice::Auto
+                .resolve_writable(name)
+                .map_err(|e| faucet_core::FaucetError::Config(format!("azure-blob sink: {e}"))),
+            other => Ok(other.shared()),
+        }
     }
 }
 
@@ -70,6 +95,22 @@ pub struct AzureBlobSinkConfig {
     /// Object-name prefix for written objects.
     #[serde(default)]
     pub prefix: String,
+    /// Object key template inside the container, after `prefix` — the file
+    /// sink's `path` (#777). May contain `{part}` (numbered objects) and
+    /// `${now.*}` tokens; a trailing `/` is a directory of
+    /// `part-{part}<extension>` objects. When set, `file_extension` is not
+    /// used. Unset: objects are named `<prefix><run id>-<part><file_extension>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// What to do when an object of the same name already exists:
+    /// `overwrite` (default), `append` (JSON Lines, CSV, raw text) or
+    /// `error_if_exists` (#777).
+    #[serde(default)]
+    pub mode: faucet_common_file::write::FileMode,
+    /// `overwrite` stages the run's objects under a hidden prefix and swaps
+    /// them in only after a successful run (#777). Default `append`.
+    #[serde(default)]
+    pub write_mode: faucet_common_file::write::FileWriteMode,
     /// Object format (default `json_lines`) (#604).
     #[serde(default)]
     pub format: AzureSinkFormat,
@@ -118,6 +159,17 @@ pub struct AzureBlobSinkConfig {
     /// Writer schema and block codec, used when `format: avro` (#719).
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
+    /// Parquet writer options, used when `format: parquet` (#777):
+    /// `compression`, `row_group_size`, explicit `schema`.
+    #[serde(default)]
+    pub parquet: faucet_common_file::write::ParquetOptions,
+    /// JSON Lines writer options (`pretty`), used when `format: json_lines`.
+    #[serde(default)]
+    pub json_lines: faucet_common_file::write::JsonLinesOptions,
+    /// Encrypt objects at rest (#777; the `encryption` feature).
+    #[cfg(feature = "encryption")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<faucet_core::EncryptionSpec>,
 }
 
 fn default_file_extension() -> String {
@@ -148,6 +200,13 @@ impl AzureBlobSinkConfig {
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
+            path: None,
+            mode: faucet_common_file::write::FileMode::default(),
+            write_mode: faucet_common_file::write::FileWriteMode::default(),
+            parquet: faucet_common_file::write::ParquetOptions::default(),
+            json_lines: faucet_common_file::write::JsonLinesOptions::default(),
+            #[cfg(feature = "encryption")]
+            encryption: None,
         }
     }
 
@@ -273,9 +332,88 @@ impl AzureBlobSinkConfig {
 }
 
 impl AzureBlobSinkConfig {
-    /// What a failed batch write leaves behind (#737): each object upload is atomic, but one batch can span several objects.
+    /// Validate the config: batch size and the shared writer's settings.
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        faucet_core::validate_batch_size(self.batch_size)?;
+        self.settings()?.validate()
+    }
+
+    /// The object name the format and codec are resolved from.
+    fn resolution_name(&self) -> String {
+        match &self.path {
+            Some(p) => format!("{}{p}", self.prefix)
+                .replace(faucet_common_file::write::PART_TOKEN, "00001"),
+            None => self.file_extension.clone(),
+        }
+    }
+
+    fn codec(&self, _name: &str) -> faucet_core::Compression {
+        #[cfg(feature = "compression")]
+        {
+            faucet_common_file::resolve_compression(self.compression, _name)
+        }
+        #[cfg(not(feature = "compression"))]
+        {
+            faucet_core::Compression::None
+        }
+    }
+
+    /// The per-object record cap without `path`: the smaller of `batch_size`
+    /// (unless `0`) and `max_records_per_file`.
+    fn legacy_cap(&self) -> Option<usize> {
+        let bs = (self.batch_size > 0).then_some(self.batch_size);
+        match (bs, self.max_records_per_file.filter(|n| *n > 0)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The shared writer's settings for this config (#777).
+    pub fn settings(
+        &self,
+    ) -> Result<faucet_common_file::write::WriteSettings, faucet_core::FaucetError> {
+        if let Some(path) = &self.path {
+            faucet_common_file::require_path("azure-blob sink", path)?;
+            if path.matches(faucet_common_file::write::PART_TOKEN).count() > 1 {
+                return Err(faucet_core::FaucetError::Config(format!(
+                    "azure-blob sink: '{path}' has more than one `{{part}}`"
+                )));
+            }
+        }
+        let name = self.resolution_name();
+        let format = self.format.resolve(&name)?;
+        let codec = if faucet_common_file::compresses_internally(format) {
+            faucet_core::Compression::None
+        } else {
+            self.codec(&name)
+        };
+        let mut s = faucet_common_file::write::WriteSettings::new(format, codec);
+        s.opts = self.format_options();
+        s.parquet = self.parquet.clone();
+        s.json_lines = self.json_lines.clone();
+        s.mode = self.mode;
+        s.write_mode = self.write_mode;
+        s.max_records_per_file = match &self.path {
+            Some(_) => self.max_records_per_file.filter(|n| *n > 0),
+            None => self.legacy_cap(),
+        };
+        s.max_bytes_per_file = self.max_bytes_per_file;
+        #[cfg(feature = "encryption")]
+        {
+            s.encryption = self.encryption.clone();
+        }
+        s.object_per_flush = true;
+        Ok(s)
+    }
+
+    /// What a failed batch write leaves behind (#737): a page is encoded
+    /// locally and published only at a rollover or flush, so without a cap a
+    /// failed write publishes nothing; with one, objects closed earlier stay.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        faucet_core::BatchAtomicity::BestEffort
+        match self.settings() {
+            Ok(s) => s.batch_atomicity(),
+            Err(_) => faucet_core::BatchAtomicity::BestEffort,
+        }
     }
 }
 
@@ -360,20 +498,6 @@ mod tests {
     /// Only JSON Lines can be appended a record at a time. That predicate
     /// routes a write between the streaming byte accumulator and the buffered
     /// record one, so a wrong answer silently changes how objects are built.
-    #[test]
-    fn only_json_lines_appends_per_record() {
-        assert!(AzureSinkFormat::JsonLines.appends_per_record());
-        assert!(!AzureSinkFormat::JsonArray.appends_per_record());
-        assert_eq!(AzureSinkFormat::default(), AzureSinkFormat::JsonLines);
-        #[cfg(feature = "file-format-csv")]
-        assert!(!AzureSinkFormat::Csv.appends_per_record());
-        #[cfg(feature = "file-format-xml")]
-        assert!(!AzureSinkFormat::Xml.appends_per_record());
-        #[cfg(feature = "file-format-excel")]
-        assert!(!AzureSinkFormat::Xlsx.appends_per_record());
-        #[cfg(feature = "file-format-avro")]
-        assert!(!AzureSinkFormat::Avro.appends_per_record());
-    }
 
     /// Every variant maps onto exactly one shared format, so what this sink
     /// writes is what the file sources read back.
