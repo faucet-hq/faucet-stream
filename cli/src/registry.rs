@@ -2736,7 +2736,9 @@ fn file_alias_source(kind: &'static str, config: &Value) -> CliResult<Box<dyn So
         file_alias_config(Side::Source, kind, kind, config)?,
     )?;
     Ok(Box::new(
-        faucet_source_file::FileSource::new(cfg)?.with_connector_name(kind),
+        faucet_source_file::FileSource::new(cfg)?
+            .with_connector_name(kind)
+            .without_discovery(),
     ))
 }
 
@@ -2747,8 +2749,12 @@ fn file_alias_sink(kind: &'static str, config: &Value) -> CliResult<Box<dyn Sink
         kind,
         file_alias_config(Side::Sink, kind, kind, config)?,
     )?;
+    let atomicity =
+        sink_batch_atomicity(kind, config).unwrap_or(faucet_core::BatchAtomicity::BestEffort);
     Ok(Box::new(
-        faucet_sink_file::FileSink::new(cfg)?.with_connector_name(kind),
+        faucet_sink_file::FileSink::new(cfg)?
+            .with_connector_name(kind)
+            .with_legacy_surface(sink_supported_write_modes(kind), atomicity),
     ))
 }
 

@@ -77,6 +77,7 @@ pub struct FileSource {
     #[cfg(feature = "encryption")]
     encryption: Option<faucet_core::CompiledEncryption>,
     name: &'static str,
+    discover: bool,
 }
 
 impl FileSource {
@@ -95,6 +96,7 @@ impl FileSource {
             shard: Mutex::new(None),
             roundtrips: RecorderSlot::new(),
             name: "file",
+            discover: true,
             #[cfg(feature = "encryption")]
             encryption: config
                 .encryption
@@ -109,6 +111,13 @@ impl FileSource {
     /// `file`, for a deprecated kind the CLI builds as this source.
     pub fn with_connector_name(mut self, name: &'static str) -> Self {
         self.name = name;
+        self
+    }
+
+    /// Stop advertising dataset discovery, for a deprecated kind that never
+    /// offered it while it is built as this source.
+    pub fn without_discovery(mut self) -> Self {
+        self.discover = false;
         self
     }
 
@@ -714,7 +723,7 @@ impl faucet_core::Source for FileSource {
     }
 
     fn supports_discover(&self) -> bool {
-        true
+        self.discover
     }
 
     /// One dataset per readable file under `path` — no file is opened.
@@ -790,5 +799,12 @@ mod tests {
         let s = FileSource::new(FileSourceConfig::new("a.jsonl")).unwrap();
         assert_eq!(s.connector_name(), "file");
         assert_eq!(s.with_connector_name("csv").connector_name(), "csv");
+    }
+
+    #[test]
+    fn discovery_is_advertised_unless_turned_off() {
+        let s = FileSource::new(FileSourceConfig::new("a.jsonl")).unwrap();
+        assert!(s.supports_discover());
+        assert!(!s.without_discovery().supports_discover());
     }
 }
