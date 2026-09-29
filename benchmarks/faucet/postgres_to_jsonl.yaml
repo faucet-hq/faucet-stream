@@ -14,6 +14,6 @@ pipeline:
       query: "SELECT id, first_name, country, amount, created_at, active, attributes FROM bench ORDER BY id"
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./benchmarks/out/faucet_pg_out.jsonl

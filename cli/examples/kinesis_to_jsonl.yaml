@@ -29,7 +29,7 @@ pipeline:
       value_format: json
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/kinesis-events.jsonl
 

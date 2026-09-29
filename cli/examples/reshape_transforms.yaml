@@ -11,7 +11,7 @@ name: reshape_transforms
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/regional_actuals.csv   # account_id, region_id, jan, feb, mar, raw_meta
 
@@ -46,6 +46,6 @@ pipeline:
         drop_nulls: true
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/regional_long.jsonl

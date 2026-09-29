@@ -53,6 +53,6 @@ pipeline:
       records_path: "$.data[*]"
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/candidates.jsonl

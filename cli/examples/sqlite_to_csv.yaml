@@ -11,9 +11,9 @@ pipeline:
       query: SELECT id, email, created_at FROM users ORDER BY id
 
   sink:
-    type: csv
+    type: file
     config:
       path: ./out/users.csv
-      delimiter: 44       # ','
-      write_headers: true
-      append: false
+      csv:
+        delimiter: ","
+        has_headers: true

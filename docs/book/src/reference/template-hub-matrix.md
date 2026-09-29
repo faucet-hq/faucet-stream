@@ -25,8 +25,7 @@
 
 <a id="sink-faucet-hq-jsonl"></a>Local JSON Lines files, one per stream — the local validation destination
 
-- connector: `jsonl` · write modes: `append`
-- satisfies by construction: `overwrite`→`append`
+- connector: `file` · write modes: `append`, `overwrite`
 - params:
   - `out_dir` (default `"./out"`) — Directory to write <source>/<stream>.jsonl under
 
@@ -54,7 +53,7 @@
 <a id="faucet-hq-example-csv"></a>Example — two CSV exports as two streams (runs offline, no credentials)
 
 - tags: `example`, `file`
-- connector: `csv` · 2 stream(s)
+- connector: `file` · 2 stream(s)
 - params:
   - `data_dir` (default `"./hub/examples/data"`) — Directory holding orders.csv and customers.csv
 
@@ -71,7 +70,7 @@ faucet run --source faucet-hq/example-csv --sink faucet-hq/bigquery \
   --param bq_sa_key="$BQ_SA_KEY"
 ```
 
-**→ faucet-hq/jsonl** — 2 stream(s) run through an alias: `orders` overwrite→append, `customers` overwrite→append
+**→ faucet-hq/jsonl**
 
 ```bash
 faucet run --source faucet-hq/example-csv --sink faucet-hq/jsonl
@@ -115,7 +114,7 @@ faucet run --source faucet-hq/example-rest-api --sink faucet-hq/bigquery \
   --param bq_sa_key="$BQ_SA_KEY"
 ```
 
-**→ faucet-hq/jsonl** — 1 stream(s) run through an alias: `accounts` overwrite→append
+**→ faucet-hq/jsonl**
 
 ```bash
 faucet run --source faucet-hq/example-rest-api --sink faucet-hq/jsonl \

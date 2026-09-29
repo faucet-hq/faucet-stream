@@ -30,6 +30,6 @@ pipeline:
       # Relative to Envelope.Body (path_relative_to_body defaults to true).
       records_element_path: GetUsersResponse.Users.User
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl

@@ -15,11 +15,11 @@ name: csv_to_jsonl_with_usage_budget
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/countries.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/countries_with_usage.jsonl
 

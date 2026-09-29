@@ -5,11 +5,11 @@ version: 1
 name: orders
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./orders.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders.jsonl
   transforms:
@@ -25,6 +25,6 @@ pipeline:
       - { name: amount, type: number, required: true }
   dlq:
     sink:
-      type: jsonl
+      type: file
       config:
         path: ./orders_dlq.jsonl

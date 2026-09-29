@@ -16,16 +16,16 @@ name: topology_join_orders_countries
 pipeline:
   sources:
     orders:
-      type: csv
+      type: file
       config:
         path: ./data/orders.csv
     countries:
-      type: csv
+      type: file
       config:
         path: ./data/countries.csv
   sinks:
     enriched:
-      type: jsonl
+      type: file
       config:
         path: ./out/orders_enriched.jsonl
 

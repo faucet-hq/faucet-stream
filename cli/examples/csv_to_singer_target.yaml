@@ -14,7 +14,7 @@ name: orders
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./cli/examples/data/orders.csv
 

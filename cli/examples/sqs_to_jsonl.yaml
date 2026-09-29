@@ -17,6 +17,6 @@ pipeline:
       wait_time_seconds: 10
       batch_size: 1000
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/sqs_events.jsonl

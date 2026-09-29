@@ -6,7 +6,7 @@
 # snapshotting an operational collection into an analytics-friendly file format.
 #
 # Infra: MongoDB from `examples/docker-compose.yml` (the `mongodb` service).
-# The Parquet sink writes to the local filesystem — no cloud credentials needed.
+# The file sink writes Parquet to the local filesystem — no cloud credentials needed.
 #
 # Run:
 #   docker compose -f examples/docker-compose.yml up -d mongodb
@@ -43,17 +43,17 @@ pipeline:
       cursor_batch_size: 1000
 
   sink:
-    type: parquet
+    type: file
     config:
-      # Local filesystem destination. A path ending in `.parquet` writes a single
-      # file; a directory path rolls over to `<uuid>.parquet` files instead.
-      destination:
-        type: local_path
-        path: ./out/orders/
-      # Codec applied to each column chunk: uncompressed | snappy | gzip | zstd | lz4.
-      compression: zstd
-      # Roll over to a new file every N rows (directory mode) to cap file size.
-      max_rows_per_file: 200000
+      # A path ending in `/` is a directory of numbered `part-00001.parquet`
+      # files; a path ending in `.parquet` writes a single file.
+      path: ./out/orders/
+      format: parquet
+      parquet:
+        # Codec applied to each column chunk: none | snappy | gzip | zstd | lz4.
+        compression: zstd
+      # Roll over to a new file every N records to cap file size.
+      max_records_per_file: 200000
       # Rows per Arrow record batch handed to the writer. `0` = write whatever
       # the source hands over as one batch (recommended for Parquet, which
       # prefers fewer, larger row groups).

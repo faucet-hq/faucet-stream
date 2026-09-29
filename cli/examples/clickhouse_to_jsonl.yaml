@@ -24,6 +24,6 @@ pipeline:
       batch_size: 1000
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/events.jsonl

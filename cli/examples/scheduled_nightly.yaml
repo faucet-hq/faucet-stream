@@ -21,11 +21,11 @@ schedule:
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./events.csv
   sink:
-    type: jsonl
+    type: file
     config:
       # Dated partition — parent directory is created automatically.
       path: "./warehouse/dt=${now.date}/events.jsonl"

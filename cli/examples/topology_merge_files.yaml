@@ -12,16 +12,16 @@ name: topology_merge_files
 pipeline:
   sources:
     orders:
-      type: csv
+      type: file
       config:
         path: ./data/orders.csv
     countries:
-      type: csv
+      type: file
       config:
         path: ./data/countries.csv
   sinks:
     combined:
-      type: jsonl
+      type: file
       config:
         path: ./out/combined.jsonl
 

@@ -20,6 +20,6 @@ pipeline:
       # columns: ["id", "name"]
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/delta_events.jsonl

@@ -89,10 +89,10 @@ def source_doc(owner: str, name: str, desc: str, streams: list[tuple[str, str]])
         "params:",
         '  data_dir: { type: string, default: ./data, description: "Directory holding the CSV extracts" }',
         "source:",
-        "  type: csv",
+        "  type: file",
         "  config:",
         '    path: "${param.data_dir}/orders.csv"',
-        "    has_headers: true",
+        "    csv: { has_headers: true }",
         "streams:",
     ]
     for i, (stream, write) in enumerate(streams):

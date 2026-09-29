@@ -25,7 +25,7 @@ pipeline:
         WHERE day >= '${backfill.start_date}' AND day < '${backfill.end_date}'
 
   sink:
-    type: jsonl
+    type: file
     config:
       # One output file per window unit, e.g. ./out/events-20260601T000000Z.jsonl.
       path: ./out/events-${backfill.unit}.jsonl

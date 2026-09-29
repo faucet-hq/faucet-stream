@@ -37,6 +37,6 @@ pipeline:
       config: { mode: snake }
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/issues.jsonl

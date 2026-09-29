@@ -14,7 +14,7 @@ name: csv_to_clickhouse
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/input.csv
 

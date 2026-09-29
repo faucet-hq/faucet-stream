@@ -8,7 +8,7 @@
 # Then submit runs that only need to specify their source/sink:
 #
 #   curl -XPOST localhost:8080/v1/runs -H 'content-type: application/json' \
-#     -d '{"config":"version: 1\npipeline:\n  source: {type: csv, config: {path: in.csv}}\n  sink: {type: jsonl, config: {path: out.jsonl}}\n","name":"adhoc"}'
+#     -d '{"config":"version: 1\npipeline:\n  source: {type: file, config: { path: in.csv }}\n  sink: {type: file, config: { path: out.jsonl }}\n","name":"adhoc"}'
 #
 # This file is a partial pipeline config: it carries no source/sink (those come
 # from each submission) — only the defaults to fold in.

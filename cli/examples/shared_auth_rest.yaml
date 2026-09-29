@@ -35,7 +35,7 @@ pipeline:
         pagination: { type: None }
   sinks:
     out:
-      type: jsonl
+      type: file
       config:
         path: /tmp/placeholder.jsonl # overridden per row
 

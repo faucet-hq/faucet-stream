@@ -27,14 +27,14 @@
       "source": "faucet-hq/example-csv",
       "streams": [
         {
-          "satisfies": "overwrite",
+          "satisfies": null,
           "stream": "orders",
-          "write_mode": "append"
+          "write_mode": "overwrite"
         },
         {
-          "satisfies": "overwrite",
+          "satisfies": null,
           "stream": "customers",
-          "write_mode": "append"
+          "write_mode": "overwrite"
         }
       ]
     },
@@ -103,9 +103,9 @@
       "source": "faucet-hq/example-rest-api",
       "streams": [
         {
-          "satisfies": "overwrite",
+          "satisfies": null,
           "stream": "accounts",
-          "write_mode": "append"
+          "write_mode": "overwrite"
         },
         {
           "satisfies": null,
@@ -218,13 +218,14 @@
           "type": "string"
         }
       ],
-      "sink_type": "jsonl",
+      "sink_type": "file",
       "tags": [
         "file",
         "local"
       ],
       "write_modes": [
-        "append"
+        "append",
+        "overwrite"
       ]
     },
     {
@@ -314,7 +315,7 @@
           "type": "string"
         }
       ],
-      "source_type": "csv",
+      "source_type": "file",
       "streams": [
         {
           "description": null,

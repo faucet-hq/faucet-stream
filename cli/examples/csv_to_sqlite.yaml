@@ -5,12 +5,14 @@ name: csv_to_sqlite
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: inventory.tsv
-      has_headers: false
-      delimiter: 9    # b'\t'
-      quote: 39       # b'\''
+      format: csv
+      csv:
+        has_headers: false
+        delimiter: "\t"
+        quote: "'"
 
   sink:
     type: sqlite

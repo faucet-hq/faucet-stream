@@ -5,12 +5,13 @@ name: csv_to_mysql
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: customers.csv
-      has_headers: true
-      delimiter: 44   # b','
-      quote: 34       # b'"'
+      csv:
+        has_headers: true
+        delimiter: ","
+        quote: '"'
 
   sink:
     type: mysql

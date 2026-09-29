@@ -32,7 +32,7 @@ pipeline:
         lower: { into: query, name: start_date, template: "${window}", format: date }
         upper: { into: query, name: end_date,   template: "${window}", format: date }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/usage.jsonl }
   state:
     type: file

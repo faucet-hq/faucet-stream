@@ -24,12 +24,12 @@ name: orders_csv_with_sla
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./orders.csv
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders_out.jsonl
 

@@ -15,7 +15,7 @@ pipeline:
       idle_timeout: 30
       batch_size: 1000
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/mysql_cdc.jsonl
   state:

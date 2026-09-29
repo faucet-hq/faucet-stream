@@ -9,10 +9,11 @@ tags: [example, file]
 params:
   data_dir: { type: string, default: ./hub/examples/data, description: "Directory holding orders.csv and customers.csv" }
 source:
-  type: csv
+  type: file
   config:
     path: "${param.data_dir}/orders.csv"
-    has_headers: true
+    csv:
+      has_headers: true
 transforms:
   - { type: keys_case, config: { mode: snake } }
 streams:

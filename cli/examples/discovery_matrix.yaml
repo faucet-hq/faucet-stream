@@ -31,7 +31,7 @@ pipeline:
         replication_method: { type: FullTable }
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/report-${subsidiaries.subsidiary_id}-${fields.field_id}.jsonl
 

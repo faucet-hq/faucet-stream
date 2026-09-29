@@ -22,11 +22,10 @@ pipeline:
       idle_timeout: 10
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/orders.jsonl
-      append: false
-      pretty: false
+      json_lines: { pretty: false }
 
   state:
     type: file

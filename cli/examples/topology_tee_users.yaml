@@ -16,16 +16,16 @@ pipeline:
   # Named templates the nodes reference via `ref:`.
   sources:
     orders:
-      type: csv
+      type: file
       config:
         path: ./data/orders.csv
   sinks:
     archive:
-      type: jsonl
+      type: file
       config:
         path: ./out/orders_archive.jsonl
     warehouse:
-      type: jsonl
+      type: file
       config:
         path: ./out/orders_warehouse.jsonl
     audit:

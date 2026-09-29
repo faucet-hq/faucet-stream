@@ -16,10 +16,11 @@ name: csv_to_jsonl_wasm
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: cli/examples/data/orders.csv
-      has_headers: true
+      csv:
+        has_headers: true
 
   transforms:
     - type: wasm
@@ -32,6 +33,6 @@ pipeline:
         reload_on_change: false   # re-stat + hot-swap the module per page
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: /tmp/faucet_wasm_demo.jsonl

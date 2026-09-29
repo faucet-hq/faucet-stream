@@ -37,10 +37,10 @@ pipeline:
 
   sinks:
     archive:
-      type: jsonl
+      type: file
       config:
-        append: false
-        pretty: false
+        format: json_lines
+        json_lines: { pretty: false }
 
 matrix:
   - id: users

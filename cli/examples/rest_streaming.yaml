@@ -38,8 +38,7 @@ pipeline:
       schema_sample_size: 100
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: comments.jsonl
-      append: false
-      pretty: false
+      json_lines: { pretty: false }

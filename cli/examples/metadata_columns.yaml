@@ -11,10 +11,10 @@ metadata_columns:
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/metadata_demo.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/metadata_demo.jsonl

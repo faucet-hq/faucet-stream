@@ -11,7 +11,7 @@ name: csv_to_delta
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/input.csv
 

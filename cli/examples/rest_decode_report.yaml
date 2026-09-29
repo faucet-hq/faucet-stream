@@ -19,5 +19,5 @@ pipeline:
         - gunzip
         - parse: { format: csv }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/report.jsonl }

@@ -355,8 +355,8 @@ cat > 01_basic.yaml <<'YAML'
 version: 1
 name: basic_csv_to_jsonl
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink:   { type: jsonl, config: { path: ./out/basic.jsonl } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink:   { type: file, config: { path: ./out/basic.jsonl } }
 YAML
 
 # --- 2. Transforms (set / keys_case / cast / redact) → stdout --------------
@@ -364,7 +364,7 @@ cat > 02_transforms.yaml <<'YAML'
 version: 1
 name: transforms_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   transforms:
     - type: set
       config: { values: { _source: demo } }
@@ -382,7 +382,7 @@ cat > 03_quality.yaml <<'YAML'
 version: 1
 name: quality_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   quality:
     record:
       - type: not_null
@@ -397,9 +397,9 @@ pipeline:
         values: [open, shipped, cancelled]
         on_failure: quarantine
   dlq:
-    sink: { type: jsonl, config: { path: ./dlq/quality.jsonl } }
+    sink: { type: file, config: { path: ./dlq/quality.jsonl } }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/quality_clean.jsonl }
 YAML
 
@@ -408,7 +408,7 @@ cat > 04_contract.yaml <<'YAML'
 version: 1
 name: contract_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   contract:
     version: "1.0.0"
     on_breach: quarantine
@@ -418,9 +418,9 @@ pipeline:
       - { name: status, type: string, enum: [open, shipped, cancelled] }
       - { name: customer_email, type: string, pattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$', required: false, nullable: true }
   dlq:
-    sink: { type: jsonl, config: { path: ./dlq/contract.jsonl } }
+    sink: { type: file, config: { path: ./dlq/contract.jsonl } }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/contract_out.jsonl }
 YAML
 
@@ -429,7 +429,7 @@ cat > 05_masking.yaml <<'YAML'
 version: 1
 name: masking_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/customers.csv } }
+  source: { type: file, config: { path: ./data/customers.csv } }
   masking:
     key: demo-masking-key
     rules:
@@ -446,7 +446,7 @@ pipeline:
         match: { fields: [user_id] }
         action: { type: tokenize, prefix: usr_ }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/masked.jsonl }
 YAML
 
@@ -456,8 +456,8 @@ version: 1
 name: sql_demo
 pipeline:
   source:
-    type: csv
-    config: { path: ./data/orders.csv, has_header: true, batch_size: 0 }
+    type: file
+    config: { path: ./data/orders.csv, batch_size: 0 }
   transforms:
     - type: sql
       config:
@@ -473,7 +473,7 @@ pipeline:
           - name: countries
             source: { type: csv, path: ./data/countries.csv, has_header: true }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/sql_agg.jsonl }
 YAML
 
@@ -485,7 +485,7 @@ cat > 07a_to_sqlite.yaml <<'YAML'
 version: 1
 name: csv_to_sqlite
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   sink:
     type: sqlite
     config:
@@ -504,8 +504,8 @@ pipeline:
       database_url: sqlite:./out/orders.db
       query: SELECT * FROM orders ORDER BY order_id
   sink:
-    type: csv
-    config: { path: ./out/orders_roundtrip.csv, write_headers: true }
+    type: file
+    config: { path: ./out/orders_roundtrip.csv, csv: { has_headers: true } }
 YAML
 
 # --- 8. Parquet round-trip: CSV → Parquet, then Parquet → JSONL ------------
@@ -513,11 +513,10 @@ cat > 08a_to_parquet.yaml <<'YAML'
 version: 1
 name: csv_to_parquet
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   sink:
-    type: parquet
-    config:
-      destination: { type: local_path, path: ./out/orders.parquet }
+    type: file
+    config: { path: ./out/orders.parquet }
 YAML
 
 cat > 08b_from_parquet.yaml <<'YAML'
@@ -525,11 +524,10 @@ version: 1
 name: parquet_to_jsonl
 pipeline:
   source:
-    type: parquet
-    config:
-      source: { type: local_path, path: ./out/orders.parquet }
+    type: file
+    config: { path: ./out/orders.parquet }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/orders_from_parquet.jsonl }
 YAML
 
@@ -538,8 +536,8 @@ cat > 09_sla.yaml <<'YAML'
 version: 1
 name: sla_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink:   { type: jsonl, config: { path: ./out/sla_out.jsonl } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink:   { type: file, config: { path: ./out/sla_out.jsonl } }
   state:  { type: file, config: { path: ./state } }
 sla:
   max_staleness_secs: 86400
@@ -552,11 +550,11 @@ cat > 10_lineage.yaml <<'YAML'
 version: 1
 name: lineage_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   transforms:
     - type: redact
       config: { fields: [customer_email], mask: "***" }
-  sink: { type: jsonl, config: { path: ./out/lineage_out.jsonl } }
+  sink: { type: file, config: { path: ./out/lineage_out.jsonl } }
 lineage:
   namespace: local.demo
   job_name: ${name}::${row_id}
@@ -572,8 +570,8 @@ cat > 11_catalog.yaml <<'YAML'
 version: 1
 name: catalog_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink:   { type: jsonl, config: { path: ./out/catalog_out.jsonl } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink:   { type: file, config: { path: ./out/catalog_out.jsonl } }
 catalog:
   url: sqlite:./catalog/catalog.db
 YAML
@@ -613,8 +611,8 @@ cat > 13_serve_run.yaml <<'YAML'
 version: 1
 name: serve_submitted
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink:   { type: jsonl, config: { path: ./out/serve_out.jsonl } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink:   { type: file, config: { path: ./out/serve_out.jsonl } }
 YAML
 
 # --- 14. Matrix fan-out: one source template, N rows → N outputs -----------
@@ -622,8 +620,8 @@ cat > 14_matrix.yaml <<'YAML'
 version: 1
 name: matrix_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink:   { type: jsonl, config: { path: ./out/matrix_default.jsonl } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink:   { type: file, config: { path: ./out/matrix_default.jsonl } }
 matrix:
   - id: us
     sink: { config: { path: ./out/matrix_us.jsonl } }
@@ -636,15 +634,15 @@ cat > 15_depends.yaml <<'YAML'
 version: 1
 name: depends_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink:   { type: csv, config: { path: ./out/staged.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink:   { type: file, config: { path: ./out/staged.csv } }
 matrix:
   - id: stage
     sink: { config: { path: ./out/staged_orders.csv } }
   - id: report
     depends_on: [stage]
     source: { config: { path: ./out/staged_orders.csv } }
-    sink: { type: jsonl, config: { path: ./out/report.jsonl } }
+    sink: { type: file, config: { path: ./out/report.jsonl } }
 YAML
 
 # --- 16. Transforms showcase: set(nested/array) → filter → explode →
@@ -653,7 +651,7 @@ cat > 16_transforms2.yaml <<'YAML'
 version: 1
 name: transforms2_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   transforms:
     - type: set
       config:
@@ -678,7 +676,7 @@ cat > 17_drift.yaml <<'YAML'
 version: 1
 name: drift_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   sink:
     type: sqlite
     config:
@@ -694,13 +692,13 @@ cat > 18_contract_fail.yaml <<'YAML'
 version: 1
 name: contract_fail_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   contract:
     version: "1.0.0"
     on_breach: fail
     fields:
       - { name: status, type: string, enum: [open, shipped, cancelled] }
-  sink: { type: jsonl, config: { path: ./out/cfail.jsonl } }
+  sink: { type: file, config: { path: ./out/cfail.jsonl } }
 YAML
 
 # --- 19. Quality `abort` policy → the run aborts (expected non-zero exit) ---
@@ -708,22 +706,22 @@ cat > 19_quality_abort.yaml <<'YAML'
 version: 1
 name: quality_abort_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
+  source: { type: file, config: { path: ./data/orders.csv } }
   quality:
     record:
       - type: value_in_set
         field: status
         values: [open, shipped, cancelled]
         on_failure: abort
-  sink: { type: jsonl, config: { path: ./out/qabort.jsonl } }
+  sink: { type: file, config: { path: ./out/qabort.jsonl } }
 YAML
 
 # --- 20. JSON (not YAML) config format -------------------------------------
 cat > 20_basic.json <<'JSON'
 { "version": 1, "name": "json_config_demo",
   "pipeline": {
-    "source": { "type": "csv", "config": { "path": "./data/orders.csv" } },
-    "sink":   { "type": "jsonl", "config": { "path": "./out/from_json.jsonl" } } } }
+    "source": { "type": "file", "config": { "path": "./data/orders.csv" } },
+    "sink":   { "type": "file", "config": { "path": "./out/from_json.jsonl" } } } }
 JSON
 
 # --- 21. Config composition: base + child `extends:` + `profiles:` ----------
@@ -731,8 +729,8 @@ cat > 21_base.yaml <<'YAML'
 version: 1
 name: compose_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink: { type: jsonl, config: { path: ./out/compose_dev.jsonl } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink: { type: file, config: { path: ./out/compose_dev.jsonl } }
 YAML
 cat > 21_child.yaml <<'YAML'
 extends: ./21_base.yaml
@@ -764,7 +762,7 @@ params:
 
 pipeline:
   source:
-    type: csv
+    type: file
     config: { path: ./data/orders.csv, batch_size: "${param.batch_size}" }
   transforms:
     - type: filter
@@ -772,7 +770,7 @@ pipeline:
     - type: set
       config: { values: { export_label: "${param.label}" } }
   sink:
-    type: jsonl
+    type: file
     config: { path: "./out/orders-${param.country}.jsonl" }
 YAML
 
@@ -781,8 +779,8 @@ cat > 22_scheduled.yaml <<'YAML'
 version: 1
 name: scheduled_demo
 pipeline:
-  source: { type: csv, config: { path: ./data/orders.csv } }
-  sink: { type: jsonl, config: { path: ./out/sched.jsonl } }
+  source: { type: file, config: { path: ./data/orders.csv } }
+  sink: { type: file, config: { path: ./out/sched.jsonl } }
   state: { type: file, config: { path: ./state } }
 schedule:
   cron: "0 2 * * *"
@@ -894,8 +892,8 @@ step_expect_fail "run 19 quality abort aborts"  "$FAUCET" run 19_quality_abort.y
 step "run 20 JSON-format config"    "$FAUCET" run 20_basic.json
 step "run 21 compose --profile prod" "$FAUCET" run 21_child.yaml --profile prod
 step "run --from-env (pure env-var pipeline)" \
-  env FAUCET_SOURCE=csv FAUCET_SOURCE_CSV_PATH=./data/orders.csv \
-      FAUCET_SINK=jsonl FAUCET_SINK_JSONL_PATH=./out/from_env.jsonl \
+  env FAUCET_SOURCE=file FAUCET_SOURCE_FILE_PATH=./data/orders.csv \
+      FAUCET_SINK=file FAUCET_SINK_FILE_PATH=./out/from_env.jsonl \
       "$FAUCET" run --from-env
 
 hdr "Params & the pipeline template registry"

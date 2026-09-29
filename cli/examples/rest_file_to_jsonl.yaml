@@ -33,6 +33,6 @@ pipeline:
           token: ${env:AUTH_TOKEN}
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/contacts.jsonl
