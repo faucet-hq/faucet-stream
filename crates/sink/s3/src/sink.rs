@@ -23,7 +23,6 @@ pub struct S3Sink {
     client: Client,
     writer: FileWriter,
     roundtrips: Arc<faucet_core::observability::RecorderSlot>,
-    name: &'static str,
 }
 
 impl S3Sink {
@@ -66,15 +65,7 @@ impl S3Sink {
             client,
             writer,
             roundtrips,
-            name: "s3",
         })
-    }
-
-    /// Report `name` as the connector (metrics, logs) instead of `s3` — for a
-    /// deprecated kind built as this sink.
-    pub fn with_connector_name(mut self, name: &'static str) -> Self {
-        self.name = name;
-        self
     }
 
     /// Build an S3 client from the configuration.
@@ -87,10 +78,7 @@ impl S3Sink {
             config_loader = config_loader.endpoint_url(endpoint);
         }
         let sdk_config = config_loader.load().await;
-        let conf = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(config.force_path_style)
-            .build();
-        Ok(Client::from_conf(conf))
+        Ok(Client::new(&sdk_config))
     }
 
     /// The format objects are written in.
@@ -124,7 +112,7 @@ impl faucet_core::Sink for S3Sink {
     }
 
     fn connector_name(&self) -> &'static str {
-        self.name
+        "s3"
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -216,31 +204,5 @@ impl faucet_core::Sink for S3Sink {
         }
         let rows = faucet_core::columnar::record_batch_to_values(batch)?;
         self.write_batch(&rows).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use faucet_core::Sink;
-
-    #[tokio::test]
-    async fn the_connector_name_and_path_style_are_configurable() {
-        let config = S3SinkConfig::new("b")
-            .region("us-east-1")
-            .endpoint_url("http://minio:9000")
-            .force_path_style(true);
-        assert!(config.force_path_style);
-        let client = S3Sink::build_client(&config).await.unwrap();
-        let sink = S3Sink::with_client(config, client).unwrap();
-        assert_eq!(sink.connector_name(), "s3");
-        let sink = sink.with_connector_name("parquet");
-        assert_eq!(sink.connector_name(), "parquet");
-        assert_eq!(
-            sink.writer
-                .backend()
-                .describe(faucet_common_file::write::Area::Destination, "k"),
-            "s3://b/k"
-        );
     }
 }

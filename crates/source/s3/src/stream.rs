@@ -71,7 +71,6 @@ pub struct S3Source {
     /// `list` (one per `ListObjectsV2` page), `get` (one per `GetObject`,
     /// including each ranged Parquet read).
     roundtrips: faucet_core::observability::RecorderSlot,
-    name: &'static str,
 }
 
 impl S3Source {
@@ -85,15 +84,7 @@ impl S3Source {
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
-            name: "s3",
         })
-    }
-
-    /// Report `name` as the connector (metrics, logs) instead of `s3` — for a
-    /// deprecated kind built as this source.
-    pub fn with_connector_name(mut self, name: &'static str) -> Self {
-        self.name = name;
-        self
     }
 
     /// Retain only the keys belonging to the applied shard (hash-of-key modulo
@@ -118,10 +109,8 @@ impl S3Source {
         }
 
         let sdk_config = config_loader.load().await;
-        let conf = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(config.force_path_style)
-            .build();
-        Ok(Client::from_conf(conf))
+        let client = Client::new(&sdk_config);
+        Ok(client)
     }
 
     /// List object keys matching the configured bucket and prefix.
@@ -1052,7 +1041,7 @@ impl faucet_core::Source for S3Source {
     }
 
     fn connector_name(&self) -> &'static str {
-        self.name
+        "s3"
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -1256,21 +1245,7 @@ mod tests {
             client,
             applied_shard: Mutex::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
-            name: "s3",
         }
-    }
-
-    #[tokio::test]
-    async fn the_connector_name_and_path_style_are_configurable() {
-        let config = S3SourceConfig::new("b")
-            .region("us-east-1")
-            .endpoint_url("http://minio:9000")
-            .force_path_style(true);
-        S3Source::build_client(&config).await.unwrap();
-        let source = test_source(S3SourceConfig::new("b"));
-        assert_eq!(faucet_core::Source::connector_name(&source), "s3");
-        let source = source.with_connector_name("parquet");
-        assert_eq!(faucet_core::Source::connector_name(&source), "parquet");
     }
 
     #[test]

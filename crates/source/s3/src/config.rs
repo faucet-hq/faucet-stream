@@ -105,11 +105,6 @@ pub struct S3SourceConfig {
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO).
     #[serde(default)]
     pub endpoint_url: Option<String>,
-    /// Address the bucket in the URL path (`<endpoint>/<bucket>/<key>`)
-    /// instead of as a host name (`<bucket>.<endpoint>`). Most S3-compatible
-    /// servers reached by host name need it. Default `false`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub force_path_style: bool,
     /// Format of the files to read. Defaults to `json_lines`.
     #[serde(default)]
     pub file_format: S3FileFormat,
@@ -204,7 +199,6 @@ impl S3SourceConfig {
             prefix: None,
             region: None,
             endpoint_url: None,
-            force_path_style: false,
             file_format: S3FileFormat::default(),
             max_objects: None,
             concurrency: 10,
@@ -250,12 +244,6 @@ impl S3SourceConfig {
     /// Set the AWS region.
     pub fn region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
-        self
-    }
-
-    /// Address the bucket in the URL path rather than the host name.
-    pub fn force_path_style(mut self, on: bool) -> Self {
-        self.force_path_style = on;
         self
     }
 

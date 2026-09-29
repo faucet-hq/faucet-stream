@@ -1558,9 +1558,7 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
 
 /// Local file sinks must not share a path (#743): two writers renaming onto
 /// one file lose one writer's data. Rows must differ, and a row that runs once
-/// per parent record or discovered tuple needs a per-invocation `${...}` token
-/// — except `mode: append` on a format each writer extends in place under a
-/// lock ([`shared_append_safe`], #779).
+/// per parent record or discovered tuple needs a per-invocation `${...}` token.
 fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
     fn per_invocation(path: &str) -> bool {
         path.match_indices("${")
@@ -1571,9 +1569,6 @@ fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
         let Some(path) = n.sink.config.get("path").and_then(Value::as_str) else {
             continue;
         };
-        if shared_append_safe(&n.sink.config, path) {
-            continue;
-        }
         let fans_out = matches!(n.role, NodeRole::Child { .. } | NodeRole::Product { .. });
         if fans_out && !per_invocation(path) {
             return Err(CliError::Config(format!(
@@ -1589,35 +1584,6 @@ fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
         }
     }
     Ok(())
-}
-
-/// Whether many writers may share a file sink `path`: `mode: append` on a
-/// format each writer extends in place under a file lock (#779) — JSON Lines
-/// or raw text (encrypted only when uncompressed, i.e. sealed per line) and
-/// unencrypted CSV. Every other mode or format rewrites the whole file.
-fn shared_append_safe(cfg: &Value, path: &str) -> bool {
-    use faucet_core::FileFormat;
-    let text = |k: &str| cfg.get(k).and_then(Value::as_str);
-    if text("mode") != Some("append") || text("write_mode") == Some("overwrite") {
-        return false;
-    }
-    let format = match text("format") {
-        None | Some("auto") => FileFormat::from_path(path),
-        Some(f) => serde_json::from_value::<FileFormat>(Value::String(f.to_string())).ok(),
-    };
-    let encrypted = cfg.get("encryption").is_some_and(|v| !v.is_null());
-    let lower = path.to_ascii_lowercase();
-    let compressed = match text("compression") {
-        None | Some("auto") => [".gz", ".gzip", ".zst", ".zstd"]
-            .iter()
-            .any(|s| lower.ends_with(s)),
-        Some(c) => c != "none",
-    };
-    match format {
-        Some(FileFormat::JsonLines | FileFormat::RawText) => !encrypted || !compressed,
-        Some(FileFormat::Csv) => !encrypted,
-        _ => false,
-    }
 }
 
 fn detect_cycle(parents: &HashMap<&str, &str>) -> CliResult<()> {
@@ -3617,71 +3583,6 @@ pipeline:
             }
             other => panic!("expected Config error, got {other:?}"),
         }
-    }
-
-    fn two_rows_sharing(sink: &str) -> CliResult<Vec<ExpandedNode>> {
-        let yaml = format!(
-            r#"
-version: 1
-pipeline:
-  source: {{ type: rest, config: {{ base_url: https://x }} }}
-  sink: {sink}
-matrix:
-  - {{ id: a }}
-  - {{ id: b }}
-"#
-        );
-        expand(&parse_with_extension(&yaml, "yaml").unwrap())
-    }
-
-    #[test]
-    fn a_shared_file_sink_path_is_allowed_only_for_in_place_appends() {
-        for ok in [
-            r#"{ type: file, config: { path: out.jsonl, mode: append } }"#,
-            r#"{ type: file, config: { path: out.jsonl.gz, mode: append } }"#,
-            r#"{ type: file, config: { path: out.txt, mode: append } }"#,
-            r#"{ type: file, config: { path: out.csv.zst, mode: append } }"#,
-            r#"{ type: file, config: { path: out.data, format: json_lines, mode: append, compression: gzip } }"#,
-            r#"{ type: file, config: { path: sealed.jsonl, mode: append, encryption: { key: k } } }"#,
-        ] {
-            assert!(two_rows_sharing(ok).is_ok(), "{ok}");
-        }
-        for refused in [
-            r#"{ type: file, config: { path: out.jsonl } }"#,
-            r#"{ type: file, config: { path: out.jsonl, mode: error_if_exists } }"#,
-            r#"{ type: file, config: { path: out.json, mode: append } }"#,
-            r#"{ type: file, config: { path: "out-{part}.parquet", mode: append } }"#,
-            r#"{ type: file, config: { path: out.csv, mode: append, encryption: { key: k } } }"#,
-            r#"{ type: file, config: { path: out.jsonl.gz, mode: append, encryption: { key: k } } }"#,
-            r#"{ type: file, config: { path: out.jsonl, mode: append, write_mode: overwrite } }"#,
-        ] {
-            let e = two_rows_sharing(refused).unwrap_err().to_string();
-            assert!(e.contains("both write the file sink path"), "{refused}: {e}");
-        }
-    }
-
-    #[test]
-    fn a_fan_out_row_may_append_in_place_to_one_file() {
-        let yaml = |mode: &str| {
-            format!(
-                r#"
-version: 1
-pipeline:
-  source: {{ type: rest, config: {{ base_url: https://x }} }}
-  sink: {{ type: file, config: {{ path: all.jsonl, mode: {mode} }} }}
-matrix:
-  - {{ id: p }}
-  - {{ id: c, parent: p, source: {{ config: {{ base_url: "https://x/${{p.id}}" }} }} }}
-"#
-            )
-        };
-        let rows = |mode: &str| expand(&parse_with_extension(&yaml(mode), "yaml").unwrap());
-        assert!(rows("append").is_ok(), "in-place appends may share one file");
-        let e = rows("error_if_exists").unwrap_err().to_string();
-        assert!(
-            e.contains("same for every invocation") || e.contains("both write"),
-            "{e}"
-        );
     }
 
     #[test]

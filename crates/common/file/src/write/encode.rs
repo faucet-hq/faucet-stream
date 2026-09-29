@@ -65,22 +65,6 @@ impl Ctx<'_> {
         Ok(out)
     }
 
-    /// Whether a `mode: append` file can be extended in place: each writer
-    /// adds only its new bytes under the backend's lock, so concurrent
-    /// appenders never lose each other's records. Line formats (sealed per
-    /// line when encrypted) and unencrypted CSV; everything else rewrites the
-    /// whole file.
-    pub fn appends_in_place(&self) -> bool {
-        if !self.backend.supports_append() {
-            return false;
-        }
-        match self.format {
-            FileFormat::JsonLines | FileFormat::RawText => !self.encrypted() || self.seals_lines(),
-            FileFormat::Csv => cfg!(feature = "file-format-csv") && !self.encrypted(),
-            _ => false,
-        }
-    }
-
     /// Whether an encryption key is configured.
     fn encrypted(&self) -> bool {
         #[cfg(feature = "encryption")]
@@ -218,32 +202,6 @@ pub(crate) struct OpenFile {
     poisoned: bool,
     /// Whether the final file holds everything written so far.
     finalized: bool,
-    /// `mode: append` in place: the scratch file holds only this writer's new
-    /// bytes, which a finalisation appends to the file under a lock.
-    in_place: bool,
-    /// A lock on the scratch file, held while the writer is alive so another
-    /// writer's stale-scratch cleanup leaves it alone.
-    _guard: Option<File>,
-}
-
-/// Create `tmp` if missing and hold an exclusive lock on it. Unix only: on
-/// Windows a lock would also block this writer's own other handles.
-fn lock_scratch(tmp: &Path) -> Option<File> {
-    #[cfg(unix)]
-    {
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(tmp)
-            .ok()?;
-        f.try_lock().ok().map(|()| f)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tmp;
-        None
-    }
 }
 
 impl OpenFile {
@@ -254,15 +212,8 @@ impl OpenFile {
         area: Area,
         name: String,
         resume: bool,
-        in_place: bool,
     ) -> Result<Self, FaucetError> {
-        let tmp = if in_place {
-            ctx.backend.unique_scratch_path(area, &name)?
-        } else {
-            ctx.backend.scratch_path(area, &name)?
-        };
-        let guard = lock_scratch(&tmp);
-        let carry = resume && !in_place;
+        let tmp = ctx.backend.scratch_path(area, &name)?;
         let mut file = Self {
             enc: Enc::Doc(Vec::new()),
             name,
@@ -272,17 +223,14 @@ impl OpenFile {
             bytes: 0,
             poisoned: false,
             finalized: false,
-            in_place,
-            _guard: guard,
         };
         file.enc = match ctx.format {
             FileFormat::JsonLines | FileFormat::RawText => {
-                Enc::Lines(Some(open_lines(ctx, area, &file.name, &file.tmp, carry)?))
+                Enc::Lines(Some(open_lines(ctx, area, &file.name, &file.tmp, resume)?))
             }
             #[cfg(feature = "file-format-csv")]
             FileFormat::Csv => {
-                let (state, carried) =
-                    CsvState::create(ctx, area, &file.name, &file.tmp, carry, resume && in_place)?;
+                let (state, carried) = CsvState::create(ctx, area, &file.name, &file.tmp, resume)?;
                 file.records = carried;
                 Enc::Csv(Box::new(state))
             }
@@ -315,17 +263,14 @@ impl OpenFile {
         let tmp = self.tmp.clone();
         #[cfg(feature = "file-format-csv")]
         if matches!(self.enc, Enc::CsvSealed) {
-            let (state, _) = CsvState::create(ctx, self.area, &self.name, &tmp, true, false)?;
+            let (state, _) = CsvState::create(ctx, self.area, &self.name, &tmp, true)?;
             self.enc = Enc::Csv(Box::new(state));
         }
         match &mut self.enc {
             Enc::Lines(slot) => {
                 let buf = ctx.line_bytes(records)?;
                 if slot.is_none() {
-                    *slot = Some(open_lines(ctx, self.area, &self.name, &tmp, !self.in_place)?);
-                    if self._guard.is_none() {
-                        self._guard = lock_scratch(&tmp);
-                    }
+                    *slot = Some(open_lines(ctx, self.area, &self.name, &tmp, true)?);
                 }
                 let w = slot.as_mut().expect("opened above");
                 w.write_all(&buf).map_err(|e| io_err("writing", &tmp, e))
@@ -402,15 +347,7 @@ impl OpenFile {
                 let file = buffered
                     .into_inner()
                     .map_err(|e| io_err("flushing", &tmp, e.into_error()))?;
-                if self.in_place {
-                    drop(file);
-                    return append_file(ctx, self.area, &self.name, &tmp);
-                }
                 sync_if(&file, &tmp, ctx.sync)?;
-            }
-            #[cfg(feature = "file-format-csv")]
-            Enc::Csv(state) if self.in_place => {
-                return state.append_to(ctx, self.area, &self.name, &tmp);
             }
             #[cfg(feature = "file-format-csv")]
             Enc::Csv(state) => state.finish_into(ctx.codec, &tmp, ctx.sync)?,
@@ -431,7 +368,6 @@ impl OpenFile {
         }
         ctx.seal_file(&tmp)?;
         ctx.backend.commit(&tmp, self.area, &self.name)?;
-        self._guard = None;
         #[cfg(feature = "file-format-csv")]
         if ctx.encrypted() && matches!(self.enc, Enc::Csv(_)) {
             self.enc = Enc::CsvSealed;
@@ -459,36 +395,6 @@ impl OpenFile {
             self.name
         ))
     }
-}
-
-/// Append the finished scratch file `tmp` to `name` under the backend's
-/// lock. A failed write is cut back off, so the file never keeps half of it.
-fn append_file(ctx: &Ctx<'_>, area: Area, name: &str, tmp: &Path) -> Result<(), FaucetError> {
-    let mut from = File::open(tmp).map_err(|e| io_err("opening", tmp, e))?;
-    ctx.backend.append(area, name, &mut |f, dest| {
-        use std::io::{Seek, SeekFrom};
-        from.seek(SeekFrom::Start(0))
-            .map_err(|e| io_err("reading", tmp, e))?;
-        append_with(f, dest, |f| std::io::copy(&mut from, f).map(|_| ()))
-    })
-}
-
-/// Run `write` at the end of the locked file `f`; on failure, truncate `f`
-/// back to its length before, so a partial addition never stays.
-pub(crate) fn append_with(
-    f: &mut File,
-    dest: &Path,
-    write: impl FnOnce(&mut File) -> std::io::Result<()>,
-) -> Result<super::backend::Appended, FaucetError> {
-    use std::io::{Seek, SeekFrom};
-    let len = f
-        .seek(SeekFrom::End(0))
-        .map_err(|e| io_err("seeking", dest, e))?;
-    if let Err(e) = write(f).and_then(|()| f.flush()) {
-        let _ = f.set_len(len);
-        return Err(io_err("appending to", dest, e));
-    }
-    Ok(super::backend::Appended::InPlace)
 }
 
 /// The CSV body scratch file beside a scratch file.
@@ -556,15 +462,13 @@ pub(crate) struct CsvState {
 #[cfg(feature = "file-format-csv")]
 impl CsvState {
     /// Start a body file; with `resume`, carry the existing file's header and
-    /// rows over; with `seed`, take only its header (an in-place appender).
-    /// Returns the state and the number of carried rows.
+    /// rows over. Returns the state and the number of carried rows.
     fn create(
         ctx: &Ctx<'_>,
         area: Area,
         name: &str,
         tmp: &Path,
         resume: bool,
-        seed: bool,
     ) -> Result<(Self, usize), FaucetError> {
         let delimiter = ctx.opts.csv.delimiter_byte()?;
         let quote = ctx.opts.csv.quote_byte()?;
@@ -588,16 +492,6 @@ impl CsvState {
             narrowest: usize::MAX,
         };
         let mut carried = 0;
-        if seed
-            && has_headers
-            && let Some(path) = ctx.backend.local_path(area, name)
-            && let Ok(f) = File::open(&path)
-            && let Some(h) = first_record(f, ctx.codec, delimiter, quote, &path)?
-        {
-            for c in &h {
-                state.add_column(c);
-            }
-        }
         if resume && ctx.backend.exists(area, name)? {
             let existing =
                 std::io::Cursor::new(ctx.read_existing(area, name, &tmp_path(tmp, "-old"))?);
@@ -738,186 +632,6 @@ impl CsvState {
 
 #[cfg(feature = "file-format-csv")]
 impl CsvState {
-    /// Append the rows written so far to `name` under the backend's lock and
-    /// start an empty body. The header is decided under the lock: the first
-    /// writer of an empty or missing file writes it; later writers map their
-    /// rows onto the file's header, and a column it lacks is dropped
-    /// (`on_unknown_field: warn`), refused (`error`), or added by rewriting
-    /// the file (`widen`).
-    fn append_to(
-        &mut self,
-        ctx: &Ctx<'_>,
-        area: Area,
-        name: &str,
-        tmp: &Path,
-    ) -> Result<(), FaucetError> {
-        use faucet_core::CsvUnknownField;
-        use std::io::{Seek, SeekFrom};
-        self.body
-            .flush()
-            .map_err(|e| io_err("flushing", &self.body_path, e))?;
-        let codec = ctx.codec;
-        let on_unknown = ctx.opts.csv.on_unknown_field;
-        let mut final_header: Option<Vec<String>> = None;
-        let mut dropped: Vec<String> = Vec::new();
-        let this = &*self;
-        ctx.backend.append(area, name, &mut |f, dest| {
-            let len = f.metadata().map_err(|e| io_err("reading", dest, e))?.len();
-            let existing = if this.has_headers && len > 0 {
-                f.seek(SeekFrom::Start(0))
-                    .map_err(|e| io_err("reading", dest, e))?;
-                first_record(&mut *f, codec, this.delimiter, this.quote, dest)?
-            } else {
-                None
-            };
-            let Some(file_header) = existing else {
-                let with_header = this.has_headers && len == 0;
-                final_header = Some(this.header.clone());
-                return append_with(f, dest, |f| {
-                    this.write_member(f, codec, with_header, &this.header)
-                });
-            };
-            let missing: Vec<String> = this
-                .header
-                .iter()
-                .filter(|c| !file_header.contains(c))
-                .cloned()
-                .collect();
-            if missing.is_empty() || on_unknown == CsvUnknownField::Warn {
-                dropped = missing;
-                final_header = Some(file_header.clone());
-                return append_with(f, dest, |f| {
-                    this.write_member(f, codec, false, &file_header)
-                });
-            }
-            if on_unknown == CsvUnknownField::Error {
-                return Err(FaucetError::Sink(format!(
-                    "csv: record field(s) not in the header of '{}' and \
-                     `csv.on_unknown_field: error`: [{}]",
-                    dest.display(),
-                    missing.join(", ")
-                )));
-            }
-            let mut wide = file_header.clone();
-            wide.extend(missing.iter().cloned());
-            let out = tmp_path(tmp, "-wide");
-            this.rewrite_widened(f, dest, codec, &wide, &out)?;
-            final_header = Some(wide);
-            Ok(super::backend::Appended::Replace(out))
-        })?;
-        for k in dropped {
-            if self.warned.insert(k.clone()) {
-                tracing::warn!(
-                    field = %k,
-                    "file sink: csv dropping a field that is not in the appended file's \
-                     header (`csv.on_unknown_field: warn`)"
-                );
-            }
-        }
-        if let Some(h) = final_header {
-            self.known = h.iter().cloned().collect();
-            self.header = h;
-        }
-        let f = File::create(&self.body_path).map_err(|e| io_err("creating", &self.body_path, e))?;
-        self.body = csv::WriterBuilder::new()
-            .delimiter(self.delimiter)
-            .quote(self.quote)
-            .flexible(true)
-            .from_writer(BufWriter::new(f));
-        self.narrowest = usize::MAX;
-        Ok(())
-    }
-
-    /// Write the body's rows to `f` as one compression member, mapped onto
-    /// the columns `target` (a column the body lacks is empty), with the
-    /// header first when `with_header`.
-    fn write_member(
-        &self,
-        f: &mut File,
-        codec: Compression,
-        with_header: bool,
-        target: &[String],
-    ) -> std::io::Result<()> {
-        let mut out = sync_compress_writer(BufWriter::new(&mut *f), codec);
-        self.write_rows(&mut out, with_header, target)?;
-        out.finish()?.flush()
-    }
-
-    fn write_rows(&self, out: &mut impl Write, with_header: bool, target: &[String]) -> std::io::Result<()> {
-        let mut w = csv::WriterBuilder::new()
-            .delimiter(self.delimiter)
-            .quote(self.quote)
-            .from_writer(out);
-        if with_header && !target.is_empty() {
-            w.write_record(target)?;
-        }
-        let index: Vec<Option<usize>> = target
-            .iter()
-            .map(|c| self.header.iter().position(|h| h == c))
-            .collect();
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true)
-            .delimiter(self.delimiter)
-            .quote(self.quote)
-            .from_reader(std::io::BufReader::new(File::open(&self.body_path)?));
-        for rec in rdr.records() {
-            let rec = rec?;
-            let row: Vec<&str> = index
-                .iter()
-                .map(|i| i.and_then(|i| rec.get(i)).unwrap_or(""))
-                .collect();
-            w.write_record(&row)?;
-        }
-        w.flush()
-    }
-
-    /// The locked file's rows padded to `wide`, then the body's, all under
-    /// the `wide` header, written to `out`.
-    fn rewrite_widened(
-        &self,
-        f: &mut File,
-        dest: &Path,
-        codec: Compression,
-        wide: &[String],
-        out: &Path,
-    ) -> Result<(), FaucetError> {
-        use std::io::{Seek, SeekFrom};
-        f.seek(SeekFrom::Start(0))
-            .map_err(|e| io_err("reading", dest, e))?;
-        let reader = faucet_core::compression::wrap_sync_reader(&mut *f, codec);
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .flexible(true)
-            .delimiter(self.delimiter)
-            .quote(self.quote)
-            .from_reader(reader);
-        let file = File::create(out).map_err(|e| io_err("creating", out, e))?;
-        let mut enc = sync_compress_writer(BufWriter::new(file), codec);
-        {
-            let mut w = csv::WriterBuilder::new()
-                .delimiter(self.delimiter)
-                .quote(self.quote)
-                .from_writer(&mut enc);
-            w.write_record(wide).map_err(|e| csv_err(out, e))?;
-            for rec in rdr.records() {
-                let rec = rec.map_err(|e| csv_err(dest, e))?;
-                let mut row: Vec<&str> = rec.iter().collect();
-                row.resize(wide.len().max(row.len()), "");
-                w.write_record(&row).map_err(|e| csv_err(out, e))?;
-            }
-            w.flush().map_err(|e| io_err("writing", out, e))?;
-        }
-        self.write_rows(&mut enc, false, wide)
-            .map_err(|e| io_err("writing", out, e))?;
-        let file = enc
-            .finish()
-            .map_err(|e| io_err("finishing", out, e))?
-            .into_inner()
-            .map_err(|e| io_err("flushing", out, e.into_error()))?;
-        sync_if(&file, out, true)
-    }
-
     /// Copy the body, padding rows written before the header widened with
     /// empty cells, so every row has one cell per column.
     fn pad_rows(&self, body: File, out: &mut impl Write, tmp: &Path) -> Result<(), FaucetError> {
@@ -939,33 +653,6 @@ impl CsvState {
             w.write_record(&row).map_err(|e| csv_err(tmp, e))?;
         }
         w.flush().map_err(|e| io_err("writing", tmp, e))
-    }
-}
-
-/// The first record of a CSV stream (its header), through the codec.
-#[cfg(feature = "file-format-csv")]
-fn first_record(
-    r: impl std::io::Read + Send,
-    codec: Compression,
-    delimiter: u8,
-    quote: u8,
-    path: &Path,
-) -> Result<Option<Vec<String>>, FaucetError> {
-    let reader = faucet_core::compression::wrap_sync_reader(r, codec);
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .flexible(true)
-        .delimiter(delimiter)
-        .quote(quote)
-        .from_reader(reader);
-    match rdr.records().next() {
-        None => Ok(None),
-        Some(rec) => Ok(Some(
-            rec.map_err(|e| csv_err(path, e))?
-                .iter()
-                .map(str::to_string)
-                .collect(),
-        )),
     }
 }
 

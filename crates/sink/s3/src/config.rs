@@ -121,11 +121,6 @@ pub struct S3SinkConfig {
     pub region: Option<String>,
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO).
     pub endpoint_url: Option<String>,
-    /// Address the bucket in the URL path (`<endpoint>/<bucket>/<key>`)
-    /// instead of as a host name (`<bucket>.<endpoint>`). Most S3-compatible
-    /// servers reached by host name need it. Default `false`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub force_path_style: bool,
     /// File extension for written objects (default: `.jsonl`). Not used when
     /// `path` is set.
     #[serde(default = "default_file_extension")]
@@ -244,7 +239,6 @@ impl S3SinkConfig {
             format: S3SinkFormat::default(),
             region: None,
             endpoint_url: None,
-            force_path_style: false,
             file_extension: ".jsonl".to_string(),
             max_records_per_file: None,
             max_bytes_per_file: None,
@@ -312,12 +306,6 @@ impl S3SinkConfig {
     /// Set a custom endpoint URL for S3-compatible services.
     pub fn endpoint_url(mut self, url: impl Into<String>) -> Self {
         self.endpoint_url = Some(url.into());
-        self
-    }
-
-    /// Address the bucket in the URL path rather than the host name.
-    pub fn force_path_style(mut self, on: bool) -> Self {
-        self.force_path_style = on;
         self
     }
 

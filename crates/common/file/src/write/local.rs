@@ -1,7 +1,7 @@
 //! The local-filesystem backend: scratch files beside the destination,
 //! fsync, and an atomic rename into place.
 
-use super::backend::{AppendFn, Appended, Area, StorageBackend};
+use super::backend::{Area, StorageBackend};
 use super::layout::io_err;
 use faucet_core::FaucetError;
 use std::path::{Path, PathBuf};
@@ -71,37 +71,6 @@ pub fn sync_dir(path: &Path) {
     let _ = path;
 }
 
-/// A scratch file younger than this is never treated as stale: its writer
-/// may be about to lock it.
-const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Whether the scratch file at `path` was left by a writer that is gone: old
-/// enough, and not locked by a live writer.
-fn is_stale(path: &Path) -> bool {
-    let old = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age >= STALE_AFTER);
-    old && std::fs::File::open(path).is_ok_and(|f| f.try_lock().is_ok())
-}
-
-/// Whether `file` is still the file at `path` (not replaced by a rename
-/// since it was opened).
-#[cfg(unix)]
-fn same_file(file: &std::fs::File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (file.metadata(), std::fs::metadata(path)) {
-        (Ok(a), Ok(b)) => a.ino() == b.ino() && a.dev() == b.dev(),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn same_file(_: &std::fs::File, path: &Path) -> bool {
-    path.exists()
-}
-
 impl StorageBackend for LocalBackend {
     fn describe(&self, area: Area, name: &str) -> String {
         self.path(area, name).display().to_string()
@@ -123,54 +92,9 @@ impl StorageBackend for LocalBackend {
             return;
         };
         for entry in entries.flatten() {
-            if entry.file_name().to_str().is_some_and(ours) && is_stale(&entry.path()) {
+            if entry.file_name().to_str().is_some_and(ours) {
                 let _ = std::fs::remove_file(entry.path());
             }
-        }
-    }
-
-    fn supports_append(&self) -> bool {
-        true
-    }
-
-    fn unique_scratch_path(&self, area: Area, name: &str) -> Result<PathBuf, FaucetError> {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        Ok(super::layout::tmp_path(
-            &self.path(area, name),
-            &format!(
-                "{}-{}-{}",
-                super::layout::TMP_SUFFIX,
-                std::process::id(),
-                &id[..12]
-            ),
-        ))
-    }
-
-    fn append(&self, area: Area, name: &str, f: &mut AppendFn<'_>) -> Result<(), FaucetError> {
-        let dest = self.path(area, name);
-        loop {
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&dest)
-                .map_err(|e| io_err("opening", &dest, e))?;
-            file.lock().map_err(|e| io_err("locking", &dest, e))?;
-            if !same_file(&file, &dest) {
-                continue;
-            }
-            match f(&mut file, &dest)? {
-                Appended::InPlace => {
-                    file.sync_all().map_err(|e| io_err("syncing", &dest, e))?;
-                }
-                Appended::Replace(from) => {
-                    std::fs::rename(&from, &dest)
-                        .map_err(|e| io_err("renaming into place", &dest, e))?;
-                }
-            }
-            sync_dir(&dest);
-            return Ok(());
         }
     }
 
@@ -345,59 +269,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_scratch_is_removed_only_when_ours_old_and_unlocked() {
+    fn stale_scratch_is_removed_only_when_ours() {
         let dir = tempfile::tempdir().unwrap();
         let b = LocalBackend::new(&dir.path().to_string_lossy(), ".s", true);
-        let old = std::time::SystemTime::now() - 2 * STALE_AFTER;
-        for n in ["mine.faucet-tmp", "theirs.faucet-tmp", "mine-locked.faucet-tmp"] {
-            let f = std::fs::File::create(dir.path().join(n)).unwrap();
-            f.set_modified(old).unwrap();
+        for n in ["mine.faucet-tmp", "theirs.faucet-tmp"] {
+            std::fs::write(dir.path().join(n), b"").unwrap();
         }
-        std::fs::write(dir.path().join("mine-young.faucet-tmp"), b"").unwrap();
-        let held = std::fs::File::open(dir.path().join("mine-locked.faucet-tmp")).unwrap();
-        held.lock().unwrap();
         b.remove_stale_scratch(Area::Destination, &|n| n.starts_with("mine"));
         assert!(!dir.path().join("mine.faucet-tmp").exists());
         assert!(dir.path().join("theirs.faucet-tmp").exists());
-        assert!(
-            dir.path().join("mine-young.faucet-tmp").exists(),
-            "a young scratch may belong to a writer about to lock it"
-        );
-        assert!(
-            dir.path().join("mine-locked.faucet-tmp").exists(),
-            "a live writer's scratch"
-        );
-        drop(held);
         b.remove_stale_scratch(Area::Staging, &|_| true);
-    }
-
-    #[test]
-    fn unique_scratch_paths_differ_and_append_locks_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let b = LocalBackend::new(&dir.path().to_string_lossy(), ".s", true);
-        assert!(b.supports_append());
-        let a1 = b.unique_scratch_path(Area::Destination, "f.jsonl").unwrap();
-        let a2 = b.unique_scratch_path(Area::Destination, "f.jsonl").unwrap();
-        assert_ne!(a1, a2);
-        let n = a1.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(n.starts_with("f.jsonl.faucet-tmp-"), "{n}");
-        b.append(Area::Destination, "f.jsonl", &mut |f, _| {
-            use std::io::Write;
-            f.write_all(b"a\n").unwrap();
-            Ok(Appended::InPlace)
-        })
-        .unwrap();
-        let wide = dir.path().join("wide");
-        std::fs::write(&wide, b"a\nb\n").unwrap();
-        let w = wide.clone();
-        b.append(Area::Destination, "f.jsonl", &mut |_, _| Ok(Appended::Replace(w.clone())))
-            .unwrap();
-        assert_eq!(std::fs::read(dir.path().join("f.jsonl")).unwrap(), b"a\nb\n");
-        let e = b
-            .append(Area::Destination, "f.jsonl", &mut |_, _| {
-                Err(FaucetError::Sink("no".into()))
-            })
-            .unwrap_err();
-        assert!(e.to_string().contains("no"));
     }
 }

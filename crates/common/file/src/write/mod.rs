@@ -21,7 +21,7 @@ mod parquet;
 mod remote;
 mod writer;
 
-pub use backend::{AppendFn, Appended, Area, StorageBackend};
+pub use backend::{Area, StorageBackend};
 pub use layout::{BODY_SUFFIX, NameTemplate, STAGING_PREFIX, TMP_SUFFIX, io_err, tmp_path};
 pub use local::{LocalBackend, sync_dir};
 pub use options::{
