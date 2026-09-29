@@ -136,6 +136,12 @@ pub struct GcsSinkConfig {
     /// Writer schema and block codec, used when `format: avro` (#719).
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
+    /// Parquet writer options, used when `format: parquet` (#777):
+    /// `compression`, `row_group_size`, `schema` (inferred or explicit) and
+    /// `on_unknown_field`. Objects still roll on `max_records_per_file` /
+    /// `max_bytes_per_file` (encoded bytes).
+    #[serde(default)]
+    pub parquet: faucet_core::ParquetWriteOptions,
 }
 
 fn default_file_extension() -> String {
@@ -167,6 +173,7 @@ impl GcsSinkConfig {
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
+            parquet: faucet_core::ParquetWriteOptions::default(),
         }
     }
 
@@ -201,6 +208,12 @@ impl GcsSinkConfig {
     }
 
     /// Set the Avro writer schema and codec used when `format: avro` (#719).
+    /// Set the Parquet writer options used when `format: parquet` (#777).
+    pub fn parquet(mut self, parquet: faucet_core::ParquetWriteOptions) -> Self {
+        self.parquet = parquet;
+        self
+    }
+
     pub fn avro(mut self, avro: faucet_core::AvroOptions) -> Self {
         self.avro = avro;
         self
@@ -265,6 +278,7 @@ impl GcsSinkConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
+        self.parquet.validate()?;
         Ok(())
     }
 }
@@ -276,6 +290,7 @@ impl GcsSinkConfig {
             matches!(self.format, GcsSinkFormat::Parquet)
                 && self.batch_size == 0
                 && self.max_records_per_file.is_none()
+                && self.max_bytes_per_file.is_none()
         }
         #[cfg(not(feature = "arrow"))]
         {

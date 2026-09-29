@@ -315,12 +315,13 @@ async fn sink_writes_parquet_on_the_row_and_columnar_paths() {
     let batch = faucet_core::columnar::values_to_record_batch_inferred(&rows).unwrap();
     assert!(sink.supports_columnar());
     assert_eq!(sink.write_batch_columnar(&batch).await.unwrap(), 3);
+    sink.flush().await.unwrap();
 
     let names = object_names(&host, &bucket, "pq/").await;
     assert_eq!(
         names.len(),
-        4,
-        "two row-path and two columnar objects: {names:?}"
+        3,
+        "six rows in objects of two, the columnar page joining the open object: {names:?}"
     );
     for name in names {
         let body = download(&host, &bucket, &name).await;
@@ -384,4 +385,59 @@ async fn sink_writes_avro_objects() {
     let back = faucet_core::file_format::avro::decode(&body, &faucet_core::AvroOptions::default())
         .unwrap();
     assert_eq!(back, rows.to_vec());
+}
+
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn sink_parquet_options_reach_the_objects() {
+    use faucet_core::file_format::parquet_io::read_bytes;
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let opts: faucet_core::ParquetWriteOptions = serde_json::from_value(json!({
+        "compression": "gzip",
+        "row_group_size": 4,
+        "schema": {"type": "explicit", "fields": [{"name": "i", "type": "int32", "nullable": false}]}
+    }))
+    .unwrap();
+    let config = GcsSinkConfig::new(&bucket)
+        .prefix("opts/")
+        .format(faucet_sink_gcs::GcsSinkFormat::Parquet)
+        .file_extension(".parquet")
+        .with_batch_size(0)
+        .auth(GcsCredentials::Anonymous)
+        .storage_host(&host)
+        .parquet(opts);
+    let sink = GcsSink::new(config).await.unwrap();
+    let rows: Vec<_> = (0..10).map(|i| json!({"i": i, "dropped": "x"})).collect();
+    sink.write_batch(&rows[..5]).await.unwrap();
+    sink.write_batch(&rows[5..]).await.unwrap();
+    assert!(
+        object_names(&host, &bucket, "opts/").await.is_empty(),
+        "nothing before flush"
+    );
+    sink.flush().await.unwrap();
+    let names = object_names(&host, &bucket, "opts/").await;
+    assert_eq!(names.len(), 1);
+    let body = download(&host, &bucket, &names[0]).await;
+    let (schema, batches) = read_bytes(
+        body.clone().into(),
+        &faucet_core::ParquetReadOptions::default(),
+        0,
+        "o",
+    )
+    .unwrap();
+    assert_eq!(schema.fields().len(), 1);
+    assert_eq!(
+        schema.field(0).data_type(),
+        &arrow::datatypes::DataType::Int32
+    );
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let meta = SerializedFileReader::new(bytes::Bytes::from(body)).unwrap();
+    assert_eq!(meta.metadata().num_row_groups(), 3);
+    assert!(matches!(
+        meta.metadata().row_group(0).column(0).compression(),
+        parquet::basic::Compression::GZIP(_)
+    ));
 }

@@ -32,7 +32,7 @@ parquet = { workspace = true, optional = true }
 [features]
 compression = ["faucet-core/compression"]
 # Enables the `Parquet` object format + the columnar `write_batch_columnar` fast path.
-arrow = ["faucet-core/arrow", "dep:arrow", "dep:parquet"]
+arrow = ["faucet-core/arrow", "faucet-core/file-format-parquet", "dep:arrow", "dep:parquet"]
 # Uniform file formats (#604): write CSV, XML and Excel objects through
 # `faucet_core::file_format`, so what this sink can write matches what the file
 # sources can read. `file-formats` is the aggregate.
@@ -54,6 +54,7 @@ faucet-source-gcs = { workspace = true }
 reqwest = { workspace = true }
 urlencoding.workspace = true
 futures.workspace = true
+bytes = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

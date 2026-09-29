@@ -336,7 +336,9 @@ impl S3SinkConfig {
     fn single_parquet_object(&self) -> bool {
         #[cfg(feature = "arrow")]
         {
-            matches!(self.format, S3SinkFormat::Parquet) && self.effective_chunk_cap().is_none()
+            matches!(self.format, S3SinkFormat::Parquet)
+                && self.effective_chunk_cap().is_none()
+                && self.max_bytes_per_file.is_none()
         }
         #[cfg(not(feature = "arrow"))]
         {
