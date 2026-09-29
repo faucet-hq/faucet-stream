@@ -5,9 +5,10 @@
 //! under the wider schema, with the new column null. A field that changes type
 //! is an error naming the field.
 
-use crate::config::{ParquetCodec, ParquetField, ParquetOptions, ParquetType};
-use crate::layout::{io_err, tmp_path};
-use crate::writer::Ctx;
+use super::backend::Area;
+use super::encode::Ctx;
+use super::layout::{io_err, tmp_path};
+use super::options::{ParquetCodec, ParquetField, ParquetOptions, ParquetType};
 use arrow::array::{RecordBatch, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use faucet_core::FaucetError;
@@ -70,7 +71,8 @@ impl ParquetState {
     pub fn write(
         &mut self,
         ctx: &Ctx<'_>,
-        final_path: &Path,
+        area: Area,
+        name: &str,
         tmp: &Path,
         finalized: bool,
         batch: &RecordBatch,
@@ -89,27 +91,30 @@ impl ParquetState {
             .as_ref()
             .is_some_and(|s| s.fields() != target.fields());
         if self.writer.is_none() || widened {
-            let old = match self.writer.take() {
+            let old = tmp_path(tmp, ".old");
+            let carried = match self.writer.take() {
                 Some(w) => {
                     w.close().map_err(|e| pq_err(tmp, e))?;
-                    let old = tmp_path(tmp, ".old");
                     std::fs::rename(tmp, &old).map_err(|e| io_err("renaming", tmp, e))?;
-                    Some((old, true))
+                    Some(None)
                 }
-                None if finalized && final_path.exists() => Some((final_path.to_path_buf(), false)),
+                None if finalized && ctx.backend.exists(area, name)? => {
+                    Some(Some(ctx.read_existing(area, name, &old)?))
+                }
                 None => None,
             };
             let mut writer = open_writer(tmp, &target, ctx.parquet)?;
-            if let Some((path, remove)) = old {
-                let bytes = if remove {
-                    std::fs::read(&path).map_err(|e| io_err("opening", &path, e))?
-                } else {
-                    ctx.read_existing(&path)?
-                };
-                copy_into(&path, bytes, &target, &mut writer)?;
-                if remove {
-                    let _ = std::fs::remove_file(&path);
+            match carried {
+                Some(None) => {
+                    let file = File::open(&old).map_err(|e| io_err("opening", &old, e))?;
+                    let r = copy_into(&old, file, &target, &mut writer);
+                    let _ = std::fs::remove_file(&old);
+                    r?;
                 }
+                Some(Some(bytes)) => {
+                    copy_into(tmp, bytes::Bytes::from(bytes), &target, &mut writer)?
+                }
+                None => {}
             }
             self.writer = Some(writer);
             self.schema = Some(target.clone());
@@ -159,13 +164,13 @@ fn open_writer(
 }
 
 /// Copy every row of the Parquet file at `path` into `writer` under `schema`.
-fn copy_into(
+fn copy_into<R: parquet::file::reader::ChunkReader + 'static>(
     path: &Path,
-    bytes: Vec<u8>,
+    input: R,
     schema: &SchemaRef,
     writer: &mut ArrowWriter<File>,
 ) -> Result<(), FaucetError> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+    let reader = ParquetRecordBatchReaderBuilder::try_new(input)
         .and_then(|b| b.build())
         .map_err(|e| pq_err(path, e))?;
     for batch in reader {

@@ -4732,10 +4732,18 @@ dependencies = [
 name = "faucet-common-file"
 version = "1.0.0"
 dependencies = [
+ "arrow",
+ "base64 0.22.1",
+ "bytes",
+ "csv",
  "faucet-core",
+ "parquet",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5253,8 +5261,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
- "bytes",
- "csv",
  "faucet-common-file",
  "faucet-conformance",
  "faucet-core",

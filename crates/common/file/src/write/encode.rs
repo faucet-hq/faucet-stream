@@ -1,7 +1,9 @@
-//! One output file: written to a temporary sibling and renamed into place on
-//! [`OpenFile::finalize`], so a reader sees a complete file or none at all.
+//! One output file: encoded into a local scratch file and published by the
+//! backend on [`OpenFile::finalize`], so a reader sees a complete file or
+//! none at all.
 
-use crate::layout::{BODY_SUFFIX, TMP_SUFFIX, io_err, tmp_path};
+use super::backend::{Area, StorageBackend};
+use super::layout::{io_err, tmp_path};
 use faucet_core::compression::{SyncCompressWriter, sync_compress_writer};
 use faucet_core::{Compression, FaucetError, FileFormat, FormatOptions};
 use serde_json::Value;
@@ -15,8 +17,9 @@ pub(crate) struct Ctx<'a> {
     pub codec: Compression,
     pub opts: &'a FormatOptions,
     #[cfg_attr(not(feature = "file-format-parquet"), allow(dead_code))]
-    pub parquet: &'a crate::config::ParquetOptions,
-    pub json_lines: &'a crate::config::JsonLinesOptions,
+    pub parquet: &'a super::options::ParquetOptions,
+    pub json_lines: &'a super::options::JsonLinesOptions,
+    pub backend: &'a dyn StorageBackend,
     #[cfg(feature = "encryption")]
     pub encryption: Option<&'a faucet_core::CompiledEncryption>,
 }
@@ -70,19 +73,31 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// Read a finalised file back as plaintext bytes (decrypting a sealed one).
+    /// A finalised file's bytes as plaintext (decrypting a sealed one),
+    /// fetched through the backend via the scratch file `via`.
     #[cfg_attr(
         not(any(feature = "file-format-csv", feature = "file-format-parquet")),
         allow(dead_code)
     )]
-    pub fn read_existing(&self, path: &Path) -> Result<Vec<u8>, FaucetError> {
-        let raw = std::fs::read(path).map_err(|e| io_err("opening", path, e))?;
+    pub fn read_existing(
+        &self,
+        area: Area,
+        name: &str,
+        via: &Path,
+    ) -> Result<Vec<u8>, FaucetError> {
+        self.backend.fetch(area, name, via)?;
+        let raw = std::fs::read(via).map_err(|e| io_err("opening", via, e));
+        let _ = std::fs::remove_file(via);
+        let raw = raw?;
         #[cfg(feature = "encryption")]
         if let Some(enc) = self.encryption
             && faucet_core::encryption::is_encrypted(&raw)
         {
             return enc.decrypt(&raw).map_err(|e| {
-                FaucetError::Sink(format!("file sink: decrypting '{}': {e}", path.display()))
+                FaucetError::Sink(format!(
+                    "file sink: decrypting '{}': {e}",
+                    self.backend.describe(area, name)
+                ))
             });
         }
         Ok(raw)
@@ -105,13 +120,14 @@ enum Enc {
     Doc(Vec<Value>),
     /// Parquet row groups streamed to the temporary file.
     #[cfg(feature = "file-format-parquet")]
-    Parquet(Box<crate::parquet::ParquetState>),
+    Parquet(Box<super::parquet::ParquetState>),
 }
 
 /// One output file in progress.
 pub(crate) struct OpenFile {
-    /// Where the file appears when finalised.
-    pub final_path: PathBuf,
+    /// The file's name in `area`.
+    pub name: String,
+    area: Area,
     tmp: PathBuf,
     /// Records in the file, including any carried over from an existing file.
     pub records: usize,
@@ -125,12 +141,19 @@ pub(crate) struct OpenFile {
 }
 
 impl OpenFile {
-    /// Start `final_path`, continuing from its current contents when `resume`.
-    pub fn create(ctx: &Ctx<'_>, final_path: PathBuf, resume: bool) -> Result<Self, FaucetError> {
-        let tmp = tmp_path(&final_path, TMP_SUFFIX);
+    /// Start `name` in `area`, continuing from its current contents when
+    /// `resume`.
+    pub fn create(
+        ctx: &Ctx<'_>,
+        area: Area,
+        name: String,
+        resume: bool,
+    ) -> Result<Self, FaucetError> {
+        let tmp = ctx.backend.scratch_path(area, &name)?;
         let mut file = Self {
             enc: Enc::Doc(Vec::new()),
-            final_path,
+            name,
+            area,
             tmp,
             records: 0,
             bytes: 0,
@@ -138,20 +161,17 @@ impl OpenFile {
             finalized: false,
         };
         file.enc = match ctx.format {
-            FileFormat::JsonLines | FileFormat::RawText => Enc::Lines(Some(open_lines(
-                &file.final_path,
-                &file.tmp,
-                ctx.codec,
-                resume,
-            )?)),
+            FileFormat::JsonLines | FileFormat::RawText => {
+                Enc::Lines(Some(open_lines(ctx, area, &file.name, &file.tmp, resume)?))
+            }
             #[cfg(feature = "file-format-csv")]
             FileFormat::Csv => {
-                let (state, carried) = CsvState::create(ctx, &file.final_path, resume)?;
+                let (state, carried) = CsvState::create(ctx, area, &file.name, &file.tmp, resume)?;
                 file.records = carried;
                 Enc::Csv(Box::new(state))
             }
             #[cfg(feature = "file-format-parquet")]
-            FileFormat::Parquet => Enc::Parquet(Box::new(crate::parquet::ParquetState::new())),
+            FileFormat::Parquet => Enc::Parquet(Box::new(super::parquet::ParquetState::new())),
             _ => Enc::Doc(Vec::new()),
         };
         Ok(file)
@@ -181,7 +201,7 @@ impl OpenFile {
             Enc::Lines(slot) => {
                 let buf = ctx.line_bytes(records)?;
                 if slot.is_none() {
-                    *slot = Some(open_lines(&self.final_path, &tmp, ctx.codec, true)?);
+                    *slot = Some(open_lines(ctx, self.area, &self.name, &tmp, true)?);
                 }
                 let w = slot.as_mut().expect("opened above");
                 w.write_all(&buf).map_err(|e| io_err("writing", &tmp, e))
@@ -195,7 +215,7 @@ impl OpenFile {
             #[cfg(feature = "file-format-parquet")]
             Enc::Parquet(state) => {
                 let batch = state.batch_for(ctx.parquet, records)?;
-                state.write(ctx, &self.final_path, &tmp, self.finalized, &batch)
+                state.write(ctx, self.area, &self.name, &tmp, self.finalized, &batch)
             }
         }
     }
@@ -214,7 +234,7 @@ impl OpenFile {
         let Enc::Parquet(state) = &mut self.enc else {
             return self.write(ctx, &faucet_core::columnar::record_batch_to_values(batch)?);
         };
-        let result = state.write(ctx, &self.final_path, &tmp, self.finalized, batch);
+        let result = state.write(ctx, self.area, &self.name, &tmp, self.finalized, batch);
         match &result {
             Ok(()) => {
                 self.records += batch.num_rows();
@@ -271,10 +291,7 @@ impl OpenFile {
             }
         }
         ctx.seal_file(&tmp)?;
-        std::fs::rename(&tmp, &self.final_path)
-            .map_err(|e| io_err("renaming into place", &self.final_path, e))?;
-        sync_dir(&self.final_path);
-        Ok(())
+        ctx.backend.commit(&tmp, self.area, &self.name)
     }
 
     /// Remove the temporary files. The final file, if any, is untouched.
@@ -287,29 +304,36 @@ impl OpenFile {
             state.abandon();
         }
         let _ = std::fs::remove_file(&self.tmp);
-        let _ = std::fs::remove_file(tmp_path(&self.final_path, BODY_SUFFIX));
+        let _ = std::fs::remove_file(body_path(&self.tmp));
     }
 
     fn poison_error(&self) -> FaucetError {
         FaucetError::Sink(format!(
             "file sink: an earlier write to '{}' failed, so it cannot be completed",
-            self.final_path.display()
+            self.name
         ))
     }
+}
+
+/// The CSV body scratch file beside a scratch file.
+pub(crate) fn body_path(tmp: &Path) -> PathBuf {
+    tmp_path(tmp, "-body")
 }
 
 /// Open the temporary file for line output, copying the final file in first
 /// when continuing it (a compressed file gains a new member).
 fn open_lines(
-    final_path: &Path,
+    ctx: &Ctx<'_>,
+    area: Area,
+    name: &str,
     tmp: &Path,
-    codec: Compression,
     resume: bool,
 ) -> Result<Box<LineWriter>, FaucetError> {
-    let carry = resume && final_path.exists();
+    let carry = resume && ctx.backend.exists(area, name)?;
     if carry {
-        std::fs::copy(final_path, tmp).map_err(|e| io_err("copying", final_path, e))?;
+        ctx.backend.fetch(area, name, tmp)?;
     }
+    let codec = ctx.codec;
     let f = OpenOptions::new()
         .create(true)
         .write(true)
@@ -325,23 +349,6 @@ pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), FaucetError>
     let mut f = File::create(path).map_err(|e| io_err("creating", path, e))?;
     f.write_all(bytes).map_err(|e| io_err("writing", path, e))?;
     f.sync_all().map_err(|e| io_err("syncing", path, e))
-}
-
-/// Best-effort fsync of the directory holding `path`, so a rename survives a
-/// crash.
-pub(crate) fn sync_dir(path: &Path) {
-    #[cfg(unix)]
-    if let Some(dir) = path.parent()
-        && let Ok(d) = File::open(if dir.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            dir
-        })
-    {
-        let _ = d.sync_all();
-    }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 /// CSV rows waiting for their header.
@@ -364,13 +371,15 @@ impl CsvState {
     /// rows over. Returns the state and the number of carried rows.
     fn create(
         ctx: &Ctx<'_>,
-        final_path: &Path,
+        area: Area,
+        name: &str,
+        tmp: &Path,
         resume: bool,
     ) -> Result<(Self, usize), FaucetError> {
         let delimiter = ctx.opts.csv.delimiter_byte()?;
         let quote = ctx.opts.csv.quote_byte()?;
         let has_headers = ctx.opts.csv.has_headers;
-        let body_path = tmp_path(final_path, BODY_SUFFIX);
+        let body_path = body_path(tmp);
         let f = File::create(&body_path).map_err(|e| io_err("creating", &body_path, e))?;
         let body = csv::WriterBuilder::new()
             .delimiter(delimiter)
@@ -389,8 +398,9 @@ impl CsvState {
             narrowest: usize::MAX,
         };
         let mut carried = 0;
-        if resume && final_path.exists() {
-            let existing = std::io::Cursor::new(ctx.read_existing(final_path)?);
+        if resume && ctx.backend.exists(area, name)? {
+            let existing =
+                std::io::Cursor::new(ctx.read_existing(area, name, &tmp_path(tmp, "-old"))?);
             let reader = faucet_core::compression::wrap_sync_reader(existing, ctx.codec);
             let mut rdr = csv::ReaderBuilder::new()
                 .has_headers(false)
@@ -403,7 +413,7 @@ impl CsvState {
                 let rec = rec.map_err(|e| {
                     FaucetError::Sink(format!(
                         "file sink: reading existing '{}': {e}",
-                        final_path.display()
+                        ctx.backend.describe(area, name)
                     ))
                 })?;
                 if first {

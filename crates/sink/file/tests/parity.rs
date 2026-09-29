@@ -464,7 +464,8 @@ mod encryption {
         let err = sink_err(json!({"path": p(dir.path(), "z.jsonl.gz"), "encryption": spec("k")}));
         assert!(err.contains("mutually exclusive"), "{err}");
         assert!(
-            sink_err(json!({"path": p(dir.path(), "b.jsonl"), "encryption": spec(" ")})).len() > 0
+            !sink_err(json!({"path": p(dir.path(), "b.jsonl"), "encryption": spec(" ")}))
+                .is_empty()
         );
     }
 
@@ -488,7 +489,7 @@ mod encryption {
             };
             pages(
                 &sink(json!({"path": out, "encryption": spec("k")})),
-                &[recs.clone()],
+                std::slice::from_ref(&recs),
             )
             .await
             .unwrap();

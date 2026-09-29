@@ -340,10 +340,7 @@ async fn a_parquet_schema_mismatch_fails_before_any_row_like_the_parquet_source(
     let ctx = HashMap::new();
     let mut s = src.stream_pages(&ctx, 0);
     let first = s.next().await.unwrap();
-    let err = first
-        .err()
-        .expect("fails before the first page")
-        .to_string();
+    let err = first.expect_err("fails before the first page").to_string();
     assert!(
         err.contains("a.parquet") && err.contains("b.parquet"),
         "{err}"
