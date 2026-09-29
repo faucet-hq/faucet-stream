@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use faucet_common_file::write::ObjectClient;
+use faucet_common_file::write::{ObjectClient, content_type};
 use faucet_core::FaucetError;
 use futures::stream::{StreamExt, TryStreamExt};
 use std::path::Path;
@@ -29,21 +29,6 @@ pub(crate) struct S3Objects {
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Sink(format!("S3 {what} error for key '{key}': {e}"))
-}
-
-/// The content type an object named `key` is served with.
-pub(crate) fn content_type(key: &str) -> &'static str {
-    let name = key.trim_end_matches(".gz").trim_end_matches(".zst");
-    match name.rsplit('.').next().unwrap_or("") {
-        "parquet" => "application/vnd.apache.parquet",
-        "csv" => "text/csv",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "avro" => "application/avro",
-        "txt" => "text/plain",
-        _ => "application/x-ndjson",
-    }
 }
 
 /// `bucket/key` for `CopySource`, percent-encoding everything but the
@@ -316,18 +301,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_types_and_copy_sources() {
-        assert_eq!(
-            content_type("a/b.parquet"),
-            "application/vnd.apache.parquet"
-        );
-        assert_eq!(content_type("x.csv.gz"), "text/csv");
-        assert_eq!(content_type("x.json"), "application/json");
-        assert_eq!(content_type("x.xml"), "application/xml");
-        assert!(content_type("x.xlsx").contains("spreadsheet"));
-        assert_eq!(content_type("x.avro"), "application/avro");
-        assert_eq!(content_type("x.txt"), "text/plain");
-        assert_eq!(content_type("x.jsonl.zst"), "application/x-ndjson");
+    fn copy_sources_are_percent_encoded() {
         assert_eq!(copy_source("b", "d/a b+c.jsonl"), "b/d/a%20b%2Bc.jsonl");
     }
 }

@@ -28,5 +28,5 @@ pub use options::{
     DEFAULT_ROW_GROUP_SIZE, FileMode, FileWriteMode, JsonLinesOptions, PART_TOKEN, ParquetCodec,
     ParquetField, ParquetOptions, ParquetType, validate_parquet,
 };
-pub use remote::{ObjectClient, RemoteBackend, STAGING_MARKER, object_layout, run};
+pub use remote::{ObjectClient, RemoteBackend, STAGING_MARKER, content_type, object_layout, run};
 pub use writer::{FileWriter, WriteSettings, blocking};

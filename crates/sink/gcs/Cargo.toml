@@ -12,14 +12,16 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-file.workspace = true
 faucet-common-gcs.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"] }
 google-cloud-storage.workspace = true
+google-cloud-gax.workspace = true
 futures.workspace = true
 bytes.workspace = true
 uuid.workspace = true
@@ -31,17 +33,19 @@ parquet = { workspace = true, optional = true }
 
 [features]
 compression = ["faucet-core/compression"]
+# Encrypt objects at rest (#777).
+encryption = ["faucet-common-file/encryption"]
 # Enables the `Parquet` object format + the columnar `write_batch_columnar` fast path.
-arrow = ["faucet-core/arrow", "dep:arrow", "dep:parquet"]
+arrow = ["faucet-core/arrow", "dep:arrow", "dep:parquet", "faucet-common-file/file-format-parquet"]
 # Uniform file formats (#604): write CSV, XML and Excel objects through
 # `faucet_core::file_format`, so what this sink can write matches what the file
 # sources can read. `file-formats` is the aggregate.
-file-format-csv = ["faucet-core/file-format-csv"]
-file-format-xml = ["faucet-core/file-format-xml"]
-file-format-excel = ["faucet-core/file-format-excel"]
+file-format-csv = ["faucet-core/file-format-csv", "faucet-common-file/file-format-csv"]
+file-format-xml = ["faucet-core/file-format-xml", "faucet-common-file/file-format-xml"]
+file-format-excel = ["faucet-core/file-format-excel", "faucet-common-file/file-format-excel"]
 # Avro Object Container Files (#719). ORC is read-only, so sinks have no ORC
 # feature.
-file-format-avro = ["faucet-core/file-format-avro"]
+file-format-avro = ["faucet-core/file-format-avro", "faucet-common-file/file-format-avro"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro"]
 
 [dev-dependencies]

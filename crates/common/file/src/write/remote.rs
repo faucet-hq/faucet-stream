@@ -252,6 +252,22 @@ impl StorageBackend for RemoteBackend {
     }
 }
 
+/// The content type an object named `name` is served with, from its
+/// extension (looking through `.gz` / `.zst`).
+pub fn content_type(name: &str) -> &'static str {
+    let name = name.trim_end_matches(".gz").trim_end_matches(".zst");
+    match name.rsplit('.').next().unwrap_or("") {
+        "parquet" => "application/vnd.apache.parquet",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "avro" => "application/avro",
+        "txt" => "text/plain",
+        _ => "application/x-ndjson",
+    }
+}
+
 /// The names directly under `prefix` among `keys` (no deeper `/`).
 fn direct_children(prefix: &str, keys: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = keys
@@ -485,6 +501,17 @@ mod tests {
     #[test]
     fn outside_a_runtime_runs_and_children_are_direct() {
         assert_eq!(run(async { Ok(7) }).unwrap(), 7);
+        assert_eq!(
+            content_type("a/b.parquet"),
+            "application/vnd.apache.parquet"
+        );
+        assert_eq!(content_type("x.csv.gz"), "text/csv");
+        assert_eq!(content_type("x.json"), "application/json");
+        assert_eq!(content_type("x.xml"), "application/xml");
+        assert!(content_type("x.xlsx").contains("spreadsheet"));
+        assert_eq!(content_type("x.avro"), "application/avro");
+        assert_eq!(content_type("x.txt"), "text/plain");
+        assert_eq!(content_type("x.jsonl.zst"), "application/x-ndjson");
         let keys = vec![
             "p/a".into(),
             "p/b/c".into(),
