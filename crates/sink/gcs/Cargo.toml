@@ -49,6 +49,7 @@ file-format-avro = ["faucet-core/file-format-avro", "faucet-common-file/file-for
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro"]
 
 [dev-dependencies]
+wiremock = "0.6"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true
 faucet-conformance.workspace = true

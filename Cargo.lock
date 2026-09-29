@@ -5099,6 +5099,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -5314,6 +5315,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -152,3 +152,32 @@ impl ObjectClient for GcsObjects {
         self.delete(from).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn uploading_a_missing_local_file_names_the_step_and_the_key() {
+        let creds = faucet_common_gcs::GcsCredentials::Anonymous;
+        let host = Some("http://127.0.0.1:9");
+        let o = GcsObjects {
+            storage: faucet_common_gcs::build_storage(&creds, host)
+                .await
+                .unwrap(),
+            control: faucet_common_gcs::build_storage_control(&creds, host)
+                .await
+                .unwrap(),
+            bucket: "b".into(),
+            roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let e = o
+            .upload(&dir.path().join("missing"), "k")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("GCS open local file error for key 'k'"), "{e}");
+        assert_eq!(o.describe("k"), "gs://b/k");
+    }
+}

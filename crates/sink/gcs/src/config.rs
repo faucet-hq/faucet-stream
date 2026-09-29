@@ -81,9 +81,9 @@ impl GcsSinkFormat {
             Self::Auto => faucet_common_file::FileFormatChoice::Auto
                 .resolve_writable(name)
                 .map_err(|e| faucet_core::FaucetError::Config(format!("GCS sink: {e}"))),
-            other => other.shared().ok_or_else(|| {
-                faucet_core::FaucetError::Config("GCS sink: format has no writer".into())
-            }),
+            other => Ok(other
+                .shared()
+                .expect("every format but `auto` and `parquet` maps onto a shared one")),
         }
     }
 }
@@ -720,5 +720,14 @@ mod object_rules_tests {
         c.max_records_per_file = None;
         c.path = Some("d/part-{part}.parquet".into());
         assert!(!c.settings().unwrap().object_per_write, "path: per part");
+    }
+
+    #[test]
+    fn auto_has_no_shared_format_and_a_bad_config_is_best_effort() {
+        assert_eq!(GcsSinkFormat::Auto.shared(), None);
+        let mut c = GcsSinkConfig::new("b");
+        c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+        assert!(c.settings().is_err());
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }
