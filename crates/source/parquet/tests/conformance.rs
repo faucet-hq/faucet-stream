@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! `faucet-conformance` Tier-1 battery for the Parquet source.
 //!
 //! Check 1 — the connector's config JSON Schema is a valid, well-formed value.

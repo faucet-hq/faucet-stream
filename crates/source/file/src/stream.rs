@@ -76,6 +76,7 @@ pub struct FileSource {
     roundtrips: RecorderSlot,
     #[cfg(feature = "encryption")]
     encryption: Option<faucet_core::CompiledEncryption>,
+    name: &'static str,
 }
 
 impl FileSource {
@@ -93,6 +94,7 @@ impl FileSource {
             start: Mutex::new(None),
             shard: Mutex::new(None),
             roundtrips: RecorderSlot::new(),
+            name: "file",
             #[cfg(feature = "encryption")]
             encryption: config
                 .encryption
@@ -101,6 +103,13 @@ impl FileSource {
                 .transpose()?,
             config,
         })
+    }
+
+    /// Report `name` as the connector name (metric labels, logs) instead of
+    /// `file`, for a deprecated kind the CLI builds as this source.
+    pub fn with_connector_name(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     fn by(&self) -> Option<IncrementalBy> {
@@ -643,7 +652,7 @@ impl faucet_core::Source for FileSource {
     }
 
     fn connector_name(&self) -> &'static str {
-        "file"
+        self.name
     }
 
     fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
@@ -768,5 +777,18 @@ impl faucet_core::Source for FileSource {
             Ok(Err(e)) => Probe::fail("list", started.elapsed(), e.to_string()),
         };
         Ok(CheckReport::single(probe))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faucet_core::Source;
+
+    #[test]
+    fn connector_name_defaults_to_file_and_can_be_renamed() {
+        let s = FileSource::new(FileSourceConfig::new("a.jsonl")).unwrap();
+        assert_eq!(s.connector_name(), "file");
+        assert_eq!(s.with_connector_name("csv").connector_name(), "csv");
     }
 }

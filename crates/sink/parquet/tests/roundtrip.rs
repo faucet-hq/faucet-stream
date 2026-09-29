@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end round-trip tests for the Parquet sink.
 //!
 //! Each test writes JSON records to a temp directory (or in-memory object

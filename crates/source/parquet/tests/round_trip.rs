@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end round-trip tests for `faucet-source-parquet`.
 //!
 //! Each test writes a Parquet fixture with `parquet::arrow::ArrowWriter` and

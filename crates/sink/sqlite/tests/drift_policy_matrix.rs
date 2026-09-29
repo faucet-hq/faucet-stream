@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! #651 Category A6 — the schema-drift policy matrix, end to end.
 //!
 //! `faucet_core::drift` unit-tests the *classification* (which columns are

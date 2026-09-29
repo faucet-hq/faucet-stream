@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! REST API → JSONL — full builder showcase for both connectors.
 //!
 //! Exercises most of the knobs on `RestStreamConfig` (auth, pagination,

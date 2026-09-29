@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 #![cfg(feature = "file-formats")]
 //! Parity with the `csv`, `jsonl` and `parquet` sinks (#777): the same
 //! records written through the old sink and through the file sink with the

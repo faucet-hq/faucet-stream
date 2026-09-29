@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! `faucet-conformance` battery against the real CSV sink.
 //!
 //! CSV is an append-only file sink — it advertises no idempotency mechanism,

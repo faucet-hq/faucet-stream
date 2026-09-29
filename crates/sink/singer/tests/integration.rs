@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end tests for `faucet-sink-singer` against real target subprocesses
 //! (a dependency-free fake Singer target written in Python).
 

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! `faucet-conformance` battery against the real Parquet sink.
 //!
 //! Parquet is an append-only file sink — it advertises no idempotency

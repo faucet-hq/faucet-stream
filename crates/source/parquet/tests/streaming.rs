@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration tests for `ParquetSource::stream_pages`.
 //!
 //! These tests write a small set of Parquet fixtures with

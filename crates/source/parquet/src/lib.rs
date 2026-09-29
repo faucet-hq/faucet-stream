@@ -1,4 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![allow(deprecated)]
 
 //! Apache Parquet source connector for the faucet-stream ecosystem.
 //!

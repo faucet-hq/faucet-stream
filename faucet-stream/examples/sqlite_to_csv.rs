@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! SQLite → CSV — full builder showcase for both connectors.
 //!
 //! SQLite source uses a tuned pool. CSV sink demonstrates delimiter,

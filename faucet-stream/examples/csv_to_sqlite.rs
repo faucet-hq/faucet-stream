@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! CSV → SQLite — full builder showcase for both connectors.
 //!
 //! CSV source uses a TSV-like config (tab delimiter, no headers). SQLite

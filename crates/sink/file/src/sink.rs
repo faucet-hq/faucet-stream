@@ -13,6 +13,7 @@ pub struct FileSink {
     config: FileSinkConfig,
     local: Arc<LocalBackend>,
     writer: FileWriter,
+    name: &'static str,
 }
 
 impl FileSink {
@@ -43,7 +44,15 @@ impl FileSink {
             config,
             local,
             writer,
+            name: "file",
         })
+    }
+
+    /// Report `name` as the connector name (metric labels, logs) instead of
+    /// `file`, for a deprecated kind the CLI builds as this sink.
+    pub fn with_connector_name(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     /// The resolved format.
@@ -95,7 +104,7 @@ impl FileSink {
 #[async_trait]
 impl Sink for FileSink {
     fn connector_name(&self) -> &'static str {
-        "file"
+        self.name
     }
 
     fn config_schema(&self) -> Value {
@@ -230,6 +239,14 @@ mod tests {
         let rel = v["path"].as_str().unwrap().to_string();
         v["path"] = Value::String(format!("{}/{rel}", dir.display()));
         FileSink::new(serde_json::from_value(v).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn connector_name_defaults_to_file_and_can_be_renamed() {
+        let d = tempfile::tempdir().unwrap();
+        let s = sink(d.path(), json!({"path": "a.jsonl"}));
+        assert_eq!(s.connector_name(), "file");
+        assert_eq!(s.with_connector_name("jsonl").connector_name(), "jsonl");
     }
 
     fn lines(p: &Path) -> Vec<Value> {

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Parity with the `csv` and `parquet` sources (#777): every option those
 //! crates have works on the file source, and the same input read through the
 //! old crate and through the file source produces the same records.

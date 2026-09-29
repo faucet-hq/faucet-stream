@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! #651 Category F — typed round-trip fidelity for the JSON Lines sink.
 //!
 //! The strictest fidelity pair in the program, and the one that isolates the

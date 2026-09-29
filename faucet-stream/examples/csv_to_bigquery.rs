@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! CSV → BigQuery — full builder showcase for both connectors.
 //!
 //! CSV source uses non-default delimiter + quote. BigQuery sink shows the

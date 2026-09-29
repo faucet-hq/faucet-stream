@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! #753: with `append: false` the file reflects the latest successful run,
 //! including a run that wrote zero records; failed and cancelled runs keep the
 //! previous file.

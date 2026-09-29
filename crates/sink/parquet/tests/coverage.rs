@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Additional coverage tests for `faucet-sink-parquet`.
 //!
 //! These exercise branches not covered by `roundtrip.rs`: single-file mode

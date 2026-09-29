@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration tests for `CsvSource::stream_pages`.
 //!
 //! These tests exercise the async line-streaming path end-to-end against
