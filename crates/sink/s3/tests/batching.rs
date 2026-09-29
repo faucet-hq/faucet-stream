@@ -379,3 +379,64 @@ async fn a_large_object_streams_through_multipart_and_round_trips() {
     assert_eq!(recs[0]["id"], 0);
     assert_eq!(recs[59_999]["id"], 59_999);
 }
+
+/// `batch_size: 0` with Parquet and no caps: one object per `write_batch`
+/// call, as the sink wrote before the shared writer (#777).
+#[cfg(feature = "arrow")]
+#[tokio::test(flavor = "multi_thread")]
+async fn parquet_with_batch_size_zero_writes_one_object_per_batch_write() {
+    let (_container, endpoint) = start_minio().await;
+    create_bucket(&endpoint).await;
+    let prefix = "pq-per-write/";
+    let config = S3SinkConfig::new(TEST_BUCKET)
+        .prefix(prefix)
+        .file_extension(".parquet")
+        .format(faucet_sink_s3::S3SinkFormat::Parquet)
+        .with_batch_size(0);
+    let sink = build_sink(&endpoint, config).await;
+    sink.write_batch(&records(30)).await.expect("write 1");
+    sink.write_batch(&records(20)).await.expect("write 2");
+    sink.flush().await.expect("flush");
+    let admin = assertion_client(&endpoint).await;
+    let keys = list_keys(&admin, prefix).await;
+    assert_eq!(keys.len(), 2, "one object per write_batch: {keys:?}");
+}
+
+async fn upload_run(endpoint: &str, prefix: &str, concurrency: usize) -> std::time::Duration {
+    let config = S3SinkConfig::new(TEST_BUCKET)
+        .prefix(prefix)
+        .max_records_per_file(50)
+        .concurrency(concurrency);
+    let sink = build_sink(endpoint, config).await;
+    let started = std::time::Instant::now();
+    sink.write_batch(&records(2_000)).await.expect("write");
+    sink.flush().await.expect("flush");
+    started.elapsed()
+}
+
+/// A page that rolls into 40 objects uploads them concurrently: every object
+/// lands, and the wall clock is printed next to a one-at-a-time run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_rolling_into_many_objects_uploads_them_concurrently() {
+    let (_container, endpoint) = start_minio().await;
+    create_bucket(&endpoint).await;
+    let serial = upload_run(&endpoint, "serial/", 1).await;
+    let parallel = upload_run(&endpoint, "parallel/", 10).await;
+    eprintln!("40 objects: concurrency 1 {serial:?}, concurrency 10 {parallel:?}");
+    let admin = assertion_client(&endpoint).await;
+    for prefix in ["serial/", "parallel/"] {
+        let keys = list_keys(&admin, prefix).await;
+        assert_eq!(keys.len(), 40, "{prefix}: {keys:?}");
+        let mut ids: Vec<i64> = Vec::new();
+        for k in &keys {
+            ids.extend(
+                fetch_jsonl(&admin, k)
+                    .await
+                    .iter()
+                    .map(|r| r["id"].as_i64().unwrap()),
+            );
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=2000).collect::<Vec<i64>>());
+    }
+}
