@@ -16,6 +16,77 @@ pub(crate) struct Ctx<'a> {
     pub opts: &'a FormatOptions,
     #[cfg_attr(not(feature = "file-format-parquet"), allow(dead_code))]
     pub parquet: &'a crate::config::ParquetOptions,
+    pub json_lines: &'a crate::config::JsonLinesOptions,
+    #[cfg(feature = "encryption")]
+    pub encryption: Option<&'a faucet_core::CompiledEncryption>,
+}
+
+impl Ctx<'_> {
+    /// The bytes of `records` as the line formats write them: pretty or
+    /// compact JSON, and sealed per record when encryption is on.
+    fn line_bytes(&self, records: &[Value]) -> Result<Vec<u8>, FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = self.encryption {
+            use base64::Engine as _;
+            let mut out = Vec::new();
+            for r in records {
+                let mut line = self.plain_lines(std::slice::from_ref(r))?;
+                line.pop();
+                out.extend_from_slice(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(enc.encrypt(&line))
+                        .as_bytes(),
+                );
+                out.push(b'\n');
+            }
+            return Ok(out);
+        }
+        self.plain_lines(records)
+    }
+
+    fn plain_lines(&self, records: &[Value]) -> Result<Vec<u8>, FaucetError> {
+        if self.format != FileFormat::JsonLines || !self.json_lines.pretty {
+            return faucet_core::file_format::encode(records, self.format, self.opts);
+        }
+        let mut out = Vec::new();
+        for r in records {
+            serde_json::to_writer_pretty(&mut out, r)
+                .map_err(|e| FaucetError::Sink(format!("json_lines: {e}")))?;
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+
+    /// Seal a finished whole-file body in place.
+    fn seal_file(&self, path: &Path) -> Result<(), FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = self.encryption
+            && !matches!(self.format, FileFormat::JsonLines | FileFormat::RawText)
+        {
+            let plain = std::fs::read(path).map_err(|e| io_err("reading", path, e))?;
+            write_synced(path, &enc.encrypt(&plain))?;
+        }
+        let _ = path;
+        Ok(())
+    }
+
+    /// Read a finalised file back as plaintext bytes (decrypting a sealed one).
+    #[cfg_attr(
+        not(any(feature = "file-format-csv", feature = "file-format-parquet")),
+        allow(dead_code)
+    )]
+    pub fn read_existing(&self, path: &Path) -> Result<Vec<u8>, FaucetError> {
+        let raw = std::fs::read(path).map_err(|e| io_err("opening", path, e))?;
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = self.encryption
+            && faucet_core::encryption::is_encrypted(&raw)
+        {
+            return enc.decrypt(&raw).map_err(|e| {
+                FaucetError::Sink(format!("file sink: decrypting '{}': {e}", path.display()))
+            });
+        }
+        Ok(raw)
+    }
 }
 
 type LineWriter = SyncCompressWriter<BufWriter<File>>;
@@ -108,7 +179,7 @@ impl OpenFile {
         let tmp = self.tmp.clone();
         match &mut self.enc {
             Enc::Lines(slot) => {
-                let buf = faucet_core::file_format::encode(records, ctx.format, ctx.opts)?;
+                let buf = ctx.line_bytes(records)?;
                 if slot.is_none() {
                     *slot = Some(open_lines(&self.final_path, &tmp, ctx.codec, true)?);
                 }
@@ -116,14 +187,14 @@ impl OpenFile {
                 w.write_all(&buf).map_err(|e| io_err("writing", &tmp, e))
             }
             #[cfg(feature = "file-format-csv")]
-            Enc::Csv(state) => state.write(records),
+            Enc::Csv(state) => state.write(records, ctx.opts.csv.on_unknown_field),
             Enc::Doc(buf) => {
                 buf.extend_from_slice(records);
                 Ok(())
             }
             #[cfg(feature = "file-format-parquet")]
             Enc::Parquet(state) => {
-                let batch = state.batch_for(records)?;
+                let batch = state.batch_for(ctx.parquet, records)?;
                 state.write(ctx, &self.final_path, &tmp, self.finalized, &batch)
             }
         }
@@ -199,6 +270,7 @@ impl OpenFile {
                 }
             }
         }
+        ctx.seal_file(&tmp)?;
         std::fs::rename(&tmp, &self.final_path)
             .map_err(|e| io_err("renaming into place", &self.final_path, e))?;
         sync_dir(&self.final_path);
@@ -280,7 +352,10 @@ pub(crate) struct CsvState {
     header: Vec<String>,
     known: std::collections::HashSet<String>,
     delimiter: u8,
+    quote: u8,
     has_headers: bool,
+    warned: std::collections::HashSet<String>,
+    narrowest: usize,
 }
 
 #[cfg(feature = "file-format-csv")]
@@ -293,11 +368,13 @@ impl CsvState {
         resume: bool,
     ) -> Result<(Self, usize), FaucetError> {
         let delimiter = ctx.opts.csv.delimiter_byte()?;
+        let quote = ctx.opts.csv.quote_byte()?;
         let has_headers = ctx.opts.csv.has_headers;
         let body_path = tmp_path(final_path, BODY_SUFFIX);
         let f = File::create(&body_path).map_err(|e| io_err("creating", &body_path, e))?;
         let body = csv::WriterBuilder::new()
             .delimiter(delimiter)
+            .quote(quote)
             .flexible(true)
             .from_writer(BufWriter::new(f));
         let mut state = Self {
@@ -306,16 +383,20 @@ impl CsvState {
             header: Vec::new(),
             known: Default::default(),
             delimiter,
+            quote,
             has_headers,
+            warned: Default::default(),
+            narrowest: usize::MAX,
         };
         let mut carried = 0;
         if resume && final_path.exists() {
-            let f = File::open(final_path).map_err(|e| io_err("opening", final_path, e))?;
-            let reader = faucet_core::compression::wrap_sync_reader(f, ctx.codec);
+            let existing = std::io::Cursor::new(ctx.read_existing(final_path)?);
+            let reader = faucet_core::compression::wrap_sync_reader(existing, ctx.codec);
             let mut rdr = csv::ReaderBuilder::new()
                 .has_headers(false)
                 .flexible(true)
                 .delimiter(delimiter)
+                .quote(quote)
                 .from_reader(reader);
             let mut first = has_headers;
             for rec in rdr.records() {
@@ -336,6 +417,7 @@ impl CsvState {
                     .body
                     .write_record(&rec)
                     .map_err(|e| csv_err(&state.body_path, e))?;
+                state.narrowest = state.narrowest.min(rec.len());
                 carried += 1;
             }
         }
@@ -348,7 +430,12 @@ impl CsvState {
         }
     }
 
-    fn write(&mut self, records: &[Value]) -> Result<(), FaucetError> {
+    fn write(
+        &mut self,
+        records: &[Value],
+        on_unknown: faucet_core::CsvUnknownField,
+    ) -> Result<(), FaucetError> {
+        use faucet_core::CsvUnknownField;
         for (i, r) in records.iter().enumerate() {
             if !r.is_object() {
                 return Err(FaucetError::Sink(format!(
@@ -356,8 +443,31 @@ impl CsvState {
                 )));
             }
         }
-        for key in faucet_core::file_format::header_union(records) {
-            self.add_column(&key);
+        let frozen = on_unknown != CsvUnknownField::Widen && !self.header.is_empty();
+        let unknown: Vec<String> = faucet_core::file_format::header_union(records)
+            .into_iter()
+            .filter(|k| !self.known.contains(k))
+            .collect();
+        if frozen && !unknown.is_empty() {
+            if on_unknown == CsvUnknownField::Error {
+                return Err(FaucetError::Sink(format!(
+                    "csv: record field(s) not in the header and `csv.on_unknown_field: error`: \
+                     [{}] — the header is fixed from the first page, so these values would be \
+                     dropped",
+                    unknown.join(", ")
+                )));
+            }
+            for k in unknown.iter().filter(|k| self.warned.insert((*k).clone())) {
+                tracing::warn!(
+                    field = %k,
+                    "file sink: csv dropping a field that is not in the header \
+                     (`csv.on_unknown_field: warn`)"
+                );
+            }
+        } else {
+            for key in unknown {
+                self.add_column(&key);
+            }
         }
         for r in records {
             let row: Vec<String> = self
@@ -372,6 +482,7 @@ impl CsvState {
             self.body
                 .write_record(&row)
                 .map_err(|e| csv_err(&self.body_path, e))?;
+            self.narrowest = self.narrowest.min(row.len());
         }
         Ok(())
     }
@@ -386,6 +497,7 @@ impl CsvState {
         if self.has_headers && !self.header.is_empty() {
             let mut w = csv::WriterBuilder::new()
                 .delimiter(self.delimiter)
+                .quote(self.quote)
                 .from_writer(Vec::new());
             w.write_record(&self.header).map_err(|e| csv_err(tmp, e))?;
             let line = w
@@ -396,12 +508,42 @@ impl CsvState {
         }
         let mut body =
             File::open(&self.body_path).map_err(|e| io_err("opening", &self.body_path, e))?;
-        std::io::copy(&mut body, &mut out).map_err(|e| io_err("writing", tmp, e))?;
+        if self.narrowest < self.header.len() {
+            self.pad_rows(body, &mut out, tmp)?;
+        } else {
+            std::io::copy(&mut body, &mut out).map_err(|e| io_err("writing", tmp, e))?;
+        }
         let buffered = out.finish().map_err(|e| io_err("finishing", tmp, e))?;
         let file = buffered
             .into_inner()
             .map_err(|e| io_err("flushing", tmp, e.into_error()))?;
         file.sync_all().map_err(|e| io_err("syncing", tmp, e))
+    }
+}
+
+#[cfg(feature = "file-format-csv")]
+impl CsvState {
+    /// Copy the body, padding rows written before the header widened with
+    /// empty cells, so every row has one cell per column.
+    fn pad_rows(&self, body: File, out: &mut impl Write, tmp: &Path) -> Result<(), FaucetError> {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .delimiter(self.delimiter)
+            .quote(self.quote)
+            .from_reader(std::io::BufReader::new(body));
+        let mut w = csv::WriterBuilder::new()
+            .delimiter(self.delimiter)
+            .quote(self.quote)
+            .from_writer(out);
+        let width = self.header.len();
+        for rec in rdr.records() {
+            let rec = rec.map_err(|e| csv_err(&self.body_path, e))?;
+            let mut row: Vec<&str> = rec.iter().collect();
+            row.resize(width.max(row.len()), "");
+            w.write_record(&row).map_err(|e| csv_err(tmp, e))?;
+        }
+        w.flush().map_err(|e| io_err("writing", tmp, e))
     }
 }
 

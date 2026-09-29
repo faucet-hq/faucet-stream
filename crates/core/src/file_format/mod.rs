@@ -196,6 +196,7 @@ fn default_delimiter() -> String {
 /// CSV dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("x-faucet-aliases" = ["write_headers"]))]
 pub struct CsvOptions {
     /// Field separator. A single character; `"\t"` is accepted for tabs.
     #[serde(default = "default_delimiter")]

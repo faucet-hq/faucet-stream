@@ -22,6 +22,8 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 csv = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 [features]
 # Formats that need a dependency. JSON Lines, JSON arrays and raw text are
@@ -30,14 +32,16 @@ file-format-csv = ["faucet-core/file-format-csv", "dep:csv"]
 file-format-xml = ["faucet-core/file-format-xml"]
 file-format-excel = ["faucet-core/file-format-excel"]
 file-format-avro = ["faucet-core/file-format-avro"]
-file-format-parquet = ["arrow", "dep:parquet"]
+file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
 # The columnar (Arrow) write path for Parquet and Avro.
 arrow = ["faucet-core/arrow", "dep:arrow"]
+# Encrypt output at rest (`encryption:` block).
+encryption = ["faucet-core/encryption", "dep:base64"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-parquet"]
 
 [dev-dependencies]
 faucet-conformance.workspace = true
-faucet-source-file = { workspace = true, features = ["file-formats"] }
+faucet-source-file = { workspace = true, features = ["file-formats", "encryption"] }
 faucet-source-rest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 tempfile = "3"

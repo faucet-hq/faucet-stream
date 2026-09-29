@@ -51,7 +51,8 @@ pub enum FileWriteMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ParquetCodec {
-    /// Uncompressed pages.
+    /// Uncompressed pages. `uncompressed` is accepted as another name.
+    #[serde(alias = "uncompressed")]
     None,
     /// Snappy (the default): fast and universally readable.
     #[default]
@@ -60,21 +61,148 @@ pub enum ParquetCodec {
     Gzip,
     /// Zstandard.
     Zstd,
+    /// LZ4 (the `LZ4_RAW` codec).
+    Lz4,
+}
+
+/// Rows per Parquet row group unless `parquet.row_group_size` says otherwise.
+pub const DEFAULT_ROW_GROUP_SIZE: usize = 1024 * 1024;
+
+fn default_row_group_size() -> usize {
+    DEFAULT_ROW_GROUP_SIZE
 }
 
 /// Parquet write options.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ParquetOptions {
     /// Column-chunk compression (default `snappy`). File-level `compression`
     /// does not apply to Parquet.
     #[serde(default)]
     pub compression: ParquetCodec,
+    /// Maximum rows per row group (default 1,048,576). Smaller groups let
+    /// readers skip more data and bound the writer's memory.
+    #[serde(default = "default_row_group_size")]
+    pub row_group_size: usize,
+    /// An explicit schema, in column order. Without it the schema is
+    /// inferred from the records and widened when a later page adds a field.
+    /// With it the file has exactly these columns: a record field the schema
+    /// does not name fails the write, and a value that does not fit its
+    /// column's type fails naming the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Vec<ParquetField>>,
+}
+
+impl Default for ParquetOptions {
+    fn default() -> Self {
+        Self {
+            compression: ParquetCodec::default(),
+            row_group_size: DEFAULT_ROW_GROUP_SIZE,
+            schema: None,
+        }
+    }
+}
+
+/// One column of an explicit Parquet schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ParquetField {
+    /// Column name — the record field it is read from.
+    pub name: String,
+    /// Column type.
+    #[serde(rename = "type")]
+    pub data_type: ParquetType,
+    /// Whether the column may be null or missing (default `true`).
+    #[serde(default = "default_true")]
+    pub nullable: bool,
+}
+
+/// A column type of an explicit Parquet schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParquetType {
+    /// `true` / `false`.
+    Boolean,
+    /// 32-bit signed integer.
+    Int32,
+    /// 64-bit signed integer.
+    Int64,
+    /// 64-bit unsigned integer.
+    Uint64,
+    /// 32-bit float.
+    Float32,
+    /// 64-bit float.
+    Float64,
+    /// UTF-8 text.
+    String,
+    /// A calendar date, from `YYYY-MM-DD` text.
+    Date,
+    /// A UTC timestamp in milliseconds, from RFC 3339 text or epoch numbers.
+    TimestampMs,
+    /// A UTC timestamp in microseconds.
+    TimestampUs,
+    /// A UTC timestamp in nanoseconds.
+    TimestampNs,
+    /// A fixed-point decimal with the given precision and scale, from
+    /// numbers or numeric text.
+    Decimal {
+        /// Total digits (1–38).
+        precision: u8,
+        /// Digits after the point.
+        scale: i8,
+    },
+}
+
+/// JSON Lines write options.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JsonLinesOptions {
+    /// Pretty-print each record across several lines. The output is then a
+    /// stream of JSON documents rather than one record per line.
+    #[serde(default)]
+    pub pretty: bool,
+}
+
+fn validate_parquet(p: &ParquetOptions) -> Result<(), FaucetError> {
+    if p.row_group_size == 0 {
+        return Err(FaucetError::Config(
+            "file sink: `parquet.row_group_size` must be at least 1".into(),
+        ));
+    }
+    let Some(fields) = &p.schema else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Err(FaucetError::Config(
+            "file sink: `parquet.schema` must name at least one column".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for f in fields {
+        if f.name.is_empty() || !seen.insert(f.name.as_str()) {
+            return Err(FaucetError::Config(format!(
+                "file sink: `parquet.schema` column names must be unique and non-empty, got {:?}",
+                f.name
+            )));
+        }
+        if let ParquetType::Decimal { precision, scale } = f.data_type
+            && (!(1..=38).contains(&precision)
+                || i16::from(scale).unsigned_abs() > u16::from(precision))
+        {
+            return Err(FaucetError::Config(format!(
+                "file sink: `parquet.schema` column '{}': decimal precision must be 1–38 and \
+                 the scale no larger than the precision",
+                f.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Configuration for the local file sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("x-faucet-aliases" = ["max_rows_per_file"]))]
 pub struct FileSinkConfig {
     /// The file to write, as a template. `{part}` is replaced by the rollover
     /// part number (`00001`, `00002`, …); with a rollover cap and no `{part}`,
@@ -99,8 +227,13 @@ pub struct FileSinkConfig {
     /// set atomically when the run succeeds.
     #[serde(default)]
     pub write_mode: FileWriteMode,
-    /// Roll to a new file after this many records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Roll to a new file after this many records. `max_rows_per_file` is
+    /// accepted as another name.
+    #[serde(
+        default,
+        alias = "max_rows_per_file",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_records_per_file: Option<usize>,
     /// Roll to a new file once the current one reaches this many bytes. A
     /// single page larger than the cap still lands in one file.
@@ -125,9 +258,22 @@ pub struct FileSinkConfig {
     /// Writer schema and block codec, used when the format is Avro.
     #[serde(default)]
     pub avro: AvroOptions,
-    /// Column-chunk compression, used when the format is Parquet.
+    /// Compression, row groups and an optional explicit schema, used when
+    /// the format is Parquet.
     #[serde(default)]
     pub parquet: ParquetOptions,
+    /// Pretty-printing, used when the format is JSON Lines.
+    #[serde(default)]
+    pub json_lines: JsonLinesOptions,
+    /// Encrypt the output at rest (AES-256-GCM). JSON Lines and raw text
+    /// seal each record on its own line (base64), exactly as the jsonl sink
+    /// does, so the file stays appendable — and, like the jsonl sink, cannot
+    /// also be compressed. Every other format is sealed as a whole file when
+    /// it is finalised, after any `compression`. The file source's
+    /// `encryption` block reads both back.
+    #[cfg(feature = "encryption")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<faucet_core::EncryptionSpec>,
 }
 
 fn default_true() -> bool {
@@ -156,7 +302,31 @@ impl FileSinkConfig {
             xml: XmlOptions::default(),
             avro: AvroOptions::default(),
             parquet: ParquetOptions::default(),
+            json_lines: JsonLinesOptions::default(),
+            #[cfg(feature = "encryption")]
+            encryption: None,
         }
+    }
+
+    /// Set the JSON Lines options.
+    pub fn json_lines(mut self, json_lines: JsonLinesOptions) -> Self {
+        self.json_lines = json_lines;
+        self
+    }
+
+    /// Encrypt the output at rest.
+    #[cfg(feature = "encryption")]
+    pub fn encryption(mut self, encryption: faucet_core::EncryptionSpec) -> Self {
+        self.encryption = Some(encryption);
+        self
+    }
+
+    /// Whether the format seals each record on its own line when encrypted.
+    pub fn encrypts_per_line(&self) -> bool {
+        matches!(
+            self.resolved_format(),
+            Ok(FileFormat::JsonLines | FileFormat::RawText)
+        )
     }
 
     /// Set the format.
@@ -311,7 +481,22 @@ impl FileSinkConfig {
             ));
         }
         if format == FileFormat::Csv {
-            self.csv.delimiter_byte()?;
+            self.csv.validate()?;
+        }
+        if format == FileFormat::Parquet {
+            validate_parquet(&self.parquet)?;
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(spec) = &self.encryption {
+            faucet_core::CompiledEncryption::compile(spec)?;
+            if codec != Compression::None && self.encrypts_per_line() {
+                return Err(FaucetError::Config(
+                    "file sink: `encryption` and `compression` are mutually exclusive for JSON \
+                     Lines and raw text — each record is sealed on its own line, and sealed \
+                     lines cannot form a gzip/zstd stream"
+                        .into(),
+                ));
+            }
         }
         if format == FileFormat::Avro
             && let Some(schema) = &self.avro.schema

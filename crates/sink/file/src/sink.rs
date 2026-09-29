@@ -23,6 +23,8 @@ pub struct FileSink {
     layout: Layout,
     state: Mutex<State>,
     outputs: faucet_core::LocalOutputLog,
+    #[cfg(feature = "encryption")]
+    encryption: Option<faucet_core::CompiledEncryption>,
 }
 
 #[derive(Default)]
@@ -43,6 +45,12 @@ impl FileSink {
         }
         let layout = Layout::new(&config, format, codec)?;
         Ok(Self {
+            #[cfg(feature = "encryption")]
+            encryption: config
+                .encryption
+                .as_ref()
+                .map(faucet_core::CompiledEncryption::compile)
+                .transpose()?,
             opts: config.format_options(),
             format,
             codec,
@@ -69,6 +77,9 @@ impl FileSink {
             codec: self.codec,
             opts: &self.opts,
             parquet: &self.config.parquet,
+            json_lines: &self.config.json_lines,
+            #[cfg(feature = "encryption")]
+            encryption: self.encryption.as_ref(),
         }
     }
 
