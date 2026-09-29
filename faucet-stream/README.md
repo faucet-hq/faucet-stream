@@ -24,7 +24,7 @@ Prefer depending on the individual crates (`faucet-core` + `faucet-source-rest` 
 cargo add faucet-stream
 
 # Pick exactly the connectors you need
-cargo add faucet-stream --features source-rest,source-s3,sink-postgres,sink-jsonl
+cargo add faucet-stream --features source-rest,source-s3,sink-postgres,sink-file
 
 # All sources / all sinks
 cargo add faucet-stream --features source
@@ -59,9 +59,9 @@ cargo add faucet-stream --features full
 | `source-redis` | no | Redis — streams, lists, or key patterns |
 | `source-webhook` | no | Webhook — temporary HTTP server collecting POSTs |
 | `source-websocket` | no | WebSocket — live streaming, subscription frames, reconnect |
-| `source-csv` | no | CSV — read CSV files as JSON objects |
+| `source-csv` | no | Deprecated: enables `source-file` (read CSV with the file source) and the old `faucet-source-csv` crate |
 | `source-elasticsearch` | no | Elasticsearch — search / scroll API |
-| `source-parquet` | no | Parquet — local, glob, or S3; vectorized Arrow reader |
+| `source-parquet` | no | Deprecated: enables `source-file` (read Parquet with the file source) and the old `faucet-source-parquet` crate |
 | `source-kafka` | no | Kafka consumer — subscribe, drain with idle / max-message termination |
 | `source-bigquery` | no | BigQuery query source — `jobs.query` + pagination |
 | `source-snowflake` | no | Snowflake query source — SQL REST API, JWT / OAuth |
@@ -82,10 +82,10 @@ cargo add faucet-stream --features full
 | `sink-elasticsearch` | no | Elasticsearch — bulk index API |
 | `sink-s3` | no | AWS S3 — JSONL files |
 | `sink-gcs` | no | Google Cloud Storage — JSONL files |
-| `sink-parquet` | no | Parquet — local or S3; schema inference, row/byte rollover |
+| `sink-parquet` | no | Deprecated: enables `sink-file` (write Parquet with the file sink) and the old `faucet-sink-parquet` crate |
 | `sink-kafka` | no | Kafka producer — batched sends, multi-topic routing |
-| `sink-csv` | no | CSV — write JSON as CSV rows |
-| `sink-jsonl` | no | JSON Lines — file output |
+| `sink-csv` | no | Deprecated: enables `sink-file` (write CSV with the file sink) and the old `faucet-sink-csv` crate |
+| `sink-jsonl` | no | Deprecated: enables `sink-file` (write JSON Lines with the file sink) and the old `faucet-sink-jsonl` crate |
 | `sink-http` | no | HTTP — POST records to any endpoint |
 | `sink-stdout` | no | Stdout/stderr — JSON Lines, pretty JSON, or TSV |
 
@@ -172,7 +172,7 @@ cargo add faucet-stream --features source-s3,sink-bigquery
 cargo add faucet-stream --features source-postgres-cdc,sink-postgres,state-postgres,transform-cdc-unwrap
 
 # Kafka with Schema Registry → Parquet on S3
-cargo add faucet-stream --features source-kafka,sink-parquet,kafka-schema-registry
+cargo add faucet-stream --features source-kafka,sink-file,file-format-parquet,kafka-schema-registry
 
 # Everything, for prototyping
 cargo add faucet-stream --features full
@@ -185,7 +185,7 @@ The whole `faucet-core` API is re-exported unconditionally; connector types appe
 ```rust
 use faucet_stream::{Pipeline, run_stream};
 use faucet_source_rest::{RestStream, RestStreamConfig, Auth, PaginationStyle};
-use faucet_sink_jsonl::{JsonlSink, JsonlSinkConfig};
+use faucet_sink_file::{FileSink, FileSinkConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -201,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Build a sink
-    let sink = JsonlSink::new(JsonlSinkConfig::new("users.jsonl"))?;
+    let sink = FileSink::new(FileSinkConfig::new("users.jsonl"))?;
 
     // Batch mode: fetch all, then write
     let result = Pipeline::new(&source, &sink).run().await?;

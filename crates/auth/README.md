@@ -322,7 +322,7 @@ pipeline:
         account: ${vars.account}
         auth: { ref: sf }      # every row using this template shares ONE token
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out.jsonl
 ```

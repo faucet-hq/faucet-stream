@@ -34,11 +34,11 @@ schedule:
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./events.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./events.jsonl
 ```
@@ -250,7 +250,7 @@ pipeline:
       base_url: https://api.example.com
       path: /v1/events
   sink:
-    type: jsonl
+    type: file
     config:
       # ${now.date} reflects the schedule's timezone (America/Los_Angeles),
       # so the partition label matches the business date of the run.

@@ -52,7 +52,7 @@ pipeline:
       method: GET
       records_element_path: Response.Users.User
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl
 ```
@@ -169,7 +169,7 @@ pipeline:
         page_size_param: per_page
       max_pages: 20
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./products.jsonl
 ```
@@ -287,7 +287,7 @@ pipeline:
         </soapenv:Envelope>
       records_element_path: soapenv:Envelope.soapenv:Body.GetOrdersResponse.Orders.Order
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders.jsonl
 ```

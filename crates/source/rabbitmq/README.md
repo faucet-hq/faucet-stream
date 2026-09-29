@@ -71,7 +71,7 @@ pipeline:
       idle_timeout_secs: 5
       batch_size: 500
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/orders.jsonl
 ```

@@ -23,7 +23,7 @@ pipeline:
   dlq:
     on_batch_error: dlq_all      # or `propagate`
     sink:
-      type: jsonl
+      type: file
       config:
         path: ./dead-letters.jsonl
 ```
@@ -114,7 +114,7 @@ The ways out, safest first:
 
    ```yaml
    dlq:
-     sink: { type: jsonl, config: { path: ./dead-letters.jsonl } }
+     sink: { type: file, config: { path: ./dead-letters.jsonl } }
      on_batch_error: dlq_all
      allow_duplicates_on_dlq_all: true
    ```
@@ -140,7 +140,7 @@ into a circuit breaker:
 
 ```yaml
   dlq:
-    sink: { type: jsonl, config: { path: ./dead-letters.jsonl } }
+    sink: { type: file, config: { path: ./dead-letters.jsonl } }
     max_failures_per_page: 50    # abort if a single page dead-letters > 50 rows
     max_failures_total: 500      # abort once the run has dead-lettered > 500 rows
 ```
@@ -237,7 +237,7 @@ the `encryption` feature — included in `--features full`):
 ```yaml
 dlq:
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./dlq/failed.jsonl
       encryption:

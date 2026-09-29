@@ -54,7 +54,7 @@ pipeline:
       max_messages: 100
       idle_timeout: 30
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./trades.jsonl
 ```

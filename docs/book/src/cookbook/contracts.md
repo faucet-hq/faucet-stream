@@ -24,7 +24,7 @@ version: 1
 name: orders
 
 pipeline:
-  source: { type: csv, config: { path: ./orders.csv } }
+  source: { type: file, config: { path: ./orders.csv } }
 
   contract:
     version: "1.0.0"                  # required, non-empty
@@ -49,9 +49,9 @@ pipeline:
         nullable: true                # default false
 
   dlq:
-    sink: { type: jsonl, config: { path: ./dlq/contract_breaches.jsonl } }
+    sink: { type: file, config: { path: ./dlq/contract_breaches.jsonl } }
 
-  sink: { type: jsonl, config: { path: ./orders_out.jsonl } }
+  sink: { type: file, config: { path: ./orders_out.jsonl } }
 ```
 
 Runnable example: `cli/examples/csv_to_jsonl_with_contract.yaml`.

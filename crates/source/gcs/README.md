@@ -52,7 +52,7 @@ pipeline:
           path: /run/secrets/gcp-sa.json
       file_format: json_lines
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./events.jsonl
 ```

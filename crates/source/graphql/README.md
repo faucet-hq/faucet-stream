@@ -62,7 +62,7 @@ pipeline:
         page_size_variable: first
       batch_size: 100
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl
 ```

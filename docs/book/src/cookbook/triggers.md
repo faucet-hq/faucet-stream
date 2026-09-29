@@ -144,7 +144,7 @@ pipeline:
       url: "https://api.example.com/orders?dataset=${trigger.query.dataset}"
       auth: { type: bearer, config: { token: "${env:API_TOKEN}" } }
   sink:
-    type: jsonl
+    type: file
     config:
       path: "./out/${trigger.fired_at}.jsonl"
 ```

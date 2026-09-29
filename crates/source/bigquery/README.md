@@ -50,7 +50,7 @@ pipeline:
       params:
         - "2026-01-01"
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./events.jsonl
 ```

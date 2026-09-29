@@ -66,7 +66,7 @@ pipeline:
         fields:
           customer_email: contact_email
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders.jsonl
 ```

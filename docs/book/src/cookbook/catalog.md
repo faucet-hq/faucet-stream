@@ -47,8 +47,8 @@ catalog:
   sample_records: 100        # schema-inference sample per side (default 100)
 
 pipeline:
-  source: { type: csv,   config: { path: ./data/input.csv } }
-  sink:   { type: jsonl, config: { path: ./out/records.jsonl } }
+  source: { type: file, config: { path: ./data/input.csv } }
+  sink:   { type: file, config: { path: ./out/records.jsonl } }
 ```
 
 `url` accepts `sqlite:<path>`, a `postgres://…` URL, or `memory`

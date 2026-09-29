@@ -62,7 +62,7 @@ pipeline:
       pagination:
         type: LinkHeader
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/issues.jsonl
 ```
@@ -891,7 +891,7 @@ pipeline:
       start_replication_value: "2026-01-01T00:00:00Z"
       state_key: events_stream
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/events.jsonl
   state:

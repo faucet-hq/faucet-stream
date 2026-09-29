@@ -301,7 +301,7 @@ dimension tables, or any source you re-fetch in full each run and where a plain
 ```yaml
 pipeline:
   source:
-    type: csv
+    type: file
     config: { path: ./data/contacts.csv }
   sink:
     type: sqlite

@@ -52,7 +52,7 @@ pipeline:
       max_payloads: 100
       timeout_secs: 60
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./events.jsonl
 ```
@@ -168,7 +168,7 @@ pipeline:
       timeout_secs: 30          # collect everything received in 30 s
       batch_size: 0             # emit a single page (load-job friendly)
   sink:
-    type: parquet
+    type: file
     config:
       path: ./telemetry.parquet
 ```

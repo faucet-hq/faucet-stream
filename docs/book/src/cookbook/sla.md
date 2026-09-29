@@ -15,7 +15,7 @@ version: 1
 name: orders
 pipeline:
   source: { type: postgres, config: { connection_url: "${env:PG_URL}", query: "SELECT * FROM orders" } }
-  sink: { type: jsonl, config: { path: ./orders.jsonl } }
+  sink: { type: file, config: { path: ./orders.jsonl } }
   state: { type: file, config: { path: ./state } }
 sla:
   max_staleness_secs: 7200     # alert when no successful run within 2 hours

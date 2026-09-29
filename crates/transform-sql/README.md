@@ -42,7 +42,7 @@ The `sql` transform is a pipeline-level (or matrix-row-level) transform — it g
 version: 1
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: data/users.csv
       has_header: true
@@ -51,7 +51,7 @@ pipeline:
       config:
         query: "SELECT id, upper(name) AS name FROM batch WHERE active"
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./active_users.jsonl
 ```
@@ -164,7 +164,7 @@ The transform runs once **per page**, not once across the whole stream. With the
 # BAD: GROUP BY runs per-page, giving partial aggregates.
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: data/orders.csv
   transforms:
@@ -179,7 +179,7 @@ pipeline:
 # CORRECT: batch_size: 0 loads the whole file as one page → global GROUP BY.
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: data/orders.csv
       batch_size: 0
@@ -240,7 +240,7 @@ name: csv_to_jsonl_sql
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: cli/examples/data/orders.csv
       has_header: true
@@ -265,7 +265,7 @@ pipeline:
               has_header: true
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: /tmp/faucet_sql_demo.jsonl
 ```

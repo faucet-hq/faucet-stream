@@ -224,7 +224,7 @@ endpoint — whichever instance has capacity first will pick it up:
 curl -XPOST http://node-a:8080/v1/runs \
   -H "Authorization: Bearer s3cret" \
   -H 'content-type: application/json' \
-  -d '{"config":"version: 1\npipeline:\n  source: {type: csv, config: {path: in.csv}}\n  sink: {type: jsonl, config: {path: out.jsonl}}\n","name":"my-pipeline"}'
+  -d '{"config":"version: 1\npipeline:\n  source: {type: file, config: { path: in.csv }}\n  sink: {type: file, config: { path: out.jsonl }}\n","name":"my-pipeline"}'
 ```
 
 Check cluster membership via `/readyz`:

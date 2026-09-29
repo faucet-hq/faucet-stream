@@ -60,7 +60,7 @@ pipeline:
         config:
           token: "${vault:secret/data/faucet/api#token}"
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/items.jsonl
 ```
@@ -289,7 +289,7 @@ pipeline:
   sources:
     orders:  { type: rest, config: { base_url: https://api.example.com/orders,  auth: { ref: api } } }
     refunds: { type: rest, config: { base_url: https://api.example.com/refunds, auth: { ref: api } } }
-  sink: { type: jsonl, config: { path: ./out.jsonl } }
+  sink: { type: file, config: { path: ./out.jsonl } }
 ```
 
 A secret in the `vars:` block works the same way and can be reused through
@@ -304,7 +304,7 @@ pipeline:
     type: postgres
     config:
       connection_url: "postgres://app:${vars.db_password}@db.internal:5432/app"
-  sink: { type: jsonl, config: { path: ./rows.jsonl } }
+  sink: { type: file, config: { path: ./rows.jsonl } }
 ```
 
 The shared `auth:` catalog is a first-class config location in every respect:

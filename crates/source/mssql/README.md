@@ -44,7 +44,7 @@ pipeline:
       connection_url: "mssql://sa:Str0ng%40Pass@localhost:1433/sales"
       query: "SELECT id, email, updated_at FROM dbo.users"
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl
 ```
@@ -134,7 +134,7 @@ pipeline:
       query: "SELECT id, email, created_at FROM dbo.users"
       batch_size: 5000
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl
 ```
@@ -158,10 +158,10 @@ pipeline:
         column: updated_at
         initial_value: "1970-01-01T00:00:00Z"
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/users.jsonl
-      append: true
+      mode: append
   state:
     type: file
     config:
@@ -203,7 +203,7 @@ pipeline:
         type: require
         ca_cert_path: /etc/ssl/certs/corp-ca.pem
   sink:
-    type: parquet
+    type: file
     config:
       path: ./fact_sales.parquet
 ```

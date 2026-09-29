@@ -38,7 +38,7 @@ The `sink-stdout` feature is **not** in the CLI default build — enable it expl
 version: 1
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./users.csv
   sink:

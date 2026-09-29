@@ -167,7 +167,7 @@ pipeline:
     on_drift: evolve
 
   dlq:                                    # quarantined rows land here; the run keeps going
-    sink: { type: jsonl, config: { path: ./dlq/orders.jsonl } }
+    sink: { type: file, config: { path: ./dlq/orders.jsonl } }
     max_failures_total: 1000              # ...unless too many fail
 
   sink:                                   # load: MERGE by id, so updated orders replace old rows
@@ -334,7 +334,7 @@ The CLI is a thin layer over a library, and the same engine is available through
 
 ```rust
 use faucet_stream::{Pipeline, RestStream, RestStreamConfig, PaginationStyle};
-use faucet_stream::sink::jsonl::{JsonlSink, JsonlSinkConfig};
+use faucet_stream::sink::file::{FileSink, FileSinkConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -346,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 param_name: "cursor".into(),
             }),
     )?;
-    let sink = JsonlSink::new(JsonlSinkConfig::new("./users.jsonl"));
+    let sink = FileSink::new(FileSinkConfig::new("./users.jsonl"))?;
 
     let result = Pipeline::new(&source, &sink).run().await?;
     println!("wrote {} records", result.records_written);

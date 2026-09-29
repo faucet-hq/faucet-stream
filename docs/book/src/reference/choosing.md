@@ -39,17 +39,18 @@ For the full feature grid see the [connector catalog](./connectors.md).
   resumable via the opaque `resumeToken`. Requires a replica set or sharded
   cluster. See the [connector reference](connectors.md).
 
-## Object storage: S3/GCS source vs. Parquet source
+## Local files vs. object storage
 
-- **`source-s3` / `source-gcs`** read objects as JSONL, a JSON array, or raw
-  text. Use them for line-delimited JSON, logs, or text dumps.
-- **`source-parquet`** reads columnar Parquet (local, glob, or S3) with a
-  vectorized Arrow reader and column projection. Use it for analytical datasets —
-  it's far faster and can skip columns you don't need.
+- **`source-file`** reads local files, directories, globs or one `http(s)://`
+  URL in any format (JSONL, JSON, CSV, Excel, XML, Parquet, Avro, ORC), picked
+  from the extension. Parquet is read with a vectorized Arrow reader and column
+  projection (`parquet.columns`).
+- **`source-s3` / `source-gcs` / `source-azure-blob`** read objects from a
+  bucket, in the same formats.
 
-**Rule of thumb:** the file is `.parquet` → Parquet source; it's JSON/text →
-S3/GCS source. (The Parquet source reads from S3 directly, so you don't need the
-S3 source in front of it.)
+**Rule of thumb:** on disk or behind a URL → file source; in a bucket → the
+object-store source. (`source-csv` and `source-parquet` are deprecated aliases
+of the file source.)
 
 ## Live feeds: WebSocket vs. Webhook vs. Kafka/Redis
 
@@ -130,23 +131,25 @@ The Postgres/MySQL/SQLite/SQL Server sinks can write either:
 **Rule of thumb:** exploratory / evolving schema → JSON column; stable schema you
 query with SQL → mapped columns.
 
-## File sinks: JSONL vs. CSV vs. Parquet vs. stdout
+## File output: formats vs. stdout
 
 - **`sink-stdout`** — debugging and pipelines (`faucet preview` uses it).
-- **`sink-jsonl`** — line-delimited JSON; lossless, streaming-friendly,
-  gzip/zstd-capable.
-- **`sink-csv`** — flat tabular output for spreadsheets/BI; nested fields flatten.
-- **`sink-parquet`** — columnar analytical output with built-in compression and
-  schema inference; best for large datasets consumed by analytics engines.
+- **`sink-file`** — local files in the format the extension names: JSON Lines
+  (lossless, streaming-friendly), CSV (flat tabular output for spreadsheets/BI;
+  nested fields flatten), Parquet (columnar, compressed, schema-inferred; best
+  for large datasets consumed by analytics engines), plus JSON, XML, Excel and
+  Avro. Gzip/zstd, rollover and atomic finalisation apply to every format.
 
-**Rule of thumb:** machine-to-machine JSON → JSONL; tabular for humans → CSV;
-analytics at scale → Parquet.
+**Rule of thumb:** machine-to-machine JSON → `.jsonl`; tabular for humans →
+`.csv`; analytics at scale → `.parquet`. (`sink-jsonl`, `sink-csv` and
+`sink-parquet` are deprecated aliases of the file sink.)
 
-## Parquet sink vs. Iceberg sink
+## Parquet files vs. Iceberg sink
 
 Both write columnar Parquet files, but they serve different use cases:
 
-- **`sink-parquet`** — writes raw Parquet files to a local path or S3 prefix.
+- **`sink-file`** (or `sink-s3` / `sink-gcs` with `format: parquet`) — writes
+  raw Parquet files to a local path or a bucket prefix.
   Simple, zero catalog dependency, compatible with any Parquet reader. Use it
   when you want portable files and don't need schema evolution, time-travel, or
   ACID snapshot isolation.
@@ -156,7 +159,7 @@ Both write columnar Parquet files, but they serve different use cases:
   schema evolution, and atomic reads across concurrent writers. Requires a
   running catalog service.
 
-**Rule of thumb:** portable raw files with no catalog → `sink-parquet`; managed
+**Rule of thumb:** portable raw files with no catalog → Parquet files; managed
 lakehouse table with snapshots, time-travel, and catalog-aware readers → `sink-iceberg`.
 
 ## Lakehouse tables: Delta Lake vs. Iceberg

@@ -388,7 +388,7 @@ Submit a run:
 ```bash
 curl -XPOST localhost:8080/v1/runs -H "Authorization: Bearer s3cret" \
   -H 'content-type: application/json' \
-  -d '{"config":"version: 1\npipeline:\n  source: {type: csv, config: {path: in.csv}}\n  sink: {type: jsonl, config: {path: out.jsonl}}\n","name":"adhoc","idempotency_key":"k1"}'
+  -d '{"config":"version: 1\npipeline:\n  source: {type: file, config: { path: in.csv }}\n  sink: {type: file, config: { path: out.jsonl }}\n","name":"adhoc","idempotency_key":"k1"}'
 ```
 
 > ⚠️ **Security:** `serve` executes arbitrary client-supplied configs with the server's identity — secrets, files, and network egress (SSRF). Run single-tenant, authenticated, behind egress controls; terminate TLS at a proxy. See the [serve cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html) and [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
@@ -585,8 +585,8 @@ pipeline:
         records_path: $.data[*]
   sinks:                             # named sink templates
     archive:
-      type: jsonl
-      config: { append: false }
+      type: file
+      config: { format: json_lines }
 
 matrix:
   - id: users
@@ -688,7 +688,7 @@ pipeline:
     - type: keys_case
       config: { mode: snake }
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/issues.jsonl
   state:
@@ -996,10 +996,10 @@ version: 1
 name: fan_out
 pipeline:
   sources:
-    orders: { type: csv, config: { path: ./data/orders.csv } }
+    orders: { type: file, config: { path: ./data/orders.csv } }
   sinks:
-    warehouse: { type: jsonl, config: { path: ./out/warehouse.jsonl } }
-    archive:   { type: jsonl, config: { path: ./out/archive.jsonl } }
+    warehouse: { type: file, config: { path: ./out/warehouse.jsonl } }
+    archive:   { type: file, config: { path: ./out/archive.jsonl } }
   nodes:
     src:  { kind: source, ref: orders }
     fan:  { kind: tee, channel_capacity: 4, fanout: 2 }
@@ -1100,7 +1100,7 @@ pipeline:
       table_id: users
   dlq:
     sink:
-      type: jsonl
+      type: file
       config: { path: ./dlq/users.jsonl }
     on_batch_error: propagate
     max_failures_per_page: 100
@@ -1355,12 +1355,12 @@ File-shaped connectors (JSONL/CSV/S3/GCS source and sink) accept a `compression`
 version: 1
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: data.csv.gz
       compression: auto      # or 'gzip', 'zstd', 'none'
   sink:
-    type: jsonl
+    type: file
     config:
       path: out.jsonl.zst
       compression: auto
@@ -1468,8 +1468,8 @@ FAUCET_SOURCE_REST_BASE_URL=https://api.github.com \
 FAUCET_SOURCE_REST_PATH=/repos/faucet-hq/faucet-stream/issues \
 FAUCET_SOURCE_REST_AUTH_JSON='{"type":"Bearer","token":"ghp_xxx"}' \
 FAUCET_SOURCE_REST_PAGINATION_JSON='{"type":"LinkHeader"}' \
-FAUCET_SINK=jsonl \
-FAUCET_SINK_JSONL_PATH=./issues.jsonl \
+FAUCET_SINK=file \
+FAUCET_SINK_FILE_PATH=./issues.jsonl \
   faucet run --from-env
 ```
 

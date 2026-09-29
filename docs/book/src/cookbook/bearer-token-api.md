@@ -71,7 +71,7 @@ pipeline:
     - type: flatten
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/contacts.jsonl
 ```

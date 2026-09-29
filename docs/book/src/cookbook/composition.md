@@ -32,11 +32,11 @@ version: 1
 name: composed-pipeline
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/input.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/output.jsonl   # neutral default — overridden per-env by the profiles below
 
@@ -192,11 +192,11 @@ version: 1
 name: composed-pipeline
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/input.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/prod.jsonl     # ← from the prod profile
   transforms:                    # ← from the !include

@@ -21,7 +21,7 @@ pipeline:
       connection_url: ${env:DATABASE_URL}
       query: SELECT 1        # placeholder — discovery ignores it
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out.jsonl }
 ```
 

@@ -94,7 +94,7 @@ pipeline:
 
   dlq:
     sink:
-      type: jsonl
+      type: file
       config:
         path: ./dlq/users_quality_failures.jsonl
     on_batch_error: propagate

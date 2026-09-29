@@ -69,7 +69,7 @@ version: 1
 name: orders
 pipeline:
   source:
-    type: csv                       # native faucet source replaces the tap
+    type: file                      # native faucet source replaces the tap
     config: { path: ./data/orders.csv }
   sink:
     type: singer                    # the Singer target you already run

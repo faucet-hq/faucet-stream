@@ -65,7 +65,7 @@ pipeline:
         page_size: 100
       records_path: $.users[*]
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl
 ```

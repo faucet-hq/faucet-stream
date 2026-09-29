@@ -54,7 +54,7 @@ pipeline:
       publication: faucet_pub
       tables: [public.orders]
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders.jsonl
   state:

@@ -112,13 +112,16 @@ injects them per stream.
 
 ### Satisfying a mode by construction
 
-A JSON Lines file rewritten on every run *is* a full refresh, even though the
-`jsonl` connector only knows `append`. A sink template can say so:
+A sink that replaces its output on every run *is* doing a full refresh, even
+when its connector only knows `append`. The `file` sink overwrites natively, so
+the hub's `jsonl` template needs nothing extra; a template over an append-only
+connector that truncates (a [plugin](../tutorials/library.md) sink, say) can
+declare the substitution:
 
 ```yaml
 sink:
-  type: jsonl
-  config: { append: false }
+  type: acme-files               # a plugin sink that rewrites its file each run
+  config: {}
 per_stream:
   path: "${param.out_dir}/${source}/${stream}.jsonl"
 write_mode_aliases:
@@ -134,9 +137,9 @@ only a sink that dedups by key can honour them.
 ### Child streams and truncating sinks
 
 A child stream (`parent:`) runs once **per parent record** into the same
-destination. On a sink that replaces its output on every invocation — `jsonl`
-/ `csv` with `append: false`, a fixed-path `parquet` file, a `file` sink in
-`mode: overwrite` — every parent's invocation would wipe the previous one's
+destination. On a sink that replaces its output on every invocation — a
+`file` sink in `mode: overwrite` (its default) writing one fixed path — every
+parent's invocation would wipe the previous one's
 rows, leaving only the last parent's. So the composer refuses:
 
 - a child stream on a truncating sink, whatever mode it asks for; and
@@ -150,14 +153,14 @@ the next (`write: [overwrite, upsert]` → `upsert`); if none remains the pairin
 fails with the stream named:
 
 ```text
-child stream 'bill_lines' (parent: bills) cannot satisfy overwrite via append on sink 'jsonl':
+child stream 'bill_lines' (parent: bills) cannot satisfy overwrite via append on sink 'acme-files':
 each parent invocation would replace the output, keeping only the last parent's rows
 ```
 
 `faucet validate` / `run` apply the same rule to hand-written configs and to
 deployment overlays: a `parent:` or `fan_out:` row whose truncating file sink
 writes one fixed path (no `${parent.*}`-style token; `${now.*}` does not count)
-is refused. Set `append: true`, or put a per-parent token in the path.
+is refused. Set `mode: append`, or put a per-parent token in the path.
 
 ## Composition and the compatibility matrix
 
@@ -216,7 +219,7 @@ description: Production state, DLQ and paging for composed runs
 params:
   state_dsn: { type: string, required: true, secret: true }
 state: { type: postgres, config: { connection_url: "${param.state_dsn}" } }
-dlq:   { sink: { type: jsonl, config: { path: /var/faucet/dlq/${now.date}.jsonl } } }
+dlq:   { sink: { type: file, config: { path: /var/faucet/dlq/${now.date}.jsonl } } }
 notify:
   - { name: oncall, on: [run_failure, sla_breach], channel: { type: pagerduty, config: { routing_key: "${env:PD_KEY}" } } }
 sla: { max_staleness_secs: 86400 }

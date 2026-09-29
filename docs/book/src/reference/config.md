@@ -102,8 +102,8 @@ pipeline:
 version: 1
 name: composed-pipeline
 pipeline:
-  source: { type: csv,   config: { path: ./data/input.csv } }
-  sink:   { type: jsonl, config: { path: ./out/dev.jsonl } }
+  source: { type: file, config: { path: ./data/input.csv } }
+  sink:   { type: file, config: { path: ./out/dev.jsonl } }
 profiles:
   dev:  { pipeline: { sink: { config: { path: ./out/dev.jsonl } } } }
   prod: { pipeline: { sink: { config: { path: ./out/prod.jsonl } } } }
@@ -391,7 +391,7 @@ pipeline:
       type: rest
       config: { method: GET, base_url: "https://api.example.com", path: "/", auth: { type: none },
                 query_params: {}, pagination: { type: None }, replication_method: { type: FullTable } }
-  sink: { type: jsonl, config: { path: "./out/${subs.subsidiary_id}-${flds.field_id}.jsonl" } }
+  sink: { type: file, config: { path: "./out/${subs.subsidiary_id}-${flds.field_id}.jsonl" } }
 
 matrix:
   - id: subs                  # discovery dimension

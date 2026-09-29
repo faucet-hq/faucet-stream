@@ -372,7 +372,7 @@ pipeline:
 
   dlq:
     sink:
-      type: jsonl
+      type: file
       config: { path: ./dlq/quality_failures.jsonl }
     max_failures_per_page: 50
     max_failures_total: 500

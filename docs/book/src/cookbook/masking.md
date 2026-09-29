@@ -42,7 +42,7 @@ name: customers_csv_with_masking
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./customers.csv
 
@@ -81,7 +81,7 @@ pipeline:
           prefix: usr_
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./customers_masked.jsonl
 ```

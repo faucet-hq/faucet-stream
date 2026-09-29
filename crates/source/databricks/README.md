@@ -99,9 +99,10 @@ pipeline:
       auth: { type: pat, config: { token: "${env:DATABRICKS_TOKEN}" } }
       arrow_native: true   # requires the `arrow` feature; replication must be `full`
   sink:
-    type: parquet
+    type: file
     config:
       path: ./out/
+      format: parquet
 ```
 
 Enable it with `cargo add faucet-source-databricks --features arrow` (library)

@@ -49,7 +49,7 @@ pipeline:
       index: my_index
       # query defaults to { match_all: {} }
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./docs.jsonl
 ```

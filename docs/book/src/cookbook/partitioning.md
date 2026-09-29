@@ -24,7 +24,7 @@ pipeline:
     config:
       path: "/records?id_from=${partition.start}&id_to=${partition.end}"
   sink:
-    type: jsonl
+    type: file
     config:
       path: "./out/records-${partition.id}.jsonl"
 ```

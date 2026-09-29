@@ -92,7 +92,7 @@ pipeline:
       include_columns: true
       idle_timeout: 30
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./changes.jsonl
   state:
@@ -287,7 +287,7 @@ pipeline:
       include_columns: false   # smaller payloads — no before-image on update/delete
       emit_schema_changes: true
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./changes.jsonl
   state:

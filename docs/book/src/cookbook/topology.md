@@ -31,10 +31,10 @@ version: 1
 name: fan_out
 pipeline:
   sources:
-    orders: { type: csv, config: { path: ./data/orders.csv } }
+    orders: { type: file, config: { path: ./data/orders.csv } }
   sinks:
-    warehouse: { type: jsonl, config: { path: ./out/warehouse.jsonl } }
-    archive:   { type: jsonl, config: { path: ./out/archive.jsonl } }
+    warehouse: { type: file, config: { path: ./out/warehouse.jsonl } }
+    archive:   { type: file, config: { path: ./out/archive.jsonl } }
   nodes:
     src:  { kind: source, ref: orders }
     norm: { kind: transform, transforms: [ { type: keys_case, config: { mode: snake } } ] }

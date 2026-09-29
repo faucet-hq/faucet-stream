@@ -52,7 +52,7 @@ pipeline:
       idle_timeout: 30      # stop after 30 s of no new messages
       max_messages: 10000   # or after 10 000 messages, whichever comes first
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders.jsonl
 ```
