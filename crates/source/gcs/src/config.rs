@@ -159,6 +159,10 @@ pub struct GcsSourceConfig {
     /// Column projection, used when `file_format: orc` (#719).
     #[serde(default)]
     pub orc: faucet_core::OrcOptions,
+    /// Column projection, used when `file_format: parquet` (#777): only
+    /// `parquet.columns` are decoded, before any row group is read.
+    #[serde(default)]
+    pub parquet: faucet_core::ParquetReadOptions,
 }
 
 /// Serde default for the integrity flags that default on.
@@ -195,6 +199,7 @@ impl GcsSourceConfig {
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
             orc: faucet_core::OrcOptions::default(),
+            parquet: faucet_core::ParquetReadOptions::default(),
         }
     }
 
@@ -234,6 +239,16 @@ impl GcsSourceConfig {
 
     pub fn file_format(mut self, format: GcsFileFormat) -> Self {
         self.file_format = format;
+        self
+    }
+
+    /// Project Parquet objects to `columns` (#777).
+    pub fn parquet_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.parquet.columns = Some(columns.into_iter().map(Into::into).collect());
         self
     }
 

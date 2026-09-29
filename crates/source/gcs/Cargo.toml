@@ -38,7 +38,7 @@ parquet = { workspace = true, optional = true }
 [features]
 compression = ["faucet-core/compression"]
 # Enables the `Parquet` file format + the columnar `stream_batches` fast path.
-arrow = ["faucet-core/arrow", "dep:arrow", "dep:parquet"]
+arrow = ["faucet-core/arrow", "faucet-core/file-format-parquet", "dep:arrow", "dep:parquet"]
 # Uniform file formats (#604): CSV, XML and Excel objects, decoded through
 # `faucet_core::file_format` so every file connector reads the same shapes with
 # the same options. `file-formats` is the aggregate.
