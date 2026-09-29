@@ -13,9 +13,10 @@ pipeline:
       timeout_secs: 120
 
   sink:
-    type: csv
+    type: file
     config:
       path: webhooks.csv
-      delimiter: 59     # b';'
-      write_headers: true
-      append: true
+      csv:
+        delimiter: ";"
+        has_headers: true
+      mode: append

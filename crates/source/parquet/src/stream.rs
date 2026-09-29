@@ -24,6 +24,7 @@ use crate::config::{ParquetLocation, ParquetS3Config, ParquetSourceConfig};
 use crate::convert::record_batch_to_json;
 
 /// A source that reads Parquet files into JSON records.
+#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
 pub struct ParquetSource {
     config: ParquetSourceConfig,
     /// Eagerly-constructed object store used for S3 sources. `None` for

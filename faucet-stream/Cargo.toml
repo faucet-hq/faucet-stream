@@ -117,6 +117,7 @@ compression = [
     "faucet-sink-gcs?/compression",
     "faucet-source-azure-blob?/compression",
     "faucet-sink-azure-blob?/compression",
+    "faucet-sink-sftp?/compression",
 ]
 ## Uniform file formats (#604): read and write CSV / XML / Excel objects on
 ## every file connector that has been opted in. Optional-dep forwarding, so
@@ -217,7 +218,9 @@ arrow = [
     "faucet-source-databricks?/arrow",
     "faucet-source-iceberg?/arrow",
     "faucet-source-azure-blob?/arrow",
+    "faucet-sink-azure-blob?/arrow",
     "faucet-source-sftp?/arrow",
+    "faucet-sink-sftp?/arrow",
     "faucet-source-file?/arrow",
     "faucet-sink-file?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can
@@ -258,7 +261,7 @@ transform-wasm = ["dep:faucet-transform-wasm"]
 ## when `sink-jsonl` is also enabled, per-line JSONL output (the file DLQ
 ## shape). Forwarded to `faucet-core` (and the jsonl sink via optional-dep
 ## syntax, so this flag never pulls the connector itself).
-encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption"]
+encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption"]
 ## Every connector and state backend.
 full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "google-sa", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-xml-excel", "file-formats"]
 

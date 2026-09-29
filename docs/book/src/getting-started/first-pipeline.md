@@ -25,11 +25,11 @@ name: csv_to_jsonl
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/input.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/records.jsonl
 ```
@@ -88,10 +88,10 @@ example, normalize keys to `snake_case`:
 
 ```yaml
 pipeline:
-  source: { type: csv, config: { path: ./data/input.csv } }
+  source: { type: file, config: { path: ./data/input.csv } }
   transforms:
     - { type: keys_case, config: { mode: snake } }
-  sink: { type: jsonl, config: { path: ./out/records.jsonl } }
+  sink: { type: file, config: { path: ./out/records.jsonl } }
 ```
 
 Config-exposed transforms include `flatten`, `rename_keys`, `keys_case`,

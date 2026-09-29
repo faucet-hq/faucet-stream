@@ -111,6 +111,27 @@ pub struct FileSourceConfig {
     /// Column projection, used for ORC files.
     #[serde(default)]
     pub orc: OrcOptions,
+    /// Column projection, used for Parquet files.
+    #[serde(default)]
+    pub parquet: ParquetReadOptions,
+    /// Decrypt files sealed by the file or jsonl sink's `encryption` block
+    /// (AES-256-GCM). JSON Lines and raw text written line by line are
+    /// opened one line at a time; every other file is opened whole. A file
+    /// that is not sealed fails the read.
+    #[cfg(feature = "encryption")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<faucet_core::EncryptionSpec>,
+}
+
+/// Parquet read options.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ParquetReadOptions {
+    /// Top-level columns to read. Only these column chunks are decoded.
+    /// Default: every column. A name a file does not have is an error, not
+    /// an empty column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
 }
 
 impl FileSourceConfig {
@@ -134,6 +155,9 @@ impl FileSourceConfig {
             xml: XmlOptions::default(),
             avro: AvroOptions::default(),
             orc: OrcOptions::default(),
+            parquet: ParquetReadOptions::default(),
+            #[cfg(feature = "encryption")]
+            encryption: None,
         }
     }
 
@@ -166,10 +190,31 @@ impl FileSourceConfig {
         faucet_common_file::is_http_path(&self.path)
     }
 
-    /// The per-format option blocks.
+    /// Project Parquet files to `columns`.
+    pub fn parquet_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.parquet.columns = Some(columns.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Whether an `encryption` block is set.
+    pub fn encryption_set(&self) -> bool {
+        #[cfg(feature = "encryption")]
+        return self.encryption.is_some();
+        #[cfg(not(feature = "encryption"))]
+        false
+    }
+
+    /// The per-format option blocks. CSV is strict about ragged rows unless
+    /// `csv.flexible` says otherwise.
     pub fn format_options(&self) -> FormatOptions {
+        let mut csv = self.csv.clone();
+        csv.flexible.get_or_insert(false);
         FormatOptions {
-            csv: self.csv.clone(),
+            csv,
             excel: self.excel.clone(),
             xml: self.xml.clone(),
             avro: self.avro.clone(),
@@ -195,6 +240,16 @@ impl FileSourceConfig {
         }
         #[cfg(feature = "file-format-avro")]
         self.avro.parsed_schema()?;
+        self.csv.validate()?;
+        if self.parquet.columns.as_ref().is_some_and(Vec::is_empty) {
+            return Err(FaucetError::Config(
+                "file source: `parquet.columns` must name at least one column".into(),
+            ));
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(spec) = &self.encryption {
+            faucet_core::CompiledEncryption::compile(spec)?;
+        }
         Ok(())
     }
 }

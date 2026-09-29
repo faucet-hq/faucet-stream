@@ -36,10 +36,16 @@ async fn start_postgres() -> (ContainerAsync<Postgres>, String) {
         ]);
     let container = image.start().await.expect("pg start");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
-    (
-        container,
-        format!("postgres://postgres@127.0.0.1:{port}/postgres"),
-    )
+    let url = format!("postgres://postgres@127.0.0.1:{port}/postgres");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while tokio_postgres::connect(&url, NoTls).await.is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "postgres never accepted connections"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (container, url)
 }
 
 async fn client(url: &str) -> tokio_postgres::Client {
@@ -255,8 +261,9 @@ async fn mirrors_every_matching_table_over_one_slot() {
     });
     run(&yaml).await;
     writer.await.unwrap();
-    // A second one-shot pass drains anything that committed after the first
-    // pass's stream went idle.
+    // Committed after every snapshot's join point, so the second pass must
+    // stream it and move shop.orders' own position past the join point.
+    sql(&url, "INSERT INTO shop.orders VALUES (52, 520);").await;
     run(&yaml).await;
 
     assert_eq!(

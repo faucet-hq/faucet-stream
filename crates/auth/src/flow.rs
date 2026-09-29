@@ -11,7 +11,7 @@
 //!
 //! ```yaml
 //! auth:
-//!   bullhorn:
+//!   login_chain:
 //!     type: flow
 //!     config:
 //!       steps:
@@ -256,7 +256,7 @@ struct FlowConfig {
     // store between the login client and the connector's HTTP client, so
     // `Set-Cookie`s from login `steps` forward to data requests automatically.
     // Out of scope here — the `capture: { from: set_cookie }` → `apply:
-    // { into: cookie }` path already expresses the same case (Acumatica).
+    // { into: cookie }` path already expresses the same case (a cookie-session login).
 }
 
 impl FlowConfig {
@@ -1362,7 +1362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skyslope_style_signed_login_then_signed_data_requests() {
+    async fn signed_login_then_signed_data_requests() {
         let server = MockServer::start().await;
         let key = "base64secret";
         let login_sig = format!(
@@ -1535,7 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_from_set_cookie_applies_as_cookie() {
-        // Acumatica-style: POST /login → 204 empty body + Set-Cookie session.
+        // Cookie-session login: POST /login → 204 empty body + Set-Cookie session.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/entity/auth/login"))
@@ -1565,7 +1565,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_from_xml_body_works() {
-        // Sage Intacct-style: session id lives in an XML response body.
+        // XML-gateway style: session id lives in an XML response body.
         let server = MockServer::start().await;
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?><response><operation><result><data><api><sessionid>XYZ-SESSION</sessionid></api></data></result></operation></response>"#;
         Mock::given(method("POST"))

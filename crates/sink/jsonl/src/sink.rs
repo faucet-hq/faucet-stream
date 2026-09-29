@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 /// multi-member compressed file that decoders read back correctly. This makes
 /// the per-page `flush` the pipeline emits for bookmarked pages safe for CDC
 /// sources — every transaction appends rather than truncates.
+#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
 pub struct JsonlSink {
     config: JsonlSinkConfig,
     /// Compiled at-rest encryption (#207), initialized on first use so

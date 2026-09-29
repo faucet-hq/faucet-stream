@@ -58,8 +58,8 @@ pipeline:
 
   sinks:
     archive:
-      type: jsonl
-      config: { append: false, pretty: false }
+      type: file
+      config: { format: json_lines, json_lines: { pretty: false } }
 
 matrix:
   # Root row — fetch the users list once.

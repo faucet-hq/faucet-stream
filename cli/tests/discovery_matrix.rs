@@ -273,7 +273,7 @@ matrix:
 /// Chained / two-level discovery + a **collected** list dimension (#531): a
 /// `discover:` row that itself `for_each:`es an upstream dimension and publishes
 /// the whole value-set per tuple (`collect: true`), which a consuming `for_each`
-/// row injects comma-joined via `${id.alias}`. This is the HubSpot custom-object
+/// row injects comma-joined via `${id.alias}`. This is the CRM custom-object
 /// shape: discover object types → discover each type's fields → pull records with
 /// the full field list in one request. Exercises the executor's chained-discovery
 /// fan-out + collected-publish + collected-injection runtime paths.

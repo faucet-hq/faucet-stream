@@ -45,6 +45,11 @@ pub enum AzureFileFormat {
     /// joins the columnar path. Requires `file-format-orc` (#719).
     #[cfg(feature = "file-format-orc")]
     Orc,
+    /// Apache Parquet, projected by [`parquet.columns`](AzureBlobSourceConfig::parquet).
+    /// **Buffered whole** (the footer sits at the end); joins the columnar
+    /// path. Requires the `arrow` feature (#777).
+    #[cfg(feature = "arrow")]
+    Parquet,
 }
 
 impl AzureFileFormat {
@@ -72,6 +77,8 @@ impl AzureFileFormat {
             Self::Avro => Some(faucet_core::FileFormat::Avro),
             #[cfg(feature = "file-format-orc")]
             Self::Orc => Some(faucet_core::FileFormat::Orc),
+            #[cfg(feature = "arrow")]
+            Self::Parquet => Some(faucet_core::FileFormat::Parquet),
         }
     }
 }
@@ -140,6 +147,9 @@ pub struct AzureBlobSourceConfig {
     /// Column projection, used when `file_format: orc` (#719).
     #[serde(default)]
     pub orc: faucet_core::OrcOptions,
+    /// Column projection, used when `file_format: parquet` (#777).
+    #[serde(default)]
+    pub parquet: faucet_core::ParquetReadOptions,
 }
 
 /// Serde default for the integrity flags that default on.
@@ -174,6 +184,7 @@ impl AzureBlobSourceConfig {
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
             orc: faucet_core::OrcOptions::default(),
+            parquet: faucet_core::ParquetReadOptions::default(),
         }
     }
 
@@ -541,6 +552,7 @@ mod tests {
         cfg.csv = faucet_core::CsvOptions {
             delimiter: "\\t".into(),
             has_headers: false,
+            ..Default::default()
         };
         cfg.excel = faucet_core::ExcelOptions {
             sheet: Some("Q3".into()),

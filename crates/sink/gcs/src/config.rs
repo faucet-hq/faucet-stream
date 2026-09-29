@@ -40,6 +40,12 @@ pub enum GcsSinkFormat {
     /// variant: ORC is read-only.
     #[cfg(feature = "file-format-avro")]
     Avro,
+    /// Unparsed text: each record's `content` field (or the record as JSON)
+    /// on its own line (#777).
+    RawText,
+    /// Take the format from the object name's extension — `path`'s, else
+    /// `file_extension` — looking through a compression suffix (#777).
+    Auto,
 }
 
 impl GcsSinkFormat {
@@ -59,15 +65,26 @@ impl GcsSinkFormat {
             Self::Xlsx => Some(faucet_core::FileFormat::Xlsx),
             #[cfg(feature = "file-format-avro")]
             Self::Avro => Some(faucet_core::FileFormat::Avro),
+            Self::RawText => Some(faucet_core::FileFormat::RawText),
+            Self::Auto => None,
         }
     }
 
-    /// Whether an object of this format can be built one record at a time.
-    ///
-    /// Only JSON Lines can: every other format has a header, a wrapper, or a
-    /// container index, so its records must be buffered and encoded together.
-    pub(crate) fn appends_per_record(self) -> bool {
-        matches!(self, Self::JsonLines)
+    /// The format objects are written in; `name` resolves `auto`.
+    pub(crate) fn resolve(
+        self,
+        name: &str,
+    ) -> Result<faucet_core::FileFormat, faucet_core::FaucetError> {
+        match self {
+            #[cfg(feature = "arrow")]
+            Self::Parquet => Ok(faucet_core::FileFormat::Parquet),
+            Self::Auto => faucet_common_file::FileFormatChoice::Auto
+                .resolve_writable(name)
+                .map_err(|e| faucet_core::FaucetError::Config(format!("GCS sink: {e}"))),
+            other => Ok(other
+                .shared()
+                .expect("every format but `auto` and `parquet` maps onto a shared one")),
+        }
     }
 }
 
@@ -78,7 +95,24 @@ pub struct GcsSinkConfig {
     /// GCS bucket name.
     pub bucket: String,
     /// Object-name prefix for written files.
+    #[serde(default)]
     pub prefix: String,
+    /// Object key template inside the container, after `prefix` — the file
+    /// sink's `path` (#777). May contain `{part}` (numbered objects) and
+    /// `${now.*}` tokens; a trailing `/` is a directory of
+    /// `part-{part}<extension>` objects. When set, `file_extension` is not
+    /// used. Unset: objects are named `<prefix><run id>-<part><file_extension>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// What to do when an object of the same name already exists:
+    /// `overwrite` (default), `append` (JSON Lines, CSV, raw text) or
+    /// `error_if_exists` (#777).
+    #[serde(default)]
+    pub mode: faucet_common_file::write::FileMode,
+    /// `overwrite` stages the run's objects under a hidden prefix and swaps
+    /// them in only after a successful run (#777). Default `append`.
+    #[serde(default)]
+    pub write_mode: faucet_common_file::write::FileWriteMode,
     /// Object format (default: `json_lines`). Set to `parquet` (with the
     /// `arrow` feature) to write Parquet objects and enable the columnar
     /// fast path.
@@ -90,8 +124,8 @@ pub struct GcsSinkConfig {
     /// File extension for written objects (default `.jsonl`).
     #[serde(default = "default_file_extension")]
     pub file_extension: String,
-    /// Hard cap on records per uploaded object. `None` means a single
-    /// object per `write_batch` call (still subject to `batch_size`).
+    /// Hard cap on records per uploaded object. `None` leaves the cap to
+    /// `batch_size`.
     pub max_records_per_file: Option<usize>,
     /// Maximum **bytes** per object before rolling to a new one (#618).
     ///
@@ -104,13 +138,17 @@ pub struct GcsSinkConfig {
     /// the cap still gets its own object rather than being split or dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes_per_file: Option<usize>,
-    /// Maximum number of concurrent uploads (default 10).
+    /// Maximum number of uploads in flight (default 10): a page that rolls
+    /// into several objects uploads them concurrently while the next object
+    /// is encoded. `flush` returns only after every upload has landed.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
-    /// Records per uploaded object from a single `write_batch` call.
-    /// `batch_size = 0` writes whatever upstream hands the sink as one
-    /// object. Recommended value for GCS is `0` — many tiny objects is
-    /// a well-known anti-pattern.
+    /// Records per object when `max_records_per_file` is not set (without
+    /// `path`). Records accumulate across `write_batch` calls and an object
+    /// closes once it holds this many records, or at `flush`. `batch_size =
+    /// 0` is the "no re-chunking" sentinel: no record cap, so JSON Lines and
+    /// the whole-object formats write one object per `flush`, and Parquet one
+    /// object per `write_batch` call. Ignored when `path` is set.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Optional storage-host override (integration-test escape hatch).
@@ -136,6 +174,17 @@ pub struct GcsSinkConfig {
     /// Writer schema and block codec, used when `format: avro` (#719).
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
+    /// Parquet writer options, used when `format: parquet` (#777):
+    /// `compression` (default `zstd`), `row_group_size`, explicit `schema`.
+    #[serde(default)]
+    pub parquet: faucet_common_file::write::RemoteParquetOptions,
+    /// JSON Lines writer options (`pretty`), used when `format: json_lines`.
+    #[serde(default)]
+    pub json_lines: faucet_common_file::write::JsonLinesOptions,
+    /// Encrypt objects at rest (#777; the `encryption` feature).
+    #[cfg(feature = "encryption")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<faucet_core::EncryptionSpec>,
 }
 
 fn default_file_extension() -> String {
@@ -167,6 +216,13 @@ impl GcsSinkConfig {
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
+            path: None,
+            mode: faucet_common_file::write::FileMode::default(),
+            write_mode: faucet_common_file::write::FileWriteMode::default(),
+            parquet: faucet_common_file::write::RemoteParquetOptions::default(),
+            json_lines: faucet_common_file::write::JsonLinesOptions::default(),
+            #[cfg(feature = "encryption")]
+            encryption: None,
         }
     }
 
@@ -265,30 +321,94 @@ impl GcsSinkConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
-        Ok(())
+        self.settings()?.validate()
     }
-}
 
-impl GcsSinkConfig {
-    fn single_parquet_object(&self) -> bool {
-        #[cfg(feature = "arrow")]
-        {
-            matches!(self.format, GcsSinkFormat::Parquet)
-                && self.batch_size == 0
-                && self.max_records_per_file.is_none()
-        }
-        #[cfg(not(feature = "arrow"))]
-        {
-            false
+    /// The object name the format and codec are resolved from.
+    fn resolution_name(&self) -> String {
+        match &self.path {
+            Some(p) => format!("{}{p}", self.prefix)
+                .replace(faucet_common_file::write::PART_TOKEN, "00001"),
+            None => self.file_extension.clone(),
         }
     }
 
-    /// What a failed batch write leaves behind (#737): only an unchunked Parquet batch is one object upload.
+    fn codec(&self, _name: &str) -> faucet_core::Compression {
+        #[cfg(feature = "compression")]
+        {
+            faucet_common_file::resolve_compression(self.compression, _name)
+        }
+        #[cfg(not(feature = "compression"))]
+        {
+            faucet_core::Compression::None
+        }
+    }
+
+    /// The per-object record cap without `path`: the smaller of `batch_size`
+    /// (unless `0`) and `max_records_per_file`.
+    fn legacy_cap(&self) -> Option<usize> {
+        let bs = (self.batch_size > 0).then_some(self.batch_size);
+        match (bs, self.max_records_per_file.filter(|n| *n > 0)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The shared writer's settings for this config (#777).
+    pub fn settings(
+        &self,
+    ) -> Result<faucet_common_file::write::WriteSettings, faucet_core::FaucetError> {
+        if let Some(path) = &self.path {
+            faucet_common_file::require_path("GCS sink", path)?;
+            if path.matches(faucet_common_file::write::PART_TOKEN).count() > 1 {
+                return Err(faucet_core::FaucetError::Config(format!(
+                    "GCS sink: '{path}' has more than one `{{part}}`"
+                )));
+            }
+        }
+        if self.path.is_none()
+            && (self.write_mode == faucet_common_file::write::FileWriteMode::Overwrite
+                || self.mode != faucet_common_file::write::FileMode::Overwrite)
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "GCS sink: `write_mode: overwrite` and `mode: append` / `error_if_exists` need \
+                 `path` — without it every run writes new, uniquely named objects"
+                    .into(),
+            ));
+        }
+        let name = self.resolution_name();
+        let format = self.format.resolve(&name)?;
+        let codec = self.codec(&name);
+        let mut s = faucet_common_file::write::WriteSettings::new(format, codec);
+        s.opts = self.format_options();
+        s.parquet = self.parquet.clone().into();
+        s.json_lines = self.json_lines.clone();
+        s.mode = self.mode;
+        s.write_mode = self.write_mode;
+        s.max_records_per_file = match &self.path {
+            Some(_) => self.max_records_per_file.filter(|n| *n > 0),
+            None => self.legacy_cap(),
+        };
+        s.max_bytes_per_file = self.max_bytes_per_file;
+        #[cfg(feature = "encryption")]
+        {
+            s.encryption = self.encryption.clone();
+        }
+        s.object_per_flush = true;
+        s.object_per_write = format == faucet_core::FileFormat::Parquet
+            && self.path.is_none()
+            && self.legacy_cap().is_none()
+            && self.max_bytes_per_file.is_none();
+        Ok(s)
+    }
+
+    /// What a failed batch write leaves behind (#737): a page is encoded
+    /// locally and published only at a rollover or flush, so without a cap a
+    /// failed write publishes nothing; with one, objects closed earlier stay.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        if self.single_parquet_object() {
-            faucet_core::BatchAtomicity::Atomic
-        } else {
-            faucet_core::BatchAtomicity::BestEffort
+        match self.settings() {
+            Ok(s) => s.batch_atomicity(),
+            Err(_) => faucet_core::BatchAtomicity::BestEffort,
         }
     }
 }
@@ -296,6 +416,46 @@ impl GcsSinkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_writer_settings_follow_path_and_mode_rules() {
+        let mut c = GcsSinkConfig::new("b");
+        let s = c.settings().unwrap();
+        assert_eq!(s.format, faucet_core::FileFormat::JsonLines);
+        assert!(s.object_per_flush);
+        c.path = Some("d/part-{part}.txt".into());
+        c.format = GcsSinkFormat::Auto;
+        c.max_records_per_file = Some(7);
+        let s = c.settings().unwrap();
+        assert_eq!(s.format, faucet_core::FileFormat::RawText);
+        assert_eq!(s.max_records_per_file, Some(7));
+        assert!(c.validate().is_ok());
+        c.path = Some("{part}-{part}.jsonl".into());
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("more than one")
+        );
+        c.path = Some("x.unknownext".into());
+        assert!(c.settings().is_err());
+        c.path = None;
+        c.format = GcsSinkFormat::JsonLines;
+        c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+        assert!(c.settings().unwrap_err().to_string().contains("need"));
+        c.write_mode = faucet_common_file::write::FileWriteMode::Append;
+        c.mode = faucet_common_file::write::FileMode::Append;
+        assert!(c.validate().is_err());
+        c.mode = faucet_common_file::write::FileMode::Overwrite;
+        c.batch_size = 0;
+        c.max_records_per_file = None;
+        assert_eq!(c.settings().unwrap().max_records_per_file, None);
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        c.max_records_per_file = Some(3);
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert!(v.get("parquet").is_some() && v.get("json_lines").is_some());
+    }
 
     #[test]
     fn defaults() {
@@ -432,27 +592,13 @@ mod tests {
     }
 
     #[test]
-    fn only_json_lines_appends_per_record() {
-        assert!(GcsSinkFormat::JsonLines.appends_per_record());
-        assert!(!GcsSinkFormat::JsonArray.appends_per_record());
-        assert_eq!(GcsSinkFormat::default(), GcsSinkFormat::JsonLines);
-        #[cfg(feature = "file-format-csv")]
-        assert!(!GcsSinkFormat::Csv.appends_per_record());
-        #[cfg(feature = "file-format-xml")]
-        assert!(!GcsSinkFormat::Xml.appends_per_record());
-        #[cfg(feature = "file-format-excel")]
-        assert!(!GcsSinkFormat::Xlsx.appends_per_record());
-        #[cfg(feature = "file-format-avro")]
-        assert!(!GcsSinkFormat::Avro.appends_per_record());
-    }
-
-    #[test]
     fn the_format_option_blocks_survive_the_builders() {
         let cfg = GcsSinkConfig::new("b")
             .format(GcsSinkFormat::JsonArray)
             .csv(faucet_core::CsvOptions {
                 delimiter: ";".into(),
                 has_headers: false,
+                ..Default::default()
             })
             .excel(faucet_core::ExcelOptions {
                 sheet: Some("Data".into()),
@@ -519,5 +665,69 @@ mod tests {
             cfg.format_options().avro.codec,
             faucet_core::AvroCodec::Snappy
         );
+    }
+}
+
+#[cfg(test)]
+mod object_rules_tests {
+    use super::*;
+    use faucet_common_file::write::ParquetCodec;
+
+    #[test]
+    fn parquet_defaults_to_zstd_even_when_other_options_are_given() {
+        let c: GcsSinkConfig = serde_json::from_value(serde_json::json!({"bucket":"b"})).unwrap();
+        assert_eq!(c.parquet.compression, ParquetCodec::Zstd);
+        let c: GcsSinkConfig = serde_json::from_value(
+            serde_json::json!({"bucket":"b","parquet":{"row_group_size":5}}),
+        )
+        .unwrap();
+        assert_eq!(c.parquet.compression, ParquetCodec::Zstd);
+        assert_eq!(c.parquet.row_group_size, 5);
+        assert_eq!(
+            GcsSinkConfig::new("b").parquet.compression,
+            ParquetCodec::Zstd
+        );
+        let s = c.settings().unwrap();
+        assert_eq!(s.parquet.compression, ParquetCodec::Zstd);
+        let schema = serde_json::to_value(faucet_core::schema_for!(GcsSinkConfig)).unwrap();
+        assert_eq!(
+            schema.pointer("/properties/parquet/default/compression"),
+            Some(&serde_json::json!("zstd")),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn batch_size_zero_writes_a_parquet_object_per_batch_write() {
+        let mut c = GcsSinkConfig::new("b");
+        c.format = GcsSinkFormat::Parquet;
+        c.batch_size = 0;
+        assert!(c.settings().unwrap().object_per_write);
+        c.format = GcsSinkFormat::JsonLines;
+        assert!(
+            !c.settings().unwrap().object_per_write,
+            "json lines: per flush"
+        );
+        c.format = GcsSinkFormat::Parquet;
+        c.batch_size = 10;
+        assert!(!c.settings().unwrap().object_per_write, "a record cap");
+        c.batch_size = 0;
+        c.max_bytes_per_file = Some(10);
+        assert!(!c.settings().unwrap().object_per_write, "a byte cap");
+        c.max_bytes_per_file = None;
+        c.max_records_per_file = Some(3);
+        assert!(!c.settings().unwrap().object_per_write, "a record cap");
+        c.max_records_per_file = None;
+        c.path = Some("d/part-{part}.parquet".into());
+        assert!(!c.settings().unwrap().object_per_write, "path: per part");
+    }
+
+    #[test]
+    fn auto_has_no_shared_format_and_a_bad_config_is_best_effort() {
+        assert_eq!(GcsSinkFormat::Auto.shared(), None);
+        let mut c = GcsSinkConfig::new("b");
+        c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+        assert!(c.settings().is_err());
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

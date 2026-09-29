@@ -31,10 +31,10 @@ pipeline:
         initial_value: "1970-01-01T00:00:00Z"
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/users.jsonl
-      append: true
+      mode: append
 
   state:
     type: file

@@ -91,7 +91,32 @@ pub fn deprecated_spellings(doc: &Value) -> Vec<String> {
             );
         }
     }
+    deprecated_kinds(doc, &mut out);
     out.into_iter().collect()
+}
+
+/// Connector kinds replaced by `type: file` (#779).
+pub const DEPRECATED_FILE_KINDS: &[&str] = &["csv", "jsonl", "parquet"];
+
+/// Connector blocks (`{type, config}`) anywhere in the document that use a
+/// deprecated kind.
+fn deprecated_kinds(v: &Value, out: &mut BTreeSet<String>) {
+    match v {
+        Value::Object(m) => {
+            if m.contains_key("config")
+                && let Some(kind) = m.get("type").and_then(Value::as_str)
+                && DEPRECATED_FILE_KINDS.contains(&kind)
+            {
+                out.insert(format!(
+                    "connector kind `{kind}` is deprecated: use `type: file` \
+                     (it still works until the next major release)"
+                ));
+            }
+            m.values().for_each(|c| deprecated_kinds(c, out));
+        }
+        Value::Array(a) => a.iter().for_each(|c| deprecated_kinds(c, out)),
+        _ => {}
+    }
 }
 
 /// Log each deprecated spelling once per load.
@@ -133,6 +158,32 @@ mod tests {
             ]
         );
         warn_deprecated(&doc);
+    }
+
+    #[test]
+    fn names_each_deprecated_file_kind_once() {
+        let doc = json!({
+            "pipeline": {
+                "source": { "type": "csv", "config": { "path": "a.csv" } },
+                "sinks": {
+                    "a": { "type": "jsonl", "config": { "path": "a.jsonl" } },
+                    "b": { "type": "parquet", "config": { "destination": { "type": "local_path", "path": "o/" } } }
+                },
+                "dlq": { "sink": { "type": "jsonl", "config": { "path": "d.jsonl" } } }
+            },
+            "matrix": [ { "id": "x", "source": { "type": "file", "config": { "path": "b.csv" } } } ]
+        });
+        let notes = deprecated_spellings(&doc);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        for kind in DEPRECATED_FILE_KINDS {
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.starts_with(&format!("connector kind `{kind}`"))),
+                "{notes:?}"
+            );
+        }
+        assert!(deprecated_spellings(&json!({"a": {"type": "csv"}})).is_empty());
     }
 
     #[test]

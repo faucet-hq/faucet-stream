@@ -315,13 +315,11 @@ async fn sink_writes_parquet_on_the_row_and_columnar_paths() {
     let batch = faucet_core::columnar::values_to_record_batch_inferred(&rows).unwrap();
     assert!(sink.supports_columnar());
     assert_eq!(sink.write_batch_columnar(&batch).await.unwrap(), 3);
+    sink.flush().await.unwrap();
 
+    // Objects close on the cap across pages: six rows in objects of two.
     let names = object_names(&host, &bucket, "pq/").await;
-    assert_eq!(
-        names.len(),
-        4,
-        "two row-path and two columnar objects: {names:?}"
-    );
+    assert_eq!(names.len(), 3, "{names:?}");
     for name in names {
         let body = download(&host, &bucket, &name).await;
         assert_eq!(&body[..4], b"PAR1");

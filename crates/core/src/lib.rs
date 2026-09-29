@@ -124,9 +124,10 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
 pub use error::FaucetError;
+pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{
-    AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, ExcelOptions, FileFormat, FileInput,
-    FormatOptions, OrcOptions, XmlOptions,
+    AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, CsvUnknownField, ExcelOptions,
+    FileFormat, FileInput, FormatOptions, OrcOptions, XmlOptions,
 };
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,

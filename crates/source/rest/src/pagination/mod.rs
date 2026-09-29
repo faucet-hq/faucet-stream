@@ -69,8 +69,8 @@ pub enum PaginationStyle {
     /// The first request uses `config.body` unchanged; each subsequent request
     /// sets `body[body_cursor_field] = <extracted cursor>`. Pagination stops when
     /// `next_token_path` is null/absent, and a repeated cursor trips the same
-    /// loop guard as [`PaginationStyle::Cursor`]. Used by e.g. HubSpot CRM
-    /// `POST /crm/v3/objects/{obj}/search` (`$.paging.next.after` → `after`).
+    /// loop guard as [`PaginationStyle::Cursor`]. Used by e.g. CRM object
+    /// search (`POST /crm/v3/objects/{obj}/search`, `$.paging.next.after` → `after`).
     ///
     /// `body_cursor_field` may also be an RFC 6901 JSON Pointer
     /// (`/variables/after`) for a nested location — e.g. a GraphQL request

@@ -1,5 +1,13 @@
 # faucet-sink-parquet
 
+> **Deprecated.** Use [`faucet-sink-file`](https://crates.io/crates/faucet-sink-file) instead.
+> This crate gets security fixes only until the next major release. In a
+> pipeline config, `type: parquet` still works: the CLI builds it as
+> `type: file` with `format: parquet` and warns. The migration table is in
+> the [`faucet-sink-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/sink/file/README.md). An S3
+> location is still built by this crate until the file connector gains object
+> stores.
+
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-parquet.svg)](https://crates.io/crates/faucet-sink-parquet)
 [![Docs.rs](https://docs.rs/faucet-sink-parquet/badge.svg)](https://docs.rs/faucet-sink-parquet)
 [![MSRV](https://img.shields.io/crates/msrv/faucet-sink-parquet.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)

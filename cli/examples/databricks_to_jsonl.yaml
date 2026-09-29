@@ -34,6 +34,6 @@ pipeline:
       # state: persist the bookmark across runs (required for incremental)
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/databricks_orders.jsonl

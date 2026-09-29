@@ -223,6 +223,7 @@ pub async fn run_command(cli: Cli) -> CliResult<()> {
 async fn dispatch(cli: Cli) -> CliResult<()> {
     #[cfg(feature = "serve")]
     let serve_log_level = cli.log_level.clone();
+    #[cfg(feature = "serve")]
     let log_format = cli.log_format;
     match cli.command {
         Command::Run(args) => commands::run::run(args).await,

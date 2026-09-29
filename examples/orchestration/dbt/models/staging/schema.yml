@@ -5,7 +5,7 @@ models:
     description: Typed, one-row-per-charge staging model over the raw faucet load.
     columns:
       - name: charge_id
-        description: Stripe charge id.
+        description: Source charge id.
         data_tests:
           - unique
           - not_null

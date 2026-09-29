@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! REST API → JSONL via `run_stream` — page-by-page, bounded memory.
 //!
 //! Same parameter showcase as `rest_to_jsonl`, but pages are written to the

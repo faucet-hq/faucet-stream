@@ -38,7 +38,7 @@ cargo install faucet-cli --features sink-mssql
 version: 1
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./events.csv
   sink:

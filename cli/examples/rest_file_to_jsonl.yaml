@@ -17,7 +17,7 @@ pipeline:
     type: rest
     config:
       base_url: https://example.com
-      # A Microsoft Graph / OneDrive / SharePoint `…/content` endpoint, a signed
+      # A cloud-drive `…/content` endpoint, a signed
       # download URL, or any authed static host serving a file.
       path: /exports/contacts.csv
       pagination:
@@ -33,6 +33,6 @@ pipeline:
           token: ${env:AUTH_TOKEN}
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/contacts.jsonl

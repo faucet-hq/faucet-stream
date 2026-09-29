@@ -40,7 +40,7 @@ policy:
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./customers.csv
 
@@ -60,7 +60,7 @@ pipeline:
         action: { type: hash }
 
   sink:
-    type: jsonl
+    type: file
     # Destination attributes a policy reasons about (free-form pairs).
     attributes:
       residency: eu

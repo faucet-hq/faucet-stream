@@ -66,7 +66,7 @@ source:
     full_document: update_lookup
     idle_timeout: 30
 sink:
-  type: jsonl
+  type: file
   config:
     path: ./changes.jsonl
 state:
@@ -262,7 +262,7 @@ state:
   type: file
   config: { path: ./state }
 sink:
-  type: jsonl
+  type: file
   config:
     path: ./users-changes.jsonl
 ```

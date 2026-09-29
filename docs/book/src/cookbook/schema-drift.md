@@ -90,7 +90,7 @@ schema:
 pipeline:
   # ...
   dlq:
-    sink: { type: jsonl, config: { path: ./drift.jsonl } }
+    sink: { type: file, config: { path: ./drift.jsonl } }
     on_batch_error: dlq_all
 ```
 

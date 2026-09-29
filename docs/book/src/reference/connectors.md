@@ -28,7 +28,7 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 
 | Connector | Tier¹¹ | Feature | Streams¹ | Resumable² | Effectively-once³ | Compression | Discover¹⁰ | Underlying primitive |
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|:---:|----------------------|
-| REST | T1 ✅ᵐ | `source-rest` | ✓ | ✓ | ✗ | ✗ | ✓ᵒ | HTTP + 6 pagination styles, JSONPath extraction; `response_format: csv\|excel` parses an authed file body (Graph/OneDrive/signed URL), Excel via `source-rest-excel`; `odata:` block adds OData paging/query + `$metadata` discovery; `replication_bind` pushes the bookmark server-side; `window` slices incremental into rolling `[start,end)` datetime windows |
+| REST | T1 ✅ᵐ | `source-rest` | ✓ | ✓ | ✗ | ✗ | ✓ᵒ | HTTP + 6 pagination styles, JSONPath extraction; `response_format: csv\|excel` parses an authed file body (cloud-drive download/signed URL), Excel via `source-rest-excel`; `odata:` block adds OData paging/query + `$metadata` discovery; `replication_bind` pushes the bookmark server-side; `window` slices incremental into rolling `[start,end)` datetime windows |
 | GraphQL | T1 ✅ᵐ | `source-graphql` | ✓ | ✓ | ✗ | ✗ | ✗ | cursor / offset pagination, variable injection; `replication_method: incremental` + `replication_bind` binds the bookmark into a GraphQL variable |
 | XML / SOAP | T1 ✅ᵐ | `source-xml` | ✓ | ✗ | ✗ | ✗ | ✗ | streaming XML→JSON, dot-path extraction, first-class `soap:` block (envelope + headers + fault handling) |
 | gRPC | T1 ✅ | `source-grpc` | ✓⁴ | ✗ | ✗ | ✗ | ✗ | dynamic protobuf; unary + server-streaming |
@@ -45,22 +45,22 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | AWS SQS | T2 | `source-sqs` | ✓ | ✗ | ✗ | ✗ | ✗ | long-poll ReceiveMessage, delete-after-emit (at-least-once), idle/max-messages termination |
 | NATS | T2 | `source-nats` | ✓ | ✗ | ✗ | ✗ | ✗ | subject subscription or JetStream durable consumer; idle/max-messages termination |
 | RabbitMQ | T2 | `source-rabbitmq` | ✓ | ✗ | ✗ | ✗ | ✗ | AMQP 0.9.1 queue consumer (`lapin`), optional declare + bind; a page is acked (`basic.ack` multiple) only after the sink flushes it — at-least-once; idle/max-messages termination |
-| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
+| SFTP | T2 | `source-sftp` | ✓ | ✗ | ✗ | ✗ | ✗ | list/glob a remote dir over SSH; JSONL, JSON array, raw text, Parquet (`parquet.columns`), plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
 | AWS S3 | T1 ✅ | `source-s3` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
 | Google Cloud Storage | T2 | `source-gcs` | ✓⁵ | ✗ | ✗ | ✓ | ✓ | object reader: JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
-| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
+| Azure Blob / ADLS Gen2 | T1 ✅ | `source-azure-blob` | ✓⁵ | ✗ | ✗ | ✓ | ✗ | object reader (object_store): JSONL, JSON array, raw text, Parquet, plus CSV / XML / Excel / Avro / ORC via [file formats](../cookbook/file-formats.md) |
 | MongoDB | T1 ✅ | `source-mongodb` | ✓ | ✗ | ✗ | ✗ | ✓ | `find()` with filter/projection/sort |
 | MongoDB CDC | T1 ✅ | `source-mongodb-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | Change Streams, resumeToken bookmarks; `max_staged_records` buffer cap |
 | Redis | T1 ✅ | `source-redis` | ✓ | ✗ | ✗ | ✗ | ✗ | streams, lists, key patterns |
 | Webhook | T2 | `source-webhook` | ✗⁶ | ✗ | ✗ | ✗ | ✗ | temporary HTTP server collecting POSTs |
 | WebSocket | T1 ✅ | `source-websocket` | ✓ | ✗ | ✗ | ✗ | ✗ | live push feed; subscribe frames, reconnect, ping keepalive |
-| CSV | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | CSV files as JSON; strict field count by default (`flexible: true` to tolerate ragged rows). For new configs prefer the file source |
+| CSV *(deprecated: use `file`)* | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | CSV files as JSON; strict field count by default (`flexible: true` to tolerate ragged rows). For new configs prefer the file source |
 | Local files | T1 ✅ | `source-file` | ✓ | ✓ | ✗ | ✓ | ✓ | [file source](../cookbook/file-formats.md#the-local-file-source): a path, directory, glob or `http(s)://` URL; JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC, format + compression resolved per file; incremental by mtime or name; hash-of-path sharding; Avro / ORC / Parquet join the columnar path |
 | Elasticsearch | T1 ✅ᵐ | `source-elasticsearch` | ✓ | ✗ | ✗ | ✗ | ✓ | search/scroll API |
 | Apache Kafka | T1 ✅ | `source-kafka` | ✓ | ✓ | **✓** | ✗ | ✗ | consumer; idle/max-messages termination, offset bookmarks |
 | AWS Kinesis | T1 ✅ | `source-kinesis` | ✓ | ✓ | ✗ | ✗ | ✗ | per-shard GetRecords workers; sequence-number bookmarks, idle/max-messages termination |
 | Google Cloud Pub/Sub | T1 ✅ᵉ | `source-pubsub` | ✓ | ✓ | ✗ | ✗ | ✗ | streaming pull; per-message records + attributes, ack at durable page boundary (at-least-once), idle/max-messages termination |
-| Apache Parquet | T1 ✅ | `source-parquet` | ✓ | ✗ | ✗ | ✗ | ✗ | local/glob/S3, vectorized Arrow reader, projection |
+| Apache Parquet *(deprecated: use `file`)* | T1 ✅ | `source-parquet` | ✓ | ✗ | ✗ | ✗ | ✗ | local/glob/S3, vectorized Arrow reader, projection |
 | Apache Delta Lake | T1 ✅ | `source-delta` | ✓ | ✗ | ✗ | ✗ | ✗ | local FS or S3/Azure/GCS; time travel (version/timestamp), projection pushdown, partition reconstruction |
 | Databricks SQL | T1 ✅ᵐ | `source-databricks` | ✓ | ✓ | ✗ | ✗ | ✗ | Statement Execution API; async poll, chunk pagination, typed decode, incremental `${bookmark}` |
 | Apache Iceberg | T1 ✅ | `source-iceberg` | ✓ | ✓ | ✗ | ✗ | ✓ | REST/Glue/SQL/HMS catalog; Arrow scan with column projection + filter pushdown, snapshot / timestamp time travel, `mode: incremental` reads only snapshots appended since the bookmark; file-task sharding |
@@ -232,7 +232,7 @@ config this project treats as a defect.
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|:---:|------------|
 | BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | per-row (`batch_size: 0`); atomic keyed | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
 | PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | atomic (JSONB + `batch_size: 0`; keyed when journaled) | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
-| JSON Lines | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file append |
+| JSON Lines *(deprecated: use `file`)* | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file append |
 | Local files | T1 ✅ | `sink-file` | no-op | ✓ | ✗ | ✗ | atomic (no rollover) | [file sink](../cookbook/file-formats.md#the-local-file-sink): JSONL / JSON / CSV / XML / Excel / Avro / Parquet by extension; temp-then-rename finalisation, record/byte rollover with a `{part}` template, `write_mode: overwrite` swaps the whole output set; Parquet (and Avro) take the columnar path |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | atomic (`batch_size: 0`) | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
 | Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | atomic (COPY + `batch_size: 0`) | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
@@ -245,14 +245,14 @@ config this project treats as a defect.
 | AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | best-effort | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
 | NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to a subject (optional subject-per-record), flush per batch |
 | RabbitMQ | T2 | `sink-rabbitmq` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to an exchange with a static / field / JSONPath routing key; publisher confirms per batch; `mandatory` returns surface as per-row (DLQ-routable) errors |
-| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | best-effort | JSONL files over SSH; atomic temp-then-rename upload; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
+| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | atomic (no rollover cap) | files over SSH, temp-then-rename upload; every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `file_name` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption |
 | Singer bridge ⚠️ | T2 ⚠️ | `sink-singer` | no-op | ✗ | `key_properties` | ✗ | best-effort | runs an external Singer target; `SCHEMA`/`RECORD` over stdin with back-pressure, bookmarks advance only after the target confirms (echoed `STATE` or clean exit, `flush_on`); `write_mode: overwrite` → `ACTIVATE_VERSION`. **Tier-2 / experimental** |
-| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, parallel uploads, Parquet; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
-| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (Parquet, unchunked) | JSONL objects, Parquet; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
-| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | best-effort | JSONL blobs (object_store), batch/byte rollover; JSON array / CSV / XML / Excel / Avro via [file formats](../cookbook/file-formats.md) |
+| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | objects in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption; multipart upload past 8 MiB |
+| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | objects in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption; resumable upload for large objects |
+| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | blobs (object_store) in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption; block-list upload past 8 MiB |
 | MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | best-effort | `insert_many`; multi-document transaction for effectively-once (replica set required) |
 | Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | best-effort | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
-| CSV | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |
+| CSV *(deprecated: use `file`)* | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |
 | Elasticsearch | T2 | `sink-elasticsearch` | ✓ | ✗ | **✓** | ✗ | per-row (`batch_size: 0`) | `_bulk` NDJSON (per-row DLQ) |
 | HTTP | T1 ✅ᵐ | `sink-http` | ✓ | ✗ | ✗ | ✗ | per-row | POST, concurrent under a semaphore |
 | Stdout | T1 ✅ | `sink-stdout` | no-op | ✗ | ✗ | ✗ | best-effort | JSON Lines / pretty JSON / TSV |
@@ -260,7 +260,7 @@ config this project treats as a defect.
 | AWS Kinesis | T1 ✅ | `sink-kinesis` | ✓ | ✗ | ✗ | ✗ | best-effort | batched PutRecords; partition-key routing, per-entry partial-failure retry (DLQ-routable) |
 | Google Cloud Pub/Sub | T1 ✅ᵉ | `sink-pubsub` | ✓ | ✗ | ✗ | ✗ | per-row | batched publish; optional ordering key, per-entry partial-failure retry (DLQ-routable) |
 | Cloud Spanner | T1 ✅ᵉ | `sink-spanner` | ✓ | ✗ | **✓** | **✓** | best-effort | batched mutations (`insert` / `insert_or_update` / `delete`), cell-budget chunking, commit-token transaction for effectively-once |
-| Apache Parquet | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | best-effort | local/S3, schema inference (re-inferred per file on rollover), row/byte rollover |
+| Apache Parquet *(deprecated: use `file`)* | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | best-effort | local/S3, schema inference (re-inferred per file on rollover), row/byte rollover |
 | Apache Delta Lake | T1 ✅ | `sink-delta` | ✓ | ✗⁶ | ✗ | ✗ | atomic (unless `target_file_size` splits a page) | append-only; local FS or S3/Azure/GCS; schema-inferred table creation, partitioning, one commit per flush |
 | Apache Iceberg | T2 | `sink-iceberg` | ✓ | ✗⁶ | ✗ | **✓** | per-row | REST/Glue/SQL/HMS catalog, local + cloud (S3/GCS) warehouses, `fast_append` snapshot, Parquet data files |
 | Amazon DynamoDB | T1 ✅ᵉ | `sink-dynamodb` | ✓ | ✗ | **✓** | ✗ | per-row | `BatchWriteItem` (25 items / 16 MiB per request) with unprocessed-item retry, bounded concurrency; `write_mode: upsert\|delete` by the table key; optional `condition_expression` writes (`on_condition_failure`) |
@@ -306,9 +306,10 @@ Iceberg upsert is not yet supported (a follow-up, blocked on `iceberg-rust`).
 `write_mode: overwrite` (full-refresh: atomically replace the whole
 destination each run) is additionally supported by **PostgreSQL, SQLite, MySQL,
 MSSQL, Oracle, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias
-swap — the configured `index` must be an alias), and by the append-only **local file**
-sink (files staged in a hidden directory and moved into place on success) — not
-Spanner or DynamoDB. See
+swap — the configured `index` must be an alias), and by the append-only **local file**,
+**S3**, **GCS**, **Azure Blob** and **SFTP** sinks (files staged under a hidden
+directory or key prefix and moved into place on success) — not Spanner or
+DynamoDB. See
 [Upsert / mirror tables](../cookbook/upsert.md).
 
 Every sink in this column except **DynamoDB**, **Databricks** and **Oracle** also supports
@@ -347,7 +348,7 @@ Arrow-native connectors:
   object is a self-contained ZSTD-compressed Parquet file).
 - **Databricks SQL** source — with `arrow_native: true` (fetches
   `EXTERNAL_LINKS` + `ARROW_STREAM`; requires `replication: full`).
-- **REST** source — with an `async_job:` (Salesforce Bulk-style) CSV extract,
+- **REST** source — with an `async_job:` (bulk-export-style) CSV extract,
   no custom `decode:` chain, and a **header** locator (#635). Every column is
   `Utf8`: types are never inferred, so a batch's columns match the `Value`
   path's keys exactly.

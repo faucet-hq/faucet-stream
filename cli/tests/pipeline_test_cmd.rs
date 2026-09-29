@@ -425,7 +425,7 @@ fn shipped_masking_example_spec_passes() {
 #[cfg(feature = "transform-zip-columns")]
 #[test]
 fn shipped_zip_columns_groups_spec_passes() {
-    // #746: the GA4 runReport fixture (quoted by the transforms cookbook).
+    // #746: the grouped runReport fixture (quoted by the transforms cookbook).
     let spec =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/tests/zip_columns_groups_tests.yaml");
     faucet()

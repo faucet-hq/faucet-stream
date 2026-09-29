@@ -67,12 +67,12 @@ pub enum OffsetPaginationKind {
     Offset,
 }
 
-/// Offset-into-query-variable pagination (ShopifyQL and similar).
+/// Offset-into-query-variable pagination (query languages that embed `LIMIT … OFFSET …`).
 ///
 /// Increments an integer offset injected into a GraphQL variable and
 /// terminates on a **short page** (fewer than `page_size` records) — unlike
 /// cursor pagination, which follows a `pageInfo` boolean. Suited to APIs whose
-/// query language embeds `LIMIT … OFFSET …` (e.g. ShopifyQL): bake the limit
+/// query language embeds `LIMIT … OFFSET …`: bake the limit
 /// into the query string and parameterize only the offset with `${…}`.
 ///
 /// The offset starts at `0`, is sent as a JSON number in the `variables` map on
@@ -85,7 +85,7 @@ pub struct GraphqlOffsetPagination {
     /// Name of the GraphQL variable that receives the current offset. It is
     /// injected as a JSON number (starting at `0`, incremented by `page_size`
     /// after each page). Reference it from the query string or as a variable
-    /// (e.g. `${q_offset}` for ShopifyQL).
+    /// (e.g. `${q_offset}` inside the query string).
     pub offset_variable: String,
     /// Records requested per page. Used both to advance the offset
     /// (`offset += page_size`) and, with `stop_when_short`, to detect the final
@@ -100,8 +100,8 @@ pub struct GraphqlOffsetPagination {
     /// Substitute `${offset_variable}` occurrences in the **query string** with
     /// the current offset before each request, instead of sending it as a
     /// GraphQL variable. Required for query languages that embed the offset in a
-    /// string-literal argument — e.g. ShopifyQL's
-    /// `shopifyqlQuery(query: "… LIMIT 250 OFFSET ${q_offset}")`, where a GraphQL
+    /// string-literal argument — e.g.
+    /// `reportQuery(query: "… LIMIT 250 OFFSET ${q_offset}")`, where a GraphQL
     /// variable cannot interpolate into a string literal (#569). Default
     /// `false` (variable injection, the #550 behavior).
     #[serde(default)]
@@ -148,7 +148,7 @@ pub struct GraphqlReplicationBind {
     pub variable: String,
     /// Template rendered with `${bookmark}` replaced by the formatted bookmark.
     /// Defaults to the bare `${bookmark}`. When the bookmark sits inside a
-    /// query-language string (Shopify `query: "updated_at:>…"`), escaping is
+    /// query-language string filter (`query: "updated_at:>…"`), escaping is
     /// the template author's job.
     #[serde(default = "default_bind_template")]
     pub template: String,
@@ -245,7 +245,7 @@ pub struct GraphqlStreamConfig {
     /// body reports it (`match_success: true` with
     /// `body_path: "$.errors[*].extensions.code"`, `values: [THROTTLED]`). A
     /// rule's `backoff_from` reads the wait from the response (`cost_bucket`
-    /// for Shopify-style cost reports, or a reset header / body value).
+    /// for a leaky-bucket cost report, or a reset header / body value).
     /// Checked before the response's `errors[]` are classified; a match
     /// retries the whole request, so partial `data` is never emitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -318,7 +318,7 @@ impl GraphqlStreamConfig {
         self
     }
 
-    /// Enable offset-into-variable pagination (ShopifyQL and similar).
+    /// Enable offset-into-variable pagination (query languages that embed `LIMIT … OFFSET …`).
     pub fn offset_pagination(mut self, pagination: GraphqlOffsetPagination) -> Self {
         self.pagination = Some(GraphqlPaginationSpec::Offset(pagination));
         self

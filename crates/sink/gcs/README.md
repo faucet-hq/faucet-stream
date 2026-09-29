@@ -11,7 +11,7 @@ Reach for it when you want to land data from any faucet-stream source — a data
 
 ## Feature highlights
 
-- **Concurrent uploads** — each batch is chunked and the chunks upload in parallel via `buffer_unordered(concurrency)` (default 10), so throughput scales with your network rather than serializing one PUT at a time.
+- **Pipelined uploads** — a closed object uploads in the background while the next one is encoded, up to `concurrency` (default 10) in flight, so throughput scales with your network rather than serializing one PUT at a time.
 - **Time-sortable keys** — every object is named `{prefix}{uuidv7}{file_extension}`. UUIDv7 embeds a timestamp, so a bucket listing returns objects in write order without any extra index.
 - **Explicit NDJSON content type** — uploads are tagged `application/x-ndjson` so consumers and tooling recognize the format.
 - **Flexible object sizing** — combine `batch_size` (pipeline-level chunking) and `max_records_per_file` (a hard per-object cap); the sink uploads at whichever limit is smaller.
@@ -69,16 +69,16 @@ This uploads each batch of records as one or more `events/{uuidv7}.jsonl` object
 | `bucket` | string | — *(required)* | GCS bucket name (without the `gs://` scheme). |
 | `prefix` | string | — *(required)* | Object-name prefix; concatenated with the UUIDv7 key and `file_extension` to form each object name. Use a trailing `/` for a folder-like layout (e.g. `events/2026/`). |
 | `auth` | `GcsCredentials` | `application_default` | Authentication — see [Authentication](#authentication). |
-| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `avro` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
+| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `avro` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained Parquet files (ZSTD by default, `parquet.compression`) and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Suffix appended to every object name. Also drives compression auto-detection (`.jsonl.gz` → gzip). |
 
 ### Batching & throughput
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `batch_size` | int | `1000` | Records per uploaded object from a single `write_batch` call. **`0` = no batching** — the sink writes whatever upstream hands it as one object. Recommended value for GCS (see [Streaming & batching](#streaming--batching)). Validated at construction (`0` ≤ value ≤ `1_000_000`). |
-| `max_records_per_file` | int | *(unset)* | Hard cap on records per uploaded object. `None` means no file-rollover cap (a single object per `write_batch` call, still subject to `batch_size`). When both are set, the **smaller** of `batch_size` and `max_records_per_file` wins. |
-| `concurrency` | int | `10` | Maximum number of object uploads in flight at once. Higher = more throughput but more peak memory (see the memory note below). Clamped to a minimum of 1. |
+| `batch_size` | int | `1000` | Records per object when `max_records_per_file` is unset (without `path`). **`0` = no record cap**: one object per `flush` (Parquet: one per `write_batch`) — see [Streaming & batching](#streaming--batching). Validated at construction (`0` ≤ value ≤ `1_000_000`). |
+| `max_records_per_file` | int | *(unset)* | Hard cap on records per uploaded object. Unset leaves the cap to `batch_size`; when both are set, the **smaller** wins. |
+| `concurrency` | int | `10` | Maximum object uploads in flight at once (each a finished local scratch file). Clamped to a minimum of 1. |
 
 ### Compression *(feature `compression`)*
 
@@ -176,15 +176,16 @@ sink:
 
 ## Streaming & batching
 
-The sink implements `Sink::write_batch`: the pipeline streams pages from the source, and each page is handed to the sink as it arrives, so peak memory is bounded by the page size rather than the total record volume.
+Records accumulate across `write_batch` calls into one open object, built in a local scratch file. An object closes at the per-object cap — `max_records_per_file`, else `batch_size` (the smaller when both are set) — at `max_bytes_per_file`, or at `flush`, which the pipeline calls at every bookmark-carrying page and at the end of the run.
 
-Within a `write_batch` call the records are chunked by the **effective chunk size** — `min(batch_size, max_records_per_file)`, where `batch_size = 0` and `max_records_per_file = None` each mean "no limit" (`usize::MAX`). Each chunk becomes a single GCS object with a fresh UUIDv7 key. Chunks upload concurrently via `buffer_unordered(concurrency)` and `try_collect`, so the first upload error aborts the batch.
+- **Uploads are pipelined.** A closed object is handed to a background upload and the sink keeps encoding the next one; up to `concurrency` uploads are in flight, and a close past that waits for a slot. Every `write_batch` waits for the uploads it started before returning, so a failed upload fails the page that wrote it (and a DLQ gets the right rows); `flush` and the overwrite commit likewise return only after every upload has landed, so a bookmark never passes an object that is not in the store. An aborted overwrite waits for in-flight uploads, then removes the staged objects.
+- **`batch_size = 0` is the "no re-chunking" sentinel** (without `path`): no record cap. JSON Lines and the whole-object formats write one object per `flush`; Parquet writes one object per `write_batch` call (as the sink always has), so a page stays one self-contained file. With `path` set, `batch_size` is ignored and objects follow the path's `{part}` rollover.
+- Scratch files are local and never fsynced — they are uploaded, then deleted.
 
-**Recommended: `batch_size = 0`.** Writing many small objects is a well-known cloud-storage anti-pattern — per-request overhead, slower downstream reads, and inflated LIST/GET costs. Let the source's `batch_size` drive object sizing, or set an explicit `max_records_per_file` if you need a hard cap.
+Many tiny objects are a well-known anti-pattern (per-request overhead, slower downstream scans, LIST/PUT cost), so size objects with `max_records_per_file` / `max_bytes_per_file` rather than a small `batch_size`.
 
-> **Memory ceiling.** Each chunk is buffered fully in memory (and, with compression enabled, briefly held as both the raw and compressed body) before a single-shot upload. Because up to `concurrency` chunks upload at once, peak memory is roughly **`concurrency` × (chunk size) × ~2**. A `batch_size = 0` (or `max_records_per_file = None`) fed by a `fetch_all`-style source produces one very large chunk per `write_batch` call — pair `batch_size = 0` with a streaming source that already sizes its pages, or set `max_records_per_file` / lower `concurrency` to cap peak memory.
+This connector reports observability metrics under the label `connector="gcs"`.
 
-**Partial-failure caveat:** because uploads abort on the first error, a batch that fails mid-flight may leave already-uploaded chunks in the bucket. The pipeline bookmark only advances after the whole batch confirms, so a resumed run re-uploads the batch (yielding new UUIDv7 keys for the chunks that already landed). This sink does not use resumable uploads.
 
 ## Arrow columnar (Parquet) mode
 
@@ -381,9 +382,50 @@ avro:
 ORC is read-only, so there is no `orc` format here. Enable with
 `file-format-avro` (or `file-formats`).
 
+## Shared file writer (#777)
+
+This sink writes through the same file-writing layer as the local
+[`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
+format and option the file sink does, with the same field names:
+
+| Field | Values | Notes |
+|---|---|---|
+| `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `path`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
+| `path` | a name template | object name template: `{part}` numbers the objects, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` objects. |
+| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when an object of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's objects under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`** — the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each object's first page and widened by later pages. |
+| `json_lines` | `pretty` | |
+| `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+
+`mode` and `write_mode: overwrite` need `path`: without it every run
+writes new, uniquely named objects (`<run id>-<part><file_extension>`), so
+there is nothing to replace or append to.
+
+**Publishing.** Each object is built in a local scratch file and published
+with one upload (resumable past the client's threshold, finalised only when every byte arrived) when it closes — at `max_records_per_file` /
+`max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
+partial object, and a bookmark never advances past records that are not
+there.
+
+Object names are `prefix + path`.
+
+```yaml
+sink:
+  type: gcs
+  config:
+    # … connection fields …
+    path: "dt=${now.date}/part-{part}.parquet"
+    format: auto
+    max_records_per_file: 1000000
+    parquet: { compression: zstd, row_group_size: 131072 }
+```
+
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** for an unchunked Parquet write (`format: parquet`, `batch_size: 0`, no `max_records_per_file`), otherwise **best-effort** — only an unchunked Parquet batch is one object upload. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** without a rollover cap —
+a page is encoded locally and published only at `flush` — otherwise
+**best-effort**: objects closed at an earlier cap stay. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

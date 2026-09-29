@@ -163,7 +163,7 @@ pipeline:
       endpoint_url: http://localhost:9000
       file_format: json_array
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./exports.jsonl
 ```
@@ -270,9 +270,25 @@ pipeline:
       region: us-east-1
       file_format: parquet   # requires the `arrow` feature
   sink:
-    type: parquet
+    type: file
     config:
       path: ./out/
+      format: parquet
+```
+
+### Column projection (`parquet.columns`, #777)
+
+`parquet.columns` decodes only the named top-level columns. The projection is
+applied from the footer before any row group is read, on the ranged path and on
+the whole-object path alike, so unread columns are never transferred or
+decoded. A name an object does not have fails the run with an error naming the
+object and its columns. Names containing dots are matched as whole column
+names.
+
+```yaml
+file_format: parquet
+parquet:
+  columns: [id, amount]
 ```
 
 Enable it with `cargo add faucet-source-s3 --features arrow` (library) or `cargo install faucet-cli --features "source-s3,arrow"` (CLI).

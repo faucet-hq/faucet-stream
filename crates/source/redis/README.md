@@ -49,7 +49,7 @@ pipeline:
         type: List
         key: jobs:pending
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./jobs.jsonl
 ```
@@ -159,7 +159,7 @@ pipeline:
         key: order-events
       batch_size: 2000
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./order-events.jsonl
 ```
@@ -201,7 +201,7 @@ pipeline:
         pattern: "session:*"
       max_records: 500
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./sessions.jsonl
 ```

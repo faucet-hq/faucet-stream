@@ -26,7 +26,7 @@ name: orders_csv_with_contract
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./orders.csv
 
@@ -53,11 +53,11 @@ pipeline:
 
   dlq:
     sink:
-      type: jsonl
+      type: file
       config:
         path: ./dlq/contract_breaches.jsonl
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders_out.jsonl

@@ -27,14 +27,14 @@ version: 1
 name: csv_to_jsonl_wasm
 pipeline:
   source:
-    type: csv
-    config: { path: cli/examples/data/orders.csv, has_headers: true }
+    type: file
+    config: { path: cli/examples/data/orders.csv, csv: { has_headers: true } }
   transforms:
     - type: wasm
       config:
         module: examples/wasm-transforms/add_field.wasm
   sink:
-    type: jsonl
+    type: file
     config: { path: /tmp/out.jsonl }
 ```
 

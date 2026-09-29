@@ -1,6 +1,6 @@
 //! Integration tests for `PaginationStyle::CursorInBody` (#500): POST-search
 //! pagination where the next-page cursor is read from the response body and
-//! injected back into the request JSON body (e.g. HubSpot CRM object search).
+//! injected back into the request JSON body (e.g. a CRM object search).
 
 use faucet_source_rest::{PaginationStyle, RestStream, RestStreamConfig};
 use reqwest::Method;

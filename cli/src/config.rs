@@ -764,7 +764,7 @@ pub struct DiscoverSpec {
     /// deduped value-set is published as a single list per upstream tuple rather
     /// than as an independent cartesian axis — so a consuming row injects the
     /// entire list into one request (`${<id>.<as>}` renders it comma-joined,
-    /// e.g. HubSpot's `?properties=a,b,c`). Required when a `discover:` row also
+    /// e.g. a `?properties=a,b,c` field list). Required when a `discover:` row also
     /// declares `for_each:` (chained / two-level discovery), and only meaningful
     /// on a discovery row.
     #[serde(default)]
@@ -917,7 +917,7 @@ pub enum DispatchOrder {
     ///
     /// With heterogeneous row durations, makespan otherwise depends on the
     /// order the user happened to list rows in — a large object listed late
-    /// becomes an idle tail (measured: two big Salesforce objects finishing
+    /// becomes an idle tail (measured: two big bulk-export objects finishing
     /// ~9 min after the other 19, with 6 of 8 slots idle). LPT is provably
     /// within 4/3 of optimal for `P || Cmax`, and largest-*last* — which plain
     /// declaration order can accidentally produce — is the worst case.

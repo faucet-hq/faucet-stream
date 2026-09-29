@@ -10,7 +10,7 @@
 //!
 //! This is the byte analogue of the columnar path: columnar is for typed
 //! columnar sources (parquet/delta) → typed sinks; byte-passthrough is for
-//! format-matched wire-byte pairs (Salesforce Bulk CSV → BigQuery CSV load;
+//! format-matched wire-byte pairs (a bulk-export CSV → BigQuery CSV load;
 //! an S3 `.jsonl` object → BigQuery NDJSON load) with no object-store hop, where
 //! the *destination* does the CSV/JSON → typed-column casting.
 //!

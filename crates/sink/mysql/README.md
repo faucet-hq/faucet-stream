@@ -42,10 +42,11 @@ version: 1
 name: csv_to_mysql
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: customers.csv
-      has_headers: true
+      csv:
+        has_headers: true
   sink:
     type: mysql
     config:
@@ -135,7 +136,7 @@ CREATE TABLE events (
 
 ```yaml
 pipeline:
-  source: { type: csv, config: { path: events.csv, has_headers: true } }
+  source: { type: file, config: { path: events.csv, csv: { has_headers: true } } }
   sink:
     type: mysql
     config:
@@ -304,7 +305,7 @@ pipeline:
       write_mode: upsert
       key: [id]
   dlq:
-    type: jsonl
+    type: file
     config: { path: ./dlq/mysql.jsonl }
 ```
 

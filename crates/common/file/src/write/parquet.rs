@@ -5,9 +5,10 @@
 //! under the wider schema, with the new column null. A field that changes type
 //! is an error naming the field.
 
-use crate::config::{ParquetCodec, ParquetOptions};
-use crate::layout::{io_err, tmp_path};
-use crate::writer::Ctx;
+use super::backend::Area;
+use super::encode::Ctx;
+use super::layout::{io_err, tmp_path};
+use super::options::{ParquetCodec, ParquetField, ParquetOptions, ParquetType};
 use arrow::array::{RecordBatch, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use faucet_core::FaucetError;
@@ -36,7 +37,26 @@ impl ParquetState {
 
     /// Encode `records` against the file's schema, widened by whatever new
     /// fields they carry.
-    pub fn batch_for(&self, records: &[Value]) -> Result<RecordBatch, FaucetError> {
+    pub fn batch_for(
+        &self,
+        opts: &ParquetOptions,
+        records: &[Value],
+    ) -> Result<RecordBatch, FaucetError> {
+        if let Some(fields) = &opts.schema {
+            let schema = explicit_schema(fields);
+            reject_unknown(
+                &schema,
+                records
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .flat_map(|m| m.keys()),
+            )?;
+            return faucet_core::columnar::values_to_record_batch(records, schema).map_err(|e| {
+                FaucetError::Sink(format!(
+                    "parquet: a record does not fit `parquet.schema`: {e}"
+                ))
+            });
+        }
         let inferred = faucet_core::columnar::infer_arrow_schema(records)?;
         let schema = match &self.schema {
             Some(current) => merge(current, &inferred)?,
@@ -51,36 +71,50 @@ impl ParquetState {
     pub fn write(
         &mut self,
         ctx: &Ctx<'_>,
-        final_path: &Path,
+        area: Area,
+        name: &str,
         tmp: &Path,
         finalized: bool,
         batch: &RecordBatch,
     ) -> Result<(), FaucetError> {
-        let target = match &self.schema {
-            Some(current) => merge(current, batch.schema_ref())?,
-            None => nullable(batch.schema_ref()),
+        let target = match (&ctx.parquet.schema, &self.schema) {
+            (Some(fields), _) => {
+                let schema = explicit_schema(fields);
+                reject_unknown(&schema, batch.schema().fields().iter().map(|f| f.name()))?;
+                schema
+            }
+            (None, Some(current)) => merge(current, batch.schema_ref())?,
+            (None, None) => nullable(batch.schema_ref()),
         };
         let widened = self
             .schema
             .as_ref()
             .is_some_and(|s| s.fields() != target.fields());
         if self.writer.is_none() || widened {
-            let old = match self.writer.take() {
+            let old = tmp_path(tmp, ".old");
+            let carried = match self.writer.take() {
                 Some(w) => {
                     w.close().map_err(|e| pq_err(tmp, e))?;
-                    let old = tmp_path(tmp, ".old");
                     std::fs::rename(tmp, &old).map_err(|e| io_err("renaming", tmp, e))?;
-                    Some((old, true))
+                    Some(None)
                 }
-                None if finalized && final_path.exists() => Some((final_path.to_path_buf(), false)),
+                None if finalized && ctx.backend.exists(area, name)? => {
+                    Some(Some(ctx.decompress(ctx.read_existing(area, name, &old)?)?))
+                }
                 None => None,
             };
             let mut writer = open_writer(tmp, &target, ctx.parquet)?;
-            if let Some((path, remove)) = old {
-                copy_into(&path, &target, &mut writer)?;
-                if remove {
-                    let _ = std::fs::remove_file(&path);
+            match carried {
+                Some(None) => {
+                    let file = File::open(&old).map_err(|e| io_err("opening", &old, e))?;
+                    let r = copy_into(&old, file, &target, &mut writer);
+                    let _ = std::fs::remove_file(&old);
+                    r?;
                 }
+                Some(Some(bytes)) => {
+                    copy_into(tmp, bytes::Bytes::from(bytes), &target, &mut writer)?
+                }
+                None => {}
             }
             self.writer = Some(writer);
             self.schema = Some(target.clone());
@@ -93,13 +127,14 @@ impl ParquetState {
             .map_err(|e| pq_err(tmp, e))
     }
 
-    /// Finish the file at `tmp` and sync it. `false` when nothing is open.
-    pub fn close(&mut self, tmp: &Path) -> Result<bool, FaucetError> {
+    /// Finish the file at `tmp`, syncing it when `sync`. `false` when nothing
+    /// is open.
+    pub fn close(&mut self, tmp: &Path, sync: bool) -> Result<bool, FaucetError> {
         let Some(writer) = self.writer.take() else {
             return Ok(false);
         };
         let file = writer.into_inner().map_err(|e| pq_err(tmp, e))?;
-        file.sync_all().map_err(|e| io_err("syncing", tmp, e))?;
+        super::encode::sync_if(&file, tmp, sync)?;
         Ok(true)
     }
 
@@ -119,22 +154,24 @@ fn open_writer(
         ParquetCodec::Snappy => Compression::SNAPPY,
         ParquetCodec::Gzip => Compression::GZIP(GzipLevel::default()),
         ParquetCodec::Zstd => Compression::ZSTD(ZstdLevel::default()),
+        ParquetCodec::Lz4 => Compression::LZ4_RAW,
     };
     let props = WriterProperties::builder()
         .set_compression(compression)
+        .set_max_row_group_row_count(Some(opts.row_group_size))
         .build();
     let file = File::create(tmp).map_err(|e| io_err("creating", tmp, e))?;
     ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| pq_err(tmp, e))
 }
 
 /// Copy every row of the Parquet file at `path` into `writer` under `schema`.
-fn copy_into(
+fn copy_into<R: parquet::file::reader::ChunkReader + 'static>(
     path: &Path,
+    input: R,
     schema: &SchemaRef,
     writer: &mut ArrowWriter<File>,
 ) -> Result<(), FaucetError> {
-    let file = File::open(path).map_err(|e| io_err("opening", path, e))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+    let reader = ParquetRecordBatchReaderBuilder::try_new(input)
         .and_then(|b| b.build())
         .map_err(|e| pq_err(path, e))?;
     for batch in reader {
@@ -184,6 +221,56 @@ fn merge(current: &SchemaRef, incoming: &Schema) -> Result<SchemaRef, FaucetErro
 }
 
 /// Every field, recursively, made nullable.
+/// The Arrow schema an explicit `parquet.schema` declares.
+pub(crate) fn explicit_schema(fields: &[ParquetField]) -> SchemaRef {
+    use arrow::datatypes::TimeUnit;
+    let utc = || Some(Arc::from("UTC"));
+    Arc::new(Schema::new(
+        fields
+            .iter()
+            .map(|f| {
+                let dt = match f.data_type {
+                    ParquetType::Boolean => DataType::Boolean,
+                    ParquetType::Int32 => DataType::Int32,
+                    ParquetType::Int64 => DataType::Int64,
+                    ParquetType::Uint64 => DataType::UInt64,
+                    ParquetType::Float32 => DataType::Float32,
+                    ParquetType::Float64 => DataType::Float64,
+                    ParquetType::String => DataType::Utf8,
+                    ParquetType::Date => DataType::Date32,
+                    ParquetType::TimestampMs => DataType::Timestamp(TimeUnit::Millisecond, utc()),
+                    ParquetType::TimestampUs => DataType::Timestamp(TimeUnit::Microsecond, utc()),
+                    ParquetType::TimestampNs => DataType::Timestamp(TimeUnit::Nanosecond, utc()),
+                    ParquetType::Decimal { precision, scale } => {
+                        DataType::Decimal128(precision, scale)
+                    }
+                };
+                Field::new(&f.name, dt, f.nullable)
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn reject_unknown<'a>(
+    schema: &Schema,
+    names: impl Iterator<Item = &'a String>,
+) -> Result<(), FaucetError> {
+    let mut unknown: Vec<&str> = Vec::new();
+    for n in names {
+        if schema.field_with_name(n).is_err() && !unknown.contains(&n.as_str()) {
+            unknown.push(n);
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(FaucetError::Sink(format!(
+        "parquet: field(s) not in `parquet.schema`: [{}] — add them to the schema or drop them \
+         with a `drop` transform",
+        unknown.join(", ")
+    )))
+}
+
 fn nullable(schema: &Schema) -> SchemaRef {
     fn field(f: &Field) -> Field {
         let dt = match f.data_type() {

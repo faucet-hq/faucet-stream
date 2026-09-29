@@ -11,7 +11,7 @@ name: csv_to_sqlite_overwrite
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/contacts.csv
 

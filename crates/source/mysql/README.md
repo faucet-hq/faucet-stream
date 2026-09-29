@@ -52,7 +52,7 @@ pipeline:
       connection_url: mysql://user:pass@localhost:3306/mydb
       query: SELECT id, name, email FROM users WHERE active = 1 ORDER BY id
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl
 ```
@@ -160,7 +160,7 @@ pipeline:
         connection_url: ${env:MYSQL_URL}
         query: SELECT id, total FROM orders WHERE customer_id = ${customers.id}
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders.jsonl
 matrix:

@@ -48,7 +48,7 @@ pipeline:
       database_url: sqlite:./app.db
       query: SELECT * FROM events ORDER BY ts
   sink:
-    type: jsonl
+    type: file
     config:
       path: events.jsonl
 ```
@@ -85,11 +85,12 @@ pipeline:
       database_url: sqlite://./data/app.db
       query: SELECT id, email, created_at FROM users ORDER BY id
   sink:
-    type: csv
+    type: file
     config:
       path: ./out/users.csv
-      delimiter: 44        # ','
-      write_headers: true
+      csv:
+        delimiter: ","
+        has_headers: true
 ```
 
 ### Project a JSON column out of a row

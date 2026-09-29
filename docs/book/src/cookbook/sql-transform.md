@@ -73,7 +73,7 @@ page, so the SQL transform sees all rows at once.
 ```yaml
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: data/orders.csv
       batch_size: 0          # ← load everything as one page
@@ -254,10 +254,11 @@ name: csv_to_jsonl_sql
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: cli/examples/data/orders.csv
-      has_headers: true
+      csv:
+        has_headers: true
       batch_size: 0          # whole file as one page → global GROUP BY
 
   transforms:
@@ -279,7 +280,7 @@ pipeline:
               has_header: true
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: /tmp/faucet_sql_demo.jsonl
 ```

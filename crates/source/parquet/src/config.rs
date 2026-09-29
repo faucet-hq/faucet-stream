@@ -23,6 +23,7 @@ fn default_concurrency() -> usize {
 /// Configuration for the Parquet source connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
 pub struct ParquetSourceConfig {
     /// Where to read Parquet from — a local file, a local glob pattern, or S3.
     pub source: ParquetLocation,

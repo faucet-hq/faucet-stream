@@ -23,10 +23,10 @@ pipeline:
       mode: incremental
       on_rewrite: full_refresh              # an overwrite/delete snapshot re-reads the table
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/iceberg_events.jsonl
-      append: true
+      mode: append
   state:
     type: file
     config: { path: ./.faucet-state }

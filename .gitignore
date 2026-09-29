@@ -45,6 +45,7 @@ docs/superpowers/
 !/scripts/integration-coverage.py
 !/scripts/test_integration_coverage.py
 !/scripts/demo_catalog.py
+!/scripts/vendor-names.py
 
 # Benchmark generated artifacts (harness + configs are tracked; outputs are not)
 /.bench-venv/

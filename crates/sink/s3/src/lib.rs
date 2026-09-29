@@ -4,10 +4,12 @@
 //!
 //! AWS S3 sink connector for the faucet-stream ecosystem.
 //!
-//! Writes `serde_json::Value` records to S3 as JSON Lines files, or — with the
-//! `arrow` feature — self-contained Parquet objects (RFC 0002 / #375).
+//! Writes records to S3 objects in every format the local file sink writes —
+//! JSON Lines, JSON, CSV, XML, Excel, Avro, Parquet and raw text — through
+//! the shared file writer in `faucet-common-file` (#777).
 
 pub mod config;
+mod object;
 pub mod sink;
 
 pub use faucet_core::{FaucetError, Sink};

@@ -519,7 +519,7 @@ async fn fetch_range(
     key: &[String],
     side: &str,
 ) -> CliResult<Vec<Value>> {
-    if key.len() == 1 {
+    if key.len() == 1 && (range.lo.is_some() || range.hi.is_some()) {
         src.apply_shard(&range.to_shard(&key[0]))
             .await
             .map_err(|e| {

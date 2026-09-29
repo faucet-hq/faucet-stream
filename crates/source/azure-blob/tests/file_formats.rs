@@ -116,6 +116,11 @@ async fn round_trip(fmt: AzureFileFormat, shared: FileFormat, key: &str) {
     let cfg = source_config(port).file_format(fmt).with_batch_size(0);
     let src = AzureBlobSource::new(cfg).await.expect("source");
     assert_eq!(drain(&src).await, records(), "{shared:?} did not read back");
+    assert_eq!(
+        src.fetch_all().await.expect("fetch_all"),
+        records(),
+        "{shared:?} did not read back through fetch_all"
+    );
 }
 
 #[tokio::test]
@@ -155,6 +160,7 @@ async fn the_configured_csv_dialect_is_honoured() {
     cfg.csv = faucet_core::CsvOptions {
         delimiter: ";".into(),
         has_headers: true,
+        ..Default::default()
     };
     let src = AzureBlobSource::new(cfg).await.expect("source");
     assert_eq!(drain(&src).await, vec![json!({"id": "1", "name": "ada"})]);

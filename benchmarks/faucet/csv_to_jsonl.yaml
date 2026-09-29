@@ -7,11 +7,11 @@ name: bench_csv_to_jsonl
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./benchmarks/data/bench.csv
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./benchmarks/out/faucet_out.jsonl

@@ -29,7 +29,7 @@ pick the codec.
 
 ```yaml
 sink:
-  type: jsonl
+  type: file
   config:
     path: ./out/records.jsonl.gz
     compression: auto      # none | gzip | zstd | auto (default)

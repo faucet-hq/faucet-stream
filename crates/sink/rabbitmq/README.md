@@ -54,7 +54,7 @@ required. Messages carry a `content_type` matching `value_format`.
 version: 1
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./orders.csv
   sink:
@@ -66,7 +66,7 @@ pipeline:
       routing_key_field: event_type
       mandatory: true
   dlq:
-    type: jsonl
+    type: file
     config:
       path: ./out/unroutable.jsonl
 ```

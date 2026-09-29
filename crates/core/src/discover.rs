@@ -41,7 +41,7 @@ pub struct DatasetDescriptor {
     pub config_patch: Value,
     /// Optional partial **sink**-config override routing this dataset to its own
     /// destination — deep-merged over the sink template by a matrix row (e.g.
-    /// `{"table_id": "account"}` so a fan-out of Salesforce objects lands one
+    /// `{"table_id": "account"}` so a fan-out of discovered objects lands one
     /// table per object). `None` (the common case) leaves the sink untouched.
     /// Must never contain credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]

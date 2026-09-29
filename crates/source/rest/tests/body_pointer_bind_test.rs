@@ -30,10 +30,10 @@ async fn bodies(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
-fn hubspot_body() -> Value {
+fn crm_search_body() -> Value {
     json!({
         "filterGroups": [{"filters": [
-            {"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": null}
+            {"propertyName": "last_modified_date", "operator": "GTE", "value": null}
         ]}],
         "limit": 2
     })
@@ -43,7 +43,7 @@ fn bind(json: Value) -> ReplicationBind {
     serde_json::from_value(json).unwrap()
 }
 
-async fn hubspot_server() -> MockServer {
+async fn crm_search_server() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/crm/v3/objects/contacts/search"))
@@ -67,10 +67,10 @@ async fn hubspot_server() -> MockServer {
     server
 }
 
-fn hubspot_config(uri: &str, b: ReplicationBind) -> RestStreamConfig {
+fn crm_search_config(uri: &str, b: ReplicationBind) -> RestStreamConfig {
     RestStreamConfig::new(uri, "/crm/v3/objects/contacts/search")
         .method(Method::POST)
-        .body(hubspot_body())
+        .body(crm_search_body())
         .records_path("$.results[*]")
         .pagination(PaginationStyle::CursorInBody {
             next_token_path: "$.paging.next.after".into(),
@@ -83,15 +83,15 @@ fn hubspot_config(uri: &str, b: ReplicationBind) -> RestStreamConfig {
 }
 
 #[tokio::test]
-async fn hubspot_search_carries_the_bookmark_at_a_nested_pointer_on_every_page() {
-    let server = hubspot_server().await;
+async fn crm_search_search_carries_the_bookmark_at_a_nested_pointer_on_every_page() {
+    let server = crm_search_server().await;
     let b = bind(json!({
         "into": "body",
         "path": "/filterGroups/0/filters/0/value",
         "format": "epoch_ms",
         "value_type": "number"
     }));
-    let records = drain(&RestStream::new(hubspot_config(&server.uri(), b)).unwrap())
+    let records = drain(&RestStream::new(crm_search_config(&server.uri(), b)).unwrap())
         .await
         .unwrap();
     assert_eq!(records.len(), 3);
@@ -109,9 +109,9 @@ async fn hubspot_search_carries_the_bookmark_at_a_nested_pointer_on_every_page()
 
 #[tokio::test]
 async fn legacy_top_level_body_bind_is_unchanged() {
-    let server = hubspot_server().await;
+    let server = crm_search_server().await;
     let b = bind(json!({"into": "body", "name": "since", "format": "date"}));
-    drain(&RestStream::new(hubspot_config(&server.uri(), b)).unwrap())
+    drain(&RestStream::new(crm_search_config(&server.uri(), b)).unwrap())
         .await
         .unwrap();
     for body in bodies(&server).await {
@@ -122,9 +122,9 @@ async fn legacy_top_level_body_bind_is_unchanged() {
 
 #[tokio::test]
 async fn an_unresolvable_pointer_fails_the_request() {
-    let server = hubspot_server().await;
+    let server = crm_search_server().await;
     let b = bind(json!({"into": "body", "path": "/filterGroups/3/filters/0/value"}));
-    let err = drain(&RestStream::new(hubspot_config(&server.uri(), b)).unwrap())
+    let err = drain(&RestStream::new(crm_search_config(&server.uri(), b)).unwrap())
         .await
         .unwrap_err();
     assert!(
@@ -136,18 +136,18 @@ async fn an_unresolvable_pointer_fails_the_request() {
 #[test]
 fn invalid_pointer_configs_fail_at_load() {
     let both = bind(json!({"into": "body", "name": "x", "path": "/a"}));
-    assert!(RestStream::new(hubspot_config("http://x", both)).is_err());
+    assert!(RestStream::new(crm_search_config("http://x", both)).is_err());
     let neither = bind(json!({"into": "body"}));
-    assert!(RestStream::new(hubspot_config("http://x", neither)).is_err());
+    assert!(RestStream::new(crm_search_config("http://x", neither)).is_err());
     let query_path = bind(json!({"into": "query", "name": "x", "path": "/a"}));
-    assert!(RestStream::new(hubspot_config("http://x", query_path)).is_err());
+    assert!(RestStream::new(crm_search_config("http://x", query_path)).is_err());
 
-    let mut no_body = hubspot_config("http://x", bind(json!({"into": "body", "path": "/a"})));
+    let mut no_body = crm_search_config("http://x", bind(json!({"into": "body", "path": "/a"})));
     no_body.body = None;
     let err = RestStream::new(no_body).err().unwrap().to_string();
     assert!(err.contains("replication_bind.path"), "{err}");
 
-    let mut dup = hubspot_config("http://x", bind(json!({"into": "body", "path": "/w"})));
+    let mut dup = crm_search_config("http://x", bind(json!({"into": "body", "path": "/w"})));
     dup.window = Some(
         serde_json::from_value(json!({
             "step": "1d",
@@ -295,14 +295,14 @@ async fn offset_in_body_pointer_fields() {
 
 #[tokio::test]
 async fn number_value_type_rejects_a_non_numeric_render() {
-    let server = hubspot_server().await;
+    let server = crm_search_server().await;
     let b = bind(json!({
         "into": "body",
         "path": "/filterGroups/0/filters/0/value",
         "format": "iso8601",
         "value_type": "number"
     }));
-    let err = drain(&RestStream::new(hubspot_config(&server.uri(), b)).unwrap())
+    let err = drain(&RestStream::new(crm_search_config(&server.uri(), b)).unwrap())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not a number"), "{err}");

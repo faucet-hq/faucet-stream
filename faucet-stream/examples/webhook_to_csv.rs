@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Webhook receiver → CSV — full builder showcase for both connectors.
 //!
 //! Webhook source uses listen-addr, path, max-payloads, and timeout knobs.

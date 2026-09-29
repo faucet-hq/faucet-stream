@@ -25,7 +25,7 @@ and an Arrow-native columnar fast path are tracked as follow-ups.
 version: 1
 pipeline:
   source:
-    type: jsonl
+    type: file
     config:
       path: events.jsonl
   sink:

@@ -5,10 +5,10 @@ version: 1
 name: demo
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: examples/demo/input.csv
   sink:
-    type: jsonl
+    type: file
     config:
       path: target/demo/out.jsonl

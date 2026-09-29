@@ -117,7 +117,7 @@ version: 1
 name: people
 pipeline:
   source:
-    type: csv
+    type: file
     config: { path: ./people.csv }
   sink:
     type: singer

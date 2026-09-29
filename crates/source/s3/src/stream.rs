@@ -225,7 +225,12 @@ impl S3Source {
         &self,
         key: &str,
     ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
-        Self::decode_parquet(self.read_object_bytes(key).await?, key).await
+        Self::decode_parquet(
+            self.read_object_bytes(key).await?,
+            key,
+            &self.config.parquet,
+        )
+        .await
     }
 
     /// Fetch one object in the shape its configured `file_format` needs.
@@ -350,6 +355,13 @@ impl S3Source {
             .map_err(|e| {
                 FaucetError::Source(format!("failed to read parquet metadata for '{key}': {e}"))
             })?;
+        if let Some(mask) = faucet_core::file_format::parquet_io::projection_mask(
+            &self.config.parquet,
+            builder.parquet_schema(),
+            key,
+        )? {
+            builder = builder.with_projection(mask);
+        }
         // Cap the Arrow batch size to the page size so a single huge row group
         // is still decoded in bounded steps — the row-group bound alone is not
         // enough when one row group holds millions of rows.
@@ -372,9 +384,11 @@ impl S3Source {
     async fn decode_parquet(
         data: bytes::Bytes,
         key: &str,
+        opts: &faucet_core::ParquetReadOptions,
     ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
         let key_owned = key.to_string();
-        tokio::task::spawn_blocking(move || decode_parquet_bytes(data, &key_owned))
+        let opts = opts.clone();
+        tokio::task::spawn_blocking(move || decode_parquet_bytes(data, &key_owned, &opts))
             .await
             .map_err(|e| {
                 FaucetError::Source(format!("parquet decode task for '{key}' panicked: {e}"))
@@ -773,7 +787,7 @@ impl faucet_core::Source for S3Source {
                         // row path. Rows accumulate across objects and chunk at
                         // `batch_size`; `batch_size == 0` emits one page per
                         // object.
-                        let (_schema, batches) = Self::decode_parquet(data, key).await?;
+                        let (_schema, batches) = Self::decode_parquet(data, key, &self.config.parquet).await?;
                         for batch in &batches {
                             let rows = faucet_core::columnar::record_batch_to_values(batch)?;
                             for record in rows {
@@ -971,7 +985,7 @@ impl faucet_core::Source for S3Source {
                 match opened? {
                     Fetched::ParquetStream(s) => streaming = Some(s),
                     Fetched::Parquet(data) => {
-                        let (schema, batches) = Self::decode_parquet(data, key).await?;
+                        let (schema, batches) = Self::decode_parquet(data, key, &self.config.parquet).await?;
                         check_schema(&mut reference, &schema, key)?;
                         pending = batches;
                     }
@@ -1178,26 +1192,9 @@ fn check_schema(
 fn decode_parquet_bytes(
     data: bytes::Bytes,
     key: &str,
+    opts: &faucet_core::ParquetReadOptions,
 ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let builder = ParquetRecordBatchReaderBuilder::try_new(data).map_err(|e| {
-        FaucetError::Source(format!("failed to read parquet metadata for '{key}': {e}"))
-    })?;
-    let schema = builder.schema().clone();
-    let reader = builder.build().map_err(|e| {
-        FaucetError::Source(format!("failed to build parquet reader for '{key}': {e}"))
-    })?;
-
-    let mut batches = Vec::new();
-    for batch in reader {
-        batches.push(
-            batch.map_err(|e| {
-                FaucetError::Source(format!("parquet decode error in '{key}': {e}"))
-            })?,
-        );
-    }
-    Ok((schema, batches))
+    faucet_core::file_format::parquet_io::read_bytes(data, opts, 0, key)
 }
 
 /// Return a human-readable name for a JSON value type.
@@ -1511,7 +1508,8 @@ mod tests {
     #[cfg(feature = "arrow")]
     #[test]
     fn decode_parquet_bytes_yields_schema_and_batches() {
-        let (schema, batches) = decode_parquet_bytes(sample_parquet_bytes(), "t.parquet").unwrap();
+        let (schema, batches) =
+            decode_parquet_bytes(sample_parquet_bytes(), "t.parquet", &Default::default()).unwrap();
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1521,7 +1519,8 @@ mod tests {
     #[cfg(feature = "arrow")]
     #[test]
     fn parquet_batches_convert_to_rows() {
-        let (_schema, batches) = decode_parquet_bytes(sample_parquet_bytes(), "t.parquet").unwrap();
+        let (_schema, batches) =
+            decode_parquet_bytes(sample_parquet_bytes(), "t.parquet", &Default::default()).unwrap();
         let mut rows = Vec::new();
         for b in &batches {
             rows.extend(faucet_core::columnar::record_batch_to_values(b).unwrap());
@@ -1537,8 +1536,12 @@ mod tests {
     #[cfg(feature = "arrow")]
     #[test]
     fn corrupt_parquet_bytes_error() {
-        let err = decode_parquet_bytes(bytes::Bytes::from_static(b"not parquet"), "bad.parquet")
-            .unwrap_err();
+        let err = decode_parquet_bytes(
+            bytes::Bytes::from_static(b"not parquet"),
+            "bad.parquet",
+            &Default::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, FaucetError::Source(_)));
     }
 

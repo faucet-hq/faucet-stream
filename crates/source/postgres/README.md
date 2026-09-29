@@ -42,7 +42,7 @@ pipeline:
       connection_url: postgres://user:pass@localhost:5432/app
       query: SELECT id, name, email FROM users WHERE active = true
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./users.jsonl
 ```
@@ -90,7 +90,7 @@ pipeline:
         - shipped
         - 100.0
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./shipped_orders.jsonl
 ```

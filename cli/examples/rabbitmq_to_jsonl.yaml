@@ -22,6 +22,6 @@ pipeline:
       idle_timeout_secs: 5     # at least one of idle_timeout_secs / max_messages is required
       batch_size: 500
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/rabbitmq_orders.jsonl

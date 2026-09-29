@@ -87,7 +87,7 @@ pipeline:
         access_token: ${env:GITHUB_TOKEN}
         repository: faucet-hq/faucet-stream
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/issues.jsonl
   state:

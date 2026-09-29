@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Proves `faucet-source-csv` upholds the shared connector contract by invoking
 //! the reusable `faucet-conformance` battery (checks 1, 2, 6, 9, 10 & 11).
 //!

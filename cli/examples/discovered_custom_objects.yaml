@@ -1,48 +1,48 @@
 # Chained / two-level discovery + collected list dimensions (#531).
 #
-# Full HubSpot custom-object sync, discovered entirely at runtime:
+# Full CRM custom-object sync, discovered entirely at runtime:
 #   1. `types`   — discover every object type (standard + custom).
 #   2. `props`   — for EACH type, discover its property names and COLLECT them
 #                  into one list per type (`collect: true`).
 #   3. `records` — for each type, pull its records with the whole property list
-#                  in a single request (`?properties=a,b,c`) — HubSpot returns
+#                  in a single request (`?properties=a,b,c`) — many CRM APIs return
 #                  only default properties unless you enumerate them.
 #
 # `${types.name}` is the per-tuple type; `${props.name}` renders the collected
 # list comma-joined. No bespoke per-type YAML.
 #
-#   faucet validate cli/examples/hubspot_custom_objects.yaml
+#   faucet validate cli/examples/discovered_custom_objects.yaml
 version: 1
-name: hubspot_custom_objects
+name: discovered_custom_objects
 pipeline:
   sources:
-    hs_schemas:
+    type_schemas:
       type: rest
       config:
-        base_url: "https://api.hubapi.com"
+        base_url: "https://api.example.com"
         path: /crm/v3/schemas
         auth: { type: bearer, config: { token: "${env:AUTH_TOKEN}" } }
         records_path: "$.results[*]"
-    hs_properties:
+    type_properties:
       type: rest
       config:
-        base_url: "https://api.hubapi.com"
+        base_url: "https://api.example.com"
         auth: { type: bearer, config: { token: "${env:AUTH_TOKEN}" } }
         records_path: "$.results[*]"
-    hs_objects:
+    type_objects:
       type: rest
       config:
-        base_url: "https://api.hubapi.com"
+        base_url: "https://api.example.com"
         auth: { type: bearer, config: { token: "${env:AUTH_TOKEN}" } }
         records_path: "$.results[*]"
   sink:
-    type: jsonl
-    config: { path: ./out/hubspot.jsonl }
+    type: file
+    config: { path: ./out/objects.jsonl }
 matrix:
   # 1. Enumerate object types.
   - id: types
     fan_out:
-      source: { ref: hs_schemas }
+      source: { ref: type_schemas }
       select: "$.name"
       as: name
   # 2. Chained discovery: one list of property names PER type (collected).
@@ -50,7 +50,7 @@ matrix:
     for_each: [types]
     fan_out:
       source:
-        ref: hs_properties
+        ref: type_properties
         config: { path: "/crm/v3/properties/${types.name}" }
       select: "$.name"
       as: name
@@ -59,11 +59,11 @@ matrix:
   - id: records
     for_each: [types]
     source:
-      ref: hs_objects
+      ref: type_objects
       config:
         path: "/crm/v3/objects/${types.name}"
         query_params:
           properties: "${props.name}"
     # One file per object type: every type writes on its own invocation.
     sink:
-      config: { path: "./out/hubspot-${types.name}.jsonl" }
+      config: { path: "./out/objects-${types.name}.jsonl" }

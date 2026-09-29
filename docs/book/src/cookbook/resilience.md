@@ -177,7 +177,7 @@ more than a quarter of 15 minutes rate-limited.
 ### Throttling signalled in an error body (`retry_on_response`)
 
 Some APIs rate-limit with a 4xx other than `429` and put the reason in the body
-— the Meta Marketing API answers HTTP 400 with `error.code` 17 (user limit) or
+— an advertising API might answer HTTP 400 with `error.code` 17 (user limit) or
 80004 (ad-account limit). The `rest` source's `retry_on_response` turns those
 into throttling instead of a failed run:
 
@@ -210,21 +210,21 @@ from the response:
 
 ```yaml
 retry_on_response:
-  # GitHub: 403/429 with x-ratelimit-remaining: 0 and an epoch-seconds reset.
+  # 403/429 with x-ratelimit-remaining: 0 and an epoch-seconds reset.
   - status: [403, 429]
     header: x-ratelimit-remaining
     values: ["0"]
     backoff_from:
       type: header
       config: { name: x-ratelimit-reset, unit: epoch_s }
-  # Meta: minutes to wait, inside a JSON-valued header.
+  # Minutes to wait, inside a JSON-valued usage header.
   - status: [400, 403]
     body_path: $.error.code
     values: [80004, 17, 4, 32]
     backoff_from:
       type: header_json
       config:
-        name: x-business-use-case-usage
+        name: x-app-usage
         path: "$.*[0].estimated_time_to_regain_access"
         unit: minutes
 ```
@@ -247,7 +247,7 @@ reset named instead of parking it for hours.
 
 #### Throttling inside a successful response (`match_success`)
 
-Some APIs answer a throttled call with `200`. Shopify's Admin GraphQL API
+Some APIs answer a throttled call with `200`. A leaky-bucket GraphQL API
 returns `errors[].extensions.code: THROTTLED` plus a cost report. With
 `match_success: true` a rule also matches 2xx responses; the `graphql` source
 supports `retry_on_response` for exactly this:

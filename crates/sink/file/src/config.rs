@@ -7,74 +7,18 @@ use faucet_core::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use faucet_common_file::{
-    appendable as is_appendable, compresses_internally as is_self_compressed,
+use faucet_common_file::write::WriteSettings;
+pub use faucet_common_file::write::{
+    DEFAULT_ROW_GROUP_SIZE, FileMode, FileWriteMode, JsonLinesOptions, PART_TOKEN, ParquetCodec,
+    ParquetField, ParquetOptions, ParquetType,
 };
 
 pub use faucet_common_file::FileFormatChoice as FileSinkFormat;
 
-/// The placeholder a path template uses for the rollover part number.
-pub const PART_TOKEN: &str = "{part}";
-
-/// What happens when a file this run writes already exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FileMode {
-    /// Replace it: the new file is written beside it and renamed over it, so
-    /// the old contents stay readable until the new ones are complete.
-    #[default]
-    Overwrite,
-    /// Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,
-    /// Excel, Avro or Parquet file cannot be appended to without rewriting.
-    /// With rollover, numbering continues after the highest existing part.
-    Append,
-    /// Fail the run instead of touching an existing file.
-    ErrorIfExists,
-}
-
-/// Pipeline-level write mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FileWriteMode {
-    /// Write this run's files; leave everything else in place.
-    #[default]
-    Append,
-    /// Replace the destination's whole output set: files are staged in a
-    /// hidden directory beside the destination and moved into place only when
-    /// the run succeeds, then files of an earlier run that match the path
-    /// template and were not rewritten are removed. A failed or cancelled run
-    /// leaves the previous output untouched.
-    Overwrite,
-}
-
-/// Parquet column-chunk compression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ParquetCodec {
-    /// Uncompressed pages.
-    None,
-    /// Snappy (the default): fast and universally readable.
-    #[default]
-    Snappy,
-    /// Gzip.
-    Gzip,
-    /// Zstandard.
-    Zstd,
-}
-
-/// Parquet write options.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ParquetOptions {
-    /// Column-chunk compression (default `snappy`). File-level `compression`
-    /// does not apply to Parquet.
-    #[serde(default)]
-    pub compression: ParquetCodec,
-}
-
 /// Configuration for the local file sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("x-faucet-aliases" = ["max_rows_per_file"]))]
 pub struct FileSinkConfig {
     /// The file to write, as a template. `{part}` is replaced by the rollover
     /// part number (`00001`, `00002`, …); with a rollover cap and no `{part}`,
@@ -99,8 +43,13 @@ pub struct FileSinkConfig {
     /// set atomically when the run succeeds.
     #[serde(default)]
     pub write_mode: FileWriteMode,
-    /// Roll to a new file after this many records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Roll to a new file after this many records. `max_rows_per_file` is
+    /// accepted as another name.
+    #[serde(
+        default,
+        alias = "max_rows_per_file",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_records_per_file: Option<usize>,
     /// Roll to a new file once the current one reaches this many bytes. A
     /// single page larger than the cap still lands in one file.
@@ -125,9 +74,22 @@ pub struct FileSinkConfig {
     /// Writer schema and block codec, used when the format is Avro.
     #[serde(default)]
     pub avro: AvroOptions,
-    /// Column-chunk compression, used when the format is Parquet.
+    /// Compression, row groups and an optional explicit schema, used when
+    /// the format is Parquet.
     #[serde(default)]
     pub parquet: ParquetOptions,
+    /// Pretty-printing, used when the format is JSON Lines.
+    #[serde(default)]
+    pub json_lines: JsonLinesOptions,
+    /// Encrypt the output at rest (AES-256-GCM). Uncompressed JSON Lines and
+    /// raw text seal each record on its own line (base64), exactly as the
+    /// jsonl sink does, so the file stays appendable. Every other file —
+    /// compressed JSON Lines included — is sealed whole when it is
+    /// finalised, after any `compression`; appending to one decrypts it
+    /// first. The file source's `encryption` block reads both back.
+    #[cfg(feature = "encryption")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<faucet_core::EncryptionSpec>,
 }
 
 fn default_true() -> bool {
@@ -156,7 +118,23 @@ impl FileSinkConfig {
             xml: XmlOptions::default(),
             avro: AvroOptions::default(),
             parquet: ParquetOptions::default(),
+            json_lines: JsonLinesOptions::default(),
+            #[cfg(feature = "encryption")]
+            encryption: None,
         }
+    }
+
+    /// Set the JSON Lines options.
+    pub fn json_lines(mut self, json_lines: JsonLinesOptions) -> Self {
+        self.json_lines = json_lines;
+        self
+    }
+
+    /// Encrypt the output at rest.
+    #[cfg(feature = "encryption")]
+    pub fn encryption(mut self, encryption: faucet_core::EncryptionSpec) -> Self {
+        self.encryption = Some(encryption);
+        self
     }
 
     /// Set the format.
@@ -265,60 +243,38 @@ impl FileSinkConfig {
     pub fn validate(&self) -> Result<(), FaucetError> {
         faucet_common_file::require_path("file sink", &self.path)?;
         faucet_core::validate_batch_size(self.batch_size)?;
-        let format = self.resolved_format()?;
-        require_feature(format)?;
-        if matches!(self.max_records_per_file, Some(0)) {
-            return Err(FaucetError::Config(
-                "file sink: `max_records_per_file` must be at least 1".into(),
-            ));
-        }
-        if matches!(self.max_bytes_per_file, Some(0)) {
-            return Err(FaucetError::Config(
-                "file sink: `max_bytes_per_file` must be at least 1".into(),
-            ));
-        }
         if self.path.matches(PART_TOKEN).count() > 1 {
             return Err(FaucetError::Config(format!(
                 "file sink: '{}' has more than one `{{part}}`",
                 self.path
             )));
         }
-        let codec = self.resolved_compression();
-        if codec != Compression::None && is_self_compressed(format) {
-            return Err(FaucetError::Config(format!(
-                "file sink: `compression` does not apply to {} files, which compress \
-                 internally{} — remove the compression suffix or setting",
-                format.as_str(),
-                match format {
-                    FileFormat::Parquet => " (see `parquet.compression`)",
-                    FileFormat::Avro => " (see `avro.codec`)",
-                    _ => "",
-                }
-            )));
-        }
-        if self.mode == FileMode::Append && !is_appendable(format) {
-            return Err(FaucetError::Config(format!(
-                "file sink: `mode: append` cannot add to a {} file without rewriting it — use \
-                 JSON Lines or CSV, `mode: overwrite`, or rollover with a `{{part}}` template",
-                format.as_str()
-            )));
-        }
-        if self.write_mode == FileWriteMode::Overwrite && self.mode != FileMode::Overwrite {
-            return Err(FaucetError::Config(
-                "file sink: `write_mode: overwrite` replaces the whole output set, so `mode` \
-                 must be `overwrite`"
-                    .into(),
-            ));
-        }
-        if format == FileFormat::Csv {
-            self.csv.delimiter_byte()?;
-        }
-        if format == FileFormat::Avro
-            && let Some(schema) = &self.avro.schema
+        let settings = self.settings()?;
+        let (_, template) = faucet_common_file::write::NameTemplate::from_path(
+            &self.path,
+            settings.format,
+            settings.codec,
+            settings.rolls_over(),
+        )
+        .map_err(|e| faucet_common_file::config_context("file sink", e))?;
+        settings.validate_for(&template)
+    }
+
+    /// The storage-independent write settings for the shared writer.
+    pub fn settings(&self) -> Result<WriteSettings, FaucetError> {
+        let mut s = WriteSettings::new(self.resolved_format()?, self.resolved_compression());
+        s.opts = self.format_options();
+        s.parquet = self.parquet.clone();
+        s.json_lines = self.json_lines.clone();
+        s.mode = self.mode;
+        s.write_mode = self.write_mode;
+        s.max_records_per_file = self.max_records_per_file;
+        s.max_bytes_per_file = self.max_bytes_per_file;
+        #[cfg(feature = "encryption")]
         {
-            validate_avro_schema(schema)?;
+            s.encryption = self.encryption.clone();
         }
-        Ok(())
+        Ok(s)
     }
 
     /// The per-format option blocks in the shape the shared encoders want.
@@ -343,36 +299,6 @@ impl FileSinkConfig {
             faucet_core::BatchAtomicity::Atomic
         }
     }
-}
-
-fn require_feature(format: FileFormat) -> Result<(), FaucetError> {
-    let missing = match format {
-        FileFormat::Csv if !cfg!(feature = "file-format-csv") => Some("file-format-csv"),
-        FileFormat::Xml if !cfg!(feature = "file-format-xml") => Some("file-format-xml"),
-        FileFormat::Xlsx if !cfg!(feature = "file-format-excel") => Some("file-format-excel"),
-        FileFormat::Avro if !cfg!(feature = "file-format-avro") => Some("file-format-avro"),
-        FileFormat::Parquet if !cfg!(feature = "file-format-parquet") => {
-            Some("file-format-parquet")
-        }
-        _ => None,
-    };
-    match missing {
-        Some(feature) => Err(FaucetError::Config(format!(
-            "file sink: `{}` needs the `{feature}` build feature",
-            format.as_str()
-        ))),
-        None => Ok(()),
-    }
-}
-
-#[cfg(feature = "file-format-avro")]
-fn validate_avro_schema(schema: &serde_json::Value) -> Result<(), FaucetError> {
-    faucet_core::file_format::avro::parse_schema(schema).map(|_| ())
-}
-
-#[cfg(not(feature = "file-format-avro"))]
-fn validate_avro_schema(_: &serde_json::Value) -> Result<(), FaucetError> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -497,21 +423,9 @@ mod tests {
     #[cfg(feature = "file-formats")]
     #[test]
     fn validate_format_specific_rules() {
-        let e = cfg(json!({"path": "a.parquet.gz"}))
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("parquet.compression"), "{e}");
-        let e = cfg(json!({"path": "a.avro", "compression": "zstd"}))
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("avro.codec"), "{e}");
-        let e = cfg(json!({"path": "a.xlsx", "compression": "gzip"}))
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("xlsx"), "{e}");
+        for p in ["a.parquet.gz", "a.avro.zst", "a.xlsx.gz"] {
+            cfg(json!({ "path": p })).validate().unwrap();
+        }
         let e = cfg(json!({"path": "a.csv", "csv": {"delimiter": "ab"}}))
             .validate()
             .unwrap_err()
@@ -543,7 +457,7 @@ mod tests {
             (FileFormat::Parquet, cfg!(feature = "file-format-parquet")),
             (FileFormat::JsonLines, true),
         ] {
-            let r = require_feature(f);
+            let r = WriteSettings::new(f, Compression::None).validate();
             assert_eq!(r.is_ok(), has, "{f:?}");
         }
     }
@@ -572,5 +486,23 @@ mod tests {
             cfg(json!({"path": "a-{part}.jsonl.gz"})).resolved_compression(),
             Compression::Gzip
         );
+    }
+
+    #[test]
+    fn json_lines_and_encryption_builders_and_a_part_token_directory() {
+        let c = FileSinkConfig::new("out/x.jsonl").json_lines(JsonLinesOptions { pretty: true });
+        assert!(c.json_lines.pretty);
+        #[cfg(feature = "encryption")]
+        {
+            let spec: faucet_core::EncryptionSpec =
+                serde_json::from_value(json!({"key": "k"})).unwrap();
+            assert!(c.clone().encryption(spec).encryption.is_some());
+        }
+        let e = cfg(json!({"path": "out-{part}/x.jsonl"}))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("file sink: "), "{e}");
+        assert!(e.contains("may appear only in the file name"), "{e}");
     }
 }

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Additional coverage tests for `faucet-source-parquet`.
 //!
 //! These exercise branches not covered by `round_trip.rs` / `streaming.rs`:

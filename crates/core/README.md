@@ -209,7 +209,7 @@ RecordTransform::custom(|record| record);
 
 Built-in `RecordTransform` variants (each feature-gated `transform-<name>`; the `transforms` aggregate enables all): `flatten`, `rename_keys` (regex), `keys_case`, `select`, `drop`, `set`, `rename_field`, `cast` (`CastType` + `CastOnError`), `redact`, `value_case` (`ValueCaseMode`), `spell_symbols`, plus `Custom` closures.
 
-Reshape transforms compile to an object-safe `TransformStage::Custom` (1→0..N), so they need no dedicated stage-enum variant: `UnpivotSpec` (wide/map → long), `TreeFlattenSpec` (recursive report tree / matrix → one row per leaf — the accounting-report shape from QuickBooks/Xero/ZohoBooks/Rillet; feature `transform-tree-flatten`). Build one with `spec.into_stage()?`.
+Reshape transforms compile to an object-safe `TransformStage::Custom` (1→0..N), so they need no dedicated stage-enum variant: `UnpivotSpec` (wide/map → long), `TreeFlattenSpec` (recursive report tree / matrix → one row per leaf — the nested accounting-report shape; feature `transform-tree-flatten`). Build one with `spec.into_stage()?`.
 
 Stage-level transforms (`TransformStage`, in the `stage` module): `Map(RecordTransform)` (1→1), `Filter` (1→0|1), `Explode` (1→0..N), `CdcUnwrap` (normalize a CDC envelope into a flat row + `__op` marker — the standard pairing for an upsert sink), and `PageFn` (whole-page closure). Attach any set of stages to any source with `TransformingSource` — the canonical way library callers add transforms:
 
@@ -372,7 +372,7 @@ pipeline:
 
   dlq:
     sink:
-      type: jsonl
+      type: file
       config: { path: ./dlq/quality_failures.jsonl }
     max_failures_per_page: 50
     max_failures_total: 500

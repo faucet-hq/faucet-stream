@@ -52,12 +52,12 @@ fn offset_config(
     })
 }
 
-/// A ShopifyQL-style config that embeds the offset in the query STRING via
+/// A query-language config that embeds the offset in the query STRING via
 /// `${q_offset}` and pages by string substitution (#569).
 fn substitute_config(server: &MockServer, page_size: usize) -> GraphqlStreamConfig {
     GraphqlStreamConfig::new(
         server.uri(),
-        "{ shopifyqlQuery(query: \"FROM orders SHOW id LIMIT 250 OFFSET ${q_offset}\") \
+        "{ reportQuery(query: \"FROM orders SHOW id LIMIT 250 OFFSET ${q_offset}\") \
          { tableData { rowData } } }",
     )
     .records_path("$.data.orders[*]")
@@ -144,7 +144,7 @@ async fn offset_walks_two_pages_and_stops_on_short_page() {
     );
 }
 
-/// ShopifyQL string-substitution mode: the offset is baked into the query
+/// Query-string substitution mode: the offset is baked into the query
 /// STRING (`OFFSET ${q_offset}`), not sent as a variable. Assert the server
 /// sees the incremented offset in the query text and no `variables.q_offset`,
 /// and that pagination walks two pages and stops on the short one (#569).

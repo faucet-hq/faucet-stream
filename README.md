@@ -167,7 +167,7 @@ pipeline:
     on_drift: evolve
 
   dlq:                                    # quarantined rows land here; the run keeps going
-    sink: { type: jsonl, config: { path: ./dlq/orders.jsonl } }
+    sink: { type: file, config: { path: ./dlq/orders.jsonl } }
     max_failures_total: 1000              # ...unless too many fail
 
   sink:                                   # load: MERGE by id, so updated orders replace old rows
@@ -293,7 +293,7 @@ connector depends only on `faucet-core`, so any source works with any sink.
 - **Capabilities per connector** (streaming, resumable state, write modes, delivery guarantee, auth) are in the [connector matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html). For help choosing between overlapping connectors, see [choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html).
 - **File formats**: the file and object-store connectors read and write JSONL, JSON, CSV, Excel, XML, Parquet and Avro, and read ORC, chosen per file by extension or set explicitly ([file formats](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html)).
 - **Tier 1** connectors pass the [conformance battery](https://faucet-hq.github.io/faucet-stream/reference/conformance.html) in CI against a real backend or an official emulator.
-- **SaaS sources** such as Salesforce, HubSpot, Stripe and Jira are maintained as declarative templates on the REST and GraphQL engines, not as separate crates. Browse the [Template Hub](https://faucet-hq.github.io/hub) and run one with `faucet run --source <owner>/<system> --sink faucet-hq/bigquery` ([guide](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html)).
+- **SaaS sources** (CRM, payments, ticketing, advertising and analytics APIs) are maintained as declarative templates on the REST and GraphQL engines, not as separate crates. Browse the [Template Hub](https://faucet-hq.github.io/hub) and run one with `faucet run --source <owner>/<system> --sink faucet-hq/bigquery` ([guide](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html)).
 
 ## Performance
 
@@ -334,7 +334,7 @@ The CLI is a thin layer over a library, and the same engine is available through
 
 ```rust
 use faucet_stream::{Pipeline, RestStream, RestStreamConfig, PaginationStyle};
-use faucet_stream::sink::jsonl::{JsonlSink, JsonlSinkConfig};
+use faucet_stream::sink::file::{FileSink, FileSinkConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -346,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 param_name: "cursor".into(),
             }),
     )?;
-    let sink = JsonlSink::new(JsonlSinkConfig::new("./users.jsonl"));
+    let sink = FileSink::new(FileSinkConfig::new("./users.jsonl"))?;
 
     let result = Pipeline::new(&source, &sink).run().await?;
     println!("wrote {} records", result.records_written);

@@ -1,5 +1,5 @@
 # Async-job source (#514): submit an export job, poll until complete, download
-# the (CSV) result. The shape of Salesforce Bulk / Stripe Reporting exports.
+# the (CSV) result. The shape of bulk export and report-run APIs.
 #
 #   faucet validate cli/examples/rest_async_job.yaml
 #   faucet run      cli/examples/rest_async_job.yaml
@@ -21,5 +21,5 @@ pipeline:
       decode:
         - parse: { format: csv }
   sink:
-    type: jsonl
+    type: file
     config: { path: ./out/contacts.jsonl }

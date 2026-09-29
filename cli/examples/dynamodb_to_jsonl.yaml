@@ -18,7 +18,7 @@ pipeline:
       segments: 8            # parallel scan segments
       max_concurrency: 4     # segments read at once
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/dynamodb_orders.jsonl
   state:

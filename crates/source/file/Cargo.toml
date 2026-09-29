@@ -28,6 +28,7 @@ reqwest = { workspace = true, features = ["stream"] }
 arrow = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 [features]
 # Formats that need a dependency. JSON Lines, JSON arrays and raw text are
@@ -40,6 +41,8 @@ file-format-orc = ["faucet-core/file-format-orc", "arrow"]
 file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
 # The columnar (Arrow) path for Avro, ORC and Parquet.
 arrow = ["faucet-core/arrow", "dep:arrow"]
+# Decrypt files sealed by a sink's `encryption` block.
+encryption = ["faucet-core/encryption", "dep:base64"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
 
 [dev-dependencies]
@@ -52,6 +55,10 @@ async-trait.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 faucet-sink-parquet = { workspace = true, features = ["arrow"] }
+faucet-source-csv = { workspace = true, features = ["compression"] }
+faucet-source-parquet.workspace = true
+faucet-sink-jsonl = { workspace = true, features = ["encryption"] }
+base64.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

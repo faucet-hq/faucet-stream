@@ -67,6 +67,7 @@ struct WriterState {
 /// (independent of `config.append`) and starts a fresh encoder. This makes
 /// the per-page `flush` the pipeline emits for bookmarked pages safe for CDC
 /// sources — every transaction appends rather than truncates.
+#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
 pub struct CsvSink {
     config: CsvSinkConfig,
     state: Mutex<Option<WriterState>>,

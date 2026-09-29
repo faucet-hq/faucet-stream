@@ -1,8 +1,9 @@
-# Airtable → JSONL on disk.
+# Bearer-token REST API → JSONL on disk.
 #
-# Airtable's REST API is a plain bearer-authenticated, offset-token-paginated
-# JSON API, so faucet's generic `rest` source covers it end-to-end — no
-# dedicated connector crate is needed (issue #414).
+# A plain bearer-authenticated, offset-token-paginated JSON API needs no
+# dedicated connector crate: faucet's generic `rest` source covers it
+# end-to-end (issue #414). The API here is a placeholder — point `base_url`
+# and `path` at yours.
 #
 # How it maps onto the `rest` source:
 #   - Bearer / personal-access-token auth  → auth: { type: bearer }
@@ -10,43 +11,42 @@
 #   - The next-page token is `offset` in the body, sent back as the `offset`
 #     query param  → pagination: { type: Cursor, next_token_path: offset,
 #     param_name: offset }.  Pagination stops when `offset` is absent.
-#   - Airtable's 5 req/s per-base rate limit returns HTTP 429 with Retry-After;
-#     the rest source's built-in retry (max_retries / retry_backoff) honours it.
+#   - A per-account rate limit that answers HTTP 429 with Retry-After is
+#     honoured by the rest source's built-in retry (max_retries / retry_backoff).
 #
 # Required env vars:
-#   AIRTABLE_TOKEN — a personal access token with data.records:read scope
-#   AIRTABLE_BASE_ID — the base id, e.g. appXXXXXXXXXXXXXX
+#   API_TOKEN — a personal access token with read scope
+#   API_BASE_ID — the workspace/base id the records live in
 #
-#   faucet run cli/examples/airtable_to_jsonl.yaml
+#   faucet run cli/examples/rest_to_jsonl_bearer.yaml
 version: 1
-name: airtable_to_jsonl
+name: rest_to_jsonl_bearer
 
 vars:
-  base_id: ${env:AIRTABLE_BASE_ID}
+  base_id: ${env:API_BASE_ID}
   table: Contacts
 
 pipeline:
   source:
     type: rest
     config:
-      base_url: https://api.airtable.com
+      base_url: https://api.example.com
       path: /v0/${vars.base_id}/${vars.table}
       method: GET
       auth:
         type: bearer
         config:
-          token: ${env:AIRTABLE_TOKEN}
+          token: ${env:API_TOKEN}
       query_params:
         pageSize: "100"
-        # Optional: restrict to a view, or push a formula filter server-side.
-        # view: "Grid view"
-        # filterByFormula: "NOT({Status} = 'Archived')"
+        # Optional: push a filter server-side.
+        # filter: "status != 'archived'"
       records_path: "$.records"
       pagination:
         type: Cursor
         next_token_path: offset
         param_name: offset
-      # Airtable rate-limits at 5 req/s per base (HTTP 429 + Retry-After).
+      # A 429 + Retry-After is retried with backoff.
       max_retries: 5
       retry_backoff: 1
       tolerated_http_errors: []
@@ -56,13 +56,13 @@ pipeline:
       requests: []
       schema_sample_size: 100
 
-  # Each Airtable record is { id, createdTime, fields: {...} }. Flatten collapses
+  # Each record is { id, createdTime, fields: {...} }. Flatten collapses
   # the nested `fields` object into dotted top-level keys (fields.Name, …) for a
   # flatter downstream shape.
   transforms:
     - type: flatten
 
   sink:
-    type: jsonl
+    type: file
     config:
-      path: ./out/airtable_contacts.jsonl
+      path: ./out/contacts.jsonl

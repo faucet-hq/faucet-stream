@@ -61,6 +61,7 @@ pub mod excel;
 pub mod json;
 #[cfg(feature = "file-format-orc")]
 pub mod orc;
+pub mod parquet_io;
 #[cfg(feature = "file-format-xml")]
 pub mod xml;
 
@@ -196,15 +197,53 @@ fn default_delimiter() -> String {
 /// CSV dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("x-faucet-aliases" = ["write_headers"]))]
 pub struct CsvOptions {
     /// Field separator. A single character; `"\t"` is accepted for tabs.
     #[serde(default = "default_delimiter")]
     pub delimiter: String,
     /// Whether the first row names the fields. When false, fields are named
     /// `column_0`, `column_1`, … — the same fallback the REST source and the
-    /// `csv` connector already use.
-    #[serde(default = "default_true")]
+    /// `csv` connector already use. On write it decides whether a header row
+    /// is written; `write_headers` is accepted as another name for it.
+    #[serde(default = "default_true", alias = "write_headers")]
     pub has_headers: bool,
+    /// Quote character. A single byte; default `"`.
+    #[serde(default = "default_quote")]
+    pub quote: String,
+    /// Whether rows may have a different number of fields than the header.
+    /// `false` fails the read on the first ragged row, naming its line; `true`
+    /// keeps the fields the row has. Unset, each connector picks: the `file`
+    /// source is strict, the object-store sources and the REST source are
+    /// lenient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flexible: Option<bool>,
+    /// Cell values read as `null` instead of a string (e.g. `["", "NULL"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub null_values: Vec<String>,
+    /// What a streaming CSV writer does with a field the header does not
+    /// have. See [`CsvUnknownField`]. Whole-object encoders always write the
+    /// union of every record's fields, so it only affects the `file` sink.
+    #[serde(default)]
+    pub on_unknown_field: CsvUnknownField,
+}
+
+/// What a CSV writer does with a field that is not in the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CsvUnknownField {
+    /// Add it as a new column; earlier rows get an empty cell for it.
+    #[default]
+    Widen,
+    /// Fix the header from the first page and drop the field, logging a
+    /// warning once per field.
+    Warn,
+    /// Fix the header from the first page and fail the write naming the field.
+    Error,
+}
+
+fn default_quote() -> String {
+    "\"".into()
 }
 
 impl Default for CsvOptions {
@@ -212,6 +251,10 @@ impl Default for CsvOptions {
         Self {
             delimiter: default_delimiter(),
             has_headers: true,
+            quote: default_quote(),
+            flexible: None,
+            null_values: Vec::new(),
+            on_unknown_field: CsvUnknownField::Widen,
         }
     }
 }
@@ -223,18 +266,37 @@ impl CsvOptions {
     /// its first byte would split every row in the wrong place and produce
     /// plausible-looking garbage.
     pub fn delimiter_byte(&self) -> Result<u8, FaucetError> {
-        let d = match self.delimiter.as_str() {
-            "\\t" => "\t",
-            other => other,
-        };
-        let bytes = d.as_bytes();
-        match bytes.len() {
-            1 => Ok(bytes[0]),
-            _ => Err(FaucetError::Config(format!(
-                "csv.delimiter must be exactly one byte, got {:?}",
-                self.delimiter
-            ))),
-        }
+        single_byte("delimiter", &self.delimiter)
+    }
+
+    /// The quote character as a single byte.
+    pub fn quote_byte(&self) -> Result<u8, FaucetError> {
+        single_byte("quote", &self.quote)
+    }
+
+    /// Whether ragged rows are accepted, with `default` when unset.
+    pub fn flexible_or(&self, default: bool) -> bool {
+        self.flexible.unwrap_or(default)
+    }
+
+    /// Check the single-byte fields, so a bad dialect fails at load time.
+    pub fn validate(&self) -> Result<(), FaucetError> {
+        self.delimiter_byte()?;
+        self.quote_byte()?;
+        Ok(())
+    }
+}
+
+fn single_byte(name: &str, value: &str) -> Result<u8, FaucetError> {
+    let d = match value {
+        "\\t" => "\t",
+        other => other,
+    };
+    match d.as_bytes() {
+        [b] => Ok(*b),
+        _ => Err(FaucetError::Config(format!(
+            "csv.{name} must be exactly one byte, got {value:?}"
+        ))),
     }
 }
 
@@ -434,7 +496,7 @@ fn missing_feature(format: FileFormat, feature: &str) -> FaucetError {
 
 #[cfg(feature = "file-format-csv")]
 async fn decode_csv(bytes: &[u8], opts: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
-    csv::decode(bytes, opts.csv.delimiter_byte()?, opts.csv.has_headers).await
+    csv::decode_with(bytes, &opts.csv, true).await
 }
 
 #[cfg(not(feature = "file-format-csv"))]
@@ -444,7 +506,7 @@ async fn decode_csv(_: &[u8], _: &FormatOptions) -> Result<Vec<Value>, FaucetErr
 
 #[cfg(feature = "file-format-csv")]
 fn encode_csv(records: &[Value], opts: &FormatOptions) -> Result<Vec<u8>, FaucetError> {
-    csv::encode(records, opts.csv.delimiter_byte()?, opts.csv.has_headers)
+    csv::encode_with(records, &opts.csv)
 }
 
 #[cfg(not(feature = "file-format-csv"))]

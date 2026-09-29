@@ -51,7 +51,7 @@ pipeline:
     # those rows.  The adaptive controller uses the per-row error signal to
     # decide when to shrink the batch.
     sink:
-      type: jsonl
+      type: file
       config:
         path: ./dlq/orders_failed.jsonl
     on_batch_error: dlq_all

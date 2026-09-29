@@ -56,7 +56,7 @@ pipeline:
         created_at: 1
       limit: 100000
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./orders.jsonl
 ```

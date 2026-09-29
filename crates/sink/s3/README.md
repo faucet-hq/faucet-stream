@@ -12,8 +12,8 @@ Reach for it to land any faucet-stream source — a REST API, a database, a Kafk
 ## Feature highlights
 
 - **JSON Lines (NDJSON) output** — each object is newline-delimited JSON, uploaded with `Content-Type: application/x-ndjson`. Reads back cleanly in Spark, Athena, DuckDB, `jq`, and the [`faucet-source-s3`](https://crates.io/crates/faucet-source-s3) JSONL reader.
-- **Concurrent uploads** — chunks are serialized up front and uploaded in parallel via `futures::stream::buffer_unordered`, bounded by `concurrency` (default 10).
-- **File splitting** — `max_records_per_file` caps records per object; `batch_size` re-chunks each `write_batch` call. The effective per-object cap is the smaller of the two.
+- **Pipelined uploads** — a closed object uploads in the background while the next one is encoded, up to `concurrency` (default 10) in flight; a large object's multipart parts also go up `concurrency` at a time.
+- **File splitting** — records accumulate across pages; `max_records_per_file` (else `batch_size`) caps records per object, `max_bytes_per_file` bytes.
 - **S3-compatible endpoints** — point `endpoint_url` at MinIO, LocalStack, Cloudflare R2, Backblaze B2, or any S3 API.
 - **AWS credential chain** — credentials resolve through the standard AWS SDK chain (env vars, shared credentials file, IAM instance/task roles, SSO) — no secrets in the config.
 - **Optional compression** — gzip / zstd / auto behind the crate-local `compression` feature; the codec auto-resolves from the file extension.
@@ -75,7 +75,7 @@ This writes `s3://my-data-lake/events/raw/<uuid>.jsonl` objects, each holding up
 | `prefix` | string | `""` | Key prefix for written objects (e.g. `"data/events/"`). Combined as `{prefix}{uuid}{file_extension}`. |
 | `region` | string | *(SDK default)* | AWS region. When unset, the AWS SDK resolves it from the environment / config. |
 | `endpoint_url` | string | *(unset)* | Custom endpoint for S3-compatible services (MinIO, LocalStack, R2, …). |
-| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `avro` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained ZSTD-compressed Parquet files and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
+| `format` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` \| `avro` \| `parquet` | `json_lines` | Object format. `parquet` (requires the `arrow` feature) writes self-contained Parquet files (ZSTD by default, `parquet.compression`) and enables the columnar fast path — see [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode); the rest are [file formats](#file-formats-604). |
 | `file_extension` | string | `".jsonl"` | Extension appended to each object key. Append `.gz` / `.zst` here when using compression so consumers can detect the codec. |
 
 ### Batching & file splitting
@@ -83,8 +83,8 @@ This writes `s3://my-data-lake/events/raw/<uuid>.jsonl` objects, each holding up
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_records_per_file` | int | *(unset)* | Maximum records per object. When unset, all records in a `write_batch` call go to one object. |
-| `concurrency` | int | `10` | Maximum number of concurrent object uploads. Bounds peak memory together with object size. |
-| `batch_size` | int | `1000` | Records per object written by a single `write_batch` call (write-side re-chunking). `0` = no re-chunking — see [Streaming & batching](#streaming--batching). **`0` is the recommended value for S3.** |
+| `concurrency` | int | `10` | Maximum uploads in flight (objects, and a large object's multipart parts). See [Streaming & batching](#streaming--batching). |
+| `batch_size` | int | `1000` | Records per object when `max_records_per_file` is unset (without `path`). `0` = no record cap: one object per `flush` (Parquet: one per `write_batch`) — see [Streaming & batching](#streaming--batching). |
 
 ### Format (compression feature)
 
@@ -165,17 +165,16 @@ pipeline:
 
 ## Streaming & batching
 
-The pipeline calls `Sink::write_batch` once per upstream page. Inside a call, `batch_size` and `max_records_per_file` together decide how many objects that page becomes:
+Records accumulate across `write_batch` calls into one open object, built in a local scratch file. An object closes at the per-object cap — `max_records_per_file`, else `batch_size` (the smaller when both are set) — at `max_bytes_per_file`, or at `flush`, which the pipeline calls at every bookmark-carrying page and at the end of the run.
 
-- The effective per-object cap is `min(batch_size, max_records_per_file)` when both are set, whichever single one is set, or **unbounded** when both are `0` / unset (the whole page becomes one object).
-- With a cap of `M`, a page of `N` records is written as `ceil(N / M)` objects, each holding at most `M` records (the last holds the remainder).
-- **`batch_size = 0` is the "no batching" sentinel:** the sink writes whatever upstream hands it without re-chunking (still honouring `max_records_per_file` if set).
+- **Uploads are pipelined.** A closed object is handed to a background upload and the sink keeps encoding the next one; up to `concurrency` uploads are in flight, and a close past that waits for a slot. Every `write_batch` waits for the uploads it started before returning, so a failed upload fails the page that wrote it (and a DLQ gets the right rows); `flush` and the overwrite commit likewise return only after every upload has landed, so a bookmark never passes an object that is not in the store. An aborted overwrite waits for in-flight uploads, then removes the staged objects.
+- **`batch_size = 0` is the "no re-chunking" sentinel** (without `path`): no record cap. JSON Lines and the whole-object formats write one object per `flush`; Parquet writes one object per `write_batch` call (as the sink always has), so a page stays one self-contained file. With `path` set, `batch_size` is ignored and objects follow the path's `{part}` rollover.
+- Scratch files are local and never fsynced — they are uploaded, then deleted.
 
-**Recommended: `batch_size: 0`.** S3 is the canonical case where one large object beats many small ones — per-request overhead, slower downstream scans, and LIST/PUT cost all compound with tiny objects. Most sources already size each page via their own `batch_size` (REST page, sqlx cursor chunk, Kafka poll, …), so let that drive object sizing.
+Many tiny objects are a well-known anti-pattern (per-request overhead, slower downstream scans, LIST/PUT cost), so size objects with `max_records_per_file` / `max_bytes_per_file` rather than a small `batch_size`.
 
 This connector reports observability metrics under the label `connector="s3"`.
 
-> **Memory ceiling.** Each object's body is buffered fully in memory before a single-shot `PutObject` (and, with compression on, briefly held as both raw and compressed). Up to `concurrency` objects upload at once, so peak memory is roughly **`concurrency` × object-size × ~2**. Pair `batch_size: 0` with a *streaming* source that sizes its own pages, or cap memory via `max_records_per_file` / lower `concurrency`. Streaming multipart upload for very large objects is a future enhancement.
 
 ## Arrow columnar (Parquet) mode
 
@@ -298,21 +297,20 @@ println!("Transferred {} records to S3", result.records_written);
 
 ## How it works
 
-1. `new()` validates `batch_size` and builds an S3 client **once** via the AWS SDK default credential chain, applying `region` / `endpoint_url` overrides if set.
-2. `write_batch()` computes the effective per-object cap (`min(batch_size, max_records_per_file)`) and splits the page into chunks.
-3. Each chunk is serialized to a JSON Lines body and assigned a UUID-based key (`{prefix}{uuid}{file_extension}`) *before* any upload begins.
-4. Chunks upload concurrently via `buffer_unordered(concurrency)` as single-shot `PutObject` calls with `Content-Type: application/x-ndjson`.
-5. With the `compression` feature, each body is compressed in memory just before upload using the codec resolved from `file_extension`.
+1. `new()` validates the config and builds an S3 client **once** via the AWS SDK default credential chain, applying `region` / `endpoint_url` overrides if set.
+2. `write_batch()` hands the page to the shared file writer, which encodes it into the open object's local scratch file.
+3. The object closes at the row / byte cap or at `flush` and is uploaded once — a single `PutObject` up to 8 MiB, a multipart upload beyond it — with a `Content-Type` from its extension.
+4. `compression` (the `compression` feature) is applied to the whole object before upload, resolved from `path` or `file_extension`.
 
 ## Object key format
 
-Each object is keyed `{prefix}{uuid}{file_extension}`. With `prefix = "events/"` and `file_extension = ".jsonl"`:
+Without `path`, each object is keyed `{prefix}{run id}-{part}{file_extension}`, where the run id is a time-ordered UUID fresh for each sink instance and `{part}` counts objects from `00001`. With `prefix = "events/"` and `file_extension = ".jsonl"`:
 
 ```
-events/a1b2c3d4-e5f6-7890-abcd-ef1234567890.jsonl
+events/01a0ecba-c433-70b7-9245-73029acfe6c2-00001.jsonl
 ```
 
-UUID keys make writes idempotent-safe against collisions but mean re-runs append new objects rather than overwriting — downstream consumers should treat the prefix as append-only.
+Keys are never reused, so re-runs add new objects rather than overwriting — treat the prefix as append-only, or set `path` for deterministic names.
 
 ## Lineage dataset URI
 
@@ -436,9 +434,50 @@ avro:
 ORC is read-only, so there is no `orc` format here. Enable with
 `file-format-avro` (or `file-formats`).
 
+## Shared file writer (#777)
+
+This sink writes through the same file-writing layer as the local
+[`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
+format and option the file sink does, with the same field names:
+
+| Field | Values | Notes |
+|---|---|---|
+| `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `path`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
+| `path` | a name template | object name template: `{part}` numbers the objects, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` objects. |
+| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when an object of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's objects under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`** — the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each object's first page and widened by later pages. |
+| `json_lines` | `pretty` | |
+| `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+
+`mode` and `write_mode: overwrite` need `path`: without it every run
+writes new, uniquely named objects (`<run id>-<part><file_extension>`), so
+there is nothing to replace or append to.
+
+**Publishing.** Each object is built in a local scratch file and published
+with one upload (multipart past 8 MiB, parts in parallel up to `concurrency`, completed only after every part landed and aborted on failure) when it closes — at `max_records_per_file` /
+`max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
+partial object, and a bookmark never advances past records that are not
+there.
+
+Object keys are `prefix + path`.
+
+```yaml
+sink:
+  type: s3
+  config:
+    # … connection fields …
+    path: "dt=${now.date}/part-{part}.parquet"
+    format: auto
+    max_records_per_file: 1000000
+    parquet: { compression: zstd, row_group_size: 131072 }
+```
+
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** for an unchunked Parquet write (`format: parquet`, `batch_size: 0`, no `max_records_per_file`), otherwise **best-effort** — only an unchunked Parquet batch is one object upload. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** without a rollover cap —
+a page is encoded locally and published only at `flush` — otherwise
+**best-effort**: objects closed at an earlier cap stay. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

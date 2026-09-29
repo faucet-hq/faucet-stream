@@ -28,7 +28,8 @@ Connection, authentication, and host-key verification come from
 | `path` | string | — | Remote directory prefix under which objects are written. |
 | `format` | enum | `json_lines` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` — see [File formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Extension for written objects. |
-| `batch_size` | integer | `1000` | Records per object; `0` = one object per `write_batch` call. |
+| `batch_size` | integer | `1000` | Records per file when `max_records_per_file` is unset (without `file_name`). `0` = no record cap: one file per `flush`; Parquet one per `write_batch`. |
+| `concurrency` | integer | `4` | File uploads in flight over the SSH session: a closed file uploads in the background while the next is encoded. `flush` waits for every upload. |
 
 The sink opens the SSH connection lazily on the first write and reuses it. It
 attempts to create the target directory on first connect (best-effort).
@@ -78,6 +79,13 @@ overhead outweighs the bytes.
 With neither cap set the whole run lands in one object, closed at `flush` —
 which the pipeline calls at every bookmark-carrying page and at the end, so
 the remainder is always written before a bookmark advances.
+
+Closed files upload in the background while the next one is encoded, up to
+`concurrency` at a time; every `write_batch` waits for the uploads it started
+(so a failed upload fails the page that wrote it) and `flush` waits for all of
+them. `batch_size: 0` removes the record cap: one file per `flush`, and for
+Parquet one file per `write_batch` call, so each page stays a self-contained
+file.
 
 ## File formats (#604)
 
@@ -136,9 +144,50 @@ avro:
 ORC is read-only, so there is no `orc` format here. Enable with
 `file-format-avro` (or `file-formats`).
 
+## Shared file writer (#777)
+
+This sink writes through the same file-writing layer as the local
+[`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
+format and option the file sink does, with the same field names:
+
+| Field | Values | Notes |
+|---|---|---|
+| `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `file_name`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
+| `file_name` | a name template | file name template: `{part}` numbers the files, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` files. |
+| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when a file of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's files under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`**, like the S3 and GCS sinks — smaller objects to move; the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each file's first page and widened by later pages. |
+| `json_lines` | `pretty` | |
+| `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+
+`mode` and `write_mode: overwrite` need `file_name`: without it every run
+writes new, uniquely named files (`<run id>-<part><file_extension>`), so
+there is nothing to replace or append to.
+
+**Publishing.** Each file is built in a local scratch file and published
+with one upload to a hidden temporary name followed by a rename into place when it closes — at `max_records_per_file` /
+`max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
+partial file, and a bookmark never advances past records that are not
+there.
+
+Files land under `path`. SFTP has no replacing rename, so replacing an existing file (`mode: overwrite` on a fixed name, or promoting a staged file over an existing one) removes it first; new names are published atomically.
+
+```yaml
+sink:
+  type: sftp
+  config:
+    # … connection fields …
+    file_name: "dt=${now.date}/part-{part}.parquet"
+    format: auto
+    max_records_per_file: 1000000
+    parquet: { compression: zstd, row_group_size: 131072 }
+```
+
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **best-effort** — each file is atomic, but one batch can span several files. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** without a rollover cap —
+a page is encoded locally and published only at `flush` — otherwise
+**best-effort**: files closed at an earlier cap stay. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

@@ -49,13 +49,13 @@ async fn rest_source_authenticates_with_a_service_account_ref() {
     let yaml = format!(
         r#"
 version: 1
-name: ga4
+name: sheets
 auth:
   google:
     type: google_service_account
     config:
       key_file: "{key}"
-      scopes: ["https://www.googleapis.com/auth/analytics.readonly"]
+      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 pipeline:
   source:
     type: rest

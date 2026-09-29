@@ -72,7 +72,7 @@ each. Highlights:
 
 - `filter` — keep records where a JSONPath predicate is true. See the cookbook for the operator set and path syntax.
 - `explode` — expand an array field into one record per element. See the cookbook for the merge rule and `on_missing` semantics.
-- `zip_columns` — zip a positional report into one object per row: one header list (`columns_path`) or several header + cell-array `groups` (`from`, `header`, `header_label?`, `value?` — GA4 `runReport`'s dimensions and metrics). A width mismatch or a column two groups both name fails the page.
+- `zip_columns` — zip a positional report into one object per row: one header list (`columns_path`) or several header + cell-array `groups` (`from`, `header`, `header_label?`, `value?` — a `runReport` response's dimensions and metrics). A width mismatch or a column two groups both name fails the page.
 
 Source-side incremental replication (`replication_method`, `replication_key`,
 `replication_bind`) is configured per connector: `rest` binds the bookmark into
@@ -102,8 +102,8 @@ pipeline:
 version: 1
 name: composed-pipeline
 pipeline:
-  source: { type: csv,   config: { path: ./data/input.csv } }
-  sink:   { type: jsonl, config: { path: ./out/dev.jsonl } }
+  source: { type: file, config: { path: ./data/input.csv } }
+  sink:   { type: file, config: { path: ./out/dev.jsonl } }
 profiles:
   dev:  { pipeline: { sink: { config: { path: ./out/dev.jsonl } } } }
   prod: { pipeline: { sink: { config: { path: ./out/prod.jsonl } } } }
@@ -300,8 +300,8 @@ load-time errors.
 ```yaml
 params:
   region:          { default: com }
-  accounts_domain: { computed: "${map:region|ca=zohocloud|*=zoho}" }
-# region=ca → accounts.zohocloud.ca ; anything else → accounts.zoho.<region>
+  accounts_domain: { computed: "${map:region|ca=examplecloud|*=example}" }
+# region=ca → accounts.examplecloud.ca ; anything else → accounts.example.<region>
 ```
 
 `${map:NAME|…}` also works inline in a source/sink config value, not only in a
@@ -391,7 +391,7 @@ pipeline:
       type: rest
       config: { method: GET, base_url: "https://api.example.com", path: "/", auth: { type: none },
                 query_params: {}, pagination: { type: None }, replication_method: { type: FullTable } }
-  sink: { type: jsonl, config: { path: "./out/${subs.subsidiary_id}-${flds.field_id}.jsonl" } }
+  sink: { type: file, config: { path: "./out/${subs.subsidiary_id}-${flds.field_id}.jsonl" } }
 
 matrix:
   - id: subs                  # discovery dimension
@@ -443,7 +443,7 @@ See `cli/examples/discovery_matrix.yaml`.
 Some APIs need a **second** discovery step *per discovered value*, then the
 whole result injected into one request — the classic case being "discover the
 object types, then discover each type's fields, then read each type asking for
-all its fields" (HubSpot custom objects, Salesforce `describe`, Airtable, …).
+all its fields" (CRM custom objects, object-describe endpoints, spreadsheet-style bases, …).
 Two additions cover it:
 
 - **Chained discovery** — a `fan_out:` row may itself carry `for_each: [dims]`,
@@ -458,18 +458,18 @@ Two additions cover it:
 ```yaml
 matrix:
   - id: types                      # 1. object types
-    fan_out: { source: { ref: hs_schemas }, select: "$.name", as: name }
+    fan_out: { source: { ref: type_schemas }, select: "$.name", as: name }
   - id: props                      # 2. per type, collect its property names
     for_each: [types]
     fan_out:
-      source: { ref: hs_properties, config: { path: "/crm/v3/properties/${types.name}" } }
+      source: { ref: type_properties, config: { path: "/crm/v3/properties/${types.name}" } }
       select: "$.name"
       as: name
       collect: true
   - id: records                    # 3. per type, read with the whole list at once
     for_each: [types]
     source:
-      ref: hs_objects
+      ref: type_objects
       config:
         path: "/crm/v3/objects/${types.name}"
         query_params: { properties: "${props.name}" }
@@ -477,7 +477,7 @@ matrix:
 
 Guards: a chained `fan_out:` row (`for_each:` present) must set `collect: true`;
 `collect: true` requires `for_each:`; chained-discovery cycles are rejected at
-load time. See `cli/examples/hubspot_custom_objects.yaml`.
+load time. See `cli/examples/discovered_custom_objects.yaml`.
 
 ## `pipeline.nodes` / `pipeline.edges` (topology mode)
 
@@ -901,7 +901,7 @@ as *rows × row width* from each dataset's row estimate and column types —
 than a 122k-row × 100-column one. Set `weight` by hand when you know better.
 
 The win depends on duration correlating with weight. For sources whose runtime
-is dominated by a server-side queue (Salesforce Bulk, say), the estimate is a
+is dominated by a server-side queue (a bulk export API, say), the estimate is a
 proxy rather than a prediction — LPT still cannot do worse than declared order,
 but it may not help as much.
 
@@ -1032,7 +1032,7 @@ prints the full list.
 | `replication_bind.path` | — | `into: body` only: a JSON Pointer into `body` (`/filterGroups/0/filters/0/value`) instead of a top-level `name`. Set exactly one of `name` / `path`; the pointer must resolve to an existing value or a new key of an existing object. |
 | `replication_bind.value_type` | `string` | `number` writes the rendered bookmark as a JSON number. |
 | `window.lower` / `window.upper` `.path`, `.value_type` | — | Same as the two above, for window bounds (e.g. `/dateRanges/0/startDate`). |
-| `window.*.template` placeholders | `${window}` | `${window}` is the bind's own boundary; `${window.start}` / `${window.end}` render the window's start and granularity-adjusted end in any bind, so one bind can carry both (GAQL `segments.date BETWEEN '${window.start}' AND '${window.end}'`). |
+| `window.*.template` placeholders | `${window}` | `${window}` is the bind's own boundary; `${window.start}` / `${window.end}` render the window's start and granularity-adjusted end in any bind, so one bind can carry both (a report query's `segments.date BETWEEN '${window.start}' AND '${window.end}'`). |
 | `window.upper` | — | Optional when `lower.template` contains `${window.end}`; only `lower` is then applied. Omitting it otherwise is rejected (unbounded above). |
 
 **`rest` — pagination and CSV**
@@ -1041,7 +1041,7 @@ prints the full list.
 |-------|---------|---------|
 | `pagination.body_cursor_field` (`CursorInBody`) | — | A top-level body field, or a JSON Pointer such as `/variables/after`. |
 | `pagination.offset_field` / `limit_field` (`OffsetInBody`) | — | Likewise a field name or a JSON Pointer. |
-| `csv_null_values` | `[]` | CSV fields equal to a listed string decode as `null` (`[""]` for Salesforce Bulk results). Applies to `response_format: csv` and `parse: { format: csv }` decode steps. |
+| `csv_null_values` | `[]` | CSV fields equal to a listed string decode as `null` (`[""]` for bulk-export results that write null as an empty field). Applies to `response_format: csv` and `parse: { format: csv }` decode steps. |
 
 With `LinkHeader` / `NextLinkInBody` pagination, next-page links are resolved
 against the request URL (relative links work), and query binds are sent on the

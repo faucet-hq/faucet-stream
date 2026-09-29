@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end reads through `FileSource` against real files on disk and a
 //! wiremock HTTP server (#720, #719).
 #![cfg(feature = "file-formats")]

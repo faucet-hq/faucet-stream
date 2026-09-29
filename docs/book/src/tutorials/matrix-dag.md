@@ -15,7 +15,7 @@ version: 1
 name: multi_region
 pipeline:
   source: { type: rest, config: { base_url: https://api.example.com, method: GET } }
-  sink:   { type: jsonl, config: {} }
+  sink:   { type: file, config: { format: json_lines } }
 execution:
   max_concurrent: 4
   on_error: continue   # or `stop`
@@ -38,7 +38,7 @@ version: 1
 name: dag_users_posts
 pipeline:
   source: { type: rest, config: { base_url: https://api.example.com, method: GET, records_path: $.data[*] } }
-  sink:   { type: jsonl, config: { append: false } }
+  sink:   { type: file, config: { format: json_lines } }
 matrix:
   # Root: fetch the users list once.
   - id: users

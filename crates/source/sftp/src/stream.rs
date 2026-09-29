@@ -35,7 +35,8 @@ enum Fetched {
         feature = "file-format-xml",
         feature = "file-format-excel",
         feature = "file-format-avro",
-        feature = "file-format-orc"
+        feature = "file-format-orc",
+        feature = "arrow"
     ))]
     Records(Vec<Value>),
     /// A whole Avro or ORC file (#719). Decoded in listing order by the page
@@ -45,6 +46,11 @@ enum Fetched {
     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
     Container(Vec<u8>),
 }
+
+#[cfg(feature = "arrow")]
+type ColumnarStream<'a> = Pin<
+    Box<dyn Stream<Item = Result<faucet_core::columnar::ColumnarPage, FaucetError>> + Send + 'a>,
+>;
 
 /// An SFTP source that lists and reads remote files.
 pub struct SftpSource {
@@ -133,6 +139,8 @@ impl SftpSource {
             allow(unused_variables)
         )]
         opts: &faucet_core::FormatOptions,
+        #[cfg_attr(not(feature = "arrow"), allow(unused_variables))]
+        parquet: &faucet_core::ParquetReadOptions,
     ) -> Result<Fetched, FaucetError> {
         Ok(match format {
             SftpFormat::Jsonl => Fetched::Lines(
@@ -152,6 +160,15 @@ impl SftpSource {
             SftpFormat::Avro => Fetched::Container(Self::read_file(sftp, path).await?),
             #[cfg(feature = "file-format-orc")]
             SftpFormat::Orc => Fetched::Container(Self::read_file(sftp, path).await?),
+            #[cfg(feature = "arrow")]
+            SftpFormat::Parquet => {
+                let (_, batches) = Self::read_parquet(sftp, path, parquet, 0).await?;
+                let mut records = Vec::new();
+                for b in &batches {
+                    records.extend(faucet_core::columnar::record_batch_to_values(b)?);
+                }
+                Fetched::Records(records)
+            }
         })
     }
 
@@ -161,12 +178,80 @@ impl SftpSource {
         feature = "file-format-xml",
         feature = "file-format-excel",
         feature = "file-format-avro",
-        feature = "file-format-orc"
+        feature = "file-format-orc",
+        feature = "arrow"
     ))]
     async fn read_file(sftp: &SftpSession, path: &str) -> Result<Vec<u8>, FaucetError> {
         sftp.read(path)
             .await
             .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))
+    }
+
+    /// Read one Parquet file whole and decode it (projected by `parquet`) on
+    /// a blocking thread.
+    #[cfg(feature = "arrow")]
+    async fn read_parquet(
+        sftp: &SftpSession,
+        path: &str,
+        parquet: &faucet_core::ParquetReadOptions,
+        batch_size: usize,
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
+        let bytes = Self::read_file(sftp, path).await?;
+        let opts = parquet.clone();
+        let display = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            faucet_core::file_format::parquet_io::read_bytes(
+                bytes.into(),
+                &opts,
+                batch_size,
+                &display,
+            )
+        })
+        .await
+        .map_err(|e| {
+            FaucetError::Source(format!("SFTP parquet decode for '{path}' panicked: {e}"))
+        })?
+    }
+
+    /// Avro / ORC files as Arrow batches, each resolved against the first
+    /// file's schema.
+    #[cfg(all(
+        feature = "arrow",
+        any(feature = "file-format-avro", feature = "file-format-orc")
+    ))]
+    fn container_batches<'a>(
+        &'a self,
+        sftp: &'a SftpSession,
+        files: Vec<String>,
+    ) -> Result<ColumnarStream<'a>, FaucetError> {
+        let decoder = self.container_decoder()?.ok_or_else(|| {
+            FaucetError::Source(
+                "SFTP source: stream_batches needs format avro, orc or parquet".into(),
+            )
+        })?;
+        Ok(Box::pin(
+            faucet_core::file_format::container::columnar_pages(
+                files,
+                self.config.concurrency,
+                decoder,
+                self.config.batch_size,
+                move |file| async move { Self::read_file(sftp, &file).await },
+            ),
+        ))
+    }
+
+    #[cfg(all(
+        feature = "arrow",
+        not(any(feature = "file-format-avro", feature = "file-format-orc"))
+    ))]
+    fn container_batches<'a>(
+        &'a self,
+        _sftp: &'a SftpSession,
+        _files: Vec<String>,
+    ) -> Result<ColumnarStream<'a>, FaucetError> {
+        Err(FaucetError::Source(
+            "SFTP source: stream_batches needs format avro, orc or parquet".into(),
+        ))
     }
 
     /// A decoder for the configured container format, or `None` for every
@@ -264,12 +349,13 @@ impl faucet_core::Source for SftpSource {
             let format = self.config.format;
             let opts = self.config.format_options();
             let opts = &opts;
+            let parquet = &self.config.parquet;
             let concurrency = self.config.concurrency.max(1);
             let mut fetched = futures::stream::iter(files.iter().cloned())
                 .map(|file| {
                     let sftp = &sftp;
                     async move {
-                        let payload = Self::fetch(sftp, &file, format, opts).await;
+                        let payload = Self::fetch(sftp, &file, format, opts, parquet).await;
                         (file, payload)
                     }
                 })
@@ -379,7 +465,8 @@ impl faucet_core::Source for SftpSource {
                         feature = "file-format-xml",
                         feature = "file-format-excel",
                         feature = "file-format-avro",
-                        feature = "file-format-orc"
+                        feature = "file-format-orc",
+                        feature = "arrow"
                     ))]
                     Fetched::Records(records) => {
                         // CSV / XML / Excel (#604): already decoded at fetch
@@ -428,25 +515,27 @@ impl faucet_core::Source for SftpSource {
         "sftp"
     }
 
-    /// Avro and ORC files decode straight to Arrow, so they take the columnar
-    /// path; every other format stays on the row path (#719).
-    #[cfg(all(
-        feature = "arrow",
-        any(feature = "file-format-avro", feature = "file-format-orc")
-    ))]
+    /// Avro, ORC and Parquet files decode straight to Arrow, so they take the
+    /// columnar path; every other format stays on the row path (#719, #777).
+    #[cfg(feature = "arrow")]
     fn supports_columnar(&self) -> bool {
-        self.config
+        if matches!(self.config.format, SftpFormat::Parquet) {
+            return true;
+        }
+        #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
+        return self
+            .config
             .format
             .shared()
-            .is_some_and(|f| f.is_container())
+            .is_some_and(|f| f.is_container());
+        #[cfg(not(any(feature = "file-format-avro", feature = "file-format-orc")))]
+        false
     }
 
-    /// Stream Avro / ORC files as Arrow batches, in listing order, each file
-    /// resolved against the first one's schema.
-    #[cfg(all(
-        feature = "arrow",
-        any(feature = "file-format-avro", feature = "file-format-orc")
-    ))]
+    /// Stream Avro / ORC files (each resolved against the first one's schema)
+    /// or Parquet files (projected by `parquet.columns`) as Arrow batches, in
+    /// listing order.
+    #[cfg(feature = "arrow")]
     fn stream_batches<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
@@ -457,23 +546,31 @@ impl faucet_core::Source for SftpSource {
         >,
     > {
         Box::pin(async_stream::try_stream! {
-            let decoder = match self.container_decoder()? {
-                Some(d) => d,
-                None => Err(FaucetError::Source(
-                    "SFTP source: stream_batches needs format avro or orc".into(),
-                ))?,
-            };
             let sftp = connect(&self.config.connection).await?;
             let path = self.effective_path(context);
             let files = self.resolve_files(&sftp, &path).await?;
-            let sftp = &sftp;
-            let mut pages = faucet_core::file_format::container::columnar_pages(
-                files,
-                self.config.concurrency,
-                decoder,
-                self.config.batch_size,
-                |file| async move { Self::read_file(sftp, &file).await },
-            );
+            if matches!(self.config.format, SftpFormat::Parquet) {
+                let mut first: Option<arrow::datatypes::SchemaRef> = None;
+                for file in files {
+                    let (schema, batches) =
+                        Self::read_parquet(&sftp, &file, &self.config.parquet, self.config.batch_size).await?;
+                    match &first {
+                        Some(f) if !faucet_core::columnar::schema_eq(f, &schema) => {
+                            Err(FaucetError::Source(format!(
+                                "SFTP parquet file '{file}' has a different schema from the \
+                                 first file in the listing"
+                            )))?;
+                        }
+                        Some(_) => {}
+                        None => first = Some(schema),
+                    }
+                    for batch in batches {
+                        yield faucet_core::columnar::ColumnarPage::new(batch, None);
+                    }
+                }
+                return;
+            }
+            let mut pages = self.container_batches(&sftp, files)?;
             while let Some(page) = pages.next().await {
                 yield page?;
             }

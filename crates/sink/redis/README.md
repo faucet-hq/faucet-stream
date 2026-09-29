@@ -105,7 +105,7 @@ Fan records out to consumers reading from one end of a Redis list:
 version: 1
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./jobs.csv
   sink:

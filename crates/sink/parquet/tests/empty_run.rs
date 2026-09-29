@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! #753 (parquet): a fixed `*.parquet` path reflects the latest successful run.
 //! An empty successful run removes the previous file (no schema exists to write
 //! a valid empty one); failed and cancelled runs keep it.

@@ -1,10 +1,13 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-//! Config types shared by the local file source and sink.
+//! Config types shared by the local file source and sink, and the shared
+//! file-writing layer ([`write`](mod@write)) every file-writing sink builds on.
 
 use faucet_core::compression::{Compression, CompressionConfig};
 use faucet_core::{FaucetError, FileFormat};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+pub mod write;
 
 /// Which format a file is in: resolved from its extension (`auto`) or fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -129,6 +132,15 @@ pub fn require_path(connector: &str, path: &str) -> Result<(), FaucetError> {
         return Err(FaucetError::Config(format!("{connector}: `path` is empty")));
     }
     Ok(())
+}
+
+/// Prefix a [`FaucetError::Config`] message with `connector`; any other
+/// error passes through unchanged.
+pub fn config_context(connector: &str, e: FaucetError) -> FaucetError {
+    match e {
+        FaucetError::Config(m) => FaucetError::Config(format!("{connector}: {m}")),
+        other => other,
+    }
 }
 
 /// Whether `path` is an `http://` or `https://` URL.
@@ -267,5 +279,17 @@ mod tests {
             serde_json::to_string(&FileFormatChoice::Auto).unwrap(),
             "\"auto\""
         );
+    }
+
+    #[test]
+    fn config_context_prefixes_only_config_errors() {
+        assert_eq!(
+            config_context("S3 sink", FaucetError::Config("bad".into())).to_string(),
+            FaucetError::Config("S3 sink: bad".into()).to_string()
+        );
+        assert!(matches!(
+            config_context("S3 sink", FaucetError::Sink("io".into())),
+            FaucetError::Sink(m) if m == "io"
+        ));
     }
 }

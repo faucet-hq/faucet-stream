@@ -52,7 +52,7 @@ pipeline:
           path: /run/secrets/gcp-sa.json
       file_format: json_lines
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./events.jsonl
 ```
@@ -297,6 +297,21 @@ pipeline:
     type: delta
     config:
       table_uri: ./out/events
+```
+
+### Column projection (`parquet.columns`, #777)
+
+`parquet.columns` decodes only the named top-level columns. The projection is
+applied from the footer before any row group is read, on the ranged path and on
+the whole-object path alike, so unread columns are never transferred or
+decoded. A name an object does not have fails the run with an error naming the
+object and its columns. Names containing dots are matched as whole column
+names.
+
+```yaml
+file_format: parquet
+parquet:
+  columns: [id, amount]
 ```
 
 Enable it with `cargo add faucet-source-gcs --features arrow` (library) or `cargo install faucet-cli --features "source-gcs,arrow"` (CLI).

@@ -18,7 +18,7 @@ every style has a loop/termination guard so a misbehaving API can't loop forever
 
 > An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an
 > empty page under every style, so a feed that ends with a `204` after its last
-> data page (e.g. ADP's `$top`/`$skip` paging) stops cleanly instead of erroring.
+> data page (e.g. `$top`/`$skip` paging) stops cleanly instead of erroring.
 
 ## Cursor
 
@@ -32,7 +32,7 @@ pagination:
 ## Cursor in body (POST search)
 
 For endpoints that page a **POST** search body — the next cursor comes back in
-the response and must be written back into the request JSON body (e.g. HubSpot
+the response and must be written back into the request JSON body (e.g. a
 CRM `POST …/objects/{obj}/search`):
 
 ```yaml
@@ -110,7 +110,7 @@ pagination:
 ```
 
 Report APIs return the whole response as **one** record (headers plus a `rows`
-array, e.g. GA4 `runReport` with `records_path: "$"`). Counting records would
+array, e.g. a `runReport` endpoint with `records_path: "$"`). Counting records would
 read every page as short and stop after page 1, so count the rows instead, and
 stop at the reported total:
 
@@ -130,7 +130,7 @@ short-page rule.
 
 ## Keyset (record-field cursor)
 
-Page by the running **max** (or **min**) of a record field — the pattern APIs like Xero's `journals` use (`offset = max(JournalNumber)` of the last page). Stops on a short page.
+Page by the running **max** (or **min**) of a record field — the pattern accounting journal APIs use (`offset = max(JournalNumber)` of the last page). Stops on a short page.
 
 ```yaml
 pagination:
@@ -145,9 +145,9 @@ pagination:
 
 ## Resumable cursor & multi-array responses
 
-- **`persist_cursor: true`** on a `Cursor` / `CursorInBody` stream saves the terminal cursor as the run's bookmark (via a `state:` store) and seeds it into the next run's first request — so an envelope-cursor feed (e.g. Plaid `/transactions/sync`) resumes incrementally instead of re-pulling from the start.
+- **`persist_cursor: true`** on a `Cursor` / `CursorInBody` stream saves the terminal cursor as the run's bookmark (via a `state:` store) and seeds it into the next run's first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start.
 - **`records_multi`** emits several response arrays in one pass (one pagination advance), each stamped with a configurable `op_field` — pair with a sink `write_mode: upsert` + `delete_marker` to route added/modified→upsert and removed→delete from a single sync response.
-- **`record_ancestors`** lifts fields from an enclosing array-element ancestor onto records unwrapped from a nested `records_path` (e.g. keep a Stripe event's envelope `id` on each unwrapped object).
+- **`record_ancestors`** lifts fields from an enclosing array-element ancestor onto records unwrapped from a nested `records_path` (e.g. keep an event's envelope `id` on each unwrapped object).
 
 See the [`faucet-source-rest` README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/rest) for the full field reference.
 

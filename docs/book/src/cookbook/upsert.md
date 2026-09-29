@@ -301,7 +301,7 @@ dimension tables, or any source you re-fetch in full each run and where a plain
 ```yaml
 pipeline:
   source:
-    type: csv
+    type: file
     config: { path: ./data/contacts.csv }
   sink:
     type: sqlite
@@ -341,6 +341,9 @@ types you add after the first run survive every refresh. With
 | `elasticsearch` | index into a fresh physical index `{index}-faucet-ovw-…` (mappings copied from the current target), then an atomic `POST /_aliases` swap repoints the read alias and the old index is dropped |
 | `oracle` | load a `CREATE TABLE … AS SELECT * FROM target WHERE 1 = 0` staging table, then one transaction: `DELETE` + `INSERT … SELECT` over the insertable columns + `DROP` (a first run renames staging into place) |
 | `databricks` | load a `CREATE TABLE … LIKE` staging Delta table, then one atomic `INSERT OVERWRITE target SELECT * FROM staging` + `DROP` (a first run renames staging into place) |
+| `file` | files written into a hidden `.faucet-overwrite-*` directory beside the destination, each renamed into place on commit; parts the run did not write are removed |
+| `s3` / `gcs` / `azure-blob` | objects written under a hidden `.faucet-overwrite-*/` key prefix (marked by a `.faucet-staging` object, so any sink instance can commit), copied into place on commit, then stale parts deleted. Each object is replaced atomically; the set is swapped object by object, so a reader listing mid-commit can see new and old parts together |
+| `sftp` | files written into a hidden `.faucet-overwrite-*` directory, renamed into place on commit; stale parts removed |
 
 **Elasticsearch requires `index` to be an alias** (not a concrete index): the
 overwrite swaps the alias atomically, so a reader never sees a half-replaced
@@ -357,7 +360,7 @@ creates the alias); a concrete index of that name is rejected at `begin`.
 
 Replace only the destination rows in a **scope** (a date window) instead of the
 whole table — the declarative equivalent of "delete a rolling window, then
-re-insert" (period-report loads: QuickBooks / Xero / Zoho Books). Add a `scope:`
+re-insert" (period-report loads from accounting APIs). Add a `scope:`
 block alongside `write_mode: overwrite`:
 
 ```yaml

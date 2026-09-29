@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! CSV → MySQL — full builder showcase for both connectors.
 //!
 //! CSV source uses non-default delimiter and quote characters. MySQL sink

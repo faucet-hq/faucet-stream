@@ -1,5 +1,11 @@
 # faucet-source-csv
 
+> **Deprecated.** Use [`faucet-source-file`](https://crates.io/crates/faucet-source-file) instead.
+> This crate gets security fixes only until the next major release. In a
+> pipeline config, `type: csv` still works: the CLI builds it as
+> `type: file` with `format: csv` and warns. The migration table is in
+> the [`faucet-source-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/source/file/README.md).
+
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-csv.svg)](https://crates.io/crates/faucet-source-csv)
 [![Docs.rs](https://docs.rs/faucet-source-csv/badge.svg)](https://docs.rs/faucet-source-csv)
 [![MSRV](https://img.shields.io/crates/msrv/faucet-source-csv.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)

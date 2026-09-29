@@ -11,8 +11,8 @@ pipeline:
       max_connections: 4
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: events.jsonl
-      append: true
-      pretty: false
+      mode: append
+      json_lines: { pretty: false }

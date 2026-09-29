@@ -31,10 +31,10 @@ pipeline:
       create_slot_if_missing: true
       idle_timeout: 30
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/changes.jsonl
-      append: true
+      mode: append
   state:
     type: file
     config:

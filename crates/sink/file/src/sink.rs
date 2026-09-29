@@ -1,363 +1,91 @@
-//! The local file sink.
+//! The local file sink: the shared file writer over the local backend.
 
-use crate::config::{FileMode, FileSinkConfig, FileWriteMode};
-use crate::layout::{Layout, io_err};
-use crate::writer::{Ctx, OpenFile, sync_dir};
+use crate::config::{FileSinkConfig, FileWriteMode};
 use async_trait::async_trait;
-use faucet_core::{Compression, FaucetError, FileFormat, FormatOptions, Sink, WriteMode};
+use faucet_common_file::write::{FileWriter, LocalBackend, NameTemplate, blocking};
+use faucet_core::{FaucetError, FileFormat, Sink, WriteMode};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 
-/// Writes records to local files in any writable format.
-///
-/// Each file is written to `<name>.faucet-tmp` and renamed into place by
-/// [`flush`](Sink::flush) (or by a rollover), so a file is complete or absent;
-/// the pipeline advances a bookmark only after that flush. A sink dropped
-/// without a flush removes its temporary files and leaves no final file.
+/// Writes records to local files. See the crate docs.
 pub struct FileSink {
     config: FileSinkConfig,
-    format: FileFormat,
-    codec: Compression,
-    opts: FormatOptions,
-    layout: Layout,
-    state: Mutex<State>,
-    outputs: faucet_core::LocalOutputLog,
-}
-
-#[derive(Default)]
-struct State {
-    current: Option<OpenFile>,
-    /// Part number the next file opens with; `0` until the first open.
-    next_part: u64,
+    local: Arc<LocalBackend>,
+    writer: FileWriter,
 }
 
 impl FileSink {
-    /// Build a sink, validating the config.
+    /// Build the sink, validating the config.
     pub fn new(config: FileSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let format = config.resolved_format()?;
-        let codec = config.resolved_compression();
-        if codec != Compression::None {
-            faucet_core::warn_mismatch(&config.path, codec);
+        let settings = config.settings()?;
+        if settings.codec != faucet_core::Compression::None {
+            faucet_core::warn_mismatch(&config.path, settings.codec);
         }
-        let layout = Layout::new(&config, format, codec)?;
+        let (dir, template) = NameTemplate::from_path(
+            &config.path,
+            settings.format,
+            settings.codec,
+            settings.rolls_over(),
+        )
+        .map_err(|e| faucet_common_file::config_context("file sink", e))?;
+        let local = Arc::new(LocalBackend::new(
+            &dir,
+            &template.staging_name(),
+            config.create_dirs,
+        ));
+        let writer = FileWriter::new(settings, template, local.clone())?;
         Ok(Self {
-            opts: config.format_options(),
-            format,
-            codec,
-            layout,
             config,
-            state: Mutex::new(State::default()),
-            outputs: faucet_core::LocalOutputLog::new(),
+            local,
+            writer,
         })
     }
 
-    /// The format this sink writes.
+    /// The resolved format.
     pub fn format(&self) -> FileFormat {
-        self.format
+        self.writer.settings().format
     }
 
-    /// The config this sink was built from.
+    /// The config the sink was built with.
     pub fn config(&self) -> &FileSinkConfig {
         &self.config
-    }
-
-    fn ctx(&self) -> Ctx<'_> {
-        Ctx {
-            format: self.format,
-            codec: self.codec,
-            opts: &self.opts,
-            parquet: &self.config.parquet,
-        }
     }
 
     fn overwriting(&self) -> bool {
         self.config.write_mode == FileWriteMode::Overwrite
     }
 
-    /// Directory this instance writes into: the destination, or the staging
-    /// directory during an overwrite run.
-    fn target_dir(&self) -> PathBuf {
-        if self.overwriting() {
-            self.layout.staging_dir()
-        } else {
-            self.layout.dir.clone()
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Make sure `dir` exists, creating it when allowed.
-    fn ensure_dir(&self, dir: &Path, always_create: bool) -> Result<(), FaucetError> {
-        if dir.is_dir() {
-            return Ok(());
-        }
-        if !(self.config.create_dirs || always_create) {
-            return Err(FaucetError::Sink(format!(
-                "file sink: directory '{}' does not exist and `create_dirs` is off",
-                dir.display()
-            )));
-        }
-        std::fs::create_dir_all(dir).map_err(|e| io_err("creating directory", dir, e))
-    }
-
-    /// Open the next output file.
-    fn open_next(&self, st: &mut State) -> Result<(), FaucetError> {
-        let dir = self.target_dir();
-        if st.next_part == 0 {
-            self.ensure_dir(&self.layout.dir, false)?;
-            if self.overwriting() {
-                self.ensure_dir(&dir, true)?;
-            }
-            self.layout.remove_stale_temps(&dir);
-            st.next_part = if self.config.mode == FileMode::Append && self.layout.numbered() {
-                self.layout.existing(&dir)?.last().map_or(1, |(n, _)| n + 1)
-            } else {
-                1
-            };
-        } else {
-            self.ensure_dir(&dir, self.overwriting())?;
-        }
-        let name = self.layout.file_name(st.next_part);
-        let final_path = dir.join(&name);
-        let exists = final_path.exists();
-        if exists && self.config.mode == FileMode::ErrorIfExists {
-            return Err(FaucetError::Sink(format!(
-                "file sink: '{}' already exists and `mode` is `error_if_exists`",
-                final_path.display()
-            )));
-        }
-        self.outputs.record_open_probing_with(
-            self.layout.dir.join(&name),
-            self.config.mode != FileMode::Append,
-        );
-        let resume = exists && self.config.mode == FileMode::Append;
-        st.current = Some(OpenFile::create(&self.ctx(), final_path, resume)?);
-        Ok(())
-    }
-
-    fn cap_reached(&self, records: usize, bytes: usize) -> bool {
-        self.config
-            .max_records_per_file
-            .is_some_and(|m| records >= m)
-            || self.config.max_bytes_per_file.is_some_and(|m| bytes >= m)
-    }
-
-    /// Finalise and close the current file; the next write opens a new part.
-    fn roll(&self, st: &mut State) -> Result<(), FaucetError> {
-        if let Some(mut f) = st.current.take() {
-            let r = f.finalize(&self.ctx());
-            f.discard();
-            r?;
-        }
-        st.next_part += 1;
-        Ok(())
-    }
-
-    /// Write `rows` into as many files as the rollover caps require.
-    fn write_rows(&self, rows: &[Value]) -> Result<usize, FaucetError> {
-        let mut st = self.lock();
-        let track_bytes = self.config.max_bytes_per_file.is_some();
-        let mut i = 0;
-        while i < rows.len() {
-            if st.current.is_none() {
-                self.open_next(&mut st)?;
-            }
-            let cur = st.current.as_mut().expect("opened above");
-            let (mut records, mut bytes) = (cur.records, cur.bytes);
-            let mut end = i;
-            while end < rows.len() && !(records > 0 && self.cap_reached(records, bytes)) {
-                if track_bytes {
-                    bytes += estimate(&rows[end]);
-                }
-                records += 1;
-                end += 1;
-            }
-            if end > i {
-                cur.write(&self.ctx(), &rows[i..end])?;
-                cur.bytes = bytes;
-            }
-            i = end;
-            if self.cap_reached(cur.records, cur.bytes) {
-                self.roll(&mut st)?;
-            }
-        }
-        Ok(rows.len())
-    }
-
-    #[cfg(feature = "file-format-parquet")]
-    fn write_columnar(&self, batch: &arrow::array::RecordBatch) -> Result<usize, FaucetError> {
-        let rows = batch.num_rows();
-        if rows == 0 {
-            return Ok(0);
-        }
-        let mut st = self.lock();
-        let mut offset = 0;
-        while offset < rows {
-            if st.current.is_none() {
-                self.open_next(&mut st)?;
-            }
-            let cur = st.current.as_mut().expect("opened above");
-            let room = self
-                .config
-                .max_records_per_file
-                .map_or(rows - offset, |m| m.saturating_sub(cur.records).max(1));
-            let len = room.min(rows - offset);
-            let slice = batch.slice(offset, len);
-            cur.write_batch(&self.ctx(), &slice)?;
-            if self.config.max_bytes_per_file.is_some() {
-                cur.bytes += slice.get_array_memory_size();
-            }
-            offset += len;
-            if self.cap_reached(cur.records, cur.bytes) {
-                self.roll(&mut st)?;
-            }
-        }
-        Ok(rows)
-    }
-
-    fn flush_blocking(&self) -> Result<(), FaucetError> {
-        let mut st = self.lock();
-        if let Some(f) = st.current.as_mut() {
-            f.finalize(&self.ctx())?;
-        }
-        Ok(())
-    }
-
-    /// `mode: overwrite` without the staged `write_mode: overwrite`: files are
-    /// replaced one by one as they are written, so after a successful run any
-    /// file of this layout the run did not write is an earlier run's output —
-    /// all of them after an empty run, the higher parts after a shorter one.
-    /// Remove them so the destination reflects this run only (#753).
-    fn complete_blocking(&self) -> Result<(), FaucetError> {
-        if self.config.mode != FileMode::Overwrite || self.overwriting() {
-            return Ok(());
-        }
-        let st = self.lock();
-        let first_unwritten = match (st.next_part, st.current.is_some()) {
-            (0, _) => 1,
-            (n, true) => n + 1,
-            (n, false) => n,
-        };
-        drop(st);
-        let mut removed = false;
-        for (n, path) in self.layout.existing(&self.layout.dir)? {
-            if n >= first_unwritten {
-                std::fs::remove_file(&path)
-                    .map_err(|e| io_err("removing earlier output", &path, e))?;
-                removed = true;
-            }
-        }
-        if removed {
-            sync_dir(&self.layout.dir.join("x"));
-        }
-        Ok(())
-    }
-
-    fn begin_blocking(&self) -> Result<(), FaucetError> {
-        let staging = self.layout.staging_dir();
-        self.ensure_dir(&self.layout.dir, false)?;
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)
-                .map_err(|e| io_err("clearing staging directory", &staging, e))?;
-        }
-        std::fs::create_dir_all(&staging)
-            .map_err(|e| io_err("creating staging directory", &staging, e))
-    }
-
-    fn commit_blocking(&self) -> Result<(), FaucetError> {
-        let staging = self.layout.staging_dir();
-        if !staging.is_dir() {
-            return Err(FaucetError::Sink(format!(
-                "file sink: overwrite staging directory '{}' is missing, so there is nothing \
-                 to swap in; the destination is unchanged",
-                staging.display()
-            )));
-        }
-        let staged = self.layout.existing(&staging)?;
-        let mut kept = std::collections::HashSet::new();
-        for (_, path) in &staged {
-            let name = path.file_name().expect("listed file").to_owned();
-            let dest = self.layout.dir.join(&name);
-            std::fs::rename(path, &dest).map_err(|e| io_err("moving into place", &dest, e))?;
-            kept.insert(name);
-        }
-        for (_, path) in self.layout.existing(&self.layout.dir)? {
-            if !path.file_name().is_some_and(|n| kept.contains(n)) {
-                std::fs::remove_file(&path)
-                    .map_err(|e| io_err("removing earlier output", &path, e))?;
-            }
-        }
-        std::fs::remove_dir_all(&staging)
-            .map_err(|e| io_err("removing staging directory", &staging, e))?;
-        sync_dir(&self.layout.dir.join("x"));
-        Ok(())
-    }
-
-    fn abort_blocking(&self) -> Result<(), FaucetError> {
-        let mut st = self.lock();
-        if let Some(mut f) = st.current.take() {
-            f.discard();
-        }
-        drop(st);
-        let staging = self.layout.staging_dir();
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)
-                .map_err(|e| io_err("removing staging directory", &staging, e))?;
-        }
-        Ok(())
-    }
-
-    /// The source config that reads this sink's output back.
+    /// The config of a `file` source that reads this sink's output back.
     fn readback_config(&self) -> Value {
-        let path = if self.layout.numbered() {
-            self.layout
-                .dir
-                .join(self.layout.name.replace(crate::config::PART_TOKEN, "*"))
+        let template = self.writer.template();
+        let path = if template.numbered() {
+            self.local
+                .dir()
+                .join(template.name.replace(crate::config::PART_TOKEN, "*"))
         } else {
-            self.layout.dir.join(&self.layout.name)
+            self.local.dir().join(&template.name)
         };
+        let format = self.format();
         let mut cfg = serde_json::json!({
             "path": path.to_string_lossy(),
-            "format": self.format.as_str(),
+            "format": format.as_str(),
         });
-        if self.format == FileFormat::Csv {
+        if format == FileFormat::Csv {
             cfg["csv"] = serde_json::to_value(&self.config.csv).unwrap_or(Value::Null);
         }
-        if self.format == FileFormat::Xml {
+        if format == FileFormat::Xml {
             cfg["xml"] = serde_json::to_value(&self.config.xml).unwrap_or(Value::Null);
         }
-        if self.format == FileFormat::Xlsx {
+        if format == FileFormat::Xlsx {
             cfg["excel"] = serde_json::to_value(&self.config.excel).unwrap_or(Value::Null);
         }
+        #[cfg(feature = "encryption")]
+        if let Some(spec) = &self.config.encryption {
+            cfg["encryption"] = serde_json::to_value(spec).unwrap_or(Value::Null);
+        }
         cfg
-    }
-}
-
-impl Drop for FileSink {
-    fn drop(&mut self) {
-        if let Some(mut f) = self.lock().current.take() {
-            f.discard();
-        }
-    }
-}
-
-/// A record's JSON length plus a newline: the unit the byte cap counts in.
-fn estimate(v: &Value) -> usize {
-    serde_json::to_vec(v).map_or(0, |b| b.len()) + 1
-}
-
-/// Run blocking filesystem work off the async worker when the runtime allows,
-/// inline otherwise (a current-thread runtime cannot block in place).
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
     }
 }
 
@@ -391,19 +119,19 @@ impl Sink for FileSink {
     }
 
     async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.begin_blocking())
+        blocking(|| self.writer.begin_overwrite())
     }
 
     async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.commit_blocking())
+        blocking(|| self.writer.commit_overwrite())
     }
 
     async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.abort_blocking())
+        blocking(|| self.writer.abort_overwrite())
     }
 
     async fn complete_run(&self) -> Result<(), FaucetError> {
-        blocking(|| self.complete_blocking())
+        blocking(|| self.writer.complete())
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
@@ -411,19 +139,19 @@ impl Sink for FileSink {
     }
 
     async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
-        self.outputs.snapshot()
+        self.writer.local_outputs()
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
-        blocking(|| self.write_rows(records))
+        blocking(|| self.writer.write_rows(records))
     }
 
     #[cfg(feature = "arrow")]
     fn supports_columnar(&self) -> bool {
-        matches!(self.format, FileFormat::Parquet | FileFormat::Avro)
+        matches!(self.format(), FileFormat::Parquet | FileFormat::Avro)
     }
 
     #[cfg(feature = "arrow")]
@@ -432,26 +160,24 @@ impl Sink for FileSink {
         batch: &arrow::array::RecordBatch,
     ) -> Result<usize, FaucetError> {
         #[cfg(feature = "file-format-parquet")]
-        if self.format == FileFormat::Parquet {
-            return blocking(|| self.write_columnar(batch));
+        if self.format() == FileFormat::Parquet {
+            return blocking(|| self.writer.write_batch(batch));
         }
         let rows = faucet_core::columnar::record_batch_to_values(batch)?;
         self.write_batch(&rows).await
     }
 
     async fn flush(&self) -> Result<(), FaucetError> {
-        blocking(|| self.flush_blocking())
+        blocking(|| self.writer.flush())
     }
 
-    /// Preflight probe: the destination directory (or, when it will be
-    /// created, its nearest existing ancestor) accepts a new file.
     async fn check(
         &self,
         _ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
         let start = std::time::Instant::now();
-        let dir = self.layout.dir.clone();
+        let dir = self.local.dir().to_path_buf();
         let probe = blocking(|| {
             let mut target = dir.clone();
             if !target.is_dir() {
@@ -653,7 +379,7 @@ mod tests {
             lines(&d.path().join("o-00001.jsonl")),
             vec![json!({"n": 1})]
         );
-        assert!(!life.layout.staging_dir().exists());
+        assert!(!life.local.staging_dir().exists());
     }
 
     #[tokio::test]
@@ -713,7 +439,6 @@ mod tests {
     #[test]
     fn blocking_runs_without_a_runtime() {
         assert_eq!(blocking(|| 7), 7);
-        assert_eq!(estimate(&json!({"a": 1})), 8);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

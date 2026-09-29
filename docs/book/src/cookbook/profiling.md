@@ -14,7 +14,7 @@ version: 1
 name: orders
 pipeline:
   source: { type: postgres, config: { connection_url: "${env:PG_URL}", query: "SELECT * FROM orders" } }
-  sink: { type: jsonl, config: { path: ./orders.jsonl } }
+  sink: { type: file, config: { path: ./orders.jsonl } }
   state: { type: file, config: { path: ./state } }
 profiling:
   min_history: 5        # runs of baseline before detection starts (default 5)

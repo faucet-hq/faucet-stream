@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Runs the reusable `faucet-conformance` battery against the real JSONL sink.
 //!
 //! JSONL is an append-only file sink — it advertises no idempotency mechanism,

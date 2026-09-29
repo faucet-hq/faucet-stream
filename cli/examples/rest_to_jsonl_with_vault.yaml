@@ -13,6 +13,6 @@ pipeline:
         config:
           token: "${vault:secret/data/faucet/api#token}"
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/items.jsonl

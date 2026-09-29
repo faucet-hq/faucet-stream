@@ -14,13 +14,13 @@ pipeline:
       base_url: "https://api.example.com"
       path: /v1/items
   sink:
-    type: jsonl
+    type: file
     config:
       path: "./out/items.jsonl"
   # Poison-pill `action: dlq` (below) requires a DLQ to be configured.
   dlq:
     sink:
-      type: jsonl
+      type: file
       config:
         path: "./out/items.dlq.jsonl"
 resilience:

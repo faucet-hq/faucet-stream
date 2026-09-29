@@ -13,11 +13,11 @@ version: 1
 name: csv_to_jsonl_notified
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: "./data/input.csv"
   sink:
-    type: jsonl
+    type: file
     config:
       path: "./out/output.jsonl"
 

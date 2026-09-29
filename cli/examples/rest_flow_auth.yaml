@@ -1,4 +1,4 @@
-# Composable multi-step auth flow (#511) — a Bullhorn-style login chain.
+# Composable multi-step auth flow (#511) — a two-step login chain.
 #
 # The `flow` provider runs a login/pre-flight chain, captures values from each
 # response by JSONPath, then places a captured token into every data request
@@ -9,7 +9,7 @@
 #   faucet validate cli/examples/rest_flow_auth.yaml
 #   faucet run      cli/examples/rest_flow_auth.yaml
 version: 1
-name: bullhorn_style_flow
+name: login_chain_flow
 
 # Shared auth catalog: built once, injected into every connector that
 # references it via `auth: { ref: session }`.
@@ -35,10 +35,10 @@ auth:
             query:
               access_token: "${access_token}"
           capture:
-            bh_rest_token: "$.BhRestToken"
+            session_token: "$.sessionToken"
             base_url: "$.restUrl"
       apply:
-        - { into: query, name: BhRestToken, value: "${bh_rest_token}" }
+        - { into: query, name: sessionToken, value: "${session_token}" }
       base_url_from: "${base_url}"
       reauth_on: [401]
 
@@ -53,6 +53,6 @@ pipeline:
       records_path: "$.data[*]"
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/candidates.jsonl

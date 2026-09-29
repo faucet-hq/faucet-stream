@@ -3,6 +3,7 @@
 //! Google Cloud Storage sink connector.
 
 mod config;
+mod object;
 mod sink;
 
 pub use config::{GcsSinkConfig, GcsSinkFormat};

@@ -45,7 +45,7 @@ A Postgres to load into — the [examples Docker stack](../README.md) provides o
 ```bash
 docker compose -f examples/docker-compose.yml up -d postgres
 export PG_URL=postgres://faucet:faucet@localhost:5432/appdb
-export STRIPE_TOKEN=sk_test_...        # or point the source at any REST API
+export SOURCE_API_TOKEN=...           # bearer token for the REST API
 ```
 
 ## Run it by hand first

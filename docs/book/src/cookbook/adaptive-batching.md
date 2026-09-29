@@ -78,7 +78,7 @@ pipeline:
 
   dlq:
     sink:
-      type: jsonl
+      type: file
       config:
         path: ./dlq/orders_failed.jsonl
     on_batch_error: dlq_all

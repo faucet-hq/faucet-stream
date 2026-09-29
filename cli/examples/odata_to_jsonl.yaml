@@ -42,6 +42,6 @@ pipeline:
         format: iso8601
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/orders.jsonl

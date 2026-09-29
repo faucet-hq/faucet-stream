@@ -17,6 +17,6 @@ pipeline:
       batch_size: 5000
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/sales.jsonl

@@ -15,12 +15,12 @@ name: matrix_depends_on
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: cli/examples/data/orders.csv
 
   sink:
-    type: csv
+    type: file
     config:
       path: staged.csv
 
@@ -38,5 +38,5 @@ matrix:
     depends_on: [stage_countries, stage_orders]
     source: { config: { path: staged_orders.csv } }
     sink:
-      type: jsonl
+      type: file
       config: { path: report.jsonl }

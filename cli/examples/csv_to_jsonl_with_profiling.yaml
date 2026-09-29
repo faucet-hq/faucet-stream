@@ -18,12 +18,12 @@ name: csv_to_jsonl_with_profiling
 
 pipeline:
   source:
-    type: csv
+    type: file
     config:
       path: ./data/input.csv
 
   sink:
-    type: jsonl
+    type: file
     config:
       path: ./out/records.jsonl
 

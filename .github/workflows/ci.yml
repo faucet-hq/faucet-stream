@@ -114,6 +114,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check connector counts in docs match connector crates
         run: bash scripts/check-doc-counts.sh
+      - name: Check no third-party vendor names in the engine (#780)
+        run: python3 scripts/vendor-names.py
 
   clippy:
     name: Clippy

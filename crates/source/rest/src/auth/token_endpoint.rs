@@ -255,7 +255,7 @@ async fn fetch_token(
         let mut req = client.request(method.clone(), url).headers(headers.clone());
         if let Some(b) = body {
             // OAuth token endpoints (RFC-6749) require form-urlencoding; a JSON
-            // body yields `unsupported_grant_type` (e.g. Salesforce). Default
+            // body yields `unsupported_grant_type`. Default
             // stays JSON for back-compat with non-OAuth token endpoints.
             req = match encoding {
                 TokenBodyEncoding::Json => req.json(b),

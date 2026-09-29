@@ -212,8 +212,8 @@ async fn async_job_poll_retries_a_matching_response() {
 async fn discovery_retries_a_matching_response() {
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
-    struct Meta(Arc<AtomicUsize>);
-    impl Respond for Meta {
+    struct ErrorCodeThenOk(Arc<AtomicUsize>);
+    impl Respond for ErrorCodeThenOk {
         fn respond(&self, _: &Request) -> ResponseTemplate {
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(400).set_body_json(json!({"error": {"code": 32}}))
@@ -226,7 +226,7 @@ async fn discovery_retries_a_matching_response() {
     }
     Mock::given(method("GET"))
         .and(path("/$metadata"))
-        .respond_with(Meta(calls.clone()))
+        .respond_with(ErrorCodeThenOk(calls.clone()))
         .mount(&server)
         .await;
     let mut c: RestStreamConfig = serde_json::from_value(json!({

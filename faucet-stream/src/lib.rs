@@ -34,12 +34,12 @@
 //! | `source-redis` | Redis source (streams, lists, keys) |
 //! | `source-webhook` | Webhook HTTP receiver source |
 //! | `source-websocket` | WebSocket streaming source |
-//! | `source-csv` | CSV file source |
+//! | `source-csv` | Deprecated CSV file source (use `source-file`) |
 //! | `source-elasticsearch` | Elasticsearch search/scroll source |
 //! | `source-kafka` | Apache Kafka consumer source |
 //! | `source-kinesis` | AWS Kinesis Data Streams source |
 //! | `source-spanner` | Google Cloud Spanner query source |
-//! | `source-parquet` | Apache Parquet file source (local, glob, S3) |
+//! | `source-parquet` | Deprecated Parquet file source (use `source-file`) |
 //! | `source-delta` | Apache Delta Lake source (local FS or S3/Azure/GCS, time travel) |
 //! | `source-databricks` | Databricks SQL query source (Statement Execution API) |
 //! | `source-iceberg` | Apache Iceberg table source (REST/Glue/SQL/HMS catalogs, time travel, incremental) |
@@ -49,7 +49,7 @@
 //! | `sink-bigquery` | Google BigQuery streaming insert sink |
 //! | `sink-iceberg` | Apache Iceberg sink (append-only, REST/Glue/SQL/HMS catalogs) |
 //! | `sink-postgres` | PostgreSQL sink (jsonb or auto-mapped columns) |
-//! | `sink-jsonl` | JSON Lines file sink |
+//! | `sink-jsonl` | Deprecated JSON Lines file sink (use `sink-file`) |
 //! | `sink-snowflake` | Snowflake SQL REST API sink |
 //! | `sink-mysql` | MySQL sink |
 //! | `sink-mssql` | Microsoft SQL Server sink |
@@ -64,13 +64,13 @@
 //! | `sink-s3` | AWS S3 file sink |
 //! | `sink-mongodb` | MongoDB insert sink |
 //! | `sink-redis` | Redis sink (streams, lists, key-value) |
-//! | `sink-csv` | CSV file sink |
+//! | `sink-csv` | Deprecated CSV file sink (use `sink-file`) |
 //! | `sink-elasticsearch` | Elasticsearch bulk index sink |
 //! | `sink-http` | HTTP POST sink |
 //! | `sink-kafka` | Apache Kafka producer sink |
 //! | `sink-kinesis` | AWS Kinesis Data Streams sink |
 //! | `sink-spanner` | Google Cloud Spanner mutation sink |
-//! | `sink-parquet` | Apache Parquet file sink (local, S3) |
+//! | `sink-parquet` | Deprecated Parquet file sink (use `sink-file`) |
 //! | `sink-file` | Local file sink (JSONL, JSON, CSV, XML, Excel, Avro, Parquet; rollover, atomic finalisation) |
 //! | `encryption` | AES-256-GCM at-rest sealing for file state-store bookmarks and per-line JSONL/DLQ output |
 //! | `sink-dynamodb` | Amazon DynamoDB sink (batched writes, upsert/delete) |

@@ -13,6 +13,7 @@ pub const DEFAULT_ROW_GROUP_SIZE: usize = 1024 * 1024;
 /// Configuration for the Parquet sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
 pub struct ParquetSinkConfig {
     /// Where to write the Parquet files (local filesystem or S3).
     pub destination: ParquetDestination,

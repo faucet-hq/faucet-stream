@@ -1,8 +1,8 @@
 //! Row routing for multi-stream results (#768).
 //!
-//! A Shopify bulk-operation result is one JSONL file mixing parents
-//! (`{"id": "gid://shopify/Order/1", …}`) and children
-//! (`{"id": "gid://shopify/LineItem/7", "__parentId": "gid://shopify/Order/1"}`).
+//! A bulk export job's result is one JSONL file mixing parents
+//! (`{"id": "gid://example/Order/1", …}`) and children
+//! (`{"id": "gid://example/LineItem/7", "__parentId": "gid://example/Order/1"}`).
 //! `records_route` stamps each row with the stream it belongs to, optionally
 //! copies `__parentId` into a join column, and drops (or refuses) rows of a
 //! type no route names.
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
-/// Field a Shopify bulk child row carries its parent's GID in.
+/// Field a bulk-export child row carries its parent's GID in.
 pub const PARENT_ID_FIELD: &str = "__parentId";
 
 /// Route-key prefix for a row with no GID of its own, keyed by its parent's type.
@@ -125,8 +125,8 @@ impl RecordsRoute {
     }
 }
 
-/// The object type in a GID: `gid://shopify/Order/123` → `Order`.
-/// Query strings (`gid://shopify/Video/1?x=y`) are ignored.
+/// The object type in a GID: `gid://example/Order/123` → `Order`.
+/// Query strings (`gid://example/Video/1?x=y`) are ignored.
 pub fn gid_type(gid: &str) -> Option<&str> {
     let rest = gid.strip_prefix("gid://")?;
     let mut parts = rest.split('/');
@@ -240,7 +240,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn shopify() -> RecordsRoute {
+    fn order_routes() -> RecordsRoute {
         serde_json::from_value(json!({
             "routes": {
                 "Order": { "stream": "orders" },
@@ -252,27 +252,27 @@ mod tests {
     }
 
     #[test]
-    fn gid_type_parses_shopify_ids() {
-        assert_eq!(gid_type("gid://shopify/Order/1"), Some("Order"));
-        assert_eq!(gid_type("gid://shopify/Video/1?x=y"), Some("Video"));
-        assert_eq!(gid_type("gid://shopify/Order"), None);
-        assert_eq!(gid_type("gid://shopify//1"), None);
+    fn gid_type_parses_ids() {
+        assert_eq!(gid_type("gid://example/Order/1"), Some("Order"));
+        assert_eq!(gid_type("gid://example/Video/1?x=y"), Some("Video"));
+        assert_eq!(gid_type("gid://example/Order"), None);
+        assert_eq!(gid_type("gid://example//1"), None);
         assert_eq!(gid_type("gid:///Order/1"), None);
-        assert_eq!(gid_type("gid://shopify/Order/"), None);
+        assert_eq!(gid_type("gid://example/Order/"), None);
         assert_eq!(gid_type("Order/1"), None);
     }
 
     #[test]
     fn route_key_prefers_own_id_then_parent() {
-        let r = shopify();
+        let r = order_routes();
         assert_eq!(
-            route_key(&r, &json!({"id": "gid://shopify/Order/1"})).as_deref(),
+            route_key(&r, &json!({"id": "gid://example/Order/1"})).as_deref(),
             Some("Order")
         );
         assert_eq!(
             route_key(
                 &r,
-                &json!({"id": "gid://shopify/LineItem/2", "__parentId": "gid://shopify/Order/1"})
+                &json!({"id": "gid://example/LineItem/2", "__parentId": "gid://example/Order/1"})
             )
             .as_deref(),
             Some("LineItem")
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(
             route_key(
                 &r,
-                &json!({"note": "x", "__parentId": "gid://shopify/Order/1"})
+                &json!({"note": "x", "__parentId": "gid://example/Order/1"})
             )
             .as_deref(),
             Some("child_of:Order")
@@ -310,20 +310,20 @@ mod tests {
 
     #[test]
     fn router_stamps_streams_and_parent_keys() {
-        let r = shopify();
+        let r = order_routes();
         let mut router = Router::new(&r);
         let out = router
             .route_page(vec![
-                json!({"id": "gid://shopify/Order/1"}),
-                json!({"id": "gid://shopify/LineItem/2", "__parentId": "gid://shopify/Order/1"}),
-                json!({"note": "n", "__parentId": "gid://shopify/Order/1"}),
+                json!({"id": "gid://example/Order/1"}),
+                json!({"id": "gid://example/LineItem/2", "__parentId": "gid://example/Order/1"}),
+                json!({"note": "n", "__parentId": "gid://example/Order/1"}),
             ])
             .unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0]["_stream"], "orders");
         assert!(out[0].get("order_id").is_none());
         assert_eq!(out[1]["_stream"], "order_line_items");
-        assert_eq!(out[1]["order_id"], "gid://shopify/Order/1");
+        assert_eq!(out[1]["order_id"], "gid://example/Order/1");
         assert_eq!(out[2]["_stream"], "order_notes");
         assert!(router.dropped().is_empty());
         router.finish();
@@ -331,14 +331,14 @@ mod tests {
 
     #[test]
     fn router_counts_and_drops_unknown_types() {
-        let r = shopify();
+        let r = order_routes();
         let mut router = Router::new(&r);
         let out = router
             .route_page(vec![
-                json!({"id": "gid://shopify/Refund/1"}),
-                json!({"id": "gid://shopify/Refund/2"}),
+                json!({"id": "gid://example/Refund/1"}),
+                json!({"id": "gid://example/Refund/2"}),
                 json!({"x": 1}),
-                json!({"id": "gid://shopify/Order/3"}),
+                json!({"id": "gid://example/Order/3"}),
             ])
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -349,23 +349,23 @@ mod tests {
 
     #[test]
     fn strict_router_fails_on_unknown_type() {
-        let mut r = shopify();
+        let mut r = order_routes();
         r.strict = true;
         let err = Router::new(&r)
-            .route_page(vec![json!({"id": "gid://shopify/Refund/1"})])
+            .route_page(vec![json!({"id": "gid://example/Refund/1"})])
             .unwrap_err();
         assert!(err.to_string().contains("'Refund'"), "{err}");
     }
 
     #[test]
     fn only_skips_other_routes_without_counting_them() {
-        let mut r = shopify();
+        let mut r = order_routes();
         r.only = vec!["order_line_items".into()];
         let mut router = Router::new(&r);
         let out = router
             .route_page(vec![
-                json!({"id": "gid://shopify/Order/1"}),
-                json!({"id": "gid://shopify/LineItem/2", "__parentId": "gid://shopify/Order/1"}),
+                json!({"id": "gid://example/Order/1"}),
+                json!({"id": "gid://example/LineItem/2", "__parentId": "gid://example/Order/1"}),
             ])
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -375,16 +375,16 @@ mod tests {
 
     #[test]
     fn missing_parent_copies_null() {
-        let r = shopify();
+        let r = order_routes();
         let out = Router::new(&r)
-            .route_page(vec![json!({"id": "gid://shopify/LineItem/2"})])
+            .route_page(vec![json!({"id": "gid://example/LineItem/2"})])
             .unwrap();
         assert_eq!(out[0]["order_id"], Value::Null);
     }
 
     #[test]
     fn validate_rejects_bad_shapes() {
-        assert!(shopify().validate().is_ok());
+        assert!(order_routes().validate().is_ok());
         let bad = |v: Value| {
             serde_json::from_value::<RecordsRoute>(v)
                 .unwrap()

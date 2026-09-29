@@ -117,7 +117,7 @@ pipeline:
       records_path: "$.data"
 
   sink:
-    type: jsonl
+    type: file
     config:
       # `${param.*}` works in any config value, including a path.
       path: "./out/${param.tenant_id}/events.jsonl"

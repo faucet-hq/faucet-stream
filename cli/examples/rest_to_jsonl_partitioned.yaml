@@ -37,7 +37,7 @@ pipeline:
       path: "/records?id_from=${partition.start}&id_to=${partition.end}"
       records_path: "$.data"
   sink:
-    type: jsonl
+    type: file
     config:
       # One file per chunk, so concurrent invocations never contend on a writer.
       path: "./out/records-${partition.id}.jsonl"

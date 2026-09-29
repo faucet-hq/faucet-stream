@@ -29,7 +29,7 @@ pipeline:
       query: "SELECT id, name, amount FROM sales WHERE amount > 0 ORDER BY id"
       batch_size: 5000
   sink:
-    type: jsonl
+    type: file
     config:
       path: sales.jsonl
 ```

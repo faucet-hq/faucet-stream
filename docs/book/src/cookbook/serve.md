@@ -23,7 +23,7 @@ FAUCET_SERVE_AUTH_TOKEN=s3cret faucet serve --listen 127.0.0.1:8080
 # Submit a run.
 curl -XPOST http://127.0.0.1:8080/v1/runs \
   -H "Authorization: Bearer s3cret" -H 'content-type: application/json' \
-  -d '{"config":"version: 1\npipeline:\n  source: {type: csv, config: {path: in.csv}}\n  sink: {type: jsonl, config: {path: out.jsonl}}\n","name":"adhoc"}'
+  -d '{"config":"version: 1\npipeline:\n  source: {type: file, config: { path: in.csv }}\n  sink: {type: file, config: { path: out.jsonl }}\n","name":"adhoc"}'
 # → {"run_id":"0192…","status":"queued","submitted_at":"…"}
 
 # Poll it to completion.
@@ -108,7 +108,7 @@ pipeline work ≈ `max-concurrent-runs × each config's execution.max_concurrent
 
 ## Idempotency
 
-Supply `idempotency_key` to make retries safe (Stripe-style):
+Supply `idempotency_key` to make retries safe (the common `Idempotency-Key` pattern):
 
 - First submit with a key → runs normally.
 - Re-submit the **same key + same request** within `--idempotency-retention-secs`

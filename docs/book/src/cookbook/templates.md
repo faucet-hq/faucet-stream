@@ -50,7 +50,7 @@ pipeline:
         type: page_number
         config: { page_param: page, size_param: per_page, size: "${param.page_size}" }
   sink:
-    type: jsonl
+    type: file
     config:
       path: "./out/${param.tenant_id}/events.jsonl"
 ```

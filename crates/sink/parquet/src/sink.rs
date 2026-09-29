@@ -45,6 +45,7 @@ use crate::schema::infer_schema;
 ///   Instead, an intermediate `flush()` only flushes buffered Arrow row groups
 ///   to the open writer (no footer, bounding memory) and the footer is written
 ///   exactly once when the sink is dropped at end of run.
+#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
 pub struct ParquetSink {
     config: ParquetSinkConfig,
     store: Arc<dyn ObjectStore>,

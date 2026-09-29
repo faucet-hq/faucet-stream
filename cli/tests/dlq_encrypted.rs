@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end tests for encrypted DLQ files (#207): envelopes written by the
 //! jsonl sink's `encryption:` block are readable by `faucet dlq
 //! inspect/replay/discard` — with an explicit key, or (for replay) picked up

@@ -19,25 +19,25 @@ serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
-csv = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
-parquet = { workspace = true, optional = true }
 
 [features]
 # Formats that need a dependency. JSON Lines, JSON arrays and raw text are
 # always available; `file-formats` turns on the rest.
-file-format-csv = ["faucet-core/file-format-csv", "dep:csv"]
-file-format-xml = ["faucet-core/file-format-xml"]
-file-format-excel = ["faucet-core/file-format-excel"]
-file-format-avro = ["faucet-core/file-format-avro"]
-file-format-parquet = ["arrow", "dep:parquet"]
+file-format-csv = ["faucet-core/file-format-csv", "faucet-common-file/file-format-csv"]
+file-format-xml = ["faucet-core/file-format-xml", "faucet-common-file/file-format-xml"]
+file-format-excel = ["faucet-core/file-format-excel", "faucet-common-file/file-format-excel"]
+file-format-avro = ["faucet-core/file-format-avro", "faucet-common-file/file-format-avro"]
+file-format-parquet = ["arrow", "faucet-common-file/file-format-parquet"]
 # The columnar (Arrow) write path for Parquet and Avro.
-arrow = ["faucet-core/arrow", "dep:arrow"]
+arrow = ["faucet-core/arrow", "faucet-common-file/arrow", "dep:arrow"]
+# Encrypt output at rest (`encryption:` block).
+encryption = ["faucet-core/encryption", "faucet-common-file/encryption"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-parquet"]
 
 [dev-dependencies]
 faucet-conformance.workspace = true
-faucet-source-file = { workspace = true, features = ["file-formats"] }
+faucet-source-file = { workspace = true, features = ["file-formats", "encryption"] }
 faucet-source-rest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 tempfile = "3"
@@ -47,6 +47,11 @@ async-stream.workspace = true
 async-trait.workspace = true
 arrow.workspace = true
 parquet.workspace = true
+flate2.workspace = true
+base64.workspace = true
+faucet-sink-csv = { workspace = true, features = ["compression"] }
+faucet-sink-jsonl = { workspace = true, features = ["compression", "encryption"] }
+faucet-sink-parquet.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

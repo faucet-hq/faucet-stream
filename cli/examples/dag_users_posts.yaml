@@ -37,10 +37,10 @@ pipeline:
       schema_sample_size: 100
 
   sink:
-    type: jsonl
+    type: file
     config:
-      append: false
-      pretty: false
+      format: json_lines
+      json_lines: { pretty: false }
 
 matrix:
   # Root row: fetch the users list once.
