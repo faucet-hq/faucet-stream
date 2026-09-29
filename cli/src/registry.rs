@@ -4,6 +4,7 @@
 //! Cargo feature so users can build a slim binary with just the connectors
 //! they need. The string keys here are the public contract of the CLI's
 //! `type:` field in YAML/JSON pipeline configs.
+#![allow(deprecated)]
 
 use crate::auth_catalog::{self, AuthCatalog};
 use crate::error::{CliError, CliResult};

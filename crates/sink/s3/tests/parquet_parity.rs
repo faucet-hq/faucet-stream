@@ -1,6 +1,7 @@
 //! `format: parquet` parity with the Parquet sink's S3 destination (#777),
 //! against MinIO: the same records written by both read back to identical
 //! records and an identical Arrow schema. Requires Docker.
+#![allow(deprecated)]
 #![cfg(feature = "arrow")]
 
 use aws_config::BehaviorVersion;
