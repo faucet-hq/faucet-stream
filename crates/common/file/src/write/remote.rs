@@ -219,7 +219,9 @@ impl RemoteBackend {
     }
 
     /// Collect finished uploads, returning the first error among them, and
-    /// wait for an in-flight upload of `key` so two versions never race.
+    /// wait for an in-flight upload of `key` so two versions never race. On
+    /// an error every other upload is awaited too, so none is still running
+    /// when the failure reaches the caller.
     fn reap(&self, key: &str) -> Result<(), FaucetError> {
         let done: Vec<InFlight> = {
             let mut pending = self.pending();
@@ -229,7 +231,9 @@ impl RemoteBackend {
             *pending = running;
             done
         };
-        join_all(done)
+        join_all(done).inspect_err(|_| {
+            let _ = self.settle();
+        })
     }
 
     fn spawn_upload(&self, scratch: &Path, key: String) -> Result<(), FaucetError> {
@@ -639,6 +643,7 @@ mod tests {
         now: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
         fail_key: Mutex<Option<String>>,
+        fail_fast_key: Mutex<Option<String>>,
     }
 
     #[faucet_core::async_trait]
@@ -658,6 +663,9 @@ mod tests {
         async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
             use std::sync::atomic::Ordering::SeqCst;
             let body = std::fs::read(from).map_err(|e| FaucetError::Sink(e.to_string()))?;
+            if self.fail_fast_key.lock().unwrap().as_deref() == Some(key) {
+                return Err(FaucetError::Sink(format!("refused {key}")));
+            }
             let n = self.now.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(n, SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
@@ -733,6 +741,20 @@ mod tests {
         assert!(e.contains("refused o/part-00002.jsonl"), "{e}");
         assert_eq!(client.now.load(std::sync::atomic::Ordering::SeqCst), 0);
         w.flush().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_failure_is_reported_only_after_every_other_upload_ends() {
+        let client = Arc::new(Slow::default());
+        *client.fail_fast_key.lock().unwrap() = Some("o/part-00001.jsonl".into());
+        let w = pipelined(&client, 3, "o/");
+        let e = w.write_rows(&rows(6)).unwrap_err().to_string();
+        assert!(e.contains("refused o/part-00001.jsonl"), "{e}");
+        assert_eq!(
+            client.now.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no upload is still running when the error is returned"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
