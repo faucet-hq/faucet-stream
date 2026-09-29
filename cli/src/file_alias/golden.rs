@@ -242,3 +242,56 @@ async fn parquet_sink_refuses_what_the_old_sink_refused() {
     .unwrap();
     assert!(err.to_string().contains("bogus"), "{err}");
 }
+
+#[cfg(all(feature = "source-csv", feature = "sink-csv"))]
+#[tokio::test]
+async fn csv_bytes_above_ascii_stay_on_the_old_crate() {
+    let d = tempfile::tempdir().unwrap();
+    let path = p(d.path(), "in.csv");
+    std::fs::write(&path, "a\u{a7}b\n1\u{a7}2\n").unwrap();
+    let src = alias_source("csv", json!({"path": path, "quote": 200})).await;
+    assert_eq!(src.fetch_all().await.unwrap().len(), 1);
+    let out = p(d.path(), "out.csv");
+    let s = alias_sink("csv", json!({"path": out, "delimiter": 167})).await;
+    write(s.as_ref(), &[people()]).await;
+    assert!(std::fs::read(&out).unwrap().contains(&167));
+}
+
+#[test]
+fn validate_checks_the_file_config_it_will_build() {
+    use crate::registry::{validate_sink_config, validate_source_config};
+    #[cfg(feature = "source-csv")]
+    validate_source_config("csv", "row", json!({"path": "a.csv", "delimiter": 59})).unwrap();
+    #[cfg(feature = "source-parquet")]
+    {
+        let s3 = json!({"source": {"type": "s3", "bucket": "b", "key": "k.parquet"}});
+        validate_source_config("parquet", "row", s3).unwrap();
+        let local = json!({"source": {"type": "local_path", "path": "a.parquet"}});
+        validate_source_config("parquet", "row", local).unwrap();
+    }
+    #[cfg(feature = "sink-jsonl")]
+    validate_sink_config("jsonl", "row", json!({"path": "o.jsonl", "append": true})).unwrap();
+    #[cfg(feature = "sink-csv")]
+    validate_sink_config("csv", "row", json!({"path": "o.csv"})).unwrap();
+    #[cfg(feature = "sink-parquet")]
+    {
+        let explicit = json!({"destination": {"type": "local_path", "path": "o/"}, "schema": {"type": "explicit"}});
+        let err = validate_sink_config("parquet", "row", explicit).unwrap_err();
+        assert!(err.to_string().contains("explicit"), "{err}");
+        let s3 = json!({"destination": {"type": "s3", "bucket": "b"}});
+        validate_sink_config("parquet", "row", s3).unwrap();
+    }
+}
+
+#[cfg(feature = "source-csv")]
+#[test]
+fn schemas_are_marked_deprecated() {
+    let s = crate::registry::source_schema("csv").unwrap();
+    assert_eq!(s["deprecated"], true);
+    assert!(
+        s["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("Deprecated alias")
+    );
+}
