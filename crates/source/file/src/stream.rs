@@ -391,9 +391,7 @@ fn input_of(opened: Opened) -> FileInput {
     match opened {
         Opened::Local(f) => FileInput::File(f),
         Opened::Bytes(b) => FileInput::Bytes(b),
-        Opened::Lines(_) | Opened::Skip => unreachable!("only binary formats are decoded here"),
-        #[cfg(feature = "file-format-csv")]
-        Opened::Csv(_) => unreachable!("only binary formats are decoded here"),
+        _ => unreachable!("only binary formats are decoded here"),
     }
 }
 

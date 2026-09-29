@@ -30,3 +30,22 @@ pub(crate) fn lines(raw: &[u8], enc: &CompiledEncryption) -> Result<Vec<u8>, Fau
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn blank_lines_between_sealed_records_are_skipped() {
+        let spec: faucet_core::EncryptionSpec =
+            serde_json::from_value(serde_json::json!({"key": "k"})).unwrap();
+        let enc = CompiledEncryption::compile(&spec).unwrap();
+        let line = base64::engine::general_purpose::STANDARD.encode(enc.encrypt(b"{\"a\":1}"));
+        let raw = format!("{line}\n\n  \n{line}\n");
+        assert_eq!(
+            lines(raw.as_bytes(), &enc).unwrap(),
+            b"{\"a\":1}\n{\"a\":1}\n"
+        );
+    }
+}

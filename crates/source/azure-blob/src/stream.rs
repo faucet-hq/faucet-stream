@@ -1048,4 +1048,16 @@ mod tests {
             assert!(err.to_string().contains("internal error"), "{err}");
         }
     }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn a_parquet_object_never_reaches_the_text_parser() {
+        let e = parse_file_content(&AzureFileFormat::Parquet, "k.parquet", "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("azure parquet object 'k.parquet' reached the text parser"),
+            "{e}"
+        );
+    }
 }
