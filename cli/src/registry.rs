@@ -7,6 +7,8 @@
 
 use crate::auth_catalog::{self, AuthCatalog};
 use crate::error::{CliError, CliResult};
+#[allow(unused_imports)]
+use crate::file_alias::{self, Side};
 use faucet_core::{FaucetError, Sink, Source};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -465,10 +467,15 @@ pub async fn build_source(
             Ok(Box::new(s))
         }
         #[cfg(feature = "source-csv")]
+        #[allow(deprecated)]
         "csv" => {
-            let cfg = decode::<faucet_source_csv::CsvSourceConfig>("source", "csv", config)?;
+            let cfg =
+                decode::<faucet_source_csv::CsvSourceConfig>("source", "csv", config.clone())?;
             cfg.validate()?;
-            Ok(Box::new(faucet_source_csv::CsvSource::new(cfg)))
+            if file_alias::uses_legacy_crate(Side::Source, "csv", &config) {
+                return Ok(Box::new(faucet_source_csv::CsvSource::new(cfg)));
+            }
+            file_alias_source("csv", &config)
         }
         #[cfg(feature = "source-singer")]
         "singer" => {
@@ -511,12 +518,19 @@ pub async fn build_source(
             ))
         }
         #[cfg(feature = "source-parquet")]
+        #[allow(deprecated)]
         "parquet" => {
-            let cfg =
-                decode::<faucet_source_parquet::ParquetSourceConfig>("source", "parquet", config)?;
-            Ok(Box::new(
-                faucet_source_parquet::ParquetSource::new(cfg).await?,
-            ))
+            let cfg = decode::<faucet_source_parquet::ParquetSourceConfig>(
+                "source",
+                "parquet",
+                config.clone(),
+            )?;
+            if file_alias::uses_legacy_crate(Side::Source, "parquet", &config) {
+                return Ok(Box::new(
+                    faucet_source_parquet::ParquetSource::new(cfg).await?,
+                ));
+            }
+            file_alias_source("parquet", &config)
         }
         #[cfg(feature = "source-delta")]
         "delta" => {
@@ -691,9 +705,10 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
             ))
         }
         #[cfg(feature = "sink-jsonl")]
+        #[allow(deprecated)]
         "jsonl" => {
-            let cfg = decode::<faucet_sink_jsonl::JsonlSinkConfig>("sink", "jsonl", config)?;
-            Ok(Box::new(faucet_sink_jsonl::JsonlSink::new(cfg)))
+            decode::<faucet_sink_jsonl::JsonlSinkConfig>("sink", "jsonl", config.clone())?;
+            file_alias_sink("jsonl", &config)
         }
         #[cfg(feature = "sink-snowflake")]
         "snowflake" => {
@@ -772,9 +787,13 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
             Ok(Box::new(faucet_sink_redis::RedisSink::new(cfg).await?))
         }
         #[cfg(feature = "sink-csv")]
+        #[allow(deprecated)]
         "csv" => {
-            let cfg = decode::<faucet_sink_csv::CsvSinkConfig>("sink", "csv", config)?;
-            Ok(Box::new(faucet_sink_csv::CsvSink::new(cfg)))
+            let cfg = decode::<faucet_sink_csv::CsvSinkConfig>("sink", "csv", config.clone())?;
+            if file_alias::uses_legacy_crate(Side::Sink, "csv", &config) {
+                return Ok(Box::new(faucet_sink_csv::CsvSink::new(cfg)));
+            }
+            file_alias_sink("csv", &config)
         }
         #[cfg(feature = "sink-elasticsearch")]
         "elasticsearch" => {
@@ -819,9 +838,23 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
             Ok(Box::new(faucet_sink_stdout::StdoutSink::new(cfg)))
         }
         #[cfg(feature = "sink-parquet")]
+        #[allow(deprecated)]
         "parquet" => {
-            let cfg = decode::<faucet_sink_parquet::ParquetSinkConfig>("sink", "parquet", config)?;
-            Ok(Box::new(faucet_sink_parquet::ParquetSink::new(cfg).await?))
+            let cfg = decode::<faucet_sink_parquet::ParquetSinkConfig>(
+                "sink",
+                "parquet",
+                config.clone(),
+            )?;
+            if file_alias::uses_legacy_crate(Side::Sink, "parquet", &config) {
+                return Ok(Box::new(faucet_sink_parquet::ParquetSink::new(cfg).await?));
+            }
+            cfg.validate()
+                .map_err(|e| CliError::InvalidConnectorConfig {
+                    kind: "sink",
+                    name: "parquet".to_owned(),
+                    message: format!("invalid parquet sink config: {e}"),
+                })?;
+            file_alias_sink("parquet", &config)
         }
         #[cfg(feature = "sink-file")]
         "file" => {
@@ -1670,9 +1703,16 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
             |c| c.validate(),
         ),
         #[cfg(feature = "source-csv")]
-        "csv" => check_with::<faucet_source_csv::CsvSourceConfig, _, _>("csv", name, config, |c| {
-            c.validate()
-        }),
+        #[allow(deprecated)]
+        "csv" => {
+            check_with::<faucet_source_csv::CsvSourceConfig, _, _>(
+                "csv",
+                name,
+                config.clone(),
+                |c| c.validate(),
+            )?;
+            check_file_alias(Side::Source, "csv", name, &config)
+        }
         #[cfg(feature = "source-singer")]
         "singer" => check::<faucet_source_singer::SingerSourceConfig>("singer", name, config),
         #[cfg(feature = "source-elasticsearch")]
@@ -1702,7 +1742,11 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> CliResul
             |c| c.validate(),
         ),
         #[cfg(feature = "source-parquet")]
-        "parquet" => check::<faucet_source_parquet::ParquetSourceConfig>("parquet", name, config),
+        #[allow(deprecated)]
+        "parquet" => {
+            check::<faucet_source_parquet::ParquetSourceConfig>("parquet", name, config.clone())?;
+            check_file_alias(Side::Source, "parquet", name, &config)
+        }
         #[cfg(feature = "source-delta")]
         "delta" => {
             check_with::<faucet_source_delta::DeltaSourceConfig, _, _>("delta", name, config, |c| {
@@ -1833,6 +1877,7 @@ pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::B
             c.batch_atomicity()
         }),
         #[cfg(feature = "sink-jsonl")]
+        #[allow(deprecated)]
         "jsonl" => {
             atomicity_of::<faucet_sink_jsonl::JsonlSinkConfig>(config, |c| c.batch_atomicity())
         }
@@ -1881,6 +1926,7 @@ pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::B
             atomicity_of::<faucet_sink_redis::RedisSinkConfig>(config, |c| c.batch_atomicity())
         }
         #[cfg(feature = "sink-csv")]
+        #[allow(deprecated)]
         "csv" => atomicity_of::<faucet_sink_csv::CsvSinkConfig>(config, |c| c.batch_atomicity()),
         #[cfg(feature = "sink-elasticsearch")]
         "elasticsearch" => {
@@ -1907,6 +1953,7 @@ pub fn sink_batch_atomicity(kind: &str, config: &Value) -> Option<faucet_core::B
             atomicity_of::<faucet_sink_stdout::StdoutSinkConfig>(config, |c| c.batch_atomicity())
         }
         #[cfg(feature = "sink-parquet")]
+        #[allow(deprecated)]
         "parquet" => {
             atomicity_of::<faucet_sink_parquet::ParquetSinkConfig>(config, |c| c.batch_atomicity())
         }
@@ -1994,7 +2041,11 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
         #[cfg(feature = "sink-postgres")]
         "postgres" => check::<faucet_sink_postgres::PostgresSinkConfig>("postgres", name, config),
         #[cfg(feature = "sink-jsonl")]
-        "jsonl" => check::<faucet_sink_jsonl::JsonlSinkConfig>("jsonl", name, config),
+        #[allow(deprecated)]
+        "jsonl" => {
+            check::<faucet_sink_jsonl::JsonlSinkConfig>("jsonl", name, config.clone())?;
+            check_file_alias(Side::Sink, "jsonl", name, &config)
+        }
         #[cfg(feature = "sink-snowflake")]
         "snowflake" => {
             check::<faucet_sink_snowflake::SnowflakeSinkConfig>("snowflake", name, config)
@@ -2043,7 +2094,11 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
         #[cfg(feature = "sink-redis")]
         "redis" => check::<faucet_sink_redis::RedisSinkConfig>("redis", name, config),
         #[cfg(feature = "sink-csv")]
-        "csv" => check::<faucet_sink_csv::CsvSinkConfig>("csv", name, config),
+        #[allow(deprecated)]
+        "csv" => {
+            check::<faucet_sink_csv::CsvSinkConfig>("csv", name, config.clone())?;
+            check_file_alias(Side::Sink, "csv", name, &config)
+        }
         #[cfg(feature = "sink-elasticsearch")]
         "elasticsearch" => check::<faucet_sink_elasticsearch::ElasticsearchSinkConfig>(
             "elasticsearch",
@@ -2075,12 +2130,16 @@ pub fn validate_sink_config(kind: &str, name: &str, config: Value) -> CliResult<
         #[cfg(feature = "sink-stdout")]
         "stdout" => check::<faucet_sink_stdout::StdoutSinkConfig>("stdout", name, config),
         #[cfg(feature = "sink-parquet")]
-        "parquet" => check_with::<faucet_sink_parquet::ParquetSinkConfig, _, _>(
-            "parquet",
-            name,
-            config,
-            |c| c.validate(),
-        ),
+        #[allow(deprecated)]
+        "parquet" => {
+            check_with::<faucet_sink_parquet::ParquetSinkConfig, _, _>(
+                "parquet",
+                name,
+                config.clone(),
+                |c| c.validate(),
+            )?;
+            check_file_alias(Side::Sink, "parquet", name, &config)
+        }
         #[cfg(feature = "sink-file")]
         "file" => check_with::<faucet_sink_file::FileSinkConfig, _, _>("file", name, config, |c| {
             c.validate()
@@ -2187,7 +2246,11 @@ pub fn source_schema(kind: &str) -> CliResult<Value> {
         #[cfg(feature = "source-websocket")]
         "websocket" => Ok(schema::<faucet_source_websocket::WebsocketSourceConfig>()),
         #[cfg(feature = "source-csv")]
-        "csv" => Ok(schema::<faucet_source_csv::CsvSourceConfig>()),
+        #[allow(deprecated)]
+        "csv" => Ok(deprecated_schema(
+            schema::<faucet_source_csv::CsvSourceConfig>(),
+            "csv",
+        )),
         #[cfg(feature = "source-singer")]
         "singer" => Ok(schema::<faucet_source_singer::SingerSourceConfig>()),
         #[cfg(feature = "source-elasticsearch")]
@@ -2201,7 +2264,11 @@ pub fn source_schema(kind: &str) -> CliResult<Value> {
         #[cfg(feature = "source-spanner")]
         "spanner" => Ok(schema::<faucet_source_spanner::SpannerSourceConfig>()),
         #[cfg(feature = "source-parquet")]
-        "parquet" => Ok(schema::<faucet_source_parquet::ParquetSourceConfig>()),
+        #[allow(deprecated)]
+        "parquet" => Ok(deprecated_schema(
+            schema::<faucet_source_parquet::ParquetSourceConfig>(),
+            "parquet",
+        )),
         #[cfg(feature = "source-delta")]
         "delta" => Ok(schema::<faucet_source_delta::DeltaSourceConfig>()),
         #[cfg(feature = "source-databricks")]
@@ -2259,7 +2326,11 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         #[cfg(feature = "sink-postgres")]
         "postgres" => Ok(schema::<faucet_sink_postgres::PostgresSinkConfig>()),
         #[cfg(feature = "sink-jsonl")]
-        "jsonl" => Ok(schema::<faucet_sink_jsonl::JsonlSinkConfig>()),
+        #[allow(deprecated)]
+        "jsonl" => Ok(deprecated_schema(
+            schema::<faucet_sink_jsonl::JsonlSinkConfig>(),
+            "jsonl",
+        )),
         #[cfg(feature = "sink-snowflake")]
         "snowflake" => Ok(schema::<faucet_sink_snowflake::SnowflakeSinkConfig>()),
         #[cfg(feature = "sink-mysql")]
@@ -2287,7 +2358,11 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         #[cfg(feature = "sink-redis")]
         "redis" => Ok(schema::<faucet_sink_redis::RedisSinkConfig>()),
         #[cfg(feature = "sink-csv")]
-        "csv" => Ok(schema::<faucet_sink_csv::CsvSinkConfig>()),
+        #[allow(deprecated)]
+        "csv" => Ok(deprecated_schema(
+            schema::<faucet_sink_csv::CsvSinkConfig>(),
+            "csv",
+        )),
         #[cfg(feature = "sink-elasticsearch")]
         "elasticsearch" => Ok(schema::<faucet_sink_elasticsearch::ElasticsearchSinkConfig>()),
         #[cfg(feature = "sink-kafka")]
@@ -2301,7 +2376,11 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
         #[cfg(feature = "sink-stdout")]
         "stdout" => Ok(schema::<faucet_sink_stdout::StdoutSinkConfig>()),
         #[cfg(feature = "sink-parquet")]
-        "parquet" => Ok(schema::<faucet_sink_parquet::ParquetSinkConfig>()),
+        #[allow(deprecated)]
+        "parquet" => Ok(deprecated_schema(
+            schema::<faucet_sink_parquet::ParquetSinkConfig>(),
+            "parquet",
+        )),
         #[cfg(feature = "sink-file")]
         "file" => Ok(schema::<faucet_sink_file::FileSinkConfig>()),
         #[cfg(feature = "sink-gcs")]
@@ -2431,7 +2510,10 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
         "WebSocket streaming source — connects, subscribes, streams each message as a record",
     ));
     #[cfg(feature = "source-csv")]
-    v.push(("csv", "CSV file source"));
+    v.push((
+        "csv",
+        "Deprecated alias of `file` with `format: csv` (CSV file source)",
+    ));
     #[cfg(feature = "source-singer")]
     v.push((
         "singer",
@@ -2446,7 +2528,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "source-spanner")]
     v.push(("spanner", "Google Cloud Spanner query source. Streaming SQL reads with incremental replication bookmarks, stale reads, and PK-range sharding."));
     #[cfg(feature = "source-parquet")]
-    v.push(("parquet", "Apache Parquet file source (local path, glob, or S3). Streams record batches via the Arrow async reader."));
+    v.push(("parquet", "Deprecated alias of `file` with `format: parquet` (Parquet file source; an S3 location still uses the old reader)"));
     #[cfg(feature = "source-delta")]
     v.push(("delta", "Apache Delta Lake source (local FS or S3/Azure/GCS). Streams active data files with time travel and projection pushdown."));
     #[cfg(feature = "source-databricks")]
@@ -2500,7 +2582,10 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-postgres")]
     v.push(("postgres", "PostgreSQL sink (JSONB or auto-mapped columns)"));
     #[cfg(feature = "sink-jsonl")]
-    v.push(("jsonl", "JSON Lines file sink"));
+    v.push((
+        "jsonl",
+        "Deprecated alias of `file` with `format: json_lines` (JSON Lines file sink)",
+    ));
     #[cfg(feature = "sink-snowflake")]
     v.push(("snowflake", "Snowflake SQL REST API sink"));
     #[cfg(feature = "sink-mysql")]
@@ -2549,7 +2634,10 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-redis")]
     v.push(("redis", "Redis (streams, lists, key-value) sink"));
     #[cfg(feature = "sink-csv")]
-    v.push(("csv", "CSV file sink"));
+    v.push((
+        "csv",
+        "Deprecated alias of `file` with `format: csv` (CSV file sink)",
+    ));
     #[cfg(feature = "sink-elasticsearch")]
     v.push(("elasticsearch", "Elasticsearch bulk index sink"));
     #[cfg(feature = "sink-kafka")]
@@ -2563,7 +2651,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-stdout")]
     v.push(("stdout", "Stdout / stderr sink (JSON Lines, pretty, TSV)"));
     #[cfg(feature = "sink-parquet")]
-    v.push(("parquet", "Apache Parquet file sink (local path or S3). Schema-inferred, configurable compression, row/byte rollover."));
+    v.push(("parquet", "Deprecated alias of `file` with `format: parquet` (Parquet file sink; an S3 destination still uses the old writer)"));
     #[cfg(feature = "sink-file")]
     v.push(("file", "Local file sink. JSONL, JSON, CSV, XML, Excel, Avro or Parquet by extension; rollover, compression, temp-then-rename finalisation, atomic overwrite."));
     #[cfg(feature = "sink-delta")]
@@ -2616,6 +2704,113 @@ pub fn source_kinds() -> Vec<&'static str> {
 /// Names of every compiled-in sink connector.
 pub fn sink_kinds() -> Vec<&'static str> {
     sink_descriptions().into_iter().map(|(k, _)| k).collect()
+}
+
+#[cfg(any(
+    feature = "source-csv",
+    feature = "source-parquet",
+    feature = "sink-csv",
+    feature = "sink-jsonl",
+    feature = "sink-parquet"
+))]
+fn file_alias_config(
+    side: Side,
+    kind: &'static str,
+    name: &str,
+    config: &Value,
+) -> CliResult<Value> {
+    file_alias::to_file_config(side, kind, config).map_err(|message| {
+        CliError::InvalidConnectorConfig {
+            kind,
+            name: name.to_owned(),
+            message,
+        }
+    })
+}
+
+#[cfg(any(feature = "source-csv", feature = "source-parquet"))]
+fn file_alias_source(kind: &'static str, config: &Value) -> CliResult<Box<dyn Source>> {
+    let cfg = decode::<faucet_source_file::FileSourceConfig>(
+        "source",
+        kind,
+        file_alias_config(Side::Source, kind, kind, config)?,
+    )?;
+    Ok(Box::new(
+        faucet_source_file::FileSource::new(cfg)?.with_connector_name(kind),
+    ))
+}
+
+#[cfg(any(feature = "sink-csv", feature = "sink-jsonl", feature = "sink-parquet"))]
+fn file_alias_sink(kind: &'static str, config: &Value) -> CliResult<Box<dyn Sink>> {
+    let cfg = decode::<faucet_sink_file::FileSinkConfig>(
+        "sink",
+        kind,
+        file_alias_config(Side::Sink, kind, kind, config)?,
+    )?;
+    Ok(Box::new(
+        faucet_sink_file::FileSink::new(cfg)?.with_connector_name(kind),
+    ))
+}
+
+/// Validate the `file` config a deprecated kind is built as, so a value the
+/// `file` connector refuses fails `faucet validate` rather than the first run.
+#[cfg(any(
+    feature = "source-csv",
+    feature = "source-parquet",
+    feature = "sink-csv",
+    feature = "sink-jsonl",
+    feature = "sink-parquet"
+))]
+fn check_file_alias(side: Side, kind: &'static str, name: &str, config: &Value) -> CliResult<()> {
+    if file_alias::uses_legacy_crate(side, kind, config) {
+        return Ok(());
+    }
+    let file_cfg = file_alias_config(side, kind, name, config)?;
+    match side {
+        #[cfg(any(feature = "source-csv", feature = "source-parquet"))]
+        Side::Source => {
+            check_with::<faucet_source_file::FileSourceConfig, _, _>(kind, name, file_cfg, |c| {
+                c.validate()
+            })
+        }
+        #[cfg(any(feature = "sink-csv", feature = "sink-jsonl", feature = "sink-parquet"))]
+        Side::Sink => {
+            check_with::<faucet_sink_file::FileSinkConfig, _, _>(kind, name, file_cfg, |c| {
+                c.validate()
+            })
+        }
+        #[allow(unreachable_patterns)]
+        _ => Ok(()),
+    }
+}
+
+/// Mark a deprecated kind's schema: `deprecated: true` and a description
+/// naming the replacement.
+#[cfg(any(
+    feature = "source-csv",
+    feature = "source-parquet",
+    feature = "sink-csv",
+    feature = "sink-jsonl",
+    feature = "sink-parquet"
+))]
+fn deprecated_schema(mut schema: Value, kind: &str) -> Value {
+    if let Some(obj) = schema.as_object_mut() {
+        obj.insert("deprecated".into(), Value::Bool(true));
+        let was = obj
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        obj.insert(
+            "description".into(),
+            Value::String(
+                format!("Deprecated alias: {}. {was}", file_alias::replacement(kind))
+                    .trim_end()
+                    .to_string(),
+            ),
+        );
+    }
+    schema
 }
 
 fn decode<T: DeserializeOwned>(kind: &'static str, name: &str, config: Value) -> CliResult<T> {

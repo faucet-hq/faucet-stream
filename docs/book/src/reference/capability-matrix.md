@@ -60,3 +60,13 @@ A `delivery: exactly_once` pipeline needs a replayable source **and** an atomic-
 | `mysql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `oracle-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `postgres-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+## Deprecated kinds
+
+These kinds still work and are built as the `file` connector with the format pinned (a `parquet` location on S3 still uses the old crate). New configs should use `type: file`.
+
+| Deprecated | Replacement |
+|---|---|
+| `type: csv` | use `type: file` with `format: csv` |
+| `type: jsonl` | use `type: file` with `format: json_lines` |
+| `type: parquet` | use `type: file` with `format: parquet` |

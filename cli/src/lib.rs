@@ -32,6 +32,7 @@ pub mod error;
 pub mod exec_metrics;
 pub mod executor;
 pub mod expand;
+pub mod file_alias;
 pub mod hub;
 #[cfg(feature = "catalog")]
 pub mod impact;
