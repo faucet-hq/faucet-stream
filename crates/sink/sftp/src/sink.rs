@@ -35,10 +35,7 @@ impl SftpSink {
             settings.codec,
             settings.rolls_over(),
         )
-        .map_err(|e| match e {
-            FaucetError::Config(m) => FaucetError::Config(format!("SFTP sink: {m}")),
-            other => other,
-        })?;
+        .map_err(|e| faucet_common_file::config_context("SFTP sink", e))?;
         let base = if config.path.starts_with('/') && !base.starts_with('/') {
             format!("/{base}")
         } else {

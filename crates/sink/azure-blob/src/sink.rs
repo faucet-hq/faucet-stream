@@ -44,10 +44,7 @@ impl AzureBlobSink {
             settings.codec,
             settings.rolls_over(),
         )
-        .map_err(|e| match e {
-            FaucetError::Config(m) => FaucetError::Config(format!("azure-blob sink: {m}")),
-            other => other,
-        })?;
+        .map_err(|e| faucet_common_file::config_context("azure-blob sink", e))?;
         let objects = Arc::new(AzureObjects {
             store: store.clone(),
             container: config.container().to_string(),

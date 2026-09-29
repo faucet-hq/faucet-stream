@@ -29,10 +29,7 @@ impl FileSink {
             settings.codec,
             settings.rolls_over(),
         )
-        .map_err(|e| match e {
-            FaucetError::Config(m) => FaucetError::Config(format!("file sink: {m}")),
-            other => other,
-        })?;
+        .map_err(|e| faucet_common_file::config_context("file sink", e))?;
         let local = Arc::new(LocalBackend::new(
             &dir,
             &template.staging_name(),

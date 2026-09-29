@@ -45,10 +45,7 @@ impl S3Sink {
             settings.codec,
             settings.rolls_over(),
         )
-        .map_err(|e| match e {
-            FaucetError::Config(m) => FaucetError::Config(format!("S3 sink: {m}")),
-            other => other,
-        })?;
+        .map_err(|e| faucet_common_file::config_context("S3 sink", e))?;
         let roundtrips = Arc::new(faucet_core::observability::RecorderSlot::new());
         let objects = Arc::new(S3Objects {
             client: client.clone(),

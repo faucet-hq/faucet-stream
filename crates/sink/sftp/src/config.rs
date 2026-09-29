@@ -624,4 +624,23 @@ mod object_rules_tests {
         c.file_name = Some("part-{part}.parquet".into());
         assert!(!c.settings().unwrap().object_per_write, "path: per part");
     }
+
+    #[test]
+    fn auto_maps_onto_json_lines_and_a_bad_config_is_best_effort() {
+        assert_eq!(
+            SftpSinkFormat::Auto.shared(),
+            faucet_core::FileFormat::JsonLines
+        );
+        let mut c = SftpSinkConfig::new(
+            faucet_common_sftp::SftpConnectionConfig::with_password("h", "u", "p"),
+            "/d",
+        )
+        .concurrency(3);
+        assert_eq!(c.concurrency, 3);
+        c.max_records_per_file = Some(0);
+        c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+        c.mode = faucet_common_file::write::FileMode::Append;
+        assert!(c.settings().and_then(|s| s.validate()).is_err());
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+    }
 }

@@ -256,10 +256,7 @@ impl FileSinkConfig {
             settings.codec,
             settings.rolls_over(),
         )
-        .map_err(|e| match e {
-            FaucetError::Config(m) => FaucetError::Config(format!("file sink: {m}")),
-            other => other,
-        })?;
+        .map_err(|e| faucet_common_file::config_context("file sink", e))?;
         settings.validate_for(&template)
     }
 
@@ -489,5 +486,23 @@ mod tests {
             cfg(json!({"path": "a-{part}.jsonl.gz"})).resolved_compression(),
             Compression::Gzip
         );
+    }
+
+    #[test]
+    fn json_lines_and_encryption_builders_and_a_part_token_directory() {
+        let c = FileSinkConfig::new("out/x.jsonl").json_lines(JsonLinesOptions { pretty: true });
+        assert!(c.json_lines.pretty);
+        #[cfg(feature = "encryption")]
+        {
+            let spec: faucet_core::EncryptionSpec =
+                serde_json::from_value(json!({"key": "k"})).unwrap();
+            assert!(c.clone().encryption(spec).encryption.is_some());
+        }
+        let e = cfg(json!({"path": "out-{part}/x.jsonl"}))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("file sink: "), "{e}");
+        assert!(e.contains("may appear only in the file name"), "{e}");
     }
 }

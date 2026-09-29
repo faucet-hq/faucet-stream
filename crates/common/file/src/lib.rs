@@ -134,6 +134,15 @@ pub fn require_path(connector: &str, path: &str) -> Result<(), FaucetError> {
     Ok(())
 }
 
+/// Prefix a [`FaucetError::Config`] message with `connector`; any other
+/// error passes through unchanged.
+pub fn config_context(connector: &str, e: FaucetError) -> FaucetError {
+    match e {
+        FaucetError::Config(m) => FaucetError::Config(format!("{connector}: {m}")),
+        other => other,
+    }
+}
+
 /// Whether `path` is an `http://` or `https://` URL.
 pub fn is_http_path(path: &str) -> bool {
     let p = path.trim_start().to_ascii_lowercase();
@@ -270,5 +279,17 @@ mod tests {
             serde_json::to_string(&FileFormatChoice::Auto).unwrap(),
             "\"auto\""
         );
+    }
+
+    #[test]
+    fn config_context_prefixes_only_config_errors() {
+        assert_eq!(
+            config_context("S3 sink", FaucetError::Config("bad".into())).to_string(),
+            FaucetError::Config("S3 sink: bad".into()).to_string()
+        );
+        assert!(matches!(
+            config_context("S3 sink", FaucetError::Sink("io".into())),
+            FaucetError::Sink(m) if m == "io"
+        ));
     }
 }
