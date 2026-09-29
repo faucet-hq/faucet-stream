@@ -1,10 +1,12 @@
 {
   "version": 1,
-  "_comment": "faucet-stream connector registry \u2014 the index behind `faucet search` / `faucet install`. Built-in connectors are `verified` and ship in the `faucet` binary (enable with `--features <kind>-<name>`). Community connectors: open a PR adding an entry with `verified: false`, an explicit `crate`, and (optionally) a `feature`; users consume them by building a custom binary (see cli/README.md \u2192 Custom binaries with third-party connectors). `crate` defaults to `faucet-<kind>-<name>` and `feature` to `<kind>-<name>` when omitted. `tier` is the connector conformance maturity tier (stable/experimental/beta/draft, #330); for verified built-ins it is validated against the score computed by `faucet conformance` (see the `builtin_tiers_match_conformance` test), so it never drifts from the code.",
+  "_comment": "faucet-stream connector registry \u2014 the index behind `faucet search` / `faucet install`. Built-in connectors are `verified` and ship in the `faucet` binary (enable with `--features <kind>-<name>`). Community connectors: open a PR adding an entry with `verified: false`, an explicit `crate`, and (optionally) a `feature`; users consume them by building a custom binary (see cli/README.md \u2192 Custom binaries with third-party connectors). `crate` defaults to `faucet-<kind>-<name>` and `feature` to `<kind>-<name>` when omitted. `tier` is the connector conformance maturity tier (stable/experimental/beta/draft, #330); for verified built-ins it is validated against the score computed by `faucet conformance` (see the `builtin_tiers_match_conformance` test), so it never drifts from the code. `title` is the display name and `category` one of databases/cdc/warehouses/streaming/files/apis/bridges (the Connector Hub groups by it, #572).",
   "connectors": [
     {
       "name": "rest",
       "kind": "source",
+      "title": "REST",
+      "category": "apis",
       "verified": true,
       "tier": "stable",
       "description": "REST API source with pagination, auth, transforms"
@@ -12,6 +14,8 @@
     {
       "name": "graphql",
       "kind": "source",
+      "title": "GraphQL",
+      "category": "apis",
       "verified": true,
       "tier": "stable",
       "description": "GraphQL API source with cursor pagination"
@@ -19,6 +23,8 @@
     {
       "name": "xml",
       "kind": "source",
+      "title": "XML / SOAP",
+      "category": "apis",
       "verified": true,
       "tier": "stable",
       "description": "XML / SOAP API source with XML\u2192JSON conversion"
@@ -26,6 +32,8 @@
     {
       "name": "grpc",
       "kind": "source",
+      "title": "gRPC",
+      "category": "apis",
       "verified": true,
       "tier": "stable",
       "description": "gRPC source with dynamic protobuf"
@@ -33,6 +41,8 @@
     {
       "name": "postgres",
       "kind": "source",
+      "title": "PostgreSQL",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "PostgreSQL query source"
@@ -40,6 +50,8 @@
     {
       "name": "postgres-cdc",
       "kind": "source",
+      "title": "PostgreSQL CDC",
+      "category": "cdc",
       "verified": true,
       "tier": "stable",
       "description": "PostgreSQL CDC source (logical replication)"
@@ -47,6 +59,8 @@
     {
       "name": "mysql",
       "kind": "source",
+      "title": "MySQL",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "MySQL query source"
@@ -54,6 +68,8 @@
     {
       "name": "mysql-cdc",
       "kind": "source",
+      "title": "MySQL CDC",
+      "category": "cdc",
       "verified": true,
       "tier": "stable",
       "description": "MySQL CDC source (binlog replication)"
@@ -61,6 +77,8 @@
     {
       "name": "mssql-cdc",
       "kind": "source",
+      "title": "SQL Server CDC",
+      "category": "cdc",
       "verified": true,
       "tier": "stable",
       "description": "Microsoft SQL Server CDC source (change data capture, exactly-once capable)"
@@ -68,6 +86,8 @@
     {
       "name": "redshift",
       "kind": "source",
+      "title": "Amazon Redshift",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Amazon Redshift query source (PostgreSQL wire; streaming rows, incremental replication)"
@@ -75,6 +95,8 @@
     {
       "name": "pubsub",
       "kind": "source",
+      "title": "Google Cloud Pub/Sub",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "Google Cloud Pub/Sub consumer with ack at durable page boundaries"
@@ -82,6 +104,8 @@
     {
       "name": "clickhouse",
       "kind": "source",
+      "title": "ClickHouse",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "ClickHouse query source (HTTP interface, JSONEachRow streaming)"
@@ -89,6 +113,8 @@
     {
       "name": "azure-blob",
       "kind": "source",
+      "title": "Azure Blob Storage",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Azure Blob Storage / ADLS Gen2 source \u2014 JSONL, JSON array, or raw text"
@@ -96,6 +122,8 @@
     {
       "name": "mssql",
       "kind": "source",
+      "title": "Microsoft SQL Server",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Microsoft SQL Server query source"
@@ -103,6 +131,8 @@
     {
       "name": "sqlite",
       "kind": "source",
+      "title": "SQLite",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "SQLite query source"
@@ -110,6 +140,8 @@
     {
       "name": "mongodb",
       "kind": "source",
+      "title": "MongoDB",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "MongoDB query source"
@@ -117,6 +149,8 @@
     {
       "name": "mongodb-cdc",
       "kind": "source",
+      "title": "MongoDB CDC",
+      "category": "cdc",
       "verified": true,
       "tier": "stable",
       "description": "MongoDB CDC source (Change Streams)"
@@ -124,6 +158,8 @@
     {
       "name": "s3",
       "kind": "source",
+      "title": "Amazon S3",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "AWS S3 object source"
@@ -131,6 +167,8 @@
     {
       "name": "gcs",
       "kind": "source",
+      "title": "Google Cloud Storage",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Google Cloud Storage source \u2014 JSONL, JSON array, or raw text"
@@ -138,6 +176,8 @@
     {
       "name": "redis",
       "kind": "source",
+      "title": "Redis",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Redis (streams, lists, keys) source"
@@ -145,6 +185,8 @@
     {
       "name": "webhook",
       "kind": "source",
+      "title": "Webhook",
+      "category": "apis",
       "verified": true,
       "tier": "stable",
       "description": "Webhook HTTP receiver source"
@@ -152,6 +194,8 @@
     {
       "name": "websocket",
       "kind": "source",
+      "title": "WebSocket",
+      "category": "apis",
       "verified": true,
       "tier": "stable",
       "description": "WebSocket streaming source"
@@ -159,6 +203,8 @@
     {
       "name": "csv",
       "kind": "source",
+      "title": "CSV",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "CSV file source"
@@ -166,6 +212,8 @@
     {
       "name": "singer",
       "kind": "source",
+      "title": "Singer bridge",
+      "category": "bridges",
       "verified": true,
       "tier": "stable",
       "description": "Singer tap bridge (runs an external Singer tap)"
@@ -173,6 +221,8 @@
     {
       "name": "elasticsearch",
       "kind": "source",
+      "title": "Elasticsearch",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Elasticsearch search / scroll source"
@@ -180,6 +230,8 @@
     {
       "name": "kafka",
       "kind": "source",
+      "title": "Apache Kafka",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "Apache Kafka consumer with idle/max-messages termination"
@@ -187,6 +239,8 @@
     {
       "name": "kinesis",
       "kind": "source",
+      "title": "AWS Kinesis",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "AWS Kinesis Data Streams consumer with per-shard checkpoints"
@@ -194,6 +248,8 @@
     {
       "name": "parquet",
       "kind": "source",
+      "title": "Apache Parquet",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Apache Parquet file source (local, glob, or S3)"
@@ -201,6 +257,8 @@
     {
       "name": "delta",
       "kind": "source",
+      "title": "Delta Lake",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Apache Delta Lake source (local FS or S3/Azure/GCS; time travel, projection)"
@@ -208,6 +266,8 @@
     {
       "name": "databricks",
       "kind": "source",
+      "title": "Databricks",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Databricks SQL query source (Statement Execution API; typed rows, chunk pagination, incremental)"
@@ -215,6 +275,8 @@
     {
       "name": "bigquery",
       "kind": "source",
+      "title": "Google BigQuery",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Google BigQuery query source"
@@ -222,6 +284,8 @@
     {
       "name": "snowflake",
       "kind": "source",
+      "title": "Snowflake",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Snowflake query source (SQL REST API)"
@@ -229,6 +293,8 @@
     {
       "name": "spanner",
       "kind": "source",
+      "title": "Cloud Spanner",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Google Cloud Spanner query source (streaming SQL, incremental replication)"
@@ -236,6 +302,8 @@
     {
       "name": "bigquery",
       "kind": "sink",
+      "title": "Google BigQuery",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Google BigQuery streaming-insert sink"
@@ -243,6 +311,8 @@
     {
       "name": "iceberg",
       "kind": "sink",
+      "title": "Apache Iceberg",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Apache Iceberg sink (append; REST/Glue/SQL/HMS catalogs)"
@@ -250,6 +320,8 @@
     {
       "name": "postgres",
       "kind": "sink",
+      "title": "PostgreSQL",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "PostgreSQL sink (JSONB or auto-mapped columns)"
@@ -257,6 +329,8 @@
     {
       "name": "jsonl",
       "kind": "sink",
+      "title": "JSON Lines",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "JSON Lines file sink"
@@ -264,6 +338,8 @@
     {
       "name": "snowflake",
       "kind": "sink",
+      "title": "Snowflake",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Snowflake SQL REST API sink"
@@ -271,6 +347,8 @@
     {
       "name": "mysql",
       "kind": "sink",
+      "title": "MySQL",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "MySQL sink"
@@ -278,6 +356,8 @@
     {
       "name": "mssql",
       "kind": "sink",
+      "title": "Microsoft SQL Server",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Microsoft SQL Server sink"
@@ -285,6 +365,8 @@
     {
       "name": "sqlite",
       "kind": "sink",
+      "title": "SQLite",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "SQLite sink"
@@ -292,6 +374,8 @@
     {
       "name": "s3",
       "kind": "sink",
+      "title": "Amazon S3",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "AWS S3 object sink"
@@ -299,6 +383,8 @@
     {
       "name": "gcs",
       "kind": "sink",
+      "title": "Google Cloud Storage",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Google Cloud Storage sink \u2014 JSONL files"
@@ -306,6 +392,8 @@
     {
       "name": "mongodb",
       "kind": "sink",
+      "title": "MongoDB",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "MongoDB insert sink"
@@ -313,6 +401,8 @@
     {
       "name": "redis",
       "kind": "sink",
+      "title": "Redis",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Redis (streams, lists, key-value) sink"
@@ -320,6 +410,8 @@
     {
       "name": "csv",
       "kind": "sink",
+      "title": "CSV",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "CSV file sink"
@@ -327,6 +419,8 @@
     {
       "name": "elasticsearch",
       "kind": "sink",
+      "title": "Elasticsearch",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Elasticsearch bulk index sink"
@@ -334,6 +428,8 @@
     {
       "name": "kafka",
       "kind": "sink",
+      "title": "Apache Kafka",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "Apache Kafka producer with QueueFull retry and topic routing"
@@ -341,6 +437,8 @@
     {
       "name": "kinesis",
       "kind": "sink",
+      "title": "AWS Kinesis",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "AWS Kinesis Data Streams producer with partial-failure retry"
@@ -348,6 +446,8 @@
     {
       "name": "spanner",
       "kind": "sink",
+      "title": "Cloud Spanner",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Google Cloud Spanner mutation sink (upsert/delete, exactly-once)"
@@ -355,6 +455,8 @@
     {
       "name": "http",
       "kind": "sink",
+      "title": "HTTP",
+      "category": "apis",
       "verified": true,
       "tier": "stable",
       "description": "HTTP POST sink (individual or array batch)"
@@ -362,6 +464,8 @@
     {
       "name": "stdout",
       "kind": "sink",
+      "title": "Stdout",
+      "category": "bridges",
       "verified": true,
       "tier": "stable",
       "description": "Stdout / stderr sink (JSON Lines, pretty, TSV)"
@@ -369,6 +473,8 @@
     {
       "name": "parquet",
       "kind": "sink",
+      "title": "Apache Parquet",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Apache Parquet file sink (local path or S3)"
@@ -376,6 +482,8 @@
     {
       "name": "delta",
       "kind": "sink",
+      "title": "Delta Lake",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Apache Delta Lake sink (append-only; local FS or S3/Azure/GCS)"
@@ -383,6 +491,8 @@
     {
       "name": "redshift",
       "kind": "sink",
+      "title": "Amazon Redshift",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Amazon Redshift sink (COPY-from-S3 or multi-row INSERT)"
@@ -390,6 +500,8 @@
     {
       "name": "pubsub",
       "kind": "sink",
+      "title": "Google Cloud Pub/Sub",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "Google Cloud Pub/Sub producer with ordering keys and partial-failure retry"
@@ -397,6 +509,8 @@
     {
       "name": "clickhouse",
       "kind": "sink",
+      "title": "ClickHouse",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "ClickHouse sink (HTTP INSERT \u2026 FORMAT JSONEachRow; optional async inserts)"
@@ -404,6 +518,8 @@
     {
       "name": "azure-blob",
       "kind": "sink",
+      "title": "Azure Blob Storage",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Azure Blob Storage / ADLS Gen2 sink \u2014 JSONL files"
@@ -411,6 +527,8 @@
     {
       "name": "duckdb",
       "kind": "source",
+      "title": "DuckDB",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "DuckDB query source (file or in-memory), rows streamed as JSON"
@@ -418,6 +536,8 @@
     {
       "name": "duckdb",
       "kind": "sink",
+      "title": "DuckDB",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "DuckDB sink; transaction-wrapped multi-row INSERT (JSON column or auto-mapped)"
@@ -425,6 +545,8 @@
     {
       "name": "sqs",
       "kind": "source",
+      "title": "AWS SQS",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "AWS SQS source; long-poll ReceiveMessage, delete-after-confirm"
@@ -432,6 +554,8 @@
     {
       "name": "sqs",
       "kind": "sink",
+      "title": "AWS SQS",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "AWS SQS sink; batched SendMessageBatch with per-entry retry"
@@ -439,6 +563,8 @@
     {
       "name": "nats",
       "kind": "source",
+      "title": "NATS",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "NATS source; subject/JetStream drain with idle/max termination"
@@ -446,6 +572,8 @@
     {
       "name": "nats",
       "kind": "sink",
+      "title": "NATS",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "NATS sink; publish records to a subject, flush per batch"
@@ -453,6 +581,8 @@
     {
       "name": "rabbitmq",
       "kind": "source",
+      "title": "RabbitMQ",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "RabbitMQ (AMQP 0.9.1) source; queue consume, ack after sink confirm, idle/max termination"
@@ -460,6 +590,8 @@
     {
       "name": "rabbitmq",
       "kind": "sink",
+      "title": "RabbitMQ",
+      "category": "streaming",
       "verified": true,
       "tier": "stable",
       "description": "RabbitMQ (AMQP 0.9.1) sink; exchange publish, per-record routing key, publisher confirms"
@@ -467,6 +599,8 @@
     {
       "name": "sftp",
       "kind": "source",
+      "title": "SFTP",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "SFTP source; list/glob a remote dir, stream JSONL/JSON-array/raw-text"
@@ -474,6 +608,8 @@
     {
       "name": "file",
       "kind": "source",
+      "title": "Local files",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Local file source; path/dir/glob/URL, every file format incl. Avro/ORC/Parquet, incremental by mtime or name"
@@ -481,6 +617,8 @@
     {
       "name": "sftp",
       "kind": "sink",
+      "title": "SFTP",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "SFTP sink; JSONL objects, atomic temp+rename upload"
@@ -488,6 +626,8 @@
     {
       "name": "file",
       "kind": "sink",
+      "title": "Local files",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Local file sink; JSONL/JSON/CSV/XML/Excel/Avro/Parquet by extension, rollover, atomic temp+rename, atomic overwrite"
@@ -495,6 +635,8 @@
     {
       "name": "singer",
       "kind": "sink",
+      "title": "Singer bridge",
+      "category": "bridges",
       "verified": true,
       "tier": "stable",
       "description": "Singer target bridge (runs an external Singer target; bookmarks advance after the target confirms)"
@@ -502,6 +644,8 @@
     {
       "name": "iceberg",
       "kind": "source",
+      "title": "Apache Iceberg",
+      "category": "files",
       "verified": true,
       "tier": "stable",
       "description": "Apache Iceberg source (REST/Glue/SQL/HMS catalogs; projection + filter pushdown, time travel, incremental snapshots)"
@@ -509,6 +653,8 @@
     {
       "name": "dynamodb",
       "kind": "source",
+      "title": "Amazon DynamoDB",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Amazon DynamoDB source; parallel Scan, Query, or Streams CDC with resumable shard bookmarks"
@@ -516,6 +662,8 @@
     {
       "name": "dynamodb",
       "kind": "sink",
+      "title": "Amazon DynamoDB",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Amazon DynamoDB sink; batched writes, upsert/delete by key, conditional writes"
@@ -523,6 +671,8 @@
     {
       "name": "databricks",
       "kind": "sink",
+      "title": "Databricks",
+      "category": "warehouses",
       "verified": true,
       "tier": "stable",
       "description": "Databricks SQL warehouse sink; append/upsert/delete/overwrite, exactly-once, schema evolution, staged COPY INTO"
@@ -530,6 +680,8 @@
     {
       "name": "oracle",
       "kind": "source",
+      "title": "Oracle Database",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Oracle Database query source (ODPI-C); incremental replication, PK-range sharding, discovery; needs Oracle Instant Client"
@@ -537,6 +689,8 @@
     {
       "name": "oracle-cdc",
       "kind": "source",
+      "title": "Oracle CDC",
+      "category": "cdc",
       "verified": true,
       "tier": "stable",
       "description": "Oracle CDC via LogMiner; committed-transaction change events, SCN bookmarks, exactly-once; needs Oracle Instant Client"
@@ -544,6 +698,8 @@
     {
       "name": "oracle",
       "kind": "sink",
+      "title": "Oracle Database",
+      "category": "databases",
       "verified": true,
       "tier": "stable",
       "description": "Oracle Database sink; array DML, MERGE upsert/delete, overwrite, exactly-once, schema evolution; needs Oracle Instant Client"

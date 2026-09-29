@@ -3,7 +3,7 @@
 use faucet_core::replication::BIND_PLACEHOLDER;
 use faucet_core::{
     AuthSpec, BindFormat, BindValueType, DEFAULT_BATCH_SIZE, FaucetError, OnMissingKey,
-    ReplicationKey, ReplicationMethod, TlsClientConfig, validate_batch_size,
+    ReplicationKey, ReplicationMethod, RetryMatcher, TlsClientConfig, validate_batch_size,
 };
 use reqwest::header::HeaderMap;
 use schemars::JsonSchema;
@@ -241,6 +241,15 @@ pub struct GraphqlStreamConfig {
     /// Requires `replication_method: incremental` + `replication_key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication_bind: Option<GraphqlReplicationBind>,
+    /// Responses to treat as throttling and retry — including a `200` whose
+    /// body reports it (`match_success: true` with
+    /// `body_path: "$.errors[*].extensions.code"`, `values: [THROTTLED]`). A
+    /// rule's `backoff_from` reads the wait from the response (`cost_bucket`
+    /// for Shopify-style cost reports, or a reset header / body value).
+    /// Checked before the response's `errors[]` are classified; a match
+    /// retries the whole request, so partial `data` is never emitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_on_response: Vec<RetryMatcher>,
 }
 
 fn default_batch_size() -> usize {
@@ -267,6 +276,7 @@ impl GraphqlStreamConfig {
             start_replication_value: None,
             state_key: None,
             replication_bind: None,
+            retry_on_response: Vec::new(),
         }
     }
 
@@ -358,6 +368,12 @@ impl GraphqlStreamConfig {
         }
         if let Some(tls) = &self.tls {
             tls.validate()?;
+        }
+        for (i, m) in self.retry_on_response.iter().enumerate() {
+            m.validate(i).map_err(|e| match e {
+                FaucetError::Config(msg) => FaucetError::Config(format!("graphql: {msg}")),
+                other => other,
+            })?;
         }
         self.validate_replication()
     }

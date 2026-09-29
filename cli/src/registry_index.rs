@@ -24,6 +24,13 @@ pub struct ConnectorEntry {
     pub name: String,
     /// `"source"` or `"sink"`.
     pub kind: String,
+    /// Display name (e.g. `PostgreSQL CDC`).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Connector Hub category: `databases` / `cdc` / `warehouses` /
+    /// `streaming` / `files` / `apis` / `bridges`.
+    #[serde(default)]
+    pub category: Option<String>,
     /// Verified = a first-party built-in that ships in the `faucet` binary.
     /// Community connectors set `false`.
     #[serde(default = "default_true")]
@@ -225,6 +232,8 @@ mod tests {
         let entry = ConnectorEntry {
             name: "acme".into(),
             kind: "source".into(),
+            title: None,
+            category: None,
             verified: false,
             description: "community".into(),
             krate: None,

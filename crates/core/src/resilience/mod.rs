@@ -6,6 +6,7 @@ mod breaker;
 mod classify;
 mod execute;
 mod policy;
+pub mod response_matcher;
 
 pub use breaker::CircuitBreaker;
 pub use classify::{RetryClass, RetryClassSet, classify};
@@ -14,4 +15,7 @@ pub use execute::{
 };
 pub use policy::{
     BackoffKind, CircuitBreakerConfig, PoisonAction, PoisonPolicy, ResiliencePolicy, RetryPolicy,
+};
+pub use response_matcher::{
+    BackoffFrom, DEFAULT_MAX_WAIT_SECS, RetryMatcher, WaitUnit, find_match,
 };

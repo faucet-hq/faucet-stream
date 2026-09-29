@@ -995,20 +995,26 @@ explicitly; otherwise the injected policy's `max_attempts` + `base` apply (its
 and on every sink-side write).
 
 For APIs that signal a rate limit with a 4xx other than `429` plus a code in the
-body, the `rest` source's own `retry_on_response` list turns matching responses
+body, inside a successful response, or with a reset time in a header, the
+`rest` and `graphql` sources' `retry_on_response` list turns matching responses
 into throttling (counted in `faucet_source_throttled_total` and retried up to
 `max_retries` times in a row):
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `status` | `[]` | Statuses the rule applies to (empty = any non-2xx). |
-| `body_path` | — | JSONPath into the JSON error body; its first match is compared with `values`. |
+| `status` | `[]` | Statuses the rule applies to (empty = any non-2xx, or any status with `match_success`). |
+| `match_success` | `false` | Also match 2xx responses (GraphQL `THROTTLED` errors, `x-ratelimit-remaining: 0`). Requires `body_path` or `header`. |
+| `body_path` | — | JSONPath into the JSON body; any match equal to one of `values` satisfies the rule. |
 | `values` | `[]` | Matching values (numbers and strings compare by text). Required with `body_path`. |
 | `header` | — | A header that must be present (compared with `values` when there is no `body_path`). |
+| `backoff_from` | — | Where the response states the wait: `header` (`name`, `unit`), `header_json` (`name`, `path`, `unit`), `body` (`path`, `unit`) or `cost_bucket` (`requested`, `available`, `restore_rate` paths). `unit`: `seconds`, `ms`, `minutes`, `epoch_s`, `epoch_ms`, `rfc3339`; absolute instants are measured from the response `Date` header. Missing or unreadable → the next source below. |
 | `backoff_secs` | — | Fixed wait; otherwise `Retry-After`, otherwise the exponential `retry_backoff`. |
+| `max_wait_secs` | `3600` | Longest wait `backoff_from` may ask for; a longer one fails the run with the reset named. |
 
-Rules are checked before `tolerated_http_errors` and apply to data pages,
-`async_job` requests and discovery requests. See the
+On `rest`, rules are checked before `tolerated_http_errors` and apply to data
+pages, `async_job` requests and discovery requests; on `graphql` they are
+checked before the response's `errors[]`, and a match retries the whole request.
+See the
 [resilience cookbook](../cookbook/resilience.md).
 
 ## Source fields: incremental keys, body targets, CSV nulls

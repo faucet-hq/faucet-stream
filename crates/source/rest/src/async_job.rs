@@ -111,6 +111,11 @@ pub struct PollSpec {
     /// Extra query params.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub query: HashMap<String, String>,
+    /// JSON request body (#768) — for status checks that are a `POST` with a
+    /// query body, such as a GraphQL `node(id:)` lookup. `${job_id}` is
+    /// substituted in every string leaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
     /// Ceiling on the poll cadence in seconds (default `5`). Polling starts at
     /// 1s and doubles up to this cap, so a job that finishes seconds after
     /// submit is noticed quickly while a long-running one isn't hammered. Set
@@ -134,6 +139,11 @@ pub struct JobStatus {
     /// Status values meaning "failed — abort".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure: Vec<String>,
+    /// JSONPath to an error code or message in the poll response (e.g. a
+    /// Shopify bulk operation's `$.data.node.errorCode`), named in the error a
+    /// failed job raises (#768).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_path: Option<String>,
 }
 
 /// Terminal classification of a poll status.
@@ -211,6 +221,101 @@ pub struct AsyncJobConfig {
     /// request plus a JSONPath to the count in its response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<RowCountProbe>,
+    /// How an incremental run pushes its bookmark into the submit body (#768).
+    /// Absent means `inject: { mode: sql }` — the `WHERE` predicate at
+    /// [`query_path`](Self::query_path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental: Option<AsyncJobIncremental>,
+    /// Errors a submit can return with a `200` and no job id — GraphQL
+    /// `userErrors`, or a "job already running" rejection (#768).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submit_errors: Option<SubmitErrors>,
+}
+
+/// The `async_job.incremental:` block (#768).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncJobIncremental {
+    /// Where and how the bookmark is written into the submit body.
+    #[serde(default)]
+    pub inject: IncrementalInject,
+}
+
+/// How the incremental bookmark reaches the submit body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectMode {
+    /// `WHERE <replication_key> > <bookmark>` injected into the SQL statement
+    /// at `query_path` (#630). The default.
+    #[default]
+    Sql,
+    /// Render [`IncrementalInject::template`] and substitute it for every
+    /// `${faucet.filter}` placeholder in the submit body — for search-syntax
+    /// filters such as Shopify's `updated_at:>'…'`.
+    Template,
+}
+
+/// The `inject:` block of [`AsyncJobIncremental`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IncrementalInject {
+    /// `sql` (default) or `template`.
+    #[serde(default)]
+    pub mode: InjectMode,
+    /// `template` mode: the filter text, with `${bookmark}` replaced by the
+    /// formatted bookmark — e.g. `updated_at:>'${bookmark}'`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// `template` mode: how the bookmark is formatted (default `raw`).
+    #[serde(default)]
+    pub format: faucet_core::BindFormat,
+    /// `template` mode: what `${faucet.filter}` renders to when there is no
+    /// bookmark yet (the first run, or `full_table`). Default empty.
+    #[serde(default)]
+    pub initial: String,
+}
+
+/// Placeholder in the submit body that `template` mode fills in.
+pub const FILTER_PLACEHOLDER: &str = "${faucet.filter}";
+
+fn default_busy_interval() -> u64 {
+    30
+}
+fn default_busy_timeout() -> u64 {
+    900
+}
+
+/// Submit-time rejections (#768).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitErrors {
+    /// JSONPath to the error messages in the submit response, e.g.
+    /// `$.data.bulkOperationRunQuery.userErrors[*].message`. A non-empty match
+    /// fails the run with those messages.
+    pub path: String,
+    /// Substrings marking a "busy" rejection — another job is still running —
+    /// that is retried after [`retry_interval_secs`](Self::retry_interval_secs)
+    /// instead of failing. Matched case-insensitively.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_on: Vec<String>,
+    /// Wait between busy retries (default `30`).
+    #[serde(default = "default_busy_interval")]
+    pub retry_interval_secs: u64,
+    /// Stop retrying a busy rejection after this many seconds (default `900`).
+    #[serde(default = "default_busy_timeout")]
+    pub retry_timeout_secs: u64,
+}
+
+impl SubmitErrors {
+    /// Whether any message is a configured "busy" rejection.
+    pub fn is_busy(&self, messages: &[String]) -> bool {
+        messages.iter().any(|m| {
+            let m = m.to_lowercase();
+            self.retry_on
+                .iter()
+                .any(|needle| m.contains(&needle.to_lowercase()))
+        })
+    }
 }
 
 /// A cheap row-count request, used to decide between the async-job and the
@@ -253,6 +358,14 @@ fn default_query_path() -> String {
 const DEFAULT_BOOKMARK_LOOKBACK_SECS: i64 = 300;
 
 impl AsyncJobConfig {
+    /// The configured push-down mode (`sql` when no `incremental:` block).
+    pub fn inject_mode(&self) -> InjectMode {
+        self.incremental
+            .as_ref()
+            .map(|i| i.inject.mode)
+            .unwrap_or_default()
+    }
+
     /// Whether the submit body carries a top-level string `query` the
     /// incremental predicate can be injected into (#630). Without one every
     /// run is a full export, so the source config's `validate()` rejects
@@ -415,8 +528,151 @@ impl AsyncJobConfig {
                     .into(),
             ));
         }
+        self.validate_inject()?;
+        if let Some(se) = &self.submit_errors {
+            if se.path.trim().is_empty() {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `submit_errors.path` must not be empty".into(),
+                ));
+            }
+            if !se.retry_on.is_empty() && se.retry_interval_secs == 0 {
+                return Err(faucet_core::FaucetError::Config(
+                    "async_job: `submit_errors.retry_interval_secs` must be > 0 when `retry_on` \
+                     is set"
+                        .into(),
+                ));
+            }
+        }
+        if self
+            .status
+            .error_path
+            .as_deref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "async_job: `status.error_path` must not be empty".into(),
+            ));
+        }
         Ok(())
     }
+
+    fn validate_inject(&self) -> Result<(), faucet_core::FaucetError> {
+        let has_placeholder = self
+            .submit
+            .json
+            .as_ref()
+            .is_some_and(|j| value_contains(j, FILTER_PLACEHOLDER));
+        let inject = self.incremental.as_ref().map(|i| &i.inject);
+        match inject.map(|i| i.mode).unwrap_or_default() {
+            InjectMode::Sql => {
+                if inject.is_some_and(|i| i.template.is_some() || !i.initial.is_empty()) {
+                    return Err(faucet_core::FaucetError::Config(
+                        "async_job: `incremental.inject.template` / `initial` apply only to \
+                         `mode: template`"
+                            .into(),
+                    ));
+                }
+                if has_placeholder {
+                    return Err(faucet_core::FaucetError::Config(format!(
+                        "async_job: the submit body contains `{FILTER_PLACEHOLDER}`, which only \
+                         `incremental.inject.mode: template` fills in — it would be sent verbatim"
+                    )));
+                }
+            }
+            InjectMode::Template => {
+                let template = inject.and_then(|i| i.template.as_deref()).unwrap_or("");
+                if !template.contains(faucet_core::replication::BIND_PLACEHOLDER) {
+                    return Err(faucet_core::FaucetError::Config(format!(
+                        "async_job: `incremental.inject.template` must contain `{}`",
+                        faucet_core::replication::BIND_PLACEHOLDER
+                    )));
+                }
+                if !has_placeholder {
+                    return Err(faucet_core::FaucetError::Config(format!(
+                        "async_job: `incremental.inject.mode: template` needs a \
+                         `{FILTER_PLACEHOLDER}` placeholder in `submit.json` to write the filter \
+                         into"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Render the `template`-mode filter for a bookmark, or `initial` without one.
+pub fn render_filter(
+    inject: &IncrementalInject,
+    bookmark: Option<&Value>,
+) -> Result<String, faucet_core::FaucetError> {
+    match bookmark {
+        Some(bm) => {
+            let formatted = faucet_core::format_bookmark(bm, inject.format)?;
+            Ok(inject
+                .template
+                .as_deref()
+                .unwrap_or_default()
+                .replace(faucet_core::replication::BIND_PLACEHOLDER, &formatted))
+        }
+        None => Ok(inject.initial.clone()),
+    }
+}
+
+/// Replace `placeholder` with `replacement` in every string leaf of `v`.
+pub fn substitute_in_value(v: &Value, placeholder: &str, replacement: &str) -> Value {
+    match v {
+        Value::String(s) => Value::String(s.replace(placeholder, replacement)),
+        Value::Array(a) => Value::Array(
+            a.iter()
+                .map(|x| substitute_in_value(x, placeholder, replacement))
+                .collect(),
+        ),
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, x)| (k.clone(), substitute_in_value(x, placeholder, replacement)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Substitute `${job_id}` in every string leaf of a request body.
+pub fn substitute_job_id_value(v: &Value, job_id: &str) -> Value {
+    substitute_in_value(v, "${job_id}", job_id)
+}
+
+/// Whether any string leaf of `v` contains `needle`.
+pub fn value_contains(v: &Value, needle: &str) -> bool {
+    match v {
+        Value::String(s) => s.contains(needle),
+        Value::Array(a) => a.iter().any(|x| value_contains(x, needle)),
+        Value::Object(m) => m.values().any(|x| value_contains(x, needle)),
+        _ => false,
+    }
+}
+
+/// Collect the error messages a JSONPath matches in a submit response: strings
+/// verbatim, anything else (an object, a number) as compact JSON. Nulls and
+/// empty arrays are not errors.
+pub fn error_messages(body: &Value, path: &str) -> Vec<String> {
+    use jsonpath_rust::JsonPath as _;
+    let Ok(matches) = body.query(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in matches {
+        match m {
+            Value::Null => {}
+            Value::String(s) if s.trim().is_empty() => {}
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => out.extend(a.iter().filter(|x| !x.is_null()).map(|x| match x {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })),
+            other => out.push(other.to_string()),
+        }
+    }
+    out
 }
 
 /// Substitute `${job_id}` in a URL/template.
@@ -442,6 +698,7 @@ mod tests {
             path: "$.state".into(),
             success: vec!["JobComplete".into()],
             failure: vec!["Failed".into(), "Aborted".into()],
+            error_path: None,
         };
         assert_eq!(s.classify("JobComplete"), JobOutcome::Success);
         assert_eq!(s.classify("Failed"), JobOutcome::Failure);
@@ -670,5 +927,130 @@ mod tests {
             !mk(serde_json::json!({ "url": "/jobs", "json": { "query": 7 } }))
                 .supports_incremental_query()
         );
+    }
+
+    fn bulk(extra: Value) -> Result<AsyncJobConfig, serde_json::Error> {
+        let mut base = json!({
+            "submit": { "method": "POST", "url": "/graphql.json",
+                        "json": { "query": "orders(query: \"${faucet.filter}\")" } },
+            "job_id": "$.id",
+            "poll": { "method": "POST", "url": "/graphql.json",
+                      "json": { "query": "node(id: \"${job_id}\")" } },
+            "status": { "path": "$.s", "success": ["COMPLETED"], "error_path": "$.code" },
+            "fetch": { "url_from": "$.url" }
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base)
+    }
+
+    fn template() -> Value {
+        json!({ "inject": { "mode": "template", "template": "updated_at:>'${bookmark}'" } })
+    }
+
+    #[test]
+    fn template_inject_validates_placeholder_and_template() {
+        assert!(
+            bulk(json!({ "incremental": template() }))
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        let err = bulk(json!({})).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("sent verbatim"), "{err}");
+        let err = bulk(json!({ "incremental": { "inject": { "mode": "template" } } }))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must contain `${bookmark}`"), "{err}");
+        let mut no_ph = bulk(json!({ "incremental": template() })).unwrap();
+        no_ph.submit.json = Some(json!({ "query": "orders" }));
+        let err = no_ph.validate().unwrap_err().to_string();
+        assert!(err.contains("needs a `${faucet.filter}`"), "{err}");
+        let mut sql = no_ph.clone();
+        sql.incremental =
+            Some(serde_json::from_value(json!({ "inject": { "initial": "x" } })).unwrap());
+        assert!(sql.validate().unwrap_err().to_string().contains("only to"));
+        assert_eq!(sql.inject_mode(), InjectMode::Sql);
+    }
+
+    #[test]
+    fn render_filter_uses_template_or_initial() {
+        let inject: IncrementalInject = serde_json::from_value(json!({
+            "mode": "template", "template": "updated_at:>'${bookmark}'",
+            "format": "date", "initial": "status:any"
+        }))
+        .unwrap();
+        assert_eq!(
+            render_filter(&inject, Some(&json!("2026-09-01T10:00:00Z"))).unwrap(),
+            "updated_at:>'2026-09-01'"
+        );
+        assert_eq!(render_filter(&inject, None).unwrap(), "status:any");
+        assert!(render_filter(&inject, Some(&json!("nope"))).is_err());
+    }
+
+    #[test]
+    fn value_helpers_walk_every_leaf() {
+        let v = json!({ "a": ["${job_id}", { "b": "x${job_id}" }], "n": 1 });
+        assert_eq!(
+            substitute_job_id_value(&v, "7"),
+            json!({ "a": ["7", { "b": "x7" }], "n": 1 })
+        );
+        assert!(value_contains(&v, "x${job_id}"));
+        assert!(!value_contains(&json!({ "n": 1 }), "x"));
+    }
+
+    #[test]
+    fn error_messages_collects_strings_and_objects() {
+        let body = json!({ "e": [{ "message": "busy" }, { "message": "other" }], "c": "ACCESS_DENIED",
+                           "empty": [], "nil": null, "blank": " ", "num": 5, "mixed": [null, 1] });
+        assert_eq!(
+            error_messages(&body, "$.e[*].message"),
+            vec!["busy", "other"]
+        );
+        assert_eq!(error_messages(&body, "$.c"), vec!["ACCESS_DENIED"]);
+        assert!(error_messages(&body, "$.empty").is_empty());
+        assert!(error_messages(&body, "$.nil").is_empty());
+        assert!(error_messages(&body, "$.blank").is_empty());
+        assert_eq!(error_messages(&body, "$.num"), vec!["5"]);
+        assert_eq!(error_messages(&body, "$.mixed"), vec!["1"]);
+        assert_eq!(
+            error_messages(&body, "$.e[0]"),
+            vec![r#"{"message":"busy"}"#]
+        );
+        assert!(error_messages(&body, "not a path [").is_empty());
+    }
+
+    #[test]
+    fn submit_errors_and_error_path_validate() {
+        let se = |v: Value| bulk(json!({ "incremental": template(), "submit_errors": v })).unwrap();
+        assert!(se(json!({ "path": "$.e" })).validate().is_ok());
+        assert!(se(json!({ "path": " " })).validate().is_err());
+        assert!(
+            se(json!({ "path": "$.e", "retry_on": ["busy"], "retry_interval_secs": 0 }))
+                .validate()
+                .is_err()
+        );
+        let mut bad = se(json!({ "path": "$.e" }));
+        bad.status.error_path = Some("".into());
+        assert!(bad.validate().is_err());
+        let s: SubmitErrors =
+            serde_json::from_value(json!({ "path": "$.e", "retry_on": ["Already In Progress"] }))
+                .unwrap();
+        assert_eq!((s.retry_interval_secs, s.retry_timeout_secs), (30, 900));
+        assert!(s.is_busy(&["A bulk query operation is already in progress".into()]));
+        assert!(!s.is_busy(&["invalid query".into()]));
+    }
+
+    #[test]
+    fn poll_json_deserializes() {
+        let cfg = bulk(json!({ "incremental": template() })).unwrap();
+        assert_eq!(
+            cfg.poll.json,
+            Some(json!({ "query": "node(id: \"${job_id}\")" }))
+        );
+        assert_eq!(cfg.status.error_path.as_deref(), Some("$.code"));
     }
 }

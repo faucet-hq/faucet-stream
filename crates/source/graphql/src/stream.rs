@@ -370,21 +370,28 @@ impl GraphqlStream {
         // Retry transient failures (5xx / connection resets) with jittered
         // backoff, matching the REST source's reliability layer (#78/#16).
         // GraphQL-level `errors` in a 200 body are application errors and are
-        // handled below — they are not retried here.
+        // handled below — unless a `retry_on_response` rule marks them as
+        // throttling (#767), which retries the whole request here.
+        let matches = std::sync::atomic::AtomicU32::new(0);
         let body: Value = faucet_core::execute_with_policy_recorded(
             &self.retry_policy,
             None,
             self.roundtrips.recorder().as_ref(),
             || {
                 let attempt = req.try_clone();
+                let matches = &matches;
                 async move {
                     let req = attempt.ok_or_else(|| {
                         FaucetError::Source("graphql: request is not cloneable for retry".into())
                     })?;
                     self.roundtrips.record("request");
                     let resp = req.send().await.map_err(FaucetError::Http)?;
-                    let resp = util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-                    resp.json().await.map_err(FaucetError::Http)
+                    if self.config.retry_on_response.is_empty() {
+                        let resp =
+                            util::check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+                        return resp.json().await.map_err(FaucetError::Http);
+                    }
+                    self.read_with_matchers(resp, matches).await
                 }
             },
         )
@@ -403,6 +410,49 @@ impl GraphqlStream {
         }
 
         Ok(body)
+    }
+
+    /// Read a response, turning a `retry_on_response` match into a rate limit
+    /// carrying the rule's wait (#767).
+    async fn read_with_matchers(
+        &self,
+        resp: reqwest::Response,
+        matches: &std::sync::atomic::AtomicU32,
+    ) -> Result<Value, FaucetError> {
+        let status = resp.status().as_u16();
+        let url = resp.url().to_string();
+        let headers = resp.headers().clone();
+        let text = resp.text().await.map_err(FaucetError::Http)?;
+        if let Some(rule) = faucet_core::resilience::find_match(
+            &self.config.retry_on_response,
+            status,
+            &headers,
+            &text,
+        ) {
+            let n = matches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let retry_after = headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let wait = rule.wait(&headers, &text, retry_after, self.retry_policy.base, n)?;
+            tracing::warn!(
+                status,
+                ?wait,
+                "response matched retry_on_response; treating as throttling"
+            );
+            return Err(FaucetError::RateLimited(wait));
+        }
+        if !(200..300).contains(&status) {
+            let body = if text.len() > DEFAULT_ERROR_BODY_MAX_LEN {
+                let end = text.floor_char_boundary(DEFAULT_ERROR_BODY_MAX_LEN);
+                format!("{}...(truncated)", &text[..end])
+            } else {
+                text
+            };
+            return Err(FaucetError::HttpStatus { status, url, body });
+        }
+        serde_json::from_str(&text).map_err(FaucetError::Json)
     }
 
     /// Extract records from a GraphQL response using the configured JSONPath.

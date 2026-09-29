@@ -9,6 +9,11 @@ Run `faucet list` to see what's compiled into your binary, and
 exact config fields. Not sure which to pick? See
 [Choosing a connector](./choosing.md).
 
+Browse them on the [Connector Hub](https://faucet-hq.github.io/connectors) — a
+page per connector with its capabilities, tier, install line, config fields and
+a `faucet init` snippet, plus community `faucet-source-*` / `faucet-sink-*`
+crates found on crates.io. It is generated from `faucet conformance --export`.
+
 Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-conformance battery in CI; T2 = not yet wired into the battery.
 
 > **Two "tier" signals, distinct on purpose.** The `Tier` column below (T1/T2/T3)

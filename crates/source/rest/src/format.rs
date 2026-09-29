@@ -343,6 +343,63 @@ where
     }
 }
 
+fn jsonl_line(line: &str, n: usize) -> Result<Option<Value>, FaucetError> {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(line)
+        .map(Some)
+        .map_err(|e| FaucetError::Source(format!("rest: JSONL line {n} is not valid JSON: {e}")))
+}
+
+/// Parse a whole JSON Lines body (#768). Blank lines are skipped.
+pub fn parse_jsonl(bytes: &[u8]) -> Result<Vec<Value>, FaucetError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| FaucetError::Source(format!("rest: JSONL body is not UTF-8: {e}")))?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if let Some(v) = jsonl_line(line, i + 1)? {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// Stream a JSON Lines body into pages of `page_size` records (#768). Only one
+/// line and one page are held at a time; `0` means one page for the whole body.
+pub fn jsonl_reader_to_value_pages<R>(
+    reader: R,
+    page_size: usize,
+) -> impl futures::Stream<Item = Result<Vec<Value>, FaucetError>> + Send
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    async_stream::try_stream! {
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        let cap = if page_size == 0 { 1024 } else { page_size };
+        let mut page: Vec<Value> = Vec::with_capacity(cap);
+        let mut n = 0usize;
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| FaucetError::Source(format!("rest: JSONL read error: {e}")))?
+        {
+            n += 1;
+            if let Some(v) = jsonl_line(&line, n)? {
+                page.push(v);
+                if page_size != 0 && page.len() >= page_size {
+                    yield std::mem::replace(&mut page, Vec::with_capacity(cap));
+                }
+            }
+        }
+        if !page.is_empty() {
+            yield page;
+        }
+    }
+}
+
 /// Parse Excel bytes into records. Requires the `excel` feature.
 #[cfg(feature = "excel")]
 pub fn parse_excel(
@@ -597,6 +654,58 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    mod jsonl {
+        use super::super::*;
+        use futures::StreamExt as _;
+
+        #[test]
+        fn parse_jsonl_skips_blank_lines_and_bom() {
+            let recs = parse_jsonl(b"\xEF\xBB\xBF{\"a\":1}\n\n  \r\n{\"a\":2}\r\n").unwrap();
+            assert_eq!(
+                recs,
+                vec![serde_json::json!({"a":1}), serde_json::json!({"a":2})]
+            );
+            assert!(parse_jsonl(b"").unwrap().is_empty());
+        }
+
+        #[test]
+        fn parse_jsonl_names_the_bad_line() {
+            let err = parse_jsonl(b"{\"a\":1}\nnot json\n").unwrap_err();
+            assert!(err.to_string().contains("line 2"), "{err}");
+            assert!(parse_jsonl(&[0xff, 0xfe]).is_err());
+        }
+
+        async fn pages(body: &'static [u8], size: usize) -> Vec<Result<Vec<Value>, FaucetError>> {
+            jsonl_reader_to_value_pages(body, size).collect().await
+        }
+
+        #[tokio::test]
+        async fn streams_pages_of_page_size() {
+            let body: &'static [u8] = b"{\"i\":1}\n{\"i\":2}\n\n{\"i\":3}\n{\"i\":4}\n{\"i\":5}";
+            let got = pages(body, 2).await;
+            let sizes: Vec<usize> = got.iter().map(|p| p.as_ref().unwrap().len()).collect();
+            assert_eq!(sizes, vec![2, 2, 1]);
+            let whole = pages(body, 0).await;
+            assert_eq!(whole.len(), 1);
+            assert_eq!(whole[0].as_ref().unwrap().len(), 5);
+            assert!(pages(b"\n\n", 2).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn stream_errors_on_bad_line_and_bad_utf8() {
+            let got = pages(b"{\"i\":1}\n{oops\n", 10).await;
+            assert!(got[0].as_ref().unwrap_err().to_string().contains("line 2"));
+            let got = pages(b"\xff\xfe\n", 10).await;
+            assert!(
+                got[0]
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("read error")
+            );
+        }
+    }
 
     /// #626 — the bounded-memory CSV page decoder.
     mod value_pages {

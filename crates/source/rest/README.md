@@ -164,7 +164,7 @@ record_ancestors: { event_id: id, event_created: created }
 | `max_retries` | int | `3` | Max retries on transient failures. |
 | `retry_backoff` | int (seconds) | `1` | Base for exponential backoff. Per-attempt sleep is `retry_backoff × 2^attempt`, **capped at 60 s** and scaled by random jitter in `[0.5, 1.5)` (decorrelated across concurrent retries). On `429`, the server's `Retry-After` (delta-seconds **or** an RFC 7231 HTTP-date) is honoured instead. |
 | `tolerated_http_errors` | array<int> | `[]` | HTTP status codes treated as an empty page **on the first request only**. Mid-pagination, a tolerated status surfaces as an error instead of silently ending the stream (otherwise a transient failure on page _N_ would drop every later page as a "successful" run). Only safe for genuinely-empty resources. |
-| `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), and optional `backoff_secs` (fixed wait; else `Retry-After`, else the exponential `retry_backoff`). A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests and discovery requests. After `max_retries` consecutive matches the original error (status + body) is surfaced. A non-JSON body never matches. |
+| `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), optional `match_success: true` (also match a 2xx, e.g. `x-ratelimit-remaining: 0`; requires `body_path` or `header`), optional `backoff_from` (read the wait from the response: `{type: header, config: {name, unit}}`, `{type: header_json, config: {name, path, unit}}`, `{type: body, config: {path, unit}}` or `{type: cost_bucket, config: {requested, available, restore_rate}}`; `unit` is `seconds`, `ms`, `minutes`, `epoch_s`, `epoch_ms` or `rfc3339`, an absolute instant measured from the response's `Date` header), optional `backoff_secs` (fixed wait), and optional `max_wait_secs` (default 3600; a longer stated wait fails the run instead of parking it). The wait is `backoff_from`, else `backoff_secs`, else `Retry-After`, else the exponential `retry_backoff`. A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests (success-matching only on submit/poll, not streamed results) and discovery requests. After `max_retries` consecutive matches the original error (status + body) is surfaced; a 2xx that still matches fails rather than being read as data. A non-JSON body never matches. |
 
 **Throttling is metered (#734):** every `429` counts in `faucet_source_throttled_total`, the time actually slept on it (not the header's value — a cancelled sleep records the partial wait) in `faucet_source_throttle_wait_seconds`, and every retry by class in `faucet_source_retries_total{class}`. The totals land on the run's usage record, so `faucet run` / `faucet usage` print `throttled 312× · waited 41 min`, and a run that spent more than 10 % of its time rate-limited logs a warning. See [source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html#source-side-throttling).
 
@@ -176,7 +176,7 @@ By default the REST source parses a **JSON** body and extracts records via `reco
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `response_format` | `json` \| `csv` \| `excel` | `json` | How to parse the body. `csv`/`excel` parse a whole tabular file into records. `excel` requires the crate's `excel` feature. |
+| `response_format` | `json` \| `csv` \| `excel` \| `jsonl` | `json` | How to parse the body. `csv`/`excel` parse a whole tabular file into records; `jsonl` reads one JSON object per line (streamed line by line on an `async_job` fetch). `excel` requires the crate's `excel` feature. |
 | `csv_delimiter` | int (byte) / char | `,` | CSV field delimiter. `response_format: csv` only. |
 | `csv_has_headers` | bool | `true` | Whether the first CSV row supplies field names (else `column_0`, `column_1`, …). `csv` only. |
 | `csv_null_values` | list of strings | `[]` | CSV fields equal to any listed string decode as JSON `null` rather than a string — on the `Value`, native NDJSON, columnar and streaming decode paths alike. Salesforce Bulk API 2.0 writes a null as an empty field, so set `[""]` for it; list sentinels such as `"NULL"` / `"#N/A"` for other APIs. Headers are never mapped, and a quoted empty field maps like an unquoted one. Applies to `response_format: csv` and to a `parse: { format: csv }` decode step; set anywhere else it is a config error. |
@@ -621,6 +621,98 @@ async_job:
 The same pointer names the dataset for catalog and lineage, so pointing it at
 the real statement is what keeps one object per dataset rather than every
 object collapsing onto one.
+
+#### Shopify-style bulk operations (#768)
+
+A Shopify Admin API **bulk operation** is an async job over GraphQL: submit a
+`bulkOperationRunQuery` mutation, poll the operation with a `POST` query body
+until `COMPLETED`, download the JSONL file at `url`, and split its rows —
+child rows (`LineItem`) carry `__parentId` and are interleaved with their
+parents (`Order`). Four pieces make that expressible in config:
+
+| Field | Purpose |
+|-------|---------|
+| `poll.json` | Request body for the poll; `${job_id}` is substituted in every string leaf. |
+| `status.error_path` | JSONPath to an error code, named in the error a `FAILED` / `CANCELED` job raises. |
+| `submit_errors: { path, retry_on, retry_interval_secs, retry_timeout_secs }` | Messages at `path` (e.g. GraphQL `userErrors`) fail the submit with the server's text; a message containing a `retry_on` substring ("already in progress" — one bulk operation per shop) is retried every `retry_interval_secs` (30) until `retry_timeout_secs` (900). |
+| `incremental.inject: { mode: template, template, format, initial }` | Renders `template` with `${bookmark}` (formatted by `format`: `raw` / `iso8601` / `date` / `epoch_s` / `epoch_ms`) and writes it over every `${faucet.filter}` in `submit.json`. Without a bookmark (first run) it writes `initial` (default empty). `mode: sql` (default) is the `WHERE` injection above. `replication_key` is optional in template mode. |
+| `response_format: jsonl` | The result is decoded line by line into pages of `batch_size`; the file is never held whole. |
+| `records_route` | Stamps each row with its stream (see below). |
+
+`fetch.url_from` resolving to an explicit `null` (a `COMPLETED` operation that
+matched nothing) is an empty result: zero records, a clean run, and the
+bookmark still advances. A download refused with `401` / `403` / `404` / `410`
+(the signed URL expired) fails the run naming the cause — transient errors are
+retried under the normal policy first, and the job is never resubmitted
+silently. The bookmark is the job's start time minus `lookback`, as above —
+not a row maximum, because child rows carry no `updated_at`.
+
+```yaml
+source:
+  type: rest
+  config:
+    base_url: https://my-shop.myshopify.com/admin/api/2026-07
+    headers: { X-Shopify-Access-Token: "${env:SHOPIFY_TOKEN}" }
+    response_format: jsonl
+    replication_method: { type: Incremental }
+    async_job:
+      submit:
+        method: POST
+        url: /graphql.json
+        json:
+          query: >-
+            mutation { bulkOperationRunQuery(query: """
+              { orders(query: "${faucet.filter}") { edges { node {
+                  id name updatedAt
+                  lineItems { edges { node { id sku quantity } } } } } } }
+            """) { bulkOperation { id status } userErrors { field message } } }
+      job_id: "$.data.bulkOperationRunQuery.bulkOperation.id"
+      submit_errors:
+        path: "$.data.bulkOperationRunQuery.userErrors[*].message"
+        retry_on: ["already in progress"]
+      poll:
+        method: POST
+        url: /graphql.json
+        json:
+          query: 'query { node(id: "${job_id}") { ... on BulkOperation { status errorCode url } } }'
+        interval_secs: 10
+        timeout_secs: 7200
+      status:
+        path: "$.data.node.status"
+        success: [COMPLETED]
+        failure: [FAILED, CANCELED, EXPIRED]
+        error_path: "$.data.node.errorCode"
+      fetch: { url_from: "$.data.node.url" }
+      incremental:
+        inject:
+          mode: template
+          template: "updated_at:>'${bookmark}'"
+          format: iso8601
+    records_route:
+      by: id_type
+      routes:
+        Order:    { stream: orders }
+        LineItem: { stream: order_line_items, parent_key_as: order_id }
+```
+
+**`records_route`** — `by: id_type` (default) keys each row by the object type
+in its GID (`gid://shopify/<Type>/<n>` in `id`); a row with no GID of its own
+is keyed `child_of:<ParentType>` from `__parentId`. `by: field` keys by a
+top-level discriminator (`field: __typename`). Each route names a `stream`,
+stamped into `stream_field` (default `_stream`), and optionally
+`parent_key_as` — `__parentId` copied into that column so the child stream
+joins back (the ordering of parents and children in the file does not
+matter). A row of a type no route names is dropped and counted, with a
+one-shot warning per type and a run total; `strict: true` fails the run
+instead. `only: [stream, …]` emits a subset of the routes on purpose.
+`records_route` applies to every read path and requires a JSON or JSONL body.
+
+**One job, several sinks.** Shopify runs one bulk operation per shop at a
+time, so each stream must not submit its own job. Run the source once in
+[topology mode](../../docs/book/src/cookbook/topology.md) and fan it out with
+a `tee` and one `filter` per stream (`path: _stream, op: eq, value: orders`),
+dropping `_stream` before each sink — see the cookbook's "Fan one bulk job out
+to several sinks" section.
 
 #### Native byte passthrough (#633)
 

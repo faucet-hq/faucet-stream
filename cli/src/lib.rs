@@ -22,6 +22,7 @@ pub mod commands;
 pub mod compose;
 pub mod config;
 pub mod conformance;
+pub mod connector_export;
 pub mod discovery_matrix;
 pub mod dlq_replay;
 pub mod dynamic_fanout;

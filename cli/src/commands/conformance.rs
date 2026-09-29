@@ -9,6 +9,9 @@ use crate::error::{CliError, CliResult};
 pub async fn run(args: ConformanceArgs) -> CliResult<()> {
     // `--matrix` prints the generated capability matrix and exits — the scoring
     // flags do not apply.
+    if args.export {
+        return export(args.require_all);
+    }
     if args.matrix {
         print!("{}", crate::conformance::capability_matrix_markdown());
         return Ok(());
@@ -133,6 +136,24 @@ pub async fn run(args: ConformanceArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// `faucet conformance --export`: print the Connector Hub export.
+fn export(require_all: bool) -> CliResult<()> {
+    let doc =
+        crate::connector_export::build_export(&crate::registry_index::RegistryIndex::embedded());
+    let missing = crate::connector_export::missing(&doc);
+    if require_all && !missing.is_empty() {
+        return Err(CliError::Config(format!(
+            "{} registry connector(s) are not compiled into this binary: {}",
+            missing.len(),
+            missing.join(", ")
+        )));
+    }
+    let json = serde_json::to_string_pretty(&doc)
+        .map_err(|e| CliError::Config(format!("serialize connector export: {e}")))?;
+    println!("{json}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +166,8 @@ mod tests {
             json,
             min_tier: None,
             matrix: false,
+            export: false,
+            require_all: false,
         }
     }
 
@@ -152,6 +175,13 @@ mod tests {
     async fn matrix_flag_prints_and_exits_ok() {
         let mut a = args(None, None, false);
         a.matrix = true;
+        assert!(run(a).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn export_flag_prints_and_exits_ok() {
+        let mut a = args(None, None, false);
+        a.export = true;
         assert!(run(a).await.is_ok());
     }
 

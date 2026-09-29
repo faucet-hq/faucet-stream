@@ -32,7 +32,7 @@ JSON-RPC stream.
 | `faucet new connector <name> --kind <source\|sink>` | Scaffold a ready-to-build connector crate. |
 | `faucet search <term>` | Search the connector registry for connectors by name/keyword. |
 | `faucet install <name>` | Print how to enable/obtain a connector from the registry. |
-| `faucet conformance [name]` | Score each connector against the SDK contract; print its maturity tier + capabilities. |
+| `faucet conformance [name]` | Score each connector against the SDK contract; print its maturity tier + capabilities. `--export` prints the Connector Hub feed. |
 | `faucet plan [config]` | Read-only preview of what a config would do — zero writes. |
 | `faucet dev <config> --sample <f>` | Watch + re-run a sample on save with a live diff (`cli-dev`). |
 | `faucet doctor [config]` | Probe every connector (auth/network/permissions) and print a checklist. |
@@ -511,6 +511,44 @@ shields.io **badge URL** third-party authors can drop into their crate README.
 The per-connector tier is mirrored in `cli/connectors/registry.json` (validated
 against this score in CI) and shown in `faucet list` and the
 [connector conformance & tiers](./conformance.md) page.
+
+### `--export`: the Connector Hub feed
+
+`faucet conformance --export` prints one JSON document describing **every
+connector in the registry index** — the feed the
+[Connector Hub](https://faucet-hq.github.io/connectors) is generated from.
+`--require-all` exits non-zero when a registry connector is not compiled into
+the binary (its schema and snippet would be missing), so a snapshot built for
+publishing is always complete.
+
+```bash
+faucet conformance --export --require-all > connectors.json
+```
+
+Every capability is derived from the registry allowlists and the connector's
+config schema — the same sources as the capability matrix and the conformance
+score — never copied by hand. Shape (`version: 1`; additive changes only):
+
+| Field | Meaning |
+|---|---|
+| `format` / `version` | `"faucet-connector-export"` / `1` |
+| `faucet_version` | the CLI version that produced the document |
+| `categories[]` | `{id, label}` — `databases`, `cdc`, `warehouses`, `streaming`, `files`, `apis`, `bridges` |
+| `tiers[]` | `{id, label, min_score, badge_url}` in rank order |
+| `connectors[]` | one object per connector, sorted by kind then name (below) |
+
+| Connector field | Meaning |
+|---|---|
+| `id` | `<kind>-<name>`, e.g. `sink-postgres` |
+| `name`, `kind`, `title`, `category`, `description`, `keywords`, `verified` | from `cli/connectors/registry.json` |
+| `crate`, `feature` | crates.io name and CLI/umbrella feature flag |
+| `repository_path`, `docs_url`, `crates_io_url` | where the crate lives |
+| `compiled` | whether this binary includes the connector |
+| `conformance` | the `faucet conformance --json` scorecard: `score`, `tier`, `dimensions[]`, `badges[]` |
+| `capabilities` | `delivery` (`deterministic`/`non_deterministic` for sources, `atomic_watermark`/`keyed_upsert`/`at_least_once` for sinks), `exactly_once`, `compression`; sources: `discover`, `incremental`, `reports_lag`; sinks: `write_modes[]`, `upsert`, `overwrite`, `cleanup`, `schema_evolution`, `staged_load`, `rollback` |
+| `config_fields[]` | top-level config fields `{name, type, required, default, description}`, required first |
+| `config_schema` | the full JSON Schema (`faucet schema <kind> <name>`), `null` when not compiled |
+| `init_snippet` | a `faucet init`-style YAML block for the connector, `null` when not compiled |
 
 ## `doctor`
 

@@ -82,6 +82,7 @@ faucet run pipeline.yaml
 | `variables` | object | `{}` *(optional)* | Static variables merged into every request; omit the key for a query that takes none. Cursor, page-size, and parent-context values are layered on top per request. |
 | `records_path` | string | *(unset)* | JSONPath plucking the record array out of the response (e.g. `$.data.users.edges[*].node`). When unset, the whole `data` object is emitted as one record. |
 | `auth` | `GraphqlAuth` \| `{ ref }` | `none` | Authentication — inline `{ type, config }` or a shared-provider reference. See [Authentication](#authentication). |
+| `retry_on_response` | array of matchers | `[]` | Responses to treat as throttling and retry, including a `200` whose body reports it. See [Throttling in a 200 body](#throttling-in-a-200-body). |
 
 ### Pagination
 
@@ -207,6 +208,37 @@ auth: { ref: my_idp }
 ```
 
 When an `auth: { ref }` is resolved (or a shared provider is attached via `with_auth_provider`), the provider's credential takes precedence over any inline auth and is shared across every source referencing it, with single-flight token refresh.
+
+## Throttling in a 200 body
+
+Cost-based APIs report throttling inside a successful response. Shopify's Admin
+GraphQL API answers a throttled call with `200`, `errors[].extensions.code:
+THROTTLED` and a cost report. A `retry_on_response` rule with `match_success:
+true` turns that into a retry that waits exactly as long as the bucket needs:
+
+```yaml
+retry_on_response:
+  - match_success: true
+    body_path: "$.errors[*].extensions.code"
+    values: [THROTTLED]
+    backoff_from:
+      type: cost_bucket
+      config:
+        requested: $.extensions.cost.requestedQueryCost
+        available: $.extensions.cost.throttleStatus.currentlyAvailable
+        restore_rate: $.extensions.cost.throttleStatus.restoreRate
+```
+
+The wait is `ceil((requested − available) / restore_rate)` seconds, at least 1.
+A missing field or a restore rate of 0 falls back to `backoff_secs`, then
+`Retry-After`, then exponential backoff; a wait over `max_wait_secs` (default
+3600) fails the run. Rules are checked before `errors[]` are classified, a
+match retries the whole request (partial `data` is never emitted), and
+non-throttling errors still fail immediately. Retries are bounded by the retry
+policy's `max_attempts` and counted in `faucet_source_throttled_total` and
+`faucet_source_throttle_wait_seconds`. The matcher fields are shared with the
+`rest` source; see its `retry_on_response` reference for `backoff_from` header
+and body variants.
 
 ## Examples
 
