@@ -22,8 +22,8 @@ source:
 
 ### Nested replication keys
 
-Many APIs put the cursor inside a nested object (Jira `fields.updated`, GitHub
-`commit.committer.date`, Google Ads `segments.date`). `replication_key` accepts
+Many APIs put the cursor inside a nested object (`fields.updated`,
+`commit.committer.date`, `segments.date`). `replication_key` accepts
 three forms:
 
 | Form | Example | Resolves |
@@ -44,14 +44,14 @@ Pointer (`path`):
 ```yaml
 replication_bind:
   into: body
-  path: /filterGroups/0/filters/0/value   # HubSpot CRM search filter
+  path: /filterGroups/0/filters/0/value   # CRM search filter
   format: epoch_ms
   value_type: number                      # write 1717200000000, not "1717200000000"
 ```
 
 The pointer must resolve to an existing scalar (or `null`) in the configured
 `body`, or to a new key of an existing object; array elements are never
-created. `window` binds accept the same `path` / `value_type`, so GA4-style
+created. `window` binds accept the same `path` / `value_type`, so report-API
 `dateRanges[0].startDate` / `endDate` can be windowed. Set exactly one of
 `name` or `path`, configure a JSON object `body`, and don't point two binds at
 the same location — all three are checked at load time.
