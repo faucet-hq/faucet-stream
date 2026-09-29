@@ -50,16 +50,18 @@ pub trait ObjectClient: Send + Sync {
     /// not assumed, so the object is downloaded and re-uploaded, then
     /// `from` deleted; stores with a copy or rename override it.
     async fn rename(&self, from: &str, to: &str) -> Result<(), FaucetError> {
-        let dir = tempfile::tempdir().map_err(|e| {
-            FaucetError::Sink(format!(
-                "remote rename: creating a temporary directory: {e}"
-            ))
-        })?;
+        let dir = tempfile::tempdir()
+            .map_err(sink_io("remote rename: creating a temporary directory"))?;
         let tmp = dir.path().join("object");
         self.download(from, &tmp).await?;
         self.upload(&tmp, to).await?;
         self.delete(from).await
     }
+}
+
+/// A [`FaucetError::Sink`] for an I/O failure while `what`.
+fn sink_io(what: impl std::fmt::Display) -> impl FnOnce(std::io::Error) -> FaucetError {
+    move |e| FaucetError::Sink(format!("{what}: {e}"))
 }
 
 /// Drive `fut` to completion from a blocking context.
@@ -184,11 +186,7 @@ impl RemoteBackend {
         let scratch = tempfile::Builder::new()
             .prefix("faucet-remote-")
             .tempdir()
-            .map_err(|e| {
-                FaucetError::Sink(format!(
-                    "remote file sink: creating a scratch directory: {e}"
-                ))
-            })?;
+            .map_err(sink_io("remote file sink: creating a scratch directory"))?;
         Ok(Self {
             staging: format!("{base}{staging_name}/"),
             base,
@@ -236,35 +234,22 @@ impl RemoteBackend {
         })
     }
 
+    /// Move `scratch` aside and upload it in the background. On an error the
+    /// caller still owns `scratch`.
     fn spawn_upload(&self, scratch: &Path, key: String) -> Result<(), FaucetError> {
-        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let moved = self.scratch.path().join(format!("inflight-{n}"));
-        if let Err(e) = std::fs::rename(scratch, &moved) {
-            let _ = std::fs::remove_file(scratch);
-            return Err(FaucetError::Sink(format!(
-                "remote file sink: preparing '{}' for upload: {e}",
-                self.client.describe(&key)
-            )));
-        }
+        let handle = io_handle()?;
         let slots = self.slots.clone();
-        let permit = match run(async move {
+        let permit = run(async move {
             slots.acquire_owned().await.map_err(|e| {
                 FaucetError::Sink(format!("remote file sink: waiting for an upload slot: {e}"))
             })
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = std::fs::remove_file(&moved);
-                return Err(e);
-            }
-        };
-        let handle = match io_handle() {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = std::fs::remove_file(&moved);
-                return Err(e);
-            }
-        };
+        })?;
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let moved = self.scratch.path().join(format!("inflight-{n}"));
+        std::fs::rename(scratch, &moved).map_err(sink_io(format!(
+            "remote file sink: preparing '{}' for upload",
+            self.client.describe(&key)
+        )))?;
         let client = self.client.clone();
         let dir = self.scratch.clone();
         let k = key.clone();
@@ -348,11 +333,11 @@ impl StorageBackend for RemoteBackend {
             let _ = std::fs::remove_file(scratch);
             return result;
         }
-        if let Err(e) = self.reap(&key) {
-            let _ = std::fs::remove_file(scratch);
-            return Err(e);
-        }
-        self.spawn_upload(scratch, key)
+        self.reap(&key)
+            .and_then(|()| self.spawn_upload(scratch, key))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(scratch);
+            })
     }
 
     fn settle(&self) -> Result<(), FaucetError> {
@@ -371,9 +356,8 @@ impl StorageBackend for RemoteBackend {
     fn begin_staging(&self) -> Result<(), FaucetError> {
         self.clear_staging()?;
         let marker = self.scratch.path().join("marker");
-        std::fs::write(&marker, b"").map_err(|e| {
-            FaucetError::Sink(format!("remote file sink: writing the staging marker: {e}"))
-        })?;
+        std::fs::write(&marker, b"")
+            .map_err(sink_io("remote file sink: writing the staging marker"))?;
         let result = run(self
             .client
             .upload(&marker, &self.key(Area::Staging, STAGING_MARKER)));
@@ -644,6 +628,7 @@ mod tests {
         peak: std::sync::atomic::AtomicUsize,
         fail_key: Mutex<Option<String>>,
         fail_fast_key: Mutex<Option<String>>,
+        panic_key: Mutex<Option<String>>,
     }
 
     #[faucet_core::async_trait]
@@ -662,7 +647,9 @@ mod tests {
         }
         async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
             use std::sync::atomic::Ordering::SeqCst;
-            let body = std::fs::read(from).map_err(|e| FaucetError::Sink(e.to_string()))?;
+            if self.panic_key.lock().unwrap().as_deref() == Some(key) {
+                panic!("upload of {key} panicked");
+            }
             if self.fail_fast_key.lock().unwrap().as_deref() == Some(key) {
                 return Err(FaucetError::Sink(format!("refused {key}")));
             }
@@ -673,8 +660,7 @@ mod tests {
             if self.fail_key.lock().unwrap().as_deref() == Some(key) {
                 return Err(FaucetError::Sink(format!("refused {key}")));
             }
-            self.mem.objects.lock().unwrap().insert(key.into(), body);
-            Ok(())
+            self.mem.upload(from, key).await
         }
         async fn delete(&self, key: &str) -> Result<(), FaucetError> {
             self.mem.delete(key).await
@@ -889,5 +875,89 @@ mod tests {
                 .unwrap()
                 .ends_with("s-x_y")
         );
+    }
+
+    #[test]
+    fn a_panicking_future_is_an_error_outside_a_runtime() {
+        let e = run::<()>(async { panic!("boom") }).unwrap_err().to_string();
+        assert!(e.contains("an I/O task panicked"), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_background_upload_fails_the_flush() {
+        let client = Arc::new(Slow::default());
+        *client.panic_key.lock().unwrap() = Some("o/part-00001.jsonl".into());
+        let w = pipelined(&client, 2, "o/");
+        let e = w
+            .write_rows(&rows(1))
+            .and_then(|_| w.flush())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("the upload of 'o/part-00001.jsonl' did not finish"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_background_commit_that_cannot_start_removes_its_scratch_file() {
+        let client = Arc::new(Slow::default());
+        let b = RemoteBackend::new(client.clone(), "p/", "stage")
+            .unwrap()
+            .with_upload_concurrency(2);
+        let missing = b.scratch_path(Area::Destination, "gone").unwrap();
+        let e = b
+            .commit(&missing, Area::Destination, "gone")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("preparing 'mem://p/gone' for upload"), "{e}");
+
+        let scratch = b.scratch_path(Area::Destination, "x").unwrap();
+        std::fs::write(&scratch, b"1").unwrap();
+        b.slots.close();
+        let e = b
+            .commit(&scratch, Area::Destination, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("waiting for an upload slot"), "{e}");
+        assert!(!scratch.exists(), "the scratch file is removed");
+        assert!(client.mem.objects.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_direct_commit_of_a_missing_file_fails() {
+        let mem = Arc::new(Mem::default());
+        let b = RemoteBackend::new(mem.clone(), "p/", "stage").unwrap();
+        let missing = b.scratch_path(Area::Destination, "gone").unwrap();
+        assert!(b.commit(&missing, Area::Destination, "gone").is_err());
+        assert!(mem.objects.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_downloads_an_object_and_a_missing_one_is_an_error() {
+        let mem = Arc::new(Mem::default());
+        mem.objects
+            .lock()
+            .unwrap()
+            .insert("p/a".into(), b"body".to_vec());
+        let b = RemoteBackend::new(mem, "p/", "stage").unwrap();
+        let to = b.scratch_path(Area::Destination, "copy").unwrap();
+        b.fetch(Area::Destination, "a", &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"body");
+        let e = b
+            .fetch(Area::Destination, "b", &to)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("missing p/b"), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_staging_marker_that_cannot_be_written_is_an_error() {
+        let mem = Arc::new(Mem::default());
+        let b = RemoteBackend::new(mem.clone(), "p/", "stage").unwrap();
+        std::fs::remove_dir_all(b.scratch.path()).unwrap();
+        let e = b.begin_staging().unwrap_err().to_string();
+        assert!(e.contains("writing the staging marker"), "{e}");
+        assert!(!b.staging_ready().unwrap());
     }
 }
