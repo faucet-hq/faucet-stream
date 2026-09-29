@@ -18,6 +18,8 @@ spell the format choice, the path kinds and the extension rules the same way.
   path is recognised and which part of it names the file.
 - `is_directory_path` / `require_path` — directory paths and the empty-path
   refusal.
+- `config_context(connector, error)` — prefix a config error with the
+  connector's name; other errors pass through.
 
 ## `write`: the shared file-writing layer
 
