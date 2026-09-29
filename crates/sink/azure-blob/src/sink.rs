@@ -20,8 +20,9 @@ use crate::object::{AzureObjects, PART_BYTES};
 ///
 /// Each blob is built in a local scratch file and published with one upload
 /// (a committed block list past 8 MiB) when it closes: at the row / byte cap
-/// or at `flush`, so a bookmark never advances past a blob that is not in
-/// the container.
+/// or at `flush`. Uploads run in the background, up to `concurrency` at a
+/// time, while the next blob is encoded; `flush` waits for all of them, so a
+/// bookmark never advances past a blob that is not in the container.
 pub struct AzureBlobSink {
     config: AzureBlobSinkConfig,
     store: Arc<dyn ObjectStore>,
@@ -51,8 +52,10 @@ impl AzureBlobSink {
             store: store.clone(),
             container: config.container().to_string(),
             part_bytes: PART_BYTES,
+            concurrency: config.concurrency,
         });
-        let backend = RemoteBackend::new(objects, base, &template.staging_name())?;
+        let backend = RemoteBackend::new(objects, base, &template.staging_name())?
+            .with_upload_concurrency(config.concurrency);
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
         Ok(Self {
             config,

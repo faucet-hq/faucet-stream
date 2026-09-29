@@ -119,12 +119,21 @@ pub struct SftpSinkConfig {
     /// File extension for written objects (default: `.jsonl`).
     #[serde(default = "default_file_extension")]
     pub file_extension: String,
-    /// Records per written object. When a `write_batch` call hands the sink
-    /// `N` records with `batch_size = M > 0`, the sink writes `ceil(N / M)`
-    /// objects. `batch_size = 0` writes whatever upstream hands it as a single
-    /// object. Defaults to [`DEFAULT_BATCH_SIZE`].
+    /// Records per file when `max_records_per_file` is not set (without
+    /// `file_name`). Records accumulate across `write_batch` calls and a file
+    /// closes once it holds this many records, or at `flush`. `batch_size =
+    /// 0` is the "no re-chunking" sentinel: no record cap, so JSON Lines and
+    /// the whole-file formats write one file per `flush`, and Parquet one
+    /// file per `write_batch` call. Ignored when `file_name` is set.
+    /// Defaults to [`DEFAULT_BATCH_SIZE`].
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum number of file uploads in flight over the SSH session
+    /// (default 4): a page that rolls into several files uploads them
+    /// concurrently while the next file is encoded. `flush` returns only
+    /// after every upload has landed.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
     /// Maximum records per file before rolling to a new one (#618). `None`
     /// removes the record cap; the sink accumulates across `write_batch`
     /// calls, so a small upstream page no longer means a small file.
@@ -152,9 +161,9 @@ pub struct SftpSinkConfig {
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
     /// Parquet writer options, used when `format: parquet` (#777):
-    /// `compression`, `row_group_size`, explicit `schema`.
+    /// `compression` (default `zstd`), `row_group_size`, explicit `schema`.
     #[serde(default)]
-    pub parquet: faucet_common_file::write::ParquetOptions,
+    pub parquet: faucet_common_file::write::RemoteParquetOptions,
     /// JSON Lines writer options (`pretty`), used when `format: json_lines`.
     #[serde(default)]
     pub json_lines: faucet_common_file::write::JsonLinesOptions,
@@ -166,6 +175,10 @@ pub struct SftpSinkConfig {
 
 fn default_file_extension() -> String {
     ".jsonl".to_string()
+}
+
+fn default_concurrency() -> usize {
+    4
 }
 
 fn default_batch_size() -> usize {
@@ -181,6 +194,7 @@ impl SftpSinkConfig {
             format: SftpSinkFormat::default(),
             file_extension: default_file_extension(),
             batch_size: DEFAULT_BATCH_SIZE,
+            concurrency: default_concurrency(),
             max_records_per_file: None,
             max_bytes_per_file: None,
             csv: faucet_core::CsvOptions::default(),
@@ -192,7 +206,7 @@ impl SftpSinkConfig {
             write_mode: faucet_common_file::write::FileWriteMode::default(),
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
-            parquet: faucet_common_file::write::ParquetOptions::default(),
+            parquet: faucet_common_file::write::RemoteParquetOptions::default(),
             json_lines: faucet_common_file::write::JsonLinesOptions::default(),
             #[cfg(feature = "encryption")]
             encryption: None,
@@ -256,6 +270,12 @@ impl SftpSinkConfig {
     /// Set the per-file byte cap (#618).
     pub fn max_bytes_per_file(mut self, n: usize) -> Self {
         self.max_bytes_per_file = Some(n);
+        self
+    }
+
+    /// Set the most file uploads in flight.
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
         self
     }
 
@@ -337,7 +357,7 @@ impl SftpSinkConfig {
         let codec = self.codec(&name);
         let mut s = faucet_common_file::write::WriteSettings::new(format, codec);
         s.opts = self.format_options();
-        s.parquet = self.parquet.clone();
+        s.parquet = self.parquet.clone().into();
         s.json_lines = self.json_lines.clone();
         s.mode = self.mode;
         s.write_mode = self.write_mode;
@@ -351,6 +371,10 @@ impl SftpSinkConfig {
             s.encryption = self.encryption.clone();
         }
         s.object_per_flush = true;
+        s.object_per_write = format == faucet_core::FileFormat::Parquet
+            && self.file_name.is_none()
+            && self.legacy_cap().is_none()
+            && self.max_bytes_per_file.is_none();
         Ok(s)
     }
 
@@ -542,5 +566,62 @@ mod tests {
             cfg.format_options().avro.codec,
             faucet_core::AvroCodec::Snappy
         );
+    }
+}
+
+#[cfg(test)]
+mod object_rules_tests {
+    use super::*;
+    use faucet_common_file::write::ParquetCodec;
+
+    #[test]
+    fn parquet_defaults_to_zstd_even_when_other_options_are_given() {
+        let c: SftpSinkConfig = serde_json::from_value(serde_json::json!({"host":"h","username":"u","type":"password","config":{"password":"p"},"path":"/o"})).unwrap();
+        assert_eq!(c.parquet.compression, ParquetCodec::Zstd);
+        let c: SftpSinkConfig = serde_json::from_value(
+            serde_json::json!({"host":"h","username":"u","type":"password","config":{"password":"p"},"path":"/o","parquet":{"row_group_size":5}}),
+        )
+        .unwrap();
+        assert_eq!(c.parquet.compression, ParquetCodec::Zstd);
+        assert_eq!(c.parquet.row_group_size, 5);
+        assert_eq!(
+            SftpSinkConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/o")
+                .parquet
+                .compression,
+            ParquetCodec::Zstd
+        );
+        let s = c.settings().unwrap();
+        assert_eq!(s.parquet.compression, ParquetCodec::Zstd);
+        let schema = serde_json::to_value(faucet_core::schema_for!(SftpSinkConfig)).unwrap();
+        assert_eq!(
+            schema.pointer("/properties/parquet/default/compression"),
+            Some(&serde_json::json!("zstd")),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn batch_size_zero_writes_a_parquet_object_per_batch_write() {
+        let mut c = SftpSinkConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/o");
+        c.format = SftpSinkFormat::Parquet;
+        c.batch_size = 0;
+        assert!(c.settings().unwrap().object_per_write);
+        c.format = SftpSinkFormat::JsonLines;
+        assert!(
+            !c.settings().unwrap().object_per_write,
+            "json lines: per flush"
+        );
+        c.format = SftpSinkFormat::Parquet;
+        c.batch_size = 10;
+        assert!(!c.settings().unwrap().object_per_write, "a record cap");
+        c.batch_size = 0;
+        c.max_bytes_per_file = Some(10);
+        assert!(!c.settings().unwrap().object_per_write, "a byte cap");
+        c.max_bytes_per_file = None;
+        c.max_records_per_file = Some(3);
+        assert!(!c.settings().unwrap().object_per_write, "a record cap");
+        c.max_records_per_file = None;
+        c.file_name = Some("part-{part}.parquet".into());
+        assert!(!c.settings().unwrap().object_per_write, "path: per part");
     }
 }

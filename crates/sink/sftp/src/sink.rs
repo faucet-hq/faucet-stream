@@ -45,7 +45,8 @@ impl SftpSink {
             base
         };
         let objects = Arc::new(SftpObjects::new(config.connection.clone()));
-        let backend = RemoteBackend::new(objects, base, &template.staging_name())?;
+        let backend = RemoteBackend::new(objects, base, &template.staging_name())?
+            .with_upload_concurrency(config.concurrency);
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
         Ok(Self { config, writer })
     }
