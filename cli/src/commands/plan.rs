@@ -289,7 +289,10 @@ pub async fn plan_node(
         let case = resolved_case_from_node(node, input, clock);
         let run = run_case(&case).await?;
         let inferred = faucet_core::schema::infer_schema(&run.written);
-        planned_output_schema = Some(inferred.clone());
+        #[cfg(feature = "catalog")]
+        {
+            planned_output_schema = Some(inferred.clone());
+        }
 
         // Build the sink ONLY to probe it and read its live schema — never to
         // write. `check()` is best-effort; `current_schema()` yields the delta.
