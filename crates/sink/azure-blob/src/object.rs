@@ -1,8 +1,9 @@
 //! The Azure Blob [`ObjectClient`] behind the shared file writer (#777).
 //!
 //! A blob up to [`PART_BYTES`] is one `Put Blob`; a larger one is uploaded
-//! as blocks and committed with one `Put Block List`, which is what makes it
-//! visible — a failed upload is aborted and leaves nothing behind.
+//! as blocks (up to `concurrency` in flight) and committed with one
+//! `Put Block List`, which is what makes it visible — a failed upload is
+//! aborted and leaves nothing behind.
 
 use async_trait::async_trait;
 use faucet_common_file::write::ObjectClient;
@@ -20,6 +21,7 @@ pub(crate) struct AzureObjects {
     pub store: Arc<dyn ObjectStore>,
     pub container: String,
     pub part_bytes: usize,
+    pub concurrency: usize,
 }
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -103,32 +105,34 @@ impl ObjectClient for AzureObjects {
         let mut file = tokio::fs::File::open(from)
             .await
             .map_err(|e| err("open local file", key, e))?;
-        let mut upload = self
+        let upload = self
             .store
             .put_multipart(&path)
             .await
             .map_err(|e| err("start multipart", key, e))?;
+        let mut writer = object_store::WriteMultipart::new_with_chunk_size(upload, self.part_bytes);
         let mut result = Ok(());
         let mut sent = 0;
         while sent < len {
+            if let Err(e) = writer.wait_for_capacity(self.concurrency.max(1)).await {
+                result = Err(err("put part", key, e));
+                break;
+            }
             let mut part = vec![0u8; self.part_bytes.min(len - sent)];
             if let Err(e) = file.read_exact(&mut part).await {
                 result = Err(err("read local file", key, e));
                 break;
             }
             sent += part.len();
-            if let Err(e) = upload.put_part(bytes::Bytes::from(part).into()).await {
-                result = Err(err("put part", key, e));
-                break;
-            }
+            writer.put(bytes::Bytes::from(part));
         }
         if result.is_ok() {
-            match upload.complete().await {
-                Ok(_) => return Ok(()),
-                Err(e) => result = Err(err("complete multipart", key, e)),
-            }
+            return match writer.finish().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(err("complete multipart", key, e)),
+            };
         }
-        let _ = upload.abort().await;
+        let _ = writer.abort().await;
         result
     }
 
@@ -166,6 +170,7 @@ mod tests {
             store: Arc::new(object_store::memory::InMemory::new()),
             container: "c".into(),
             part_bytes: 4,
+            concurrency: 2,
         };
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");

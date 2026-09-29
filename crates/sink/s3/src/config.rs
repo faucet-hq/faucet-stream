@@ -146,26 +146,30 @@ pub struct S3SinkConfig {
     /// than being split (which would corrupt it) or dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes_per_file: Option<usize>,
-    /// Maximum number of concurrent part uploads for a large object
-    /// (default: 10).
+    /// Maximum number of uploads in flight (default: 10). A page that rolls
+    /// into several objects uploads them concurrently, up to this many, while
+    /// the next object is encoded; a large object's multipart parts are also
+    /// uploaded up to this many at a time. `flush` returns only after every
+    /// upload has landed.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
-    /// Records per S3 object written by a single
-    /// [`Sink::write_batch`](faucet_core::Sink::write_batch) call. When a call
-    /// hands the sink `N` records with `batch_size = M > 0`, the sink writes
-    /// `ceil(N / M)` objects, each containing at most `M` records (the final
-    /// object holds the remainder). Defaults to [`DEFAULT_BATCH_SIZE`].
+    /// Records per S3 object when `max_records_per_file` is not set (without
+    /// `path`). Records accumulate across
+    /// [`Sink::write_batch`](faucet_core::Sink::write_batch) calls and an
+    /// object closes once it holds `batch_size` records, or at `flush`.
+    /// Defaults to [`DEFAULT_BATCH_SIZE`].
     ///
-    /// `batch_size = 0` is the "no batching" sentinel: the sink writes
-    /// whatever upstream hands it without re-chunking (still honouring
-    /// `max_records_per_file` if set). Recommended for S3 — most callers
-    /// should leave this at `0` and let the source's `batch_size` drive
-    /// object sizing, because many tiny S3 objects are a well-known
-    /// anti-pattern (per-request overhead, slower downstream reads,
-    /// LIST/PUT cost).
+    /// `batch_size = 0` is the "no re-chunking" sentinel: no record cap
+    /// (still honouring `max_records_per_file` / `max_bytes_per_file` if
+    /// set). JSON Lines and the whole-object formats then write one object
+    /// per `flush`; Parquet writes one object per `write_batch` call, as the
+    /// sink always has. Many tiny S3 objects are a well-known anti-pattern
+    /// (per-request overhead, slower downstream reads, LIST/PUT cost), so
+    /// size objects with the caps rather than a small `batch_size`.
     ///
     /// When both `batch_size > 0` and `max_records_per_file` are set, the
     /// effective per-object cap is `min(batch_size, max_records_per_file)`.
+    /// Ignored when `path` is set.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Compression codec applied to each uploaded object body. Defaults to
@@ -190,9 +194,9 @@ pub struct S3SinkConfig {
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
     /// Parquet writer options, used when `format: parquet` (#777):
-    /// `compression`, `row_group_size`, explicit `schema`.
+    /// `compression` (default `zstd`), `row_group_size`, explicit `schema`.
     #[serde(default)]
-    pub parquet: faucet_common_file::write::ParquetOptions,
+    pub parquet: faucet_common_file::write::RemoteParquetOptions,
     /// JSON Lines writer options (`pretty`), used when `format: json_lines`.
     #[serde(default)]
     pub json_lines: faucet_common_file::write::JsonLinesOptions,
@@ -249,7 +253,7 @@ impl S3SinkConfig {
             path: None,
             mode: faucet_common_file::write::FileMode::default(),
             write_mode: faucet_common_file::write::FileWriteMode::default(),
-            parquet: faucet_common_file::write::ParquetOptions::default(),
+            parquet: faucet_common_file::write::RemoteParquetOptions::default(),
             json_lines: faucet_common_file::write::JsonLinesOptions::default(),
             #[cfg(feature = "encryption")]
             encryption: None,
@@ -426,7 +430,7 @@ impl S3SinkConfig {
         let codec = self.codec(&name);
         let mut s = faucet_common_file::write::WriteSettings::new(format, codec);
         s.opts = self.format_options();
-        s.parquet = self.parquet.clone();
+        s.parquet = self.parquet.clone().into();
         s.json_lines = self.json_lines.clone();
         s.mode = self.mode;
         s.write_mode = self.write_mode;
@@ -440,7 +444,17 @@ impl S3SinkConfig {
             s.encryption = self.encryption.clone();
         }
         s.object_per_flush = true;
+        s.object_per_write = self.object_per_write(format);
         Ok(s)
+    }
+
+    /// `batch_size: 0` without `path` or caps: a Parquet object per
+    /// `write_batch` call, as the sink wrote before the shared writer.
+    fn object_per_write(&self, format: faucet_core::FileFormat) -> bool {
+        format == faucet_core::FileFormat::Parquet
+            && self.path.is_none()
+            && self.effective_chunk_cap().is_none()
+            && self.max_bytes_per_file.is_none()
     }
 
     /// What a failed batch write leaves behind (#737): a page is encoded
@@ -743,5 +757,60 @@ mod tests {
             cfg.format_options().avro.codec,
             faucet_core::AvroCodec::Snappy
         );
+    }
+}
+
+#[cfg(test)]
+mod object_rules_tests {
+    use super::*;
+    use faucet_common_file::write::ParquetCodec;
+
+    #[test]
+    fn parquet_defaults_to_zstd_even_when_other_options_are_given() {
+        let c: S3SinkConfig = serde_json::from_value(serde_json::json!({"bucket":"b"})).unwrap();
+        assert_eq!(c.parquet.compression, ParquetCodec::Zstd);
+        let c: S3SinkConfig = serde_json::from_value(
+            serde_json::json!({"bucket":"b","parquet":{"row_group_size":5}}),
+        )
+        .unwrap();
+        assert_eq!(c.parquet.compression, ParquetCodec::Zstd);
+        assert_eq!(c.parquet.row_group_size, 5);
+        assert_eq!(
+            S3SinkConfig::new("b").parquet.compression,
+            ParquetCodec::Zstd
+        );
+        let s = c.settings().unwrap();
+        assert_eq!(s.parquet.compression, ParquetCodec::Zstd);
+        let schema = serde_json::to_value(faucet_core::schema_for!(S3SinkConfig)).unwrap();
+        assert_eq!(
+            schema.pointer("/properties/parquet/default/compression"),
+            Some(&serde_json::json!("zstd")),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn batch_size_zero_writes_a_parquet_object_per_batch_write() {
+        let mut c = S3SinkConfig::new("b");
+        c.format = S3SinkFormat::Parquet;
+        c.batch_size = 0;
+        assert!(c.settings().unwrap().object_per_write);
+        c.format = S3SinkFormat::JsonLines;
+        assert!(
+            !c.settings().unwrap().object_per_write,
+            "json lines: per flush"
+        );
+        c.format = S3SinkFormat::Parquet;
+        c.batch_size = 10;
+        assert!(!c.settings().unwrap().object_per_write, "a record cap");
+        c.batch_size = 0;
+        c.max_bytes_per_file = Some(10);
+        assert!(!c.settings().unwrap().object_per_write, "a byte cap");
+        c.max_bytes_per_file = None;
+        c.max_records_per_file = Some(3);
+        assert!(!c.settings().unwrap().object_per_write, "a record cap");
+        c.max_records_per_file = None;
+        c.path = Some("d/part-{part}.parquet".into());
+        assert!(!c.settings().unwrap().object_per_write, "path: per part");
     }
 }

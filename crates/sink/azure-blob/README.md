@@ -28,8 +28,8 @@ Sink-specific fields:
 | `format` | enum | `json_lines` | `json_lines` / `json_array` / `csv` / `xml` / `xlsx` / `avro` — see [File formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Extension for written objects. |
 | `max_records_per_file` | int | — | Cap records per object (file rollover). |
-| `concurrency` | int | `10` | Max concurrent uploads. |
-| `batch_size` | int | `1000` | Records per object; `0` writes one object per `write_batch` (recommended). |
+| `concurrency` | int | `10` | Max uploads in flight: a closed blob uploads in the background while the next is encoded, and a large blob's blocks go up this many at a time. `flush` waits for every upload. |
+| `batch_size` | int | `1000` | Records per blob when `max_records_per_file` is unset (without `path`). `0` = no record cap: one blob per `flush`; Parquet one per `write_batch`. |
 | `compression` | enum | `auto` | `auto` / `gzip` / `zstd` (requires the `compression` feature); resolved from `file_extension`. |
 
 Object names are `{prefix}{uuidv7}{file_extension}` — time-sortable so a listing
@@ -71,6 +71,13 @@ overhead outweighs the bytes.
 With neither cap set the whole run lands in one object, closed at `flush` —
 which the pipeline calls at every bookmark-carrying page and at the end, so
 the remainder is always written before a bookmark advances.
+
+Closed blobs upload in the background while the next one is encoded, up to
+`concurrency` at a time; every `write_batch` waits for the uploads it started
+(so a failed upload fails the page that wrote it) and `flush` waits for all of
+them. `batch_size: 0` removes the record cap: one blob per `flush`, and for
+Parquet one blob per `write_batch` call, so each page stays a self-contained
+file.
 
 Large objects stream through **multipart** upload: a part is sent as soon as it
 fills and its buffer is dropped, so peak memory is O(part size) rather than
@@ -147,7 +154,7 @@ format and option the file sink does, with the same field names:
 | `path` | a name template | blob name template: `{part}` numbers the blobs, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` blobs. |
 | `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when a blob of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
 | `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's blobs under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
-| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each blob's first page and widened by later pages. |
+| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`**, like the S3 and GCS sinks — smaller objects to move; the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each blob's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
 

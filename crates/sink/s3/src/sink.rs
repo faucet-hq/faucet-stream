@@ -15,8 +15,9 @@ use std::sync::Arc;
 ///
 /// Each object is built in a local scratch file and published with one
 /// upload (multipart past 8 MiB) when it closes: at the row / byte cap or at
-/// `flush`, so a bookmark never advances past an object that is not in the
-/// bucket.
+/// `flush`. Uploads run in the background, up to `concurrency` at a time,
+/// while the next object is encoded; `flush` waits for all of them, so a
+/// bookmark never advances past an object that is not in the bucket.
 pub struct S3Sink {
     config: S3SinkConfig,
     client: Client,
@@ -56,7 +57,8 @@ impl S3Sink {
             part_bytes: PART_BYTES,
             roundtrips: roundtrips.clone(),
         });
-        let backend = RemoteBackend::new(objects, base, &template.staging_name())?;
+        let backend = RemoteBackend::new(objects, base, &template.staging_name())?
+            .with_upload_concurrency(config.concurrency);
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
         Ok(Self {
             config,

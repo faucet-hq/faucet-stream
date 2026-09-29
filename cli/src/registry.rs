@@ -1077,6 +1077,12 @@ pub const OVERWRITE_SINK_KINDS: &[&str] = &[
     "oracle",
     // local files: staged in a hidden directory, moved into place on commit.
     "file",
+    // object stores and SFTP (#777): the same stage-and-swap under a staging
+    // key prefix / directory, through the shared file writer.
+    "s3",
+    "gcs",
+    "azure-blob",
+    "sftp",
 ];
 
 /// Whether a sink kind supports `write_mode: overwrite`.

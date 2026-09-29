@@ -28,7 +28,8 @@ Connection, authentication, and host-key verification come from
 | `path` | string | — | Remote directory prefix under which objects are written. |
 | `format` | enum | `json_lines` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` — see [File formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Extension for written objects. |
-| `batch_size` | integer | `1000` | Records per object; `0` = one object per `write_batch` call. |
+| `batch_size` | integer | `1000` | Records per file when `max_records_per_file` is unset (without `file_name`). `0` = no record cap: one file per `flush`; Parquet one per `write_batch`. |
+| `concurrency` | integer | `4` | File uploads in flight over the SSH session: a closed file uploads in the background while the next is encoded. `flush` waits for every upload. |
 
 The sink opens the SSH connection lazily on the first write and reuses it. It
 attempts to create the target directory on first connect (best-effort).
@@ -78,6 +79,13 @@ overhead outweighs the bytes.
 With neither cap set the whole run lands in one object, closed at `flush` —
 which the pipeline calls at every bookmark-carrying page and at the end, so
 the remainder is always written before a bookmark advances.
+
+Closed files upload in the background while the next one is encoded, up to
+`concurrency` at a time; every `write_batch` waits for the uploads it started
+(so a failed upload fails the page that wrote it) and `flush` waits for all of
+them. `batch_size: 0` removes the record cap: one file per `flush`, and for
+Parquet one file per `write_batch` call, so each page stays a self-contained
+file.
 
 ## File formats (#604)
 
@@ -148,7 +156,7 @@ format and option the file sink does, with the same field names:
 | `file_name` | a name template | file name template: `{part}` numbers the files, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` files. |
 | `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when a file of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
 | `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's files under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
-| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each file's first page and widened by later pages. |
+| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`**, like the S3 and GCS sinks — smaller objects to move; the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each file's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
 

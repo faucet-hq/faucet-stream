@@ -100,6 +100,64 @@ impl Default for ParquetOptions {
     }
 }
 
+fn zstd() -> ParquetCodec {
+    ParquetCodec::Zstd
+}
+
+/// Parquet write options for the object-store and SFTP sinks: the same
+/// fields as [`ParquetOptions`], but `compression` defaults to `zstd`, which
+/// is what those sinks wrote before the shared writer — smaller objects to
+/// upload and store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteParquetOptions {
+    /// Column-chunk compression (default `zstd`). File-level `compression`
+    /// does not apply to Parquet.
+    #[serde(default = "zstd")]
+    pub compression: ParquetCodec,
+    /// Maximum rows per row group (default 1,048,576). Smaller groups let
+    /// readers skip more data and bound the writer's memory.
+    #[serde(default = "default_row_group_size")]
+    pub row_group_size: usize,
+    /// An explicit schema, in column order. Without it the schema is
+    /// inferred from the records and widened when a later page adds a field.
+    /// With it the file has exactly these columns: a record field the schema
+    /// does not name fails the write, and a value that does not fit its
+    /// column's type fails naming the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Vec<ParquetField>>,
+}
+
+impl Default for RemoteParquetOptions {
+    fn default() -> Self {
+        Self {
+            compression: ParquetCodec::Zstd,
+            row_group_size: DEFAULT_ROW_GROUP_SIZE,
+            schema: None,
+        }
+    }
+}
+
+impl From<RemoteParquetOptions> for ParquetOptions {
+    fn from(o: RemoteParquetOptions) -> Self {
+        Self {
+            compression: o.compression,
+            row_group_size: o.row_group_size,
+            schema: o.schema,
+        }
+    }
+}
+
+impl From<ParquetOptions> for RemoteParquetOptions {
+    fn from(o: ParquetOptions) -> Self {
+        Self {
+            compression: o.compression,
+            row_group_size: o.row_group_size,
+            schema: o.schema,
+        }
+    }
+}
+
 /// One column of an explicit Parquet schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

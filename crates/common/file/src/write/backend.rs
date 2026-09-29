@@ -45,6 +45,14 @@ pub trait StorageBackend: Send + Sync {
     /// remote one uses a temporary directory.
     fn scratch_path(&self, area: Area, name: &str) -> Result<PathBuf, FaucetError>;
 
+    /// Whether finished scratch files must be synced to disk before
+    /// [`commit`](Self::commit). A local backend renames the scratch file into
+    /// place, so it must be durable first; a remote one uploads it and then
+    /// deletes it, so syncing would only cost time. Default: `true`.
+    fn sync_scratch(&self) -> bool {
+        true
+    }
+
     /// Remove scratch files a crashed run left in `area`, for the names
     /// `ours` accepts. Best effort. Default: nothing.
     fn remove_stale_scratch(&self, _area: Area, _ours: &dyn Fn(&str) -> bool) {}
@@ -65,7 +73,23 @@ pub trait StorageBackend: Send + Sync {
     /// Publish the finished local file `scratch` as `name` in `area`,
     /// replacing any existing file atomically: a reader sees the old file or
     /// the new one, never a partial one. `scratch` is consumed.
+    ///
+    /// A backend may return before the file is published — an upload left
+    /// running in the background — provided [`settle`](Self::settle) waits
+    /// for it and reports its error.
     fn commit(&self, scratch: &Path, area: Area, name: &str) -> Result<(), FaucetError>;
+
+    /// Wait for every [`commit`](Self::commit) this backend has accepted to
+    /// land, and return the first error among them. The writer calls it
+    /// before a flush returns and before it lists, promotes or deletes files.
+    /// Default: commits are synchronous, so there is nothing to wait for.
+    fn settle(&self) -> Result<(), FaucetError> {
+        Ok(())
+    }
+
+    /// Wait for in-flight commits and discard their outcome (an aborted
+    /// run). Default: nothing.
+    fn cancel(&self) {}
 
     /// Delete `name` from `area`. A missing file is not an error.
     fn delete(&self, area: Area, name: &str) -> Result<(), FaucetError>;

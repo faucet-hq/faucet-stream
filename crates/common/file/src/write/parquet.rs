@@ -127,13 +127,14 @@ impl ParquetState {
             .map_err(|e| pq_err(tmp, e))
     }
 
-    /// Finish the file at `tmp` and sync it. `false` when nothing is open.
-    pub fn close(&mut self, tmp: &Path) -> Result<bool, FaucetError> {
+    /// Finish the file at `tmp`, syncing it when `sync`. `false` when nothing
+    /// is open.
+    pub fn close(&mut self, tmp: &Path, sync: bool) -> Result<bool, FaucetError> {
         let Some(writer) = self.writer.take() else {
             return Ok(false);
         };
         let file = writer.into_inner().map_err(|e| pq_err(tmp, e))?;
-        file.sync_all().map_err(|e| io_err("syncing", tmp, e))?;
+        super::encode::sync_if(&file, tmp, sync)?;
         Ok(true)
     }
 
