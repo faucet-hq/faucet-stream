@@ -89,8 +89,8 @@ faucet run pipeline.yaml
 #### Custom request headers
 
 Set arbitrary static headers on every request via the `headers:` map — useful for
-APIs that require a fixed non-auth header (e.g. NetSuite SuiteQL's `Prefer:
-transient`, Stripe's `Stripe-Version`, Plaid's `Plaid-Version`, or a custom
+APIs that require a fixed non-auth header (e.g. `Prefer:
+transient`, an `Api-Version` header, or a custom
 `Accept`/tenant/feature-flag header):
 
 ```yaml
@@ -135,7 +135,7 @@ pagination: { type: RecordFieldCursor, field: JournalNumber, into: query, param:
 
 Both stop on a short page (fewer than `limit`/`page_size` records) and guard against a non-advancing cursor.
 
-**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. Plaid `/transactions/sync`) resumes incrementally instead of re-pulling from the start.
+**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start.
 
 ### Multi-array fan-out (`records_multi`) & envelope carry (`record_ancestors`)
 
@@ -149,7 +149,7 @@ records_multi:
 op_field: _op          # each record gets { _op: "<op>" }; default "_op"
 
 # record_ancestors — lift fields from the enclosing array-element ancestor onto
-# each record when records_path selects a NESTED array (e.g. Stripe events).
+# each record when records_path selects a NESTED array (e.g. an event feed).
 records_path: "$.data[*].data.object"
 record_ancestors: { event_id: id, event_created: created }
 ```
@@ -172,14 +172,14 @@ A **`204 No Content`** response — or any `2xx` with an empty/whitespace-only b
 
 ### Response format — authenticated CSV / Excel files
 
-By default the REST source parses a **JSON** body and extracts records via `records_path`. Set `response_format` to consume an authenticated **file** endpoint instead — a Microsoft Graph / OneDrive / SharePoint `…/content` download, a signed export URL, or any authed host serving a CSV/Excel file — reusing all of this source's auth (inline **or** a shared `auth: { ref }` provider), retry, and `${...}` substitution.
+By default the REST source parses a **JSON** body and extracts records via `records_path`. Set `response_format` to consume an authenticated **file** endpoint instead — a cloud-drive `…/content` download, a signed export URL, or any authed host serving a CSV/Excel file — reusing all of this source's auth (inline **or** a shared `auth: { ref }` provider), retry, and `${...}` substitution.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `response_format` | `json` \| `csv` \| `excel` \| `jsonl` | `json` | How to parse the body. `csv`/`excel` parse a whole tabular file into records; `jsonl` reads one JSON object per line (streamed line by line on an `async_job` fetch). `excel` requires the crate's `excel` feature. |
 | `csv_delimiter` | int (byte) / char | `,` | CSV field delimiter. `response_format: csv` only. |
 | `csv_has_headers` | bool | `true` | Whether the first CSV row supplies field names (else `column_0`, `column_1`, …). `csv` only. |
-| `csv_null_values` | list of strings | `[]` | CSV fields equal to any listed string decode as JSON `null` rather than a string — on the `Value`, native NDJSON, columnar and streaming decode paths alike. Salesforce Bulk API 2.0 writes a null as an empty field, so set `[""]` for it; list sentinels such as `"NULL"` / `"#N/A"` for other APIs. Headers are never mapped, and a quoted empty field maps like an unquoted one. Applies to `response_format: csv` and to a `parse: { format: csv }` decode step; set anywhere else it is a config error. |
+| `csv_null_values` | list of strings | `[]` | CSV fields equal to any listed string decode as JSON `null` rather than a string — on the `Value`, native NDJSON, columnar and streaming decode paths alike. Some bulk-export APIs write a null as an empty field, so set `[""]` for them; list sentinels such as `"NULL"` / `"#N/A"` for other APIs. Headers are never mapped, and a quoted empty field maps like an unquoted one. Applies to `response_format: csv` and to a `parse: { format: csv }` decode step; set anywhere else it is a config error. |
 | `excel_sheet` | string / null | first sheet | Worksheet name, or a 0-based index as a string. `excel` only. |
 | `excel_header_row` | int | `0` | 0-based index of the Excel header row. `excel` only. |
 
@@ -189,8 +189,8 @@ In file mode a **single** response is fetched: `pagination` must be `none` and `
 source:
   type: rest
   config:
-    base_url: https://graph.microsoft.com
-    path: /v1.0/me/drive/items/ITEM_ID/content
+    base_url: https://files.example.com
+    path: /v1.0/drive/items/ITEM_ID/content
     pagination: none
     response_format: excel
     excel_sheet: "Sheet1"
@@ -244,8 +244,8 @@ replication_bind:
 **Next-page links.** With `LinkHeader` / `NextLinkInBody` pagination the
 server's next-page URL is used as given: static `query_params`, query-target
 `replication_bind` values and query-target `window` bounds are sent on the first
-request only, because the link already carries them (Shopify rejects any filter
-next to `page_info`; a duplicated window bound can select the wrong window).
+request only, because the link already carries them (some APIs reject any filter
+next to a `page_info` cursor; a duplicated window bound can select the wrong window).
 Credentials are still sent on every page — an `ApiKeyQuery` key is appended
 unless the link already echoes it, and a flow provider's query placements are
 always re-applied. A server that does *not* echo its filter into the link
@@ -253,8 +253,8 @@ degrades to over-fetching on page 2+, which the client-side incremental filter
 then trims — never to data loss. Header / body / path binds are unaffected.
 
 Relative links are resolved per RFC 3986 against the URL of the request that
-returned them: root-relative (`/services/data/v60.0/query/01g…-2000`, Salesforce
-`nextRecordsUrl`), path-relative (`page2`), protocol-relative (`//host/p`) and
+returned them: root-relative (`/services/data/v60.0/query/01g…-2000`, a
+`nextRecordsUrl` field), path-relative (`page2`), protocol-relative (`//host/p`) and
 query-only (`?page=2`) links all work, and the loop guard compares resolved
 URLs. A link to a different host is followed (logged at debug) with the same
 credentials, since it came from the authenticated API; an unparseable link
@@ -262,7 +262,7 @@ fails the run naming the path and the value. `async_job` URLs that already
 carry the `base_url` path prefix (`/services/data/v60.0/jobs/…` under
 `base_url: https://x/services/data/v60.0`) no longer duplicate it.
 
-A POST-search API whose filter sits deep in the body (HubSpot CRM search) takes
+A POST-search API whose filter sits deep in the body (a CRM object search) takes
 the bookmark through a JSON Pointer. The value is written after any
 `${parent.*}` substitution, on the first request and on every paginated one:
 
@@ -279,7 +279,7 @@ replication_bind:
   value_type: number
 ```
 
-A windowed report API (GA4 `runReport`) can place both bounds the same way:
+A windowed report API (a `runReport` endpoint) can place both bounds the same way:
 `lower: { into: body, path: /dateRanges/0/startDate, format: date }` and
 `upper: { into: body, path: /dateRanges/0/endDate, format: date }`.
 
@@ -333,7 +333,7 @@ window:
   upper: { into: query, name: end_date,   template: "${window}", format: date }
 ```
 
-Some APIs take both bounds in **one** string — the Google Ads query language
+Some APIs take both bounds in **one** string — an SQL-like report query language
 (`segments.date BETWEEN 'a' AND 'b'`), Lucene `date:[a TO b]`, `range=a..b`. Any
 bind's template may use `${window.start}` and `${window.end}` (the end is
 granularity-adjusted, like `upper`); `${window}` stays "this bind's own
@@ -486,7 +486,7 @@ decode:
 
 ### Async-job pattern (`async_job`)
 
-For bulk/export/report-run APIs (Salesforce Bulk, Stripe Reporting, …): submit a
+For bulk/export/report-run APIs (bulk export jobs, report runs, …): submit a
 job → poll a status endpoint until terminal → fetch the result → hand it to the
 `decode:` pipeline. Requires `pagination: none`.
 
@@ -520,7 +520,7 @@ string; an absolute URL is used verbatim, a relative one is resolved against
 `base_url`. Because such links are often one-time/expiring, the URL is fetched
 immediately after resolution.
 
-Stripe report runs are the canonical case — poll until `status: succeeded`, then
+A report-run API is the canonical case — poll until `status: succeeded`, then
 download the signed CSV link at `result.url`:
 
 ```yaml
@@ -536,19 +536,19 @@ decode:
 
 #### Result-set continuation (`fetch.locator_*`)
 
-When a job's results span several pages behind a continuation locator (e.g. the Salesforce Bulk API's `Sforce-Locator` response header), loop the fetch until the locator is absent:
+When a job's results span several pages behind a continuation locator (e.g. an `X-Locator` response header), loop the fetch until the locator is absent:
 
 ```yaml
 async_job:
   # …submit / poll / status…
   fetch:
     url: "/jobs/${job_id}/result"
-    locator_header: "Sforce-Locator"   # or locator_body: "$.nextLocator"
+    locator_header: "X-Locator"   # or locator_body: "$.nextLocator"
     locator_param: "locator"           # sent as ?locator=<value> on each continuation
     records_path: "$.records[*]"
 ```
 
-Records are appended across pages; the loop stops when the locator header/body is missing, empty, or matches one of `locator_terminal_values` (default `["null"]` — the Salesforce Bulk sentinel). An API that signals completion differently sets its own list, without a code change:
+Records are appended across pages; the loop stops when the locator header/body is missing, empty, or matches one of `locator_terminal_values` (default `["null"]` — a common bulk-export sentinel). An API that signals completion differently sets its own list, without a code change:
 
 ```yaml
     locator_terminal_values: ["EOF", "-1"]   # replaces the default, does not extend it
@@ -622,9 +622,9 @@ The same pointer names the dataset for catalog and lineage, so pointing it at
 the real statement is what keeps one object per dataset rather than every
 object collapsing onto one.
 
-#### Shopify-style bulk operations (#768)
+#### GraphQL bulk export jobs (#768)
 
-A Shopify Admin API **bulk operation** is an async job over GraphQL: submit a
+A GraphQL **bulk export job** is an async job over GraphQL: submit a
 `bulkOperationRunQuery` mutation, poll the operation with a `POST` query body
 until `COMPLETED`, download the JSONL file at `url`, and split its rows —
 child rows (`LineItem`) carry `__parentId` and are interleaved with their
@@ -634,7 +634,7 @@ parents (`Order`). Four pieces make that expressible in config:
 |-------|---------|
 | `poll.json` | Request body for the poll; `${job_id}` is substituted in every string leaf. |
 | `status.error_path` | JSONPath to an error code, named in the error a `FAILED` / `CANCELED` job raises. |
-| `submit_errors: { path, retry_on, retry_interval_secs, retry_timeout_secs }` | Messages at `path` (e.g. GraphQL `userErrors`) fail the submit with the server's text; a message containing a `retry_on` substring ("already in progress" — one bulk operation per shop) is retried every `retry_interval_secs` (30) until `retry_timeout_secs` (900). |
+| `submit_errors: { path, retry_on, retry_interval_secs, retry_timeout_secs }` | Messages at `path` (e.g. GraphQL `userErrors`) fail the submit with the server's text; a message containing a `retry_on` substring ("already in progress" — one bulk job per account) is retried every `retry_interval_secs` (30) until `retry_timeout_secs` (900). |
 | `incremental.inject: { mode: template, template, format, initial }` | Renders `template` with `${bookmark}` (formatted by `format`: `raw` / `iso8601` / `date` / `epoch_s` / `epoch_ms`) and writes it over every `${faucet.filter}` in `submit.json`. Without a bookmark (first run) it writes `initial` (default empty). `mode: sql` (default) is the `WHERE` injection above. `replication_key` is optional in template mode. |
 | `response_format: jsonl` | The result is decoded line by line into pages of `batch_size`; the file is never held whole. |
 | `records_route` | Stamps each row with its stream (see below). |
@@ -651,8 +651,8 @@ not a row maximum, because child rows carry no `updated_at`.
 source:
   type: rest
   config:
-    base_url: https://my-shop.myshopify.com/admin/api/2026-07
-    headers: { X-Shopify-Access-Token: "${env:SHOPIFY_TOKEN}" }
+    base_url: https://api.example.com/admin/api/2026-07
+    headers: { X-Access-Token: "${env:API_TOKEN}" }
     response_format: jsonl
     replication_method: { type: Incremental }
     async_job:
@@ -696,7 +696,7 @@ source:
 ```
 
 **`records_route`** — `by: id_type` (default) keys each row by the object type
-in its GID (`gid://shopify/<Type>/<n>` in `id`); a row with no GID of its own
+in its GID (`gid://<app>/<Type>/<n>` in `id`); a row with no GID of its own
 is keyed `child_of:<ParentType>` from `__parentId`. `by: field` keys by a
 top-level discriminator (`field: __typename`). Each route names a `stream`,
 stamped into `stream_field` (default `_stream`), and optionally
@@ -707,8 +707,8 @@ one-shot warning per type and a run total; `strict: true` fails the run
 instead. `only: [stream, …]` emits a subset of the routes on purpose.
 `records_route` applies to every read path and requires a JSON or JSONL body.
 
-**One job, several sinks.** Shopify runs one bulk operation per shop at a
-time, so each stream must not submit its own job. Run the source once in
+**One job, several sinks.** An API that runs one bulk job per account at a
+time means each stream must not submit its own job. Run the source once in
 [topology mode](../../docs/book/src/cookbook/topology.md) and fan it out with
 a `tee` and one `filter` per stream (`path: _stream, op: eq, value: orders`),
 dropping `_stream` before each sink — see the cookbook's "Fan one bulk job out
@@ -776,7 +776,7 @@ The `auth` field accepts the project-wide adjacently-tagged `{ type, config }` s
 
 ### Mutual TLS (client certificates)
 
-For APIs that require the client to present a certificate (mutual TLS, e.g. ADP),
+For APIs that require the client to present a certificate (mutual TLS, common on payroll and banking APIs),
 add a `tls:` block. The identity is attached to the source's HTTP client, so it's
 presented on **every** request — data pages *and* any inline token-endpoint call.
 Requires the crate's `mtls` feature (`cargo add faucet-source-rest --features mtls`,
@@ -785,7 +785,7 @@ it is a load-time error.
 
 ```yaml
 config:
-  base_url: https://api.eu.adp.com
+  base_url: https://api.eu.example.com
   tls:
     client_cert: ${file:./cert.pem}   # PEM cert chain (inline / ${file:} / ${secret:})
     client_key:  ${file:./key.pem}    # PEM PKCS#8 private key
@@ -950,13 +950,13 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 |----------------|--------|------------|
 | `None` | — | After the first page. |
 | `Cursor` | `next_token_path`, `param_name` | Next-token JSONPath is null/absent, or the same cursor repeats (loop detection). |
-| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. HubSpot CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
+| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same body returned twice in a row (content-stagnation detection for APIs that clamp out-of-range pages). |
 | `Offset` | `offset_param`, `limit_param`, `limit`, `total_path` | A zero-record page, offset reaches `total` (via `total_path`), or a page returns fewer records than `limit`. |
 
-An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. ADP's `$top`/`$skip` paging) terminates cleanly rather than erroring.
+An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 
 ## Streaming & batching
 

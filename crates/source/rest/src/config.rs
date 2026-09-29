@@ -28,7 +28,7 @@ pub enum ResponseFormat {
     /// Excel (`.xlsx`/`.xls`) — parse a workbook body. Requires the crate's
     /// `excel` feature.
     Excel,
-    /// JSON Lines — one JSON object per line (a Shopify bulk-operation
+    /// JSON Lines — one JSON object per line (a bulk export job's
     /// result, #768). An async-job fetch is decoded line by line into pages
     /// of `batch_size`, so the file is never held in memory whole.
     Jsonl,
@@ -307,8 +307,8 @@ pub struct RestStreamConfig {
     // ── Response format (#497) ─────────────────────────────────────────────────
     /// How to parse the response body. `json` (default) uses JSONPath
     /// extraction (`records_path`); `csv` / `excel` parse a tabular **file**
-    /// body into records — for authenticated file endpoints such as a Microsoft
-    /// Graph / OneDrive / SharePoint `…/content` download or any signed export
+    /// body into records — for authenticated file endpoints such as a cloud-drive
+    /// `…/content` download or any signed export
     /// URL. In file mode a single response is fetched (pagination must be
     /// `none`) and `records_path` does not apply. `excel` requires the crate's
     /// `excel` feature.
@@ -329,8 +329,8 @@ pub struct RestStreamConfig {
     #[serde(default = "default_csv_quote")]
     pub csv_quote: u8,
     /// CSV fields equal to any of these strings decode as JSON `null` instead
-    /// of a string (default: none). Salesforce Bulk API 2.0 results write a
-    /// null as an empty field, so its templates set `[""]`; other APIs list
+    /// of a string (default: none). Some bulk-export APIs write a
+    /// null as an empty field, so their templates set `[""]`; other APIs list
     /// sentinels such as `"NULL"` or `"#N/A"`. Headers are never mapped, and a
     /// quoted empty field (`""`) is mapped like an unquoted one — the CSV
     /// reader does not report quoting per field. `response_format: csv` only.
@@ -383,7 +383,7 @@ pub struct RestStreamConfig {
 
     // ── Async-job pattern (#514) ────────────────────────────────────────────────
     /// Run a submit→poll→fetch job lifecycle instead of a single GET, for
-    /// bulk/export/report-run APIs (Salesforce Bulk, Stripe Reporting, …). The
+    /// bulk/export/report-run APIs (bulk export jobs, report runs, …). The
     /// fetched result flows through `decode:` / `response_format`. When set,
     /// pagination must be `none`. See [`AsyncJobConfig`](crate::async_job::AsyncJobConfig).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1828,7 +1828,7 @@ mod tests {
         assert!(schema["properties"].get("requests").is_some());
     }
 
-    fn shopify_bulk(extra: serde_json::Value) -> RestStreamConfig {
+    fn bulk_export_config(extra: serde_json::Value) -> RestStreamConfig {
         let mut v = serde_json::json!({
             "base_url": "https://shop.example/admin/api/2026-07",
             "response_format": "jsonl",
@@ -1852,9 +1852,9 @@ mod tests {
 
     #[test]
     fn template_push_down_needs_no_replication_key_but_needs_incremental() {
-        assert!(shopify_bulk(serde_json::json!({})).validate().is_ok());
+        assert!(bulk_export_config(serde_json::json!({})).validate().is_ok());
         let full =
-            shopify_bulk(serde_json::json!({ "replication_method": { "type": "FullTable" } }));
+            bulk_export_config(serde_json::json!({ "replication_method": { "type": "FullTable" } }));
         let err = full.validate().unwrap_err().to_string();
         assert!(
             err.contains("requires `replication_method: incremental`"),
@@ -1864,7 +1864,7 @@ mod tests {
 
     #[test]
     fn records_route_is_validated_and_needs_json_objects() {
-        let routed = shopify_bulk(serde_json::json!({
+        let routed = bulk_export_config(serde_json::json!({
             "records_route": { "routes": { "Order": { "stream": "orders" } } }
         }));
         assert!(routed.validate().is_ok());
@@ -1876,7 +1876,7 @@ mod tests {
                 .to_string()
                 .contains("records_route")
         );
-        let bad = shopify_bulk(serde_json::json!({ "records_route": { "routes": {} } }));
+        let bad = bulk_export_config(serde_json::json!({ "records_route": { "routes": {} } }));
         assert!(bad.validate().is_err());
     }
 

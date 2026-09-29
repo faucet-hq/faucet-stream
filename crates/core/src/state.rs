@@ -280,7 +280,7 @@ pub fn validate_state_key(key: &str) -> Result<(), FaucetError> {
             "state key '{key}' must not begin with a dot"
         )));
     }
-    // `/` separates a hub owner namespace from a name (`acme/netsuite::…`);
+    // `/` separates a hub owner namespace from a name (`acme/erp::…`);
     // it must never read as a path: no empty, `.` or `..` segments, no
     // leading or trailing separator.
     if key.contains('/')
@@ -743,7 +743,7 @@ mod tests {
             assert!(validate_state_key(k).is_err(), "expected reject for {k:?}");
         }
         // A `/` that separates a hub owner from a name is fine (#682).
-        assert!(validate_state_key("acme/netsuite::invoices").is_ok());
+        assert!(validate_state_key("acme/erp::invoices").is_ok());
     }
 
     #[test]
@@ -877,13 +877,13 @@ mod tests {
             "pipeline%3Arest%3Aissues"
         );
         assert_eq!(safe_filename("plain_key-1.v2"), "plain_key-1.v2");
-        // Owner-scoped hub ids (`acme/netsuite::invoices`) must not become
+        // Owner-scoped hub ids (`acme/erp::invoices`) must not become
         // nested directories.
         assert_eq!(
-            safe_filename("acme/netsuite::invoices"),
-            "acme%2Fnetsuite%3A%3Ainvoices"
+            safe_filename("acme/erp::invoices"),
+            "acme%2Ferp%3A%3Ainvoices"
         );
-        assert!(validate_state_key("acme/netsuite::invoices").is_ok());
+        assert!(validate_state_key("acme/erp::invoices").is_ok());
         assert!(validate_state_key("a b").is_err());
     }
 

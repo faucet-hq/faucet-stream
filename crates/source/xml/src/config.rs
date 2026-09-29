@@ -176,7 +176,7 @@ pub enum XmlPagination {
     /// each subsequent request replace the request body with `next_body` (with
     /// `${next_token}` substituted). Stops when the token is absent/empty or
     /// repeats (loop guard), honouring `max_pages`. For stateful XML/SOAP APIs
-    /// that page with a `readMore`/`resultId` handle (e.g. Sage Intacct).
+    /// that page with a `readMore`/`resultId` handle (an XML gateway's continuation).
     BodyCursor {
         /// Dot-path to the continuation-token element in the response.
         next_token_path: String,

@@ -597,11 +597,11 @@ mod tests {
     fn computed_param_map_default_and_match() {
         let spec = spec_of(
             "region: { default: com }\n\
-             accounts_domain: { computed: \"${map:region|ca=zohocloud|*=zoho}\" }\n",
+             accounts_domain: { computed: \"${map:region|ca=examplecloud|*=example}\" }\n",
         );
         // Default region → `*` default value.
         let bound = resolve(&spec, &SuppliedParams::new(), BindMode::Strict).unwrap();
-        assert_eq!(bound.values["accounts_domain"], json!("zoho"));
+        assert_eq!(bound.values["accounts_domain"], json!("example"));
         assert_eq!(bound.values["region"], json!("com"));
         // region=ca → matching case.
         let bound = resolve(
@@ -610,14 +610,14 @@ mod tests {
             BindMode::Strict,
         )
         .unwrap();
-        assert_eq!(bound.values["accounts_domain"], json!("zohocloud"));
+        assert_eq!(bound.values["accounts_domain"], json!("examplecloud"));
     }
 
     #[test]
     fn computed_param_rejected_when_supplied() {
         let spec = spec_of(
             "region: { default: com }\n\
-             accounts_domain: { computed: \"${map:region|*=zoho}\" }\n",
+             accounts_domain: { computed: \"${map:region|*=example}\" }\n",
         );
         let err = resolve(
             &spec,
@@ -671,7 +671,7 @@ mod tests {
     fn map_with_no_match_and_no_default_errors() {
         let spec = spec_of(
             "region: { default: xx }\n\
-             d: { computed: \"${map:region|ca=zohocloud}\" }\n",
+             d: { computed: \"${map:region|ca=examplecloud}\" }\n",
         );
         let err = resolve(&spec, &SuppliedParams::new(), BindMode::Strict).unwrap_err();
         assert!(
@@ -746,11 +746,11 @@ mod tests {
         let mut doc = json!({
             "params": { "region": { "default": "com" } },
             "pipeline": { "source": { "config": {
-                "domain": "${map:region|ca=zohocloud|*=zoho}"
+                "domain": "${map:region|ca=examplecloud|*=example}"
             } } }
         });
         bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
-        assert_eq!(doc["pipeline"]["source"]["config"]["domain"], json!("zoho"));
+        assert_eq!(doc["pipeline"]["source"]["config"]["domain"], json!("example"));
     }
 
     #[test]
@@ -759,13 +759,13 @@ mod tests {
         let mut doc = json!({
             "params": { "region": { "default": "ca" } },
             "pipeline": { "source": { "config": {
-                "host": "accounts.${map:region|ca=zohocloud|*=zoho}.${param.region}"
+                "host": "accounts.${map:region|ca=examplecloud|*=example}.${param.region}"
             } } }
         });
         bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
         assert_eq!(
             doc["pipeline"]["source"]["config"]["host"],
-            json!("accounts.zohocloud.ca")
+            json!("accounts.examplecloud.ca")
         );
     }
 
@@ -774,7 +774,7 @@ mod tests {
         let mut doc = json!({
             "params": {
                 "region": { "default": "com" },
-                "accounts_domain": { "computed": "${map:region|ca=zohocloud|*=zoho}" }
+                "accounts_domain": { "computed": "${map:region|ca=examplecloud|*=example}" }
             },
             "pipeline": { "source": { "config": {
                 "base_url": "https://accounts.${param.accounts_domain}.${param.region}"
@@ -783,12 +783,12 @@ mod tests {
         bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
         assert_eq!(
             doc["pipeline"]["source"]["config"]["base_url"],
-            json!("https://accounts.zoho.com")
+            json!("https://accounts.example.com")
         );
         // The declaration block is preserved byte-identical (computed expr intact).
         assert_eq!(
             doc["params"]["accounts_domain"]["computed"],
-            json!("${map:region|ca=zohocloud|*=zoho}")
+            json!("${map:region|ca=examplecloud|*=example}")
         );
     }
 

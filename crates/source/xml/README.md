@@ -304,14 +304,14 @@ pipeline:
 
 ### Body-cursor pagination (`BodyCursor`, #544)
 
-For stateful XML/SOAP APIs that page with a `readMore`/`resultId` handle carried in the request **body** (e.g. Sage Intacct). Each response's continuation token is read via a dot-path (`next_token_path`), and the next request's body is replaced with `next_body` (with `${next_token}` substituted):
+For stateful XML/SOAP APIs that page with a `readMore`/`resultId` handle carried in the request **body** (an XML gateway's `readByQuery` / `readMore` pair). Each response's continuation token is read via a dot-path (`next_token_path`), and the next request's body is replaced with `next_body` (with `${next_token}` substituted):
 
 ```yaml
 source:
   type: xml
   config:
     method: POST
-    base_url: https://api.intacct.com
+    base_url: https://xml-gateway.example.com
     path: /ia/xml/xmlgw.phtml
     body: "<readByQuery><object>GLDETAIL</object><pagesize>1000</pagesize></readByQuery>"
     records_element_path: response.operation.result.data.gldetail
@@ -332,7 +332,7 @@ A declarative chain applied to the raw response body **before** record extractio
 | `unzip: { member: "*.csv" }` | Select a member from a zip archive. |
 | `parse: { format: csv\|xlsx\|xml\|json, header_row, delimiter, has_headers, sheet, records_path }` | Parse the bytes into records. |
 
-Example — Oracle Fusion's SOAP `runReport` returns a base64-encoded XLSX inside `<reportBytes>`:
+Example — a SOAP `runReport` report service returns a base64-encoded XLSX inside `<reportBytes>`:
 
 ```yaml
 source:

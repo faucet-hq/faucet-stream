@@ -41,7 +41,7 @@ The `faucet-cli` binary always links `faucet-auth` to power the top-level `auth:
 | `oauth2_refresh` | [`OAuth2RefreshProvider`] | OAuth2 `refresh_token` grant with refresh-token **rotation capture** (a single active access token + a rotating refresh token, shared safely). |
 | `token_endpoint` | [`TokenEndpointProvider`] | Fetches a token from any HTTP endpoint and extracts it from the JSON response via JSONPath. The escape hatch for non-standard token APIs. |
 | `google_service_account` | `GoogleServiceAccountProvider` | Google service-account key → RS256 JWT-bearer assertion (RFC 7523) → cached bearer token, single-flight refresh. Requires the `google-sa` crate feature. |
-| `oauth1` | `OAuth1Provider` | OAuth1 one-legged **request signing** (HMAC-SHA256) — signs each request's method + URL + query per RFC 5849 (no token to fetch). For NetSuite Token-Based Auth and similar. Requires the `oauth1` crate feature. |
+| `oauth1` | `OAuth1Provider` | OAuth1 one-legged **request signing** (HMAC-SHA256) — signs each request's method + URL + query per RFC 5849 (no token to fetch). For token-based request-signing APIs. Requires the `oauth1` crate feature. |
 
 `build_provider(&Value)` is the entry point: it reads a `{ type, config }` spec and returns a `SharedAuthProvider` (`Arc<dyn AuthProvider>`).
 
@@ -61,7 +61,7 @@ request chain whose responses are captured by JSONPath, credential *placement*
 across header / query / cookie / body, a pluggable HMAC request *signer*, and a
 dynamic per-session base-URL — on top of the single-flight machinery. It's the
 single biggest source-side unlock for session-cookie / multi-step ERP APIs
-(Bullhorn, Acumatica, SAP, Sage/Intacct, SkySlope, …).
+(cookie sessions, XML-gateway session ids, per-session REST URLs, signed logins, …).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -76,14 +76,14 @@ single biggest source-side unlock for session-cookie / multi-step ERP APIs
 A login/pre-flight `request` can carry its **own** `sign:` block — the same
 `SignSpec` shape used in `apply`. It's computed with a fresh `${ts}`/`${nonce}`
 clock per step and attached as a header, so APIs whose *login* call is itself
-HMAC-signed (e.g. SkySlope) are expressible from config. On the **first** step
+HMAC-signed are expressible from config. On the **first** step
 nothing has been captured yet, so its `template` may reference only
 `${param.*}` / `${env:*}` / `${ts}` / `${nonce}` (later steps also see values
 captured by earlier steps).
 
 ```yaml
 auth:
-  skyslope:
+  signed_login:
     type: flow
     config:
       steps:
@@ -121,8 +121,8 @@ steps:
   - request: { method: POST, url: "${param.base_url}/entity/auth/login",
                json: { name: "${param.user}", password: "${secret:pw}" } }
     capture:
-      session_cookie: { from: set_cookie, name: "ASP.NET_SessionId" }   # Acumatica: Set-Cookie + 204 empty body
-      sess_id:        { from: xml, path: "response.operation.result.data.api.sessionid" }  # Sage Intacct: XML session id
+      session_cookie: { from: set_cookie, name: "ASP.NET_SessionId" }   # Set-Cookie + 204 empty body
+      sess_id:        { from: xml, path: "response.operation.result.data.api.sessionid" }  # XML-gateway session id
       loc:            { from: header, name: "Location" }                # any response header
 apply:
   - { into: cookie, name: "ASP.NET_SessionId", value: "${session_cookie}" }
@@ -134,7 +134,7 @@ apply:
 
 ```yaml
 auth:
-  bullhorn:
+  login_chain:
     type: flow
     config:
       steps:
@@ -182,9 +182,9 @@ A fixed credential. Exactly one of the three shapes below must be present.
 | `client_id` | string | — *(required)* | OAuth2 client ID. |
 | `client_secret` | string | — *(required)* | OAuth2 client secret. |
 | `refresh_token` | string | — *(required)* | Initial (seed) refresh token. A rotated token in the response is captured in place for the next refresh. |
-| `scope` | string | *(none)* | Optional `scope` sent on the refresh grant. Some IdPs require it on refresh (e.g. Microsoft Graph needs `https://graph.microsoft.com/.default offline_access`). Omitted entirely when unset, so the refresh inherits the original grant's scope (RFC 6749 §6). |
+| `scope` | string | *(none)* | Optional `scope` sent on the refresh grant. Some IdPs require it on refresh (e.g. `https://api.example.com/.default offline_access`). Omitted entirely when unset, so the refresh inherits the original grant's scope (RFC 6749 §6). |
 | `expiry_ratio` | number | `0.9` | Refresh after `expires_in × expiry_ratio` seconds. Must be a finite number in `(0, 1]`. |
-| `persist` | object | *(none)* | Durably persist the rotated `refresh_token` so a **later** run authenticates after the token rotates (providers like Microsoft / Rippling rotate on every refresh; without this the second scheduled run 401s). `persist.path` is a file-backed state-store directory; the rotated token is written after each refresh and re-read on startup in preference to the config seed. Optional `persist.key` overrides the auto-derived (stable, identity-scoped) storage key. |
+| `persist` | object | *(none)* | Durably persist the rotated `refresh_token` so a **later** run authenticates after the token rotates (some providers rotate on every refresh; without this the second scheduled run 401s). `persist.path` is a file-backed state-store directory; the rotated token is written after each refresh and re-read on startup in preference to the config seed. Optional `persist.key` overrides the auto-derived (stable, identity-scoped) storage key. |
 
 `persist` example:
 
@@ -194,10 +194,10 @@ auth:
     type: oauth2_refresh
     config:
       token_url: "https://login.microsoftonline.com/${param.tenant}/oauth2/v2.0/token"
-      client_id: "${secret:graph_client_id}"
-      client_secret: "${secret:graph_client_secret}"
-      refresh_token: "${secret:graph_seed_refresh_token}"   # seed; used only until the first rotation
-      scope: "https://graph.microsoft.com/.default offline_access"  # Graph requires scope on refresh
+      client_id: "${secret:idp_client_id}"
+      client_secret: "${secret:idp_client_secret}"
+      refresh_token: "${secret:idp_seed_refresh_token}"   # seed; used only until the first rotation
+      scope: "https://api.example.com/.default offline_access"  # this IdP requires scope on refresh
       persist:
         path: "./state/auth"        # rotated refresh_token survives across runs
 ```
@@ -215,25 +215,25 @@ auth:
 | `expiry_ratio` | number | `0.9` | Refresh after `expires_in × expiry_ratio` seconds. Must be a finite number in `(0, 1]`. |
 | `apply_as` | object | *(Bearer)* | Where the fetched token is placed on each request. Default is `Authorization: Bearer <token>`. Set `apply_as: { header, template }` to place it in an arbitrary header (e.g. a session cookie): `template` is the header value with `{token}` substituted (defaults to the bare token). |
 
-`apply_as` example — SAP Business One session cookie:
+`apply_as` example — a session cookie:
 
 ```yaml
 auth:
-  sap:
+  session:
     type: token_endpoint
     config:
-      url: "https://host:50000/b1s/v1/Login"
-      body: { CompanyDB: "${param.company_db}", UserName: "${param.user}", Password: "${secret:sap_pw}" }
+      url: "https://host:50000/api/v1/Login"
+      body: { CompanyDB: "${param.company_db}", UserName: "${param.user}", Password: "${secret:session_pw}" }
       token_path: "$.SessionId"
       apply_as:
         header: "Cookie"
-        template: "B1SESSION={token}; CompanyDB=${param.company_db}"
+        template: "SESSION={token}; CompanyDB=${param.company_db}"
 ```
 
 ### `google_service_account` (RFC 7523 JWT-bearer)
 
 Authenticates as a Google service account — the machine credential for the
-`googleapis.com` family (GA4 Data API, Google Ads, Search Console, Sheets,
+`googleapis.com` family (analytics, advertising, Sheets,
 Drive, …) when no human-held refresh token is available. Each refresh signs an
 RS256 assertion (`kid` = the key's `private_key_id`; claims `iss`, `scope`,
 `aud` = token URI, `iat` back-dated 30 s for clock skew, `exp` = `iat` + 1 h,
@@ -284,19 +284,19 @@ parameters). Requires the `oauth1` crate feature (`cargo add faucet-auth
 | `consumer_secret` | string | — *(required)* | OAuth1 consumer secret. |
 | `token` | string | — *(required)* | OAuth1 access token. |
 | `token_secret` | string | — *(required)* | OAuth1 access-token secret. |
-| `realm` | string | *(none)* | Optional `realm` (e.g. the NetSuite account id). |
+| `realm` | string | *(none)* | Optional `realm` (e.g. the account id). |
 | `signature_method` | string | `HMAC-SHA256` | Only `HMAC-SHA256` is supported. |
 
 ```yaml
 auth:
-  netsuite:
+  signed:
     type: oauth1
     config:
       consumer_key: "${secret:ns_consumer_key}"
       consumer_secret: "${secret:ns_consumer_secret}"
       token: "${secret:ns_token}"
       token_secret: "${secret:ns_token_secret}"
-      realm: "${param.account}"   # NetSuite account id
+      realm: "${param.account}"   # account id
 ```
 
 ## CLI usage — the top-level `auth:` catalog

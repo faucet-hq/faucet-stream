@@ -55,7 +55,7 @@ edge.
 ### Fan one bulk job out to several sinks
 
 A REST `async_job` with `records_route` (for example a Shopify bulk
-operation, see the [REST source README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/rest#shopify-style-bulk-operations-768))
+operation, see the [REST source README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/rest#graphql-bulk-export-jobs-768))
 returns parents and children in one file and stamps each row with its stream
 in `_stream`. Shopify runs one bulk operation per shop at a time, so the
 streams must share one job: fetch once, `tee`, and give each branch a

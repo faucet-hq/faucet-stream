@@ -969,8 +969,8 @@ mod tests {
         assert!(TemplateId::parse(&"a".repeat(MAX_ID_LEN)).is_ok());
         // Owner-scoped hub ids (#682): exactly one `/`, both halves slugs.
         assert_eq!(
-            TemplateId::parse("acme/netsuite").unwrap().as_str(),
-            "acme/netsuite"
+            TemplateId::parse("acme/erp").unwrap().as_str(),
+            "acme/erp"
         );
         assert!(
             TemplateId::parse(&format!(
@@ -981,11 +981,11 @@ mod tests {
             .is_ok()
         );
         for bad in [
-            "/netsuite",
+            "/erp",
             "acme/",
-            "acme//netsuite",
+            "acme//erp",
             "a/b/c",
-            "Acme/netsuite",
+            "Acme/erp",
             "acme/Net",
         ] {
             assert!(TemplateId::parse(bad).is_err(), "{bad}");

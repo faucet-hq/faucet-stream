@@ -158,8 +158,8 @@ pub struct OAuth2RefreshProvider {
     client_id: String,
     client_secret: String,
     expiry_ratio: f64,
-    /// Optional `scope` sent on the refresh grant. Some IdPs (Microsoft, Rippling)
-    /// require it on refresh — e.g. `https://graph.microsoft.com/.default
+    /// Optional `scope` sent on the refresh grant. Some IdPs
+    /// require it on refresh — e.g. `https://api.example.com/.default
     /// offline_access`. `None` omits the parameter entirely (RFC 6749 §6 allows
     /// omitting `scope` on refresh to keep the original grant's scope).
     scope: Option<String>,
@@ -729,7 +729,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(body_string_contains("grant_type=refresh_token"))
             .and(body_string_contains(
-                "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default+offline_access",
+                "scope=https%3A%2F%2Fapi.example.com%2F.default+offline_access",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "A1",
@@ -742,7 +742,7 @@ mod tests {
             "client_id": "id",
             "client_secret": "secret",
             "refresh_token": "rt0",
-            "scope": "https://graph.microsoft.com/.default offline_access",
+            "scope": "https://api.example.com/.default offline_access",
         }))
         .unwrap();
         assert_eq!(

@@ -140,11 +140,11 @@ mod tests {
         let ds = vec![
             DatasetDescriptor::new(
                 "Account",
-                "sobject",
+                "object",
                 json!({"async_job": {"submit": {"json": {"query": "SELECT Id FROM Account"}}}}),
             )
             .with_sink_patch(json!({ "table_id": "account" })),
-            DatasetDescriptor::new("Churn__c", "sobject", json!({"async_job": {}}))
+            DatasetDescriptor::new("Churn__c", "object", json!({"async_job": {}}))
                 .with_sink_patch(json!({ "table_id": "churn_c" })),
         ];
         let rows = descriptors_to_rows(&ds, "default", Some("bigquery")).unwrap();

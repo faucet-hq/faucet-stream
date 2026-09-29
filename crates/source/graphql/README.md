@@ -13,7 +13,7 @@ Reach for it when you want to pull a paginated GraphQL collection (users, reposi
 
 - **Native streaming** — overrides `Source::stream_pages`: every upstream GraphQL response is emitted as one `StreamPage` and written to the sink immediately, so a million-row collection never buffers client-side.
 - **Relay cursor pagination** — follows `pageInfo { hasNextPage, endCursor }`, injecting the `endCursor` back into the query's `after:` variable on each request. Stops cleanly when `hasNextPage` is false, the cursor is absent, the same cursor repeats (loop guard), or `max_pages` is reached. If `has_next_page_path` can't be resolved to a boolean on a page, the signal is treated as "unknown" and pagination **defers to cursor presence** (and warns once) rather than silently stopping — so a missing has-next field never drops the remaining pages.
-- **Offset pagination** — for query languages that page with `LIMIT … OFFSET …` (ShopifyQL and similar). Injects an integer offset into a GraphQL variable (starting at `0`, advancing by `page_size` after each page) and terminates on a **short page** — fewer than `page_size` records — rather than a `pageInfo` boolean. Set `stop_when_short: false` to keep paginating until a fully empty page instead. See [Offset pagination](#offset-pagination).
+- **Offset pagination** — for query languages that page with `LIMIT … OFFSET …` (an SQL-like report query language). Injects an integer offset into a GraphQL variable (starting at `0`, advancing by `page_size` after each page) and terminates on a **short page** — fewer than `page_size` records — rather than a `pageInfo` boolean. Set `stop_when_short: false` to keep paginating until a fully empty page instead. See [Offset pagination](#offset-pagination).
 - **Incremental replication** — `replication_method: incremental` + `replication_key` filters every page against the stored bookmark and persists a new one on the final page only; `replication_bind` renders the bookmark into a GraphQL variable (a name or a JSON Pointer into `variables`) so the server returns only newer rows. See [Incremental replication](#incremental-replication).
 - **Variable injection** — static `variables` from config, plus per-request cursor / page-size variables, plus parent-record context values (`${parent.path}` matrix fan-out) merged into the GraphQL variables map at runtime.
 - **JSONPath record extraction** — `records_path` plucks the record array out of any response shape (`$.data.users.edges[*].node`). When unset, the whole `data` object is returned as a single record.
@@ -134,7 +134,7 @@ faucet run pipeline.yaml
 source:
   type: graphql
   config:
-    endpoint: https://shop.example.com/admin/api/2025-07/graphql.json
+    endpoint: https://api.example.com/admin/api/2025-07/graphql.json
     query: |
       query($after: String, $first: Int, $query: String) {
         orders(first: $first, after: $after, query: $query, sortKey: UPDATED_AT) {
@@ -160,7 +160,7 @@ source:
   page when `max_pages` truncates), so a crash between cursor pages re-reads
   the run instead of skipping rows. A GraphQL `errors[]` response fails the
   run before any bookmark is written.
-- When the bookmark sits inside a query-language string (Shopify's `query:
+- When the bookmark sits inside a query-language string (a string filter such as `query:
   "updated_at:>…"`), escaping it is the template author's job.
 - Delivery stays at-least-once: pair it with an upsert sink (`write_mode:
   upsert` + `key`) to make re-reads harmless.
@@ -211,7 +211,7 @@ When an `auth: { ref }` is resolved (or a shared provider is attached via `with_
 
 ## Throttling in a 200 body
 
-Cost-based APIs report throttling inside a successful response. Shopify's Admin
+Cost-based APIs report throttling inside a successful response. A leaky-bucket
 GraphQL API answers a throttled call with `200`, `errors[].extensions.code:
 THROTTLED` and a cost report. A `retry_on_response` rule with `match_success:
 true` turns that into a retry that waits exactly as long as the bucket needs:
@@ -341,7 +341,7 @@ source:
     # no `pagination:` block → one request, one page
 ```
 
-### Offset pagination (ShopifyQL)
+### Offset pagination (query-language strings)
 
 For APIs whose query language pages with `LIMIT … OFFSET …`, bake the limit into
 the query and parameterize only the offset. Pagination stops on the first page
@@ -351,10 +351,10 @@ shorter than `page_size`.
 source:
   type: graphql
   config:
-    endpoint: https://shop.example.com/admin/api/2024-10/graphql.json
+    endpoint: https://api.example.com/admin/api/2024-10/graphql.json
     query: |
       query($q_offset: Int!) {
-        shopifyqlQuery(query: "FROM orders SHOW total_sales LIMIT 250 OFFSET $q_offset") {
+        reportQuery(query: "FROM orders SHOW total_sales LIMIT 250 OFFSET $q_offset") {
           ... on TableResponse { tableData { rowData } }
         }
       }
@@ -362,8 +362,8 @@ source:
       type: custom
       config:
         headers:
-          X-Shopify-Access-Token: ${env:SHOPIFY_TOKEN}
-    records_path: $.data.shopifyqlQuery.tableData.rowData[*]
+          X-Access-Token: ${env:API_TOKEN}
+    records_path: $.data.reportQuery.tableData.rowData[*]
     pagination:
       type: Offset
       offset_variable: q_offset

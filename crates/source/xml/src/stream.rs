@@ -29,7 +29,7 @@ fn page_fingerprint(records: &[Value]) -> u64 {
 }
 
 /// Substitute `${name}` tokens with flow-captured login values (#567) — e.g. an
-/// Intacct `sessionid` captured from the login response and needed inside every
+/// XML-gateway `sessionid` captured from the login response and needed inside every
 /// data request's raw XML body. Only exact `${name}` occurrences for a captured
 /// `name` are replaced; any other `${...}` token is left untouched. Applied per
 /// request, after the parent-context substitution.
@@ -428,7 +428,7 @@ impl XmlStream {
         // #567 rich per-request auth: a flow provider may override the base-URL,
         // place credentials across header/query/cookie, and expose captured
         // login values for `${name}` substitution into the raw body/headers
-        // (an Intacct `sessionid`). When it contributes anything it supersedes
+        // (an XML-gateway `sessionid`). When it contributes anything it supersedes
         // the plain credential() path below.
         let mut base_url = self.config.base_url.clone();
         let mut ra_headers: Vec<(String, String)> = Vec::new();
@@ -576,7 +576,7 @@ impl XmlStream {
         // legacy raw-`body` path is used verbatim (byte-for-byte unchanged).
         if let Some(ob) = body_override {
             // #544 body-cursor: a rendered `next_body` replaces the request body
-            // for pages after the first (e.g. Intacct `readMore`). Takes
+            // for pages after the first (e.g. a `readMore` request). Takes
             // precedence over the configured soap/raw body.
             let resolved = if context.is_empty() {
                 ob.to_string()

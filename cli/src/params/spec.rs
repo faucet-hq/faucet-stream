@@ -88,7 +88,7 @@ pub struct ParamSpec {
     /// params bind (#573). A computed param is excluded from the trigger surface
     /// (supplying a value for it is an error) and is mutually exclusive with
     /// `required`, `default`, and `secret`. Example:
-    /// `accounts_domain: { computed: "${map:region|ca=zohocloud|*=zoho}" }`.
+    /// `accounts_domain: { computed: "${map:region|ca=examplecloud|*=example}" }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computed: Option<String>,
 

@@ -280,7 +280,7 @@ impl GraphqlStream {
         }
 
         // The query string; for offset `substitute_in_query` mode it is
-        // rewritten per request with the current offset (ShopifyQL etc.).
+        // rewritten per request with the current offset.
         let mut query = self.config.query.clone();
 
         // Inject the per-request pagination variable(s).
@@ -302,7 +302,7 @@ impl GraphqlStream {
                 }
             }
             // Offset mode: either substitute `${offset_variable}` into the query
-            // string (ShopifyQL's string-literal `LIMIT … OFFSET …`, #569) or
+            // string (a string-literal `LIMIT … OFFSET …`, #569) or
             // inject the current offset as a JSON GraphQL variable (#550). The
             // page size is not injected — the user bakes the limit into the query.
             Some(GraphqlPaginationSpec::Offset(off)) => {

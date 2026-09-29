@@ -7,7 +7,7 @@
 
 A **webhook receiver** source that starts a temporary HTTP server, collects incoming `POST` payloads as JSON records, and then hands them to the pipeline. Part of the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem.
 
-Reach for it to capture push-style events — GitHub/GitLab hooks, Stripe events, SaaS callbacks, IoT pushes — without standing up a separate ingestion service. The server is short-lived: it runs for a bounded receive window (a timeout and/or a payload cap), drains everything it collected, and shuts down. Built on [`axum`](https://crates.io/crates/axum) + [`tokio`](https://crates.io/crates/tokio), with a constant-time shared-secret check and a hard request-body cap so a single huge POST can't exhaust memory.
+Reach for it to capture push-style events — GitHub/GitLab hooks, payment events, SaaS callbacks, IoT pushes — without standing up a separate ingestion service. The server is short-lived: it runs for a bounded receive window (a timeout and/or a payload cap), drains everything it collected, and shuts down. Built on [`axum`](https://crates.io/crates/axum) + [`tokio`](https://crates.io/crates/tokio), with a constant-time shared-secret check and a hard request-body cap so a single huge POST can't exhaust memory.
 
 ## Feature highlights
 

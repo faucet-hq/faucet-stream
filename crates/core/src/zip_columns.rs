@@ -2,7 +2,7 @@
 //! `{ columns: [{name}, …], rows: [[v0, v1, …], …] }` — into one object per row,
 //! keyed by column name.
 //!
-//! Analytics / report APIs (e.g. Shopify's ShopifyQL `tableData`) return results
+//! Analytics / report APIs (e.g. a query-language `tableData` payload) return results
 //! positionally: a list of column descriptors plus a list of value-arrays. This
 //! transform zips each row against the column names so downstream stages and
 //! sinks see ordinary `{col: value}` records. It is expressible today via the
@@ -38,8 +38,8 @@ pub struct ZipColumnsSpec {
     /// list. With `groups`, the row objects (`rows[*]`).
     pub rows_path: String,
     /// Column groups (#746): each row object holds several positional cell
-    /// arrays, each named by its own header list (GA4 `runReport`'s
-    /// `dimensionValues` / `metricValues`). Every group is zipped on its own and
+    /// arrays, each named by its own header list (a `runReport`-style
+    /// `dimensionValues` / `metricValues` pair). Every group is zipped on its own and
     /// the results are merged into one record; two groups naming the same
     /// column is an error.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -442,7 +442,7 @@ mod tests {
         }
     }
 
-    fn ga4() -> ZipColumnsSpec {
+    fn grouped_report() -> ZipColumnsSpec {
         serde_json::from_value(json!({
             "rows_path": "$.rows[*]",
             "groups": [
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn groups_zip_ga4_rows() {
-        let out = ga4().compile().unwrap().apply(&report()).unwrap();
+        let out = grouped_report().compile().unwrap().apply(&report()).unwrap();
         assert_eq!(
             out,
             vec![
@@ -492,8 +492,8 @@ mod tests {
 
     #[test]
     fn groups_edge_cases() {
-        let c = ga4().compile().unwrap();
-        // An empty report (GA4 omits `rows`) yields nothing.
+        let c = grouped_report().compile().unwrap();
+        // An empty report (the API omits `rows`) yields nothing.
         assert!(
             c.apply(&json!({"dimensionHeaders": [], "metricHeaders": []}))
                 .unwrap()
@@ -572,7 +572,7 @@ mod tests {
                 .contains("group 'a'")
         );
         assert!(bad(json!({"rows_path": " ", "groups": [g]})).contains("rows_path"));
-        let s = ga4();
+        let s = grouped_report();
         assert_eq!(
             serde_json::from_value::<ZipColumnsSpec>(serde_json::to_value(&s).unwrap()).unwrap(),
             s

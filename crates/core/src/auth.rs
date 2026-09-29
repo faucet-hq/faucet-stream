@@ -151,7 +151,7 @@ impl std::fmt::Debug for CredentialPlacement {
 /// The per-request auth a provider contributes beyond a single [`Credential`]:
 /// zero or more [`CredentialPlacement`]s plus an optional dynamic base-URL that
 /// overrides the connector's configured one (captured from a login response —
-/// Bullhorn `restUrl`, Zoho region host, #511).
+/// a per-session REST URL, a region-specific host, #511).
 ///
 /// A connector that receives a non-[`is_empty`](RequestAuth::is_empty)
 /// `RequestAuth` uses it **instead of** the plain [`credential`](AuthProvider::credential)
