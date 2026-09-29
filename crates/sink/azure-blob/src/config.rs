@@ -541,10 +541,6 @@ mod tests {
 
     // ── file formats (#604) ───────────────────────────────────────────────
 
-    /// Only JSON Lines can be appended a record at a time. That predicate
-    /// routes a write between the streaming byte accumulator and the buffered
-    /// record one, so a wrong answer silently changes how objects are built.
-
     /// Every variant maps onto exactly one shared format, so what this sink
     /// writes is what the file sources read back.
     #[test]

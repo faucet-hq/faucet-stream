@@ -277,12 +277,14 @@ pub async fn case<R: Remote>(
 /// Every combination (`full`), or a covering subset — every format with
 /// every run mode, rotating through the codecs, encryption and layouts so
 /// each value of each option still appears for several formats.
+#[allow(dead_code)]
 pub async fn run_matrix<R: Remote>(remote: R, full: bool) {
     run_matrix_with(remote, full, 16).await
 }
 
 /// [`run_matrix`] with at most `concurrency` cases in flight (a server that
 /// limits concurrent sessions needs fewer).
+#[allow(dead_code)]
 pub async fn run_matrix_with<R: Remote>(remote: R, full: bool, concurrency: usize) {
     let remote = Arc::new(remote);
     let mut cases = Vec::new();
@@ -297,9 +299,9 @@ pub async fn run_matrix_with<R: Remote>(remote: R, full: bool, concurrency: usiz
                     }
                 }
             } else {
-                for k in 0..LAYOUTS.len() {
+                for (k, &layout) in LAYOUTS.iter().enumerate() {
                     let n = fi + ri + k;
-                    cases.push((format, CODECS[n % 3], n % 2 == 0, LAYOUTS[k], run));
+                    cases.push((format, CODECS[n % 3], n % 2 == 0, layout, run));
                 }
             }
         }
