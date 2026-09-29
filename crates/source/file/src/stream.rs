@@ -24,6 +24,8 @@ type Reader = Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>;
 /// every other shape the file's bytes.
 enum Opened {
     Lines(Reader),
+    #[cfg(feature = "file-format-csv")]
+    Csv(Reader),
     Bytes(Vec<u8>),
     Local(std::fs::File),
     Skip,
@@ -37,12 +39,15 @@ pub(crate) struct Decoders {
     containers: HashMap<&'static str, faucet_core::ContainerDecoder>,
     #[cfg(feature = "file-format-parquet")]
     parquet: Option<(String, arrow::datatypes::SchemaRef)>,
+    #[cfg_attr(not(feature = "file-format-parquet"), allow(dead_code))]
+    parquet_columns: Option<Vec<String>>,
 }
 
 impl Decoders {
-    fn new(opts: FormatOptions) -> Arc<Mutex<Self>> {
+    fn new(opts: FormatOptions, parquet_columns: Option<Vec<String>>) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             opts,
+            parquet_columns,
             containers: HashMap::new(),
             #[cfg(feature = "file-format-parquet")]
             parquet: None,
@@ -69,6 +74,8 @@ pub struct FileSource {
     start: Mutex<Option<Bookmark>>,
     shard: Mutex<Option<HashShard>>,
     roundtrips: RecorderSlot,
+    #[cfg(feature = "encryption")]
+    encryption: Option<faucet_core::CompiledEncryption>,
 }
 
 impl FileSource {
@@ -82,11 +89,17 @@ impl FileSource {
             None
         };
         Ok(Self {
-            config,
             http,
             start: Mutex::new(None),
             shard: Mutex::new(None),
             roundtrips: RecorderSlot::new(),
+            #[cfg(feature = "encryption")]
+            encryption: config
+                .encryption
+                .as_ref()
+                .map(faucet_core::CompiledEncryption::compile)
+                .transpose()?,
+            config,
         })
     }
 
@@ -116,29 +129,37 @@ impl FileSource {
 
     /// The files this run reads, in order.
     async fn candidates(&self, apply_bookmark: bool) -> Result<Vec<Candidate>, FaucetError> {
+        self.candidates_at(&self.config.path, apply_bookmark).await
+    }
+
+    async fn candidates_at(
+        &self,
+        root: &str,
+        apply_bookmark: bool,
+    ) -> Result<Vec<Candidate>, FaucetError> {
         let mut files = match &self.http {
             Some(http) => {
                 let needs_mtime = matches!(self.by(), Some(IncrementalBy::Mtime))
                     || self.config.stable_for_secs.is_some();
                 let mtime_ns = if needs_mtime {
-                    let meta = http.head(&self.config.path, &self.roundtrips).await?;
+                    let meta = http.head(root, &self.roundtrips).await?;
                     Some(meta.last_modified_ns.ok_or_else(|| {
                         FaucetError::Source(format!(
                             "file source: {} sends no Last-Modified header, which `incremental: \
                              {{by: mtime}}` / `stable_for_secs` need",
-                            self.config.path
+                            root
                         ))
                     })?)
                 } else {
                     None
                 };
                 vec![Candidate {
-                    path: self.config.path.clone(),
+                    path: root.to_string(),
                     mtime_ns,
                 }]
             }
             None => {
-                let path = self.config.path.clone();
+                let path = root.to_string();
                 let recursive = self.config.recursive;
                 tokio::task::spawn_blocking(move || plan::list_local(&path, recursive))
                     .await
@@ -169,7 +190,15 @@ impl FileSource {
     }
 
     async fn open_reader(&self, path: &str) -> Result<Reader, FaucetError> {
-        let raw: Reader = match &self.http {
+        let raw = self.open_raw(path).await?;
+        Ok(faucet_core::compression::wrap_async_reader(
+            raw,
+            self.codec_of(path),
+        ))
+    }
+
+    async fn open_raw(&self, path: &str) -> Result<Reader, FaucetError> {
+        Ok(match &self.http {
             Some(http) => {
                 let resp = http.get(path, &self.roundtrips).await?;
                 let body = resp
@@ -182,19 +211,29 @@ impl FileSource {
                     .await
                     .map_err(|e| read_err(path, e))?,
             )),
-        };
-        Ok(faucet_core::compression::wrap_async_reader(
-            raw,
-            self.codec_of(path),
-        ))
+        })
     }
 
     async fn open(&self, path: &str) -> Result<Opened, FaucetError> {
         let Some(format) = self.format_of(path)? else {
             return Ok(Opened::Skip);
         };
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.encryption {
+            let plain = self.read_decrypted(path, format, enc).await?;
+            return Ok(match format {
+                FileFormat::JsonLines => Opened::Lines(Box::pin(std::io::Cursor::new(plain))),
+                #[cfg(feature = "file-format-csv")]
+                FileFormat::Csv => Opened::Csv(Box::pin(std::io::Cursor::new(plain))),
+                _ => Opened::Bytes(plain),
+            });
+        }
         if format == FileFormat::JsonLines {
             return Ok(Opened::Lines(self.open_reader(path).await?));
+        }
+        #[cfg(feature = "file-format-csv")]
+        if format == FileFormat::Csv {
+            return Ok(Opened::Csv(self.open_reader(path).await?));
         }
         let binary = format.is_container() || format == FileFormat::Parquet;
         if binary && self.http.is_none() && self.codec_of(path) == Compression::None {
@@ -208,6 +247,82 @@ impl FileSource {
             .await
             .map_err(|e| read_err(path, e))?;
         Ok(Opened::Bytes(bytes))
+    }
+
+    #[cfg(feature = "encryption")]
+    async fn read_decrypted(
+        &self,
+        path: &str,
+        format: FileFormat,
+        enc: &faucet_core::CompiledEncryption,
+    ) -> Result<Vec<u8>, FaucetError> {
+        let mut raw = Vec::new();
+        self.open_raw(path)
+            .await?
+            .read_to_end(&mut raw)
+            .await
+            .map_err(|e| read_err(path, e))?;
+        let codec = self.codec_of(path);
+        let fail = |e: FaucetError| FaucetError::Source(format!("file source: '{path}': {e}"));
+        if faucet_core::encryption::is_encrypted(&raw) {
+            let sealed = enc.decrypt(&raw).map_err(fail)?;
+            let mut plain = Vec::new();
+            std::io::Read::read_to_end(
+                &mut faucet_core::compression::wrap_sync_reader(
+                    std::io::Cursor::new(sealed),
+                    codec,
+                ),
+                &mut plain,
+            )
+            .map_err(|e| read_err(path, e))?;
+            return Ok(plain);
+        }
+        if matches!(format, FileFormat::JsonLines | FileFormat::RawText)
+            && codec == Compression::None
+        {
+            return crate::decrypt::lines(&raw, enc).map_err(fail);
+        }
+        Err(FaucetError::Source(format!(
+            "file source: '{path}' is not encrypted, but `encryption` is set — refusing to read \
+             plaintext as if it were authenticated"
+        )))
+    }
+
+    fn root(&self, context: &HashMap<String, Value>) -> String {
+        if context.is_empty() {
+            self.config.path.clone()
+        } else {
+            faucet_core::util::substitute_context(&self.config.path, context)
+        }
+    }
+
+    async fn check_parquet_schemas(&self, files: &[Candidate]) -> Result<(), FaucetError> {
+        #[cfg(feature = "file-format-parquet")]
+        {
+            if self.http.is_some() || self.config.encryption_set() {
+                return Ok(());
+            }
+            let mut local = Vec::new();
+            for f in files {
+                if self.format_of(&f.path)? == Some(FileFormat::Parquet)
+                    && self.codec_of(&f.path) == Compression::None
+                {
+                    local.push(f.path.clone());
+                }
+            }
+            if local.len() < 2 {
+                return Ok(());
+            }
+            let columns = self.config.parquet.columns.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::parquet::check_schemas(&local, columns.as_deref())
+            })
+            .await
+            .map_err(|e| FaucetError::Source(format!("file source: schema check failed: {e}")))??;
+        }
+        #[cfg(not(feature = "file-format-parquet"))]
+        let _ = files;
+        Ok(())
     }
 
     fn prefetch<'a>(
@@ -277,6 +392,8 @@ fn input_of(opened: Opened) -> FileInput {
         Opened::Local(f) => FileInput::File(f),
         Opened::Bytes(b) => FileInput::Bytes(b),
         Opened::Lines(_) | Opened::Skip => unreachable!("only binary formats are decoded here"),
+        #[cfg(feature = "file-format-csv")]
+        Opened::Csv(_) => unreachable!("only binary formats are decoded here"),
     }
 }
 
@@ -339,6 +456,10 @@ impl Decoders {
     ) -> &mut Option<(String, arrow::datatypes::SchemaRef)> {
         &mut self.parquet
     }
+
+    pub(crate) fn parquet_columns(&self) -> Option<&[String]> {
+        self.parquet_columns.as_deref()
+    }
 }
 
 #[async_trait]
@@ -361,16 +482,18 @@ impl faucet_core::Source for FileSource {
     /// resumes at the next unread file.
     fn stream_pages<'a>(
         &'a self,
-        _context: &'a HashMap<String, Value>,
+        context: &'a HashMap<String, Value>,
         _batch_size: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         let batch_size = self.config.batch_size;
         Box::pin(async_stream::try_stream! {
-            let files = self.candidates(true).await?;
-            tracing::info!(path = %self.config.path, files = files.len(), "file source listed files");
+            let root = self.root(context);
+            let files = self.candidates_at(&root, true).await?;
+            tracing::info!(path = %root, files = files.len(), "file source listed files");
+            self.check_parquet_schemas(&files).await?;
             let by = self.by();
             let mut bookmark = self.start.lock().expect("bookmark mutex").clone();
-            let decoders = Decoders::new(self.config.format_options());
+            let decoders = Decoders::new(self.config.format_options(), self.config.parquet.columns.clone());
             let opts = self.config.format_options();
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let mut buffer: Vec<Value> = Vec::new();
@@ -397,6 +520,18 @@ impl faucet_core::Source for FileSource {
                                 buffer.push(serde_json::from_str(line).map_err(|e| {
                                     FaucetError::Source(format!("file source: '{path}' line {n}: {e}"))
                                 })?);
+                                if buffer.len() >= chunk {
+                                    yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                                }
+                            }
+                        }
+                        #[cfg(feature = "file-format-csv")]
+                        Opened::Csv(reader) => {
+                            let mut rows = faucet_core::file_format::csv::CsvRowReader::new(reader, &opts.csv, false)?;
+                            while let Some(r) = rows.next_record().await.map_err(|e| {
+                                FaucetError::Source(format!("file source: '{path}': {e}"))
+                            })? {
+                                buffer.push(r);
                                 if buffer.len() >= chunk {
                                     yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
                                 }
@@ -453,7 +588,7 @@ impl faucet_core::Source for FileSource {
     #[cfg(feature = "arrow")]
     fn stream_batches<'a>(
         &'a self,
-        _context: &'a HashMap<String, Value>,
+        context: &'a HashMap<String, Value>,
         _batch_size: usize,
     ) -> Pin<
         Box<
@@ -467,10 +602,12 @@ impl faucet_core::Source for FileSource {
                 ))?;
             }
             let format = self.config.format.explicit().expect("checked by supports_columnar");
-            let files = self.candidates(true).await?;
+            let root = self.root(context);
+            let files = self.candidates_at(&root, true).await?;
+            self.check_parquet_schemas(&files).await?;
             let by = self.by();
             let mut bookmark = self.start.lock().expect("bookmark mutex").clone();
-            let decoders = Decoders::new(self.config.format_options());
+            let decoders = Decoders::new(self.config.format_options(), self.config.parquet.columns.clone());
             let mut opened_files = self.prefetch(&files);
             while let Some((file, opened)) = opened_files.next().await {
                 let (mut rx, handle) = batches_task(decoders.clone(), file.path.clone(), format, input_of(opened?), self.config.batch_size);

@@ -8,13 +8,17 @@
 //! since the previous run, by modification time or by name.
 
 pub mod config;
+#[cfg(feature = "encryption")]
+mod decrypt;
 pub mod http;
 #[cfg(feature = "file-format-parquet")]
 mod parquet;
 pub mod plan;
 mod stream;
 
-pub use config::{FileSourceConfig, FileSourceFormat, IncrementalBy, IncrementalSpec};
+pub use config::{
+    FileSourceConfig, FileSourceFormat, IncrementalBy, IncrementalSpec, ParquetReadOptions,
+};
 pub use stream::FileSource;
 
 #[cfg(not(feature = "file-format-parquet"))]
