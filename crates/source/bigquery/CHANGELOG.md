@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-bigquery-v1.4.3...faucet-source-bigquery-v1.5.0) - 2026-09-29
+
+### Features
+
+- One shared file writer for local, S3, GCS, Azure and SFTP; deprecate the csv, jsonl and parquet connectors ([#782](https://github.com/faucet-hq/faucet-stream/pull/782))
+- Change requests (plan → approve → run), run budgets, and cost & usage accounting ([#730](https://github.com/faucet-hq/faucet-stream/pull/730))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.4.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-bigquery-v1.4.2...faucet-source-bigquery-v1.4.3) - 2026-08-23
 
 ### Miscellaneous

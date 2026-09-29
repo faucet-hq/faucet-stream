@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-cdc-v1.2.7...faucet-source-mysql-cdc-v1.3.0) - 2026-09-29
+
+### Features
+
+- One shared file writer for local, S3, GCS, Azure and SFTP; deprecate the csv, jsonl and parquet connectors ([#782](https://github.com/faucet-hq/faucet-stream/pull/782))
+- Multi-table faucet mirror over a table set, and prebuilt Windows binaries ([#758](https://github.com/faucet-hq/faucet-stream/pull/758))
+- Pipeline status, source lag, state management, versioned state and safe partial batches ([#742](https://github.com/faucet-hq/faucet-stream/pull/742))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.2.7](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-cdc-v1.2.6...faucet-source-mysql-cdc-v1.2.7) - 2026-08-23
 
 ### Miscellaneous
