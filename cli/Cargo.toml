@@ -68,7 +68,7 @@ policy = ["faucet-core/policy", "masking", "lineage", "dep:regex"]
 # (AES-256-GCM bookmark files) and on the jsonl sink (per-line sealing — the
 # file-DLQ-at-rest shape), plus decryption support in `faucet dlq
 # inspect/replay/discard`. Opt-in; included in `full`.
-encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "dep:base64"]
+encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "faucet-sink-s3?/encryption", "faucet-sink-gcs?/encryption", "faucet-sink-azure-blob?/encryption", "faucet-sink-sftp?/encryption", "dep:base64"]
 
 source = [
     "source-rest",
@@ -277,6 +277,7 @@ compression = [
     "faucet-sink-gcs?/compression",
     "faucet-source-azure-blob?/compression",
     "faucet-sink-azure-blob?/compression",
+    "faucet-sink-sftp?/compression",
 ]
 
 # Uniform file formats (#604): read and write CSV / XML / Excel objects on
@@ -337,7 +338,19 @@ file-format-orc = [
     "faucet-source-sftp?/file-format-orc",
     "faucet-source-file?/file-format-orc",
 ]
-file-format-parquet = ["faucet-source-file?/file-format-parquet", "faucet-sink-file?/file-format-parquet"]
+# Parquet on the object-store and SFTP connectors rides their `arrow` feature.
+file-format-parquet = [
+    "faucet-source-file?/file-format-parquet",
+    "faucet-sink-file?/file-format-parquet",
+    "faucet-source-s3?/arrow",
+    "faucet-sink-s3?/arrow",
+    "faucet-source-gcs?/arrow",
+    "faucet-sink-gcs?/arrow",
+    "faucet-source-azure-blob?/arrow",
+    "faucet-sink-azure-blob?/arrow",
+    "faucet-source-sftp?/arrow",
+    "faucet-sink-sftp?/arrow",
+]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
 
 # Mutual-TLS client-certificate auth (#495) on whichever HTTP sources are
@@ -382,7 +395,9 @@ arrow = [
     "faucet-source-databricks?/arrow",
     "faucet-source-iceberg?/arrow",
     "faucet-source-azure-blob?/arrow",
+    "faucet-sink-azure-blob?/arrow",
     "faucet-source-sftp?/arrow",
+    "faucet-sink-sftp?/arrow",
     "faucet-source-file?/arrow",
     "faucet-sink-file?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can

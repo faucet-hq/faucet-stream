@@ -27,13 +27,18 @@ const PASS: &str = "secret";
 
 struct SftpRemote {
     port: u16,
-    session: SftpSession,
     _c: ContainerAsync<GenericImage>,
 }
 
 impl SftpRemote {
-    async fn walk(&self, dir: &str, rel: &str, out: &mut Vec<(String, Vec<u8>)>) {
-        let Ok(entries) = self.session.read_dir(dir).await else {
+    async fn walk(
+        &self,
+        session: &SftpSession,
+        dir: &str,
+        rel: &str,
+        out: &mut Vec<(String, Vec<u8>)>,
+    ) {
+        let Ok(entries) = session.read_dir(dir).await else {
             return;
         };
         for e in entries {
@@ -44,9 +49,9 @@ impl SftpRemote {
             let path = format!("{dir}/{name}");
             let rel = format!("{rel}{name}");
             if e.file_type().is_dir() {
-                Box::pin(self.walk(&path, &format!("{rel}/"), out)).await;
+                Box::pin(self.walk(session, &path, &format!("{rel}/"), out)).await;
             } else {
-                let mut f = self.session.open(path).await.expect("open");
+                let mut f = session.open(path).await.expect("open");
                 let mut body = Vec::new();
                 f.read_to_end(&mut body).await.expect("read");
                 out.push((rel, body));
@@ -80,8 +85,10 @@ impl Remote for SftpRemote {
     fn objects(&self, prefix: &str) -> BoxFut<'_, Vec<(String, Vec<u8>)>> {
         let dir = format!("/data/{}", prefix.trim_end_matches('/'));
         Box::pin(async move {
+            let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(self.port);
+            let session = connect(&conn).await.expect("verify session");
             let mut out = Vec::new();
-            self.walk(&dir, "", &mut out).await;
+            self.walk(&session, &dir, "", &mut out).await;
             out
         })
     }
@@ -101,13 +108,10 @@ async fn every_writable_format_takes_every_option_on_sftp() {
         }
     };
     let port = container.get_host_port_ipv4(22).await.expect("port");
-    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
-    let session = connect(&conn).await.expect("verify session");
     let full = std::env::var("FAUCET_MATRIX_FULL").is_ok();
     run_matrix_with(
         SftpRemote {
             port,
-            session,
             _c: container,
         },
         full,
