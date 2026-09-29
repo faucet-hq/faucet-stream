@@ -2,12 +2,12 @@
 #
 #   faucet test cli/examples/tests/tree_flatten_tests.yaml
 #
-# `tree_flatten` walks a recursive report tree (QuickBooks/Xero-style nested
+# `tree_flatten` walks a recursive report tree (accounting-report-style nested
 # `Rows`) and emits one flat row per leaf, carrying the section labels and the
 # period columns. The input is one report record; the output is N leaf rows.
 version: 1
 tests:
-  - name: quickbooks P&L report flattens to leaf rows
+  - name: nested-Rows P&L report flattens to leaf rows
     pipeline:
       transforms:
         - type: tree_flatten

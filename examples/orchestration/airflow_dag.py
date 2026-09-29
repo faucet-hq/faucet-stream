@@ -7,7 +7,7 @@ to land raw rows in Postgres, then runs `dbt build` to transform + test them.
 Drop this file in your Airflow `dags/` folder. It assumes the `faucet` and
 `dbt` binaries are on the worker's PATH (`cargo install faucet-cli`;
 `pip install dbt-postgres`) and that the pipeline's env vars (PG_URL,
-STRIPE_TOKEN, and the dbt PG* vars) are set in the worker environment.
+SOURCE_API_TOKEN, and the dbt PG* vars) are set in the worker environment.
 """
 
 from __future__ import annotations

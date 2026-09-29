@@ -44,7 +44,7 @@ These run immediately after installing the CLI — great for a first smoke test:
 | `nats_to_jsonl.yaml` | NATS → JSONL; runs against a local NATS (`docker run -p 4222:4222 nats:latest -js`) |
 | `rabbitmq_to_jsonl.yaml` | RabbitMQ → JSONL, acking each page after the sink flushes it; runs against the compose `rabbitmq` service (or `docker run -p 5672:5672 -p 15672:15672 rabbitmq:3-management`) |
 | `sftp_to_jsonl.yaml` | SFTP directory → JSONL over SSH; point `host`/`username`/`path` at a real server (set `SFTP_PASSWORD`) |
-| `airtable_to_jsonl.yaml` | Airtable base/table → JSONL via the generic `rest` source (bearer PAT + offset-token pagination); set `AIRTABLE_TOKEN` + `AIRTABLE_BASE_ID` |
+| `rest_to_jsonl_bearer.yaml` | a bearer-token, offset-token-paginated REST API → JSONL via the generic `rest` source; point `base_url` at a real API and set `API_TOKEN` + `API_BASE_ID` |
 | `rest_to_jsonl.yaml`, `rest_streaming.yaml`, `rest_to_stdout_preview.yaml` | point `base_url` at any HTTP API; preview needs no sink setup |
 | `rest_filter_explode_to_stdout.yaml` | `filter` + `explode` + `keys_case` against DummyJSON; demonstrates the v1 JSONPath subset and the merge rule |
 | `shared_auth_rest.yaml` | one OAuth2 provider in the top-level `auth:` block shared across four matrix rows via `auth: { ref }` — single token, single-flight refresh (point `base_url` / token endpoint at a real API) |
