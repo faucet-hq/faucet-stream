@@ -2776,6 +2776,16 @@ pub struct ConformanceArgs {
     /// capability matrix. Ignores the scoring flags.
     #[arg(long)]
     pub matrix: bool,
+    /// Print the Connector Hub export (JSON) for every connector in the
+    /// registry index — identity, install coordinates, derived capabilities,
+    /// conformance, config schema and a `faucet init` snippet — and exit.
+    /// Ignores the scoring flags.
+    #[arg(long)]
+    pub export: bool,
+    /// With `--export`: fail when a registry connector is not compiled into
+    /// this binary (its schema would be missing from the export).
+    #[arg(long, requires = "export")]
+    pub require_all: bool,
 }
 
 /// `faucet search` arguments.

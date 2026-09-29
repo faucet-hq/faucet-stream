@@ -315,6 +315,36 @@ jobs:
 
           gh release edit "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft=false
 
+  # The Connector Hub feed (#572): attached to the release so the website
+  # picks up every released connector without a manual snapshot.
+  connector-export:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.host.result == 'success' }}
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - name: Install librdkafka prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: connector-export
+      - name: Export and upload connectors.json
+        run: |
+          cargo build -p faucet-cli --no-default-features --features full
+          ./target/debug/faucet conformance --export --require-all > connectors.json
+          gh release upload "${{ needs.plan.outputs.tag }}" connectors.json --clobber
+
   publish-homebrew-formula:
     needs:
       - plan

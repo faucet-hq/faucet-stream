@@ -582,6 +582,17 @@ jobs:
           key: ${{ matrix.features }}
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: cargo build -p faucet-cli --no-default-features --features "${{ matrix.features }}"
+      # The Connector Hub feed (#572) must cover every registry connector.
+      - name: Connector Hub export
+        if: ${{ matrix.features == 'full' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        run: |
+          ./target/debug/faucet conformance --export --require-all > connectors.json
+          jq -e '.format == "faucet-connector-export" and (.connectors | length) > 0 and all(.connectors[]; .compiled and .config_schema != null)' connectors.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ matrix.features == 'full' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        with:
+          name: connectors-export
+          path: connectors.json
 
   # Windows (#565): the prebuilt x86_64-pc-windows-msvc binary's feature set
   # (CLI default + the dist-workspace.toml `features`) must build and pass the
