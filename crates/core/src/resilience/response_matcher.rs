@@ -67,7 +67,7 @@ pub enum BackoffFrom {
         unit: WaitUnit,
     },
     /// A JSON-valued response header, read at a JSONPath
-    /// (`x-business-use-case-usage`).
+    /// (a usage header carrying a JSON object).
     HeaderJson {
         /// Header name.
         name: String,
@@ -84,7 +84,7 @@ pub enum BackoffFrom {
         /// How to read the value.
         unit: WaitUnit,
     },
-    /// A leaky-bucket cost report (Shopify GraphQL): wait
+    /// A leaky-bucket cost report (a GraphQL cost extension): wait
     /// `ceil((requested - available) / restore_rate)` seconds, at least 1.
     CostBucket {
         /// JSONPath to the cost the request asked for.
@@ -624,21 +624,21 @@ mod tests {
             "body_path": "$.error.code",
             "values": [80004, 17],
             "backoff_from": {"type": "header_json", "config": {
-                "name": "x-business-use-case-usage",
+                "name": "x-app-usage",
                 "path": "$.*[0].estimated_time_to_regain_access",
                 "unit": "minutes"
             }}
         }));
         rule.validate(0).unwrap();
         let h = headers(&[(
-            "x-business-use-case-usage",
+            "x-app-usage",
             r#"{"123":[{"type":"ads_insights","estimated_time_to_regain_access":3}]}"#,
         )]);
         assert_eq!(
             rule.wait(&h, "", None, Duration::ZERO, 0).unwrap(),
             Duration::from_secs(180)
         );
-        let bad = headers(&[("x-business-use-case-usage", "not json")]);
+        let bad = headers(&[("x-app-usage", "not json")]);
         let w = rule
             .wait(&bad, "", Some(Duration::from_secs(4)), Duration::ZERO, 0)
             .unwrap();

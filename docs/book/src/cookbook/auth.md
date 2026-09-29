@@ -73,18 +73,18 @@ Two knobs cover the less-standard flows:
 
 ```yaml
 auth:
-  sap:                          # SAP B1: SessionId carried as a cookie
+  session:                      # SessionId carried as a cookie
     type: token_endpoint
     config:
-      url: "https://host:50000/b1s/v1/Login"
-      body: { CompanyDB: "${param.company_db}", UserName: "${param.user}", Password: "${secret:sap_pw}" }
+      url: "https://host:50000/api/v1/Login"
+      body: { CompanyDB: "${param.company_db}", UserName: "${param.user}", Password: "${secret:session_pw}" }
       token_path: "$.SessionId"
-      apply_as: { header: "Cookie", template: "B1SESSION={token}; CompanyDB=${param.company_db}" }
+      apply_as: { header: "Cookie", template: "SESSION={token}; CompanyDB=${param.company_db}" }
 ```
 
 ## Persisting a rotating refresh token
 
-Some providers (Microsoft Graph, Rippling) **rotate the `refresh_token` on every
+Some providers **rotate the `refresh_token` on every
 refresh** — the old one is invalidated. In-memory rotation works for a single
 run, but the *next* scheduled run would present the now-stale seed and get a 401.
 Set `persist.path` on an `oauth2_refresh` provider to durably store the rotated
@@ -93,20 +93,20 @@ off:
 
 ```yaml
 auth:
-  graph:
+  idp:
     type: oauth2_refresh
     config:
-      token_url: "https://login.microsoftonline.com/${param.tenant}/oauth2/v2.0/token"
-      client_id: "${secret:graph_client_id}"
-      client_secret: "${secret:graph_client_secret}"
-      refresh_token: "${secret:graph_seed_refresh_token}"   # seed; used only until the first rotation
+      token_url: "https://login.example.com/${param.tenant}/oauth2/v2.0/token"
+      client_id: "${secret:idp_client_id}"
+      client_secret: "${secret:idp_client_secret}"
+      refresh_token: "${secret:idp_seed_refresh_token}"   # seed; used only until the first rotation
       persist:
         path: "./state/auth"      # rotated refresh_token survives across runs
 ```
 
 ## Mutual TLS (client certificates)
 
-Some enterprise/gov APIs (e.g. ADP) require the client to present a certificate
+Some enterprise/gov APIs (payroll, banking) require the client to present a certificate
 (**mutual TLS**). The `rest`, `xml`, and `graphql` sources accept a `tls:` block
 that attaches a client identity to **every** request — data requests *and* any
 inline token-endpoint request (they share one HTTP client). Build the CLI with
@@ -117,10 +117,10 @@ the `mtls` feature (`cargo install faucet-cli --features mtls`); without it a
 source:
   type: rest
   config:
-    base_url: https://api.eu.adp.com
+    base_url: https://api.eu.example.com
     tls:
-      client_cert: ${file:./adp-cert.pem}   # PEM cert chain (inline / ${file:} / ${secret:})
-      client_key:  ${file:./adp-key.pem}    # PEM PKCS#8 private key
+      client_cert: ${file:./client-cert.pem}   # PEM cert chain (inline / ${file:} / ${secret:})
+      client_key:  ${file:./client-key.pem}    # PEM PKCS#8 private key
       # min_version: "1.2"                   # optional: "1.2" | "1.3"
 ```
 
@@ -142,7 +142,7 @@ never written to logs or error messages.
 
 ## Google service accounts (JWT-bearer)
 
-Google APIs (GA4 Data API, Google Ads, Search Console, Sheets, Drive, …) accept a
+Google APIs (Sheets, Drive, BigQuery, …) accept a
 **service-account key** instead of a user's refresh token — the right credential
 for `faucet schedule`, `faucet serve` and tenants, where no human is around to
 re-consent. Declare it once in the top-level `auth:` catalog and reference it:
@@ -153,7 +153,7 @@ auth:
     type: google_service_account
     config:
       key_json: "${secret:GOOGLE_SA_KEY}"        # or key_file: /etc/faucet/sa.json
-      scopes: ["https://www.googleapis.com/auth/analytics.readonly"]
+      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
       subject: reports@example.com               # optional: domain-wide delegation
       # token_uri: defaults to the key's own token_uri
 
@@ -161,9 +161,9 @@ pipeline:
   source:
     type: rest
     config:
-      base_url: https://analyticsdata.googleapis.com
-      path: /v1beta/properties/123456:runReport
-      method: POST
+      base_url: https://sheets.googleapis.com
+      path: /v4/spreadsheets/SHEET_ID/values/Sheet1
+      method: GET
       auth: { ref: google }
       # …
 ```
@@ -178,7 +178,7 @@ the default CLI build (`google-sa` feature).
 
 ## OAuth1 request signing (HMAC-SHA256)
 
-Some APIs (e.g. NetSuite Token-Based Auth) authenticate by **signing each
+Some APIs (token-based auth schemes) authenticate by **signing each
 request** rather than issuing a bearer token. The `oauth1` provider signs every
 request's method + URL + query per RFC 5849. It's a catalog provider used via
 `auth: { ref }`, and requires the `oauth1` build feature
@@ -186,20 +186,20 @@ request's method + URL + query per RFC 5849. It's a catalog provider used via
 
 ```yaml
 auth:
-  netsuite:
+  signed:
     type: oauth1
     config:
-      consumer_key: ${secret:NS_CONSUMER_KEY}
-      consumer_secret: ${secret:NS_CONSUMER_SECRET}
-      token: ${secret:NS_TOKEN}
-      token_secret: ${secret:NS_TOKEN_SECRET}
-      realm: ${param.account}      # NetSuite account id
+      consumer_key: ${secret:OAUTH1_CONSUMER_KEY}
+      consumer_secret: ${secret:OAUTH1_CONSUMER_SECRET}
+      token: ${secret:OAUTH1_TOKEN}
+      token_secret: ${secret:OAUTH1_TOKEN_SECRET}
+      realm: ${param.account}      # account id
 pipeline:
   source:
     type: rest
     config:
-      base_url: https://${param.account_lower}.suitetalk.api.netsuite.com
-      auth: { ref: netsuite }
+      base_url: https://${param.account_lower}.api.example.com
+      auth: { ref: signed }
 ```
 
 ## Composable multi-step flows (`type: flow`)
@@ -213,18 +213,18 @@ overrides the base-URL per session:
 
 ```yaml
 auth:
-  bullhorn:
+  login_chain:
     type: flow
     config:
       steps:
         - request: { method: POST, url: https://auth.example.com/oauth/token,
-                     form: { grant_type: refresh_token, refresh_token: ${secret:BH_RT} } }
+                     form: { grant_type: refresh_token, refresh_token: ${secret:LOGIN_RT} } }
           capture: { access_token: "$.access_token" }
         - request: { method: GET, url: https://login.example.com/rest-services/login,
                      query: { access_token: "${access_token}" } }
-          capture: { bh_rest_token: "$.BhRestToken", base_url: "$.restUrl" }
+          capture: { session_token: "$.sessionToken", base_url: "$.restUrl" }
       apply:
-        - { into: query, name: BhRestToken, value: "${bh_rest_token}" }
+        - { into: query, name: sessionToken, value: "${session_token}" }
       base_url_from: "${base_url}"   # follow the server-supplied REST host
       reauth_on: [401]               # re-login + retry once when the session expires
 pipeline:
@@ -233,7 +233,7 @@ pipeline:
     config:
       base_url: https://placeholder.example.com   # overridden by base_url_from
       path: /entity/Candidate
-      auth: { ref: bullhorn }
+      auth: { ref: login_chain }
       records_path: "$.data[*]"
 ```
 
@@ -251,11 +251,11 @@ request carries it:
 
 ```yaml
 auth:
-  intacct:
+  xml_gateway:
     type: flow
     config:
       steps:
-        - request: { url: "https://api.intacct.com/ia/xml/xmlgw.phtml", method: POST, body: "<request>…getAPISession…</request>" }
+        - request: { url: "https://xml-gateway.example.com/xml/gateway", method: POST, body: "<request>…getAPISession…</request>" }
           capture: { session_id: { from: xml, path: "operation.result.data.api.sessionid" } }
 pipeline:
   source:
@@ -263,7 +263,7 @@ pipeline:
     config:
       method: POST
       body: "<request><control>…</control><operation><authentication><sessionid>${session_id}</sessionid></authentication>…</operation></request>"
-      auth: { ref: intacct }
+      auth: { ref: xml_gateway }
 ```
 
 The capture names declared by a `flow` provider are valid `${name}` tokens

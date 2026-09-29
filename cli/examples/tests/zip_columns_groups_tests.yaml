@@ -2,13 +2,13 @@
 #
 #   faucet test cli/examples/tests/zip_columns_groups_tests.yaml
 #
-# A Google Analytics 4 `runReport` response names its cells with two header
+# An analytics `runReport` response names its cells with two header
 # lists (`dimensionHeaders`, `metricHeaders`) and splits every row into two
 # positional cell arrays. Each group is zipped against its own headers and the
 # groups are merged into one flat record per row.
 version: 1
 tests:
-  - name: ga4 runReport rows become flat records
+  - name: grouped runReport rows become flat records
     pipeline:
       transforms:
         - type: zip_columns

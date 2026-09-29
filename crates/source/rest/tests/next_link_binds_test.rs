@@ -22,8 +22,8 @@ fn count(req: &Request, key: &str) -> usize {
     req.url.query_pairs().filter(|(k, _)| k == key).count()
 }
 
-/// Shopify REST Admin: a `page_info` request rejects any other filter param.
-async fn shopify_server() -> MockServer {
+/// A `page_info`-cursor API: a `page_info` request rejects any other filter param.
+async fn page_info_server() -> MockServer {
     let server = MockServer::start().await;
     let uri = server.uri();
     Mock::given(method("GET"))
@@ -67,7 +67,7 @@ async fn shopify_server() -> MockServer {
 
 #[tokio::test]
 async fn link_header_next_page_carries_no_replication_bind() {
-    let server = shopify_server().await;
+    let server = page_info_server().await;
     let bind: ReplicationBind =
         serde_json::from_value(json!({"into": "query", "name": "updated_at_min"})).unwrap();
     let stream = RestStream::new(

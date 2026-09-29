@@ -4,8 +4,8 @@
 //! carries an `Authorization: OAuth …` header whose signature covers the HTTP
 //! method, URL, and parameters (RFC 5849). This provider therefore overrides
 //! [`AuthProvider::sign_request`] (computed fresh per request) rather than
-//! [`AuthProvider::credential`]. The motivating target is NetSuite Token-Based
-//! Auth (SuiteQL/REST), which uses HMAC-**SHA256** with a `realm`.
+//! [`AuthProvider::credential`]. The motivating target is token-based
+//! request signing with HMAC-**SHA256** and an account `realm`.
 
 use async_trait::async_trait;
 use base64::Engine as _;

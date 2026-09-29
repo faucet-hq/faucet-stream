@@ -22,7 +22,7 @@ pub enum TokenBodyEncoding {
     #[default]
     Json,
     /// Form-urlencoded body (`application/x-www-form-urlencoded`) — required by
-    /// RFC-6749 OAuth token endpoints (Salesforce, Google, most OAuth servers),
+    /// RFC-6749 OAuth token endpoints (most OAuth servers),
     /// which reject a JSON body with `unsupported_grant_type`.
     Form,
 }
@@ -96,7 +96,7 @@ pub enum Auth {
         expiry_ratio: f64,
         /// Body encoding: `json` (default) or `form`
         /// (`application/x-www-form-urlencoded`, required by RFC-6749 OAuth
-        /// token endpoints like Salesforce/Google).
+        /// token endpoints).
         #[serde(default)]
         encoding: TokenBodyEncoding,
         /// Optional callback to decide whether the token endpoint response is

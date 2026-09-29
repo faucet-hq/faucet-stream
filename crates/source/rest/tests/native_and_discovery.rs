@@ -24,7 +24,7 @@ fn csv_job(server: &MockServer) -> Value {
         "fetch": {
             "method": "GET",
             "url": "/jobs/${job_id}/result",
-            "locator_header": "Sforce-Locator",
+            "locator_header": "X-Locator",
             "locator_param": "locator"
         }
     })
@@ -36,7 +36,7 @@ impl Respond for TwoCsvPages {
     fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
         if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
             ResponseTemplate::new(200)
-                .insert_header("Sforce-Locator", "loc2")
+                .insert_header("X-Locator", "loc2")
                 .set_body_string("id,name\n1,alice\n")
         } else {
             ResponseTemplate::new(200).set_body_string("id,name\n2,bob\n")

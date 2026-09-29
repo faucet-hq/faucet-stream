@@ -150,7 +150,7 @@ pub enum KeyCaseMode {
 
 /// Policy for [`RecordTransform::KeysCase`] when two distinct source keys
 /// re-case to the same name (common on wide, vendor-namespaced sources such
-/// as Salesforce, e.g. `AccountId__c` + `Account_Id__c` → `account_id_c`).
+/// with custom-field suffixes, e.g. `AccountId__c` + `Account_Id__c` → `account_id_c`).
 #[cfg(feature = "transform-keys-case")]
 #[derive(
     Debug,

@@ -1,7 +1,7 @@
 //! Async-job source pattern (#514): submit → poll → fetch result.
 //!
 //! Covers the "big-data export / bulk / report-run" class of APIs that a
-//! paginated GET can't express (Salesforce Bulk, Stripe Reporting, warehouse
+//! paginated GET can't express (bulk export jobs, report-run APIs, warehouse
 //! UNLOAD, …). Configured as an `async_job:` block on the REST source; the
 //! fetched result is handed to the `decode:` pipeline (#515) or the normal
 //! body parsing.
@@ -48,7 +48,7 @@ pub struct JobRequest {
     /// `fetch` only (#543): resolve the download URL from the **last poll
     /// response body** via JSONPath, instead of rendering [`url`](Self::url).
     /// For APIs that return a one-time signed download link in the poll body
-    /// (e.g. a Stripe report run's `result.url`) rather than at a deterministic
+    /// (e.g. a report run's `result.url`) rather than at a deterministic
     /// `/{job_id}` path. The matched value must be a string; an absolute URL is
     /// used verbatim, a relative one is resolved against `base_url`. Mutually
     /// exclusive with [`url`](Self::url).
@@ -64,7 +64,7 @@ pub struct JobRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json: Option<Value>,
     /// `fetch` only (#557): result-set continuation. Response header carrying a
-    /// pagination locator (e.g. Salesforce Bulk `Sforce-Locator`). While present
+    /// pagination locator (e.g. a bulk-export `X-Locator` header). While present
     /// (and not empty / `"null"`), the fetch is repeated with the locator sent as
     /// [`locator_param`](Self::locator_param), appending records across pages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,7 +140,7 @@ pub struct JobStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure: Vec<String>,
     /// JSONPath to an error code or message in the poll response (e.g. a
-    /// Shopify bulk operation's `$.data.node.errorCode`), named in the error a
+    /// bulk export job's `$.data.node.errorCode`), named in the error a
     /// failed job raises (#768).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_path: Option<String>,
@@ -206,7 +206,7 @@ pub struct AsyncJobConfig {
     /// paginated path** when a cheap probe says the object is small (#629).
     ///
     /// An async bulk API has a fixed async floor — job queue plus processing,
-    /// measured at ~14s of a 22s 701-row Salesforce `User` run — that is paid
+    /// measured at ~14s of a 22s 701-row bulk-export run — that is paid
     /// whatever the row count. A synchronous query API answers the same
     /// request immediately. Bulk is still right for the large objects it was
     /// designed for, so the choice is per-run and made from data rather than
@@ -251,7 +251,7 @@ pub enum InjectMode {
     Sql,
     /// Render [`IncrementalInject::template`] and substitute it for every
     /// `${faucet.filter}` placeholder in the submit body — for search-syntax
-    /// filters such as Shopify's `updated_at:>'…'`.
+    /// filters such as `updated_at:>'…'`.
     Template,
 }
 
@@ -812,7 +812,7 @@ mod tests {
         assert!(
             make(json!({
                 "url": "/jobs/${job_id}/results",
-                "locator_header": "Sforce-Locator",
+                "locator_header": "X-Locator",
                 "locator_param": "locator",
                 "records_path": "$.records[*]"
             }))
@@ -832,7 +832,7 @@ mod tests {
         // Locator source without param → error.
         let err = make(json!({
             "url": "/r",
-            "locator_header": "Sforce-Locator"
+            "locator_header": "X-Locator"
         }))
         .validate()
         .unwrap_err();

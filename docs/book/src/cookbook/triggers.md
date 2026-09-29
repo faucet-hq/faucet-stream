@@ -85,7 +85,7 @@ curl -s -H "Authorization: Bearer s3cret" \
 
 ## Walkthrough 2 — Webhook → sync pipeline
 
-**Use-case:** a CI system, Shopify webhook, or GitHub Action calls your server
+**Use-case:** a CI system, a SaaS webhook, or a CI workflow calls your server
 to trigger a data sync. You want idempotent delivery and to pass request
 metadata into the pipeline.
 
@@ -108,7 +108,7 @@ rather than a new run.
 
 > **Security note:** the dedupe key is trusted verbatim. Only use
 > `dedupe_header` when callers are trusted or the header is verified
-> upstream (e.g. HMAC-signed by GitHub/Shopify).
+> upstream (e.g. HMAC-signed by the sender).
 
 ### Fire the webhook
 

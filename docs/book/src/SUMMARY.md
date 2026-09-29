@@ -28,7 +28,7 @@
   - [Pagination styles](./cookbook/pagination.md)
   - [Authentication](./cookbook/auth.md)
   - [Source discovery (auto-generate configs)](./cookbook/discover.md)
-  - [Airtable (via REST source)](./cookbook/airtable.md)
+  - [Bearer-token REST API](./cookbook/bearer-token-api.md)
 - [Moving data reliably]()
   - [Incremental replication & state](./cookbook/state.md)
   - [Pipeline state & status (`faucet state` / `faucet status`)](./cookbook/state-and-status.md)

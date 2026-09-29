@@ -54,22 +54,22 @@ edge.
 
 ### Fan one bulk job out to several sinks
 
-A REST `async_job` with `records_route` (for example a Shopify bulk
-operation, see the [REST source README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/rest#shopify-style-bulk-operations-768))
+A REST `async_job` with `records_route` (for example a GraphQL bulk
+export job, see the [REST source README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/rest#graphql-bulk-export-jobs-768))
 returns parents and children in one file and stamps each row with its stream
-in `_stream`. Shopify runs one bulk operation per shop at a time, so the
+in `_stream`. When the API runs one bulk job per account at a time, the
 streams must share one job: fetch once, `tee`, and give each branch a
 `filter` on `_stream` plus a `drop` of the marker before its sink.
 
 ```yaml
 pipeline:
   sources:
-    shopify: { type: rest, config: { … async_job + records_route … } }
+    bulk_export: { type: rest, config: { … async_job + records_route … } }
   sinks:
     orders: { type: postgres, config: { table: orders, write_mode: upsert, key: [id] } }
     line_items: { type: postgres, config: { table: order_line_items, write_mode: upsert, key: [id] } }
   nodes:
-    bulk:  { kind: source, ref: shopify }
+    bulk:  { kind: source, ref: bulk_export }
     split: { kind: tee, fanout: 2 }
     only_orders:
       kind: transform

@@ -72,12 +72,12 @@ async fn async_job_submit_poll_fetch_decode() {
 }
 
 /// Poll responds "pending" once, then "succeeded" carrying the download URL in
-/// the body (the Stripe report-run shape).
-struct StripeReportPoll {
+/// the body (the report-run shape).
+struct ReportRunPoll {
     calls: Arc<AtomicUsize>,
     download_url: String,
 }
-impl Respond for StripeReportPoll {
+impl Respond for ReportRunPoll {
     fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let body = if n == 0 {
@@ -102,7 +102,7 @@ async fn async_job_fetch_url_from_poll_body() {
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/reporting/report_runs/frr_1"))
-        .respond_with(StripeReportPoll {
+        .respond_with(ReportRunPoll {
             calls: Arc::new(AtomicUsize::new(0)),
             download_url: download_url.clone(),
         })
@@ -202,7 +202,7 @@ async fn async_job_failure_status_errors() {
     assert!(err.to_string().contains("Failed"), "{err}");
 }
 
-/// Locator-paged fetch (#557): page 1 carries a `Sforce-Locator` header pointing
+/// Locator-paged fetch (#557): page 1 carries a `X-Locator` header pointing
 /// to page 2; page 2 is terminal (no locator). Deterministic by call count.
 struct FetchTwoLocatorPages(Arc<AtomicUsize>);
 impl Respond for FetchTwoLocatorPages {
@@ -210,7 +210,7 @@ impl Respond for FetchTwoLocatorPages {
         let n = self.0.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             ResponseTemplate::new(200)
-                .insert_header("Sforce-Locator", "loc2")
+                .insert_header("X-Locator", "loc2")
                 .set_body_string("id,name\n1,alice\n")
         } else {
             ResponseTemplate::new(200).set_body_string("id,name\n2,bob\n")
@@ -227,7 +227,7 @@ fn bulk_job() -> AsyncJobConfig {
         "fetch": {
             "method": "GET",
             "url": "/jobs/${job_id}/result",
-            "locator_header": "Sforce-Locator",
+            "locator_header": "X-Locator",
             "locator_param": "locator"
         }
     }))
@@ -635,7 +635,7 @@ async fn mount_bulk_one_big_page(server: &MockServer, rows: usize) {
 
 /// #626: one locator page must not become one `StreamPage`.
 ///
-/// #623 bounded memory *across* locator pages, but a Salesforce Bulk extract
+/// #623 bounded memory *across* locator pages, but a bulk-export extract
 /// returns the whole object in a single response — 838k rows, measured at
 /// 3.96 GB peak once buffered into one `Vec<Value>`. The decode now runs off
 /// the response body and emits `batch_size` pages, so peak memory is one page

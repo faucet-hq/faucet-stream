@@ -526,7 +526,7 @@ pub struct ReplicationBind {
     pub value_type: BindValueType,
     /// Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by
     /// the formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.
-    /// `"gte|${bookmark}"` (Greenhouse) or `"[${bookmark} TO *]"` (Lucene).
+    /// `"gte|${bookmark}"` (an operator-prefixed filter) or `"[${bookmark} TO *]"` (Lucene).
     #[serde(default = "default_bind_template")]
     pub template: String,
     /// How to format the bookmark before substitution.
@@ -907,7 +907,7 @@ mod tests {
             b.render(&json!("2024-06-01T00:00:00Z")).unwrap(),
             "gte|2024-06-01T00:00:00Z"
         );
-        // Lucene range form (Bullhorn).
+        // Lucene range form.
         let l = bind(BindTarget::Query, "[${bookmark} TO *]", BindFormat::Raw);
         assert_eq!(l.render(&json!("20240601")).unwrap(), "[20240601 TO *]");
     }

@@ -33,7 +33,7 @@ them are listed in `faucet list` and dispatchable as `type:` values.
 | `lookup` | Enrich records by joining an inline / JSONL reference table | `values` \| `jsonl`, `on: {record, ref}`, `add: {out: ref_col}`, `on_missing?` |
 | `tree_flatten` | Flatten a recursive report tree / matrix (nested `Rows`) into one row per leaf (1→N) | `children`, `columns: {from, header?, value}` or `groups: [{from, header, header_label?, value?}]`, `root?`, `leaf?`, `ancestors?`, `path_as?` |
 | `cross_join` | Cartesian product of two or more sibling array fields → one row per combination (1→N) | `arrays`, `prefix?`, `keep_parent?`, `on_empty?`, `drop_arrays?`, `max_product?` |
-| `zip_columns` | Zip a columnar payload (`{columns, rows}`, or several header + cell-array groups such as GA4 `runReport`) into one object per row (1→N) | `rows_path`, `columns_path` or `groups: [{from, header, header_label?, value?}]` |
+| `zip_columns` | Zip a columnar payload (`{columns, rows}`, or several header + cell-array groups such as a `runReport` response) into one object per row (1→N) | `rows_path`, `columns_path` or `groups: [{from, header, header_label?, value?}]` |
 | `sql` | Run DuckDB SQL over the whole page; records are the `batch` relation | `query`, `relations?`, `memory_limit?`, `threads?` · page-level (sees the whole batch) · needs `transform-sql` feature · [cookbook](./sql-transform.md) |
 | `wasm` | Run a user-provided sandboxed `.wasm` module over each record | `module`, `function?`, `memory_limit_mb?`, `fuel_limit?`, `on_error?`, `reload_on_change?` · per-record · needs `transform-wasm` feature · [cookbook](./wasm-transforms.md) |
 
@@ -550,7 +550,7 @@ the `transform-lookup` feature.
     # max_depth: 64             # stack-overflow backstop
 ```
 
-Financial-report APIs (QuickBooks, Xero, ZohoBooks, Rillet, Sage/Intacct)
+Financial-report APIs (profit-and-loss, balance-sheet and similar endpoints)
 return a **self-referential nested-`Rows` matrix** — a tree of section →
 subsection → line. `tree_flatten` walks it depth-first, carries the section
 labels down, and emits **one flat row per leaf**, naming the value columns from
@@ -699,7 +699,7 @@ transforms:
 
 ## `zip_columns` — columnar payload → one object per row (1→N)
 
-Analytics / report APIs (e.g. Shopify ShopifyQL `tableData`) return results *positionally*: a list of column descriptors plus a list of value-arrays. `zip_columns` zips each row against the column names.
+Analytics / report APIs (e.g. a query-language `tableData` payload) return results *positionally*: a list of column descriptors plus a list of value-arrays. `zip_columns` zips each row against the column names.
 
 ```yaml
 - type: zip_columns
@@ -710,7 +710,7 @@ Analytics / report APIs (e.g. Shopify ShopifyQL `tableData`) return results *pos
 
 ### Several column groups (`groups`)
 
-Some report APIs split every row into **several** positional cell arrays, each named by its **own** header list. The Google Analytics 4 Data API `runReport` response is the common case:
+Some report APIs split every row into **several** positional cell arrays, each named by its **own** header list. An analytics `runReport` response is the common case:
 
 ```json
 {
@@ -743,7 +743,7 @@ Use `groups` instead of `columns_path`. Each group is zipped against its own hea
 | `header_label` | Field of each header object to use as the column name, when `header` matches objects. |
 | `value` | Dot path, inside each cell, of the value. Omit when the cells are the values. A cell without it (or a `null` cell) yields `null`. |
 
-Set exactly one of `columns_path` or `groups`. Two groups naming the same column, a header that is not a string, and a row whose group width differs from that group's header count each fail the page with the group and row named — a value never lands under the wrong column. A record with no rows (GA4 omits `rows` from an empty report) yields no records. The runnable fixture is `cli/examples/tests/zip_columns_groups_tests.yaml`.
+Set exactly one of `columns_path` or `groups`. Two groups naming the same column, a header that is not a string, and a row whose group width differs from that group's header count each fail the page with the group and row named — a value never lands under the wrong column. A record with no rows (the API omits `rows` from an empty report) yields no records. The runnable fixture is `cli/examples/tests/zip_columns_groups_tests.yaml`.
 
 ### Ordering: explode early, filter late (usually)
 

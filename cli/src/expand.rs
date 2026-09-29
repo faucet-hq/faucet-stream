@@ -2133,7 +2133,7 @@ pipeline:
         let c = cfg(r#"
 version: 1
 auth:
-  intacct:
+  xml_gateway:
     type: flow
     config:
       steps:
@@ -2147,7 +2147,7 @@ pipeline:
       base_url: "https://x"
       path: /gw
       body: "<r><sessionid>${session_id}</sessionid></r>"
-      auth: { ref: intacct }
+      auth: { ref: xml_gateway }
   sink: { type: jsonl, config: { path: ./o } }
 "#);
         assert_eq!(expand(&c).unwrap().len(), 1);

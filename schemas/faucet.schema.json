@@ -355,7 +355,7 @@
           ]
         },
         "computed": {
-          "description": "A **derived** value: this param is not user-supplied but computed from\nother params via an interpolation expression — `${param.NAME}` and the\n`${map:NAME|case=value|*=default}` lookup — resolved *after* the ordinary\nparams bind (#573). A computed param is excluded from the trigger surface\n(supplying a value for it is an error) and is mutually exclusive with\n`required`, `default`, and `secret`. Example:\n`accounts_domain: { computed: \"${map:region|ca=zohocloud|*=zoho}\" }`.",
+          "description": "A **derived** value: this param is not user-supplied but computed from\nother params via an interpolation expression — `${param.NAME}` and the\n`${map:NAME|case=value|*=default}` lookup — resolved *after* the ordinary\nparams bind (#573). A computed param is excluded from the trigger surface\n(supplying a value for it is an error) and is mutually exclusive with\n`required`, `default`, and `secret`. Example:\n`accounts_domain: { computed: \"${map:region|ca=examplecloud|*=example}\" }`.",
           "type": [
             "string",
             "null"
@@ -2614,7 +2614,7 @@
           "type": "string"
         },
         "collect": {
-          "description": "**Collected (list-valued) dimension** (#531). When `true`, the whole\ndeduped value-set is published as a single list per upstream tuple rather\nthan as an independent cartesian axis — so a consuming row injects the\nentire list into one request (`${<id>.<as>}` renders it comma-joined,\ne.g. HubSpot's `?properties=a,b,c`). Required when a `discover:` row also\ndeclares `for_each:` (chained / two-level discovery), and only meaningful\non a discovery row.",
+          "description": "**Collected (list-valued) dimension** (#531). When `true`, the whole\ndeduped value-set is published as a single list per upstream tuple rather\nthan as an independent cartesian axis — so a consuming row injects the\nentire list into one request (`${<id>.<as>}` renders it comma-joined,\ne.g. a `?properties=a,b,c` field list). Required when a `discover:` row also\ndeclares `for_each:` (chained / two-level discovery), and only meaningful\non a discovery row.",
           "type": "boolean",
           "default": false
         }
@@ -2774,7 +2774,7 @@
           "const": "declared"
         },
         {
-          "description": "Longest-processing-time-first: heaviest rows claim permits first.\n\nWith heterogeneous row durations, makespan otherwise depends on the\norder the user happened to list rows in — a large object listed late\nbecomes an idle tail (measured: two big Salesforce objects finishing\n~9 min after the other 19, with 6 of 8 slots idle). LPT is provably\nwithin 4/3 of optimal for `P || Cmax`, and largest-*last* — which plain\ndeclaration order can accidentally produce — is the worst case.\n\nRows are ranked by [`MatrixRow::weight`]; ties and missing weights fall\nback to declaration order, so dispatch is never nondeterministic.",
+          "description": "Longest-processing-time-first: heaviest rows claim permits first.\n\nWith heterogeneous row durations, makespan otherwise depends on the\norder the user happened to list rows in — a large object listed late\nbecomes an idle tail (measured: two big bulk-export objects finishing\n~9 min after the other 19, with 6 of 8 slots idle). LPT is provably\nwithin 4/3 of optimal for `P || Cmax`, and largest-*last* — which plain\ndeclaration order can accidentally produce — is the worst case.\n\nRows are ranked by [`MatrixRow::weight`]; ties and missing weights fall\nback to declaration order, so dispatch is never nondeterministic.",
           "type": "string",
           "const": "lpt"
         }
@@ -4471,7 +4471,7 @@
                   "default": 0.9
                 },
                 "encoding": {
-                  "description": "Body encoding: `json` (default) or `form`\n(`application/x-www-form-urlencoded`, required by RFC-6749 OAuth\ntoken endpoints like Salesforce/Google).",
+                  "description": "Body encoding: `json` (default) or `form`\n(`application/x-www-form-urlencoded`, required by RFC-6749 OAuth\ntoken endpoints).",
                   "$ref": "#/$defs/source_rest__TokenBodyEncoding",
                   "default": "json"
                 }
@@ -4511,7 +4511,7 @@
           "const": "json"
         },
         {
-          "description": "Form-urlencoded body (`application/x-www-form-urlencoded`) — required by\nRFC-6749 OAuth token endpoints (Salesforce, Google, most OAuth servers),\nwhich reject a JSON body with `unsupported_grant_type`.",
+          "description": "Form-urlencoded body (`application/x-www-form-urlencoded`) — required by\nRFC-6749 OAuth token endpoints (most OAuth servers),\nwhich reject a JSON body with `unsupported_grant_type`.",
           "type": "string",
           "const": "form"
         }
@@ -4556,7 +4556,7 @@
           }
         },
         {
-          "description": "POST-search pagination: the next-page cursor is read from the response\nbody via `next_token_path` and written **into the request JSON body** at\n`body_cursor_field` for the next request (rather than a query param).\n\nThe first request uses `config.body` unchanged; each subsequent request\nsets `body[body_cursor_field] = <extracted cursor>`. Pagination stops when\n`next_token_path` is null/absent, and a repeated cursor trips the same\nloop guard as [`PaginationStyle::Cursor`]. Used by e.g. HubSpot CRM\n`POST /crm/v3/objects/{obj}/search` (`$.paging.next.after` → `after`).\n\n`body_cursor_field` may also be an RFC 6901 JSON Pointer\n(`/variables/after`) for a nested location — e.g. a GraphQL request\nsent through the REST source. The pointer must resolve to an existing\nvalue, or to a new key of an existing object (#751).",
+          "description": "POST-search pagination: the next-page cursor is read from the response\nbody via `next_token_path` and written **into the request JSON body** at\n`body_cursor_field` for the next request (rather than a query param).\n\nThe first request uses `config.body` unchanged; each subsequent request\nsets `body[body_cursor_field] = <extracted cursor>`. Pagination stops when\n`next_token_path` is null/absent, and a repeated cursor trips the same\nloop guard as [`PaginationStyle::Cursor`]. Used by e.g. CRM object\nsearch (`POST /crm/v3/objects/{obj}/search`, `$.paging.next.after` → `after`).\n\n`body_cursor_field` may also be an RFC 6901 JSON Pointer\n(`/variables/after`) for a nested location — e.g. a GraphQL request\nsent through the REST source. The pointer must resolve to an existing\nvalue, or to a new key of an existing object (#751).",
           "type": "object",
           "properties": {
             "next_token_path": {
@@ -4864,7 +4864,7 @@
           "const": "excel"
         },
         {
-          "description": "JSON Lines — one JSON object per line (a Shopify bulk-operation\nresult, #768). An async-job fetch is decoded line by line into pages\nof `batch_size`, so the file is never held in memory whole.",
+          "description": "JSON Lines — one JSON object per line (a bulk export job's\nresult, #768). An async-job fetch is decoded line by line into pages\nof `batch_size`, so the file is never held in memory whole.",
           "type": "string",
           "const": "jsonl"
         }
@@ -4885,7 +4885,7 @@
           "default": ""
         },
         "template": {
-          "description": "Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by\nthe formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.\n`\"gte|${bookmark}\"` (Greenhouse) or `\"[${bookmark} TO *]\"` (Lucene).",
+          "description": "Template rendered with [`BIND_PLACEHOLDER`] (`${bookmark}`) replaced by\nthe formatted bookmark. Defaults to the bare `${bookmark}`; set e.g.\n`\"gte|${bookmark}\"` (an operator-prefixed filter) or `\"[${bookmark} TO *]\"` (Lucene).",
           "type": "string",
           "default": "${bookmark}"
         },
@@ -5332,7 +5332,7 @@
           "default": "/query"
         },
         "sync_below_rows": {
-          "description": "Skip the job entirely and read through the source's **ordinary\npaginated path** when a cheap probe says the object is small (#629).\n\nAn async bulk API has a fixed async floor — job queue plus processing,\nmeasured at ~14s of a 22s 701-row Salesforce `User` run — that is paid\nwhatever the row count. A synchronous query API answers the same\nrequest immediately. Bulk is still right for the large objects it was\ndesigned for, so the choice is per-run and made from data rather than\nfrom a guess baked into the config.\n\nRequires [`count`](Self::count). The source's own `path` / `params` /\n`pagination` describe the synchronous read, so a config that opts in\ncarries both shapes and faucet picks between them.",
+          "description": "Skip the job entirely and read through the source's **ordinary\npaginated path** when a cheap probe says the object is small (#629).\n\nAn async bulk API has a fixed async floor — job queue plus processing,\nmeasured at ~14s of a 22s 701-row bulk-export run — that is paid\nwhatever the row count. A synchronous query API answers the same\nrequest immediately. Bulk is still right for the large objects it was\ndesigned for, so the choice is per-run and made from data rather than\nfrom a guess baked into the config.\n\nRequires [`count`](Self::count). The source's own `path` / `params` /\n`pagination` describe the synchronous read, so a config that opts in\ncarries both shapes and faucet picks between them.",
           "type": [
             "integer",
             "null",
@@ -5394,7 +5394,7 @@
           ]
         },
         "url_from": {
-          "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a Stripe report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
+          "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
           "type": [
             "string",
             "null"
@@ -5418,7 +5418,7 @@
           "description": "JSON request body."
         },
         "locator_header": {
-          "description": "`fetch` only (#557): result-set continuation. Response header carrying a\npagination locator (e.g. Salesforce Bulk `Sforce-Locator`). While present\n(and not empty / `\"null\"`), the fetch is repeated with the locator sent as\n[`locator_param`](Self::locator_param), appending records across pages.",
+          "description": "`fetch` only (#557): result-set continuation. Response header carrying a\npagination locator (e.g. a bulk-export `X-Locator` header). While present\n(and not empty / `\"null\"`), the fetch is repeated with the locator sent as\n[`locator_param`](Self::locator_param), appending records across pages.",
           "type": [
             "string",
             "null"
@@ -5534,7 +5534,7 @@
           }
         },
         "error_path": {
-          "description": "JSONPath to an error code or message in the poll response (e.g. a\nShopify bulk operation's `$.data.node.errorCode`), named in the error a\nfailed job raises (#768).",
+          "description": "JSONPath to an error code or message in the poll response (e.g. a\nbulk export job's `$.data.node.errorCode`), named in the error a\nfailed job raises (#768).",
           "type": [
             "string",
             "null"
@@ -5560,7 +5560,7 @@
           ]
         },
         "url_from": {
-          "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a Stripe report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
+          "description": "`fetch` only (#543): resolve the download URL from the **last poll\nresponse body** via JSONPath, instead of rendering [`url`](Self::url).\nFor APIs that return a one-time signed download link in the poll body\n(e.g. a report run's `result.url`) rather than at a deterministic\n`/{job_id}` path. The matched value must be a string; an absolute URL is\nused verbatim, a relative one is resolved against `base_url`. Mutually\nexclusive with [`url`](Self::url).",
           "type": [
             "string",
             "null"
@@ -5584,7 +5584,7 @@
           "description": "JSON request body."
         },
         "locator_header": {
-          "description": "`fetch` only (#557): result-set continuation. Response header carrying a\npagination locator (e.g. Salesforce Bulk `Sforce-Locator`). While present\n(and not empty / `\"null\"`), the fetch is repeated with the locator sent as\n[`locator_param`](Self::locator_param), appending records across pages.",
+          "description": "`fetch` only (#557): result-set continuation. Response header carrying a\npagination locator (e.g. a bulk-export `X-Locator` header). While present\n(and not empty / `\"null\"`), the fetch is repeated with the locator sent as\n[`locator_param`](Self::locator_param), appending records across pages.",
           "type": [
             "string",
             "null"
@@ -5986,7 +5986,7 @@
       }
     },
     "source_graphql__GraphqlOffsetPagination": {
-      "description": "Offset-into-query-variable pagination (ShopifyQL and similar).\n\nIncrements an integer offset injected into a GraphQL variable and\nterminates on a **short page** (fewer than `page_size` records) — unlike\ncursor pagination, which follows a `pageInfo` boolean. Suited to APIs whose\nquery language embeds `LIMIT … OFFSET …` (e.g. ShopifyQL): bake the limit\ninto the query string and parameterize only the offset with `${…}`.\n\nThe offset starts at `0`, is sent as a JSON number in the `variables` map on\nevery request, and advances by `page_size` after each page.",
+      "description": "Offset-into-query-variable pagination (query languages that embed `LIMIT … OFFSET …`).\n\nIncrements an integer offset injected into a GraphQL variable and\nterminates on a **short page** (fewer than `page_size` records) — unlike\ncursor pagination, which follows a `pageInfo` boolean. Suited to APIs whose\nquery language embeds `LIMIT … OFFSET …`: bake the limit\ninto the query string and parameterize only the offset with `${…}`.\n\nThe offset starts at `0`, is sent as a JSON number in the `variables` map on\nevery request, and advances by `page_size` after each page.",
       "type": "object",
       "properties": {
         "type": {
@@ -5994,7 +5994,7 @@
           "$ref": "#/$defs/source_graphql__OffsetPaginationKind"
         },
         "offset_variable": {
-          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, incremented by `page_size`\nafter each page). Reference it from the query string or as a variable\n(e.g. `${q_offset}` for ShopifyQL).",
+          "description": "Name of the GraphQL variable that receives the current offset. It is\ninjected as a JSON number (starting at `0`, incremented by `page_size`\nafter each page). Reference it from the query string or as a variable\n(e.g. `${q_offset}` inside the query string).",
           "type": "string"
         },
         "page_size": {
@@ -6015,7 +6015,7 @@
           "default": true
         },
         "substitute_in_query": {
-          "description": "Substitute `${offset_variable}` occurrences in the **query string** with\nthe current offset before each request, instead of sending it as a\nGraphQL variable. Required for query languages that embed the offset in a\nstring-literal argument — e.g. ShopifyQL's\n`shopifyqlQuery(query: \"… LIMIT 250 OFFSET ${q_offset}\")`, where a GraphQL\nvariable cannot interpolate into a string literal (#569). Default\n`false` (variable injection, the #550 behavior).",
+          "description": "Substitute `${offset_variable}` occurrences in the **query string** with\nthe current offset before each request, instead of sending it as a\nGraphQL variable. Required for query languages that embed the offset in a\nstring-literal argument — e.g.\n`reportQuery(query: \"… LIMIT 250 OFFSET ${q_offset}\")`, where a GraphQL\nvariable cannot interpolate into a string literal (#569). Default\n`false` (variable injection, the #550 behavior).",
           "type": [
             "boolean",
             "string"
@@ -6304,7 +6304,7 @@
           }
         },
         {
-          "description": "Body-cursor pagination (#544): read a continuation token from the\nresponse via a dot-path (namespace-insensitive, trailing-match), and on\neach subsequent request replace the request body with `next_body` (with\n`${next_token}` substituted). Stops when the token is absent/empty or\nrepeats (loop guard), honouring `max_pages`. For stateful XML/SOAP APIs\nthat page with a `readMore`/`resultId` handle (e.g. Sage Intacct).",
+          "description": "Body-cursor pagination (#544): read a continuation token from the\nresponse via a dot-path (namespace-insensitive, trailing-match), and on\neach subsequent request replace the request body with `next_body` (with\n`${next_token}` substituted). Stops when the token is absent/empty or\nrepeats (loop guard), honouring `max_pages`. For stateful XML/SOAP APIs\nthat page with a `readMore`/`resultId` handle (an XML gateway's continuation).",
           "type": "object",
           "properties": {
             "next_token_path": {
@@ -14397,7 +14397,7 @@
                       "default": null
                     },
                     "response_format": {
-                      "description": "How to parse the response body. `json` (default) uses JSONPath\nextraction (`records_path`); `csv` / `excel` parse a tabular **file**\nbody into records — for authenticated file endpoints such as a Microsoft\nGraph / OneDrive / SharePoint `…/content` download or any signed export\nURL. In file mode a single response is fetched (pagination must be\n`none`) and `records_path` does not apply. `excel` requires the crate's\n`excel` feature.",
+                      "description": "How to parse the response body. `json` (default) uses JSONPath\nextraction (`records_path`); `csv` / `excel` parse a tabular **file**\nbody into records — for authenticated file endpoints such as a cloud-drive\n`…/content` download or any signed export\nURL. In file mode a single response is fetched (pagination must be\n`none`) and `records_path` does not apply. `excel` requires the crate's\n`excel` feature.",
                       "$ref": "#/$defs/source_rest__ResponseFormat",
                       "default": "json"
                     },
@@ -14432,7 +14432,7 @@
                       "default": 34
                     },
                     "csv_null_values": {
-                      "description": "CSV fields equal to any of these strings decode as JSON `null` instead\nof a string (default: none). Salesforce Bulk API 2.0 results write a\nnull as an empty field, so its templates set `[\"\"]`; other APIs list\nsentinels such as `\"NULL\"` or `\"#N/A\"`. Headers are never mapped, and a\nquoted empty field (`\"\"`) is mapped like an unquoted one — the CSV\nreader does not report quoting per field. `response_format: csv` only.",
+                      "description": "CSV fields equal to any of these strings decode as JSON `null` instead\nof a string (default: none). Some bulk-export APIs write a\nnull as an empty field, so their templates set `[\"\"]`; other APIs list\nsentinels such as `\"NULL\"` or `\"#N/A\"`. Headers are never mapped, and a\nquoted empty field (`\"\"`) is mapped like an unquoted one — the CSV\nreader does not report quoting per field. `response_format: csv` only.",
                       "type": "array",
                       "items": {
                         "type": "string"
@@ -14494,7 +14494,7 @@
                       }
                     },
                     "async_job": {
-                      "description": "Run a submit→poll→fetch job lifecycle instead of a single GET, for\nbulk/export/report-run APIs (Salesforce Bulk, Stripe Reporting, …). The\nfetched result flows through `decode:` / `response_format`. When set,\npagination must be `none`. See [`AsyncJobConfig`](crate::async_job::AsyncJobConfig).",
+                      "description": "Run a submit→poll→fetch job lifecycle instead of a single GET, for\nbulk/export/report-run APIs (bulk export jobs, report runs, …). The\nfetched result flows through `decode:` / `response_format`. When set,\npagination must be `none`. See [`AsyncJobConfig`](crate::async_job::AsyncJobConfig).",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/source_rest__AsyncJobConfig"
@@ -14713,7 +14713,7 @@
                       ]
                     },
                     "retry_on_response": {
-                      "description": "Responses to treat as throttling and retry — including a `200` whose\nbody reports it (`match_success: true` with\n`body_path: \"$.errors[*].extensions.code\"`, `values: [THROTTLED]`). A\nrule's `backoff_from` reads the wait from the response (`cost_bucket`\nfor Shopify-style cost reports, or a reset header / body value).\nChecked before the response's `errors[]` are classified; a match\nretries the whole request, so partial `data` is never emitted.",
+                      "description": "Responses to treat as throttling and retry — including a `200` whose\nbody reports it (`match_success: true` with\n`body_path: \"$.errors[*].extensions.code\"`, `values: [THROTTLED]`). A\nrule's `backoff_from` reads the wait from the response (`cost_bucket`\nfor a leaky-bucket cost report, or a reset header / body value).\nChecked before the response's `errors[]` are classified; a match\nretries the whole request, so partial `data` is never emitted.",
                       "type": "array",
                       "items": {
                         "$ref": "#/$defs/source_graphql__RetryMatcher"
@@ -28597,7 +28597,7 @@
           "type": "string"
         },
         "template": {
-          "description": "Template rendered with `${bookmark}` replaced by the formatted bookmark.\nDefaults to the bare `${bookmark}`. When the bookmark sits inside a\nquery-language string (Shopify `query: \"updated_at:>…\"`), escaping is\nthe template author's job.",
+          "description": "Template rendered with `${bookmark}` replaced by the formatted bookmark.\nDefaults to the bare `${bookmark}`. When the bookmark sits inside a\nquery-language string filter (`query: \"updated_at:>…\"`), escaping is\nthe template author's job.",
           "type": "string",
           "default": "${bookmark}"
         },
@@ -28827,7 +28827,7 @@
           "const": "sql"
         },
         {
-          "description": "Render [`IncrementalInject::template`] and substitute it for every\n`${faucet.filter}` placeholder in the submit body — for search-syntax\nfilters such as Shopify's `updated_at:>'…'`.",
+          "description": "Render [`IncrementalInject::template`] and substitute it for every\n`${faucet.filter}` placeholder in the submit body — for search-syntax\nfilters such as `updated_at:>'…'`.",
           "type": "string",
           "const": "template"
         }
@@ -28977,7 +28977,7 @@
           }
         },
         {
-          "description": "A JSON-valued response header, read at a JSONPath\n(`x-business-use-case-usage`).",
+          "description": "A JSON-valued response header, read at a JSONPath\n(a usage header carrying a JSON object).",
           "type": "object",
           "properties": {
             "type": {
@@ -29027,7 +29027,7 @@
           }
         },
         {
-          "description": "A leaky-bucket cost report (Shopify GraphQL): wait\n`ceil((requested - available) / restore_rate)` seconds, at least 1.",
+          "description": "A leaky-bucket cost report (a GraphQL cost extension): wait\n`ceil((requested - available) / restore_rate)` seconds, at least 1.",
           "type": "object",
           "properties": {
             "type": {
@@ -29196,7 +29196,7 @@
           }
         },
         {
-          "description": "A JSON-valued response header, read at a JSONPath\n(`x-business-use-case-usage`).",
+          "description": "A JSON-valued response header, read at a JSONPath\n(a usage header carrying a JSON object).",
           "type": "object",
           "properties": {
             "type": {
@@ -29246,7 +29246,7 @@
           }
         },
         {
-          "description": "A leaky-bucket cost report (Shopify GraphQL): wait\n`ceil((requested - available) / restore_rate)` seconds, at least 1.",
+          "description": "A leaky-bucket cost report (a GraphQL cost extension): wait\n`ceil((requested - available) / restore_rate)` seconds, at least 1.",
           "type": "object",
           "properties": {
             "type": {

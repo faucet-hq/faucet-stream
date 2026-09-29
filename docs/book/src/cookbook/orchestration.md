@@ -43,11 +43,11 @@ pipeline:
   source:
     type: rest
     config:
-      base_url: https://api.stripe.com/v1
+      base_url: https://api.example.com/v1
       path: /charges
       auth:
         type: bearer
-        config: { token: ${env:STRIPE_TOKEN} }
+        config: { token: ${env:SOURCE_API_TOKEN} }
       pagination:
         type: Cursor
         next_token_path: $.next_page
@@ -61,7 +61,7 @@ pipeline:
     config:
       connection_url: ${env:PG_URL}
       table_name: charges_raw       # dbt reads this raw landing table
-      column_mapping: { type: jsonb, column: data }
+      column_mapping: { jsonb: { column: data } }
   state:
     type: file
     config: { path: ./.faucet-state }

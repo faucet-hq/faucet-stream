@@ -692,7 +692,7 @@ pipeline:
 
     #[test]
     fn render_emits_sink_ref_and_sink_patch_per_row() {
-        // A Salesforce-style discovery: source config_patch + a per-object sink
+        // A describe-style discovery: source config_patch + a per-object sink
         // patch, targeting a named sink template via --sink.
         let raw = r#"
 version: 1
@@ -700,7 +700,7 @@ pipeline:
   sources:
     default:
       type: rest
-      config: { base_url: "https://x.my.salesforce.com" }
+      config: { base_url: "https://api.example.com" }
   sinks:
     bigquery:
       type: jsonl
@@ -709,7 +709,7 @@ pipeline:
         let datasets = vec![
             DatasetDescriptor::new(
                 "Account",
-                "sobject",
+                "object",
                 json!({"async_job": {"submit": {"json": {"query": "SELECT Id FROM Account"}}}}),
             )
             .with_sink_patch(json!({ "table_id": "account" })),

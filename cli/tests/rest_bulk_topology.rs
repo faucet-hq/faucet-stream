@@ -1,5 +1,5 @@
 //! One REST bulk job fanned out to several sinks in topology mode (#768): a
-//! Shopify-style bulk operation's parents and children reach separate JSONL
+//! GraphQL bulk export job's parents and children reach separate JSONL
 //! sinks through `tee` + `filter`, and the shared job-start bookmark makes the
 //! next run push the template filter down.
 #![cfg(all(
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const OP_ID: &str = "gid://shopify/BulkOperation/1";
+const OP_ID: &str = "gid://example/BulkOperation/1";
 
 async fn mount(server: &MockServer) {
     Mock::given(method("POST"))
@@ -38,11 +38,11 @@ async fn mount(server: &MockServer) {
         .mount(server)
         .await;
     let body = concat!(
-        "{\"id\":\"gid://shopify/Order/1\",\"name\":\"#1\"}\n",
-        "{\"id\":\"gid://shopify/LineItem/11\",\"__parentId\":\"gid://shopify/Order/1\"}\n",
-        "{\"id\":\"gid://shopify/LineItem/12\",\"__parentId\":\"gid://shopify/Order/1\"}\n",
-        "{\"id\":\"gid://shopify/Order/2\",\"name\":\"#2\"}\n",
-        "{\"id\":\"gid://shopify/LineItem/21\",\"__parentId\":\"gid://shopify/Order/2\"}\n",
+        "{\"id\":\"gid://example/Order/1\",\"name\":\"#1\"}\n",
+        "{\"id\":\"gid://example/LineItem/11\",\"__parentId\":\"gid://example/Order/1\"}\n",
+        "{\"id\":\"gid://example/LineItem/12\",\"__parentId\":\"gid://example/Order/1\"}\n",
+        "{\"id\":\"gid://example/Order/2\",\"name\":\"#2\"}\n",
+        "{\"id\":\"gid://example/LineItem/21\",\"__parentId\":\"gid://example/Order/2\"}\n",
     );
     Mock::given(method("GET"))
         .and(path("/results/bulk.jsonl"))
@@ -54,11 +54,11 @@ async fn mount(server: &MockServer) {
 fn config(server: &MockServer, dir: &Path) -> PipelineConfig {
     let yaml = format!(
         r#"version: 1
-name: shopify_bulk
+name: bulk_export
 pipeline:
   state: {{ type: file, config: {{ path: {state} }} }}
   sources:
-    shopify:
+    bulk_export:
       type: rest
       config:
         base_url: {base}/admin
@@ -88,7 +88,7 @@ pipeline:
     orders: {{ type: jsonl, config: {{ path: {orders} }} }}
     items: {{ type: jsonl, config: {{ path: {items} }} }}
   nodes:
-    bulk: {{ kind: source, ref: shopify }}
+    bulk: {{ kind: source, ref: bulk_export }}
     split: {{ kind: tee, fanout: 2 }}
     only_orders:
       kind: transform
@@ -114,7 +114,7 @@ pipeline:
         orders = dir.join("orders.jsonl").display(),
         items = dir.join("items.jsonl").display(),
     );
-    PipelineConfig::from_text(&yaml, Path::new("shopify.yaml")).expect("parses")
+    PipelineConfig::from_text(&yaml, Path::new("bulk_export.yaml")).expect("parses")
 }
 
 fn lines(p: &Path) -> Vec<Value> {
@@ -154,8 +154,8 @@ async fn one_bulk_job_fans_out_to_a_sink_per_stream() {
     assert_eq!(orders.len(), 2);
     assert_eq!(items.len(), 3);
     assert!(orders.iter().all(|o| o.get("_stream").is_none()));
-    assert_eq!(items[0]["order_id"], "gid://shopify/Order/1");
-    assert_eq!(items[2]["order_id"], "gid://shopify/Order/2");
+    assert_eq!(items[0]["order_id"], "gid://example/Order/1");
+    assert_eq!(items[2]["order_id"], "gid://example/Order/2");
     assert!(items.iter().all(|i| i.get("__parentId").is_none()));
 
     let first = submit_bodies(&server).await;

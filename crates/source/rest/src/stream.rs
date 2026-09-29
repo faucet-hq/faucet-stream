@@ -257,7 +257,7 @@ fn fetch_url_error(e: FaucetError, job: &crate::async_job::AsyncJobConfig) -> Fa
 
 /// A locator value counts as "no more pages" when it is empty, or when it
 /// matches one of the configured `locator_terminal_values` (default `["null"]`
-/// — Salesforce Bulk sends `Sforce-Locator: null` when done). Comparison is
+/// — some bulk-export APIs send `X-Locator: null` when done). Comparison is
 /// case-insensitive after trimming.
 fn is_terminal_locator(value: &str, terminal: &[String]) -> bool {
     let v = value.trim();
@@ -265,7 +265,7 @@ fn is_terminal_locator(value: &str, terminal: &[String]) -> bool {
 }
 
 /// Derive the queried object name for an async-job source's `dataset_uri` (#640).
-/// Looks for a `query` string in the submit body (Salesforce Bulk SOQL, etc.) and
+/// Looks for a `query` string in the submit body (a bulk export's SQL-like query, etc.) and
 /// returns its `FROM <object>`. `None` when there's no query or it can't be parsed
 /// (the caller then falls back to a hash of the submit body).
 fn async_job_object(submit_json: Option<&Value>, query_path: &str) -> Option<String> {
@@ -1963,7 +1963,7 @@ impl RestStream {
 
     /// Submit the job and return its id. A `submit_errors` match fails with the
     /// server's messages; a "busy" match is retried until `retry_timeout_secs`
-    /// (#768 — Shopify allows one bulk operation per shop at a time).
+    /// (#768 — some APIs allow one bulk export job per account at a time).
     async fn submit_async_job(
         &self,
         job: &crate::async_job::AsyncJobConfig,
@@ -2029,7 +2029,7 @@ impl RestStream {
         let base = &self.config.base_url;
 
         // 1) Submit → capture the job id. Incremental (#630): inject a
-        // `WHERE <replication_key> > <bookmark>` predicate into the submit SOQL
+        // `WHERE <replication_key> > <bookmark>` predicate into the submit query
         // when replicating incrementally with a start bookmark; falls back to the
         // unmodified submit body on the first run / full-table.
         let submit_url = resolve_url(base, job.submit.url.as_deref().unwrap_or_default());
@@ -2102,8 +2102,8 @@ impl RestStream {
         // by rendering the templated `url`. Exactly one is set (validated).
         let fetch_url = match (&job.fetch.url_from, &job.fetch.url) {
             (Some(path), _) => {
-                // An explicit `null` is an empty result (a Shopify bulk
-                // operation that matched nothing), not a misconfigured path.
+                // An explicit `null` is an empty result (a bulk export
+                // job that matched nothing), not a misconfigured path.
                 if jsonpath_first_value(&last_poll_body, path).is_some_and(|v| v.is_null()) {
                     tracing::info!(
                         url_from = %path,
@@ -2917,10 +2917,10 @@ impl faucet_core::Source for RestStream {
             faucet_core::redact_uri_credentials(&self.config.base_url),
             self.config.path
         );
-        // Async-job sources (Salesforce Bulk etc.) address every object through the
-        // *same* endpoint — the object lives in the SOQL query body, not the URL. So
+        // Async-job sources (bulk export APIs) address every object through the
+        // *same* endpoint — the object lives in the query body, not the URL. So
         // without this, a 21-object matrix collapses to one catalog/lineage dataset
-        // (#640). Derive a per-object URI from the query: the `FROM <SObject>` when
+        // (#640). Derive a per-object URI from the query: the `FROM <object>` when
         // parseable, else a stable hash of the submit body (distinct query → distinct
         // dataset either way).
         if let Some(job) = &self.config.async_job {
@@ -3079,7 +3079,7 @@ impl faucet_core::Source for RestStream {
         Ok(())
     }
 
-    /// Native byte-passthrough (#633): an `async_job` (Salesforce Bulk-style)
+    /// Native byte-passthrough (#633): an `async_job` (bulk-export-style)
     /// source whose fetch pages are CSV can stream straight to a byte-loading sink
     /// (e.g. BigQuery's load job) as NDJSON, never building `Vec<Value>`. Advertised
     /// only for the CSV async-job path with no custom `decode` (JSON async jobs and
@@ -3406,7 +3406,7 @@ impl faucet_core::Source for RestStream {
 
 impl RestStream {
     /// Authed GET for a discovery probe, returning the response body as text.
-    /// Shared by the OData `$metadata` and Salesforce `/sobjects` paths.
+    /// Shared by the OData `$metadata` and describe-recipe paths.
     async fn discover_get_text(&self, url: &str, what: &str) -> Result<String, FaucetError> {
         if self.config.retry_on_response.is_empty() {
             return self.discover_get_text_once(url, what).await;
@@ -3966,8 +3966,8 @@ mod tests {
             Some("Account".to_string())
         );
         assert_eq!(
-            sql_from_object("SELECT Id\nFROM SBQQ__Quote__c\nORDER BY Id"),
-            Some("SBQQ__Quote__c".to_string())
+            sql_from_object("SELECT Id\nFROM Custom_Quote__c\nORDER BY Id"),
+            Some("Custom_Quote__c".to_string())
         );
         assert_eq!(
             sql_from_object("select id from contact"),

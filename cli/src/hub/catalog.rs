@@ -267,7 +267,7 @@ const SECRET_KEYS: &[&str] = &[
 /// A value that is not a credential even though it sits under a secret-ish
 /// key: empty, a `${…}` reference, a JSONPath capture (`$.access_token` in a
 /// login-flow `capture:` block says *where to read* a token), or a one-/two-
-/// character constant (BambooHR's documented `password: x`), which cannot be
+/// character constant (an API's documented placeholder `password: x`), which cannot be
 /// a real secret.
 fn looks_like_reference(s: &str) -> bool {
     s.is_empty()
@@ -622,7 +622,7 @@ fn rel(root: &Path, p: &Path) -> String {
 
 /// The docs-site page: the matrix as a table, then one section per source
 /// with its streams and a copy-paste command per compatible sink.
-/// Markdown heading anchor for a hub id (`acme/netsuite` → `acme-netsuite`).
+/// Markdown heading anchor for a hub id (`acme/erp` → `acme-erp`).
 fn anchor(id: &str) -> String {
     id.replace('/', "-")
 }

@@ -73,14 +73,14 @@ mod tests {
 
     #[test]
     fn resolves_every_reference_form() {
-        let base = "https://x.my.salesforce.com/services/data/v60.0/query?q=SELECT";
+        let base = "https://api.example.com/services/data/v60.0/query?q=SELECT";
         assert_eq!(
             r(base, "/services/data/v60.0/query/01g-2000"),
-            "https://x.my.salesforce.com/services/data/v60.0/query/01g-2000"
+            "https://api.example.com/services/data/v60.0/query/01g-2000"
         );
         assert_eq!(
             r(base, "query/next"),
-            "https://x.my.salesforce.com/services/data/v60.0/query/next"
+            "https://api.example.com/services/data/v60.0/query/next"
         );
         assert_eq!(
             r(base, "//cdn.example.com/p2"),
@@ -92,7 +92,7 @@ mod tests {
         );
         assert_eq!(
             r(base, "?page=2"),
-            "https://x.my.salesforce.com/services/data/v60.0/query?page=2"
+            "https://api.example.com/services/data/v60.0/query?page=2"
         );
         assert_eq!(r("https://h/a/b", " /c "), "https://h/c");
     }
@@ -105,18 +105,18 @@ mod tests {
 
     #[test]
     fn job_urls_do_not_duplicate_the_base_path() {
-        let base = "https://x.my.salesforce.com/services/data/v60.0";
+        let base = "https://api.example.com/services/data/v60.0";
         assert_eq!(
             resolve_job_url(base, "/services/data/v60.0/jobs/query/750"),
-            "https://x.my.salesforce.com/services/data/v60.0/jobs/query/750"
+            "https://api.example.com/services/data/v60.0/jobs/query/750"
         );
         assert_eq!(
             resolve_job_url(base, "/jobs/query"),
-            "https://x.my.salesforce.com/services/data/v60.0/jobs/query"
+            "https://api.example.com/services/data/v60.0/jobs/query"
         );
         assert_eq!(
             resolve_job_url(base, "jobs/query"),
-            "https://x.my.salesforce.com/services/data/v60.0/jobs/query"
+            "https://api.example.com/services/data/v60.0/jobs/query"
         );
         assert_eq!(resolve_job_url(base, "https://o/x"), "https://o/x");
         assert_eq!(resolve_job_url("https://h", "/jobs"), "https://h/jobs");
@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(resolve_job_url("::bad", "/jobs"), "::bad/jobs");
         assert_eq!(
             resolve_job_url(base, "/services/data/v60.0?x=1"),
-            "https://x.my.salesforce.com/services/data/v60.0?x=1"
+            "https://api.example.com/services/data/v60.0?x=1"
         );
     }
 }

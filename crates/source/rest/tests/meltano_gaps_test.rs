@@ -373,12 +373,12 @@ impl Respond for LocatorFetch {
         if n == 0 {
             // First page carries a continuation locator header.
             ResponseTemplate::new(200)
-                .insert_header("Sforce-Locator", "loc1")
+                .insert_header("X-Locator", "loc1")
                 .set_body_json(json!({"records": [{"id": 1}, {"id": 2}]}))
         } else {
             // Last page: no (empty) locator → stop.
             ResponseTemplate::new(200)
-                .insert_header("Sforce-Locator", "null")
+                .insert_header("X-Locator", "null")
                 .set_body_json(json!({"records": [{"id": 3}]}))
         }
     }
@@ -411,7 +411,7 @@ async fn async_job_fetch_follows_result_locator_across_pages() {
         "fetch": {
             "method": "GET",
             "url": "/jobs/${job_id}/result",
-            "locator_header": "Sforce-Locator",
+            "locator_header": "X-Locator",
             "locator_param": "locator",
             "records_path": "$.records[*]"
         }

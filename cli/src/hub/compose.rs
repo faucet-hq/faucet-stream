@@ -683,18 +683,18 @@ mod tests {
 
     const SRC: &str = r#"
 kind: source-template
-name: ramp
+name: spend
 params:
   token: { type: string, required: true, secret: true }
   shared: { type: string, default: a }
 auth:
-  ramp_oauth: { type: static, config: { token: "${param.token}" } }
+  spend_oauth: { type: static, config: { token: "${param.token}" } }
 source:
   type: rest
   config:
     base_url: https://api.example.com/v1
     path: /
-    auth: { ref: ramp_oauth }
+    auth: { ref: spend_oauth }
 transforms:
   - { type: keys_case, config: { mode: snake } }
 contract: { version: "1", fields: [] }
@@ -749,7 +749,7 @@ per_stream:
         let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         let c = compose_with(&src(), &sink, ALL).unwrap();
         assert_eq!(
-            c.name, "ramp",
+            c.name, "spend",
             "pipeline name is the source's, so state keys survive a sink swap"
         );
         assert_eq!(c.sink_kind, "bigquery");
@@ -766,7 +766,7 @@ per_stream:
         );
         assert_eq!(d["pipeline"]["transforms"][0]["type"], "keys_case");
         assert_eq!(d["pipeline"]["contract"]["version"], "1");
-        assert!(d["auth"]["ramp_oauth"].is_object());
+        assert!(d["auth"]["spend_oauth"].is_object());
         // Params merged: identical `shared` is fine.
         assert!(d["params"]["token"].is_object() && d["params"]["project"].is_object());
         let rows = d["matrix"].as_array().unwrap();
@@ -1013,7 +1013,7 @@ per_stream:
         s.streams[0].write = WriteChoice::One(WriteMode::Append);
         let c = compose_with(&s, &sink, &[WriteMode::Append]).unwrap();
         let cfg = &c.document["matrix"][0]["sink"]["config"];
-        assert_eq!(cfg["path"], "${param.out_dir}/ramp/bills.jsonl");
+        assert_eq!(cfg["path"], "${param.out_dir}/spend/bills.jsonl");
         assert!(
             cfg.get("write_mode").is_none(),
             "jsonl has no WriteSpec; the key would be rejected"
@@ -1040,21 +1040,21 @@ per_stream:
         sink.params.get_mut("shared").unwrap().default = Some(json!("b"));
         let err = compose_with(&src(), &sink, ALL).unwrap_err().to_string();
         assert!(
-            err.contains("param 'shared' is declared by both 'ramp' and 'bigquery'"),
+            err.contains("param 'shared' is declared by both 'spend' and 'bigquery'"),
             "{err}"
         );
 
         let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         sink.auth = Some(
             [(
-                "ramp_oauth".to_string(),
+                "spend_oauth".to_string(),
                 json!({"type": "static", "config": {"token": "other"}}),
             )]
             .into_iter()
             .collect(),
         );
         let err = compose_with(&src(), &sink, ALL).unwrap_err().to_string();
-        assert!(err.contains("auth provider 'ramp_oauth'"), "{err}");
+        assert!(err.contains("auth provider 'spend_oauth'"), "{err}");
 
         let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
         sink.auth = Some(
@@ -1067,7 +1067,8 @@ per_stream:
         );
         let c = compose_with(&src(), &sink, ALL).unwrap();
         assert!(
-            c.document["auth"]["bq_sa"].is_object() && c.document["auth"]["ramp_oauth"].is_object()
+            c.document["auth"]["bq_sa"].is_object()
+                && c.document["auth"]["spend_oauth"].is_object()
         );
     }
 
@@ -1096,8 +1097,8 @@ per_stream:
     fn render_per_stream_touches_only_strings() {
         let v = json!({"a": "${stream}-${source}", "b": ["${stream}", 3], "c": true});
         assert_eq!(
-            render_per_stream(&v, "bills", "ramp"),
-            json!({"a": "bills-ramp", "b": ["bills", 3], "c": true})
+            render_per_stream(&v, "bills", "spend"),
+            json!({"a": "bills-spend", "b": ["bills", 3], "c": true})
         );
     }
 

@@ -357,7 +357,7 @@ creates the alias); a concrete index of that name is rejected at `begin`.
 
 Replace only the destination rows in a **scope** (a date window) instead of the
 whole table — the declarative equivalent of "delete a rolling window, then
-re-insert" (period-report loads: QuickBooks / Xero / Zoho Books). Add a `scope:`
+re-insert" (period-report loads from accounting APIs). Add a `scope:`
 block alongside `write_mode: overwrite`:
 
 ```yaml

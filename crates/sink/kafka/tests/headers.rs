@@ -133,7 +133,7 @@ async fn configured_headers_reach_the_broker() {
 
     sink.write_batch(&[json!({
         "id": 1,
-        "meta": { "tenant": "acme", "trace_id": "abc123", "source": "salesforce" }
+        "meta": { "tenant": "acme", "trace_id": "abc123", "source": "crm" }
     })])
     .await
     .expect("write");

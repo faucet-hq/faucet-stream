@@ -1,7 +1,7 @@
 //! Tabular response-body parsing for `response_format: csv | excel` (#497).
 //!
 //! Turns a downloaded file body into a `Vec<Value>` of JSON objects, so an
-//! authenticated file endpoint (a Microsoft Graph `…/content` download, a
+//! authenticated file endpoint (a cloud-drive `…/content` download, a
 //! signed export URL, …) can be consumed through the same REST source that
 //! already owns auth, retry, and context substitution.
 

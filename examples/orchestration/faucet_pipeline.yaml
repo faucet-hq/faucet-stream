@@ -10,7 +10,7 @@
 # Required env vars:
 #   PG_URL        — Postgres connection URL, e.g.
 #                   postgres://faucet:faucet@localhost:5432/appdb
-#   STRIPE_TOKEN  — bearer token for the source API
+#   SOURCE_API_TOKEN — bearer token for the source API
 #
 # Run standalone:
 #   faucet run examples/orchestration/faucet_pipeline.yaml
@@ -21,13 +21,13 @@ pipeline:
   source:
     type: rest
     config:
-      base_url: https://api.stripe.com/v1
+      base_url: https://api.example.com/v1
       path: /charges
       method: GET
       auth:
         type: bearer
         config:
-          token: ${env:STRIPE_TOKEN}
+          token: ${env:SOURCE_API_TOKEN}
       query_params:
         limit: "100"
       pagination:
@@ -50,8 +50,8 @@ pipeline:
       # dbt reads from this raw landing table (source: raw.charges_raw).
       table_name: charges_raw
       column_mapping:
-        type: jsonb
-        column: data
+        jsonb:
+          column: data
       batch_size: 500
       max_connections: 5
 

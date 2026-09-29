@@ -135,8 +135,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn stripe_events() -> Value {
-        // Stripe-events-shaped body: an outer `data[*]` envelope carrying the
+    fn event_feed() -> Value {
+        // Event-feed-shaped body: an outer `data[*]` envelope carrying the
         // event id/created, with the real object nested at `.data.object`.
         json!({
             "data": [
@@ -162,7 +162,7 @@ mod tests {
             ("event_id".to_owned(), "id".to_owned()),
             ("event_created".to_owned(), "created".to_owned()),
         ]);
-        let out = extract_with_ancestors(&stripe_events(), "$.data[*].data.object", &anc).unwrap();
+        let out = extract_with_ancestors(&event_feed(), "$.data[*].data.object", &anc).unwrap();
         assert_eq!(out.len(), 2);
 
         assert_eq!(out[0]["id"], "in_1");
@@ -179,7 +179,7 @@ mod tests {
     fn record_ancestors_skips_absent_ancestor_fields() {
         // An ancestor-relative path that matches nothing is simply not copied.
         let anc = HashMap::from([("missing".to_owned(), "nope".to_owned())]);
-        let out = extract_with_ancestors(&stripe_events(), "$.data[*].data.object", &anc).unwrap();
+        let out = extract_with_ancestors(&event_feed(), "$.data[*].data.object", &anc).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out[0].get("missing").is_none());
         assert_eq!(out[0]["id"], "in_1");
@@ -272,7 +272,7 @@ mod tests {
         // Ancestor mode.
         let anc = HashMap::from([("event_id".to_owned(), "id".to_owned())]);
         let out = extract_configured(
-            &stripe_events(),
+            &event_feed(),
             Some("$.data[*].data.object"),
             Some(&anc),
             &[],

@@ -19,7 +19,7 @@ async fn drain(stream: &RestStream) -> Result<Vec<Value>, faucet_core::FaucetErr
 }
 
 #[tokio::test]
-async fn salesforce_root_relative_next_records_url_paginates() {
+async fn root_relative_next_records_url_paginates() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/services/data/v60.0/query"))

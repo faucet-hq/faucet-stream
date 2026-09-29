@@ -85,7 +85,7 @@ fn default_version() -> u32 {
 /// `-`/`_`, first character alphanumeric. Stream names additionally become
 /// table names, so `-` is rejected there (see [`Stream::validate`]).
 /// The namespace the hub's maintained templates live under. An unqualified
-/// locator (`--source netsuite`) resolves here when no top-level file matches,
+/// locator (`--source erp`) resolves here when no top-level file matches,
 /// so the official set is addressable by short name while still being owned
 /// by the org like any other namespace (#682).
 pub const OFFICIAL_OWNER: &str = "faucet-hq";
@@ -291,7 +291,7 @@ pub struct SourceTemplate {
     /// Document version; must be `1`.
     #[serde(default = "default_version")]
     pub version: u32,
-    /// Short name (`netsuite`). With `owner`, the hub id is `owner/name`; an
+    /// Short name (`erp`). With `owner`, the hub id is `owner/name`; an
     /// official template (no owner) is addressed by `name` alone. The id is the
     /// composed pipeline's `name:`, so per-stream state keys
     /// (`{id}::{stream}`) stay stable no matter which sink is composed in.
@@ -911,8 +911,8 @@ mod tests {
     fn src_yaml() -> &'static str {
         r#"
 kind: source-template
-name: ramp
-description: Ramp spend platform
+name: spend
+description: Example spend platform
 tags: [finance]
 params:
   client_id: { type: string, required: true, secret: true }
@@ -974,7 +974,7 @@ per_stream:
         };
         assert!(err(&|t| t.kind = TemplateKind::SinkTemplate).contains("not a source-template"));
         assert!(err(&|t| t.version = 2).contains("version 2"));
-        assert!(err(&|t| t.name = "Ramp!".into()).contains("must match"));
+        assert!(err(&|t| t.name = "Spend!".into()).contains("must match"));
         assert!(err(&|t| t.streams.clear()).contains("`streams` is empty"));
         assert!(err(&|t| t.streams[1].name = "bills".into()).contains("declared twice"));
         assert!(err(&|t| t.streams[0].name = "with-dash".into()).contains("must match"));

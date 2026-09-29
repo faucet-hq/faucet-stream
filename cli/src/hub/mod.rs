@@ -1043,16 +1043,16 @@ mod tests {
     fn qualified_locators_split_only_on_a_real_hub() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().display().to_string();
-        let (loc, id) = split_qualified("github:acme/private-hub:acme/netsuite@3").unwrap();
+        let (loc, id) = split_qualified("github:acme/private-hub:acme/erp@3").unwrap();
         assert_eq!(
             (loc.describe().as_str(), id),
-            ("github:acme/private-hub@main", "acme/netsuite@3")
+            ("github:acme/private-hub@main", "acme/erp@3")
         );
         let qualified = format!("{d}:files");
         let (loc, id) = split_qualified(&qualified).unwrap();
         assert_eq!((loc, id), (HubLocation::Dir(dir.path().into()), "files"));
         for plain in [
-            "acme/netsuite",
+            "acme/erp",
             "github:acme/hub",
             "nowhere:files",
             "https://x.y/a:b",

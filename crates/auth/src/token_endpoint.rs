@@ -427,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_as_header_returns_templated_cookie_credential() {
-        // SAP B1: the fetched SessionId is carried as a Cookie header, not a
+        // Session-cookie APIs: the fetched SessionId is carried as a Cookie header, not a
         // bearer token. `apply_as` renders it via the `{token}` template.
         let server = MockServer::start().await;
         Mock::given(method("POST"))

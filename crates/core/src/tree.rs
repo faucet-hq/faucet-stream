@@ -1,7 +1,7 @@
 //! Recursive report-tree / matrix flatten transform (`tree_flatten`, #530).
 //!
-//! Financial-report APIs (QuickBooks / Xero / ZohoBooks / Rillet, and
-//! Sage/Intacct) return a self-referential nested-`Rows` matrix — a tree of
+//! Financial-report APIs (profit-and-loss, balance-sheet and similar report
+//! endpoints) return a self-referential nested-`Rows` matrix — a tree of
 //! section → subsection → line, where the tabular output is one row per **leaf**
 //! carrying the section labels it sits under plus the period columns. Flattening
 //! it is the one reshape that kept those taps on the embedded-DuckDB SQL path;
@@ -564,9 +564,9 @@ mod tests {
         }
     }
 
-    /// A QuickBooks-style P&L: Income → {Sales, Services}, one leaf each, two
+    /// A nested-`Rows` P&L: Income → {Sales, Services}, one leaf each, two
     /// period columns.
-    fn quickbooks_report() -> Value {
+    fn nested_rows_report() -> Value {
         json!({
             "Columns": { "Column": [ {"ColTitle": ""}, {"ColTitle": "Jan 2024"}, {"ColTitle": "Feb 2024"} ] },
             "Rows": { "Row": [
@@ -582,8 +582,8 @@ mod tests {
     }
 
     #[test]
-    fn flattens_quickbooks_report_to_leaf_rows() {
-        let out = spec().compile().unwrap().apply(quickbooks_report());
+    fn flattens_nested_rows_report_to_leaf_rows() {
+        let out = spec().compile().unwrap().apply(nested_rows_report());
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["section"], json!("Income"));
         assert_eq!(out[0]["group_path"], json!("Income"));

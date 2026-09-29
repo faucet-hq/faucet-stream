@@ -7,7 +7,7 @@ sources:
     tables:
       - name: charges_raw
         description: >
-          Raw Stripe charges as loaded by faucet — one row per charge, the full
+          Raw payment charges as loaded by faucet — one row per charge, the full
           API payload in the JSONB column `data`.
         columns:
           - name: data

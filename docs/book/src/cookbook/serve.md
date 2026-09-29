@@ -108,7 +108,7 @@ pipeline work ≈ `max-concurrent-runs × each config's execution.max_concurrent
 
 ## Idempotency
 
-Supply `idempotency_key` to make retries safe (Stripe-style):
+Supply `idempotency_key` to make retries safe (the common `Idempotency-Key` pattern):
 
 - First submit with a key → runs normally.
 - Re-submit the **same key + same request** within `--idempotency-retention-secs`

@@ -28,7 +28,7 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 
 | Connector | Tier¹¹ | Feature | Streams¹ | Resumable² | Effectively-once³ | Compression | Discover¹⁰ | Underlying primitive |
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|:---:|----------------------|
-| REST | T1 ✅ᵐ | `source-rest` | ✓ | ✓ | ✗ | ✗ | ✓ᵒ | HTTP + 6 pagination styles, JSONPath extraction; `response_format: csv\|excel` parses an authed file body (Graph/OneDrive/signed URL), Excel via `source-rest-excel`; `odata:` block adds OData paging/query + `$metadata` discovery; `replication_bind` pushes the bookmark server-side; `window` slices incremental into rolling `[start,end)` datetime windows |
+| REST | T1 ✅ᵐ | `source-rest` | ✓ | ✓ | ✗ | ✗ | ✓ᵒ | HTTP + 6 pagination styles, JSONPath extraction; `response_format: csv\|excel` parses an authed file body (cloud-drive download/signed URL), Excel via `source-rest-excel`; `odata:` block adds OData paging/query + `$metadata` discovery; `replication_bind` pushes the bookmark server-side; `window` slices incremental into rolling `[start,end)` datetime windows |
 | GraphQL | T1 ✅ᵐ | `source-graphql` | ✓ | ✓ | ✗ | ✗ | ✗ | cursor / offset pagination, variable injection; `replication_method: incremental` + `replication_bind` binds the bookmark into a GraphQL variable |
 | XML / SOAP | T1 ✅ᵐ | `source-xml` | ✓ | ✗ | ✗ | ✗ | ✗ | streaming XML→JSON, dot-path extraction, first-class `soap:` block (envelope + headers + fault handling) |
 | gRPC | T1 ✅ | `source-grpc` | ✓⁴ | ✗ | ✗ | ✗ | ✗ | dynamic protobuf; unary + server-streaming |
@@ -347,7 +347,7 @@ Arrow-native connectors:
   object is a self-contained ZSTD-compressed Parquet file).
 - **Databricks SQL** source — with `arrow_native: true` (fetches
   `EXTERNAL_LINKS` + `ARROW_STREAM`; requires `replication: full`).
-- **REST** source — with an `async_job:` (Salesforce Bulk-style) CSV extract,
+- **REST** source — with an `async_job:` (bulk-export-style) CSV extract,
   no custom `decode:` chain, and a **header** locator (#635). Every column is
   `Utf8`: types are never inferred, so a batch's columns match the `Value`
   path's keys exactly.

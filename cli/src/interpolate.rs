@@ -148,8 +148,8 @@ pub fn interpolate_record(input: &str, ctx: &HashMap<String, Value>) -> CliResul
 /// Like [`value_to_string`], but a JSON **array** renders as its scalar elements
 /// **comma-joined** (`["a","b","c"]` → `a,b,c`) rather than as JSON. This is the
 /// collected-dimension form (#531): a `collect: true` discovery publishes a list
-/// per tuple, and `${id.alias}` injects it as one param (e.g. HubSpot's
-/// `?properties=a,b,c`). Non-scalar array elements fall back to their JSON form.
+/// per tuple, and `${id.alias}` injects it as one param (e.g. a
+/// `?properties=a,b,c` field list). Non-scalar array elements fall back to their JSON form.
 pub(crate) fn value_to_string_record(v: &Value) -> String {
     match v {
         Value::Array(items) => items

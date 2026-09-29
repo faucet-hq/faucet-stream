@@ -3,21 +3,21 @@
 #
 # Required env vars:
 #   PG_URL          — connection URL, e.g. postgres://user:pass@localhost/app
-#   STRIPE_TOKEN    — bearer token for the source API
+#   SOURCE_API_TOKEN — bearer token for the source API
 version: 1
-name: stripe_charges_to_postgres
+name: rest_charges_to_postgres
 
 pipeline:
   source:
     type: rest
     config:
-      base_url: https://api.stripe.com/v1
+      base_url: https://api.example.com/v1
       path: /charges
       method: GET
       auth:
         type: bearer
         config:
-          token: ${env:STRIPE_TOKEN}
+          token: ${env:SOURCE_API_TOKEN}
       query_params:
         limit: "100"
       pagination:
@@ -33,7 +33,7 @@ pipeline:
       primary_keys: ["id"]
       requests: []
       schema_sample_size: 200
-      state_key: stripe:charges
+      state_key: payments:charges
 
   transforms:
     - type: keys_case
@@ -43,7 +43,7 @@ pipeline:
     type: postgres
     config:
       connection_url: ${env:PG_URL}
-      table_name: stripe_charges
+      table_name: raw_charges
       column_mapping:
         jsonb:
           column: data
