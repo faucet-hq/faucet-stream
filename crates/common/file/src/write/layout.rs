@@ -91,9 +91,15 @@ impl NameTemplate {
 
     /// Whether `name` is a scratch file of one of this template's files.
     pub fn owns_scratch(&self, name: &str) -> bool {
-        name.strip_suffix(BODY_SUFFIX)
-            .or_else(|| name.strip_suffix(TMP_SUFFIX))
-            .is_some_and(|base| self.part_of(base).is_some())
+        let Some(at) = name.rfind(TMP_SUFFIX) else {
+            return false;
+        };
+        let (base, rest) = (&name[..at], &name[at + TMP_SUFFIX.len()..]);
+        let tail_ok = rest.is_empty()
+            || rest
+                .strip_prefix('-')
+                .is_some_and(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        tail_ok && self.part_of(base).is_some()
     }
 
     /// The staging area's name for an overwrite run of this template: hidden
@@ -228,6 +234,12 @@ mod tests {
         let (_, l) = t("out/x y-{part}.jsonl", false);
         assert_eq!(l.staging_name(), ".faucet-overwrite-x_y-_part_.jsonl");
         assert!(l.owns_scratch("x y-00003.jsonl.faucet-tmp"));
+        assert!(l.owns_scratch("x y-00003.jsonl.faucet-tmp-body"));
+        assert!(l.owns_scratch("x y-00003.jsonl.faucet-tmp-123-0a1b2c3d4e5f"));
+        assert!(l.owns_scratch("x y-00003.jsonl.faucet-tmp-123-0a1b2c3d4e5f-body"));
+        assert!(!l.owns_scratch("x y-00003.jsonl.faucet-tmp-"));
+        assert!(!l.owns_scratch("x y-00003.jsonl.faucet-tmp.bak"));
+        assert!(!l.owns_scratch("x y-00003.jsonl"));
         assert!(l.owns_scratch("x y-00004.jsonl.faucet-tmp-body"));
         assert!(!l.owns_scratch("q.jsonl.faucet-tmp"));
         assert!(!l.owns_scratch("x y-00001.jsonl"));

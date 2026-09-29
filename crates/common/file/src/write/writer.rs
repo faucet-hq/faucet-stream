@@ -344,7 +344,9 @@ impl FileWriter {
         if let Some(path) = self.backend.local_path(Area::Destination, &name) {
             self.outputs.record_open_probing_with(path, !append);
         }
-        st.current = Some(OpenFile::create(&self.ctx(), area, name, exists && append)?);
+        let ctx = self.ctx();
+        let in_place = append && ctx.appends_in_place();
+        st.current = Some(OpenFile::create(&ctx, area, name, exists && append, in_place)?);
         Ok(())
     }
 

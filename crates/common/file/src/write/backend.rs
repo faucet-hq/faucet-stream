@@ -26,6 +26,22 @@ pub enum Area {
     Staging,
 }
 
+/// What an [`append`](StorageBackend::append) callback did to the locked
+/// file.
+#[derive(Debug)]
+pub enum Appended {
+    /// It wrote to the locked file in place.
+    InPlace,
+    /// It wrote the file's whole new contents to this local path, which the
+    /// backend moves over the file before the lock is released.
+    Replace(PathBuf),
+}
+
+/// The callback [`StorageBackend::append`] runs under the lock: the file
+/// (opened for reading and writing, created empty when missing) and its path.
+pub type AppendFn<'a> =
+    dyn FnMut(&mut std::fs::File, &Path) -> Result<Appended, FaucetError> + 'a;
+
 /// Storage for finished files. Object-safe: the writer holds an
 /// `Arc<dyn StorageBackend>`.
 pub trait StorageBackend: Send + Sync {
@@ -53,8 +69,36 @@ pub trait StorageBackend: Send + Sync {
         true
     }
 
+    /// Whether the backend can add bytes to the end of a file in place
+    /// ([`append`](Self::append)), so concurrent `mode: append` writers never
+    /// rewrite each other's output. Default: `false` — the writer then
+    /// fetches the file, extends it and commits it whole.
+    fn supports_append(&self) -> bool {
+        false
+    }
+
+    /// A scratch path for `name` that no other writer uses, for an appending
+    /// writer (see [`append`](Self::append)). Default:
+    /// [`scratch_path`](Self::scratch_path).
+    fn unique_scratch_path(&self, area: Area, name: &str) -> Result<PathBuf, FaucetError> {
+        self.scratch_path(area, name)
+    }
+
+    /// Run `f` on `name` in `area` while holding an exclusive lock that every
+    /// other appender of that file also takes, so their additions never
+    /// interleave or overwrite one another. Only called when
+    /// [`supports_append`](Self::supports_append). Default: unsupported.
+    fn append(&self, area: Area, name: &str, f: &mut AppendFn<'_>) -> Result<(), FaucetError> {
+        let _ = f;
+        Err(FaucetError::Sink(format!(
+            "file sink: '{}' cannot be appended to in place",
+            self.describe(area, name)
+        )))
+    }
+
     /// Remove scratch files a crashed run left in `area`, for the names
-    /// `ours` accepts. Best effort. Default: nothing.
+    /// `ours` accepts, never one a live writer is using. Best effort.
+    /// Default: nothing.
     fn remove_stale_scratch(&self, _area: Area, _ours: &dyn Fn(&str) -> bool) {}
 
     /// Make `area` ready for writes (create the directory, check the
