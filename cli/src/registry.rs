@@ -337,7 +337,7 @@ pub async fn build_source(
                 "source", "postgres", config,
             )?;
             Ok(Box::new(
-                faucet_source_postgres::PostgresSource::new(cfg).await?,
+                Box::pin(faucet_source_postgres::PostgresSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-postgres-cdc")]
@@ -348,25 +348,29 @@ pub async fn build_source(
                 config,
             )?;
             Ok(Box::new(
-                faucet_source_postgres_cdc::PostgresCdcSource::new(cfg).await?,
+                Box::pin(faucet_source_postgres_cdc::PostgresCdcSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-mysql")]
         "mysql" => {
             let cfg = decode::<faucet_source_mysql::MysqlSourceConfig>("source", "mysql", config)?;
-            Ok(Box::new(faucet_source_mysql::MysqlSource::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_mysql::MysqlSource::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-mssql")]
         "mssql" => {
             let cfg = decode::<faucet_source_mssql::MssqlSourceConfig>("source", "mssql", config)?;
-            Ok(Box::new(faucet_source_mssql::MssqlSource::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_mssql::MssqlSource::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-sqlite")]
         "sqlite" => {
             let cfg =
                 decode::<faucet_source_sqlite::SqliteSourceConfig>("source", "sqlite", config)?;
             Ok(Box::new(
-                faucet_source_sqlite::SqliteSource::new(cfg).await?,
+                Box::pin(faucet_source_sqlite::SqliteSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-duckdb")]
@@ -374,18 +378,22 @@ pub async fn build_source(
             let cfg =
                 decode::<faucet_source_duckdb::DuckdbSourceConfig>("source", "duckdb", config)?;
             Ok(Box::new(
-                faucet_source_duckdb::DuckdbSource::new(cfg).await?,
+                Box::pin(faucet_source_duckdb::DuckdbSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-sqs")]
         "sqs" => {
             let cfg = decode::<faucet_source_sqs::SqsSourceConfig>("source", "sqs", config)?;
-            Ok(Box::new(faucet_source_sqs::SqsSource::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_sqs::SqsSource::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-nats")]
         "nats" => {
             let cfg = decode::<faucet_source_nats::NatsSourceConfig>("source", "nats", config)?;
-            Ok(Box::new(faucet_source_nats::NatsSource::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_nats::NatsSource::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-rabbitmq")]
         "rabbitmq" => {
@@ -393,7 +401,7 @@ pub async fn build_source(
                 "source", "rabbitmq", config,
             )?;
             Ok(Box::new(
-                faucet_source_rabbitmq::RabbitMqSource::new(cfg).await?,
+                Box::pin(faucet_source_rabbitmq::RabbitMqSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-sftp")]
@@ -409,14 +417,16 @@ pub async fn build_source(
         #[cfg(feature = "source-s3")]
         "s3" => {
             let cfg = decode::<faucet_source_s3::S3SourceConfig>("source", "s3", config)?;
-            Ok(Box::new(faucet_source_s3::S3Source::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_s3::S3Source::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-mongodb")]
         "mongodb" => {
             let cfg =
                 decode::<faucet_source_mongodb::MongoSourceConfig>("source", "mongodb", config)?;
             Ok(Box::new(
-                faucet_source_mongodb::MongoSource::new(cfg).await?,
+                Box::pin(faucet_source_mongodb::MongoSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-mongodb-cdc")]
@@ -427,7 +437,7 @@ pub async fn build_source(
                 config,
             )?;
             Ok(Box::new(
-                faucet_source_mongodb_cdc::MongoCdcSource::new(cfg).await?,
+                Box::pin(faucet_source_mongodb_cdc::MongoCdcSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-mysql-cdc")]
@@ -438,7 +448,7 @@ pub async fn build_source(
                 config,
             )?;
             Ok(Box::new(
-                faucet_source_mysql_cdc::MysqlCdcSource::new(cfg).await?,
+                Box::pin(faucet_source_mysql_cdc::MysqlCdcSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-redis")]
@@ -493,14 +503,16 @@ pub async fn build_source(
         #[cfg(feature = "source-kafka")]
         "kafka" => {
             let cfg = decode::<faucet_source_kafka::KafkaSourceConfig>("source", "kafka", config)?;
-            Ok(Box::new(faucet_source_kafka::KafkaSource::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_kafka::KafkaSource::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-kinesis")]
         "kinesis" => {
             let cfg =
                 decode::<faucet_source_kinesis::KinesisSourceConfig>("source", "kinesis", config)?;
             Ok(Box::new(
-                faucet_source_kinesis::KinesisSource::new(cfg).await?,
+                Box::pin(faucet_source_kinesis::KinesisSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-spanner")]
@@ -508,7 +520,7 @@ pub async fn build_source(
             let cfg =
                 decode::<faucet_source_spanner::SpannerSourceConfig>("source", "spanner", config)?;
             Ok(Box::new(
-                faucet_source_spanner::SpannerSource::new(cfg).await?,
+                Box::pin(faucet_source_spanner::SpannerSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-parquet")]
@@ -516,13 +528,15 @@ pub async fn build_source(
             let cfg =
                 decode::<faucet_source_parquet::ParquetSourceConfig>("source", "parquet", config)?;
             Ok(Box::new(
-                faucet_source_parquet::ParquetSource::new(cfg).await?,
+                Box::pin(faucet_source_parquet::ParquetSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-delta")]
         "delta" => {
             let cfg = decode::<faucet_source_delta::DeltaSourceConfig>("source", "delta", config)?;
-            Ok(Box::new(faucet_source_delta::DeltaSource::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_delta::DeltaSource::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-databricks")]
         "databricks" => {
@@ -542,7 +556,7 @@ pub async fn build_source(
             let cfg =
                 decode::<faucet_source_iceberg::IcebergSourceConfig>("source", "iceberg", config)?;
             Ok(Box::new(
-                faucet_source_iceberg::IcebergSource::new(cfg).await?,
+                Box::pin(faucet_source_iceberg::IcebergSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-dynamodb")]
@@ -551,7 +565,7 @@ pub async fn build_source(
                 "source", "dynamodb", config,
             )?;
             Ok(Box::new(
-                faucet_source_dynamodb::DynamoDbSource::new(cfg).await?,
+                Box::pin(faucet_source_dynamodb::DynamoDbSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-oracle")]
@@ -559,7 +573,7 @@ pub async fn build_source(
             let cfg =
                 decode::<faucet_source_oracle::OracleSourceConfig>("source", "oracle", config)?;
             Ok(Box::new(
-                faucet_source_oracle::OracleSource::new(cfg).await?,
+                Box::pin(faucet_source_oracle::OracleSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-oracle-cdc")]
@@ -570,13 +584,15 @@ pub async fn build_source(
                 config,
             )?;
             Ok(Box::new(
-                faucet_source_oracle_cdc::OracleCdcSource::new(cfg).await?,
+                Box::pin(faucet_source_oracle_cdc::OracleCdcSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-gcs")]
         "gcs" => {
             let cfg = decode::<faucet_source_gcs::GcsSourceConfig>("source", "gcs", config)?;
-            Ok(Box::new(faucet_source_gcs::GcsSource::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_source_gcs::GcsSource::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "source-bigquery")]
         "bigquery" => {
@@ -584,7 +600,7 @@ pub async fn build_source(
                 "source", "bigquery", config,
             )?;
             Ok(Box::new(
-                faucet_source_bigquery::BigQuerySource::new(cfg).await?,
+                Box::pin(faucet_source_bigquery::BigQuerySource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-snowflake")]
@@ -608,7 +624,7 @@ pub async fn build_source(
                 config,
             )?;
             Ok(Box::new(
-                faucet_source_mssql_cdc::MssqlCdcSource::new(cfg).await?,
+                Box::pin(faucet_source_mssql_cdc::MssqlCdcSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-redshift")]
@@ -623,7 +639,7 @@ pub async fn build_source(
             let cfg =
                 decode::<faucet_source_pubsub::PubsubSourceConfig>("source", "pubsub", config)?;
             Ok(Box::new(
-                faucet_source_pubsub::PubsubSource::new(cfg).await?,
+                Box::pin(faucet_source_pubsub::PubsubSource::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "source-clickhouse")]
@@ -645,7 +661,7 @@ pub async fn build_source(
                 config,
             )?;
             Ok(Box::new(
-                faucet_source_azure_blob::AzureBlobSource::new(cfg).await?,
+                Box::pin(faucet_source_azure_blob::AzureBlobSource::new(cfg)).await?,
             ))
         }
         other => Err(unknown(other, "source", source_kinds())),
@@ -670,25 +686,29 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
             let cfg =
                 decode::<faucet_sink_bigquery::BigQuerySinkConfig>("sink", "bigquery", config)?;
             Ok(Box::new(
-                faucet_sink_bigquery::BigQuerySink::new(cfg).await?,
+                Box::pin(faucet_sink_bigquery::BigQuerySink::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "sink-iceberg")]
         "iceberg" => {
             let cfg = decode::<faucet_sink_iceberg::IcebergSinkConfig>("sink", "iceberg", config)?;
-            Ok(Box::new(faucet_sink_iceberg::IcebergSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_iceberg::IcebergSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-delta")]
         "delta" => {
             let cfg = decode::<faucet_sink_delta::DeltaSinkConfig>("sink", "delta", config)?;
-            Ok(Box::new(faucet_sink_delta::DeltaSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_delta::DeltaSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-postgres")]
         "postgres" => {
             let cfg =
                 decode::<faucet_sink_postgres::PostgresSinkConfig>("sink", "postgres", config)?;
             Ok(Box::new(
-                faucet_sink_postgres::PostgresSink::new(cfg).await?,
+                Box::pin(faucet_sink_postgres::PostgresSink::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "sink-jsonl")]
@@ -709,39 +729,51 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         #[cfg(feature = "sink-mysql")]
         "mysql" => {
             let cfg = decode::<faucet_sink_mysql::MysqlSinkConfig>("sink", "mysql", config)?;
-            Ok(Box::new(faucet_sink_mysql::MysqlSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_mysql::MysqlSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-mssql")]
         "mssql" => {
             let cfg = decode::<faucet_sink_mssql::MssqlSinkConfig>("sink", "mssql", config)?;
-            Ok(Box::new(faucet_sink_mssql::MssqlSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_mssql::MssqlSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-sqlite")]
         "sqlite" => {
             let cfg = decode::<faucet_sink_sqlite::SqliteSinkConfig>("sink", "sqlite", config)?;
-            Ok(Box::new(faucet_sink_sqlite::SqliteSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_sqlite::SqliteSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-duckdb")]
         "duckdb" => {
             let cfg = decode::<faucet_sink_duckdb::DuckdbSinkConfig>("sink", "duckdb", config)?;
-            Ok(Box::new(faucet_sink_duckdb::DuckdbSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_duckdb::DuckdbSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-sqs")]
         "sqs" => {
             let cfg = decode::<faucet_sink_sqs::SqsSinkConfig>("sink", "sqs", config)?;
-            Ok(Box::new(faucet_sink_sqs::SqsSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_sqs::SqsSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-nats")]
         "nats" => {
             let cfg = decode::<faucet_sink_nats::NatsSinkConfig>("sink", "nats", config)?;
-            Ok(Box::new(faucet_sink_nats::NatsSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_nats::NatsSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-rabbitmq")]
         "rabbitmq" => {
             let cfg =
                 decode::<faucet_sink_rabbitmq::RabbitMqSinkConfig>("sink", "rabbitmq", config)?;
             Ok(Box::new(
-                faucet_sink_rabbitmq::RabbitMqSink::new(cfg).await?,
+                Box::pin(faucet_sink_rabbitmq::RabbitMqSink::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "sink-sftp")]
@@ -760,17 +792,21 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         #[cfg(feature = "sink-s3")]
         "s3" => {
             let cfg = decode::<faucet_sink_s3::S3SinkConfig>("sink", "s3", config)?;
-            Ok(Box::new(faucet_sink_s3::S3Sink::new(cfg).await?))
+            Ok(Box::new(Box::pin(faucet_sink_s3::S3Sink::new(cfg)).await?))
         }
         #[cfg(feature = "sink-mongodb")]
         "mongodb" => {
             let cfg = decode::<faucet_sink_mongodb::MongoSinkConfig>("sink", "mongodb", config)?;
-            Ok(Box::new(faucet_sink_mongodb::MongoSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_mongodb::MongoSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-redis")]
         "redis" => {
             let cfg = decode::<faucet_sink_redis::RedisSinkConfig>("sink", "redis", config)?;
-            Ok(Box::new(faucet_sink_redis::RedisSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_redis::RedisSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-csv")]
         "csv" => {
@@ -793,17 +829,23 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         #[cfg(feature = "sink-kafka")]
         "kafka" => {
             let cfg = decode::<faucet_sink_kafka::KafkaSinkConfig>("sink", "kafka", config)?;
-            Ok(Box::new(faucet_sink_kafka::KafkaSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_kafka::KafkaSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-kinesis")]
         "kinesis" => {
             let cfg = decode::<faucet_sink_kinesis::KinesisSinkConfig>("sink", "kinesis", config)?;
-            Ok(Box::new(faucet_sink_kinesis::KinesisSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_kinesis::KinesisSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-spanner")]
         "spanner" => {
             let cfg = decode::<faucet_sink_spanner::SpannerSinkConfig>("sink", "spanner", config)?;
-            Ok(Box::new(faucet_sink_spanner::SpannerSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_spanner::SpannerSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-http")]
         "http" => {
@@ -822,7 +864,9 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         #[cfg(feature = "sink-parquet")]
         "parquet" => {
             let cfg = decode::<faucet_sink_parquet::ParquetSinkConfig>("sink", "parquet", config)?;
-            Ok(Box::new(faucet_sink_parquet::ParquetSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_parquet::ParquetSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-file")]
         "file" => {
@@ -832,20 +876,24 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         #[cfg(feature = "sink-gcs")]
         "gcs" => {
             let cfg = decode::<faucet_sink_gcs::GcsSinkConfig>("sink", "gcs", config)?;
-            Ok(Box::new(faucet_sink_gcs::GcsSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_gcs::GcsSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-redshift")]
         "redshift" => {
             let cfg =
                 decode::<faucet_sink_redshift::RedshiftSinkConfig>("sink", "redshift", config)?;
             Ok(Box::new(
-                faucet_sink_redshift::RedshiftSink::new(cfg).await?,
+                Box::pin(faucet_sink_redshift::RedshiftSink::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "sink-pubsub")]
         "pubsub" => {
             let cfg = decode::<faucet_sink_pubsub::PubsubSinkConfig>("sink", "pubsub", config)?;
-            Ok(Box::new(faucet_sink_pubsub::PubsubSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_pubsub::PubsubSink::new(cfg)).await?,
+            ))
         }
         #[cfg(feature = "sink-clickhouse")]
         "clickhouse" => {
@@ -864,7 +912,7 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
                 config,
             )?;
             Ok(Box::new(
-                faucet_sink_azure_blob::AzureBlobSink::new(cfg).await?,
+                Box::pin(faucet_sink_azure_blob::AzureBlobSink::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "sink-dynamodb")]
@@ -872,7 +920,7 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
             let cfg =
                 decode::<faucet_sink_dynamodb::DynamoDbSinkConfig>("sink", "dynamodb", config)?;
             Ok(Box::new(
-                faucet_sink_dynamodb::DynamoDbSink::new(cfg).await?,
+                Box::pin(faucet_sink_dynamodb::DynamoDbSink::new(cfg)).await?,
             ))
         }
         #[cfg(feature = "sink-databricks")]
@@ -891,7 +939,9 @@ pub async fn build_sink(kind: &str, config: Value, auth: &AuthCatalog) -> CliRes
         #[cfg(feature = "sink-oracle")]
         "oracle" => {
             let cfg = decode::<faucet_sink_oracle::OracleSinkConfig>("sink", "oracle", config)?;
-            Ok(Box::new(faucet_sink_oracle::OracleSink::new(cfg).await?))
+            Ok(Box::new(
+                Box::pin(faucet_sink_oracle::OracleSink::new(cfg)).await?,
+            ))
         }
         other => Err(unknown(other, "sink", sink_kinds())),
     }
