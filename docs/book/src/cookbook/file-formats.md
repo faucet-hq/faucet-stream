@@ -402,9 +402,37 @@ row without a per-invocation token in its path, are refused at load time. The
 `jsonl`, `csv` and `parquet` sinks stay for existing configs, and the file sink
 matches them option for option — see the
 [crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/file)
-for every field and the mapping from the old sinks' fields. The same writer
-(`faucet_common_file::write`) sits under the object-store sinks, with a
-different storage backend.
+for every field and the mapping from the old sinks' fields.
+
+### The same writer on S3, GCS, Azure Blob and SFTP
+
+The same writer (`faucet_common_file::write`) sits under the `s3`, `gcs`,
+`azure-blob` and `sftp` sinks, with a remote storage backend — so they take
+every format and option above with the same field names. The object's name
+template is `path` (`file_name` on SFTP, whose `path` is the remote
+directory), placed after the existing `prefix`:
+
+```yaml
+sink:
+  type: s3
+  config:
+    bucket: my-data-lake
+    prefix: exports/
+    path: "orders/${now.date}/orders-{part}.parquet"
+    max_records_per_file: 1000000
+    write_mode: overwrite            # staged under a hidden prefix, swapped in on success
+    parquet: { compression: zstd, row_group_size: 131072 }
+```
+
+Each object is built locally and published with one upload when it closes —
+multipart on S3 past 8 MiB, a resumable upload on GCS, a committed block list
+on Azure, a temporary name renamed into place on SFTP — so a reader never sees
+a partial object and a bookmark never advances past one that is not there.
+Without `path` the sinks keep their original naming, a fresh
+`<run id>-<part><file_extension>` per object, so `mode` and
+`write_mode: overwrite` need a `path` to have something to replace. The
+format × option matrix that pins the local sink runs against MinIO,
+fake-gcs-server, Azurite and an SFTP server too.
 
 ### Run it locally
 
