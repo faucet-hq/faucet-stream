@@ -1853,8 +1853,9 @@ mod tests {
     #[test]
     fn template_push_down_needs_no_replication_key_but_needs_incremental() {
         assert!(bulk_export_config(serde_json::json!({})).validate().is_ok());
-        let full =
-            bulk_export_config(serde_json::json!({ "replication_method": { "type": "FullTable" } }));
+        let full = bulk_export_config(
+            serde_json::json!({ "replication_method": { "type": "FullTable" } }),
+        );
         let err = full.validate().unwrap_err().to_string();
         assert!(
             err.contains("requires `replication_method: incremental`"),

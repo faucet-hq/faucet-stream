@@ -468,7 +468,11 @@ mod tests {
 
     #[test]
     fn groups_zip_ga4_rows() {
-        let out = grouped_report().compile().unwrap().apply(&report()).unwrap();
+        let out = grouped_report()
+            .compile()
+            .unwrap()
+            .apply(&report())
+            .unwrap();
         assert_eq!(
             out,
             vec![

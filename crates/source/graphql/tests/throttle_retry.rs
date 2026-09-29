@@ -93,7 +93,10 @@ fn stream(server: &MockServer, rules: Vec<Value>) -> (GraphqlStream, Arc<Roundtr
 #[tokio::test]
 async fn a_throttled_200_waits_out_the_cost_bucket_and_retries() {
     let (server, calls) = serve(1, throttled(false)).await;
-    let (s, rec) = stream(&server, vec![cost_throttle_rule("$.errors[*].extensions.code")]);
+    let (s, rec) = stream(
+        &server,
+        vec![cost_throttle_rule("$.errors[*].extensions.code")],
+    );
     let started = Instant::now();
     let records = s.fetch_all().await.unwrap();
     assert!(
@@ -111,7 +114,10 @@ async fn a_throttled_200_waits_out_the_cost_bucket_and_retries() {
 #[tokio::test]
 async fn partial_data_in_a_throttled_body_is_never_emitted() {
     let (server, _) = serve(1, throttled(true)).await;
-    let (s, _) = stream(&server, vec![cost_throttle_rule("$.errors[*].extensions.code")]);
+    let (s, _) = stream(
+        &server,
+        vec![cost_throttle_rule("$.errors[*].extensions.code")],
+    );
     let records = s.fetch_all().await.unwrap();
     assert!(!records.contains(&json!({"id": "stale"})), "{records:?}");
     assert_eq!(records.len(), 2);
@@ -120,7 +126,10 @@ async fn partial_data_in_a_throttled_body_is_never_emitted() {
 #[tokio::test]
 async fn a_rule_that_never_matches_changes_nothing() {
     let (server, calls) = serve(1, throttled(false)).await;
-    let (s, _) = stream(&server, vec![cost_throttle_rule("$.errors[*].extensions.typo")]);
+    let (s, _) = stream(
+        &server,
+        vec![cost_throttle_rule("$.errors[*].extensions.typo")],
+    );
     let err = s.fetch_all().await.unwrap_err().to_string();
     assert!(err.contains("Throttled"), "{err}");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -130,7 +139,10 @@ async fn a_rule_that_never_matches_changes_nothing() {
 async fn other_graphql_errors_still_fail_fast() {
     let invalid = json!({"errors": [{"message": "Field 'x' doesn't exist", "extensions": {"code": "undefinedField"}}]});
     let (server, calls) = serve(1, invalid).await;
-    let (s, _) = stream(&server, vec![cost_throttle_rule("$.errors[*].extensions.code")]);
+    let (s, _) = stream(
+        &server,
+        vec![cost_throttle_rule("$.errors[*].extensions.code")],
+    );
     let err = s.fetch_all().await.unwrap_err().to_string();
     assert!(err.contains("doesn't exist"), "{err}");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -143,7 +155,10 @@ async fn http_errors_keep_their_shape_with_matchers_configured() {
         .respond_with(ResponseTemplate::new(401).set_body_string("x".repeat(5000)))
         .mount(&server)
         .await;
-    let (s, _) = stream(&server, vec![cost_throttle_rule("$.errors[*].extensions.code")]);
+    let (s, _) = stream(
+        &server,
+        vec![cost_throttle_rule("$.errors[*].extensions.code")],
+    );
     match s.fetch_all().await.unwrap_err() {
         faucet_core::FaucetError::HttpStatus { status, body, .. } => {
             assert_eq!(status, 401);
@@ -176,7 +191,10 @@ async fn a_wait_beyond_the_cap_fails_without_retrying() {
         "extensions": {"cost": {"requestedQueryCost": 1e9, "throttleStatus": {"currentlyAvailable": 0, "restoreRate": 1}}}
     });
     let (server, calls) = serve(usize::MAX, huge).await;
-    let (s, _) = stream(&server, vec![cost_throttle_rule("$.errors[*].extensions.code")]);
+    let (s, _) = stream(
+        &server,
+        vec![cost_throttle_rule("$.errors[*].extensions.code")],
+    );
     let err = s.fetch_all().await.unwrap_err().to_string();
     assert!(err.contains("max_wait_secs"), "{err}");
     assert_eq!(calls.load(Ordering::SeqCst), 1);

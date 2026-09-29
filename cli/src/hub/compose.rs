@@ -1067,7 +1067,8 @@ per_stream:
         );
         let c = compose_with(&src(), &sink, ALL).unwrap();
         assert!(
-            c.document["auth"]["bq_sa"].is_object() && c.document["auth"]["spend_oauth"].is_object()
+            c.document["auth"]["bq_sa"].is_object()
+                && c.document["auth"]["spend_oauth"].is_object()
         );
     }
 

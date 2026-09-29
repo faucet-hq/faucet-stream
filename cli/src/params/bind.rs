@@ -750,7 +750,10 @@ mod tests {
             } } }
         });
         bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
-        assert_eq!(doc["pipeline"]["source"]["config"]["domain"], json!("example"));
+        assert_eq!(
+            doc["pipeline"]["source"]["config"]["domain"],
+            json!("example")
+        );
     }
 
     #[test]
