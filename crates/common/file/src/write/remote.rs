@@ -13,9 +13,9 @@
 //! store rather than from memory.
 //!
 //! Backend calls are blocking; [`run`] drives the client's futures on the
-//! current Tokio runtime from inside `block_in_place`, which needs a
-//! multi-threaded runtime (the CLI's). A current-thread runtime is refused
-//! with a typed error rather than deadlocking.
+//! caller's multi-threaded Tokio runtime from inside `block_in_place`, or on
+//! a process-wide I/O runtime when the caller has none (or a current-thread
+//! one).
 
 use super::backend::{Area, StorageBackend};
 use super::layout::NameTemplate;
@@ -62,18 +62,43 @@ pub trait ObjectClient: Send + Sync {
     }
 }
 
-/// Drive `fut` to completion from a blocking context on the current
-/// multi-threaded Tokio runtime.
-pub fn run<T>(fut: impl Future<Output = Result<T, FaucetError>>) -> Result<T, FaucetError> {
-    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-        FaucetError::Sink("remote file sink: called outside a Tokio runtime".into())
-    })?;
-    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-        return Err(FaucetError::Sink(
-            "remote file sink: needs a multi-threaded Tokio runtime (it blocks on uploads)".into(),
-        ));
+/// Drive `fut` to completion from a blocking context.
+///
+/// On a multi-threaded Tokio runtime the future runs on that runtime inside
+/// `block_in_place`. Anywhere else — a current-thread runtime, or no runtime
+/// — it runs on a small process-wide runtime from a scoped helper thread, so
+/// the caller's single thread is never asked to drive I/O it is blocked on.
+pub fn run<T: Send>(
+    fut: impl Future<Output = Result<T, FaucetError>> + Send,
+) -> Result<T, FaucetError> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        return tokio::task::block_in_place(|| handle.block_on(fut));
     }
-    tokio::task::block_in_place(|| handle.block_on(fut))
+    let rt = fallback_runtime()?;
+    std::thread::scope(|s| {
+        s.spawn(|| rt.block_on(fut)).join().unwrap_or_else(|_| {
+            Err(FaucetError::Sink(
+                "remote file sink: an I/O task panicked".into(),
+            ))
+        })
+    })
+}
+
+fn fallback_runtime() -> Result<&'static tokio::runtime::Runtime, FaucetError> {
+    static RT: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("faucet-remote-io")
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+    })
+    .as_ref()
+    .map_err(|e| FaucetError::Sink(format!("remote file sink: starting an I/O runtime: {e}")))
 }
 
 /// A [`StorageBackend`] over an [`ObjectClient`].
@@ -449,19 +474,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_current_thread_runtime_is_refused() {
-        let err = run(async { Ok(()) }).unwrap_err().to_string();
-        assert!(err.contains("multi-threaded"), "{err}");
+    async fn a_current_thread_runtime_uses_the_io_runtime() {
+        let mem = Arc::new(Mem::default());
+        let w = writer(&mem, Some("ct.jsonl"), false);
+        w.write_rows(&[serde_json::json!({"a": 1})]).unwrap();
+        w.flush().unwrap();
+        assert_eq!(text(&mem, "pre/ct.jsonl"), "{\"a\":1}\n");
     }
 
     #[test]
-    fn outside_a_runtime_is_refused_and_children_are_direct() {
-        assert!(
-            run(async { Ok(()) })
-                .unwrap_err()
-                .to_string()
-                .contains("outside")
-        );
+    fn outside_a_runtime_runs_and_children_are_direct() {
+        assert_eq!(run(async { Ok(7) }).unwrap(), 7);
         let keys = vec![
             "p/a".into(),
             "p/b/c".into(),

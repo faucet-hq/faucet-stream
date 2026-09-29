@@ -5643,6 +5643,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "bytes",
+ "faucet-common-file",
  "faucet-conformance",
  "faucet-core",
  "faucet-sink-parquet",
