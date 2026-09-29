@@ -36,11 +36,6 @@ pub enum AzureSinkFormat {
     /// variant: ORC is read-only.
     #[cfg(feature = "file-format-avro")]
     Avro,
-    /// Apache Parquet: each object is a complete, self-contained Parquet
-    /// file, written with the `parquet` options. Enables the columnar fast
-    /// path. Requires the `arrow` feature (#777).
-    #[cfg(feature = "arrow")]
-    Parquet,
 }
 
 impl AzureSinkFormat {
@@ -57,8 +52,6 @@ impl AzureSinkFormat {
             Self::Xlsx => faucet_core::FileFormat::Xlsx,
             #[cfg(feature = "file-format-avro")]
             Self::Avro => faucet_core::FileFormat::Avro,
-            #[cfg(feature = "arrow")]
-            Self::Parquet => faucet_core::FileFormat::Parquet,
         }
     }
 
@@ -125,12 +118,6 @@ pub struct AzureBlobSinkConfig {
     /// Writer schema and block codec, used when `format: avro` (#719).
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
-    /// Parquet writer options, used when `format: parquet` (#777):
-    /// `compression`, `row_group_size`, `schema` (inferred or explicit) and
-    /// `on_unknown_field`. Objects still roll on `max_records_per_file` /
-    /// `max_bytes_per_file` (encoded bytes).
-    #[serde(default)]
-    pub parquet: faucet_core::ParquetWriteOptions,
 }
 
 fn default_file_extension() -> String {
@@ -161,7 +148,6 @@ impl AzureBlobSinkConfig {
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
-            parquet: faucet_core::ParquetWriteOptions::default(),
         }
     }
 
@@ -190,12 +176,6 @@ impl AzureBlobSinkConfig {
     }
 
     /// Set the Avro writer schema and codec used when `format: avro` (#719).
-    /// Set the Parquet writer options used when `format: parquet` (#777).
-    pub fn parquet(mut self, parquet: faucet_core::ParquetWriteOptions) -> Self {
-        self.parquet = parquet;
-        self
-    }
-
     pub fn avro(mut self, avro: faucet_core::AvroOptions) -> Self {
         self.avro = avro;
         self
@@ -393,8 +373,6 @@ mod tests {
         assert!(!AzureSinkFormat::Xlsx.appends_per_record());
         #[cfg(feature = "file-format-avro")]
         assert!(!AzureSinkFormat::Avro.appends_per_record());
-        #[cfg(feature = "arrow")]
-        assert!(!AzureSinkFormat::Parquet.appends_per_record());
     }
 
     /// Every variant maps onto exactly one shared format, so what this sink
@@ -417,11 +395,6 @@ mod tests {
         assert_eq!(
             AzureSinkFormat::Xlsx.shared(),
             faucet_core::FileFormat::Xlsx
-        );
-        #[cfg(feature = "arrow")]
-        assert_eq!(
-            AzureSinkFormat::Parquet.shared(),
-            faucet_core::FileFormat::Parquet
         );
     }
 

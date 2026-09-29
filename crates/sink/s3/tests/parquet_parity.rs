@@ -1,19 +1,17 @@
 //! `format: parquet` parity with the Parquet sink's S3 destination (#777),
-//! against MinIO: the same records written by both read back identically,
-//! and the `parquet:` options (codec, row groups, explicit schema, rollover)
-//! land in the uploaded objects. Requires Docker.
+//! against MinIO: the same records written by both read back to identical
+//! records and an identical Arrow schema. Requires Docker.
 #![cfg(feature = "arrow")]
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::{Client, Config as S3Config};
 use faucet_core::file_format::parquet_io::read_bytes;
-use faucet_core::{ParquetReadOptions, ParquetWriteOptions, Sink};
+use faucet_core::{ParquetReadOptions, Sink};
 use faucet_sink_parquet::{
     ParquetDestination, ParquetS3Destination, ParquetSink, ParquetSinkConfig,
 };
 use faucet_sink_s3::{S3Sink, S3SinkConfig, S3SinkFormat};
-use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::minio::MinIO;
@@ -150,8 +148,7 @@ async fn golden_parquet_sink_and_s3_sink_write_the_same_records_and_schema() {
     let s3 = S3Sink::new(s3_sink(&endpoint, "golden/s3/"))
         .await
         .expect("s3 sink");
-    s3.write_batch(&rows[..20]).await.unwrap();
-    s3.write_batch(&rows[20..]).await.unwrap();
+    s3.write_batch(&rows).await.unwrap();
     s3.flush().await.unwrap();
 
     let a = objects(&client, "golden/pq/").await;
@@ -162,53 +159,4 @@ async fn golden_parquet_sink_and_s3_sink_write_the_same_records_and_schema() {
     assert_eq!(schema_a.fields(), schema_b.fields());
     assert_eq!(rows_a, rows_b);
     assert_eq!(rows_b.len(), 50);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn parquet_options_reach_the_uploaded_objects() {
-    let (_c, endpoint, client) = start().await;
-    let opts: ParquetWriteOptions = serde_json::from_value(json!({
-        "compression": "snappy",
-        "row_group_size": 10,
-        "schema": {"type": "explicit", "fields": [
-            {"name": "id", "type": "int32", "nullable": false},
-            {"name": "name", "type": "string"}
-        ]}
-    }))
-    .unwrap();
-    let sink = S3Sink::new(
-        s3_sink(&endpoint, "opts/")
-            .max_records_per_file(30)
-            .parquet(opts),
-    )
-    .await
-    .expect("s3 sink");
-    sink.write_batch(&records()).await.unwrap();
-    assert_eq!(
-        objects(&client, "opts/").await.len(),
-        1,
-        "the first object closed on the row cap"
-    );
-    sink.flush().await.unwrap();
-
-    let objs = objects(&client, "opts/").await;
-    assert_eq!(objs.len(), 2);
-    let mut total = 0;
-    for o in &objs {
-        let (schema, rows) = decode(o);
-        assert_eq!(schema.fields().len(), 2, "unknown fields were dropped");
-        assert_eq!(
-            schema.field(0).data_type(),
-            &arrow::datatypes::DataType::Int32
-        );
-        total += rows.len();
-        let meta = SerializedFileReader::new(bytes::Bytes::copy_from_slice(o)).unwrap();
-        let md = meta.metadata();
-        assert!(md.row_groups().iter().all(|g| g.num_rows() <= 10));
-        assert_eq!(
-            md.row_group(0).column(0).compression(),
-            parquet::basic::Compression::SNAPPY
-        );
-    }
-    assert_eq!(total, 50);
 }

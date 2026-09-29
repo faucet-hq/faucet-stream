@@ -23,8 +23,6 @@ futures.workspace = true
 bytes.workspace = true
 uuid.workspace = true
 object_store = { workspace = true, features = ["azure"] }
-# The `Parquet` format + the columnar fast path (#777).
-arrow = { workspace = true, optional = true }
 
 [features]
 compression = ["faucet-core/compression"]
@@ -38,9 +36,6 @@ file-format-excel = ["faucet-core/file-format-excel"]
 # feature.
 file-format-avro = ["faucet-core/file-format-avro"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro"]
-# Parquet objects through `faucet_core::ParquetObjects` and the columnar
-# `write_batch_columnar` fast path (#777).
-arrow = ["faucet-core/arrow", "faucet-core/file-format-parquet", "dep:arrow"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "io-util", "sync"] }
@@ -58,8 +53,6 @@ object_store = { workspace = true, features = ["azure"] }
 # proven Azurite path used by `testcontainers-modules`' own tests).
 azure_storage = "0.21"
 azure_storage_blobs = "0.21"
-# Reads written Parquet blobs back and inspects their footers.
-parquet = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -27,10 +27,6 @@ pub struct GcsSink {
     /// records are buffered and encoded together at the rollover. Always empty
     /// for JSON Lines, which streams through `open`.
     pending: tokio::sync::Mutex<faucet_core::object_rollover::PageAccumulator>,
-    /// The open Parquet object when `format: parquet` (#777); pages are
-    /// encoded into it and it closes on the same row/byte caps.
-    #[cfg(feature = "arrow")]
-    parquet: tokio::sync::Mutex<Option<faucet_core::ParquetObjects>>,
     /// Round-trip recorder installed by the pipeline (#638 / #704). Op: `put`
     /// (one per object upload).
     roundtrips: faucet_core::observability::RecorderSlot,
@@ -48,22 +44,11 @@ impl GcsSink {
             Some(resolve_effective_chunk_size(&config)),
             config.max_bytes_per_file,
         ));
-        #[cfg(feature = "arrow")]
-        let parquet = tokio::sync::Mutex::new(match config.format {
-            GcsSinkFormat::Parquet => Some(faucet_core::ParquetObjects::new(
-                &config.parquet,
-                Some(resolve_effective_chunk_size(&config)),
-                config.max_bytes_per_file,
-            )?),
-            _ => None,
-        });
         Ok(Self {
             config,
             storage,
             open,
             pending,
-            #[cfg(feature = "arrow")]
-            parquet,
             roundtrips: faucet_core::observability::RecorderSlot::new(),
         })
     }
@@ -116,33 +101,6 @@ impl GcsSink {
             .map_err(|e| FaucetError::Sink(format!("GCS put object error for key '{key}': {e}")))?;
         tracing::debug!(key = %key, "Uploaded GCS object");
         Ok(())
-    }
-
-    /// Run `f` against the open Parquet object, then upload every object it
-    /// finished — also when `f` failed, so nothing already closed is lost.
-    #[cfg(feature = "arrow")]
-    async fn push_parquet(
-        &self,
-        f: impl FnOnce(&mut faucet_core::ParquetObjects) -> Result<(), FaucetError>,
-    ) -> Result<(), FaucetError> {
-        let (pushed, ready) = {
-            let mut guard = self.parquet.lock().await;
-            let pq = guard
-                .as_mut()
-                .ok_or_else(|| FaucetError::Sink("GCS sink: no parquet writer".into()))?;
-            let pushed = f(pq);
-            (pushed, pq.take_ready())
-        };
-        let concurrency = self.config.concurrency.max(1);
-        stream::iter(ready)
-            .map(|body| async move {
-                let key = self.generate_key();
-                self.upload_parquet_object(&key, body).await
-            })
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<()>>()
-            .await?;
-        pushed
     }
 
     /// Upload a pre-encoded Parquet object. Parquet carries its own internal
@@ -202,10 +160,6 @@ impl faucet_core::Sink for GcsSink {
         if let Some(group) = group {
             self.write_encoded_object(group).await?;
         }
-        #[cfg(feature = "arrow")]
-        if matches!(self.config.format, GcsSinkFormat::Parquet) {
-            self.push_parquet(|pq| pq.finish()).await?;
-        }
         Ok(())
     }
 
@@ -216,9 +170,26 @@ impl faucet_core::Sink for GcsSink {
         let concurrency = self.config.concurrency.max(1);
         let written = records.len();
 
+        // Parquet path: encode each chunk as a self-contained Parquet object.
+        // Parquet objects are self-describing and carry their own footer, so
+        // they are not accumulated across pages — a rolled-over half-file
+        // would not be readable.
         #[cfg(feature = "arrow")]
         if matches!(self.config.format, GcsSinkFormat::Parquet) {
-            self.push_parquet(|pq| pq.push_records(records)).await?;
+            let chunk = resolve_effective_chunk_size(&self.config);
+            let uploads: Vec<(String, Vec<u8>)> = records
+                .chunks(chunk)
+                .map(|slice| {
+                    let batch = faucet_core::columnar::values_to_record_batch_inferred(slice)?;
+                    let body = encode_parquet(&batch)?;
+                    Ok::<(String, Vec<u8>), FaucetError>((self.generate_key(), body))
+                })
+                .collect::<Result<_, _>>()?;
+            stream::iter(uploads)
+                .map(|(key, body)| async move { self.upload_parquet_object(&key, body).await })
+                .buffer_unordered(concurrency)
+                .try_collect::<Vec<()>>()
+                .await?;
             return Ok(written);
         }
 
@@ -283,8 +254,23 @@ impl faucet_core::Sink for GcsSink {
             return self.write_batch(&rows).await;
         }
 
-        self.push_parquet(|pq| pq.push_batch(batch)).await?;
-        Ok(batch.num_rows())
+        let n = batch.num_rows();
+        let cap = resolve_effective_chunk_size(&self.config).min(n).max(1);
+        let concurrency = self.config.concurrency.max(1);
+        let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut offset = 0usize;
+        while offset < n {
+            let len = cap.min(n - offset);
+            let slice = batch.slice(offset, len);
+            uploads.push((self.generate_key(), encode_parquet(&slice)?));
+            offset += len;
+        }
+        stream::iter(uploads)
+            .map(|(key, body)| async move { self.upload_parquet_object(&key, body).await })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(n)
     }
 
     fn config_schema(&self) -> Value {
@@ -368,6 +354,31 @@ fn resolve_effective_chunk_size(config: &GcsSinkConfig) -> usize {
 /// destination bucket returns objects in write order.
 fn generate_object_key(prefix: &str, file_extension: &str) -> String {
     format!("{prefix}{}{file_extension}", uuid::Uuid::now_v7())
+}
+
+/// Encode an Arrow `RecordBatch` into a complete, self-contained Parquet file
+/// (ZSTD-compressed) in memory.
+#[cfg(feature = "arrow")]
+fn encode_parquet(batch: &arrow::array::RecordBatch) -> Result<Vec<u8>, FaucetError> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
+            .map_err(|e| FaucetError::Sink(format!("parquet writer init failed: {e}")))?;
+        writer
+            .write(batch)
+            .map_err(|e| FaucetError::Sink(format!("parquet write failed: {e}")))?;
+        writer
+            .close()
+            .map_err(|e| FaucetError::Sink(format!("parquet finalize failed: {e}")))?;
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -493,16 +504,35 @@ mod tests {
     // ── Parquet columnar path (feature `arrow`) ──────────────────────────────
 
     #[cfg(feature = "arrow")]
-    #[tokio::test]
-    async fn a_bad_parquet_option_fails_construction() {
-        let cfg = GcsSinkConfig::new("b")
-            .format(GcsSinkFormat::Parquet)
-            .parquet(faucet_core::ParquetWriteOptions {
-                row_group_size: 0,
-                ..Default::default()
-            });
-        let err = GcsSink::new(cfg).await.err().unwrap().to_string();
-        assert!(err.contains("row_group_size"), "{err}");
+    #[test]
+    fn encode_parquet_round_trips_via_reader() {
+        use arrow::array::{Int32Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            ],
+        )
+        .unwrap();
+
+        let bytes = encode_parquet(&batch).unwrap();
+        assert_eq!(&bytes[..4], b"PAR1");
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .unwrap()
+            .build()
+            .unwrap();
+        let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(total, 3);
     }
 
     #[cfg(feature = "compression")]

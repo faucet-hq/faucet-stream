@@ -153,12 +153,6 @@ pub struct S3SinkConfig {
     /// Writer schema and block codec, used when `format: avro` (#719).
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
-    /// Parquet writer options, used when `format: parquet` (#777):
-    /// `compression`, `row_group_size`, `schema` (inferred or explicit) and
-    /// `on_unknown_field`. Objects still roll on `max_records_per_file` /
-    /// `max_bytes_per_file` (encoded bytes).
-    #[serde(default)]
-    pub parquet: faucet_core::ParquetWriteOptions,
 }
 
 fn default_batch_size() -> usize {
@@ -197,7 +191,6 @@ impl S3SinkConfig {
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
-            parquet: faucet_core::ParquetWriteOptions::default(),
         }
     }
 
@@ -233,12 +226,6 @@ impl S3SinkConfig {
     }
 
     /// Set the Avro writer schema and codec used when `format: avro` (#719).
-    /// Set the Parquet writer options used when `format: parquet` (#777).
-    pub fn parquet(mut self, parquet: faucet_core::ParquetWriteOptions) -> Self {
-        self.parquet = parquet;
-        self
-    }
-
     pub fn avro(mut self, avro: faucet_core::AvroOptions) -> Self {
         self.avro = avro;
         self
@@ -327,7 +314,6 @@ impl S3SinkConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
-        self.parquet.validate()?;
         Ok(())
     }
 }
@@ -336,9 +322,7 @@ impl S3SinkConfig {
     fn single_parquet_object(&self) -> bool {
         #[cfg(feature = "arrow")]
         {
-            matches!(self.format, S3SinkFormat::Parquet)
-                && self.effective_chunk_cap().is_none()
-                && self.max_bytes_per_file.is_none()
+            matches!(self.format, S3SinkFormat::Parquet) && self.effective_chunk_cap().is_none()
         }
         #[cfg(not(feature = "arrow"))]
         {

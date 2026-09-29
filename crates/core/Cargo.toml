@@ -129,8 +129,8 @@ file-format-avro = ["dep:apache-avro"]
 # Apache ORC (#719). Read-only: decoded to Arrow `RecordBatch`es stripe by
 # stripe, so it pulls `arrow` in.
 file-format-orc = ["arrow", "dep:orc-rust", "dep:bytes"]
-# Apache Parquet objects for the object-store connectors (#777): the
-# `ParquetObjects` encoder and the read-side projection helpers.
+# Apache Parquet read helpers for the object-store sources (#777): column
+# projection over a Parquet schema and whole-object decoding.
 file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
