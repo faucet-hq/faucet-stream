@@ -116,6 +116,11 @@ async fn round_trip(fmt: AzureFileFormat, shared: FileFormat, key: &str) {
     let cfg = source_config(port).file_format(fmt).with_batch_size(0);
     let src = AzureBlobSource::new(cfg).await.expect("source");
     assert_eq!(drain(&src).await, records(), "{shared:?} did not read back");
+    assert_eq!(
+        src.fetch_all().await.expect("fetch_all"),
+        records(),
+        "{shared:?} did not read back through fetch_all"
+    );
 }
 
 #[tokio::test]

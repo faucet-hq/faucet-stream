@@ -5787,6 +5787,7 @@ dependencies = [
 name = "faucet-source-azure-blob"
 version = "1.0.5"
 dependencies = [
+ "arrow",
  "async-stream",
  "async-trait",
  "azure_storage",
@@ -5796,6 +5797,7 @@ dependencies = [
  "faucet-core",
  "futures",
  "object_store",
+ "parquet",
  "schemars 1.2.1",
  "serde",
  "serde_json",
