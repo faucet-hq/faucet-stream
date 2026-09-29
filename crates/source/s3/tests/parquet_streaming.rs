@@ -320,3 +320,43 @@ async fn a_schema_mismatch_between_objects_is_still_caught() {
         "the failure must name the problem: {err}"
     );
 }
+
+/// `parquet.columns` (#777) projects on both the ranged and the buffered
+/// path, and an unknown column is an error naming the object.
+#[tokio::test(flavor = "multi_thread")]
+async fn parquet_columns_project_on_both_read_paths() {
+    let (_c, endpoint) = start_minio().await;
+    seed(&endpoint, "proj/a.parquet", parquet_bytes(50, 10, 8)).await;
+    for buffered in [false, true] {
+        let source = build_source(
+            &endpoint,
+            config(20)
+                .prefix("proj/")
+                .verify_checksum(buffered)
+                .parquet_columns(["id"]),
+        )
+        .await;
+        let rows = source.fetch_all().await.expect("fetch");
+        assert_eq!(rows.len(), 50);
+        assert!(
+            rows.iter()
+                .all(|r| r.as_object().unwrap().keys().eq(["id"])),
+            "buffered={buffered}: only the projected column"
+        );
+        let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut batches = source.stream_batches(&ctx, 20);
+        while let Some(b) = batches.next().await {
+            assert_eq!(b.expect("batch").batch.num_columns(), 1);
+        }
+    }
+    let source = build_source(
+        &endpoint,
+        config(20).prefix("proj/").parquet_columns(["nope"]),
+    )
+    .await;
+    let err = source.fetch_all().await.unwrap_err().to_string();
+    assert!(
+        err.contains("`nope`") && err.contains("proj/a.parquet"),
+        "{err}"
+    );
+}
