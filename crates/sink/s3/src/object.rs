@@ -304,4 +304,54 @@ mod tests {
     fn copy_sources_are_percent_encoded() {
         assert_eq!(copy_source("b", "d/a b+c.jsonl"), "b/d/a%20b%2Bc.jsonl");
     }
+
+    fn objects(endpoint: &str) -> S3Objects {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "k", "s", None, None, "test",
+            ))
+            .force_path_style(true)
+            .build();
+        S3Objects {
+            client: Client::from_conf(conf),
+            bucket: "b".into(),
+            concurrency: 1,
+            part_bytes: PART_BYTES,
+            roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_file_failures_name_the_step_and_the_key() {
+        let o = objects("http://127.0.0.1:9");
+        let dir = tempfile::tempdir().unwrap();
+        let e = o
+            .upload(&dir.path().join("missing"), "k1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("S3 stat local file error for key 'k1'"), "{e}");
+        let e = o.upload(dir.path(), "k2").await.unwrap_err().to_string();
+        assert!(e.contains("S3 read local file error for key 'k2'"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_download_into_a_missing_directory_is_an_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("x"))
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let e = o
+            .download("k", &dir.path().join("no/such/file"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("S3 create local copy error for key 'k'"), "{e}");
+    }
 }

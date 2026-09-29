@@ -468,6 +468,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    fn io(e: std::io::Error) -> FaucetError {
+        FaucetError::Sink(e.to_string())
+    }
+
     #[derive(Default)]
     struct Mem {
         objects: Mutex<BTreeMap<String, Vec<u8>>>,
@@ -492,13 +496,13 @@ mod tests {
         async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
             let body = self.objects.lock().unwrap().get(key).cloned();
             let body = body.ok_or_else(|| FaucetError::Sink(format!("missing {key}")))?;
-            std::fs::write(to, body).map_err(|e| FaucetError::Sink(e.to_string()))
+            std::fs::write(to, body).map_err(io)
         }
         async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
             if self.fail_upload.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(FaucetError::Sink("upload refused".into()));
             }
-            let body = std::fs::read(from).map_err(|e| FaucetError::Sink(e.to_string()))?;
+            let body = std::fs::read(from).map_err(io)?;
             self.objects.lock().unwrap().insert(key.to_string(), body);
             Ok(())
         }
