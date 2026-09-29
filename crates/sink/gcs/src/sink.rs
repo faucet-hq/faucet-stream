@@ -410,6 +410,7 @@ mod tests {
             .csv(faucet_core::CsvOptions {
                 delimiter: ";".into(),
                 has_headers: true,
+                ..Default::default()
             });
         assert!(!cfg.format.appends_per_record());
         let body = faucet_core::file_format::encode(

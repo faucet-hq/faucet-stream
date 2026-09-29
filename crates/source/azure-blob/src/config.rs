@@ -541,6 +541,7 @@ mod tests {
         cfg.csv = faucet_core::CsvOptions {
             delimiter: "\\t".into(),
             has_headers: false,
+            ..Default::default()
         };
         cfg.excel = faucet_core::ExcelOptions {
             sheet: Some("Q3".into()),

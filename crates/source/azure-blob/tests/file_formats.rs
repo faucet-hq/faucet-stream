@@ -155,6 +155,7 @@ async fn the_configured_csv_dialect_is_honoured() {
     cfg.csv = faucet_core::CsvOptions {
         delimiter: ";".into(),
         has_headers: true,
+        ..Default::default()
     };
     let src = AzureBlobSource::new(cfg).await.expect("source");
     assert_eq!(drain(&src).await, vec![json!({"id": "1", "name": "ada"})]);
