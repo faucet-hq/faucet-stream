@@ -368,6 +368,49 @@ impl SftpSinkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_writer_settings_follow_path_and_mode_rules() {
+        let mut c = SftpSinkConfig::new(
+            faucet_common_sftp::SftpConnectionConfig::with_password("h", "u", "p"),
+            "/out",
+        );
+        let s = c.settings().unwrap();
+        assert_eq!(s.format, faucet_core::FileFormat::JsonLines);
+        assert!(s.object_per_flush);
+        c.file_name = Some("d/part-{part}.txt".into());
+        c.format = SftpSinkFormat::Auto;
+        c.max_records_per_file = Some(7);
+        let s = c.settings().unwrap();
+        assert_eq!(s.format, faucet_core::FileFormat::RawText);
+        assert_eq!(s.max_records_per_file, Some(7));
+        assert!(c.validate().is_ok());
+        c.file_name = Some("{part}-{part}.jsonl".into());
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("more than one")
+        );
+        c.file_name = Some("x.unknownext".into());
+        assert!(c.settings().is_err());
+        c.file_name = None;
+        c.format = SftpSinkFormat::JsonLines;
+        c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+        assert!(c.settings().unwrap_err().to_string().contains("need"));
+        c.write_mode = faucet_common_file::write::FileWriteMode::Append;
+        c.mode = faucet_common_file::write::FileMode::Append;
+        assert!(c.validate().is_err());
+        c.mode = faucet_common_file::write::FileMode::Overwrite;
+        c.batch_size = 0;
+        c.max_records_per_file = None;
+        assert_eq!(c.settings().unwrap().max_records_per_file, None);
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        c.max_records_per_file = Some(3);
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert!(v.get("parquet").is_some() && v.get("json_lines").is_some());
+    }
     use faucet_common_sftp::SftpConnectionConfig;
 
     fn conn() -> SftpConnectionConfig {
