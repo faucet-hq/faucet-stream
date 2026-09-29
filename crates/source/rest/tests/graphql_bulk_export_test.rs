@@ -1,4 +1,4 @@
-//! Shopify-style bulk operations through the REST `async_job` (#768):
+//! GraphQL bulk export jobs through the REST `async_job` (#768):
 //! GraphQL submit → POST poll → JSONL download → row routing by GID type.
 
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
-const OP_ID: &str = "gid://shopify/BulkOperation/1";
+const OP_ID: &str = "gid://example/BulkOperation/1";
 
 /// Poll answers RUNNING `running` times, then the given terminal body.
 struct PollSequence {
@@ -150,11 +150,11 @@ fn jsonl(orders: usize, items_per_order: usize) -> String {
     let mut out = String::new();
     for o in 1..=orders {
         out.push_str(&format!(
-            "{{\"id\":\"gid://shopify/Order/{o}\",\"name\":\"#{o}\"}}\n"
+            "{{\"id\":\"gid://example/Order/{o}\",\"name\":\"#{o}\"}}\n"
         ));
         for i in 1..=items_per_order {
             out.push_str(&format!(
-                "{{\"id\":\"gid://shopify/LineItem/{o}{i}\",\"__parentId\":\"gid://shopify/Order/{o}\"}}\n"
+                "{{\"id\":\"gid://example/LineItem/{o}{i}\",\"__parentId\":\"gid://example/Order/{o}\"}}\n"
             ));
         }
     }
@@ -187,7 +187,7 @@ async fn bulk_parents_and_children_route_to_their_streams_once_each() {
     assert_eq!(records.len(), 6, "each record exactly once");
     assert!(orders.iter().all(|o| o.get("order_id").is_none()));
     assert!(items.iter().all(|i| i["order_id"] == i["__parentId"]));
-    assert_eq!(items[0]["order_id"], "gid://shopify/Order/1");
+    assert_eq!(items[0]["order_id"], "gid://example/Order/1");
     let mut ids: Vec<&str> = records.iter().map(|r| r["id"].as_str().unwrap()).collect();
     ids.sort();
     ids.dedup();
@@ -280,7 +280,7 @@ impl Respond for BusyThenOk {
         if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
             ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "bulkOperationRunQuery": { "bulkOperation": null, "userErrors": [
-                    { "field": null, "message": "A bulk query operation for this app and shop is already in progress: gid://shopify/BulkOperation/0." }
+                    { "field": null, "message": "A bulk query operation for this app and account is already in progress: gid://example/BulkOperation/0." }
                 ] } }
             }))
         } else {
@@ -376,7 +376,7 @@ async fn an_expired_download_url_fails_without_resubmitting() {
 async fn strict_routing_fails_on_an_unrouted_type() {
     let server = MockServer::start().await;
     mount_submit(&server, "bulkOperationRunQuery").await;
-    let body = format!("{}{{\"id\":\"gid://shopify/Refund/9\"}}\n", jsonl(1, 0));
+    let body = format!("{}{{\"id\":\"gid://example/Refund/9\"}}\n", jsonl(1, 0));
     let url = mount_result(&server, body).await;
     mount_poll(&server, 0, completed(json!(url))).await;
     let mut cfg = bulk_config(&server, json!({}));
@@ -392,7 +392,7 @@ async fn strict_routing_fails_on_an_unrouted_type() {
 async fn unrouted_types_are_dropped_and_only_selects_streams() {
     let server = MockServer::start().await;
     mount_submit(&server, "bulkOperationRunQuery").await;
-    let body = format!("{}{{\"id\":\"gid://shopify/Refund/9\"}}\n", jsonl(2, 1));
+    let body = format!("{}{{\"id\":\"gid://example/Refund/9\"}}\n", jsonl(2, 1));
     let url = mount_result(&server, body).await;
     mount_poll(&server, 0, completed(json!(url))).await;
     let mut cfg = bulk_config(&server, json!({}));

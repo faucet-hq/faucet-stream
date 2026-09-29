@@ -3,7 +3,7 @@
 //!
 //! A 204 has already been treated as an empty page since #146 M10; because a
 //! zero-record page stops every pagination style, an offset paginator that pages
-//! with `$top`/`$skip` and receives a 204 after the last data page (the ADP
+//! with `$top`/`$skip` and receives a 204 after the last data page (a common
 //! convention) stops without erroring on the empty body. This test locks that
 //! behavior in as a contract.
 
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
-/// One full data page, then a 204 (as ADP's `$top`/`$skip` feed signals "done").
+/// One full data page, then a 204 (as a `$top`/`$skip` feed signals "done").
 struct RowsThen204(Arc<AtomicUsize>);
 impl Respond for RowsThen204 {
     fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {

@@ -99,7 +99,7 @@ async fn a_meta_usage_header_waits_in_minutes() {
     let (server, calls) = serve(1, || {
         ResponseTemplate::new(400)
             .insert_header(
-                "x-business-use-case-usage",
+                "x-app-usage",
                 r#"{"act_1":[{"type":"ads_insights","estimated_time_to_regain_access":0.02}]}"#,
             )
             .set_body_json(json!({"error": {"code": 80004, "message": "too many calls"}}))
@@ -112,7 +112,7 @@ async fn a_meta_usage_header_waits_in_minutes() {
             "body_path": "$.error.code",
             "values": [80004],
             "backoff_from": {"type": "header_json", "config": {
-                "name": "x-business-use-case-usage",
+                "name": "x-app-usage",
                 "path": "$.*[0].estimated_time_to_regain_access",
                 "unit": "minutes"
             }}

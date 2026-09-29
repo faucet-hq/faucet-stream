@@ -1,7 +1,7 @@
 //! #629 — route small objects away from the async job's fixed latency floor.
 //!
 //! A bulk API pays job-queue + processing time whatever the row count:
-//! measured at ~14s of a 22s, 701-row Salesforce `User` run. A synchronous
+//! measured at ~14s of a 22s, 701-row bulk-export run. A synchronous
 //! query answers the same request immediately. Bulk is still right for the
 //! large objects it exists for, so the choice is made per run from a cheap
 //! count probe rather than from a guess baked into the config.

@@ -69,7 +69,7 @@ async fn nested_key_filters_advances_and_counts_missing() {
     stream.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
         RoundtripSide::Source,
         "p",
-        "jira",
+        "issues",
         "rest",
     )));
     let (records, bookmark) = run(&stream).await.unwrap();
@@ -82,7 +82,7 @@ async fn nested_key_filters_advances_and_counts_missing() {
         .into_iter()
         .filter(|(k, _, _, _)| {
             k.key().name() == "faucet_source_replication_key_missing_total"
-                && k.key().labels().any(|l| l.value() == "jira")
+                && k.key().labels().any(|l| l.value() == "issues")
         })
         .map(|(_, _, _, v)| match v {
             DebugValue::Counter(c) => c,

@@ -458,18 +458,18 @@ Two additions cover it:
 ```yaml
 matrix:
   - id: types                      # 1. object types
-    fan_out: { source: { ref: hs_schemas }, select: "$.name", as: name }
+    fan_out: { source: { ref: type_schemas }, select: "$.name", as: name }
   - id: props                      # 2. per type, collect its property names
     for_each: [types]
     fan_out:
-      source: { ref: hs_properties, config: { path: "/crm/v3/properties/${types.name}" } }
+      source: { ref: type_properties, config: { path: "/crm/v3/properties/${types.name}" } }
       select: "$.name"
       as: name
       collect: true
   - id: records                    # 3. per type, read with the whole list at once
     for_each: [types]
     source:
-      ref: hs_objects
+      ref: type_objects
       config:
         path: "/crm/v3/objects/${types.name}"
         query_params: { properties: "${props.name}" }
