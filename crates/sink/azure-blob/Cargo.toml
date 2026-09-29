@@ -62,6 +62,8 @@ object_store = { workspace = true, features = ["azure"] }
 # proven Azurite path used by `testcontainers-modules`' own tests).
 azure_storage = "0.21"
 azure_storage_blobs = "0.21"
+# The shared format × option matrix reads what landed back with the file source.
+faucet-source-file = { workspace = true, features = ["file-formats", "encryption"] }
 
 [package.metadata.docs.rs]
 all-features = true

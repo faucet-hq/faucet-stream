@@ -135,9 +135,50 @@ avro:
 ORC is read-only, so there is no `orc` format here. Enable with
 `file-format-avro` (or `file-formats`).
 
+## Shared file writer (#777)
+
+This sink writes through the same file-writing layer as the local
+[`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
+format and option the file sink does, with the same field names:
+
+| Field | Values | Notes |
+|---|---|---|
+| `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `path`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
+| `path` | a name template | blob name template: `{part}` numbers the blobs, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` blobs. |
+| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when a blob of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's blobs under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each blob's first page and widened by later pages. |
+| `json_lines` | `pretty` | |
+| `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+
+`mode` and `write_mode: overwrite` need `path`: without it every run
+writes new, uniquely named blobs (`<run id>-<part><file_extension>`), so
+there is nothing to replace or append to.
+
+**Publishing.** Each blob is built in a local scratch file and published
+with one upload (a committed block list past 8 MiB, aborted on failure) when it closes — at `max_records_per_file` /
+`max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
+partial blob, and a bookmark never advances past records that are not
+there.
+
+Blob names are `prefix + path`.
+
+```yaml
+sink:
+  type: azure-blob
+  config:
+    # … connection fields …
+    path: "dt=${now.date}/part-{part}.parquet"
+    format: auto
+    max_records_per_file: 1000000
+    parquet: { compression: zstd, row_group_size: 131072 }
+```
+
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **best-effort** — each object upload is atomic, but one batch can span several objects. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** without a rollover cap —
+a page is encoded locally and published only at `flush` — otherwise
+**best-effort**: blobs closed at an earlier cap stay. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

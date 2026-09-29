@@ -298,21 +298,20 @@ println!("Transferred {} records to S3", result.records_written);
 
 ## How it works
 
-1. `new()` validates `batch_size` and builds an S3 client **once** via the AWS SDK default credential chain, applying `region` / `endpoint_url` overrides if set.
-2. `write_batch()` computes the effective per-object cap (`min(batch_size, max_records_per_file)`) and splits the page into chunks.
-3. Each chunk is serialized to a JSON Lines body and assigned a UUID-based key (`{prefix}{uuid}{file_extension}`) *before* any upload begins.
-4. Chunks upload concurrently via `buffer_unordered(concurrency)` as single-shot `PutObject` calls with `Content-Type: application/x-ndjson`.
-5. With the `compression` feature, each body is compressed in memory just before upload using the codec resolved from `file_extension`.
+1. `new()` validates the config and builds an S3 client **once** via the AWS SDK default credential chain, applying `region` / `endpoint_url` overrides if set.
+2. `write_batch()` hands the page to the shared file writer, which encodes it into the open object's local scratch file.
+3. The object closes at the row / byte cap or at `flush` and is uploaded once — a single `PutObject` up to 8 MiB, a multipart upload beyond it — with a `Content-Type` from its extension.
+4. `compression` (the `compression` feature) is applied to the whole object before upload, resolved from `path` or `file_extension`.
 
 ## Object key format
 
-Each object is keyed `{prefix}{uuid}{file_extension}`. With `prefix = "events/"` and `file_extension = ".jsonl"`:
+Without `path`, each object is keyed `{prefix}{run id}-{part}{file_extension}`, where the run id is a time-ordered UUID fresh for each sink instance and `{part}` counts objects from `00001`. With `prefix = "events/"` and `file_extension = ".jsonl"`:
 
 ```
-events/a1b2c3d4-e5f6-7890-abcd-ef1234567890.jsonl
+events/01a0ecba-c433-70b7-9245-73029acfe6c2-00001.jsonl
 ```
 
-UUID keys make writes idempotent-safe against collisions but mean re-runs append new objects rather than overwriting — downstream consumers should treat the prefix as append-only.
+Keys are never reused, so re-runs add new objects rather than overwriting — treat the prefix as append-only, or set `path` for deterministic names.
 
 ## Lineage dataset URI
 
@@ -436,9 +435,50 @@ avro:
 ORC is read-only, so there is no `orc` format here. Enable with
 `file-format-avro` (or `file-formats`).
 
+## Shared file writer (#777)
+
+This sink writes through the same file-writing layer as the local
+[`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
+format and option the file sink does, with the same field names:
+
+| Field | Values | Notes |
+|---|---|---|
+| `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `path`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
+| `path` | a name template | object name template: `{part}` numbers the objects, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` objects. |
+| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when an object of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's objects under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each object's first page and widened by later pages. |
+| `json_lines` | `pretty` | |
+| `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+
+`mode` and `write_mode: overwrite` need `path`: without it every run
+writes new, uniquely named objects (`<run id>-<part><file_extension>`), so
+there is nothing to replace or append to.
+
+**Publishing.** Each object is built in a local scratch file and published
+with one upload (multipart past 8 MiB, parts in parallel up to `concurrency`, completed only after every part landed and aborted on failure) when it closes — at `max_records_per_file` /
+`max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
+partial object, and a bookmark never advances past records that are not
+there.
+
+Object keys are `prefix + path`.
+
+```yaml
+sink:
+  type: s3
+  config:
+    # … connection fields …
+    path: "dt=${now.date}/part-{part}.parquet"
+    format: auto
+    max_records_per_file: 1000000
+    parquet: { compression: zstd, row_group_size: 131072 }
+```
+
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** for an unchunked Parquet write (`format: parquet`, `batch_size: 0`, no `max_records_per_file`), otherwise **best-effort** — only an unchunked Parquet batch is one object upload. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **atomic** without a rollover cap —
+a page is encoded locally and published only at `flush` — otherwise
+**best-effort**: objects closed at an earlier cap stay. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

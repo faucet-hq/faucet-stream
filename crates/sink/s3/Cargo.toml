@@ -66,6 +66,9 @@ faucet-source-s3 = { workspace = true, features = [
     "file-format-xml",
 ] }
 faucet-core = { workspace = true, features = ["arrow", "file-format-parquet"] }
+# The shared format × option matrix reads what landed back with the file source.
+faucet-source-file = { workspace = true, features = ["file-formats", "encryption"] }
+tempfile.workspace = true
 # Golden parity test: the same records written by the Parquet sink to S3.
 faucet-sink-parquet = { workspace = true }
 aws-config = { workspace = true }

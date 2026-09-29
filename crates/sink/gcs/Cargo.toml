@@ -58,6 +58,9 @@ faucet-source-gcs = { workspace = true }
 reqwest = { workspace = true }
 urlencoding.workspace = true
 futures.workspace = true
+# The shared format × option matrix reads what landed back with the file source.
+faucet-source-file = { workspace = true, features = ["file-formats", "encryption"] }
+tempfile.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

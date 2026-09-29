@@ -322,13 +322,19 @@ impl SftpSinkConfig {
                 )));
             }
         }
+        if self.file_name.is_none()
+            && (self.write_mode == faucet_common_file::write::FileWriteMode::Overwrite
+                || self.mode != faucet_common_file::write::FileMode::Overwrite)
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "SFTP sink: `write_mode: overwrite` and `mode: append` / `error_if_exists` need \
+                 `file_name` — without it every run writes new, uniquely named objects"
+                    .into(),
+            ));
+        }
         let name = self.resolution_name();
         let format = self.format.resolve(&name)?;
-        let codec = if faucet_common_file::compresses_internally(format) {
-            faucet_core::Compression::None
-        } else {
-            self.codec(&name)
-        };
+        let codec = self.codec(&name);
         let mut s = faucet_common_file::write::WriteSettings::new(format, codec);
         s.opts = self.format_options();
         s.parquet = self.parquet.clone();
