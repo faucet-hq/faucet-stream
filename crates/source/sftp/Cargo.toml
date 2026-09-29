@@ -22,6 +22,11 @@ tokio = { workspace = true, features = ["rt", "macros", "io-util", "net"] }
 async-stream = { workspace = true }
 futures.workspace = true
 
+# The Parquet format + the columnar path (#777).
+[dependencies.arrow]
+workspace = true
+optional = true
+
 [features]
 # Uniform file formats (#604): CSV, XML and Excel files, decoded through
 # `faucet_core::file_format` so every file connector reads the same shapes with
@@ -33,10 +38,11 @@ file-format-excel = ["faucet-core/file-format-excel"]
 # take the columnar path; ORC is Arrow-native and turns `arrow` on.
 file-format-avro = ["faucet-core/file-format-avro"]
 file-format-orc = ["faucet-core/file-format-orc", "arrow"]
-arrow = ["faucet-core/arrow"]
+arrow = ["faucet-core/arrow", "faucet-core/file-format-parquet", "dep:arrow"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
 [dev-dependencies]
+parquet = { workspace = true }
 faucet-conformance.workspace = true
 faucet-common-sftp.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }

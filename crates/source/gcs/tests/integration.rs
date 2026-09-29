@@ -702,3 +702,51 @@ async fn avro_and_orc_objects_decode_on_both_paths() {
     assert_eq!(stream_all(&orc).await.len(), 3);
     assert_eq!(columnar(&orc).await, Ok(3));
 }
+
+/// `parquet.columns` (#777) projects on the ranged and the buffered path;
+/// an unknown column names the object.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn parquet_columns_project_on_both_read_paths() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows: Vec<_> = (0..5)
+        .map(|i| serde_json::json!({"id": i, "name": format!("n{i}")}))
+        .collect();
+    seed_bytes(
+        &host,
+        &bucket,
+        "proj/a.parquet",
+        parquet_bytes(&rows, 2),
+        "application/vnd.apache.parquet",
+    )
+    .await;
+    let build = |cols: &'static [&'static str], verify: bool| {
+        GcsSource::new(
+            GcsSourceConfig::new(&bucket)
+                .prefix("proj/")
+                .file_format(GcsFileFormat::Parquet)
+                .verify_checksum(verify)
+                .parquet_columns(cols.iter().copied())
+                .auth(GcsCredentials::Anonymous)
+                .storage_host(&host),
+        )
+    };
+    for verify in [false, true] {
+        let got = stream_all(&build(&["name"], verify).await.unwrap()).await;
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[0], serde_json::json!({"name": "n0"}), "verify={verify}");
+    }
+    let err = build(&["nope"], false)
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("`nope`") && err.contains("proj/a.parquet"),
+        "{err}"
+    );
+}

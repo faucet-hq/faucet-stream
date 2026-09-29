@@ -117,6 +117,7 @@ compression = [
     "faucet-sink-gcs?/compression",
     "faucet-source-azure-blob?/compression",
     "faucet-sink-azure-blob?/compression",
+    "faucet-sink-sftp?/compression",
 ]
 ## Uniform file formats (#604): read and write CSV / XML / Excel objects on
 ## every file connector that has been opted in. Optional-dep forwarding, so
@@ -217,7 +218,9 @@ arrow = [
     "faucet-source-databricks?/arrow",
     "faucet-source-iceberg?/arrow",
     "faucet-source-azure-blob?/arrow",
+    "faucet-sink-azure-blob?/arrow",
     "faucet-source-sftp?/arrow",
+    "faucet-sink-sftp?/arrow",
     "faucet-source-file?/arrow",
     "faucet-sink-file?/arrow",
     # Arrow-columnar CSV async-job streaming (#635), so a Bulk extract can

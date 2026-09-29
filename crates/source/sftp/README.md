@@ -121,3 +121,19 @@ columnar path (`avro → parquet` never builds JSON rows). Enable with
 `file-formats`. Details: the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
 
+
+## Parquet (#777)
+
+`format: parquet` (the `arrow` feature) reads Apache Parquet files. Each file
+is fetched whole (the footer is at the end) and decoded on a blocking thread;
+`parquet.columns` projects top-level columns before any row group is decoded,
+and a name a file does not have fails the run naming the file and its
+columns. With `arrow` the format joins the columnar path, where every file in
+the listing must share the first file's schema.
+
+```yaml
+format: parquet
+parquet:
+  columns: [id, amount]
+```
+

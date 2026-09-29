@@ -36,6 +36,16 @@ pub enum SftpSinkFormat {
     /// variant: ORC is read-only.
     #[cfg(feature = "file-format-avro")]
     Avro,
+    /// Apache Parquet, written with the `parquet` options; enables the
+    /// columnar fast path. Requires the `arrow` feature (#777).
+    #[cfg(feature = "arrow")]
+    Parquet,
+    /// Unparsed text: each record's `content` field (or the record as JSON)
+    /// on its own line (#777).
+    RawText,
+    /// Take the format from the file name's extension — `file_name`'s, else
+    /// `file_extension` — looking through a compression suffix (#777).
+    Auto,
 }
 
 impl SftpSinkFormat {
@@ -52,12 +62,24 @@ impl SftpSinkFormat {
             Self::Xlsx => faucet_core::FileFormat::Xlsx,
             #[cfg(feature = "file-format-avro")]
             Self::Avro => faucet_core::FileFormat::Avro,
+            #[cfg(feature = "arrow")]
+            Self::Parquet => faucet_core::FileFormat::Parquet,
+            Self::RawText => faucet_core::FileFormat::RawText,
+            Self::Auto => faucet_core::FileFormat::JsonLines,
         }
     }
 
-    /// Whether a file of this format can be built one record at a time.
-    pub(crate) fn appends_per_record(self) -> bool {
-        matches!(self, Self::JsonLines)
+    /// The format files are written in; `name` resolves `auto`.
+    pub(crate) fn resolve(
+        self,
+        name: &str,
+    ) -> Result<faucet_core::FileFormat, faucet_core::FaucetError> {
+        match self {
+            Self::Auto => faucet_common_file::FileFormatChoice::Auto
+                .resolve_writable(name)
+                .map_err(|e| faucet_core::FaucetError::Config(format!("SFTP sink: {e}"))),
+            other => Ok(other.shared()),
+        }
     }
 }
 
@@ -70,6 +92,27 @@ pub struct SftpSinkConfig {
     pub connection: SftpConnectionConfig,
     /// Remote directory prefix under which JSON Lines objects are written.
     pub path: String,
+    /// File-name template inside `path` — the file sink's `path` file name
+    /// (#777). May contain `{part}` (numbered files) and `${now.*}` tokens; a
+    /// trailing `/` is a subdirectory of `part-{part}<extension>` files. When
+    /// set, `file_extension` is not used. Unset: files are named
+    /// `<run id>-<part><file_extension>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// What to do when a file of the same name already exists: `overwrite`
+    /// (default), `append` (JSON Lines, CSV, raw text) or `error_if_exists`
+    /// (#777).
+    #[serde(default)]
+    pub mode: faucet_common_file::write::FileMode,
+    /// `overwrite` stages the run's files in a hidden directory and moves
+    /// them in only after a successful run (#777). Default `append`.
+    #[serde(default)]
+    pub write_mode: faucet_common_file::write::FileWriteMode,
+    /// Compression codec (default `auto`: from the file name's extension,
+    /// `.gz` / `.zst`). The `compression` feature (#777).
+    #[cfg(feature = "compression")]
+    #[serde(default)]
+    pub compression: faucet_core::CompressionConfig,
     /// File format (default `json_lines`) (#604).
     #[serde(default)]
     pub format: SftpSinkFormat,
@@ -108,6 +151,17 @@ pub struct SftpSinkConfig {
     /// Writer schema and block codec, used when `format: avro` (#719).
     #[serde(default)]
     pub avro: faucet_core::AvroOptions,
+    /// Parquet writer options, used when `format: parquet` (#777):
+    /// `compression`, `row_group_size`, explicit `schema`.
+    #[serde(default)]
+    pub parquet: faucet_common_file::write::ParquetOptions,
+    /// JSON Lines writer options (`pretty`), used when `format: json_lines`.
+    #[serde(default)]
+    pub json_lines: faucet_common_file::write::JsonLinesOptions,
+    /// Encrypt files at rest (#777; the `encryption` feature).
+    #[cfg(feature = "encryption")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<faucet_core::EncryptionSpec>,
 }
 
 fn default_file_extension() -> String {
@@ -133,6 +187,15 @@ impl SftpSinkConfig {
             excel: faucet_core::ExcelOptions::default(),
             xml: faucet_core::XmlOptions::default(),
             avro: faucet_core::AvroOptions::default(),
+            file_name: None,
+            mode: faucet_common_file::write::FileMode::default(),
+            write_mode: faucet_common_file::write::FileWriteMode::default(),
+            #[cfg(feature = "compression")]
+            compression: faucet_core::CompressionConfig::default(),
+            parquet: faucet_common_file::write::ParquetOptions::default(),
+            json_lines: faucet_common_file::write::JsonLinesOptions::default(),
+            #[cfg(feature = "encryption")]
+            encryption: None,
         }
     }
 
@@ -204,15 +267,150 @@ impl SftpSinkConfig {
 }
 
 impl SftpSinkConfig {
-    /// What a failed batch write leaves behind (#737): each file is atomic, but one batch can span several files.
+    /// The remote directory as a key prefix (`path` with a trailing `/`).
+    pub(crate) fn dir_prefix(&self) -> String {
+        if self.path.is_empty() || self.path.ends_with('/') {
+            self.path.clone()
+        } else {
+            format!("{}/", self.path)
+        }
+    }
+
+    /// Validate the config: batch size and the shared writer's settings.
+    pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        faucet_core::validate_batch_size(self.batch_size)?;
+        self.settings()?.validate()
+    }
+
+    /// The object name the format and codec are resolved from.
+    fn resolution_name(&self) -> String {
+        match &self.file_name {
+            Some(p) => format!("{}{p}", self.dir_prefix())
+                .replace(faucet_common_file::write::PART_TOKEN, "00001"),
+            None => self.file_extension.clone(),
+        }
+    }
+
+    fn codec(&self, _name: &str) -> faucet_core::Compression {
+        #[cfg(feature = "compression")]
+        {
+            faucet_common_file::resolve_compression(self.compression, _name)
+        }
+        #[cfg(not(feature = "compression"))]
+        {
+            faucet_core::Compression::None
+        }
+    }
+
+    /// The per-file record cap without `file_name`: `max_records_per_file`,
+    /// else `batch_size` (unless `0`).
+    fn legacy_cap(&self) -> Option<usize> {
+        self.max_records_per_file
+            .filter(|n| *n > 0)
+            .or((self.batch_size > 0).then_some(self.batch_size))
+    }
+
+    /// The shared writer's settings for this config (#777).
+    pub fn settings(
+        &self,
+    ) -> Result<faucet_common_file::write::WriteSettings, faucet_core::FaucetError> {
+        if let Some(path) = &self.file_name {
+            faucet_common_file::require_path("SFTP sink", path)?;
+            if path.matches(faucet_common_file::write::PART_TOKEN).count() > 1 {
+                return Err(faucet_core::FaucetError::Config(format!(
+                    "SFTP sink: '{path}' has more than one `{{part}}`"
+                )));
+            }
+        }
+        if self.file_name.is_none()
+            && (self.write_mode == faucet_common_file::write::FileWriteMode::Overwrite
+                || self.mode != faucet_common_file::write::FileMode::Overwrite)
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "SFTP sink: `write_mode: overwrite` and `mode: append` / `error_if_exists` need \
+                 `file_name` — without it every run writes new, uniquely named objects"
+                    .into(),
+            ));
+        }
+        let name = self.resolution_name();
+        let format = self.format.resolve(&name)?;
+        let codec = self.codec(&name);
+        let mut s = faucet_common_file::write::WriteSettings::new(format, codec);
+        s.opts = self.format_options();
+        s.parquet = self.parquet.clone();
+        s.json_lines = self.json_lines.clone();
+        s.mode = self.mode;
+        s.write_mode = self.write_mode;
+        s.max_records_per_file = match &self.file_name {
+            Some(_) => self.max_records_per_file.filter(|n| *n > 0),
+            None => self.legacy_cap(),
+        };
+        s.max_bytes_per_file = self.max_bytes_per_file;
+        #[cfg(feature = "encryption")]
+        {
+            s.encryption = self.encryption.clone();
+        }
+        s.object_per_flush = true;
+        Ok(s)
+    }
+
+    /// What a failed batch write leaves behind (#737): a page is encoded
+    /// locally and published only at a rollover or flush, so without a cap a
+    /// failed write publishes nothing; with one, objects closed earlier stay.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        faucet_core::BatchAtomicity::BestEffort
+        match self.settings() {
+            Ok(s) => s.batch_atomicity(),
+            Err(_) => faucet_core::BatchAtomicity::BestEffort,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_writer_settings_follow_path_and_mode_rules() {
+        let mut c = SftpSinkConfig::new(
+            faucet_common_sftp::SftpConnectionConfig::with_password("h", "u", "p"),
+            "/out",
+        );
+        let s = c.settings().unwrap();
+        assert_eq!(s.format, faucet_core::FileFormat::JsonLines);
+        assert!(s.object_per_flush);
+        c.file_name = Some("d/part-{part}.txt".into());
+        c.format = SftpSinkFormat::Auto;
+        c.max_records_per_file = Some(7);
+        let s = c.settings().unwrap();
+        assert_eq!(s.format, faucet_core::FileFormat::RawText);
+        assert_eq!(s.max_records_per_file, Some(7));
+        assert!(c.validate().is_ok());
+        c.file_name = Some("{part}-{part}.jsonl".into());
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("more than one")
+        );
+        c.file_name = Some("x.unknownext".into());
+        assert!(c.settings().is_err());
+        c.file_name = None;
+        c.format = SftpSinkFormat::JsonLines;
+        c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+        assert!(c.settings().unwrap_err().to_string().contains("need"));
+        c.write_mode = faucet_common_file::write::FileWriteMode::Append;
+        c.mode = faucet_common_file::write::FileMode::Append;
+        assert!(c.validate().is_err());
+        c.mode = faucet_common_file::write::FileMode::Overwrite;
+        c.batch_size = 0;
+        c.max_records_per_file = None;
+        assert_eq!(c.settings().unwrap().max_records_per_file, None);
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        c.max_records_per_file = Some(3);
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert!(v.get("parquet").is_some() && v.get("json_lines").is_some());
+    }
     use faucet_common_sftp::SftpConnectionConfig;
 
     fn conn() -> SftpConnectionConfig {
@@ -251,24 +449,6 @@ mod tests {
     }
 
     // ── file formats (#604) ───────────────────────────────────────────────
-
-    /// Only JSON Lines can be appended a record at a time. That predicate
-    /// routes a write between the streaming byte accumulator and the buffered
-    /// record one, so a wrong answer silently changes how objects are built.
-    #[test]
-    fn only_json_lines_appends_per_record() {
-        assert!(SftpSinkFormat::JsonLines.appends_per_record());
-        assert!(!SftpSinkFormat::JsonArray.appends_per_record());
-        assert_eq!(SftpSinkFormat::default(), SftpSinkFormat::JsonLines);
-        #[cfg(feature = "file-format-csv")]
-        assert!(!SftpSinkFormat::Csv.appends_per_record());
-        #[cfg(feature = "file-format-xml")]
-        assert!(!SftpSinkFormat::Xml.appends_per_record());
-        #[cfg(feature = "file-format-excel")]
-        assert!(!SftpSinkFormat::Xlsx.appends_per_record());
-        #[cfg(feature = "file-format-avro")]
-        assert!(!SftpSinkFormat::Avro.appends_per_record());
-    }
 
     /// Every variant maps onto exactly one shared format, so what this sink
     /// writes is what the file sources read back.

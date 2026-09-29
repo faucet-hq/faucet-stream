@@ -23,6 +23,8 @@ tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true, features = ["io"] }
 futures.workspace = true
 object_store = { workspace = true, features = ["azure"] }
+# Parquet batches on the columnar path (#777).
+arrow = { workspace = true, optional = true }
 
 [features]
 compression = ["faucet-core/compression"]
@@ -36,7 +38,7 @@ file-format-excel = ["faucet-core/file-format-excel"]
 # take the columnar path; ORC is Arrow-native and turns `arrow` on.
 file-format-avro = ["faucet-core/file-format-avro"]
 file-format-orc = ["faucet-core/file-format-orc", "arrow"]
-arrow = ["faucet-core/arrow"]
+arrow = ["faucet-core/arrow", "faucet-core/file-format-parquet", "dep:arrow"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
 [dev-dependencies]
@@ -55,6 +57,8 @@ object_store = { workspace = true, features = ["azure"] }
 # proven Azurite path used by `testcontainers-modules`' own tests).
 azure_storage = "0.21"
 azure_storage_blobs = "0.21"
+# Writes Parquet fixtures for the `parquet` integration test.
+parquet = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

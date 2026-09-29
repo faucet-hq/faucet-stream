@@ -7285,6 +7285,11 @@
           "description": "Apache ORC, projected by [`orc.columns`](SftpSourceConfig::orc). **Buffered\nwhole** (the footer sits at the end) and decoded stripe by stripe;\njoins the columnar path. Requires `file-format-orc` (#719).",
           "type": "string",
           "const": "orc"
+        },
+        {
+          "description": "Apache Parquet, projected by [`parquet.columns`](SftpSourceConfig::parquet).\n**Buffered whole** (the footer sits at the end); joins the columnar\npath. Requires the `arrow` feature (#777).",
+          "type": "string",
+          "const": "parquet"
         }
       ]
     },
@@ -8281,6 +8286,11 @@
           "description": "Apache ORC, projected by [`orc.columns`](AzureBlobSourceConfig::orc). **Buffered\nwhole** (the footer sits at the end) and decoded stripe by stripe;\njoins the columnar path. Requires `file-format-orc` (#719).",
           "type": "string",
           "const": "orc"
+        },
+        {
+          "description": "Apache Parquet, projected by [`parquet.columns`](AzureBlobSourceConfig::parquet).\n**Buffered whole** (the footer sits at the end); joins the columnar\npath. Requires the `arrow` feature (#777).",
+          "type": "string",
+          "const": "parquet"
         }
       ]
     },
@@ -11691,6 +11701,21 @@
           "description": "An Apache Avro Object Container File, against `avro.schema` or a\nschema inferred from the object's records; block codec from\n`avro.codec`. Requires `file-format-avro` (#719). There is no ORC\nvariant: ORC is read-only.",
           "type": "string",
           "const": "avro"
+        },
+        {
+          "description": "Apache Parquet, written with the `parquet` options; enables the\ncolumnar fast path. Requires the `arrow` feature (#777).",
+          "type": "string",
+          "const": "parquet"
+        },
+        {
+          "description": "Unparsed text: each record's `content` field (or the record as JSON)\non its own line (#777).",
+          "type": "string",
+          "const": "raw_text"
+        },
+        {
+          "description": "Take the format from the file name's extension — `file_name`'s, else\n`file_extension` — looking through a compression suffix (#777).",
+          "type": "string",
+          "const": "auto"
         }
       ]
     },
@@ -11820,6 +11845,16 @@
           "description": "An Apache Avro Object Container File, against `avro.schema` or a\nschema inferred from the object's records; block codec from\n`avro.codec`. Requires `file-format-avro` (#719). There is no ORC\nvariant: ORC is read-only.",
           "type": "string",
           "const": "avro"
+        },
+        {
+          "description": "Unparsed text: each record's `content` field (or the record as JSON)\non its own line (#777).",
+          "type": "string",
+          "const": "raw_text"
+        },
+        {
+          "description": "Take the format from the object name's extension — `path`'s, else\n`file_extension` — looking through a compression suffix (#777).",
+          "type": "string",
+          "const": "auto"
         }
       ]
     },
@@ -13501,6 +13536,16 @@
           "description": "An Apache Avro Object Container File, against `avro.schema` or a\nschema inferred from the object's records; block codec from\n`avro.codec`. Requires `file-format-avro` (#719). There is no ORC\nvariant: ORC is read-only.",
           "type": "string",
           "const": "avro"
+        },
+        {
+          "description": "Unparsed text: each record's `content` field (or the record as JSON)\non its own line (#777).",
+          "type": "string",
+          "const": "raw_text"
+        },
+        {
+          "description": "Take the format from the object name's extension — `path`'s, else\n`file_extension` — looking through a compression suffix (#777).",
+          "type": "string",
+          "const": "auto"
         }
       ]
     },
@@ -14257,6 +14302,21 @@
           "description": "An Apache Avro Object Container File, against `avro.schema` or a\nschema inferred from the object's records; block codec from\n`avro.codec`. Requires `file-format-avro` (#719). There is no ORC\nvariant: ORC is read-only.",
           "type": "string",
           "const": "avro"
+        },
+        {
+          "description": "Apache Parquet: each object is a complete, self-contained Parquet\nfile, written with the `parquet` options; enables the columnar fast\npath. Requires the `arrow` feature (#777).",
+          "type": "string",
+          "const": "parquet"
+        },
+        {
+          "description": "Unparsed text: each record's `content` field (or the record as JSON)\non its own line (#777).",
+          "type": "string",
+          "const": "raw_text"
+        },
+        {
+          "description": "Take the format from the object name's extension — `path`'s, else\n`file_extension` — looking through a compression suffix (#777).",
+          "type": "string",
+          "const": "auto"
         }
       ]
     },
@@ -16492,150 +16552,6 @@
                         "record_element": "record",
                         "root_element": "records"
                       }
-                    }
-                  }
-                },
-                true,
-                {
-                  "oneOf": [
-                    {
-                      "description": "Password authentication.",
-                      "type": "object",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "password"
-                        },
-                        "config": {
-                          "type": "object",
-                          "properties": {
-                            "password": {
-                              "description": "The account password.",
-                              "type": "string"
-                            }
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "description": "Public-key authentication with an OpenSSH/PEM private key on disk.",
-                      "type": "object",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "private_key"
-                        },
-                        "config": {
-                          "type": "object",
-                          "properties": {
-                            "path": {
-                              "description": "Path to the private-key file.",
-                              "type": "string"
-                            },
-                            "passphrase": {
-                              "description": "Optional passphrase used to decrypt an encrypted private key.",
-                              "type": [
-                                "string",
-                                "null"
-                              ],
-                              "default": null
-                            }
-                          }
-                        }
-                      }
-                    }
-                  ],
-                  "title": "SftpSourceConfig",
-                  "description": "Configuration for the SFTP source connector.",
-                  "type": "object",
-                  "properties": {
-                    "host": {
-                      "description": "Server hostname or IP address.",
-                      "type": "string"
-                    },
-                    "port": {
-                      "description": "Server port (default: 22).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint16",
-                      "minimum": 0,
-                      "maximum": 65535,
-                      "default": 22
-                    },
-                    "username": {
-                      "description": "SSH username.",
-                      "type": "string"
-                    },
-                    "known_hosts": {
-                      "description": "Host-key verification policy (default: `accept_new`).",
-                      "$ref": "#/$defs/source_sftp__HostKeyPolicy",
-                      "default": {
-                        "mode": "accept_new"
-                      }
-                    },
-                    "path": {
-                      "description": "Remote path to read: a directory whose files are listed and streamed,\nor a single file.",
-                      "type": "string"
-                    },
-                    "glob": {
-                      "description": "Optional filename glob (`*` / `?`) applied to the basenames of files in\na directory listing. Ignored when `path` points at a single file.",
-                      "type": [
-                        "string",
-                        "null"
-                      ],
-                      "default": null
-                    },
-                    "format": {
-                      "description": "Format of the files to read (default: `jsonl`).",
-                      "$ref": "#/$defs/source_sftp__SftpFormat",
-                      "default": "jsonl"
-                    },
-                    "batch_size": {
-                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). For\n`jsonl` / `raw_text`, files are decoded incrementally and a page is\nyielded whenever the buffer reaches this size (bounded memory). For\n`json_array`, each file is buffered fully, then its records are chunked\ninto pages of this size. Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: one page is emitted per\nfile.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 1000
-                    },
-                    "concurrency": {
-                      "description": "Maximum number of files read concurrently (default: 4).\n\nReads are overlapped with a bounded look-ahead in listing order, so\nthroughput improves without changing which file an error is attributed\nto. Lower than the object-store sources' default because every read\nshares one SSH channel, and many servers cap concurrent open handles.\n`0` is treated as `1`.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 4
-                    },
-                    "csv": {
-                      "description": "CSV dialect, used when `format: csv` (#604).",
-                      "$ref": "#/$defs/source_sftp__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet selection, used when `format: xlsx` (#604).",
-                      "$ref": "#/$defs/source_sftp__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `format: xml` (#604).",
-                      "$ref": "#/$defs/source_sftp__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
                     },
                     "avro": {
                       "description": "Reader schema, used when `format: avro` (#719).",
@@ -16648,9 +16564,15 @@
                       "description": "Column projection, used when `format: orc` (#719).",
                       "$ref": "#/$defs/source_sftp__OrcOptions",
                       "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `format: parquet` (#777).",
+                      "$ref": "#/$defs/source_sftp__ParquetReadOptions",
+                      "default": {}
                     }
                   }
-                }
+                },
+                true
               ]
             },
             "transforms": {
@@ -16794,124 +16716,6 @@
                         "record_element": "record",
                         "root_element": "records"
                       }
-                    }
-                  },
-                  "title": "S3SourceConfig",
-                  "description": "Configuration for the S3 source connector.",
-                  "type": "object"
-                },
-                true,
-                {
-                  "properties": {
-                    "bucket": {
-                      "description": "S3 bucket name.",
-                      "type": "string"
-                    },
-                    "prefix": {
-                      "description": "Object key prefix filter.",
-                      "type": [
-                        "string",
-                        "null"
-                      ],
-                      "default": null
-                    },
-                    "region": {
-                      "description": "AWS region. `None` uses the SDK default.",
-                      "type": [
-                        "string",
-                        "null"
-                      ],
-                      "default": null
-                    },
-                    "endpoint_url": {
-                      "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO).",
-                      "type": [
-                        "string",
-                        "null"
-                      ],
-                      "default": null
-                    },
-                    "file_format": {
-                      "description": "Format of the files to read. Defaults to `json_lines`.",
-                      "$ref": "#/$defs/source_s3__S3FileFormat",
-                      "default": "json_lines"
-                    },
-                    "max_objects": {
-                      "description": "Maximum number of objects to read.",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": null
-                    },
-                    "concurrency": {
-                      "description": "Maximum number of concurrent object reads (default: 10).\n\nThese `#[serde(default)]`s are the same oversight the REST source\ncarried: without them every field here was **required**, so a config\nnaming only `bucket` could not deserialize at all (#609). `bucket` is\nthe one genuinely required field.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 10
-                    },
-                    "batch_size": {
-                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). For\n`JsonLines` and `RawText` formats, the object body is decoded\nline-by-line via [`tokio::io::AsyncBufReadExt`] and a page is yielded\nwhenever the buffer reaches this size; multi-object scans flatten so\na single page may contain lines from any object. For `JsonArray`,\neach object is buffered fully before its records are chunked into\npages of this size (see the README \"Streaming and batching\" section\nfor the caveat). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: every page is one\ncomplete object — no within-object chunking. Useful for small\nlookup files, or for sinks (e.g. SQL `COPY`, BigQuery load jobs)\nthat prefer one large request per file to many small ones.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 1000
-                    },
-                    "verify_length": {
-                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": true
-                    },
-                    "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": false
-                    },
-                    "compression": {
-                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
-                      "$ref": "#/$defs/source_s3__CompressionConfig",
-                      "default": "auto"
-                    },
-                    "csv": {
-                      "description": "CSV dialect, used when `file_format: csv` (#604).",
-                      "$ref": "#/$defs/source_s3__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
-                      "$ref": "#/$defs/source_s3__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `file_format: xml` (#604).",
-                      "$ref": "#/$defs/source_s3__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
                     },
                     "avro": {
                       "description": "Reader schema, used when `file_format: avro` (#719).",
@@ -16924,12 +16728,18 @@
                       "description": "Column projection, used when `file_format: orc` (#719).",
                       "$ref": "#/$defs/source_s3__OrcOptions",
                       "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
+                      "$ref": "#/$defs/source_s3__ParquetReadOptions",
+                      "default": {}
                     }
                   },
                   "title": "S3SourceConfig",
                   "description": "Configuration for the S3 source connector.",
                   "type": "object"
-                }
+                },
+                true
               ]
             },
             "transforms": {
@@ -17952,153 +17762,6 @@
                         "record_element": "record",
                         "root_element": "records"
                       }
-                    }
-                  },
-                  "title": "AzureBlobSourceConfig",
-                  "description": "Configuration for the Azure Blob source connector.",
-                  "type": "object"
-                },
-                true,
-                {
-                  "properties": {
-                    "container": {
-                      "description": "Blob container / ADLS Gen2 filesystem name. Required.",
-                      "type": "string"
-                    },
-                    "account": {
-                      "description": "Storage-account name. Optional when a connection string or the\nemulator supplies it, otherwise required.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "auth": {
-                      "description": "Credential source. Defaults to the environment / managed-identity\ncredential chain.",
-                      "$ref": "#/$defs/source_azure-blob__AzureCredentials",
-                      "default": {
-                        "type": "default"
-                      }
-                    },
-                    "endpoint": {
-                      "description": "Custom blob endpoint (e.g. an Azurite emulator or a sovereign cloud).",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "allow_http": {
-                      "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": false
-                    },
-                    "use_emulator": {
-                      "description": "Target the Azurite storage emulator with its well-known\n`devstoreaccount1` credentials.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": false
-                    },
-                    "prefix": {
-                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "object_keys": {
-                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
-                      "type": [
-                        "array",
-                        "null"
-                      ],
-                      "items": {
-                        "type": "string"
-                      }
-                    },
-                    "file_format": {
-                      "description": "File format.",
-                      "$ref": "#/$defs/source_azure-blob__AzureFileFormat",
-                      "default": "json_lines"
-                    },
-                    "max_objects": {
-                      "description": "Hard cap on the number of objects read (after listing).",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "concurrency": {
-                      "description": "Maximum concurrent object reads (default: 10).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 10
-                    },
-                    "batch_size": {
-                      "description": "Records per emitted `StreamPage`. `batch_size = 0` is the \"no batching\"\nsentinel and emits one page per object.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 1000
-                    },
-                    "verify_length": {
-                      "description": "Verify each blob's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer. Cheap — a byte counter over a body\nthat is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored blob's.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": true
-                    },
-                    "verify_checksum": {
-                      "description": "Not supported on Azure Blob: `object_store` exposes no `Content-MD5`\nattribute and an Azure ETag is not a content hash, so there is nothing\nto verify against. Setting it `true` is **rejected at config load**\nrather than silently ignored — see `validate()`.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": false
-                    },
-                    "compression": {
-                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the\ncodec is resolved per-object-key, so a single source can read a mix of\ncompressed and uncompressed objects. Requires the crate-local\n`compression` feature.",
-                      "$ref": "#/$defs/source_azure-blob__CompressionConfig",
-                      "default": "auto"
-                    },
-                    "csv": {
-                      "description": "CSV dialect, used when `file_format: csv` (#604).",
-                      "$ref": "#/$defs/source_azure-blob__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
-                      "$ref": "#/$defs/source_azure-blob__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `file_format: xml` (#604).",
-                      "$ref": "#/$defs/source_azure-blob__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
                     },
                     "avro": {
                       "description": "Reader schema, used when `file_format: avro` (#719).",
@@ -18111,12 +17774,18 @@
                       "description": "Column projection, used when `file_format: orc` (#719).",
                       "$ref": "#/$defs/source_azure-blob__OrcOptions",
                       "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777).",
+                      "$ref": "#/$defs/source_azure-blob__ParquetReadOptions",
+                      "default": {}
                     }
                   },
                   "title": "AzureBlobSourceConfig",
                   "description": "Configuration for the Azure Blob source connector.",
                   "type": "object"
-                }
+                },
+                true
               ]
             },
             "transforms": {
@@ -19613,130 +19282,6 @@
                         "record_element": "record",
                         "root_element": "records"
                       }
-                    }
-                  },
-                  "title": "GcsSourceConfig",
-                  "description": "Configuration for the GCS source connector.",
-                  "type": "object"
-                },
-                true,
-                {
-                  "properties": {
-                    "bucket": {
-                      "description": "GCS bucket name.",
-                      "type": "string"
-                    },
-                    "prefix": {
-                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "object_keys": {
-                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
-                      "type": [
-                        "array",
-                        "null"
-                      ],
-                      "items": {
-                        "type": "string"
-                      }
-                    },
-                    "auth": {
-                      "description": "Credential source.",
-                      "$ref": "#/$defs/source_gcs__GcsCredentials",
-                      "default": {
-                        "type": "application_default"
-                      }
-                    },
-                    "file_format": {
-                      "description": "File format.",
-                      "$ref": "#/$defs/source_gcs__GcsFileFormat",
-                      "default": "json_lines"
-                    },
-                    "max_objects": {
-                      "description": "Hard cap on the number of objects read (after listing).",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "concurrency": {
-                      "description": "Maximum concurrent object reads (default: 10).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 10
-                    },
-                    "batch_size": {
-                      "description": "Records per emitted `StreamPage`. See \"Streaming and batching\"\nin the README. `batch_size = 0` is the \"no batching\" sentinel and\nemits one page per object.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 1000
-                    },
-                    "verify_length": {
-                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": true
-                    },
-                    "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": false
-                    },
-                    "storage_host": {
-                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "compression": {
-                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
-                      "$ref": "#/$defs/source_gcs__CompressionConfig",
-                      "default": "auto"
-                    },
-                    "csv": {
-                      "description": "CSV dialect, used when `file_format: csv` (#604).",
-                      "$ref": "#/$defs/source_gcs__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
-                      "$ref": "#/$defs/source_gcs__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `file_format: xml` (#604).",
-                      "$ref": "#/$defs/source_gcs__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
                     },
                     "avro": {
                       "description": "Reader schema, used when `file_format: avro` (#719).",
@@ -19749,12 +19294,18 @@
                       "description": "Column projection, used when `file_format: orc` (#719).",
                       "$ref": "#/$defs/source_gcs__OrcOptions",
                       "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
+                      "$ref": "#/$defs/source_gcs__ParquetReadOptions",
+                      "default": {}
                     }
                   },
                   "title": "GcsSourceConfig",
                   "description": "Configuration for the GCS source connector.",
                   "type": "object"
-                }
+                },
+                true
               ]
             },
             "transforms": {
@@ -20968,6 +20519,542 @@
                       ]
                     }
                   }
+                },
+                true
+              ]
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "s3",
+          "properties": {
+            "type": {
+              "const": "s3"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "bucket": {
+                      "description": "S3 bucket name.",
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "description": "Object key prefix filter.",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "region": {
+                      "description": "AWS region. `None` uses the SDK default.",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "endpoint_url": {
+                      "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO).",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "file_format": {
+                      "description": "Format of the files to read. Defaults to `json_lines`.",
+                      "$ref": "#/$defs/source_s3__S3FileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Maximum number of objects to read.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": null
+                    },
+                    "concurrency": {
+                      "description": "Maximum number of concurrent object reads (default: 10).\n\nThese `#[serde(default)]`s are the same oversight the REST source\ncarried: without them every field here was **required**, so a config\nnaming only `bucket` could not deserialize at all (#609). `bucket` is\nthe one genuinely required field.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). For\n`JsonLines` and `RawText` formats, the object body is decoded\nline-by-line via [`tokio::io::AsyncBufReadExt`] and a page is yielded\nwhenever the buffer reaches this size; multi-object scans flatten so\na single page may contain lines from any object. For `JsonArray`,\neach object is buffered fully before its records are chunked into\npages of this size (see the README \"Streaming and batching\" section\nfor the caveat). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: every page is one\ncomplete object — no within-object chunking. Useful for small\nlookup files, or for sinks (e.g. SQL `COPY`, BigQuery load jobs)\nthat prefer one large request per file to many small ones.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
+                      "$ref": "#/$defs/source_s3__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_s3__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_s3__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_s3__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    },
+                    "avro": {
+                      "description": "Reader schema, used when `file_format: avro` (#719).",
+                      "$ref": "#/$defs/source_s3__AvroOptions",
+                      "default": {
+                        "codec": "null"
+                      }
+                    },
+                    "orc": {
+                      "description": "Column projection, used when `file_format: orc` (#719).",
+                      "$ref": "#/$defs/source_s3__OrcOptions",
+                      "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
+                      "$ref": "#/$defs/source_s3__ParquetReadOptions",
+                      "default": {}
+                    }
+                  },
+                  "title": "S3SourceConfig",
+                  "description": "Configuration for the S3 source connector.",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "azure-blob",
+          "properties": {
+            "type": {
+              "const": "azure-blob"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "container": {
+                      "description": "Blob container / ADLS Gen2 filesystem name. Required.",
+                      "type": "string"
+                    },
+                    "account": {
+                      "description": "Storage-account name. Optional when a connection string or the\nemulator supplies it, otherwise required.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "auth": {
+                      "description": "Credential source. Defaults to the environment / managed-identity\ncredential chain.",
+                      "$ref": "#/$defs/source_azure-blob__AzureCredentials",
+                      "default": {
+                        "type": "default"
+                      }
+                    },
+                    "endpoint": {
+                      "description": "Custom blob endpoint (e.g. an Azurite emulator or a sovereign cloud).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "allow_http": {
+                      "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "use_emulator": {
+                      "description": "Target the Azurite storage emulator with its well-known\n`devstoreaccount1` credentials.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "prefix": {
+                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "object_keys": {
+                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "file_format": {
+                      "description": "File format.",
+                      "$ref": "#/$defs/source_azure-blob__AzureFileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Hard cap on the number of objects read (after listing).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "concurrency": {
+                      "description": "Maximum concurrent object reads (default: 10).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted `StreamPage`. `batch_size = 0` is the \"no batching\"\nsentinel and emits one page per object.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each blob's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer. Cheap — a byte counter over a body\nthat is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored blob's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Not supported on Azure Blob: `object_store` exposes no `Content-MD5`\nattribute and an Azure ETag is not a content hash, so there is nothing\nto verify against. Setting it `true` is **rejected at config load**\nrather than silently ignored — see `validate()`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the\ncodec is resolved per-object-key, so a single source can read a mix of\ncompressed and uncompressed objects. Requires the crate-local\n`compression` feature.",
+                      "$ref": "#/$defs/source_azure-blob__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    },
+                    "avro": {
+                      "description": "Reader schema, used when `file_format: avro` (#719).",
+                      "$ref": "#/$defs/source_azure-blob__AvroOptions",
+                      "default": {
+                        "codec": "null"
+                      }
+                    },
+                    "orc": {
+                      "description": "Column projection, used when `file_format: orc` (#719).",
+                      "$ref": "#/$defs/source_azure-blob__OrcOptions",
+                      "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777).",
+                      "$ref": "#/$defs/source_azure-blob__ParquetReadOptions",
+                      "default": {}
+                    }
+                  },
+                  "title": "AzureBlobSourceConfig",
+                  "description": "Configuration for the Azure Blob source connector.",
+                  "type": "object"
+                },
+                true
+              ]
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "gcs",
+          "properties": {
+            "type": {
+              "const": "gcs"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "bucket": {
+                      "description": "GCS bucket name.",
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "object_keys": {
+                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "auth": {
+                      "description": "Credential source.",
+                      "$ref": "#/$defs/source_gcs__GcsCredentials",
+                      "default": {
+                        "type": "application_default"
+                      }
+                    },
+                    "file_format": {
+                      "description": "File format.",
+                      "$ref": "#/$defs/source_gcs__GcsFileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Hard cap on the number of objects read (after listing).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "concurrency": {
+                      "description": "Maximum concurrent object reads (default: 10).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted `StreamPage`. See \"Streaming and batching\"\nin the README. `batch_size = 0` is the \"no batching\" sentinel and\nemits one page per object.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "storage_host": {
+                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
+                      "$ref": "#/$defs/source_gcs__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_gcs__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_gcs__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_gcs__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    },
+                    "avro": {
+                      "description": "Reader schema, used when `file_format: avro` (#719).",
+                      "$ref": "#/$defs/source_gcs__AvroOptions",
+                      "default": {
+                        "codec": "null"
+                      }
+                    },
+                    "orc": {
+                      "description": "Column projection, used when `file_format: orc` (#719).",
+                      "$ref": "#/$defs/source_gcs__OrcOptions",
+                      "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
+                      "$ref": "#/$defs/source_gcs__ParquetReadOptions",
+                      "default": {}
+                    }
+                  },
+                  "title": "GcsSourceConfig",
+                  "description": "Configuration for the GCS source connector.",
+                  "type": "object"
                 },
                 true
               ]
@@ -22577,156 +22664,27 @@
                       "description": "Remote directory prefix under which JSON Lines objects are written.",
                       "type": "string"
                     },
-                    "format": {
-                      "description": "File format (default `json_lines`) (#604).",
-                      "$ref": "#/$defs/sink_sftp__SftpSinkFormat",
-                      "default": "json_lines"
-                    },
-                    "file_extension": {
-                      "description": "File extension for written objects (default: `.jsonl`).",
-                      "type": "string",
-                      "default": ".jsonl"
-                    },
-                    "batch_size": {
-                      "description": "Records per written object. When a `write_batch` call hands the sink\n`N` records with `batch_size = M > 0`, the sink writes `ceil(N / M)`\nobjects. `batch_size = 0` writes whatever upstream hands it as a single\nobject. Defaults to [`DEFAULT_BATCH_SIZE`].",
+                    "file_name": {
+                      "description": "File-name template inside `path` — the file sink's `path` file name\n(#777). May contain `{part}` (numbered files) and `${now.*}` tokens; a\ntrailing `/` is a subdirectory of `part-{part}<extension>` files. When\nset, `file_extension` is not used. Unset: files are named\n`<run id>-<part><file_extension>`.",
                       "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 1000
+                        "string",
+                        "null"
+                      ]
                     },
-                    "max_records_per_file": {
-                      "description": "Maximum records per file before rolling to a new one (#618). `None`\nremoves the record cap; the sink accumulates across `write_batch`\ncalls, so a small upstream page no longer means a small file.",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
+                    "mode": {
+                      "description": "What to do when a file of the same name already exists: `overwrite`\n(default), `append` (JSON Lines, CSV, raw text) or `error_if_exists`\n(#777).",
+                      "$ref": "#/$defs/sink_sftp__FileMode",
+                      "default": "overwrite"
                     },
-                    "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per file before rolling to a new one (#618).\n\nRows are a poor proxy for file size, so a rows-only cap either writes\ntiny files for narrow data or unbounded ones for wide data. This is\nalso what bounds peak memory: the open file's body is buffered until it\nrolls. `None` (the default) removes the byte cap; a single record\nlarger than the cap still gets its own file rather than being split.",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
+                    "write_mode": {
+                      "description": "`overwrite` stages the run's files in a hidden directory and moves\nthem in only after a successful run (#777). Default `append`.",
+                      "$ref": "#/$defs/sink_sftp__FileWriteMode",
+                      "default": "append"
                     },
-                    "csv": {
-                      "description": "CSV dialect, used when `format: csv` (#604).",
-                      "$ref": "#/$defs/sink_sftp__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet name, used when `format: xlsx` (#604).",
-                      "$ref": "#/$defs/sink_sftp__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `format: xml` (#604).",
-                      "$ref": "#/$defs/sink_sftp__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
-                    }
-                  }
-                },
-                true,
-                {
-                  "oneOf": [
-                    {
-                      "description": "Password authentication.",
-                      "type": "object",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "password"
-                        },
-                        "config": {
-                          "type": "object",
-                          "properties": {
-                            "password": {
-                              "description": "The account password.",
-                              "type": "string"
-                            }
-                          }
-                        }
-                      }
-                    },
-                    {
-                      "description": "Public-key authentication with an OpenSSH/PEM private key on disk.",
-                      "type": "object",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "const": "private_key"
-                        },
-                        "config": {
-                          "type": "object",
-                          "properties": {
-                            "path": {
-                              "description": "Path to the private-key file.",
-                              "type": "string"
-                            },
-                            "passphrase": {
-                              "description": "Optional passphrase used to decrypt an encrypted private key.",
-                              "type": [
-                                "string",
-                                "null"
-                              ],
-                              "default": null
-                            }
-                          }
-                        }
-                      }
-                    }
-                  ],
-                  "title": "SftpSinkConfig",
-                  "description": "Configuration for the SFTP sink connector.",
-                  "type": "object",
-                  "properties": {
-                    "host": {
-                      "description": "Server hostname or IP address.",
-                      "type": "string"
-                    },
-                    "port": {
-                      "description": "Server port (default: 22).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint16",
-                      "minimum": 0,
-                      "maximum": 65535,
-                      "default": 22
-                    },
-                    "username": {
-                      "description": "SSH username.",
-                      "type": "string"
-                    },
-                    "known_hosts": {
-                      "description": "Host-key verification policy (default: `accept_new`).",
-                      "$ref": "#/$defs/sink_sftp__HostKeyPolicy",
-                      "default": {
-                        "mode": "accept_new"
-                      }
-                    },
-                    "path": {
-                      "description": "Remote directory prefix under which JSON Lines objects are written.",
-                      "type": "string"
+                    "compression": {
+                      "description": "Compression codec (default `auto`: from the file name's extension,\n`.gz` / `.zst`). The `compression` feature (#777).",
+                      "$ref": "#/$defs/sink_sftp__CompressionConfig",
+                      "default": "auto"
                     },
                     "format": {
                       "description": "File format (default `json_lines`) (#604).",
@@ -22799,9 +22757,36 @@
                       "default": {
                         "codec": "null"
                       }
+                    },
+                    "parquet": {
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_sftp__ParquetOptions",
+                      "default": {
+                        "compression": "snappy",
+                        "row_group_size": 1048576
+                      }
+                    },
+                    "json_lines": {
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "$ref": "#/$defs/sink_sftp__JsonLinesOptions",
+                      "default": {
+                        "pretty": false
+                      }
+                    },
+                    "encryption": {
+                      "description": "Encrypt files at rest (#777; the `encryption` feature).",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_sftp__EncryptionSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   }
-                }
+                },
+                true
               ]
             },
             "attributes": {
@@ -22975,7 +22960,25 @@
                     },
                     "prefix": {
                       "description": "Key prefix for written objects.",
-                      "type": "string"
+                      "type": "string",
+                      "default": ""
+                    },
+                    "path": {
+                      "description": "Object key template inside the bucket, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: objects are named `<prefix><run id>-<part><file_extension>`.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mode": {
+                      "description": "What to do when an object of the same name already exists:\n`overwrite` (default), `append` (JSON Lines, CSV, raw text) or\n`error_if_exists` (#777).",
+                      "$ref": "#/$defs/sink_s3__FileMode",
+                      "default": "overwrite"
+                    },
+                    "write_mode": {
+                      "description": "`overwrite` stages the run's objects under a hidden prefix and swaps\nthem in only after a successful run (#777). Default `append`.",
+                      "$ref": "#/$defs/sink_s3__FileWriteMode",
+                      "default": "append"
                     },
                     "format": {
                       "description": "Object format (default: `json_lines`). Set to `parquet` (with the\n`arrow` feature) to write Parquet objects and enable the columnar\nfast path.",
@@ -22997,8 +23000,9 @@
                       ]
                     },
                     "file_extension": {
-                      "description": "File extension for written objects (default: `.jsonl`).",
-                      "type": "string"
+                      "description": "File extension for written objects (default: `.jsonl`). Not used when\n`path` is set.",
+                      "type": "string",
+                      "default": ".jsonl"
                     },
                     "max_records_per_file": {
                       "description": "Maximum records per object. Since #618 the sink **accumulates across\n`write_batch` calls** and rolls to a new object when this (or\n[`max_bytes_per_file`](Self::max_bytes_per_file)) is reached, so a\nsmall upstream page no longer means a small object. `None` removes the\nrecord cap; with neither cap set the whole run lands in one object,\nclosed at `flush`.",
@@ -23021,122 +23025,14 @@
                       "minimum": 0
                     },
                     "concurrency": {
-                      "description": "Maximum number of concurrent file uploads (default: 10).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "batch_size": {
-                      "description": "Records per S3 object written by a single\n[`Sink::write_batch`](faucet_core::Sink::write_batch) call. When a call\nhands the sink `N` records with `batch_size = M > 0`, the sink writes\n`ceil(N / M)` objects, each containing at most `M` records (the final\nobject holds the remainder). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the sink writes\nwhatever upstream hands it without re-chunking (still honouring\n`max_records_per_file` if set). Recommended for S3 — most callers\nshould leave this at `0` and let the source's `batch_size` drive\nobject sizing, because many tiny S3 objects are a well-known\nanti-pattern (per-request overhead, slower downstream reads,\nLIST/PUT cost).\n\nWhen both `batch_size > 0` and `max_records_per_file` are set, the\neffective per-object cap is `min(batch_size, max_records_per_file)`.",
+                      "description": "Maximum number of concurrent part uploads for a large object\n(default: 10).",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000
-                    },
-                    "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the S3 `Content-Encoding` header, so consumers must\ndecompress explicitly.",
-                      "$ref": "#/$defs/sink_s3__CompressionConfig",
-                      "default": "auto"
-                    },
-                    "csv": {
-                      "description": "CSV dialect, used when `format: csv` (#604).",
-                      "$ref": "#/$defs/sink_s3__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet name, used when `format: xlsx` (#604).",
-                      "$ref": "#/$defs/sink_s3__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `format: xml` (#604).",
-                      "$ref": "#/$defs/sink_s3__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
-                    }
-                  }
-                },
-                true,
-                {
-                  "additionalProperties": true,
-                  "title": "S3SinkConfig",
-                  "description": "Configuration for the S3 sink connector.",
-                  "type": "object",
-                  "properties": {
-                    "bucket": {
-                      "description": "S3 bucket name.",
-                      "type": "string"
-                    },
-                    "prefix": {
-                      "description": "Key prefix for written objects.",
-                      "type": "string"
-                    },
-                    "format": {
-                      "description": "Object format (default: `json_lines`). Set to `parquet` (with the\n`arrow` feature) to write Parquet objects and enable the columnar\nfast path.",
-                      "$ref": "#/$defs/sink_s3__S3SinkFormat",
-                      "default": "json_lines"
-                    },
-                    "region": {
-                      "description": "AWS region. `None` uses the SDK default.",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "endpoint_url": {
-                      "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO).",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "file_extension": {
-                      "description": "File extension for written objects (default: `.jsonl`).",
-                      "type": "string"
-                    },
-                    "max_records_per_file": {
-                      "description": "Maximum records per object. Since #618 the sink **accumulates across\n`write_batch` calls** and rolls to a new object when this (or\n[`max_bytes_per_file`](Self::max_bytes_per_file)) is reached, so a\nsmall upstream page no longer means a small object. `None` removes the\nrecord cap; with neither cap set the whole run lands in one object,\nclosed at `flush`.",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size — 10k wide rows and 10k\n`{\"id\":1}` rows differ by orders of magnitude — so a rows-only cap\neither writes tiny objects for narrow data or unbounded ones for wide\ndata. This is also what bounds peak memory: the open object's body is\nbuffered until it rolls. Counted on the **uncompressed** body, before\nany `compression` codec, so the threshold means the same thing whatever\nthe codec. `None` (the default) removes the byte cap.\n\nA single record larger than the cap still gets its own object rather\nthan being split (which would corrupt it) or dropped.",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "concurrency": {
-                      "description": "Maximum number of concurrent file uploads (default: 10).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
+                      "default": 10
                     },
                     "batch_size": {
                       "description": "Records per S3 object written by a single\n[`Sink::write_batch`](faucet_core::Sink::write_batch) call. When a call\nhands the sink `N` records with `batch_size = M > 0`, the sink writes\n`ceil(N / M)` objects, each containing at most `M` records (the final\nobject holds the remainder). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the sink writes\nwhatever upstream hands it without re-chunking (still honouring\n`max_records_per_file` if set). Recommended for S3 — most callers\nshould leave this at `0` and let the source's `batch_size` drive\nobject sizing, because many tiny S3 objects are a well-known\nanti-pattern (per-request overhead, slower downstream reads,\nLIST/PUT cost).\n\nWhen both `batch_size > 0` and `max_records_per_file` are set, the\neffective per-object cap is `min(batch_size, max_records_per_file)`.",
@@ -23184,9 +23080,36 @@
                       "default": {
                         "codec": "null"
                       }
+                    },
+                    "parquet": {
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_s3__ParquetOptions",
+                      "default": {
+                        "compression": "snappy",
+                        "row_group_size": 1048576
+                      }
+                    },
+                    "json_lines": {
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "$ref": "#/$defs/sink_s3__JsonLinesOptions",
+                      "default": {
+                        "pretty": false
+                      }
+                    },
+                    "encryption": {
+                      "description": "Encrypt objects at rest (#777; the `encryption` feature).",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_s3__EncryptionSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   }
-                }
+                },
+                true
               ]
             },
             "attributes": {
@@ -24566,118 +24489,25 @@
                     },
                     "prefix": {
                       "description": "Object-name prefix for written files.",
-                      "type": "string"
-                    },
-                    "format": {
-                      "description": "Object format (default: `json_lines`). Set to `parquet` (with the\n`arrow` feature) to write Parquet objects and enable the columnar\nfast path.",
-                      "$ref": "#/$defs/sink_gcs__GcsSinkFormat",
-                      "default": "json_lines"
-                    },
-                    "auth": {
-                      "description": "Credential source.",
-                      "$ref": "#/$defs/sink_gcs__GcsCredentials",
-                      "default": {
-                        "type": "application_default"
-                      }
-                    },
-                    "file_extension": {
-                      "description": "File extension for written objects (default `.jsonl`).",
                       "type": "string",
-                      "default": ".jsonl"
+                      "default": ""
                     },
-                    "max_records_per_file": {
-                      "description": "Hard cap on records per uploaded object. `None` means a single\nobject per `write_batch` call (still subject to `batch_size`).",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. This is\nalso what bounds peak memory: the open object's body is buffered until\nit rolls. Counted on the uncompressed body, before any `compression`\ncodec, so the threshold means the same thing whatever the codec.\n`None` (the default) removes the byte cap. A single record larger than\nthe cap still gets its own object rather than being split or dropped.",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "concurrency": {
-                      "description": "Maximum number of concurrent uploads (default 10).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 10
-                    },
-                    "batch_size": {
-                      "description": "Records per uploaded object from a single `write_batch` call.\n`batch_size = 0` writes whatever upstream hands the sink as one\nobject. Recommended value for GCS is `0` — many tiny objects is\na well-known anti-pattern.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 1000
-                    },
-                    "storage_host": {
-                      "description": "Optional storage-host override (integration-test escape hatch).",
+                    "path": {
+                      "description": "Object key template inside the container, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: objects are named `<prefix><run id>-<part><file_extension>`.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
-                    "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set the GCS `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
-                      "$ref": "#/$defs/sink_gcs__CompressionConfig",
-                      "default": "auto"
+                    "mode": {
+                      "description": "What to do when an object of the same name already exists:\n`overwrite` (default), `append` (JSON Lines, CSV, raw text) or\n`error_if_exists` (#777).",
+                      "$ref": "#/$defs/sink_gcs__FileMode",
+                      "default": "overwrite"
                     },
-                    "csv": {
-                      "description": "CSV dialect, used when `format: csv` (#604).",
-                      "$ref": "#/$defs/sink_gcs__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet name, used when `format: xlsx` (#604).",
-                      "$ref": "#/$defs/sink_gcs__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `format: xml` (#604).",
-                      "$ref": "#/$defs/sink_gcs__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
-                    }
-                  }
-                },
-                true,
-                {
-                  "additionalProperties": true,
-                  "title": "GcsSinkConfig",
-                  "description": "Configuration for the GCS sink connector.",
-                  "type": "object",
-                  "properties": {
-                    "bucket": {
-                      "description": "GCS bucket name.",
-                      "type": "string"
-                    },
-                    "prefix": {
-                      "description": "Object-name prefix for written files.",
-                      "type": "string"
+                    "write_mode": {
+                      "description": "`overwrite` stages the run's objects under a hidden prefix and swaps\nthem in only after a successful run (#777). Default `append`.",
+                      "$ref": "#/$defs/sink_gcs__FileWriteMode",
+                      "default": "append"
                     },
                     "format": {
                       "description": "Object format (default: `json_lines`). Set to `parquet` (with the\n`arrow` feature) to write Parquet objects and enable the columnar\nfast path.",
@@ -24779,9 +24609,36 @@
                       "default": {
                         "codec": "null"
                       }
+                    },
+                    "parquet": {
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_gcs__ParquetOptions",
+                      "default": {
+                        "compression": "snappy",
+                        "row_group_size": 1048576
+                      }
+                    },
+                    "json_lines": {
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "$ref": "#/$defs/sink_gcs__JsonLinesOptions",
+                      "default": {
+                        "pretty": false
+                      }
+                    },
+                    "encryption": {
+                      "description": "Encrypt objects at rest (#777; the `encryption` feature).",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_gcs__EncryptionSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   }
-                }
+                },
+                true
               ]
             },
             "attributes": {
@@ -25286,139 +25143,22 @@
                       "type": "string",
                       "default": ""
                     },
-                    "format": {
-                      "description": "Object format (default `json_lines`) (#604).",
-                      "$ref": "#/$defs/sink_azure-blob__AzureSinkFormat",
-                      "default": "json_lines"
-                    },
-                    "file_extension": {
-                      "description": "File extension for written objects (default `.jsonl`).",
-                      "type": "string",
-                      "default": ".jsonl"
-                    },
-                    "max_records_per_file": {
-                      "description": "Hard cap on records per uploaded object. `None` means a single object\nper `write_batch` call (still subject to `batch_size`).",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "max_bytes_per_file": {
-                      "description": "Maximum **bytes** per object before rolling to a new one (#618).\n\nRows are a poor proxy for object size, so a rows-only cap either writes\ntiny objects for narrow data or unbounded ones for wide data. Counted\non the uncompressed body, before any `compression` codec. `None` (the\ndefault) removes the byte cap; a single record larger than the cap\nstill gets its own object rather than being split or dropped.",
-                      "type": [
-                        "integer",
-                        "null",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0
-                    },
-                    "concurrency": {
-                      "description": "Maximum number of concurrent uploads (default 10).",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 10
-                    },
-                    "batch_size": {
-                      "description": "Records per uploaded object from a single `write_batch` call.\n`batch_size = 0` writes whatever upstream hands the sink as one object.\nRecommended value for object stores is `0` — many tiny objects is a\nwell-known anti-pattern.",
-                      "type": [
-                        "integer",
-                        "string"
-                      ],
-                      "format": "uint",
-                      "minimum": 0,
-                      "default": 1000
-                    },
-                    "compression": {
-                      "description": "Compression codec applied to each uploaded object body. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nresolves against `file_extension` (so `.jsonl.gz` triggers gzip).\nRequires the crate-local `compression` feature. Note: this sink does\n**not** set any `Content-Encoding` metadata, so consumers must\ndecompress explicitly.",
-                      "$ref": "#/$defs/sink_azure-blob__CompressionConfig",
-                      "default": "auto"
-                    },
-                    "csv": {
-                      "description": "CSV dialect, used when `format: csv` (#604).",
-                      "$ref": "#/$defs/sink_azure-blob__CsvOptions",
-                      "default": {
-                        "delimiter": ",",
-                        "has_headers": true,
-                        "quote": "\"",
-                        "on_unknown_field": "widen"
-                      }
-                    },
-                    "excel": {
-                      "description": "Worksheet name, used when `format: xlsx` (#604).",
-                      "$ref": "#/$defs/sink_azure-blob__ExcelOptions",
-                      "default": {
-                        "header_row": 0
-                      }
-                    },
-                    "xml": {
-                      "description": "Record framing, used when `format: xml` (#604).",
-                      "$ref": "#/$defs/sink_azure-blob__XmlOptions",
-                      "default": {
-                        "record_element": "record",
-                        "root_element": "records"
-                      }
-                    }
-                  },
-                  "title": "AzureBlobSinkConfig",
-                  "description": "Configuration for the Azure Blob sink connector.",
-                  "type": "object"
-                },
-                true,
-                {
-                  "properties": {
-                    "container": {
-                      "description": "Blob container / ADLS Gen2 filesystem name. Required.",
-                      "type": "string"
-                    },
-                    "account": {
-                      "description": "Storage-account name. Optional when a connection string or the\nemulator supplies it, otherwise required.",
+                    "path": {
+                      "description": "Object key template inside the container, after `prefix` — the file\nsink's `path` (#777). May contain `{part}` (numbered objects) and\n`${now.*}` tokens; a trailing `/` is a directory of\n`part-{part}<extension>` objects. When set, `file_extension` is not\nused. Unset: objects are named `<prefix><run id>-<part><file_extension>`.",
                       "type": [
                         "string",
                         "null"
                       ]
                     },
-                    "auth": {
-                      "description": "Credential source. Defaults to the environment / managed-identity\ncredential chain.",
-                      "$ref": "#/$defs/sink_azure-blob__AzureCredentials",
-                      "default": {
-                        "type": "default"
-                      }
+                    "mode": {
+                      "description": "What to do when an object of the same name already exists:\n`overwrite` (default), `append` (JSON Lines, CSV, raw text) or\n`error_if_exists` (#777).",
+                      "$ref": "#/$defs/sink_azure-blob__FileMode",
+                      "default": "overwrite"
                     },
-                    "endpoint": {
-                      "description": "Custom blob endpoint (e.g. an Azurite emulator or a sovereign cloud).",
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    },
-                    "allow_http": {
-                      "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": false
-                    },
-                    "use_emulator": {
-                      "description": "Target the Azurite storage emulator with its well-known\n`devstoreaccount1` credentials.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
-                      "default": false
-                    },
-                    "prefix": {
-                      "description": "Object-name prefix for written objects.",
-                      "type": "string",
-                      "default": ""
+                    "write_mode": {
+                      "description": "`overwrite` stages the run's objects under a hidden prefix and swaps\nthem in only after a successful run (#777). Default `append`.",
+                      "$ref": "#/$defs/sink_azure-blob__FileWriteMode",
+                      "default": "append"
                     },
                     "format": {
                       "description": "Object format (default `json_lines`) (#604).",
@@ -25506,12 +25246,39 @@
                       "default": {
                         "codec": "null"
                       }
+                    },
+                    "parquet": {
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_azure-blob__ParquetOptions",
+                      "default": {
+                        "compression": "snappy",
+                        "row_group_size": 1048576
+                      }
+                    },
+                    "json_lines": {
+                      "description": "JSON Lines writer options (`pretty`), used when `format: json_lines`.",
+                      "$ref": "#/$defs/sink_azure-blob__JsonLinesOptions",
+                      "default": {
+                        "pretty": false
+                      }
+                    },
+                    "encryption": {
+                      "description": "Encrypt objects at rest (#777; the `encryption` feature).",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_azure-blob__EncryptionSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   },
                   "title": "AzureBlobSinkConfig",
                   "description": "Configuration for the Azure Blob sink connector.",
                   "type": "object"
-                }
+                },
+                true
               ]
             },
             "attributes": {
@@ -30105,6 +29872,1132 @@
           "const": "error"
         }
       ]
+    },
+    "source_s3__ParquetReadOptions": {
+      "description": "Parquet reader options (the `parquet:` block of an object-store source).",
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "Decode only these top-level columns. A name missing from an object is\nan error naming the object and its columns. Unset: every column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_gcs__ParquetReadOptions": {
+      "description": "Parquet reader options (the `parquet:` block of an object-store source).",
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "Decode only these top-level columns. A name missing from an object is\nan error naming the object and its columns. Unset: every column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_azure-blob__ParquetReadOptions": {
+      "description": "Parquet reader options (the `parquet:` block of an object-store source).",
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "Decode only these top-level columns. A name missing from an object is\nan error naming the object and its columns. Unset: every column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__EncryptionAlgorithm": {
+      "description": "Supported AEAD algorithms. A single variant today; the format byte in the\non-disk header leaves room for more without breaking old files.",
+      "oneOf": [
+        {
+          "description": "AES-256-GCM authenticated encryption (the default and only option).",
+          "type": "string",
+          "const": "aes-256-gcm"
+        }
+      ]
+    },
+    "sink_azure-blob__EncryptionSpec": {
+      "description": "The user-facing `encryption:` config block (state store / jsonl sink).\n\n```yaml\nencryption:\n  key: ${vault:secret/faucet#state-key}\n  # previous_keys: [\"${env:OLD_STATE_KEY}\"]   # rotation: read-only\n  # algorithm: aes-256-gcm                     # default\n```",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key material used to seal new writes (and tried first on reads).\nShould come from a secrets manager; derived to a 32-byte AES key via\nSHA-256.",
+          "type": "string"
+        },
+        "previous_keys": {
+          "description": "Older keys tried (in order) when decrypting, for rotation. Never used\nto seal new writes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "algorithm": {
+          "description": "AEAD algorithm. Only `aes-256-gcm` today.",
+          "$ref": "#/$defs/sink_azure-blob__EncryptionAlgorithm",
+          "default": "aes-256-gcm"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__FileMode": {
+      "description": "What happens when a file this run writes already exists.",
+      "oneOf": [
+        {
+          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
+          "type": "string",
+          "const": "overwrite"
+        },
+        {
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Fail the run instead of touching an existing file.",
+          "type": "string",
+          "const": "error_if_exists"
+        }
+      ]
+    },
+    "sink_azure-blob__FileWriteMode": {
+      "description": "Pipeline-level write mode.",
+      "oneOf": [
+        {
+          "description": "Write this run's files; leave everything else in place.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "type": "string",
+          "const": "overwrite"
+        }
+      ]
+    },
+    "sink_azure-blob__JsonLinesOptions": {
+      "description": "JSON Lines write options.",
+      "type": "object",
+      "properties": {
+        "pretty": {
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__ParquetCodec": {
+      "description": "Parquet column-chunk compression.",
+      "oneOf": [
+        {
+          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Snappy (the default): fast and universally readable.",
+          "type": "string",
+          "const": "snappy"
+        },
+        {
+          "description": "Gzip.",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "Zstandard.",
+          "type": "string",
+          "const": "zstd"
+        },
+        {
+          "description": "LZ4 (the `LZ4_RAW` codec).",
+          "type": "string",
+          "const": "lz4"
+        }
+      ]
+    },
+    "sink_azure-blob__ParquetField": {
+      "description": "One column of an explicit Parquet schema.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Column name — the record field it is read from.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Column type.",
+          "$ref": "#/$defs/sink_azure-blob__ParquetType"
+        },
+        "nullable": {
+          "description": "Whether the column may be null or missing (default `true`).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__ParquetOptions": {
+      "description": "Parquet write options.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_azure-blob__ParquetCodec",
+          "default": "snappy"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_azure-blob__ParquetField"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__ParquetType": {
+      "description": "A column type of an explicit Parquet schema.",
+      "oneOf": [
+        {
+          "description": "`true` / `false`.",
+          "type": "string",
+          "const": "boolean"
+        },
+        {
+          "description": "32-bit signed integer.",
+          "type": "string",
+          "const": "int32"
+        },
+        {
+          "description": "64-bit signed integer.",
+          "type": "string",
+          "const": "int64"
+        },
+        {
+          "description": "64-bit unsigned integer.",
+          "type": "string",
+          "const": "uint64"
+        },
+        {
+          "description": "32-bit float.",
+          "type": "string",
+          "const": "float32"
+        },
+        {
+          "description": "64-bit float.",
+          "type": "string",
+          "const": "float64"
+        },
+        {
+          "description": "UTF-8 text.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A calendar date, from `YYYY-MM-DD` text.",
+          "type": "string",
+          "const": "date"
+        },
+        {
+          "description": "A UTC timestamp in milliseconds, from RFC 3339 text or epoch numbers.",
+          "type": "string",
+          "const": "timestamp_ms"
+        },
+        {
+          "description": "A UTC timestamp in microseconds.",
+          "type": "string",
+          "const": "timestamp_us"
+        },
+        {
+          "description": "A UTC timestamp in nanoseconds.",
+          "type": "string",
+          "const": "timestamp_ns"
+        },
+        {
+          "description": "A fixed-point decimal with the given precision and scale, from\nnumbers or numeric text.",
+          "type": "object",
+          "properties": {
+            "decimal": {
+              "type": "object",
+              "properties": {
+                "precision": {
+                  "description": "Total digits (1–38).",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "uint8",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "scale": {
+                  "description": "Digits after the point.",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "int8",
+                  "minimum": -128,
+                  "maximum": 127
+                }
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "sink_gcs__EncryptionAlgorithm": {
+      "description": "Supported AEAD algorithms. A single variant today; the format byte in the\non-disk header leaves room for more without breaking old files.",
+      "oneOf": [
+        {
+          "description": "AES-256-GCM authenticated encryption (the default and only option).",
+          "type": "string",
+          "const": "aes-256-gcm"
+        }
+      ]
+    },
+    "sink_gcs__EncryptionSpec": {
+      "description": "The user-facing `encryption:` config block (state store / jsonl sink).\n\n```yaml\nencryption:\n  key: ${vault:secret/faucet#state-key}\n  # previous_keys: [\"${env:OLD_STATE_KEY}\"]   # rotation: read-only\n  # algorithm: aes-256-gcm                     # default\n```",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key material used to seal new writes (and tried first on reads).\nShould come from a secrets manager; derived to a 32-byte AES key via\nSHA-256.",
+          "type": "string"
+        },
+        "previous_keys": {
+          "description": "Older keys tried (in order) when decrypting, for rotation. Never used\nto seal new writes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "algorithm": {
+          "description": "AEAD algorithm. Only `aes-256-gcm` today.",
+          "$ref": "#/$defs/sink_gcs__EncryptionAlgorithm",
+          "default": "aes-256-gcm"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_gcs__FileMode": {
+      "description": "What happens when a file this run writes already exists.",
+      "oneOf": [
+        {
+          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
+          "type": "string",
+          "const": "overwrite"
+        },
+        {
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Fail the run instead of touching an existing file.",
+          "type": "string",
+          "const": "error_if_exists"
+        }
+      ]
+    },
+    "sink_gcs__FileWriteMode": {
+      "description": "Pipeline-level write mode.",
+      "oneOf": [
+        {
+          "description": "Write this run's files; leave everything else in place.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "type": "string",
+          "const": "overwrite"
+        }
+      ]
+    },
+    "sink_gcs__JsonLinesOptions": {
+      "description": "JSON Lines write options.",
+      "type": "object",
+      "properties": {
+        "pretty": {
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_gcs__ParquetCodec": {
+      "description": "Parquet column-chunk compression.",
+      "oneOf": [
+        {
+          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Snappy (the default): fast and universally readable.",
+          "type": "string",
+          "const": "snappy"
+        },
+        {
+          "description": "Gzip.",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "Zstandard.",
+          "type": "string",
+          "const": "zstd"
+        },
+        {
+          "description": "LZ4 (the `LZ4_RAW` codec).",
+          "type": "string",
+          "const": "lz4"
+        }
+      ]
+    },
+    "sink_gcs__ParquetField": {
+      "description": "One column of an explicit Parquet schema.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Column name — the record field it is read from.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Column type.",
+          "$ref": "#/$defs/sink_gcs__ParquetType"
+        },
+        "nullable": {
+          "description": "Whether the column may be null or missing (default `true`).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_gcs__ParquetOptions": {
+      "description": "Parquet write options.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_gcs__ParquetCodec",
+          "default": "snappy"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_gcs__ParquetField"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_gcs__ParquetType": {
+      "description": "A column type of an explicit Parquet schema.",
+      "oneOf": [
+        {
+          "description": "`true` / `false`.",
+          "type": "string",
+          "const": "boolean"
+        },
+        {
+          "description": "32-bit signed integer.",
+          "type": "string",
+          "const": "int32"
+        },
+        {
+          "description": "64-bit signed integer.",
+          "type": "string",
+          "const": "int64"
+        },
+        {
+          "description": "64-bit unsigned integer.",
+          "type": "string",
+          "const": "uint64"
+        },
+        {
+          "description": "32-bit float.",
+          "type": "string",
+          "const": "float32"
+        },
+        {
+          "description": "64-bit float.",
+          "type": "string",
+          "const": "float64"
+        },
+        {
+          "description": "UTF-8 text.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A calendar date, from `YYYY-MM-DD` text.",
+          "type": "string",
+          "const": "date"
+        },
+        {
+          "description": "A UTC timestamp in milliseconds, from RFC 3339 text or epoch numbers.",
+          "type": "string",
+          "const": "timestamp_ms"
+        },
+        {
+          "description": "A UTC timestamp in microseconds.",
+          "type": "string",
+          "const": "timestamp_us"
+        },
+        {
+          "description": "A UTC timestamp in nanoseconds.",
+          "type": "string",
+          "const": "timestamp_ns"
+        },
+        {
+          "description": "A fixed-point decimal with the given precision and scale, from\nnumbers or numeric text.",
+          "type": "object",
+          "properties": {
+            "decimal": {
+              "type": "object",
+              "properties": {
+                "precision": {
+                  "description": "Total digits (1–38).",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "uint8",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "scale": {
+                  "description": "Digits after the point.",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "int8",
+                  "minimum": -128,
+                  "maximum": 127
+                }
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "sink_s3__EncryptionAlgorithm": {
+      "description": "Supported AEAD algorithms. A single variant today; the format byte in the\non-disk header leaves room for more without breaking old files.",
+      "oneOf": [
+        {
+          "description": "AES-256-GCM authenticated encryption (the default and only option).",
+          "type": "string",
+          "const": "aes-256-gcm"
+        }
+      ]
+    },
+    "sink_s3__EncryptionSpec": {
+      "description": "The user-facing `encryption:` config block (state store / jsonl sink).\n\n```yaml\nencryption:\n  key: ${vault:secret/faucet#state-key}\n  # previous_keys: [\"${env:OLD_STATE_KEY}\"]   # rotation: read-only\n  # algorithm: aes-256-gcm                     # default\n```",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key material used to seal new writes (and tried first on reads).\nShould come from a secrets manager; derived to a 32-byte AES key via\nSHA-256.",
+          "type": "string"
+        },
+        "previous_keys": {
+          "description": "Older keys tried (in order) when decrypting, for rotation. Never used\nto seal new writes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "algorithm": {
+          "description": "AEAD algorithm. Only `aes-256-gcm` today.",
+          "$ref": "#/$defs/sink_s3__EncryptionAlgorithm",
+          "default": "aes-256-gcm"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_s3__FileMode": {
+      "description": "What happens when a file this run writes already exists.",
+      "oneOf": [
+        {
+          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
+          "type": "string",
+          "const": "overwrite"
+        },
+        {
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Fail the run instead of touching an existing file.",
+          "type": "string",
+          "const": "error_if_exists"
+        }
+      ]
+    },
+    "sink_s3__FileWriteMode": {
+      "description": "Pipeline-level write mode.",
+      "oneOf": [
+        {
+          "description": "Write this run's files; leave everything else in place.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "type": "string",
+          "const": "overwrite"
+        }
+      ]
+    },
+    "sink_s3__JsonLinesOptions": {
+      "description": "JSON Lines write options.",
+      "type": "object",
+      "properties": {
+        "pretty": {
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_s3__ParquetCodec": {
+      "description": "Parquet column-chunk compression.",
+      "oneOf": [
+        {
+          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Snappy (the default): fast and universally readable.",
+          "type": "string",
+          "const": "snappy"
+        },
+        {
+          "description": "Gzip.",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "Zstandard.",
+          "type": "string",
+          "const": "zstd"
+        },
+        {
+          "description": "LZ4 (the `LZ4_RAW` codec).",
+          "type": "string",
+          "const": "lz4"
+        }
+      ]
+    },
+    "sink_s3__ParquetField": {
+      "description": "One column of an explicit Parquet schema.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Column name — the record field it is read from.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Column type.",
+          "$ref": "#/$defs/sink_s3__ParquetType"
+        },
+        "nullable": {
+          "description": "Whether the column may be null or missing (default `true`).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_s3__ParquetOptions": {
+      "description": "Parquet write options.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_s3__ParquetCodec",
+          "default": "snappy"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_s3__ParquetField"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_s3__ParquetType": {
+      "description": "A column type of an explicit Parquet schema.",
+      "oneOf": [
+        {
+          "description": "`true` / `false`.",
+          "type": "string",
+          "const": "boolean"
+        },
+        {
+          "description": "32-bit signed integer.",
+          "type": "string",
+          "const": "int32"
+        },
+        {
+          "description": "64-bit signed integer.",
+          "type": "string",
+          "const": "int64"
+        },
+        {
+          "description": "64-bit unsigned integer.",
+          "type": "string",
+          "const": "uint64"
+        },
+        {
+          "description": "32-bit float.",
+          "type": "string",
+          "const": "float32"
+        },
+        {
+          "description": "64-bit float.",
+          "type": "string",
+          "const": "float64"
+        },
+        {
+          "description": "UTF-8 text.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A calendar date, from `YYYY-MM-DD` text.",
+          "type": "string",
+          "const": "date"
+        },
+        {
+          "description": "A UTC timestamp in milliseconds, from RFC 3339 text or epoch numbers.",
+          "type": "string",
+          "const": "timestamp_ms"
+        },
+        {
+          "description": "A UTC timestamp in microseconds.",
+          "type": "string",
+          "const": "timestamp_us"
+        },
+        {
+          "description": "A UTC timestamp in nanoseconds.",
+          "type": "string",
+          "const": "timestamp_ns"
+        },
+        {
+          "description": "A fixed-point decimal with the given precision and scale, from\nnumbers or numeric text.",
+          "type": "object",
+          "properties": {
+            "decimal": {
+              "type": "object",
+              "properties": {
+                "precision": {
+                  "description": "Total digits (1–38).",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "uint8",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "scale": {
+                  "description": "Digits after the point.",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "int8",
+                  "minimum": -128,
+                  "maximum": 127
+                }
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "sink_sftp__CompressionConfig": {
+      "description": "User-facing compression config. Defaults to [`Auto`](Self::Auto).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "none",
+            "gzip",
+            "zstd"
+          ]
+        },
+        {
+          "description": "Detect from filename suffix: `.gz` → Gzip, `.zst` → Zstd, anything else → None.",
+          "type": "string",
+          "const": "auto"
+        }
+      ]
+    },
+    "sink_sftp__EncryptionAlgorithm": {
+      "description": "Supported AEAD algorithms. A single variant today; the format byte in the\non-disk header leaves room for more without breaking old files.",
+      "oneOf": [
+        {
+          "description": "AES-256-GCM authenticated encryption (the default and only option).",
+          "type": "string",
+          "const": "aes-256-gcm"
+        }
+      ]
+    },
+    "sink_sftp__EncryptionSpec": {
+      "description": "The user-facing `encryption:` config block (state store / jsonl sink).\n\n```yaml\nencryption:\n  key: ${vault:secret/faucet#state-key}\n  # previous_keys: [\"${env:OLD_STATE_KEY}\"]   # rotation: read-only\n  # algorithm: aes-256-gcm                     # default\n```",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key material used to seal new writes (and tried first on reads).\nShould come from a secrets manager; derived to a 32-byte AES key via\nSHA-256.",
+          "type": "string"
+        },
+        "previous_keys": {
+          "description": "Older keys tried (in order) when decrypting, for rotation. Never used\nto seal new writes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "algorithm": {
+          "description": "AEAD algorithm. Only `aes-256-gcm` today.",
+          "$ref": "#/$defs/sink_sftp__EncryptionAlgorithm",
+          "default": "aes-256-gcm"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_sftp__FileMode": {
+      "description": "What happens when a file this run writes already exists.",
+      "oneOf": [
+        {
+          "description": "Replace it: the new file is written beside it and renamed over it, so\nthe old contents stay readable until the new ones are complete.",
+          "type": "string",
+          "const": "overwrite"
+        },
+        {
+          "description": "Add to it. JSON Lines, CSV and raw text only — a JSON array, XML,\nExcel, Avro or Parquet file cannot be appended to without rewriting.\nWith rollover, numbering continues after the highest existing part.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Fail the run instead of touching an existing file.",
+          "type": "string",
+          "const": "error_if_exists"
+        }
+      ]
+    },
+    "sink_sftp__FileWriteMode": {
+      "description": "Pipeline-level write mode.",
+      "oneOf": [
+        {
+          "description": "Write this run's files; leave everything else in place.",
+          "type": "string",
+          "const": "append"
+        },
+        {
+          "description": "Replace the destination's whole output set: files are staged in a\nhidden directory beside the destination and moved into place only when\nthe run succeeds, then files of an earlier run that match the path\ntemplate and were not rewritten are removed. A failed or cancelled run\nleaves the previous output untouched.",
+          "type": "string",
+          "const": "overwrite"
+        }
+      ]
+    },
+    "sink_sftp__JsonLinesOptions": {
+      "description": "JSON Lines write options.",
+      "type": "object",
+      "properties": {
+        "pretty": {
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_sftp__ParquetCodec": {
+      "description": "Parquet column-chunk compression.",
+      "oneOf": [
+        {
+          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Snappy (the default): fast and universally readable.",
+          "type": "string",
+          "const": "snappy"
+        },
+        {
+          "description": "Gzip.",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "Zstandard.",
+          "type": "string",
+          "const": "zstd"
+        },
+        {
+          "description": "LZ4 (the `LZ4_RAW` codec).",
+          "type": "string",
+          "const": "lz4"
+        }
+      ]
+    },
+    "sink_sftp__ParquetField": {
+      "description": "One column of an explicit Parquet schema.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Column name — the record field it is read from.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Column type.",
+          "$ref": "#/$defs/sink_sftp__ParquetType"
+        },
+        "nullable": {
+          "description": "Whether the column may be null or missing (default `true`).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_sftp__ParquetOptions": {
+      "description": "Parquet write options.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_sftp__ParquetCodec",
+          "default": "snappy"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_sftp__ParquetField"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_sftp__ParquetType": {
+      "description": "A column type of an explicit Parquet schema.",
+      "oneOf": [
+        {
+          "description": "`true` / `false`.",
+          "type": "string",
+          "const": "boolean"
+        },
+        {
+          "description": "32-bit signed integer.",
+          "type": "string",
+          "const": "int32"
+        },
+        {
+          "description": "64-bit signed integer.",
+          "type": "string",
+          "const": "int64"
+        },
+        {
+          "description": "64-bit unsigned integer.",
+          "type": "string",
+          "const": "uint64"
+        },
+        {
+          "description": "32-bit float.",
+          "type": "string",
+          "const": "float32"
+        },
+        {
+          "description": "64-bit float.",
+          "type": "string",
+          "const": "float64"
+        },
+        {
+          "description": "UTF-8 text.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A calendar date, from `YYYY-MM-DD` text.",
+          "type": "string",
+          "const": "date"
+        },
+        {
+          "description": "A UTC timestamp in milliseconds, from RFC 3339 text or epoch numbers.",
+          "type": "string",
+          "const": "timestamp_ms"
+        },
+        {
+          "description": "A UTC timestamp in microseconds.",
+          "type": "string",
+          "const": "timestamp_us"
+        },
+        {
+          "description": "A UTC timestamp in nanoseconds.",
+          "type": "string",
+          "const": "timestamp_ns"
+        },
+        {
+          "description": "A fixed-point decimal with the given precision and scale, from\nnumbers or numeric text.",
+          "type": "object",
+          "properties": {
+            "decimal": {
+              "type": "object",
+              "properties": {
+                "precision": {
+                  "description": "Total digits (1–38).",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "uint8",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "scale": {
+                  "description": "Digits after the point.",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "int8",
+                  "minimum": -128,
+                  "maximum": 127
+                }
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "source_sftp__ParquetReadOptions": {
+      "description": "Parquet reader options (the `parquet:` block of an object-store source).",
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "Decode only these top-level columns. A name missing from an object is\nan error naming the object and its columns. Unset: every column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
     }
   }
 }

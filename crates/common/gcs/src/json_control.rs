@@ -11,7 +11,8 @@ use google_cloud_gax::error::Error;
 use google_cloud_gax::options::RequestOptions;
 use google_cloud_gax::response::Response;
 use google_cloud_storage::model::{
-    GetObjectRequest, ListObjectsRequest, ListObjectsResponse, Object,
+    DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, ListObjectsResponse, Object,
+    RewriteObjectRequest, RewriteResponse,
 };
 use serde::Deserialize;
 
@@ -100,6 +101,58 @@ impl google_cloud_storage::stub::StorageControl for JsonApiControl {
             object.into_model(bucket_from_parent(&req.bucket)?),
         ))
     }
+
+    async fn delete_object(
+        &self,
+        req: DeleteObjectRequest,
+        _options: RequestOptions,
+    ) -> google_cloud_gax::Result<Response<()>> {
+        let bucket = bucket_from_parent(&req.bucket)?;
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            urlencoding::encode(bucket),
+            urlencoding::encode(&req.object)
+        );
+        let resp = self.http.delete(&url).send().await.map_err(Error::io)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let headers = resp.headers().clone();
+            let body = resp.bytes().await.map_err(Error::io)?;
+            return Err(Error::http(status.as_u16(), headers, body));
+        }
+        Ok(Response::from(()))
+    }
+
+    async fn rewrite_object(
+        &self,
+        req: RewriteObjectRequest,
+        _options: RequestOptions,
+    ) -> google_cloud_gax::Result<Response<RewriteResponse>> {
+        let src = bucket_from_parent(&req.source_bucket)?;
+        let dst = bucket_from_parent(&req.destination_bucket)?;
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
+            self.endpoint,
+            urlencoding::encode(src),
+            urlencoding::encode(&req.source_object),
+            urlencoding::encode(dst),
+            urlencoding::encode(&req.destination_name)
+        );
+        let resp = self.http.post(&url).send().await.map_err(Error::io)?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.bytes().await.map_err(Error::io)?;
+        if !status.is_success() {
+            return Err(Error::http(status.as_u16(), headers, body));
+        }
+        let parsed: JsonRewrite = serde_json::from_slice(&body).map_err(Error::deser)?;
+        Ok(Response::from(
+            RewriteResponse::new()
+                .set_done(parsed.done)
+                .set_rewrite_token(parsed.rewrite_token.unwrap_or_default()),
+        ))
+    }
 }
 
 fn bucket_from_parent(parent: &str) -> Result<&str, Error> {
@@ -138,6 +191,15 @@ fn list_query(req: &ListObjectsRequest) -> String {
         .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonRewrite {
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    rewrite_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,6 +264,65 @@ mod tests {
 
     fn req(parent: &str) -> ListObjectsRequest {
         ListObjectsRequest::new().set_parent(parent)
+    }
+
+    #[tokio::test]
+    async fn delete_and_rewrite_go_through_the_json_api() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/storage/v1/b/b/o/a%2Fx"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/storage/v1/b/b/o/gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/storage/v1/b/b/o/a%2Fx/rewriteTo/b/b/o/y"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"done": false, "rewriteToken": "t1"})),
+            )
+            .mount(&server)
+            .await;
+        let c = JsonApiControl::new(&server.uri());
+        let bucket = "projects/_/buckets/b";
+        c.delete_object(
+            DeleteObjectRequest::new()
+                .set_bucket(bucket)
+                .set_object("a/x"),
+            RequestOptions::default(),
+        )
+        .await
+        .unwrap();
+        let err = c
+            .delete_object(
+                DeleteObjectRequest::new()
+                    .set_bucket(bucket)
+                    .set_object("gone"),
+                RequestOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.http_status_code(), Some(404));
+        let r = c
+            .rewrite_object(
+                RewriteObjectRequest::new()
+                    .set_source_bucket(bucket)
+                    .set_source_object("a/x")
+                    .set_destination_bucket(bucket)
+                    .set_destination_name("y"),
+                RequestOptions::default(),
+            )
+            .await
+            .unwrap()
+            .into_body();
+        assert!(!r.done);
+        assert_eq!(r.rewrite_token, "t1");
     }
 
     #[test]
