@@ -26,7 +26,7 @@ pub use layout::{BODY_SUFFIX, NameTemplate, STAGING_PREFIX, TMP_SUFFIX, io_err, 
 pub use local::{LocalBackend, sync_dir};
 pub use options::{
     DEFAULT_ROW_GROUP_SIZE, FileMode, FileWriteMode, JsonLinesOptions, PART_TOKEN, ParquetCodec,
-    ParquetField, ParquetOptions, ParquetType, validate_parquet,
+    ParquetField, ParquetOptions, ParquetType, RemoteParquetOptions, validate_parquet,
 };
 pub use remote::{ObjectClient, RemoteBackend, STAGING_MARKER, content_type, object_layout, run};
 pub use writer::{FileWriter, WriteSettings, blocking};

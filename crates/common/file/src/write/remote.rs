@@ -101,12 +101,66 @@ fn fallback_runtime() -> Result<&'static tokio::runtime::Runtime, FaucetError> {
     .map_err(|e| FaucetError::Sink(format!("remote file sink: starting an I/O runtime: {e}")))
 }
 
+/// The runtime background uploads are spawned on: the caller's
+/// multi-threaded runtime, else the process-wide I/O runtime.
+fn io_handle() -> Result<tokio::runtime::Handle, FaucetError> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        return Ok(handle);
+    }
+    Ok(fallback_runtime()?.handle().clone())
+}
+
+type Upload = tokio::task::JoinHandle<Result<(), FaucetError>>;
+
+/// An upload running in the background, and the key it publishes.
+struct InFlight {
+    key: String,
+    handle: Upload,
+}
+
+/// Await `uploads` and return the first error; every one is awaited even
+/// after a failure, so none is left running unobserved.
+fn join_all(uploads: Vec<InFlight>) -> Result<(), FaucetError> {
+    if uploads.is_empty() {
+        return Ok(());
+    }
+    run(async move {
+        let mut first = Ok(());
+        for u in uploads {
+            let r = match u.handle.await {
+                Ok(r) => r,
+                Err(e) => Err(FaucetError::Sink(format!(
+                    "remote file sink: the upload of '{}' did not finish: {e}",
+                    u.key
+                ))),
+            };
+            if first.is_ok() {
+                first = r;
+            }
+        }
+        first
+    })
+}
+
 /// A [`StorageBackend`] over an [`ObjectClient`].
+///
+/// With [`with_upload_concurrency`](Self::with_upload_concurrency) above 1, a
+/// [`commit`](StorageBackend::commit) hands the finished file to a background
+/// upload and returns, so the writer encodes the next file while earlier ones
+/// are still going up; at most that many uploads are in flight, and a commit
+/// past the limit waits for a slot. [`settle`](StorageBackend::settle) awaits
+/// them all and reports the first error.
 pub struct RemoteBackend {
     client: Arc<dyn ObjectClient>,
     base: String,
     staging: String,
-    scratch: tempfile::TempDir,
+    scratch: Arc<tempfile::TempDir>,
+    uploads: usize,
+    slots: Arc<tokio::sync::Semaphore>,
+    in_flight: std::sync::Mutex<Vec<InFlight>>,
+    seq: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -139,8 +193,86 @@ impl RemoteBackend {
             staging: format!("{base}{staging_name}/"),
             base,
             client,
-            scratch,
+            scratch: Arc::new(scratch),
+            uploads: 1,
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            in_flight: std::sync::Mutex::new(Vec::new()),
+            seq: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Keep up to `n` uploads in flight (at least 1). With 1 (the default)
+    /// every commit uploads before it returns.
+    pub fn with_upload_concurrency(mut self, n: usize) -> Self {
+        self.uploads = n.max(1);
+        self.slots = Arc::new(tokio::sync::Semaphore::new(self.uploads));
+        self
+    }
+
+    /// The most uploads kept in flight.
+    pub fn upload_concurrency(&self) -> usize {
+        self.uploads
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<InFlight>> {
+        self.in_flight.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Collect finished uploads, returning the first error among them, and
+    /// wait for an in-flight upload of `key` so two versions never race.
+    fn reap(&self, key: &str) -> Result<(), FaucetError> {
+        let done: Vec<InFlight> = {
+            let mut pending = self.pending();
+            let (done, running): (Vec<_>, Vec<_>) = pending
+                .drain(..)
+                .partition(|u| u.handle.is_finished() || u.key == key);
+            *pending = running;
+            done
+        };
+        join_all(done)
+    }
+
+    fn spawn_upload(&self, scratch: &Path, key: String) -> Result<(), FaucetError> {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let moved = self.scratch.path().join(format!("inflight-{n}"));
+        if let Err(e) = std::fs::rename(scratch, &moved) {
+            let _ = std::fs::remove_file(scratch);
+            return Err(FaucetError::Sink(format!(
+                "remote file sink: preparing '{}' for upload: {e}",
+                self.client.describe(&key)
+            )));
+        }
+        let slots = self.slots.clone();
+        let permit = match run(async move {
+            slots.acquire_owned().await.map_err(|e| {
+                FaucetError::Sink(format!("remote file sink: waiting for an upload slot: {e}"))
+            })
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_file(&moved);
+                return Err(e);
+            }
+        };
+        let handle = match io_handle() {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = std::fs::remove_file(&moved);
+                return Err(e);
+            }
+        };
+        let client = self.client.clone();
+        let dir = self.scratch.clone();
+        let k = key.clone();
+        let task = handle.spawn(async move {
+            let r = client.upload(&moved, &k).await;
+            let _ = tokio::fs::remove_file(&moved).await;
+            drop(permit);
+            drop(dir);
+            r
+        });
+        self.pending().push(InFlight { key, handle: task });
+        Ok(())
     }
 
     /// The key prefix files land under.
@@ -183,6 +315,10 @@ impl StorageBackend for RemoteBackend {
         Ok(self.scratch.path().join(format!("{tag}-{safe}")))
     }
 
+    fn sync_scratch(&self) -> bool {
+        false
+    }
+
     fn prepare(&self, _area: Area) -> Result<(), FaucetError> {
         Ok(())
     }
@@ -202,9 +338,26 @@ impl StorageBackend for RemoteBackend {
     }
 
     fn commit(&self, scratch: &Path, area: Area, name: &str) -> Result<(), FaucetError> {
-        let result = run(self.client.upload(scratch, &self.key(area, name)));
-        let _ = std::fs::remove_file(scratch);
-        result
+        let key = self.key(area, name);
+        if self.uploads <= 1 {
+            let result = run(self.client.upload(scratch, &key));
+            let _ = std::fs::remove_file(scratch);
+            return result;
+        }
+        if let Err(e) = self.reap(&key) {
+            let _ = std::fs::remove_file(scratch);
+            return Err(e);
+        }
+        self.spawn_upload(scratch, key)
+    }
+
+    fn settle(&self) -> Result<(), FaucetError> {
+        let all = std::mem::take(&mut *self.pending());
+        join_all(all)
+    }
+
+    fn cancel(&self) {
+        let _ = self.settle();
     }
 
     fn delete(&self, area: Area, name: &str) -> Result<(), FaucetError> {
@@ -475,6 +628,185 @@ mod tests {
                 .contains("upload refused")
         );
         assert!(mem.objects.lock().unwrap().is_empty());
+    }
+
+    const DELAY_MS: u64 = 150;
+
+    /// Records how many uploads overlap.
+    #[derive(Default)]
+    struct Slow {
+        mem: Mem,
+        now: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        fail_key: Mutex<Option<String>>,
+    }
+
+    #[faucet_core::async_trait]
+    impl ObjectClient for Slow {
+        fn describe(&self, key: &str) -> String {
+            self.mem.describe(key)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+            self.mem.list(prefix).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool, FaucetError> {
+            self.mem.exists(key).await
+        }
+        async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
+            self.mem.download(key, to).await
+        }
+        async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let body = std::fs::read(from).map_err(|e| FaucetError::Sink(e.to_string()))?;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(n, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+            self.now.fetch_sub(1, SeqCst);
+            if self.fail_key.lock().unwrap().as_deref() == Some(key) {
+                return Err(FaucetError::Sink(format!("refused {key}")));
+            }
+            self.mem.objects.lock().unwrap().insert(key.into(), body);
+            Ok(())
+        }
+        async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+            self.mem.delete(key).await
+        }
+    }
+
+    fn pipelined(client: &Arc<Slow>, uploads: usize, path: &str) -> FileWriter {
+        let mut s = WriteSettings::new(FileFormat::JsonLines, Compression::None);
+        s.object_per_flush = true;
+        s.max_records_per_file = Some(1);
+        let (base, t) = object_layout("", Some(path), "", s.format, s.codec, true).unwrap();
+        let b = RemoteBackend::new(client.clone(), base, &t.staging_name())
+            .unwrap()
+            .with_upload_concurrency(uploads);
+        assert_eq!(b.upload_concurrency(), uploads);
+        FileWriter::new(s, t, Arc::new(b)).unwrap()
+    }
+
+    fn rows(n: usize) -> Vec<serde_json::Value> {
+        (0..n).map(|i| serde_json::json!({ "i": i })).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_page_that_rolls_into_many_objects_uploads_them_concurrently() {
+        let client = Arc::new(Slow::default());
+        let w = pipelined(&client, 5, "o/");
+        let started = std::time::Instant::now();
+        w.write_rows(&rows(20)).unwrap();
+        w.flush().unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(client.mem.objects.lock().unwrap().len(), 20);
+        assert_eq!(
+            client.peak.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "uploads overlap up to the limit and never beyond it"
+        );
+        assert_eq!(client.now.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            elapsed < std::time::Duration::from_millis(20 * DELAY_MS / 2),
+            "20 uploads of {DELAY_MS} ms took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_upload_in_flight_is_sequential() {
+        let client = Arc::new(Slow::default());
+        let w = pipelined(&client, 1, "o/");
+        w.write_rows(&rows(4)).unwrap();
+        w.flush().unwrap();
+        assert_eq!(client.peak.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(client.mem.objects.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_background_upload_failure_fails_the_flush() {
+        let client = Arc::new(Slow::default());
+        *client.fail_key.lock().unwrap() = Some("o/part-00002.jsonl".into());
+        let w = pipelined(&client, 4, "o/");
+        let e = w
+            .write_rows(&rows(6))
+            .and_then(|_| w.flush())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("refused o/part-00002.jsonl"), "{e}");
+        assert_eq!(client.now.load(std::sync::atomic::Ordering::SeqCst), 0);
+        w.flush().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_failure_surfaces_at_the_next_commit() {
+        let client = Arc::new(Slow::default());
+        *client.fail_key.lock().unwrap() = Some("o/part-00001.jsonl".into());
+        let w = pipelined(&client, 2, "o/");
+        w.write_rows(&rows(1)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS * 3)).await;
+        let e = w.write_rows(&rows(1)).unwrap_err().to_string();
+        assert!(e.contains("refused"), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overwrite_waits_for_staged_uploads_and_abort_clears_them() {
+        let client = Arc::new(Slow::default());
+        let mut s = WriteSettings::new(FileFormat::JsonLines, Compression::None);
+        s.write_mode = crate::write::FileWriteMode::Overwrite;
+        s.object_per_flush = true;
+        s.max_records_per_file = Some(1);
+        let (base, t) = object_layout("", Some("d/"), "", s.format, s.codec, true).unwrap();
+        let b = RemoteBackend::new(client.clone(), base, &t.staging_name())
+            .unwrap()
+            .with_upload_concurrency(3);
+        let w = FileWriter::new(s, t, Arc::new(b)).unwrap();
+        w.begin_overwrite().unwrap();
+        w.write_rows(&rows(5)).unwrap();
+        w.commit_overwrite().unwrap();
+        let keys: Vec<String> = client.mem.objects.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys.len(), 5, "{keys:?}");
+        assert!(keys.iter().all(|k| k.starts_with("d/part-")), "{keys:?}");
+
+        w.begin_overwrite().unwrap();
+        w.write_rows(&rows(4)).unwrap();
+        w.abort_overwrite().unwrap();
+        assert_eq!(client.now.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let keys: Vec<String> = client.mem.objects.lock().unwrap().keys().cloned().collect();
+        assert!(keys.iter().all(|k| !k.contains("staging")), "{keys:?}");
+        assert_eq!(keys.len(), 5, "{keys:?}");
+    }
+
+    #[test]
+    fn pipelined_uploads_run_outside_a_runtime() {
+        let client = Arc::new(Slow::default());
+        let w = pipelined(&client, 3, "o/");
+        w.write_rows(&rows(6)).unwrap();
+        w.flush().unwrap();
+        assert_eq!(client.mem.objects.lock().unwrap().len(), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn object_per_write_closes_an_object_at_the_end_of_each_batch_write() {
+        let mem = Arc::new(Mem::default());
+        let mut s = WriteSettings::new(FileFormat::JsonLines, Compression::None);
+        s.object_per_flush = true;
+        s.object_per_write = true;
+        let (base, t) = object_layout("pre/", None, ".jsonl", s.format, s.codec, false).unwrap();
+        let b = RemoteBackend::new(mem.clone(), base, &t.staging_name()).unwrap();
+        assert!(!b.sync_scratch());
+        let w = FileWriter::new(s, t, Arc::new(b)).unwrap();
+        w.write_rows(&rows(3)).unwrap();
+        assert_eq!(
+            mem.objects.lock().unwrap().len(),
+            1,
+            "published at write end"
+        );
+        w.write_rows(&rows(2)).unwrap();
+        w.flush().unwrap();
+        let o = mem.objects.lock().unwrap();
+        let bodies: Vec<usize> = o
+            .values()
+            .map(|b| b.iter().filter(|c| **c == b'\n').count())
+            .collect();
+        assert_eq!(bodies, [3, 2]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

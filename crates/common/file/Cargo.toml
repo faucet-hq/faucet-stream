@@ -16,7 +16,7 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "fs"] }
 csv = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
@@ -40,7 +40,7 @@ encryption = ["faucet-core/encryption", "dep:base64"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-parquet"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [package.metadata.docs.rs]
 all-features = true

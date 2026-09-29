@@ -40,6 +40,11 @@ pub struct WriteSettings {
     /// stores, where extending a published object means downloading it
     /// again. Only takes effect with a numbered (`{part}`) template.
     pub object_per_flush: bool,
+    /// Close the open file at the end of every batch write, so each
+    /// `write_batch` call becomes its own file(s). The object-store sinks'
+    /// `batch_size: 0` ("no re-chunking") for Parquet. Only takes effect with
+    /// a numbered (`{part}`) template.
+    pub object_per_write: bool,
 }
 
 impl WriteSettings {
@@ -59,6 +64,7 @@ impl WriteSettings {
             #[cfg(feature = "encryption")]
             encryption: None,
             object_per_flush: false,
+            object_per_write: false,
         }
     }
 
@@ -277,6 +283,7 @@ impl FileWriter {
             parquet: &self.settings.parquet,
             json_lines: &self.settings.json_lines,
             backend: self.backend.as_ref(),
+            sync: self.backend.sync_scratch(),
             #[cfg(feature = "encryption")]
             encryption: self.encryption.as_ref(),
         }
@@ -324,7 +331,10 @@ impl FileWriter {
             self.backend.prepare(area)?;
         }
         let name = self.template.file_name(st.next_part);
-        let exists = self.backend.exists(area, &name)?;
+        let exists = match self.settings.mode {
+            FileMode::Overwrite => false,
+            FileMode::Append | FileMode::ErrorIfExists => self.backend.exists(area, &name)?,
+        };
         if exists && self.settings.mode == FileMode::ErrorIfExists {
             return Err(FaucetError::Sink(format!(
                 "file sink: '{}' already exists and `mode` is `error_if_exists`",
@@ -385,6 +395,7 @@ impl FileWriter {
                 self.roll(&mut st)?;
             }
         }
+        self.end_of_write(&mut st)?;
         Ok(rows.len())
     }
 
@@ -417,22 +428,29 @@ impl FileWriter {
                 self.roll(&mut st)?;
             }
         }
+        self.end_of_write(&mut st)?;
         Ok(rows)
     }
 
-    /// Publish the open file so it holds everything written so far.
+    fn end_of_write(&self, st: &mut State) -> Result<(), FaucetError> {
+        if self.settings.object_per_write && self.template.numbered() && st.current.is_some() {
+            self.roll(st)?;
+        }
+        Ok(())
+    }
+
+    /// Publish the open file so it holds everything written so far, and wait
+    /// until every file closed earlier has landed too.
     pub fn flush(&self) -> Result<(), FaucetError> {
         let mut st = self.lock();
         if self.settings.object_per_flush && self.template.numbered() {
             if st.current.is_some() {
                 self.roll(&mut st)?;
             }
-            return Ok(());
-        }
-        if let Some(f) = st.current.as_mut() {
+        } else if let Some(f) = st.current.as_mut() {
             f.finalize(&self.ctx())?;
         }
-        Ok(())
+        self.backend.settle()
     }
 
     /// End of a successful run: in plain `mode: overwrite`, delete this
@@ -449,6 +467,7 @@ impl FileWriter {
             (n, false) => n,
         };
         drop(st);
+        self.backend.settle()?;
         for (n, name) in self.existing(Area::Destination)? {
             if n >= first_unwritten {
                 self.backend.delete(Area::Destination, &name)?;
@@ -465,6 +484,7 @@ impl FileWriter {
     /// `write_mode: overwrite`: move every staged file into place, delete this
     /// template's files the run did not write, and drop the staging area.
     pub fn commit_overwrite(&self) -> Result<(), FaucetError> {
+        self.backend.settle()?;
         if !self.backend.staging_ready()? {
             return Err(FaucetError::Sink(format!(
                 "file sink: overwrite staging area '{}' is missing, so there is nothing to swap \
@@ -488,6 +508,7 @@ impl FileWriter {
     /// `write_mode: overwrite`: discard the open file and the staging area.
     pub fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.discard();
+        self.backend.cancel();
         self.backend.clear_staging()
     }
 

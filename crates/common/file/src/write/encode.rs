@@ -20,6 +20,9 @@ pub(crate) struct Ctx<'a> {
     pub parquet: &'a super::options::ParquetOptions,
     pub json_lines: &'a super::options::JsonLinesOptions,
     pub backend: &'a dyn StorageBackend,
+    /// Whether finished scratch files are fsynced (see
+    /// [`StorageBackend::sync_scratch`]).
+    pub sync: bool,
     #[cfg(feature = "encryption")]
     pub encryption: Option<&'a faucet_core::CompiledEncryption>,
 }
@@ -104,7 +107,11 @@ impl Ctx<'_> {
             return Ok(());
         }
         let plain = std::fs::read(path).map_err(|e| io_err("reading", path, e))?;
-        write_synced(path, &faucet_core::compress_buf(&plain, self.codec)?)
+        write_synced(
+            path,
+            &faucet_core::compress_buf(&plain, self.codec)?,
+            self.sync,
+        )
     }
 
     /// Undo the file-level codec on a fetched body.
@@ -132,7 +139,7 @@ impl Ctx<'_> {
             && !self.seals_lines()
         {
             let plain = std::fs::read(path).map_err(|e| io_err("reading", path, e))?;
-            write_synced(path, &enc.encrypt(&plain))?;
+            write_synced(path, &enc.encrypt(&plain), self.sync)?;
         }
         let _ = path;
         Ok(())
@@ -340,20 +347,20 @@ impl OpenFile {
                 let file = buffered
                     .into_inner()
                     .map_err(|e| io_err("flushing", &tmp, e.into_error()))?;
-                file.sync_all().map_err(|e| io_err("syncing", &tmp, e))?;
+                sync_if(&file, &tmp, ctx.sync)?;
             }
             #[cfg(feature = "file-format-csv")]
-            Enc::Csv(state) => state.finish_into(ctx.codec, &tmp)?,
+            Enc::Csv(state) => state.finish_into(ctx.codec, &tmp, ctx.sync)?,
             #[cfg(feature = "file-format-csv")]
             Enc::CsvSealed => return Ok(()),
             Enc::Doc(records) => {
                 let body = faucet_core::file_format::encode(records, ctx.format, ctx.opts)?;
                 let body = faucet_core::compress_buf(&body, ctx.codec)?;
-                write_synced(&tmp, &body)?;
+                write_synced(&tmp, &body, ctx.sync)?;
             }
             #[cfg(feature = "file-format-parquet")]
             Enc::Parquet(state) => {
-                if !state.close(&tmp)? {
+                if !state.close(&tmp, ctx.sync)? {
                     return Ok(());
                 }
                 ctx.compress_file(&tmp)?;
@@ -409,7 +416,7 @@ fn open_lines(
         ctx.backend.fetch(area, name, tmp)?;
         if ctx.encrypted() && !ctx.seals_lines() {
             let raw = std::fs::read(tmp).map_err(|e| io_err("reading", tmp, e))?;
-            write_synced(tmp, &ctx.unseal(raw, area, name)?)?;
+            write_synced(tmp, &ctx.unseal(raw, area, name)?, ctx.sync)?;
         }
     }
     let codec = ctx.codec;
@@ -423,11 +430,19 @@ fn open_lines(
     Ok(Box::new(sync_compress_writer(BufWriter::new(f), codec)))
 }
 
-/// Write `bytes` to `path` and sync it.
-pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), FaucetError> {
+/// Write `bytes` to `path`, and sync it when `sync`.
+pub(crate) fn write_synced(path: &Path, bytes: &[u8], sync: bool) -> Result<(), FaucetError> {
     let mut f = File::create(path).map_err(|e| io_err("creating", path, e))?;
     f.write_all(bytes).map_err(|e| io_err("writing", path, e))?;
-    f.sync_all().map_err(|e| io_err("syncing", path, e))
+    sync_if(&f, path, sync)
+}
+
+/// Sync `f` to disk when `sync`.
+pub(crate) fn sync_if(f: &File, path: &Path, sync: bool) -> Result<(), FaucetError> {
+    if sync {
+        f.sync_all().map_err(|e| io_err("syncing", path, e))?;
+    }
+    Ok(())
 }
 
 /// CSV rows waiting for their header.
@@ -577,7 +592,12 @@ impl CsvState {
     }
 
     /// Write header + body to `tmp` through the codec.
-    fn finish_into(&mut self, codec: Compression, tmp: &Path) -> Result<(), FaucetError> {
+    fn finish_into(
+        &mut self,
+        codec: Compression,
+        tmp: &Path,
+        sync: bool,
+    ) -> Result<(), FaucetError> {
         self.body
             .flush()
             .map_err(|e| io_err("flushing", &self.body_path, e))?;
@@ -606,7 +626,7 @@ impl CsvState {
         let file = buffered
             .into_inner()
             .map_err(|e| io_err("flushing", tmp, e.into_error()))?;
-        file.sync_all().map_err(|e| io_err("syncing", tmp, e))
+        sync_if(&file, tmp, sync)
     }
 }
 
