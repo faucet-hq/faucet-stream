@@ -5632,6 +5632,7 @@ dependencies = [
  "bytes",
  "faucet-conformance",
  "faucet-core",
+ "faucet-sink-parquet",
  "faucet-source-s3",
  "futures",
  "parquet",

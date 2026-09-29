@@ -31,7 +31,7 @@ parquet = { workspace = true, optional = true }
 [features]
 compression = ["faucet-core/compression"]
 # Enables the `Parquet` object format + the columnar `write_batch_columnar` fast path.
-arrow = ["faucet-core/arrow", "dep:arrow", "dep:parquet"]
+arrow = ["faucet-core/arrow", "faucet-core/file-format-parquet", "dep:arrow", "dep:parquet"]
 # Uniform file formats (#604): write CSV, XML and Excel objects through
 # `faucet_core::file_format`, so what this sink can write matches what the file
 # sources can read. `file-formats` is the aggregate.
@@ -62,7 +62,9 @@ faucet-source-s3 = { workspace = true, features = [
     "file-format-csv",
     "file-format-xml",
 ] }
-faucet-core = { workspace = true, features = ["arrow"] }
+faucet-core = { workspace = true, features = ["arrow", "file-format-parquet"] }
+# Golden parity test: the same records written by the Parquet sink to S3.
+faucet-sink-parquet = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 

@@ -128,6 +128,7 @@ async fn sink_write_batch_row_path_then_source_reads_back() {
     // Sink row path: write_batch encodes each chunk as a Parquet object.
     let sink = make_sink(&endpoint, "row/").await;
     assert_eq!(sink.write_batch(&rows).await.expect("write_batch"), 3);
+    sink.flush().await.expect("flush uploads the open object");
 
     // Source row path: fetch_with_context decodes the objects back to rows.
     let source = make_source(&endpoint, "row/").await;
@@ -170,6 +171,7 @@ async fn sink_columnar_then_source_columnar_roundtrip() {
             .expect("columnar write"),
         3
     );
+    sink.flush().await.expect("flush uploads the open object");
 
     // Source columnar path: stream_batches yields RecordBatch pages.
     let source = make_source(&endpoint, "col/").await;
