@@ -99,7 +99,7 @@ impl ParquetState {
                     Some(None)
                 }
                 None if finalized && ctx.backend.exists(area, name)? => {
-                    Some(Some(ctx.read_existing(area, name, &old)?))
+                    Some(Some(ctx.decompress(ctx.read_existing(area, name, &old)?)?))
                 }
                 None => None,
             };

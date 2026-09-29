@@ -68,7 +68,7 @@ policy = ["faucet-core/policy", "masking", "lineage", "dep:regex"]
 # (AES-256-GCM bookmark files) and on the jsonl sink (per-line sealing — the
 # file-DLQ-at-rest shape), plus decryption support in `faucet dlq
 # inspect/replay/discard`. Opt-in; included in `full`.
-encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "dep:base64"]
+encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "dep:base64"]
 
 source = [
     "source-rest",

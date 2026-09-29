@@ -191,3 +191,93 @@ impl StorageBackend for LocalBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_files_only_and_tolerates_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = LocalBackend::new(&dir.path().to_string_lossy(), ".stage", false);
+        assert!(b.list(Area::Staging).unwrap().is_empty());
+        std::fs::write(dir.path().join("a"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert_eq!(b.list(Area::Destination).unwrap(), vec!["a".to_string()]);
+        let file = LocalBackend::new(&dir.path().join("a").to_string_lossy(), ".s", false);
+        assert!(
+            file.list(Area::Destination)
+                .unwrap_err()
+                .to_string()
+                .contains("listing")
+        );
+        assert!(b.exists(Area::Destination, "a").unwrap());
+        assert_eq!(
+            b.local_path(Area::Destination, "a"),
+            Some(dir.path().join("a"))
+        );
+        assert!(b.describe(Area::Staging, "x").ends_with(".stage/x"));
+    }
+
+    #[test]
+    fn prepare_respects_create_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("m");
+        let strict = LocalBackend::new(&missing.to_string_lossy(), ".s", false);
+        assert!(
+            strict
+                .prepare(Area::Destination)
+                .unwrap_err()
+                .to_string()
+                .contains("create_dirs")
+        );
+        strict.prepare(Area::Staging).unwrap();
+        let lax = LocalBackend::new(&dir.path().join("n").to_string_lossy(), ".s", true);
+        lax.prepare(Area::Destination).unwrap();
+        assert!(dir.path().join("n").is_dir());
+        assert_eq!(LocalBackend::new("", ".s", true).dir(), Path::new("."));
+    }
+
+    #[test]
+    fn commit_fetch_delete_and_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = LocalBackend::new(&dir.path().to_string_lossy(), ".stage", true);
+        let scratch = b.scratch_path(Area::Destination, "f").unwrap();
+        assert!(scratch.ends_with("f.faucet-tmp"));
+        std::fs::write(&scratch, b"one").unwrap();
+        b.commit(&scratch, Area::Destination, "f").unwrap();
+        let copy = dir.path().join("copy");
+        b.fetch(Area::Destination, "f", &copy).unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"one");
+        assert!(b.fetch(Area::Destination, "nope", &copy).is_err());
+        b.delete(Area::Destination, "f").unwrap();
+        b.delete(Area::Destination, "f").unwrap();
+
+        assert!(!b.staging_ready().unwrap());
+        b.clear_staging().unwrap();
+        b.begin_staging().unwrap();
+        std::fs::write(b.staging_dir().join("g"), b"two").unwrap();
+        b.begin_staging().unwrap();
+        assert!(b.list(Area::Staging).unwrap().is_empty());
+        std::fs::write(b.staging_dir().join("g"), b"two").unwrap();
+        assert!(b.staging_ready().unwrap());
+        b.promote("g").unwrap();
+        assert!(b.promote("g").is_err());
+        assert_eq!(std::fs::read(dir.path().join("g")).unwrap(), b"two");
+        b.clear_staging().unwrap();
+        assert!(!b.staging_dir().exists());
+    }
+
+    #[test]
+    fn stale_scratch_is_removed_only_when_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = LocalBackend::new(&dir.path().to_string_lossy(), ".s", true);
+        for n in ["mine.faucet-tmp", "theirs.faucet-tmp"] {
+            std::fs::write(dir.path().join(n), b"").unwrap();
+        }
+        b.remove_stale_scratch(Area::Destination, &|n| n.starts_with("mine"));
+        assert!(!dir.path().join("mine.faucet-tmp").exists());
+        assert!(dir.path().join("theirs.faucet-tmp").exists());
+        b.remove_stale_scratch(Area::Staging, &|_| true);
+    }
+}

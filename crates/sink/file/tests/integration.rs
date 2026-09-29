@@ -321,15 +321,17 @@ async fn refusals_at_construction() {
         (json!({"path": "x.orc"}), "read-only"),
         (json!({"path": "x.bin"}), "x.bin"),
         (json!({"path": "x.xlsx", "mode": "append"}), "append"),
-        (
-            json!({"path": "x.parquet", "compression": "gzip"}),
-            "compress",
-        ),
     ] {
         let c: FileSinkConfig = serde_json::from_value(cfg.clone()).unwrap();
         let e = FileSink::new(c).err().unwrap().to_string();
         assert!(e.contains(needle), "{cfg}: {e}");
     }
+    let gz: FileSinkConfig =
+        serde_json::from_value(json!({"path": "x.parquet", "compression": "gzip"})).unwrap();
+    assert!(
+        FileSink::new(gz).is_ok(),
+        "a compressed parquet file is written, not refused"
+    );
 }
 
 #[tokio::test]

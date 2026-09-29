@@ -29,7 +29,9 @@ impl Ctx<'_> {
     /// compact JSON, and sealed per record when encryption is on.
     fn line_bytes(&self, records: &[Value]) -> Result<Vec<u8>, FaucetError> {
         #[cfg(feature = "encryption")]
-        if let Some(enc) = self.encryption {
+        if let Some(enc) = self.encryption
+            && self.seals_lines()
+        {
             use base64::Engine as _;
             let mut out = Vec::new();
             for r in records {
@@ -60,11 +62,74 @@ impl Ctx<'_> {
         Ok(out)
     }
 
+    /// Whether an encryption key is configured.
+    fn encrypted(&self) -> bool {
+        #[cfg(feature = "encryption")]
+        return self.encryption.is_some();
+        #[cfg(not(feature = "encryption"))]
+        false
+    }
+
+    /// Whether encryption seals each line (uncompressed line formats: the
+    /// jsonl sink's layout, which stays appendable) rather than the whole
+    /// file after compression.
+    fn seals_lines(&self) -> bool {
+        matches!(self.format, FileFormat::JsonLines | FileFormat::RawText)
+            && self.codec == Compression::None
+    }
+
+    /// A fetched file's stored (compressed) bytes: whole-file sealing is
+    /// undone; a per-line sealed file is returned as it is.
+    fn unseal(&self, raw: Vec<u8>, area: Area, name: &str) -> Result<Vec<u8>, FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = self.encryption
+            && faucet_core::encryption::is_encrypted(&raw)
+        {
+            return enc.decrypt(&raw).map_err(|e| {
+                FaucetError::Sink(format!(
+                    "file sink: decrypting '{}': {e}",
+                    self.backend.describe(area, name)
+                ))
+            });
+        }
+        let _ = (area, name);
+        Ok(raw)
+    }
+
+    /// Compress a finished body in place, for an encoder that does not write
+    /// through the codec.
+    #[cfg_attr(not(feature = "file-format-parquet"), allow(dead_code))]
+    fn compress_file(&self, path: &Path) -> Result<(), FaucetError> {
+        if self.codec == Compression::None {
+            return Ok(());
+        }
+        let plain = std::fs::read(path).map_err(|e| io_err("reading", path, e))?;
+        write_synced(path, &faucet_core::compress_buf(&plain, self.codec)?)
+    }
+
+    /// Undo the file-level codec on a fetched body.
+    #[cfg_attr(not(feature = "file-format-parquet"), allow(dead_code))]
+    pub fn decompress(&self, bytes: Vec<u8>) -> Result<Vec<u8>, FaucetError> {
+        if self.codec == Compression::None {
+            return Ok(bytes);
+        }
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(
+            &mut faucet_core::compression::wrap_sync_reader(
+                std::io::Cursor::new(bytes),
+                self.codec,
+            ),
+            &mut out,
+        )
+        .map_err(|e| FaucetError::Sink(format!("file sink: decompressing: {e}")))?;
+        Ok(out)
+    }
+
     /// Seal a finished whole-file body in place.
     fn seal_file(&self, path: &Path) -> Result<(), FaucetError> {
         #[cfg(feature = "encryption")]
         if let Some(enc) = self.encryption
-            && !matches!(self.format, FileFormat::JsonLines | FileFormat::RawText)
+            && !self.seals_lines()
         {
             let plain = std::fs::read(path).map_err(|e| io_err("reading", path, e))?;
             write_synced(path, &enc.encrypt(&plain))?;
@@ -88,19 +153,7 @@ impl Ctx<'_> {
         self.backend.fetch(area, name, via)?;
         let raw = std::fs::read(via).map_err(|e| io_err("opening", via, e));
         let _ = std::fs::remove_file(via);
-        let raw = raw?;
-        #[cfg(feature = "encryption")]
-        if let Some(enc) = self.encryption
-            && faucet_core::encryption::is_encrypted(&raw)
-        {
-            return enc.decrypt(&raw).map_err(|e| {
-                FaucetError::Sink(format!(
-                    "file sink: decrypting '{}': {e}",
-                    self.backend.describe(area, name)
-                ))
-            });
-        }
-        Ok(raw)
+        self.unseal(raw?, area, name)
     }
 }
 
@@ -115,6 +168,10 @@ enum Enc {
     /// the file is finalised, so a later record can still add a column.
     #[cfg(feature = "file-format-csv")]
     Csv(Box<CsvState>),
+    /// CSV of an encrypted output after a finalisation: the plaintext body is
+    /// gone, and the next write reopens the sealed file.
+    #[cfg(feature = "file-format-csv")]
+    CsvSealed,
     /// Whole-document formats (JSON array, XML, Excel, Avro): the file's
     /// records, encoded together at each finalisation.
     Doc(Vec<Value>),
@@ -197,6 +254,11 @@ impl OpenFile {
 
     fn write_inner(&mut self, ctx: &Ctx<'_>, records: &[Value]) -> Result<(), FaucetError> {
         let tmp = self.tmp.clone();
+        #[cfg(feature = "file-format-csv")]
+        if matches!(self.enc, Enc::CsvSealed) {
+            let (state, _) = CsvState::create(ctx, self.area, &self.name, &tmp, true)?;
+            self.enc = Enc::Csv(Box::new(state));
+        }
         match &mut self.enc {
             Enc::Lines(slot) => {
                 let buf = ctx.line_bytes(records)?;
@@ -208,6 +270,10 @@ impl OpenFile {
             }
             #[cfg(feature = "file-format-csv")]
             Enc::Csv(state) => state.write(records, ctx.opts.csv.on_unknown_field),
+            #[cfg(feature = "file-format-csv")]
+            Enc::CsvSealed => Err(FaucetError::Sink(
+                "csv: the sealed file was not reopened for writing".into(),
+            )),
             Enc::Doc(buf) => {
                 buf.extend_from_slice(records);
                 Ok(())
@@ -278,6 +344,8 @@ impl OpenFile {
             }
             #[cfg(feature = "file-format-csv")]
             Enc::Csv(state) => state.finish_into(ctx.codec, &tmp)?,
+            #[cfg(feature = "file-format-csv")]
+            Enc::CsvSealed => return Ok(()),
             Enc::Doc(records) => {
                 let body = faucet_core::file_format::encode(records, ctx.format, ctx.opts)?;
                 let body = faucet_core::compress_buf(&body, ctx.codec)?;
@@ -288,10 +356,17 @@ impl OpenFile {
                 if !state.close(&tmp)? {
                     return Ok(());
                 }
+                ctx.compress_file(&tmp)?;
             }
         }
         ctx.seal_file(&tmp)?;
-        ctx.backend.commit(&tmp, self.area, &self.name)
+        ctx.backend.commit(&tmp, self.area, &self.name)?;
+        #[cfg(feature = "file-format-csv")]
+        if ctx.encrypted() && matches!(self.enc, Enc::Csv(_)) {
+            self.enc = Enc::CsvSealed;
+            let _ = std::fs::remove_file(body_path(&tmp));
+        }
+        Ok(())
     }
 
     /// Remove the temporary files. The final file, if any, is untouched.
@@ -332,6 +407,10 @@ fn open_lines(
     let carry = resume && ctx.backend.exists(area, name)?;
     if carry {
         ctx.backend.fetch(area, name, tmp)?;
+        if ctx.encrypted() && !ctx.seals_lines() {
+            let raw = std::fs::read(tmp).map_err(|e| io_err("reading", tmp, e))?;
+            write_synced(tmp, &ctx.unseal(raw, area, name)?)?;
+        }
     }
     let codec = ctx.codec;
     let f = OpenOptions::new()

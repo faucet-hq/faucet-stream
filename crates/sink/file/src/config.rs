@@ -81,12 +81,12 @@ pub struct FileSinkConfig {
     /// Pretty-printing, used when the format is JSON Lines.
     #[serde(default)]
     pub json_lines: JsonLinesOptions,
-    /// Encrypt the output at rest (AES-256-GCM). JSON Lines and raw text
-    /// seal each record on its own line (base64), exactly as the jsonl sink
-    /// does, so the file stays appendable — and, like the jsonl sink, cannot
-    /// also be compressed. Every other format is sealed as a whole file when
-    /// it is finalised, after any `compression`. The file source's
-    /// `encryption` block reads both back.
+    /// Encrypt the output at rest (AES-256-GCM). Uncompressed JSON Lines and
+    /// raw text seal each record on its own line (base64), exactly as the
+    /// jsonl sink does, so the file stays appendable. Every other file —
+    /// compressed JSON Lines included — is sealed whole when it is
+    /// finalised, after any `compression`; appending to one decrypts it
+    /// first. The file source's `encryption` block reads both back.
     #[cfg(feature = "encryption")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<faucet_core::EncryptionSpec>,
@@ -135,14 +135,6 @@ impl FileSinkConfig {
     pub fn encryption(mut self, encryption: faucet_core::EncryptionSpec) -> Self {
         self.encryption = Some(encryption);
         self
-    }
-
-    /// Whether the format seals each record on its own line when encrypted.
-    pub fn encrypts_per_line(&self) -> bool {
-        matches!(
-            self.resolved_format(),
-            Ok(FileFormat::JsonLines | FileFormat::RawText)
-        )
     }
 
     /// Set the format.
@@ -257,7 +249,18 @@ impl FileSinkConfig {
                 self.path
             )));
         }
-        self.settings()?.validate()
+        let settings = self.settings()?;
+        let (_, template) = faucet_common_file::write::NameTemplate::from_path(
+            &self.path,
+            settings.format,
+            settings.codec,
+            settings.rolls_over(),
+        )
+        .map_err(|e| match e {
+            FaucetError::Config(m) => FaucetError::Config(format!("file sink: {m}")),
+            other => other,
+        })?;
+        settings.validate_for(&template)
     }
 
     /// The storage-independent write settings for the shared writer.
@@ -423,21 +426,9 @@ mod tests {
     #[cfg(feature = "file-formats")]
     #[test]
     fn validate_format_specific_rules() {
-        let e = cfg(json!({"path": "a.parquet.gz"}))
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("parquet.compression"), "{e}");
-        let e = cfg(json!({"path": "a.avro", "compression": "zstd"}))
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("avro.codec"), "{e}");
-        let e = cfg(json!({"path": "a.xlsx", "compression": "gzip"}))
-            .validate()
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("xlsx"), "{e}");
+        for p in ["a.parquet.gz", "a.avro.zst", "a.xlsx.gz"] {
+            cfg(json!({ "path": p })).validate().unwrap();
+        }
         let e = cfg(json!({"path": "a.csv", "csv": {"delimiter": "ab"}}))
             .validate()
             .unwrap_err()

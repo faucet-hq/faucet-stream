@@ -461,8 +461,23 @@ mod encryption {
         assert_eq!(read_back(&new, "k").await.unwrap().len(), 3);
         assert!(read_back(&new, "other").await.is_err());
 
-        let err = sink_err(json!({"path": p(dir.path(), "z.jsonl.gz"), "encryption": spec("k")}));
-        assert!(err.contains("mutually exclusive"), "{err}");
+        let gz = p(dir.path(), "z.jsonl.gz");
+        pages(
+            &sink(json!({"path": gz, "encryption": spec("k")})),
+            &[people()],
+        )
+        .await
+        .unwrap();
+        assert!(faucet_core::encryption::is_encrypted(
+            &std::fs::read(&gz).unwrap()
+        ));
+        pages(
+            &sink(json!({"path": gz, "mode": "append", "encryption": spec("k")})),
+            &[people()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_back(&gz, "k").await.unwrap().len(), 4);
         assert!(
             !sink_err(json!({"path": p(dir.path(), "b.jsonl"), "encryption": spec(" ")}))
                 .is_empty()

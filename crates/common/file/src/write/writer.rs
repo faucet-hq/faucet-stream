@@ -108,25 +108,6 @@ impl WriteSettings {
                 "file sink: `max_bytes_per_file` must be at least 1".into(),
             ));
         }
-        if self.codec != Compression::None && crate::compresses_internally(format) {
-            return Err(FaucetError::Config(format!(
-                "file sink: `compression` does not apply to {} files, which compress \
-                 internally{} — remove the compression suffix or setting",
-                format.as_str(),
-                match format {
-                    FileFormat::Parquet => " (see `parquet.compression`)",
-                    FileFormat::Avro => " (see `avro.codec`)",
-                    _ => "",
-                }
-            )));
-        }
-        if self.mode == FileMode::Append && !crate::appendable(format) {
-            return Err(FaucetError::Config(format!(
-                "file sink: `mode: append` cannot add to a {} file without rewriting it — use \
-                 JSON Lines or CSV, `mode: overwrite`, or rollover with a `{{part}}` template",
-                format.as_str()
-            )));
-        }
         if self.write_mode == FileWriteMode::Overwrite && self.mode != FileMode::Overwrite {
             return Err(FaucetError::Config(
                 "file sink: `write_mode: overwrite` replaces the whole output set, so `mode` \
@@ -144,19 +125,30 @@ impl WriteSettings {
         #[cfg(feature = "encryption")]
         if let Some(spec) = &self.encryption {
             faucet_core::CompiledEncryption::compile(spec)?;
-            if self.codec != Compression::None && self.line_based() {
-                return Err(FaucetError::Config(
-                    "file sink: `encryption` and `compression` are mutually exclusive for JSON \
-                     Lines and raw text — each record is sealed on its own line, and sealed \
-                     lines cannot form a gzip/zstd stream"
-                        .into(),
-                ));
-            }
         }
         if format == FileFormat::Avro
             && let Some(schema) = &self.opts.avro.schema
         {
             validate_avro_schema(schema)?;
+        }
+        Ok(())
+    }
+}
+
+impl WriteSettings {
+    /// [`validate`](Self::validate), plus the checks that depend on the
+    /// output's names: `mode: append` to a whole-document format is refused
+    /// unless the template is numbered (each run then adds new parts).
+    pub fn validate_for(&self, template: &NameTemplate) -> Result<(), FaucetError> {
+        self.validate()?;
+        if self.mode == FileMode::Append && !crate::appendable(self.format) && !template.numbered()
+        {
+            return Err(FaucetError::Config(format!(
+                "file sink: `mode: append` cannot add to a {} file without rewriting it — use \
+                 JSON Lines, CSV or raw text, `mode: overwrite`, or a `{{part}}` template (or a \
+                 rollover cap) so each run adds new files",
+                self.format.as_str()
+            )));
         }
         Ok(())
     }
@@ -235,7 +227,7 @@ impl FileWriter {
         template: NameTemplate,
         backend: Arc<dyn StorageBackend>,
     ) -> Result<Self, FaucetError> {
-        settings.validate()?;
+        settings.validate_for(&template)?;
         Ok(Self {
             #[cfg(feature = "encryption")]
             encryption: settings
