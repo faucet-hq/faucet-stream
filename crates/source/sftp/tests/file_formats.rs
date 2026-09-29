@@ -205,3 +205,52 @@ mod containers {
         assert!(columnar(&csv).await.is_err());
     }
 }
+
+/// `format: parquet` (#777): files decode on the row and columnar paths and
+/// `parquet.columns` projects.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn parquet_files_decode_and_project() {
+    fn parquet(rows: &[Value]) -> Vec<u8> {
+        let batch = faucet_core::columnar::values_to_record_batch_inferred(rows).unwrap();
+        let mut buf = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        buf
+    }
+    let rows: Vec<Value> = (0..4)
+        .map(|i| json!({"id": i, "name": format!("n{i}")}))
+        .collect();
+    let Some((_c, port)) = start_sftp(&[
+        ("a.parquet".to_string(), parquet(&rows[..2])),
+        ("b.parquet".to_string(), parquet(&rows[2..])),
+    ])
+    .await
+    else {
+        return;
+    };
+    let src = source(port, SftpFormat::Parquet, "*.parquet");
+    assert!(src.supports_columnar());
+    let mut got = drain(&src).await;
+    got.sort_by_key(|r| r["id"].as_i64());
+    assert_eq!(got, rows);
+
+    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+    let mut cfg = SftpSourceConfig::new(conn, "/data")
+        .format(SftpFormat::Parquet)
+        .glob("*.parquet");
+    cfg.parquet.columns = Some(vec!["name".into()]);
+    let src = SftpSource::new(cfg).unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut batches = src.stream_batches(&ctx, 0);
+    let mut total = 0;
+    while let Some(b) = batches.next().await {
+        let b = b.expect("batch");
+        assert_eq!(b.batch.num_columns(), 1);
+        total += b.num_rows();
+    }
+    assert_eq!(total, 4);
+    let all = src.fetch_all().await.unwrap();
+    assert!(all.iter().all(|r| r.as_object().unwrap().len() == 1));
+}
