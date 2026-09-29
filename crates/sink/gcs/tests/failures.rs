@@ -201,3 +201,28 @@ async fn continuing_an_object_that_cannot_be_read_back_is_an_error() {
     .to_string();
     assert!(e.contains("GCS get error for key 'one.jsonl'"), "{e}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn check_passes_and_fails() {
+    let ctx = CheckContext {
+        timeout: Duration::from_secs(10),
+    };
+    let ok = MockServer::start().await;
+    mount(
+        &ok,
+        is("GET"),
+        ResponseTemplate::new(200).set_body_json(json!({})),
+    )
+    .await;
+    let report = sink(&ok, json!({})).await.check(&ctx).await.unwrap();
+    assert!(matches!(report.probes[0].status, ProbeStatus::Pass));
+
+    let refused = MockServer::start().await;
+    mount(&refused, |_: &Request| true, denied()).await;
+    let report = sink(&refused, json!({})).await.check(&ctx).await.unwrap();
+    assert!(matches!(report.probes[0].status, ProbeStatus::Fail { .. }));
+    assert_eq!(
+        report.probes[0].hint.as_deref(),
+        Some("check bucket name, credentials, and network")
+    );
+}
