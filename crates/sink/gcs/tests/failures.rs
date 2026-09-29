@@ -39,7 +39,7 @@ async fn mount(
 async fn sink(server: &MockServer, fields: Value) -> GcsSink {
     let base = GcsSinkConfig::new(BUCKET)
         .auth(GcsCredentials::Anonymous)
-        .storage_host(&server.uri());
+        .storage_host(server.uri());
     let mut cfg = serde_json::to_value(base).unwrap();
     for (k, v) in fields.as_object().unwrap() {
         cfg[k] = v.clone();
@@ -161,7 +161,7 @@ async fn a_part_token_in_the_directory_is_a_config_error() {
     let server = MockServer::start().await;
     let cfg = GcsSinkConfig::new(BUCKET)
         .auth(GcsCredentials::Anonymous)
-        .storage_host(&server.uri());
+        .storage_host(server.uri());
     let mut v = serde_json::to_value(cfg).unwrap();
     v["path"] = json!("a-{part}/x.jsonl");
     let e = GcsSink::new(serde_json::from_value(v).unwrap())
