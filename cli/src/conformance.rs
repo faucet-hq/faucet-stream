@@ -415,21 +415,6 @@ pub fn capability_matrix_markdown() -> String {
         }
         out.push('\n');
     }
-
-    // ── Deprecated kinds (#779) ──────────────────────────────────────────
-    out.push_str("\n## Deprecated kinds\n\n");
-    out.push_str(
-        "These kinds still work and are built as the `file` connector with the format \
-         pinned (a `parquet` location on S3 still uses the old crate). New configs \
-         should use `type: file`.\n\n",
-    );
-    out.push_str("| Deprecated | Replacement |\n|---|---|\n");
-    for k in crate::file_alias::DEPRECATED_FILE_KINDS {
-        out.push_str(&format!(
-            "| `type: {k}` | {} |\n",
-            crate::file_alias::replacement(k)
-        ));
-    }
     out
 }
 

@@ -91,24 +91,30 @@ pub fn deprecated_spellings(doc: &Value) -> Vec<String> {
             );
         }
     }
-    deprecated_file_kinds(doc, &mut out);
+    deprecated_kinds(doc, &mut out);
     out.into_iter().collect()
 }
 
+/// Connector kinds replaced by `type: file` (#779).
+pub const DEPRECATED_FILE_KINDS: &[&str] = &["csv", "jsonl", "parquet"];
+
 /// Connector blocks (`{type, config}`) anywhere in the document that use a
-/// kind now spelled `type: file` (#779).
-fn deprecated_file_kinds(v: &Value, out: &mut BTreeSet<String>) {
+/// deprecated kind.
+fn deprecated_kinds(v: &Value, out: &mut BTreeSet<String>) {
     match v {
         Value::Object(m) => {
             if m.contains_key("config")
                 && let Some(kind) = m.get("type").and_then(Value::as_str)
-                && crate::file_alias::is_deprecated_file_kind(kind)
+                && DEPRECATED_FILE_KINDS.contains(&kind)
             {
-                out.insert(crate::file_alias::deprecation_notice(kind));
+                out.insert(format!(
+                    "connector kind `{kind}` is deprecated: use `type: file` \
+                     (it still works until the next major release)"
+                ));
             }
-            m.values().for_each(|c| deprecated_file_kinds(c, out));
+            m.values().for_each(|c| deprecated_kinds(c, out));
         }
-        Value::Array(a) => a.iter().for_each(|c| deprecated_file_kinds(c, out)),
+        Value::Array(a) => a.iter().for_each(|c| deprecated_kinds(c, out)),
         _ => {}
     }
 }
@@ -167,14 +173,16 @@ mod tests {
             },
             "matrix": [ { "id": "x", "source": { "type": "file", "config": { "path": "b.csv" } } } ]
         });
-        assert_eq!(
-            deprecated_spellings(&doc),
-            vec![
-                "connector kind `csv` is deprecated: use `type: file` with `format: csv` (the old kind still works)",
-                "connector kind `jsonl` is deprecated: use `type: file` with `format: json_lines` (the old kind still works)",
-                "connector kind `parquet` is deprecated: use `type: file` with `format: parquet` (the old kind still works)",
-            ]
-        );
+        let notes = deprecated_spellings(&doc);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        for kind in DEPRECATED_FILE_KINDS {
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.starts_with(&format!("connector kind `{kind}`"))),
+                "{notes:?}"
+            );
+        }
         assert!(deprecated_spellings(&json!({"a": {"type": "csv"}})).is_empty());
     }
 

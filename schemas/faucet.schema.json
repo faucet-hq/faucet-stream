@@ -18149,9 +18149,8 @@
               "anyOf": [
                 {
                   "additionalProperties": true,
-                  "deprecated": true,
                   "title": "CsvSourceConfig",
-                  "description": "Deprecated alias: use `type: file` with `format: csv`. Configuration for the CSV file source.",
+                  "description": "Configuration for the CSV file source.",
                   "type": "object",
                   "properties": {
                     "path": {
@@ -18865,9 +18864,8 @@
               "anyOf": [
                 {
                   "additionalProperties": true,
-                  "deprecated": true,
                   "title": "ParquetSourceConfig",
-                  "description": "Deprecated alias: use `type: file` with `format: parquet`. Configuration for the Parquet source connector.",
+                  "description": "Configuration for the Parquet source connector.",
                   "type": "object",
                   "properties": {
                     "source": {
@@ -21491,9 +21489,8 @@
               "anyOf": [
                 {
                   "additionalProperties": true,
-                  "deprecated": true,
                   "title": "JsonlSinkConfig",
-                  "description": "Deprecated alias: use `type: file` with `format: json_lines`. Configuration for the JSON Lines file sink.",
+                  "description": "Configuration for the JSON Lines file sink.",
                   "type": "object",
                   "properties": {
                     "path": {
@@ -23281,9 +23278,8 @@
               "anyOf": [
                 {
                   "additionalProperties": true,
-                  "deprecated": true,
                   "title": "CsvSinkConfig",
-                  "description": "Deprecated alias: use `type: file` with `format: csv`. Configuration for the CSV file sink.",
+                  "description": "Configuration for the CSV file sink.",
                   "type": "object",
                   "properties": {
                     "path": {
@@ -24129,9 +24125,8 @@
               "anyOf": [
                 {
                   "additionalProperties": true,
-                  "deprecated": true,
                   "title": "ParquetSinkConfig",
-                  "description": "Deprecated alias: use `type: file` with `format: parquet`. Configuration for the Parquet sink connector.",
+                  "description": "Configuration for the Parquet sink connector.",
                   "type": "object",
                   "properties": {
                     "destination": {

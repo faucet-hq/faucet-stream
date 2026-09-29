@@ -38,7 +38,7 @@ pub async fn run(args: DiscoverArgs) -> CliResult<()> {
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
     let source =
         crate::registry::build_source(&spec.kind, spec.config.clone(), &auth, None).await?;
-    if !source.supports_discover() || crate::file_alias::is_deprecated_file_kind(&spec.kind) {
+    if !source.supports_discover() {
         return Err(CliError::Config(format!(
             "source '{}' does not support dataset discovery — discovery is available for \
              catalog-backed sources (postgres, mysql, mssql, sqlite, mongodb, elasticsearch, \

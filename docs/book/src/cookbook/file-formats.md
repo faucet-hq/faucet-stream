@@ -441,52 +441,6 @@ faucet run cli/examples/rest_to_file.yaml        # REST API → ./out/posts/<dat
 faucet run cli/examples/file_to_jsonl.yaml       # and read files back in the next pipeline
 ```
 
-## Moving off the csv, jsonl and parquet kinds
-
-`type: csv`, `type: jsonl` and `type: parquet` are deprecated aliases of
-`type: file`. An existing config keeps working unchanged: the CLI checks it
-against the old connector's fields (so a typo still fails the same way),
-builds the `file` connector with the format pinned, keeps the old kind as
-the connector name in metrics and logs, and prints one line on `faucet
-validate` / `faucet run`:
-
-```text
-connector kind `jsonl` is deprecated: use `type: file` with `format: json_lines` (the old kind still works)
-```
-
-To migrate, rename the kind and move the fields:
-
-| Old | `type: file` |
-|---|---|
-| csv source `has_headers`, `delimiter`, `quote`, `flexible`, `null_values` | `csv.has_headers`, `csv.delimiter` (a one-character string, `";"` rather than `59`), `csv.quote`, `csv.flexible`, `csv.null_values` |
-| csv sink `delimiter`, `write_headers` | `csv.delimiter`, `csv.has_headers` |
-| csv sink `on_unknown_field` (default `warn`) | `csv.on_unknown_field` (default `widen`: a later field becomes a new column instead of being dropped) |
-| csv / jsonl sink `append: true` | `mode: append` (the csv sink never wrote a header when appending; the file sink writes one when it creates the file, and the alias turns `csv.has_headers` off to keep the old output) |
-| jsonl sink `pretty` | `json_lines.pretty` |
-| jsonl sink `encryption` | `encryption` |
-| parquet source `source: {type: local_path, path}` / `{type: glob, pattern}` | `path` |
-| parquet source `columns` | `parquet.columns` |
-| parquet sink `destination: {type: local_path, path}` | `path`; a directory becomes `dir/` (numbered `part-00001.parquet` files) |
-| parquet sink `compression`, `row_group_size` | `parquet.compression`, `parquet.row_group_size` |
-| parquet sink `max_rows_per_file` | `max_records_per_file` |
-| parquet sink `schema: {type: inferred, sample_size}` | drop it: the file sink infers from every record |
-
-`path`, `batch_size`, `compression` and `concurrency` keep their names. Set
-`format:` when the extension does not say it: a `jsonl` sink writing
-`out.json` needs `format: json_lines`, or the file sink writes a JSON array.
-
-Three differences to know about:
-
-- A parquet sink writing to a directory, or with a rollover threshold, used
-  to add UUID-named files on every run. The alias writes numbered parts with
-  `mode: append`, so each run still adds files, after the highest existing
-  part.
-- The file source reads a null Parquet column as `"key": null`; the parquet
-  source left the key out.
-- A `parquet` location on S3 (`type: s3`) is still built by the old crate,
-  and so is a CSV delimiter or quote byte above ASCII. Both warn like the
-  rest.
-
 ## Parquet is separate on purpose
 
 `parquet` is columnar and self-describing, and each connector reads and writes
@@ -511,6 +465,49 @@ source:
 
 A column an object does not have fails the run with an error naming the object
 and its columns.
+
+## Moving from the csv, jsonl and parquet connectors
+
+`type: csv`, `type: jsonl` and `type: parquet` are deprecated. They keep
+working exactly as before until the next major release, and `faucet validate`
+/ `faucet run` print one line naming the replacement:
+
+```text
+connector kind `jsonl` is deprecated: use `type: file` (it still works until the next major release)
+```
+
+The `file` connector does everything they did. To move a config, change the
+kind and move these fields:
+
+| Old | `type: file` |
+|---|---|
+| csv source `has_headers`, `delimiter`, `quote`, `flexible`, `null_values` | `csv.has_headers`, `csv.delimiter` (a one-character string, `";"` rather than `59`), `csv.quote`, `csv.flexible`, `csv.null_values` |
+| csv sink `delimiter`, `write_headers` | `csv.delimiter`, `csv.has_headers` |
+| csv sink `on_unknown_field` (default `warn`) | `csv.on_unknown_field` (default `widen`: a later field becomes a new column instead of being dropped) |
+| csv / jsonl sink `append: true` | `mode: append` |
+| jsonl sink `pretty` | `json_lines.pretty` |
+| jsonl sink `encryption` | `encryption` |
+| parquet source `source: {type: local_path, path}` / `{type: glob, pattern}` | `path` |
+| parquet source `columns` | `parquet.columns` |
+| parquet sink `destination: {type: local_path, path}` | `path`; for a directory of numbered files use `dir/part-{part}.parquet` with `mode: append` |
+| parquet sink `compression`, `row_group_size` | `parquet.compression`, `parquet.row_group_size` |
+| parquet sink `max_rows_per_file` | `max_records_per_file` |
+| parquet sink `schema: {type: inferred, sample_size}` | drop it: the file sink infers from every record |
+
+`path`, `batch_size`, `compression` and `concurrency` keep their names. Set
+`format:` when the extension does not say it: a `jsonl` sink writing
+`out.json` needs `format: json_lines`, or the file sink writes a JSON array.
+A Parquet location on S3 moves to the `s3` source or sink with
+`file_format: parquet` / `format: parquet`.
+
+Two differences to know about:
+
+- The file source reads a null Parquet column as `"key": null`; the parquet
+  source left the key out.
+- The file sink writes each file to a temporary name and renames it into place
+  when it is complete, so a reader never sees a half-written file. Because of
+  that, two rows cannot append to the same `type: file` path at once; give each
+  row its own path. The old kinds still allow it.
 
 ## See also
 

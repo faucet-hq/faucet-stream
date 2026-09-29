@@ -13,8 +13,6 @@ pub struct FileSink {
     config: FileSinkConfig,
     local: Arc<LocalBackend>,
     writer: FileWriter,
-    name: &'static str,
-    advertised: Option<(&'static [WriteMode], faucet_core::BatchAtomicity)>,
 }
 
 impl FileSink {
@@ -45,27 +43,7 @@ impl FileSink {
             config,
             local,
             writer,
-            name: "file",
-            advertised: None,
         })
-    }
-
-    /// Report `name` as the connector name (metric labels, logs) instead of
-    /// `file`, for a deprecated kind the CLI builds as this sink.
-    pub fn with_connector_name(mut self, name: &'static str) -> Self {
-        self.name = name;
-        self
-    }
-
-    /// Advertise what a deprecated kind built as this sink always advertised:
-    /// these write modes, this batch atomicity, and no read-back source.
-    pub fn with_legacy_surface(
-        mut self,
-        write_modes: &'static [WriteMode],
-        atomicity: faucet_core::BatchAtomicity,
-    ) -> Self {
-        self.advertised = Some((write_modes, atomicity));
-        self
     }
 
     /// The resolved format.
@@ -117,7 +95,7 @@ impl FileSink {
 #[async_trait]
 impl Sink for FileSink {
     fn connector_name(&self) -> &'static str {
-        self.name
+        "file"
     }
 
     fn config_schema(&self) -> Value {
@@ -132,13 +110,11 @@ impl Sink for FileSink {
     }
 
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.advertised
-            .map_or_else(|| self.config.batch_atomicity(), |(_, a)| a)
+        self.config.batch_atomicity()
     }
 
     fn supported_write_modes(&self) -> &'static [WriteMode] {
-        self.advertised
-            .map_or(&[WriteMode::Append, WriteMode::Overwrite], |(m, _)| m)
+        &[WriteMode::Append, WriteMode::Overwrite]
     }
 
     fn is_overwrite(&self) -> bool {
@@ -162,10 +138,7 @@ impl Sink for FileSink {
     }
 
     fn readback_source(&self) -> Option<(String, Value)> {
-        match self.advertised {
-            Some(_) => None,
-            None => Some(("file".into(), self.readback_config())),
-        }
+        Some(("file".into(), self.readback_config()))
     }
 
     async fn local_outputs(&self) -> Vec<faucet_core::LocalOutput> {
@@ -252,38 +225,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn legacy_surface_replaces_the_advertised_capabilities() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = sink(dir.path(), json!({ "path": "out.jsonl" }));
-        assert_eq!(
-            s.supported_write_modes(),
-            &[WriteMode::Append, WriteMode::Overwrite]
-        );
-        assert_eq!(s.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
-        assert!(s.readback_source().is_some());
-        let s = s.with_legacy_surface(
-            &[WriteMode::Append],
-            faucet_core::BatchAtomicity::BestEffort,
-        );
-        assert_eq!(s.supported_write_modes(), &[WriteMode::Append]);
-        assert_eq!(s.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
-        assert!(s.readback_source().is_none());
-    }
-
     fn sink(dir: &Path, v: Value) -> FileSink {
         let mut v = v;
         let rel = v["path"].as_str().unwrap().to_string();
         v["path"] = Value::String(format!("{}/{rel}", dir.display()));
         FileSink::new(serde_json::from_value(v).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn connector_name_defaults_to_file_and_can_be_renamed() {
-        let d = tempfile::tempdir().unwrap();
-        let s = sink(d.path(), json!({"path": "a.jsonl"}));
-        assert_eq!(s.connector_name(), "file");
-        assert_eq!(s.with_connector_name("jsonl").connector_name(), "jsonl");
     }
 
     fn lines(p: &Path) -> Vec<Value> {

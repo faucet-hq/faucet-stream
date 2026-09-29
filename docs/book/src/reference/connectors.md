@@ -54,13 +54,13 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | Redis | T1 ✅ | `source-redis` | ✓ | ✗ | ✗ | ✗ | ✗ | streams, lists, key patterns |
 | Webhook | T2 | `source-webhook` | ✗⁶ | ✗ | ✗ | ✗ | ✗ | temporary HTTP server collecting POSTs |
 | WebSocket | T1 ✅ | `source-websocket` | ✓ | ✗ | ✗ | ✗ | ✗ | live push feed; subscribe frames, reconnect, ping keepalive |
-| CSV *(deprecated)* | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | **Deprecated alias** of the [file source](../cookbook/file-formats.md#moving-off-the-csv-jsonl-and-parquet-kinds): `type: csv` is built as `type: file` with `format: csv` and warns |
+| CSV *(deprecated: use `file`)* | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | CSV files as JSON; strict field count by default (`flexible: true` to tolerate ragged rows). For new configs prefer the file source |
 | Local files | T1 ✅ | `source-file` | ✓ | ✓ | ✗ | ✓ | ✓ | [file source](../cookbook/file-formats.md#the-local-file-source): a path, directory, glob or `http(s)://` URL; JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC, format + compression resolved per file; incremental by mtime or name; hash-of-path sharding; Avro / ORC / Parquet join the columnar path |
 | Elasticsearch | T1 ✅ᵐ | `source-elasticsearch` | ✓ | ✗ | ✗ | ✗ | ✓ | search/scroll API |
 | Apache Kafka | T1 ✅ | `source-kafka` | ✓ | ✓ | **✓** | ✗ | ✗ | consumer; idle/max-messages termination, offset bookmarks |
 | AWS Kinesis | T1 ✅ | `source-kinesis` | ✓ | ✓ | ✗ | ✗ | ✗ | per-shard GetRecords workers; sequence-number bookmarks, idle/max-messages termination |
 | Google Cloud Pub/Sub | T1 ✅ᵉ | `source-pubsub` | ✓ | ✓ | ✗ | ✗ | ✗ | streaming pull; per-message records + attributes, ack at durable page boundary (at-least-once), idle/max-messages termination |
-| Apache Parquet *(deprecated)* | T1 ✅ | `source-parquet` | ✓ | ✗ | ✗ | ✗ | ✗ | **Deprecated alias** of the [file source](../cookbook/file-formats.md#moving-off-the-csv-jsonl-and-parquet-kinds) with `format: parquet`; an S3 location still uses the old reader |
+| Apache Parquet *(deprecated: use `file`)* | T1 ✅ | `source-parquet` | ✓ | ✗ | ✗ | ✗ | ✗ | local/glob/S3, vectorized Arrow reader, projection |
 | Apache Delta Lake | T1 ✅ | `source-delta` | ✓ | ✗ | ✗ | ✗ | ✗ | local FS or S3/Azure/GCS; time travel (version/timestamp), projection pushdown, partition reconstruction |
 | Databricks SQL | T1 ✅ᵐ | `source-databricks` | ✓ | ✓ | ✗ | ✗ | ✗ | Statement Execution API; async poll, chunk pagination, typed decode, incremental `${bookmark}` |
 | Apache Iceberg | T1 ✅ | `source-iceberg` | ✓ | ✓ | ✗ | ✗ | ✓ | REST/Glue/SQL/HMS catalog; Arrow scan with column projection + filter pushdown, snapshot / timestamp time travel, `mode: incremental` reads only snapshots appended since the bookmark; file-task sharding |
@@ -232,7 +232,7 @@ config this project treats as a defect.
 |-----------|:---:|---------|:---:|:---:|:---:|:---:|:---:|------------|
 | BigQuery | T2 | `sink-bigquery` | ✓ | ✗ | **✓** | **✓** | per-row (`batch_size: 0`); atomic keyed | Bucket-free resumable load job by default (`media_load`); in-place `MERGE` for upsert + effectively-once |
 | PostgreSQL | T1 ✅ | `sink-postgres` | ✓ | ✗ | **✓** | **✓** | atomic (JSONB + `batch_size: 0`; keyed when journaled) | multi-row `INSERT` (JSONB or mapped cols); `COPY FROM STDIN` fast-path for append (`write_method: copy`) |
-| JSON Lines *(deprecated)* | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | best-effort | **Deprecated alias** of the [file sink](../cookbook/file-formats.md#moving-off-the-csv-jsonl-and-parquet-kinds) with `format: json_lines` |
+| JSON Lines *(deprecated: use `file`)* | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file append |
 | Local files | T1 ✅ | `sink-file` | no-op | ✓ | ✗ | ✗ | atomic (no rollover) | [file sink](../cookbook/file-formats.md#the-local-file-sink): JSONL / JSON / CSV / XML / Excel / Avro / Parquet by extension; temp-then-rename finalisation, record/byte rollover with a `{part}` template, `write_mode: overwrite` swaps the whole output set; Parquet (and Avro) take the columnar path |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | atomic (`batch_size: 0`) | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
 | Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | atomic (COPY + `batch_size: 0`) | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
@@ -252,7 +252,7 @@ config this project treats as a defect.
 | Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | blobs (object_store) in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption; block-list upload past 8 MiB |
 | MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | best-effort | `insert_many`; multi-document transaction for effectively-once (replica set required) |
 | Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | best-effort | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
-| CSV *(deprecated)* | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | best-effort | **Deprecated alias** of the [file sink](../cookbook/file-formats.md#moving-off-the-csv-jsonl-and-parquet-kinds) with `format: csv`; keeps the old `on_unknown_field: warn` default |
+| CSV *(deprecated: use `file`)* | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |
 | Elasticsearch | T2 | `sink-elasticsearch` | ✓ | ✗ | **✓** | ✗ | per-row (`batch_size: 0`) | `_bulk` NDJSON (per-row DLQ) |
 | HTTP | T1 ✅ᵐ | `sink-http` | ✓ | ✗ | ✗ | ✗ | per-row | POST, concurrent under a semaphore |
 | Stdout | T1 ✅ | `sink-stdout` | no-op | ✗ | ✗ | ✗ | best-effort | JSON Lines / pretty JSON / TSV |
@@ -260,7 +260,7 @@ config this project treats as a defect.
 | AWS Kinesis | T1 ✅ | `sink-kinesis` | ✓ | ✗ | ✗ | ✗ | best-effort | batched PutRecords; partition-key routing, per-entry partial-failure retry (DLQ-routable) |
 | Google Cloud Pub/Sub | T1 ✅ᵉ | `sink-pubsub` | ✓ | ✗ | ✗ | ✗ | per-row | batched publish; optional ordering key, per-entry partial-failure retry (DLQ-routable) |
 | Cloud Spanner | T1 ✅ᵉ | `sink-spanner` | ✓ | ✗ | **✓** | **✓** | best-effort | batched mutations (`insert` / `insert_or_update` / `delete`), cell-budget chunking, commit-token transaction for effectively-once |
-| Apache Parquet *(deprecated)* | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | best-effort | **Deprecated alias** of the [file sink](../cookbook/file-formats.md#moving-off-the-csv-jsonl-and-parquet-kinds) with `format: parquet`; an S3 destination still uses the old writer |
+| Apache Parquet *(deprecated: use `file`)* | T1 ✅ | `sink-parquet` | ✓ | ✗⁶ | ✗ | ✗ | best-effort | local/S3, schema inference (re-inferred per file on rollover), row/byte rollover |
 | Apache Delta Lake | T1 ✅ | `sink-delta` | ✓ | ✗⁶ | ✗ | ✗ | atomic (unless `target_file_size` splits a page) | append-only; local FS or S3/Azure/GCS; schema-inferred table creation, partitioning, one commit per flush |
 | Apache Iceberg | T2 | `sink-iceberg` | ✓ | ✗⁶ | ✗ | **✓** | per-row | REST/Glue/SQL/HMS catalog, local + cloud (S3/GCS) warehouses, `fast_append` snapshot, Parquet data files |
 | Amazon DynamoDB | T1 ✅ᵉ | `sink-dynamodb` | ✓ | ✗ | **✓** | ✗ | per-row | `BatchWriteItem` (25 items / 16 MiB per request) with unprocessed-item retry, bounded concurrency; `write_mode: upsert\|delete` by the table key; optional `condition_expression` writes (`on_condition_failure`) |
