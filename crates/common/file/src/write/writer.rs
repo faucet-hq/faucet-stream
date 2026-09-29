@@ -434,11 +434,15 @@ impl FileWriter {
         Ok(rows)
     }
 
+    /// End of a batch write: close the file when each write is its own
+    /// object, then wait for every upload the batch started, so a failed
+    /// upload fails the batch that wrote it (and a DLQ receives the right
+    /// rows) rather than a later one.
     fn end_of_write(&self, st: &mut State) -> Result<(), FaucetError> {
         if self.settings.object_per_write && self.template.numbered() && st.current.is_some() {
             self.roll(st)?;
         }
-        Ok(())
+        self.backend.settle()
     }
 
     /// Publish the open file so it holds everything written so far, and wait

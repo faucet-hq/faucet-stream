@@ -736,14 +736,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_finished_failure_surfaces_at_the_next_commit() {
+    async fn a_failed_upload_fails_the_batch_that_wrote_it() {
         let client = Arc::new(Slow::default());
         *client.fail_key.lock().unwrap() = Some("o/part-00001.jsonl".into());
         let w = pipelined(&client, 2, "o/");
-        w.write_rows(&rows(1)).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS * 3)).await;
         let e = w.write_rows(&rows(1)).unwrap_err().to_string();
         assert!(e.contains("refused"), "{e}");
+        w.write_rows(&rows(1)).unwrap();
+        w.flush().unwrap();
+        assert_eq!(client.mem.objects.lock().unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

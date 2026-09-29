@@ -306,9 +306,10 @@ Iceberg upsert is not yet supported (a follow-up, blocked on `iceberg-rust`).
 `write_mode: overwrite` (full-refresh: atomically replace the whole
 destination each run) is additionally supported by **PostgreSQL, SQLite, MySQL,
 MSSQL, Oracle, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias
-swap — the configured `index` must be an alias), and by the append-only **local file**
-sink (files staged in a hidden directory and moved into place on success) — not
-Spanner or DynamoDB. See
+swap — the configured `index` must be an alias), and by the append-only **local file**,
+**S3**, **GCS**, **Azure Blob** and **SFTP** sinks (files staged under a hidden
+directory or key prefix and moved into place on success) — not Spanner or
+DynamoDB. See
 [Upsert / mirror tables](../cookbook/upsert.md).
 
 Every sink in this column except **DynamoDB**, **Databricks** and **Oracle** also supports
