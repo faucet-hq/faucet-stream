@@ -193,4 +193,84 @@ mod tests {
         assert_eq!(objects.describe("k"), "az://c/k");
         assert!(objects.download("p/none", &out).await.is_err());
     }
+
+    fn objects(store: Arc<dyn ObjectStore>, part_bytes: usize) -> AzureObjects {
+        AzureObjects {
+            store,
+            container: "c".into(),
+            part_bytes,
+            concurrency: 1,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_file_failures_name_the_step_and_the_key() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let whole = objects(mem.clone(), 1 << 20);
+        let parts = objects(mem, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let e = whole.upload(&dir.path().join("missing"), "k").await;
+        assert!(
+            e.unwrap_err()
+                .to_string()
+                .contains("azure stat local file error for key 'k'")
+        );
+        let e = whole.upload(dir.path(), "k").await.unwrap_err().to_string();
+        assert!(e.contains("azure read local file error for key 'k'"), "{e}");
+        let e = parts.upload(dir.path(), "k").await.unwrap_err().to_string();
+        assert!(e.contains("azure read local file error for key 'k'"), "{e}");
+        assert!(
+            !parts.exists("k").await.unwrap(),
+            "an aborted upload publishes nothing"
+        );
+
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"ab").unwrap();
+        whole.upload(&src, "o").await.unwrap();
+        let e = whole
+            .download("o", &dir.path().join("no/such/file"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("azure create local copy error for key 'o'"),
+            "{e}"
+        );
+        let e = whole.rename("absent", "to").await.unwrap_err().to_string();
+        assert!(e.contains("azure copy error for key 'to'"), "{e}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::File::open(&src).is_err() {
+                let e = parts.upload(&src, "p").await.unwrap_err().to_string();
+                assert!(e.contains("azure open local file error for key 'p'"), "{e}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_failures_name_the_call_and_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("f"), b"").unwrap();
+        let fs: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap());
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"abc").unwrap();
+        let e = objects(fs.clone(), 1 << 20)
+            .upload(&src, "f/x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("azure put object error for key 'f/x'"), "{e}");
+        let e = objects(fs, 1)
+            .upload(&src, "f/y")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("error for key 'f/y'"), "{e}");
+    }
 }

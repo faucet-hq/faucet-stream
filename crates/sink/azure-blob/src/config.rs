@@ -676,4 +676,24 @@ mod object_rules_tests {
         c.path = Some("d/part-{part}.parquet".into());
         assert!(!c.settings().unwrap().object_per_write, "path: per part");
     }
+
+    #[test]
+    fn every_variant_has_a_shared_format_and_caps_combine() {
+        #[cfg(feature = "arrow")]
+        assert_eq!(
+            AzureSinkFormat::Parquet.shared(),
+            faucet_core::FileFormat::Parquet
+        );
+        assert_eq!(
+            AzureSinkFormat::Auto.shared(),
+            faucet_core::FileFormat::JsonLines
+        );
+        let mut c = AzureBlobSinkConfig::new("c");
+        c.batch_size = 10;
+        c.max_records_per_file = Some(4);
+        assert_eq!(c.legacy_cap(), Some(4));
+        c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+        assert!(c.settings().is_err());
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+    }
 }
