@@ -174,23 +174,24 @@ fn config_text(e: FaucetError) -> String {
 }
 
 fn require_feature(format: FileFormat) -> Result<(), FaucetError> {
-    let missing = match format {
-        FileFormat::Csv if !cfg!(feature = "file-format-csv") => Some("file-format-csv"),
-        FileFormat::Xml if !cfg!(feature = "file-format-xml") => Some("file-format-xml"),
-        FileFormat::Xlsx if !cfg!(feature = "file-format-excel") => Some("file-format-excel"),
-        FileFormat::Avro if !cfg!(feature = "file-format-avro") => Some("file-format-avro"),
-        FileFormat::Parquet if !cfg!(feature = "file-format-parquet") => {
-            Some("file-format-parquet")
-        }
-        _ => None,
+    let (feature, built) = match format {
+        FileFormat::Csv => ("file-format-csv", cfg!(feature = "file-format-csv")),
+        FileFormat::Xml => ("file-format-xml", cfg!(feature = "file-format-xml")),
+        FileFormat::Xlsx => ("file-format-excel", cfg!(feature = "file-format-excel")),
+        FileFormat::Avro => ("file-format-avro", cfg!(feature = "file-format-avro")),
+        FileFormat::Parquet => ("file-format-parquet", cfg!(feature = "file-format-parquet")),
+        _ => return Ok(()),
     };
-    match missing {
-        Some(feature) => Err(FaucetError::Config(format!(
-            "file sink: `{}` needs the `{feature}` build feature",
-            format.as_str()
-        ))),
-        None => Ok(()),
-    }
+    built
+        .then_some(())
+        .ok_or_else(|| missing_feature(format, feature))
+}
+
+fn missing_feature(format: FileFormat, feature: &str) -> FaucetError {
+    FaucetError::Config(format!(
+        "file sink: `{}` needs the `{feature}` build feature",
+        format.as_str()
+    ))
 }
 
 #[cfg(feature = "file-format-avro")]
@@ -539,8 +540,249 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use crate::write::LocalBackend;
+
     #[test]
     fn estimate_is_the_json_length_plus_a_newline() {
         assert_eq!(estimate(&json!({"a": 1})), 8);
+    }
+
+    fn local(dir: &std::path::Path, path: &str, s: WriteSettings) -> FileWriter {
+        let full = dir.join(path);
+        let (d, t) =
+            NameTemplate::from_path(full.to_str().unwrap(), s.format, s.codec, s.rolls_over())
+                .unwrap();
+        let b = LocalBackend::new(&d, &t.staging_name(), true);
+        FileWriter::new(s, t, Arc::new(b)).unwrap()
+    }
+
+    #[test]
+    fn settings_report_encryption_and_line_formats() {
+        let s = WriteSettings::new(FileFormat::JsonLines, Compression::None);
+        assert!(!s.encrypted());
+        assert!(s.line_based());
+        assert!(WriteSettings::new(FileFormat::RawText, Compression::None).line_based());
+        assert!(!WriteSettings::new(FileFormat::Csv, Compression::None).line_based());
+        #[cfg(feature = "encryption")]
+        {
+            let mut e = s.clone();
+            e.encryption = Some(serde_json::from_value(json!({"key": "k"})).unwrap());
+            assert!(e.encrypted());
+        }
+    }
+
+    #[test]
+    fn orc_output_is_refused() {
+        let e = WriteSettings::new(FileFormat::Orc, Compression::None)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`orc` is read-only"), "{e}");
+    }
+
+    #[test]
+    fn config_text_keeps_a_config_message_and_renders_anything_else() {
+        assert_eq!(config_text(FaucetError::Config("bad".into())), "bad");
+        assert!(config_text(FaucetError::Sink("io".into())).contains("io"));
+    }
+
+    #[test]
+    fn a_missing_feature_is_named() {
+        let e = missing_feature(FileFormat::Parquet, "file-format-parquet").to_string();
+        assert!(
+            e.contains("`parquet` needs the `file-format-parquet` build feature"),
+            "{e}"
+        );
+        assert!(require_feature(FileFormat::JsonLines).is_ok());
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[test]
+    fn remote_parquet_options_round_trip_the_local_ones() {
+        let local = ParquetOptions {
+            row_group_size: 7,
+            ..ParquetOptions::default()
+        };
+        let remote = super::super::options::RemoteParquetOptions::from(local.clone());
+        assert_eq!(remote.row_group_size, 7);
+        assert_eq!(ParquetOptions::from(remote), local);
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    fn parquet_shape(bytes: Vec<u8>) -> (i64, usize) {
+        use parquet::file::reader::FileReader;
+        let r =
+            parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(bytes)).unwrap();
+        let m = r.metadata().file_metadata();
+        (m.num_rows(), m.schema_descr().num_columns())
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[test]
+    fn a_compressed_parquet_file_is_continued_after_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "out.parquet.gz",
+            WriteSettings::new(FileFormat::Parquet, Compression::Gzip),
+        );
+        w.write_rows(&[json!({"a": 1}), json!({"a": 2})]).unwrap();
+        w.flush().unwrap();
+        w.write_rows(&[json!({"a": 3})]).unwrap();
+        w.flush().unwrap();
+        let gz = std::fs::read(dir.path().join("out.parquet.gz")).unwrap();
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(
+            &mut faucet_core::compression::wrap_sync_reader(
+                std::io::Cursor::new(gz),
+                Compression::Gzip,
+            ),
+            &mut plain,
+        )
+        .unwrap();
+        assert_eq!(parquet_shape(plain), (3, 1));
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[test]
+    fn a_widened_parquet_schema_carries_the_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "w.parquet",
+            WriteSettings::new(FileFormat::Parquet, Compression::None),
+        );
+        w.write_rows(&[json!({"a": 1})]).unwrap();
+        w.write_rows(&[json!({"a": 2, "b": "x"})]).unwrap();
+        w.flush().unwrap();
+        let bytes = std::fs::read(dir.path().join("w.parquet")).unwrap();
+        assert_eq!(parquet_shape(bytes), (2, 2));
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[test]
+    fn a_rejected_parquet_page_leaves_nothing_to_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = WriteSettings::new(FileFormat::Parquet, Compression::None);
+        s.parquet.schema = Some(vec![super::super::options::ParquetField {
+            name: "a".into(),
+            data_type: super::super::options::ParquetType::Int64,
+            nullable: true,
+        }]);
+        let w = local(dir.path(), "r.parquet", s);
+        let e = w.write_rows(&[json!({"b": 1})]).unwrap_err().to_string();
+        assert!(e.contains("not in `parquet.schema`"), "{e}");
+        w.flush().unwrap();
+        assert!(!dir.path().join("r.parquet").exists());
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    fn batch() -> arrow::array::RecordBatch {
+        faucet_core::columnar::values_to_record_batch(
+            &[json!({"a": 1}), json!({"a": 2})],
+            faucet_core::columnar::infer_arrow_schema(&[json!({"a": 1})]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[test]
+    fn a_batch_for_a_row_format_is_written_as_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "b.jsonl",
+            WriteSettings::new(FileFormat::JsonLines, Compression::None),
+        );
+        assert_eq!(w.write_batch(&batch()).unwrap(), 2);
+        w.flush().unwrap();
+        let text = std::fs::read_to_string(dir.path().join("b.jsonl")).unwrap();
+        assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    #[test]
+    fn a_failed_finalize_poisons_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sub");
+        let w = local(
+            &out,
+            "doc.json",
+            WriteSettings::new(FileFormat::JsonArray, Compression::None),
+        );
+        w.write_rows(&[json!({"a": 1})]).unwrap();
+        std::fs::remove_dir_all(&out).unwrap();
+        assert!(w.flush().is_err());
+        let e = w.write_rows(&[json!({"a": 2})]).unwrap_err().to_string();
+        assert!(e.contains("an earlier write to 'doc.json' failed"), "{e}");
+        let e = w.flush().unwrap_err().to_string();
+        assert!(e.contains("cannot be completed"), "{e}");
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[test]
+    fn a_poisoned_parquet_file_refuses_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sub");
+        let w = local(
+            &out,
+            "p.parquet",
+            WriteSettings::new(FileFormat::Parquet, Compression::None),
+        );
+        w.write_batch(&batch()).unwrap();
+        std::fs::remove_dir_all(&out).unwrap();
+        assert!(w.flush().is_err());
+        let e = w.write_batch(&batch()).unwrap_err().to_string();
+        assert!(e.contains("cannot be completed"), "{e}");
+    }
+
+    #[cfg(all(feature = "file-format-csv", feature = "encryption"))]
+    #[test]
+    fn an_encrypted_csv_file_is_reopened_after_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+        let spec: faucet_core::EncryptionSpec =
+            serde_json::from_value(json!({"key": "k"})).unwrap();
+        s.encryption = Some(spec.clone());
+        let w = local(dir.path(), "e.csv", s);
+        w.write_rows(&[json!({"a": 1})]).unwrap();
+        w.flush().unwrap();
+        w.write_rows(&[json!({"a": 2, "b": 3})]).unwrap();
+        w.flush().unwrap();
+        let sealed = std::fs::read(dir.path().join("e.csv")).unwrap();
+        let plain = faucet_core::CompiledEncryption::compile(&spec)
+            .unwrap()
+            .decrypt(&sealed)
+            .unwrap();
+        let text = String::from_utf8(plain).unwrap();
+        assert_eq!(text.lines().collect::<Vec<_>>(), ["a,b", "1,", "2,3"]);
+    }
+
+    #[cfg(feature = "file-format-csv")]
+    #[test]
+    fn appending_to_an_unreadable_csv_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.csv"), b"a\n\xff\xfe\n").unwrap();
+        let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+        s.mode = FileMode::Append;
+        let w = local(dir.path(), "x.csv", s);
+        let e = w.write_rows(&[json!({"a": 1})]).unwrap_err().to_string();
+        assert!(e.contains("reading existing"), "{e}");
+    }
+
+    #[cfg(feature = "file-format-csv")]
+    #[test]
+    fn a_corrupt_csv_body_fails_the_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = local(
+            dir.path(),
+            "c.csv",
+            WriteSettings::new(FileFormat::Csv, Compression::None),
+        );
+        w.write_rows(&[json!({"a": 1})]).unwrap();
+        w.write_rows(&[json!({"a": 2, "b": 3})]).unwrap();
+        let tmp = crate::write::tmp_path(&dir.path().join("c.csv"), crate::write::TMP_SUFFIX);
+        std::fs::write(super::super::encode::body_path(&tmp), [0xff; 64]).unwrap();
+        let e = w.flush().unwrap_err().to_string();
+        assert!(e.contains("file sink: writing"), "{e}");
     }
 }

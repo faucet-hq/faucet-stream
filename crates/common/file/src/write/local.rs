@@ -280,4 +280,16 @@ mod tests {
         assert!(dir.path().join("theirs.faucet-tmp").exists());
         b.remove_stale_scratch(Area::Staging, &|_| true);
     }
+
+    #[test]
+    fn deleting_a_directory_is_an_error_and_a_bare_name_syncs_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let b = LocalBackend::new(&dir.path().to_string_lossy(), ".stage", false);
+        let e = b.delete(Area::Destination, "d").unwrap_err().to_string();
+        assert!(e.contains("removing earlier output"), "{e}");
+        assert!(dir.path().join("d").is_dir());
+        sync_dir(Path::new("no-directory-part"));
+        assert!(b.delete(Area::Destination, "absent").is_ok());
+    }
 }

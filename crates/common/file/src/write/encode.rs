@@ -261,11 +261,6 @@ impl OpenFile {
 
     fn write_inner(&mut self, ctx: &Ctx<'_>, records: &[Value]) -> Result<(), FaucetError> {
         let tmp = self.tmp.clone();
-        #[cfg(feature = "file-format-csv")]
-        if matches!(self.enc, Enc::CsvSealed) {
-            let (state, _) = CsvState::create(ctx, self.area, &self.name, &tmp, true)?;
-            self.enc = Enc::Csv(Box::new(state));
-        }
         match &mut self.enc {
             Enc::Lines(slot) => {
                 let buf = ctx.line_bytes(records)?;
@@ -278,9 +273,12 @@ impl OpenFile {
             #[cfg(feature = "file-format-csv")]
             Enc::Csv(state) => state.write(records, ctx.opts.csv.on_unknown_field),
             #[cfg(feature = "file-format-csv")]
-            Enc::CsvSealed => Err(FaucetError::Sink(
-                "csv: the sealed file was not reopened for writing".into(),
-            )),
+            Enc::CsvSealed => {
+                let (mut state, _) = CsvState::create(ctx, self.area, &self.name, &tmp, true)?;
+                let written = state.write(records, ctx.opts.csv.on_unknown_field);
+                self.enc = Enc::Csv(Box::new(state));
+                written
+            }
             Enc::Doc(buf) => {
                 buf.extend_from_slice(records);
                 Ok(())
