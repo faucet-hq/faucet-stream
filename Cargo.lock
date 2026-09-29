@@ -5669,7 +5669,9 @@ dependencies = [
 name = "faucet-sink-sftp"
 version = "1.0.5"
 dependencies = [
+ "arrow",
  "async-trait",
+ "faucet-common-file",
  "faucet-common-sftp",
  "faucet-conformance",
  "faucet-core",

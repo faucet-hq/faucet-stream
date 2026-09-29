@@ -1,246 +1,123 @@
-//! SFTP sink executor.
+//! SFTP sink executor: the shared file writer (#777) over an SFTP backend.
 //!
-//! Writes each `write_batch` chunk as a JSON Lines object under a remote
-//! directory. Writes are **atomic**: each object is uploaded to a hidden
-//! temporary name and then renamed to its final name, so a consumer watching
-//! the directory never observes a partially-written file. Construction is lazy
-//! — [`SftpSink::new`] performs no I/O; the SSH transport is opened on the
-//! first `write_batch` and reused for the life of the sink.
+//! Files are built locally and published by uploading to a hidden temporary
+//! name and renaming it into place, so a consumer watching the directory
+//! never sees a partial file. Construction is lazy — [`SftpSink::new`]
+//! performs no I/O; the SSH transport is opened on the first write and
+//! reused for the life of the sink.
 
 use crate::config::SftpSinkConfig;
+use crate::object::SftpObjects;
 use async_trait::async_trait;
-use faucet_common_sftp::{SftpSession, connect};
-use faucet_core::FaucetError;
-use russh_sftp::protocol::OpenFlags;
+use faucet_common_file::write::{FileWriter, RemoteBackend, blocking, object_layout};
+use faucet_core::{FaucetError, FileFormat, WriteMode};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
-/// A sink that writes JSON records to an SFTP server as JSON Lines objects.
+/// A sink that writes records to files on an SFTP server in any format the
+/// local file sink writes — JSON Lines, JSON, CSV, XML, Excel, Avro, Parquet
+/// or raw text.
 pub struct SftpSink {
     config: SftpSinkConfig,
-    /// Reused SFTP session, opened on first write. Behind a `Mutex` so writes
-    /// share one SSH connection instead of reconnecting per page.
-    session: Mutex<Option<SftpSession>>,
-    /// Rows accumulated across `write_batch` calls for the open file (#618).
-    ///
-    /// Without this the sink wrote one file per upstream page, so a small
-    /// `batch_size` produced a directory of tiny files.
-    open: Mutex<faucet_core::ObjectAccumulator>,
-    /// Records held for a **whole-file** format (#604). CSV has a header, XML
-    /// a document element, a workbook a container index and a JSON array its
-    /// brackets — none can be appended a record at a time, so their records
-    /// are buffered and encoded together at the rollover. Always empty for
-    /// JSON Lines, which streams through `open`.
-    pending: Mutex<faucet_core::object_rollover::PageAccumulator>,
+    writer: FileWriter,
 }
 
 impl SftpSink {
-    /// Create a new SFTP sink. Lazy: performs no I/O and never connects here.
-    /// The batch size is validated up front so a bad config fails fast.
+    /// Build the sink. Validates the config; opens no connection.
     pub fn new(config: SftpSinkConfig) -> Result<Self, FaucetError> {
-        faucet_core::validate_batch_size(config.batch_size)?;
-        let open = Mutex::new(faucet_core::ObjectAccumulator::new(
-            config.max_records_per_file.or(match config.batch_size {
-                0 => None,
-                n => Some(n),
-            }),
-            config.max_bytes_per_file,
-        ));
-        let pending = Mutex::new(faucet_core::object_rollover::PageAccumulator::new(
-            config.max_records_per_file.or(match config.batch_size {
-                0 => None,
-                n => Some(n),
-            }),
-            config.max_bytes_per_file,
-        ));
-        Ok(Self {
-            config,
-            session: Mutex::new(None),
-            open,
-            pending,
-        })
-    }
-
-    /// Join the configured directory prefix with a file name using POSIX `/`.
-    fn join_path(&self, name: &str) -> String {
-        let dir = &self.config.path;
-        if dir.is_empty() {
-            name.to_string()
-        } else if dir.ends_with('/') {
-            format!("{dir}{name}")
+        config.validate()?;
+        let settings = config.settings()?;
+        let (base, template) = object_layout(
+            &config.dir_prefix(),
+            config.file_name.as_deref(),
+            &config.file_extension,
+            settings.format,
+            settings.codec,
+            settings.rolls_over(),
+        )
+        .map_err(|e| match e {
+            FaucetError::Config(m) => FaucetError::Config(format!("SFTP sink: {m}")),
+            other => other,
+        })?;
+        let base = if config.path.starts_with('/') && !base.starts_with('/') {
+            format!("/{base}")
         } else {
-            format!("{dir}/{name}")
-        }
+            base
+        };
+        let objects = Arc::new(SftpObjects::new(config.connection.clone()));
+        let backend = RemoteBackend::new(objects, base, &template.staging_name())?;
+        let writer = FileWriter::new(settings, template, Arc::new(backend))?;
+        Ok(Self { config, writer })
     }
 
-    /// Generate the final object key: `{path}/{uuid}{ext}`.
-    fn final_key(&self) -> String {
-        let id = uuid::Uuid::new_v4();
-        self.join_path(&format!("{id}{}", self.config.file_extension))
-    }
-
-    /// Encode one buffered group in the configured whole-file format and
-    /// write it as a single file (#604).
-    async fn write_encoded_file(&self, group: Vec<Value>) -> Result<(), FaucetError> {
-        if group.is_empty() {
-            return Ok(());
-        }
-        let format = self.config.format.shared();
-        let rows = group.len();
-        let body = faucet_core::file_format::encode(&group, format, &self.config.format_options())?;
-        let mut guard = self.session.lock().await;
-        if guard.is_none() {
-            let sftp = connect(&self.config.connection).await?;
-            if let Err(e) = sftp.create_dir(self.config.path.as_str()).await {
-                tracing::debug!(path = %self.config.path, error = %e, "SFTP create_dir (best-effort)");
-            }
-            *guard = Some(sftp);
-        }
-        let sftp = guard.as_ref().expect("session initialized above");
-        let key = self.final_key();
-        Self::upload_atomic(sftp, &key, &body).await?;
-        tracing::info!(path = %key, records = rows, format = format.as_str(), "SFTP file written");
-        Ok(())
-    }
-
-    /// Upload `body` to `final_key` atomically: write a temporary object and
-    /// rename it into place, so consumers never see a partial file.
-    async fn upload_atomic(
-        sftp: &SftpSession,
-        final_key: &str,
-        body: &[u8],
-    ) -> Result<(), FaucetError> {
-        let temp_key = format!("{final_key}.tmp");
-
-        let mut file = sftp
-            .open_with_flags(
-                temp_key.as_str(),
-                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
-            )
-            .await
-            .map_err(|e| {
-                FaucetError::Sink(format!("SFTP open '{temp_key}' for write failed: {e}"))
-            })?;
-
-        file.write_all(body)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SFTP write to '{temp_key}' failed: {e}")))?;
-        file.flush()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SFTP flush of '{temp_key}' failed: {e}")))?;
-        file.shutdown()
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SFTP close of '{temp_key}' failed: {e}")))?;
-
-        sftp.rename(temp_key.as_str(), final_key)
-            .await
-            .map_err(|e| {
-                FaucetError::Sink(format!(
-                    "SFTP rename '{temp_key}' -> '{final_key}' failed: {e}"
-                ))
-            })?;
-
-        tracing::debug!(key = %final_key, "wrote SFTP object");
-        Ok(())
+    /// The format files are written in.
+    pub fn format(&self) -> FileFormat {
+        self.writer.settings().format
     }
 }
 
 #[async_trait]
 impl faucet_core::Sink for SftpSink {
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.config.batch_atomicity()
+        self.writer.settings().batch_atomicity()
     }
 
-    /// Close the open file (#618).
-    ///
-    /// The pipeline calls `flush` at every bookmark-carrying page and once at
-    /// the end, so the remainder is uploaded before the bookmark advances — a
-    /// file left unwritten after a "successful" run is data loss with a green
-    /// exit code.
+    /// Publish the open file before the bookmark advances.
     async fn flush(&self) -> Result<(), FaucetError> {
-        let finished = {
-            let mut open = self.open.lock().await;
-            open.finish()
-        };
-        let group = {
-            let mut pending = self.pending.lock().await;
-            pending.finish()
-        };
-        if let Some(group) = group {
-            self.write_encoded_file(group).await?;
-        }
-        let Some(obj) = finished else {
-            return Ok(());
-        };
-        let mut guard = self.session.lock().await;
-        if guard.is_none() {
-            let sftp = connect(&self.config.connection).await?;
-            if let Err(e) = sftp.create_dir(self.config.path.as_str()).await {
-                tracing::debug!(path = %self.config.path, error = %e, "SFTP create_dir (best-effort)");
-            }
-            *guard = Some(sftp);
-        }
-        let sftp = guard.as_ref().expect("session initialized above");
-        let key = self.final_key();
-        Self::upload_atomic(sftp, &key, &obj.body).await?;
-        tracing::info!(path = %key, records = obj.rows, "SFTP file closed");
-        Ok(())
+        blocking(|| self.writer.flush())
+    }
+
+    fn supported_write_modes(&self) -> &'static [WriteMode] {
+        &[WriteMode::Append, WriteMode::Overwrite]
+    }
+
+    fn is_overwrite(&self) -> bool {
+        self.config.write_mode == faucet_common_file::write::FileWriteMode::Overwrite
+    }
+
+    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+        blocking(|| self.writer.begin_overwrite())
+    }
+
+    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+        blocking(|| self.writer.commit_overwrite())
+    }
+
+    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+        blocking(|| self.writer.abort_overwrite())
+    }
+
+    async fn complete_run(&self) -> Result<(), FaucetError> {
+        blocking(|| self.writer.complete())
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
+        blocking(|| self.writer.write_rows(records))
+    }
 
-        // Whole-file formats (#604): a CSV header, an XML document element, a
-        // workbook index and a JSON array's brackets all need every record
-        // before any byte is final, so records are buffered and encoded
-        // together. The same row/byte caps decide the rollover, so file sizing
-        // means the same thing whatever the format.
-        if !self.config.format.appends_per_record() {
-            let group = {
-                let mut pending = self.pending.lock().await;
-                pending.push_page(records)
-            };
-            if let Some(group) = group {
-                self.write_encoded_file(group).await?;
-            }
-            return Ok(records.len());
+    /// Arrow `RecordBatch`es go straight into a Parquet file; other formats
+    /// take the row path.
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        self.format() == FileFormat::Parquet
+    }
+
+    #[cfg(feature = "arrow")]
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        if batch.num_rows() == 0 {
+            return Ok(0);
         }
-
-        let mut guard = self.session.lock().await;
-        if guard.is_none() {
-            let sftp = connect(&self.config.connection).await?;
-            // Best-effort: ensure the target directory exists. Ignore errors
-            // (it usually already exists; a real permission/path problem
-            // surfaces on the first write with a clear message).
-            if let Err(e) = sftp.create_dir(self.config.path.as_str()).await {
-                tracing::debug!(path = %self.config.path, error = %e, "SFTP create_dir (best-effort)");
-            }
-            *guard = Some(sftp);
+        if self.format() == FileFormat::Parquet {
+            return blocking(|| self.writer.write_batch(batch));
         }
-        let sftp = guard.as_ref().expect("session initialized above");
-
-        // Accumulate across calls and roll on the record/byte cap (#618). A
-        // page smaller than the cap joins the open file rather than becoming a
-        // file of its own. `batch_size` still sizes files when no explicit
-        // `max_records_per_file` is given, so an existing config keeps the
-        // file size it asked for.
-        let mut files = 0usize;
-        {
-            let mut open = self.open.lock().await;
-            for record in records {
-                if let faucet_core::object_rollover::Emit::Object(obj) = open.push_record(record)? {
-                    let key = self.final_key();
-                    Self::upload_atomic(sftp, &key, &obj.body).await?;
-                    files += 1;
-                }
-            }
-        }
-
-        tracing::debug!(records = records.len(), files, "SFTP batch accumulated");
-        Ok(records.len())
+        let rows = faucet_core::columnar::record_batch_to_values(batch)?;
+        self.write_batch(&rows).await
     }
 
     fn config_schema(&self) -> Value {
@@ -279,53 +156,29 @@ mod tests {
         assert!(matches!(SftpSink::new(bad), Err(FaucetError::Config(_))));
     }
 
-    /// The NDJSON encoding moved into `faucet_core::ObjectAccumulator` with
-    /// the cross-page accumulation (#618) — pinned here too, because this is
-    /// what lands on the remote filesystem.
     #[test]
-    fn records_write_as_newline_delimited_json() {
-        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
-        acc.push_record(&serde_json::json!({"id": 1, "name": "Alice"}))
-            .unwrap();
-        let faucet_core::object_rollover::Emit::Object(obj) = acc
-            .push_record(&serde_json::json!({"id": 2, "name": "Bob"}))
-            .unwrap()
-        else {
-            panic!("rolled at 2 records");
-        };
-        let text = String::from_utf8(obj.body).unwrap();
-        let lines: Vec<&str> = text.trim().split('\n').collect();
-        assert_eq!(lines.len(), 2);
-        let first: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(first["id"], 1);
-    }
-
-    #[test]
-    fn an_empty_accumulator_writes_no_file() {
-        // An empty page must not create an empty file on the remote host.
-        let mut acc = faucet_core::ObjectAccumulator::new(Some(2), None);
-        assert!(acc.finish().is_none());
-    }
-
-    #[test]
-    fn join_path_handles_trailing_slash() {
+    fn files_land_under_the_directory() {
         let sink = SftpSink::new(cfg()).unwrap();
-        assert_eq!(sink.join_path("f.jsonl"), "/out/f.jsonl");
-
-        let sink2 = SftpSink::new(SftpSinkConfig::new(
-            SftpConnectionConfig::with_password("h", "u", "p"),
-            "/out/",
-        ))
-        .unwrap();
-        assert_eq!(sink2.join_path("f.jsonl"), "/out/f.jsonl");
-    }
-
-    #[test]
-    fn final_key_uses_prefix_and_extension() {
-        let sink = SftpSink::new(cfg()).unwrap();
-        let key = sink.final_key();
-        assert!(key.starts_with("/out/"), "got {key}");
-        assert!(key.ends_with(".jsonl"), "got {key}");
+        let key = sink
+            .writer
+            .backend()
+            .describe(faucet_common_file::write::Area::Destination, "f.jsonl");
+        assert_eq!(key, "sftp://h:22/out/f.jsonl");
+        let mut c = cfg();
+        c.file_name = Some("dt/part-{part}.csv".into());
+        c.format = crate::config::SftpSinkFormat::Auto;
+        #[cfg(feature = "file-format-csv")]
+        {
+            let sink = SftpSink::new(c).unwrap();
+            assert_eq!(sink.format(), FileFormat::Csv);
+            let d = sink
+                .writer
+                .backend()
+                .describe(faucet_common_file::write::Area::Destination, "x");
+            assert_eq!(d, "sftp://h:22/out/dt/x");
+        }
+        #[cfg(not(feature = "file-format-csv"))]
+        assert!(SftpSink::new(c).is_err());
     }
 
     #[test]
@@ -341,27 +194,11 @@ mod tests {
     }
 
     #[test]
-    fn append_only_capabilities() {
+    fn write_modes_and_capabilities() {
         let sink = SftpSink::new(cfg()).unwrap();
         assert!(!sink.supports_idempotent_writes());
         assert!(!sink.dedups_by_key());
-        assert!(
-            sink.supported_write_modes()
-                .contains(&faucet_core::write_mode::WriteMode::Append)
-        );
-    }
-
-    /// `batch_size: 0` is the documented "no batching" sentinel: it must
-    /// become *no* record cap, not a cap of zero — which would roll a new
-    /// file on every record.
-    #[test]
-    fn batch_size_zero_leaves_both_accumulators_uncapped() {
-        let sink = SftpSink::new(cfg().with_batch_size(0)).expect("zero is a valid batch size");
-        assert_eq!(sink.config.batch_size, 0);
-        assert_eq!(sink.config.max_records_per_file, None);
-
-        // An explicit record cap still wins over the batch size.
-        let capped = SftpSink::new(cfg().with_batch_size(0).max_records_per_file(7)).expect("new");
-        assert_eq!(capped.config.max_records_per_file, Some(7));
+        assert!(sink.supported_write_modes().contains(&WriteMode::Overwrite));
+        assert!(!sink.is_overwrite());
     }
 }
