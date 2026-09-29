@@ -129,6 +129,9 @@ file-format-avro = ["dep:apache-avro"]
 # Apache ORC (#719). Read-only: decoded to Arrow `RecordBatch`es stripe by
 # stripe, so it pulls `arrow` in.
 file-format-orc = ["arrow", "dep:orc-rust", "dep:bytes"]
+# Apache Parquet objects for the object-store connectors (#777): the
+# `ParquetObjects` encoder and the read-side projection helpers.
+file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
 [dependencies]
@@ -189,6 +192,9 @@ arrow-json = { workspace = true, optional = true }
 apache-avro = { workspace = true, optional = true, features = ["snappy", "zstandard"] }
 orc-rust = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+# Default features only: the workspace entry adds `async` + `object_store`,
+# which core does not need.
+parquet = { version = "58", optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

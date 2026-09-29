@@ -5021,6 +5021,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "orc-rust",
+ "parquet",
  "quick-xml 0.37.5",
  "regex",
  "reqwest 0.13.3",

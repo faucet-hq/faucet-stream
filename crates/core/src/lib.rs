@@ -124,6 +124,12 @@ pub use drift::{
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec};
 pub use error::FaucetError;
+#[cfg(feature = "file-format-parquet")]
+pub use file_format::parquet_io::ParquetObjects;
+pub use file_format::parquet_io::{
+    ParquetCompression, ParquetField, ParquetFieldType, ParquetReadOptions, ParquetSchema,
+    ParquetUnknownField, ParquetWriteOptions,
+};
 pub use file_format::{
     AvroCodec, AvroOptions, ContainerDecoder, CsvOptions, ExcelOptions, FileFormat, FileInput,
     FormatOptions, OrcOptions, XmlOptions,

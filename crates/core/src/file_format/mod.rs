@@ -61,6 +61,7 @@ pub mod excel;
 pub mod json;
 #[cfg(feature = "file-format-orc")]
 pub mod orc;
+pub mod parquet_io;
 #[cfg(feature = "file-format-xml")]
 pub mod xml;
 
