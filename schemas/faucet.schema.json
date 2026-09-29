@@ -18148,6 +18148,7 @@
             "config": {
               "anyOf": [
                 {
+                  "deprecated": true,
                   "additionalProperties": true,
                   "title": "CsvSourceConfig",
                   "description": "Configuration for the CSV file source.",
@@ -18863,6 +18864,7 @@
             "config": {
               "anyOf": [
                 {
+                  "deprecated": true,
                   "additionalProperties": true,
                   "title": "ParquetSourceConfig",
                   "description": "Configuration for the Parquet source connector.",
@@ -21488,6 +21490,7 @@
             "config": {
               "anyOf": [
                 {
+                  "deprecated": true,
                   "additionalProperties": true,
                   "title": "JsonlSinkConfig",
                   "description": "Configuration for the JSON Lines file sink.",
@@ -21543,6 +21546,7 @@
                 },
                 true,
                 {
+                  "deprecated": true,
                   "additionalProperties": true,
                   "title": "JsonlSinkConfig",
                   "description": "Configuration for the JSON Lines file sink.",
@@ -23287,6 +23291,7 @@
             "config": {
               "anyOf": [
                 {
+                  "deprecated": true,
                   "additionalProperties": true,
                   "title": "CsvSinkConfig",
                   "description": "Configuration for the CSV file sink.",
@@ -24134,6 +24139,7 @@
             "config": {
               "anyOf": [
                 {
+                  "deprecated": true,
                   "additionalProperties": true,
                   "title": "ParquetSinkConfig",
                   "description": "Configuration for the Parquet sink connector.",
