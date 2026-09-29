@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared config types for the faucet-stream local file source and sink"
+description = "Shared config types and the file-writing layer (formats, compression, encryption, rollover, overwrite staging over a storage backend) for faucet-stream file sinks"
 readme = "README.md"
 keywords = ["file", "etl", "pipeline", "connector", "format"]
 categories.workspace = true
@@ -14,9 +14,30 @@ categories.workspace = true
 faucet-core = { workspace = true, features = ["compression"] }
 schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+csv = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+# Formats the shared writer encodes that need a dependency. JSON Lines, JSON
+# arrays and raw text are always available.
+file-format-csv = ["faucet-core/file-format-csv", "dep:csv"]
+file-format-xml = ["faucet-core/file-format-xml"]
+file-format-excel = ["faucet-core/file-format-excel"]
+file-format-avro = ["faucet-core/file-format-avro"]
+file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
+arrow = ["faucet-core/arrow", "dep:arrow"]
+# Encrypt output at rest.
+encryption = ["faucet-core/encryption", "dep:base64"]
+file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-parquet"]
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile = "3"
 
 [package.metadata.docs.rs]
 all-features = true

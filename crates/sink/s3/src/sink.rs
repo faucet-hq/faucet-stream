@@ -569,6 +569,7 @@ mod tests {
             .csv(faucet_core::CsvOptions {
                 delimiter: ";".into(),
                 has_headers: true,
+                ..Default::default()
             });
         let body = faucet_core::file_format::encode(
             &[json!({"a": 1, "b": 2})],

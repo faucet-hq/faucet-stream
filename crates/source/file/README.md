@@ -38,6 +38,9 @@ source:
 Every listing is sorted by path, so runs are deterministic. Symlinks are
 followed. An unreadable file or directory fails the run with its path.
 
+`{key}` placeholders in `path` are filled from the fetch context (a library
+caller's `fetch_with_context`), as the `csv` and `parquet` sources do.
+
 ## Formats
 
 `format: auto` (the default) picks a format per file from its extension,
@@ -47,10 +50,10 @@ looking through a compression suffix, so `export.csv.gz` is gzip-compressed CSV:
 |---|---|---|
 | `.jsonl`, `.ndjson` | JSON Lines | streamed line by line |
 | `.json` | JSON array (a lone object is one record) | whole file |
-| `.csv` | CSV (dialect from `csv:`) | whole file |
+| `.csv` | CSV (dialect from `csv:`) | streamed row by row |
 | `.xml` | XML (framing from `xml:`) | whole file |
 | `.xlsx` | Excel (sheet from `excel:`) | whole file |
-| `.parquet` | Parquet | streamed by row group |
+| `.parquet` | Parquet (projection from `parquet:`) | streamed by row group |
 | `.avro` | Avro Object Container File (reader schema from `avro:`) | streamed by block |
 | `.orc` | ORC (projection from `orc:`) | streamed by stripe |
 | `.txt` | raw text: one record `{path, content}` per file | whole file |
@@ -63,11 +66,51 @@ A directory mixing formats reads in one run. Avro files are resolved against
 the first Avro file's schema, or against `avro.schema` when you set it. A later
 file whose schema cannot be resolved against it fails with an error naming both
 files. Parquet and ORC files must share one schema, and a mismatch likewise
-names both files.
+names both files. For local Parquet files the schemas are compared from the
+footers before any row is read, so a mismatch in a late file never leaves
+earlier files half-delivered.
+
+### CSV
+
+| `csv.` field | Default | Meaning |
+|---|---|---|
+| `delimiter` | `","` | One byte; `"\t"` for tabs. |
+| `has_headers` | `true` | The first row names the fields; otherwise `column_0`, `column_1`, …. A repeated header name fails the read (it would drop a column). |
+| `quote` | `"\""` | The quote character. |
+| `flexible` | `false` | Accept rows with more or fewer fields than the header. Off, the first ragged row fails the read naming its line. |
+| `null_values` | `[]` | Cell values read as `null` (e.g. `["", "NULL"]`). |
+
+Values are strings; cast them with a `cast` transform.
+
+### Parquet
+
+`parquet.columns` projects the read: only those column chunks are decoded, on
+both the row and the columnar path, and a name a file does not have fails
+naming the columns it does have. Nulls are explicit: a null column is read as
+`"key": null` (the `parquet` source omitted the key).
 
 Compression (`compression: auto | gzip | zstd | none`) resolves per file from
 its suffix. A compressed Parquet, Avro or ORC file is decompressed into memory
 before decoding, because those formats need random access or a whole stream.
+
+## Encryption
+
+`encryption: { key, previous_keys }` (feature `encryption`) reads files the
+`file` or `jsonl` sink encrypted: a file sealed whole is decrypted and then
+decompressed; JSON Lines or raw text sealed line by line is decrypted a line at
+a time. A file or line that is not sealed fails the read rather than being
+trusted as plaintext.
+
+## Coming from the csv or parquet source
+
+| Old field | File source |
+|---|---|
+| csv `path`, `has_headers`, `delimiter`, `quote`, `flexible`, `null_values`, `batch_size`, `compression` | `path`, `csv.has_headers`, `csv.delimiter`, `csv.quote`, `csv.flexible`, `csv.null_values`, `batch_size`, `compression` |
+| parquet `source: {type: local_path, path}` / `{type: glob, pattern}` | `path` (a file, directory or glob) |
+| parquet `columns`, `batch_size`, `concurrency` | `parquet.columns`, `batch_size`, `concurrency` |
+
+Golden tests (`tests/parity.rs`) read the same fixtures through the old sources
+and the file source and compare the records.
 
 ## Columnar path
 
@@ -123,7 +166,7 @@ JSON Lines, JSON arrays and raw text are always available. The other formats
 are behind features: `file-format-csv`, `-xml`, `-excel`, `-avro`, `-orc` and
 `-parquet`, plus `arrow` for the columnar path. The `file-formats` feature
 turns them all on. A build that lacks a format names the missing feature
-instead of misreading the file.
+instead of misreading the file. `encryption` enables the `encryption` block.
 
 ## Library
 

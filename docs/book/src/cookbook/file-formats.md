@@ -57,7 +57,16 @@ source:
     csv:
       delimiter: ","               # one byte; "\t" for tabs
       has_headers: true            # false → fields are column_0, column_1, …
+      quote: "\""                  # the quote character
+      flexible: true               # accept ragged rows (the `file` source defaults to false)
+      null_values: ["", "NULL"]    # cells read as null
 ```
+
+A repeated header name fails the read — rows are keyed by header, so a
+duplicate would silently drop a column. With `flexible: false` a row with more
+or fewer fields than the header fails naming its line. The object-store and
+REST sources are lenient by default; the `file` source is strict, like the
+`csv` source.
 
 ```yaml
 source:
@@ -149,9 +158,10 @@ records are **buffered and encoded together**:
   / `max_bytes_per_file` caps that size a JSON Lines object, then the whole
   group is encoded and written as one object. Object sizing therefore means the
   same thing whatever the format — but peak memory is one group, not one record.
-- On the **source** side `csv`, `xml` and `xlsx` objects are read whole and
-  decoded before their records are chunked into pages, the same way
-  `json_array` already was.
+- On the **source** side `xml` and `xlsx` objects are read whole and decoded
+  before their records are chunked into pages, the same way `json_array`
+  already was. The object-store sources read `csv` whole too; the `file`
+  source streams it row by row.
 
 `xlsx` is the strictest case: a workbook is a zip container whose directory sits
 at the end, so it cannot be decoded incrementally in either direction. Size
@@ -325,10 +335,14 @@ Incremental mode reads only new files. `by: mtime` reads files modified after
 the newest one the previous run read; `by: name` reads files whose path sorts
 after the last one read. The bookmark advances after each file. Over HTTP, the
 `Last-Modified` header is the modification time. JSON Lines, Avro, ORC and
-Parquet stream; the other formats are read whole per file. See the
+Parquet stream, and so does CSV (with the `csv:` dialect above); the other
+formats are read whole per file. `parquet: { columns: [...] }` projects a
+Parquet read to those columns, and Parquet schemas are compared from the
+footers before the first row is read. `encryption:` decrypts files the `file`
+or `jsonl` sink encrypted. See the
 [crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/file)
-for sharding, discovery and HTTP retries. The older `csv` source stays for
-existing configs; the `file` source is the general one.
+for sharding, discovery, HTTP retries and a field-by-field mapping from the
+`csv` and `parquet` sources, which the `file` source matches option for option.
 
 ## The local file sink
 
@@ -356,15 +370,41 @@ resumes from the last bookmark and removes the leftover temporary file.
 destination and swaps them in (removing stale parts of the previous run) only
 after a successful run; a failed run leaves the previous output as it was.
 
-Whole-document formats (JSON array, XML, Excel, Avro) cannot be appended to, so
-`mode: append` is refused for them — use JSON Lines or CSV, or rollover. ORC is
-read-only and refused. Parquet goes through the Arrow writer: the schema comes
-from the first page, a later field widens the file, and a type change is an
-error naming the field. Two matrix rows writing the same path, or a fan-out row
-without a per-invocation token in its path, are refused at load time. The
-`jsonl`, `csv` and `parquet` sinks stay for existing configs; see the
+Every option works with every writable format: `compression` (a Parquet or
+Avro file is compressed whole on top of its own codec), `encryption`, rollover
+by records or bytes, `{part}` templates and directories, and both write modes.
+The one refusal is `mode: append` to a single whole-document file (JSON array,
+XML, Excel, Avro, Parquet), which cannot be extended without a rewrite — a
+numbered output appends new parts instead. ORC is read-only and refused.
+
+```yaml
+sink:
+  type: file
+  config:
+    path: ./out/orders-{part}.parquet
+    max_records_per_file: 5000000
+    parquet:
+      compression: zstd            # none | snappy | gzip | zstd | lz4
+      row_group_size: 131072
+      schema:                      # optional; inferred and widened when unset
+        - { name: id, type: int64, nullable: false }
+        - { name: amount, type: { decimal: { precision: 12, scale: 2 } } }
+        - { name: placed_at, type: timestamp_us }
+    encryption: { key: "${vault:secret/data/export#key}" }
+```
+
+CSV headers are written when a file is finalised, so a field that appears
+later becomes a new column and earlier rows get an empty cell;
+`csv: { on_unknown_field: warn | error }` fixes the header from the first page
+instead (drop the field with a warning, or fail). `json_lines: { pretty: true }`
+pretty-prints each record. Two matrix rows writing the same path, or a fan-out
+row without a per-invocation token in its path, are refused at load time. The
+`jsonl`, `csv` and `parquet` sinks stay for existing configs, and the file sink
+matches them option for option — see the
 [crate README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/file)
-for every field.
+for every field and the mapping from the old sinks' fields. The same writer
+(`faucet_common_file::write`) sits under the object-store sinks, with a
+different storage backend.
 
 ### Run it locally
 

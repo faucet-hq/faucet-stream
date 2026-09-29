@@ -7,33 +7,141 @@
 //! that reads a CSV through the REST source and one that reads the same file
 //! from S3 must produce the same records.
 
+use super::CsvOptions;
 use crate::error::FaucetError;
 use serde_json::{Map, Value};
 
-/// Parse CSV bytes into records.
+/// Parse CSV bytes into records (lenient about ragged rows).
 pub async fn decode(
     bytes: &[u8],
     delimiter: u8,
     has_headers: bool,
 ) -> Result<Vec<Value>, FaucetError> {
-    use futures::StreamExt as _;
-    let mut rdr = csv_async::AsyncReaderBuilder::new()
-        .has_headers(false)
-        .delimiter(delimiter)
-        .flexible(true)
-        .create_reader(bytes);
-    let mut records = rdr.records();
-    let mut headers: Option<Vec<String>> = None;
+    let opts = CsvOptions {
+        delimiter: (delimiter as char).to_string(),
+        has_headers,
+        ..CsvOptions::default()
+    };
+    let mut rdr = CsvRowReader::with_bytes(bytes, delimiter, &opts, true)?;
     let mut out = Vec::new();
-    while let Some(rec) = records.next().await {
-        let rec = rec.map_err(|e| FaucetError::Source(format!("csv: parse error: {e}")))?;
-        if has_headers && headers.is_none() {
-            headers = Some(rec.iter().map(str::to_string).collect());
-            continue;
-        }
-        out.push(Value::Object(record_to_object(&rec, headers.as_deref())));
+    while let Some(r) = rdr.next_record().await? {
+        out.push(r);
     }
     Ok(out)
+}
+
+/// Parse CSV bytes into records with the full dialect in `opts`;
+/// `default_flexible` applies when `opts.flexible` is unset.
+pub async fn decode_with(
+    bytes: &[u8],
+    opts: &CsvOptions,
+    default_flexible: bool,
+) -> Result<Vec<Value>, FaucetError> {
+    let mut rdr = CsvRowReader::new(bytes, opts, default_flexible)?;
+    let mut out = Vec::new();
+    while let Some(r) = rdr.next_record().await? {
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// A streaming CSV reader yielding one JSON object per row.
+///
+/// Header names must be unique: rows are keyed by header, so a repeated name
+/// would silently drop a column. A ragged row fails naming its line unless
+/// the dialect is flexible.
+pub struct CsvRowReader<R> {
+    inner: csv_async::AsyncReader<R>,
+    record: csv_async::StringRecord,
+    headers: Option<Vec<String>>,
+    has_headers: bool,
+    flexible: bool,
+    null_values: Vec<String>,
+    line: usize,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin + Send> CsvRowReader<R> {
+    /// Build a reader over `reader` with the dialect in `opts`.
+    pub fn new(reader: R, opts: &CsvOptions, default_flexible: bool) -> Result<Self, FaucetError> {
+        Self::with_bytes(reader, opts.delimiter_byte()?, opts, default_flexible)
+    }
+
+    fn with_bytes(
+        reader: R,
+        delimiter: u8,
+        opts: &CsvOptions,
+        default_flexible: bool,
+    ) -> Result<Self, FaucetError> {
+        let flexible = opts.flexible_or(default_flexible);
+        let inner = csv_async::AsyncReaderBuilder::new()
+            .has_headers(false)
+            .delimiter(delimiter)
+            .quote(opts.quote_byte()?)
+            .flexible(flexible)
+            .create_reader(reader);
+        Ok(Self {
+            inner,
+            record: csv_async::StringRecord::new(),
+            headers: None,
+            has_headers: opts.has_headers,
+            flexible,
+            null_values: opts.null_values.clone(),
+            line: 0,
+        })
+    }
+
+    /// The next row, or `None` at the end of the input.
+    pub async fn next_record(&mut self) -> Result<Option<Value>, FaucetError> {
+        loop {
+            self.line += 1;
+            let more = self
+                .inner
+                .read_record(&mut self.record)
+                .await
+                .map_err(|e| self.parse_error(e))?;
+            if !more {
+                return Ok(None);
+            }
+            if self.has_headers && self.headers.is_none() {
+                self.headers = Some(unique_headers(&self.record)?);
+                continue;
+            }
+            return Ok(Some(Value::Object(record_to_object(
+                &self.record,
+                self.headers.as_deref(),
+                &self.null_values,
+            ))));
+        }
+    }
+
+    fn parse_error(&self, e: csv_async::Error) -> FaucetError {
+        if !self.flexible && matches!(e.kind(), csv_async::ErrorKind::UnequalLengths { .. }) {
+            FaucetError::Source(format!(
+                "csv: ragged row at line {}: {e} — a short or long row is a structural defect \
+                 that would silently misalign fields; fix the file or set `csv.flexible: true` \
+                 to accept uneven rows",
+                self.line
+            ))
+        } else {
+            FaucetError::Source(format!("csv: parse error at line {}: {e}", self.line))
+        }
+    }
+}
+
+fn unique_headers(rec: &csv_async::StringRecord) -> Result<Vec<String>, FaucetError> {
+    let headers: Vec<String> = rec.iter().map(str::to_string).collect();
+    let mut seen = std::collections::HashMap::with_capacity(headers.len());
+    for (i, name) in headers.iter().enumerate() {
+        if let Some(first) = seen.insert(name.as_str(), i) {
+            let shown = if name.is_empty() { "(empty)" } else { name };
+            return Err(FaucetError::Source(format!(
+                "csv: duplicate header {shown} at columns {first} and {i}; rows are keyed by \
+                 header name, so a repeated header would silently drop a column — rename it \
+                 or set `csv.has_headers: false`"
+            )));
+        }
+    }
+    Ok(headers)
 }
 
 /// How one CSV record becomes a JSON object — the single definition, so the
@@ -41,13 +149,19 @@ pub async fn decode(
 fn record_to_object(
     rec: &csv_async::StringRecord,
     headers: Option<&[String]>,
+    null_values: &[String],
 ) -> Map<String, Value> {
     let mut obj = Map::new();
     for (i, field) in rec.iter().enumerate() {
         let key = headers
             .and_then(|h| h.get(i).cloned())
             .unwrap_or_else(|| format!("column_{i}"));
-        obj.insert(key, Value::String(field.to_string()));
+        let value = if null_values.iter().any(|n| n == field) {
+            Value::Null
+        } else {
+            Value::String(field.to_string())
+        };
+        obj.insert(key, value);
     }
     obj
 }
@@ -59,9 +173,29 @@ fn record_to_object(
 /// mid-page widens the file instead of losing the field. A record missing a
 /// column writes an empty cell.
 pub fn encode(records: &[Value], delimiter: u8, has_headers: bool) -> Result<Vec<u8>, FaucetError> {
+    encode_rows(records, delimiter, b'"', has_headers)
+}
+
+/// [`encode`] with the full dialect in `opts`.
+pub fn encode_with(records: &[Value], opts: &CsvOptions) -> Result<Vec<u8>, FaucetError> {
+    encode_rows(
+        records,
+        opts.delimiter_byte()?,
+        opts.quote_byte()?,
+        opts.has_headers,
+    )
+}
+
+fn encode_rows(
+    records: &[Value],
+    delimiter: u8,
+    quote: u8,
+    has_headers: bool,
+) -> Result<Vec<u8>, FaucetError> {
     let headers = super::header_union(records);
     let mut wtr = csv::WriterBuilder::new()
         .delimiter(delimiter)
+        .quote(quote)
         .from_writer(Vec::new());
     if has_headers && !headers.is_empty() {
         wtr.write_record(&headers)
@@ -155,5 +289,92 @@ mod tests {
     fn nested_structure_survives_as_json_rather_than_being_dropped() {
         let out = encode(&[json!({"a": {"k": 1}})], b',', true).expect("encode");
         assert_eq!(String::from_utf8(out).unwrap(), "a\n\"{\"\"k\"\":1}\"\n");
+    }
+    fn opts(f: impl FnOnce(&mut CsvOptions)) -> CsvOptions {
+        let mut o = CsvOptions::default();
+        f(&mut o);
+        o
+    }
+
+    #[tokio::test]
+    async fn a_custom_quote_character_is_honoured_on_read_and_write() {
+        let o = opts(|o| o.quote = "'".into());
+        let recs = decode_with(b"a,b\n'x,y',2\n", &o, false)
+            .await
+            .expect("decode");
+        assert_eq!(recs, vec![json!({"a": "x,y", "b": "2"})]);
+        let out = encode_with(&recs, &o).expect("encode");
+        assert_eq!(String::from_utf8(out).unwrap(), "a,b\n'x,y',2\n");
+    }
+
+    #[tokio::test]
+    async fn a_strict_dialect_rejects_a_ragged_row_naming_its_line() {
+        let o = opts(|o| o.flexible = Some(false));
+        let err = decode_with(b"a,b\n1,2\n3\n", &o, true).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ragged row at line 3"), "{msg}");
+        assert!(msg.contains("csv.flexible"), "{msg}");
+        let lenient = decode_with(b"a,b\n1,2\n3\n", &CsvOptions::default(), false)
+            .await
+            .unwrap_err();
+        assert!(lenient.to_string().contains("ragged"));
+        let ok = decode_with(b"a,b\n3\n", &CsvOptions::default(), true)
+            .await
+            .expect("default flexible");
+        assert_eq!(ok, vec![json!({"a": "3"})]);
+    }
+
+    #[tokio::test]
+    async fn null_values_read_as_null() {
+        let o = opts(|o| o.null_values = vec!["".into(), "NULL".into()]);
+        let recs = decode_with(b"a,b,c\n,NULL,x\n", &o, false)
+            .await
+            .expect("decode");
+        assert_eq!(recs, vec![json!({"a": null, "b": null, "c": "x"})]);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_header_is_refused_rather_than_dropping_a_column() {
+        let err = decode(b"a,a\n1,2\n", b',', true).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate header a at columns 0 and 1"),
+            "{msg}"
+        );
+        let err = decode(b",\n1,2\n", b',', true).await.unwrap_err();
+        assert!(err.to_string().contains("(empty)"));
+        let ok = decode(b"a,a\n1,2\n", b',', false)
+            .await
+            .expect("no headers");
+        assert_eq!(
+            ok,
+            vec![
+                json!({"column_0": "a", "column_1": "a"}),
+                json!({"column_0": "1", "column_1": "2"})
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_quote_is_a_typed_parse_error() {
+        let o = opts(|o| o.flexible = Some(false));
+        let bad: &[u8] = b"a\n\xff\xfe\n";
+        let err = decode_with(bad, &o, false).await.unwrap_err();
+        assert!(err.to_string().contains("parse error at line"), "{err}");
+    }
+
+    #[test]
+    fn dialect_bytes_are_validated() {
+        assert!(opts(|o| o.quote = "''".into()).validate().is_err());
+        assert!(opts(|o| o.delimiter = ";;".into()).validate().is_err());
+        assert!(opts(|o| o.delimiter = "\\t".into()).validate().is_ok());
+        assert!(encode_with(&[json!({"a": 1})], &opts(|o| o.quote = "".into())).is_err());
+    }
+
+    #[test]
+    fn write_headers_is_another_name_for_has_headers() {
+        let o: CsvOptions = serde_json::from_value(json!({"write_headers": false})).unwrap();
+        assert!(!o.has_headers);
+        assert_eq!(o.on_unknown_field, super::super::CsvUnknownField::Widen);
     }
 }

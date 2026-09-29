@@ -7298,15 +7298,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/source_sftp__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "source_sftp__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -7427,15 +7455,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/source_s3__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "source_s3__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -8261,15 +8317,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/source_azure-blob__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "source_azure-blob__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -9691,15 +9775,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/source_gcs__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "source_gcs__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -11597,15 +11709,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/sink_sftp__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "sink_sftp__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -11716,15 +11856,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/sink_s3__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "sink_s3__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -13430,15 +13598,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/sink_gcs__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "sink_gcs__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -14097,15 +14293,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/sink_azure-blob__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "sink_azure-blob__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -16254,7 +16478,9 @@
                       "$ref": "#/$defs/source_sftp__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -16396,7 +16622,9 @@
                       "$ref": "#/$defs/source_sftp__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -16552,7 +16780,9 @@
                       "$ref": "#/$defs/source_s3__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -16668,7 +16898,9 @@
                       "$ref": "#/$defs/source_s3__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -16696,11 +16928,6 @@
                     "orc": {
                       "description": "Column projection, used when `file_format: orc` (#719).",
                       "$ref": "#/$defs/source_s3__OrcOptions",
-                      "default": {}
-                    },
-                    "parquet": {
-                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
-                      "$ref": "#/$defs/source_s3__ParquetReadOptions",
                       "default": {}
                     }
                   },
@@ -17711,7 +17938,9 @@
                       "$ref": "#/$defs/source_azure-blob__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -17856,7 +18085,9 @@
                       "$ref": "#/$defs/source_azure-blob__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -17884,11 +18115,6 @@
                     "orc": {
                       "description": "Column projection, used when `file_format: orc` (#719).",
                       "$ref": "#/$defs/source_azure-blob__OrcOptions",
-                      "default": {}
-                    },
-                    "parquet": {
-                      "description": "Column projection, used when `file_format: parquet` (#777).",
-                      "$ref": "#/$defs/source_azure-blob__ParquetReadOptions",
                       "default": {}
                     }
                   },
@@ -19371,7 +19597,9 @@
                       "$ref": "#/$defs/source_gcs__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -19493,7 +19721,9 @@
                       "$ref": "#/$defs/source_gcs__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -19521,11 +19751,6 @@
                     "orc": {
                       "description": "Column projection, used when `file_format: orc` (#719).",
                       "$ref": "#/$defs/source_gcs__OrcOptions",
-                      "default": {}
-                    },
-                    "parquet": {
-                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
-                      "$ref": "#/$defs/source_gcs__ParquetReadOptions",
                       "default": {}
                     }
                   },
@@ -20697,7 +20922,9 @@
                       "$ref": "#/$defs/source_file__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -20726,10 +20953,936 @@
                       "description": "Column projection, used for ORC files.",
                       "$ref": "#/$defs/source_file__OrcOptions",
                       "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used for Parquet files.",
+                      "$ref": "#/$defs/source_file__ParquetReadOptions",
+                      "default": {}
+                    },
+                    "encryption": {
+                      "description": "Decrypt files sealed by the file or jsonl sink's `encryption` block\n(AES-256-GCM). JSON Lines and raw text written line by line are\nopened one line at a time; every other file is opened whole. A file\nthat is not sealed fails the read.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_file__EncryptionSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
                   }
                 },
                 true
+              ]
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "s3",
+          "properties": {
+            "type": {
+              "const": "s3"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "bucket": {
+                      "description": "S3 bucket name.",
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "description": "Object key prefix filter.",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "region": {
+                      "description": "AWS region. `None` uses the SDK default.",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "endpoint_url": {
+                      "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO).",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "file_format": {
+                      "description": "Format of the files to read. Defaults to `json_lines`.",
+                      "$ref": "#/$defs/source_s3__S3FileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Maximum number of objects to read.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": null
+                    },
+                    "concurrency": {
+                      "description": "Maximum number of concurrent object reads (default: 10).\n\nThese `#[serde(default)]`s are the same oversight the REST source\ncarried: without them every field here was **required**, so a config\nnaming only `bucket` could not deserialize at all (#609). `bucket` is\nthe one genuinely required field.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). For\n`JsonLines` and `RawText` formats, the object body is decoded\nline-by-line via [`tokio::io::AsyncBufReadExt`] and a page is yielded\nwhenever the buffer reaches this size; multi-object scans flatten so\na single page may contain lines from any object. For `JsonArray`,\neach object is buffered fully before its records are chunked into\npages of this size (see the README \"Streaming and batching\" section\nfor the caveat). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: every page is one\ncomplete object — no within-object chunking. Useful for small\nlookup files, or for sinks (e.g. SQL `COPY`, BigQuery load jobs)\nthat prefer one large request per file to many small ones.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
+                      "$ref": "#/$defs/source_s3__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_s3__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_s3__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_s3__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    }
+                  },
+                  "title": "S3SourceConfig",
+                  "description": "Configuration for the S3 source connector.",
+                  "type": "object"
+                },
+                true,
+                {
+                  "properties": {
+                    "bucket": {
+                      "description": "S3 bucket name.",
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "description": "Object key prefix filter.",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "region": {
+                      "description": "AWS region. `None` uses the SDK default.",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "endpoint_url": {
+                      "description": "Custom endpoint URL for S3-compatible services (e.g. MinIO).",
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "default": null
+                    },
+                    "file_format": {
+                      "description": "Format of the files to read. Defaults to `json_lines`.",
+                      "$ref": "#/$defs/source_s3__S3FileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Maximum number of objects to read.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": null
+                    },
+                    "concurrency": {
+                      "description": "Maximum number of concurrent object reads (default: 10).\n\nThese `#[serde(default)]`s are the same oversight the REST source\ncarried: without them every field here was **required**, so a config\nnaming only `bucket` could not deserialize at all (#609). `bucket` is\nthe one genuinely required field.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). For\n`JsonLines` and `RawText` formats, the object body is decoded\nline-by-line via [`tokio::io::AsyncBufReadExt`] and a page is yielded\nwhenever the buffer reaches this size; multi-object scans flatten so\na single page may contain lines from any object. For `JsonArray`,\neach object is buffered fully before its records are chunked into\npages of this size (see the README \"Streaming and batching\" section\nfor the caveat). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: every page is one\ncomplete object — no within-object chunking. Useful for small\nlookup files, or for sinks (e.g. SQL `COPY`, BigQuery load jobs)\nthat prefer one large request per file to many small ones.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
+                      "$ref": "#/$defs/source_s3__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_s3__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_s3__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_s3__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    },
+                    "avro": {
+                      "description": "Reader schema, used when `file_format: avro` (#719).",
+                      "$ref": "#/$defs/source_s3__AvroOptions",
+                      "default": {
+                        "codec": "null"
+                      }
+                    },
+                    "orc": {
+                      "description": "Column projection, used when `file_format: orc` (#719).",
+                      "$ref": "#/$defs/source_s3__OrcOptions",
+                      "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
+                      "$ref": "#/$defs/source_s3__ParquetReadOptions",
+                      "default": {}
+                    }
+                  },
+                  "title": "S3SourceConfig",
+                  "description": "Configuration for the S3 source connector.",
+                  "type": "object"
+                }
+              ]
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "azure-blob",
+          "properties": {
+            "type": {
+              "const": "azure-blob"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "container": {
+                      "description": "Blob container / ADLS Gen2 filesystem name. Required.",
+                      "type": "string"
+                    },
+                    "account": {
+                      "description": "Storage-account name. Optional when a connection string or the\nemulator supplies it, otherwise required.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "auth": {
+                      "description": "Credential source. Defaults to the environment / managed-identity\ncredential chain.",
+                      "$ref": "#/$defs/source_azure-blob__AzureCredentials",
+                      "default": {
+                        "type": "default"
+                      }
+                    },
+                    "endpoint": {
+                      "description": "Custom blob endpoint (e.g. an Azurite emulator or a sovereign cloud).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "allow_http": {
+                      "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "use_emulator": {
+                      "description": "Target the Azurite storage emulator with its well-known\n`devstoreaccount1` credentials.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "prefix": {
+                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "object_keys": {
+                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "file_format": {
+                      "description": "File format.",
+                      "$ref": "#/$defs/source_azure-blob__AzureFileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Hard cap on the number of objects read (after listing).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "concurrency": {
+                      "description": "Maximum concurrent object reads (default: 10).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted `StreamPage`. `batch_size = 0` is the \"no batching\"\nsentinel and emits one page per object.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each blob's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer. Cheap — a byte counter over a body\nthat is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored blob's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Not supported on Azure Blob: `object_store` exposes no `Content-MD5`\nattribute and an Azure ETag is not a content hash, so there is nothing\nto verify against. Setting it `true` is **rejected at config load**\nrather than silently ignored — see `validate()`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the\ncodec is resolved per-object-key, so a single source can read a mix of\ncompressed and uncompressed objects. Requires the crate-local\n`compression` feature.",
+                      "$ref": "#/$defs/source_azure-blob__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    }
+                  },
+                  "title": "AzureBlobSourceConfig",
+                  "description": "Configuration for the Azure Blob source connector.",
+                  "type": "object"
+                },
+                true,
+                {
+                  "properties": {
+                    "container": {
+                      "description": "Blob container / ADLS Gen2 filesystem name. Required.",
+                      "type": "string"
+                    },
+                    "account": {
+                      "description": "Storage-account name. Optional when a connection string or the\nemulator supplies it, otherwise required.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "auth": {
+                      "description": "Credential source. Defaults to the environment / managed-identity\ncredential chain.",
+                      "$ref": "#/$defs/source_azure-blob__AzureCredentials",
+                      "default": {
+                        "type": "default"
+                      }
+                    },
+                    "endpoint": {
+                      "description": "Custom blob endpoint (e.g. an Azurite emulator or a sovereign cloud).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "allow_http": {
+                      "description": "Permit plaintext HTTP (required for a local Azurite emulator).",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "use_emulator": {
+                      "description": "Target the Azurite storage emulator with its well-known\n`devstoreaccount1` credentials.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "prefix": {
+                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "object_keys": {
+                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "file_format": {
+                      "description": "File format.",
+                      "$ref": "#/$defs/source_azure-blob__AzureFileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Hard cap on the number of objects read (after listing).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "concurrency": {
+                      "description": "Maximum concurrent object reads (default: 10).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted `StreamPage`. `batch_size = 0` is the \"no batching\"\nsentinel and emits one page per object.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each blob's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer. Cheap — a byte counter over a body\nthat is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored blob's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Not supported on Azure Blob: `object_store` exposes no `Content-MD5`\nattribute and an Azure ETag is not a content hash, so there is nothing\nto verify against. Setting it `true` is **rejected at config load**\nrather than silently ignored — see `validate()`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the\ncodec is resolved per-object-key, so a single source can read a mix of\ncompressed and uncompressed objects. Requires the crate-local\n`compression` feature.",
+                      "$ref": "#/$defs/source_azure-blob__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_azure-blob__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    },
+                    "avro": {
+                      "description": "Reader schema, used when `file_format: avro` (#719).",
+                      "$ref": "#/$defs/source_azure-blob__AvroOptions",
+                      "default": {
+                        "codec": "null"
+                      }
+                    },
+                    "orc": {
+                      "description": "Column projection, used when `file_format: orc` (#719).",
+                      "$ref": "#/$defs/source_azure-blob__OrcOptions",
+                      "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777).",
+                      "$ref": "#/$defs/source_azure-blob__ParquetReadOptions",
+                      "default": {}
+                    }
+                  },
+                  "title": "AzureBlobSourceConfig",
+                  "description": "Configuration for the Azure Blob source connector.",
+                  "type": "object"
+                }
+              ]
+            },
+            "transforms": {
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "inherit_transforms": {
+              "type": "boolean"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "gcs",
+          "properties": {
+            "type": {
+              "const": "gcs"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "bucket": {
+                      "description": "GCS bucket name.",
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "object_keys": {
+                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "auth": {
+                      "description": "Credential source.",
+                      "$ref": "#/$defs/source_gcs__GcsCredentials",
+                      "default": {
+                        "type": "application_default"
+                      }
+                    },
+                    "file_format": {
+                      "description": "File format.",
+                      "$ref": "#/$defs/source_gcs__GcsFileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Hard cap on the number of objects read (after listing).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "concurrency": {
+                      "description": "Maximum concurrent object reads (default: 10).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted `StreamPage`. See \"Streaming and batching\"\nin the README. `batch_size = 0` is the \"no batching\" sentinel and\nemits one page per object.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "storage_host": {
+                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
+                      "$ref": "#/$defs/source_gcs__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_gcs__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_gcs__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_gcs__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    }
+                  },
+                  "title": "GcsSourceConfig",
+                  "description": "Configuration for the GCS source connector.",
+                  "type": "object"
+                },
+                true,
+                {
+                  "properties": {
+                    "bucket": {
+                      "description": "GCS bucket name.",
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "description": "Object name prefix filter. Ignored when `object_keys` is set.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "object_keys": {
+                      "description": "Explicit object names. When set, listing is skipped and `prefix`\nis ignored.",
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "auth": {
+                      "description": "Credential source.",
+                      "$ref": "#/$defs/source_gcs__GcsCredentials",
+                      "default": {
+                        "type": "application_default"
+                      }
+                    },
+                    "file_format": {
+                      "description": "File format.",
+                      "$ref": "#/$defs/source_gcs__GcsFileFormat",
+                      "default": "json_lines"
+                    },
+                    "max_objects": {
+                      "description": "Hard cap on the number of objects read (after listing).",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0
+                    },
+                    "concurrency": {
+                      "description": "Maximum concurrent object reads (default: 10).",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 10
+                    },
+                    "batch_size": {
+                      "description": "Records per emitted `StreamPage`. See \"Streaming and batching\"\nin the README. `batch_size = 0` is the \"no batching\" sentinel and\nemits one page per object.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000
+                    },
+                    "verify_length": {
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "verify_checksum": {
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": false
+                    },
+                    "storage_host": {
+                      "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "compression": {
+                      "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
+                      "$ref": "#/$defs/source_gcs__CompressionConfig",
+                      "default": "auto"
+                    },
+                    "csv": {
+                      "description": "CSV dialect, used when `file_format: csv` (#604).",
+                      "$ref": "#/$defs/source_gcs__CsvOptions",
+                      "default": {
+                        "delimiter": ",",
+                        "has_headers": true
+                      }
+                    },
+                    "excel": {
+                      "description": "Worksheet selection, used when `file_format: xlsx` (#604).",
+                      "$ref": "#/$defs/source_gcs__ExcelOptions",
+                      "default": {
+                        "header_row": 0
+                      }
+                    },
+                    "xml": {
+                      "description": "Record framing, used when `file_format: xml` (#604).",
+                      "$ref": "#/$defs/source_gcs__XmlOptions",
+                      "default": {
+                        "record_element": "record",
+                        "root_element": "records"
+                      }
+                    },
+                    "avro": {
+                      "description": "Reader schema, used when `file_format: avro` (#719).",
+                      "$ref": "#/$defs/source_gcs__AvroOptions",
+                      "default": {
+                        "codec": "null"
+                      }
+                    },
+                    "orc": {
+                      "description": "Column projection, used when `file_format: orc` (#719).",
+                      "$ref": "#/$defs/source_gcs__OrcOptions",
+                      "default": {}
+                    },
+                    "parquet": {
+                      "description": "Column projection, used when `file_format: parquet` (#777): only\n`parquet.columns` are decoded, before any row group is read.",
+                      "$ref": "#/$defs/source_gcs__ParquetReadOptions",
+                      "default": {}
+                    }
+                  },
+                  "title": "GcsSourceConfig",
+                  "description": "Configuration for the GCS source connector.",
+                  "type": "object"
+                }
               ]
             },
             "transforms": {
@@ -22381,7 +23534,9 @@
                       "$ref": "#/$defs/sink_sftp__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -22530,7 +23685,9 @@
                       "$ref": "#/$defs/sink_sftp__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -22804,7 +23961,9 @@
                       "$ref": "#/$defs/sink_s3__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -22911,7 +24070,9 @@
                       "$ref": "#/$defs/sink_s3__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -24050,7 +25211,9 @@
             "config": {
               "anyOf": [
                 {
-                  "additionalProperties": true,
+                  "x-faucet-aliases": [
+                    "max_rows_per_file"
+                  ],
                   "title": "FileSinkConfig",
                   "description": "Configuration for the local file sink.",
                   "type": "object",
@@ -24080,7 +25243,7 @@
                       "default": "append"
                     },
                     "max_records_per_file": {
-                      "description": "Roll to a new file after this many records.",
+                      "description": "Roll to a new file after this many records. `max_rows_per_file` is\naccepted as another name.",
                       "type": [
                         "integer",
                         "null",
@@ -24122,7 +25285,9 @@
                       "$ref": "#/$defs/sink_file__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -24148,13 +25313,33 @@
                       }
                     },
                     "parquet": {
-                      "description": "Column-chunk compression, used when the format is Parquet.",
+                      "description": "Compression, row groups and an optional explicit schema, used when\nthe format is Parquet.",
                       "$ref": "#/$defs/sink_file__ParquetOptions",
                       "default": {
-                        "compression": "snappy"
+                        "compression": "snappy",
+                        "row_group_size": 1048576
                       }
+                    },
+                    "json_lines": {
+                      "description": "Pretty-printing, used when the format is JSON Lines.",
+                      "$ref": "#/$defs/sink_file__JsonLinesOptions",
+                      "default": {
+                        "pretty": false
+                      }
+                    },
+                    "encryption": {
+                      "description": "Encrypt the output at rest (AES-256-GCM). Uncompressed JSON Lines and\nraw text seal each record on its own line (base64), exactly as the\njsonl sink does, so the file stays appendable. Every other file —\ncompressed JSON Lines included — is sealed whole when it is\nfinalised, after any `compression`; appending to one decrypts it\nfirst. The file source's `encryption` block reads both back.",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/sink_file__EncryptionSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
                     }
-                  }
+                  },
+                  "additionalProperties": true
                 },
                 true
               ]
@@ -24367,7 +25552,9 @@
                       "$ref": "#/$defs/sink_gcs__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -24476,7 +25663,9 @@
                       "$ref": "#/$defs/sink_gcs__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -25067,7 +26256,9 @@
                       "$ref": "#/$defs/sink_azure-blob__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -25199,7 +26390,9 @@
                       "$ref": "#/$defs/sink_azure-blob__CsvOptions",
                       "default": {
                         "delimiter": ",",
-                        "has_headers": true
+                        "has_headers": true,
+                        "quote": "\"",
+                        "on_unknown_field": "widen"
                       }
                     },
                     "excel": {
@@ -27721,15 +28914,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/source_file__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "source_file__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -28278,15 +29499,43 @@
           "default": ","
         },
         "has_headers": {
-          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use.",
+          "description": "Whether the first row names the fields. When false, fields are named\n`column_0`, `column_1`, … — the same fallback the REST source and the\n`csv` connector already use. On write it decides whether a header row\nis written; `write_headers` is accepted as another name for it.",
           "type": [
             "boolean",
             "string"
           ],
           "default": true
+        },
+        "quote": {
+          "description": "Quote character. A single byte; default `\"`.",
+          "type": "string",
+          "default": "\""
+        },
+        "flexible": {
+          "description": "Whether rows may have a different number of fields than the header.\n`false` fails the read on the first ragged row, naming its line; `true`\nkeeps the fields the row has. Unset, each connector picks: the `file`\nsource is strict, the object-store sources and the REST source are\nlenient.",
+          "type": [
+            "boolean",
+            "null",
+            "string"
+          ]
+        },
+        "null_values": {
+          "description": "Cell values read as `null` instead of a string (e.g. `[\"\", \"NULL\"]`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "on_unknown_field": {
+          "description": "What a streaming CSV writer does with a field the header does not\nhave. See [`CsvUnknownField`]. Whole-object encoders always write the\nunion of every record's fields, so it only affects the `file` sink.",
+          "$ref": "#/$defs/sink_file__CsvUnknownField",
+          "default": "widen"
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "x-faucet-aliases": [
+        "write_headers"
+      ]
     },
     "sink_file__ExcelOptions": {
       "description": "Excel worksheet selection.",
@@ -28377,6 +29626,26 @@
           "description": "Column-chunk compression (default `snappy`). File-level `compression`\ndoes not apply to Parquet.",
           "$ref": "#/$defs/sink_file__ParquetCodec",
           "default": "snappy"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_file__ParquetField"
+          }
         }
       },
       "additionalProperties": true
@@ -28385,7 +29654,7 @@
       "description": "Parquet column-chunk compression.",
       "oneOf": [
         {
-          "description": "Uncompressed pages.",
+          "description": "Uncompressed pages. `uncompressed` is accepted as another name.",
           "type": "string",
           "const": "none"
         },
@@ -28403,6 +29672,11 @@
           "description": "Zstandard.",
           "type": "string",
           "const": "zstd"
+        },
+        {
+          "description": "LZ4 (the `LZ4_RAW` codec).",
+          "type": "string",
+          "const": "lz4"
         }
       ]
     },
@@ -29326,6 +30600,419 @@
           "description": "An absolute RFC 3339 instant.",
           "type": "string",
           "const": "rfc3339"
+        }
+      ]
+    },
+    "source_sftp__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "source_file__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "source_file__ParquetReadOptions": {
+      "description": "Parquet read options.",
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "Top-level columns to read. Only these column chunks are decoded.\nDefault: every column. A name a file does not have is an error, not\nan empty column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_file__EncryptionSpec": {
+      "description": "The user-facing `encryption:` config block (state store / jsonl sink).\n\n```yaml\nencryption:\n  key: ${vault:secret/faucet#state-key}\n  # previous_keys: [\"${env:OLD_STATE_KEY}\"]   # rotation: read-only\n  # algorithm: aes-256-gcm                     # default\n```",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key material used to seal new writes (and tried first on reads).\nShould come from a secrets manager; derived to a 32-byte AES key via\nSHA-256.",
+          "type": "string"
+        },
+        "previous_keys": {
+          "description": "Older keys tried (in order) when decrypting, for rotation. Never used\nto seal new writes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "algorithm": {
+          "description": "AEAD algorithm. Only `aes-256-gcm` today.",
+          "$ref": "#/$defs/source_file__EncryptionAlgorithm",
+          "default": "aes-256-gcm"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_file__EncryptionAlgorithm": {
+      "description": "Supported AEAD algorithms. A single variant today; the format byte in the\non-disk header leaves room for more without breaking old files.",
+      "oneOf": [
+        {
+          "description": "AES-256-GCM authenticated encryption (the default and only option).",
+          "type": "string",
+          "const": "aes-256-gcm"
+        }
+      ]
+    },
+    "source_s3__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "source_azure-blob__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "source_gcs__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "sink_sftp__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "sink_s3__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "sink_file__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "sink_file__ParquetField": {
+      "description": "One column of an explicit Parquet schema.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Column name — the record field it is read from.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Column type.",
+          "$ref": "#/$defs/sink_file__ParquetType"
+        },
+        "nullable": {
+          "description": "Whether the column may be null or missing (default `true`).",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__ParquetType": {
+      "description": "A column type of an explicit Parquet schema.",
+      "oneOf": [
+        {
+          "description": "`true` / `false`.",
+          "type": "string",
+          "const": "boolean"
+        },
+        {
+          "description": "32-bit signed integer.",
+          "type": "string",
+          "const": "int32"
+        },
+        {
+          "description": "64-bit signed integer.",
+          "type": "string",
+          "const": "int64"
+        },
+        {
+          "description": "64-bit unsigned integer.",
+          "type": "string",
+          "const": "uint64"
+        },
+        {
+          "description": "32-bit float.",
+          "type": "string",
+          "const": "float32"
+        },
+        {
+          "description": "64-bit float.",
+          "type": "string",
+          "const": "float64"
+        },
+        {
+          "description": "UTF-8 text.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A calendar date, from `YYYY-MM-DD` text.",
+          "type": "string",
+          "const": "date"
+        },
+        {
+          "description": "A UTC timestamp in milliseconds, from RFC 3339 text or epoch numbers.",
+          "type": "string",
+          "const": "timestamp_ms"
+        },
+        {
+          "description": "A UTC timestamp in microseconds.",
+          "type": "string",
+          "const": "timestamp_us"
+        },
+        {
+          "description": "A UTC timestamp in nanoseconds.",
+          "type": "string",
+          "const": "timestamp_ns"
+        },
+        {
+          "description": "A fixed-point decimal with the given precision and scale, from\nnumbers or numeric text.",
+          "type": "object",
+          "properties": {
+            "decimal": {
+              "type": "object",
+              "properties": {
+                "precision": {
+                  "description": "Total digits (1–38).",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "uint8",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "scale": {
+                  "description": "Digits after the point.",
+                  "type": [
+                    "integer",
+                    "string"
+                  ],
+                  "format": "int8",
+                  "minimum": -128,
+                  "maximum": 127
+                }
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "sink_file__JsonLinesOptions": {
+      "description": "JSON Lines write options.",
+      "type": "object",
+      "properties": {
+        "pretty": {
+          "description": "Pretty-print each record across several lines. The output is then a\nstream of JSON documents rather than one record per line.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__EncryptionSpec": {
+      "description": "The user-facing `encryption:` config block (state store / jsonl sink).\n\n```yaml\nencryption:\n  key: ${vault:secret/faucet#state-key}\n  # previous_keys: [\"${env:OLD_STATE_KEY}\"]   # rotation: read-only\n  # algorithm: aes-256-gcm                     # default\n```",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Key material used to seal new writes (and tried first on reads).\nShould come from a secrets manager; derived to a 32-byte AES key via\nSHA-256.",
+          "type": "string"
+        },
+        "previous_keys": {
+          "description": "Older keys tried (in order) when decrypting, for rotation. Never used\nto seal new writes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "algorithm": {
+          "description": "AEAD algorithm. Only `aes-256-gcm` today.",
+          "$ref": "#/$defs/sink_file__EncryptionAlgorithm",
+          "default": "aes-256-gcm"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_file__EncryptionAlgorithm": {
+      "description": "Supported AEAD algorithms. A single variant today; the format byte in the\non-disk header leaves room for more without breaking old files.",
+      "oneOf": [
+        {
+          "description": "AES-256-GCM authenticated encryption (the default and only option).",
+          "type": "string",
+          "const": "aes-256-gcm"
+        }
+      ]
+    },
+    "sink_gcs__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
+        }
+      ]
+    },
+    "sink_azure-blob__CsvUnknownField": {
+      "description": "What a CSV writer does with a field that is not in the header.",
+      "oneOf": [
+        {
+          "description": "Add it as a new column; earlier rows get an empty cell for it.",
+          "type": "string",
+          "const": "widen"
+        },
+        {
+          "description": "Fix the header from the first page and drop the field, logging a\nwarning once per field.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Fix the header from the first page and fail the write naming the field.",
+          "type": "string",
+          "const": "error"
         }
       ]
     },
