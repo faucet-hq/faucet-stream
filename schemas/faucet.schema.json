@@ -22697,7 +22697,7 @@
                       "default": ".jsonl"
                     },
                     "batch_size": {
-                      "description": "Records per written object. When a `write_batch` call hands the sink\n`N` records with `batch_size = M > 0`, the sink writes `ceil(N / M)`\nobjects. `batch_size = 0` writes whatever upstream hands it as a single\nobject. Defaults to [`DEFAULT_BATCH_SIZE`].",
+                      "description": "Records per file when `max_records_per_file` is not set (without\n`file_name`). Records accumulate across `write_batch` calls and a file\ncloses once it holds this many records, or at `flush`. `batch_size =\n0` is the \"no re-chunking\" sentinel: no record cap, so JSON Lines and\nthe whole-file formats write one file per `flush`, and Parquet one\nfile per `write_batch` call. Ignored when `file_name` is set.\nDefaults to [`DEFAULT_BATCH_SIZE`].",
                       "type": [
                         "integer",
                         "string"
@@ -22705,6 +22705,16 @@
                       "format": "uint",
                       "minimum": 0,
                       "default": 1000
+                    },
+                    "concurrency": {
+                      "description": "Maximum number of file uploads in flight over the SSH session\n(default 4): a page that rolls into several files uploads them\nconcurrently while the next file is encoded. `flush` returns only\nafter every upload has landed.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 4
                     },
                     "max_records_per_file": {
                       "description": "Maximum records per file before rolling to a new one (#618). `None`\nremoves the record cap; the sink accumulates across `write_batch`\ncalls, so a small upstream page no longer means a small file.",
@@ -22759,10 +22769,10 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_sftp__ParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_sftp__RemoteParquetOptions",
                       "default": {
-                        "compression": "snappy",
+                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
@@ -23025,7 +23035,7 @@
                       "minimum": 0
                     },
                     "concurrency": {
-                      "description": "Maximum number of concurrent part uploads for a large object\n(default: 10).",
+                      "description": "Maximum number of uploads in flight (default: 10). A page that rolls\ninto several objects uploads them concurrently, up to this many, while\nthe next object is encoded; a large object's multipart parts are also\nuploaded up to this many at a time. `flush` returns only after every\nupload has landed.",
                       "type": [
                         "integer",
                         "string"
@@ -23035,7 +23045,7 @@
                       "default": 10
                     },
                     "batch_size": {
-                      "description": "Records per S3 object written by a single\n[`Sink::write_batch`](faucet_core::Sink::write_batch) call. When a call\nhands the sink `N` records with `batch_size = M > 0`, the sink writes\n`ceil(N / M)` objects, each containing at most `M` records (the final\nobject holds the remainder). Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the sink writes\nwhatever upstream hands it without re-chunking (still honouring\n`max_records_per_file` if set). Recommended for S3 — most callers\nshould leave this at `0` and let the source's `batch_size` drive\nobject sizing, because many tiny S3 objects are a well-known\nanti-pattern (per-request overhead, slower downstream reads,\nLIST/PUT cost).\n\nWhen both `batch_size > 0` and `max_records_per_file` are set, the\neffective per-object cap is `min(batch_size, max_records_per_file)`.",
+                      "description": "Records per S3 object when `max_records_per_file` is not set (without\n`path`). Records accumulate across\n[`Sink::write_batch`](faucet_core::Sink::write_batch) calls and an\nobject closes once it holds `batch_size` records, or at `flush`.\nDefaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no re-chunking\" sentinel: no record cap\n(still honouring `max_records_per_file` / `max_bytes_per_file` if\nset). JSON Lines and the whole-object formats then write one object\nper `flush`; Parquet writes one object per `write_batch` call, as the\nsink always has. Many tiny S3 objects are a well-known anti-pattern\n(per-request overhead, slower downstream reads, LIST/PUT cost), so\nsize objects with the caps rather than a small `batch_size`.\n\nWhen both `batch_size > 0` and `max_records_per_file` are set, the\neffective per-object cap is `min(batch_size, max_records_per_file)`.\nIgnored when `path` is set.",
                       "type": [
                         "integer",
                         "string"
@@ -23082,10 +23092,10 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_s3__ParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_s3__RemoteParquetOptions",
                       "default": {
-                        "compression": "snappy",
+                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
@@ -24527,7 +24537,7 @@
                       "default": ".jsonl"
                     },
                     "max_records_per_file": {
-                      "description": "Hard cap on records per uploaded object. `None` means a single\nobject per `write_batch` call (still subject to `batch_size`).",
+                      "description": "Hard cap on records per uploaded object. `None` leaves the cap to\n`batch_size`.",
                       "type": [
                         "integer",
                         "null",
@@ -24547,7 +24557,7 @@
                       "minimum": 0
                     },
                     "concurrency": {
-                      "description": "Maximum number of concurrent uploads (default 10).",
+                      "description": "Maximum number of uploads in flight (default 10): a page that rolls\ninto several objects uploads them concurrently while the next object\nis encoded. `flush` returns only after every upload has landed.",
                       "type": [
                         "integer",
                         "string"
@@ -24557,7 +24567,7 @@
                       "default": 10
                     },
                     "batch_size": {
-                      "description": "Records per uploaded object from a single `write_batch` call.\n`batch_size = 0` writes whatever upstream hands the sink as one\nobject. Recommended value for GCS is `0` — many tiny objects is\na well-known anti-pattern.",
+                      "description": "Records per object when `max_records_per_file` is not set (without\n`path`). Records accumulate across `write_batch` calls and an object\ncloses once it holds this many records, or at `flush`. `batch_size =\n0` is the \"no re-chunking\" sentinel: no record cap, so JSON Lines and\nthe whole-object formats write one object per `flush`, and Parquet one\nobject per `write_batch` call. Ignored when `path` is set.",
                       "type": [
                         "integer",
                         "string"
@@ -24611,10 +24621,10 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_gcs__ParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_gcs__RemoteParquetOptions",
                       "default": {
-                        "compression": "snappy",
+                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
@@ -25191,7 +25201,7 @@
                       "minimum": 0
                     },
                     "concurrency": {
-                      "description": "Maximum number of concurrent uploads (default 10).",
+                      "description": "Maximum number of uploads in flight (default 10): a page that rolls\ninto several objects uploads them concurrently while the next object\nis encoded, and a large blob's blocks go up this many at a time.\n`flush` returns only after every upload has landed.",
                       "type": [
                         "integer",
                         "string"
@@ -25201,7 +25211,7 @@
                       "default": 10
                     },
                     "batch_size": {
-                      "description": "Records per uploaded object from a single `write_batch` call.\n`batch_size = 0` writes whatever upstream hands the sink as one object.\nRecommended value for object stores is `0` — many tiny objects is a\nwell-known anti-pattern.",
+                      "description": "Records per object when `max_records_per_file` is not set (without\n`path`). Records accumulate across `write_batch` calls and an object\ncloses once it holds this many records, or at `flush`. `batch_size =\n0` is the \"no re-chunking\" sentinel: no record cap, so JSON Lines and\nthe whole-object formats write one object per `flush`, and Parquet one\nobject per `write_batch` call. Ignored when `path` is set.",
                       "type": [
                         "integer",
                         "string"
@@ -25248,10 +25258,10 @@
                       }
                     },
                     "parquet": {
-                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression`, `row_group_size`, explicit `schema`.",
-                      "$ref": "#/$defs/sink_azure-blob__ParquetOptions",
+                      "description": "Parquet writer options, used when `format: parquet` (#777):\n`compression` (default `zstd`), `row_group_size`, explicit `schema`.",
+                      "$ref": "#/$defs/sink_azure-blob__RemoteParquetOptions",
                       "default": {
-                        "compression": "snappy",
+                        "compression": "zstd",
                         "row_group_size": 1048576
                       }
                     },
@@ -30994,6 +31004,134 @@
           ],
           "items": {
             "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_azure-blob__RemoteParquetOptions": {
+      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_azure-blob__ParquetCodec",
+          "default": "zstd"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_azure-blob__ParquetField"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_gcs__RemoteParquetOptions": {
+      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_gcs__ParquetCodec",
+          "default": "zstd"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_gcs__ParquetField"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_s3__RemoteParquetOptions": {
+      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_s3__ParquetCodec",
+          "default": "zstd"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_s3__ParquetField"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_sftp__RemoteParquetOptions": {
+      "description": "Parquet write options for the object-store and SFTP sinks: the same\nfields as [`ParquetOptions`], but `compression` defaults to `zstd`, which\nis what those sinks wrote before the shared writer — smaller objects to\nupload and store.",
+      "type": "object",
+      "properties": {
+        "compression": {
+          "description": "Column-chunk compression (default `zstd`). File-level `compression`\ndoes not apply to Parquet.",
+          "$ref": "#/$defs/sink_sftp__ParquetCodec",
+          "default": "zstd"
+        },
+        "row_group_size": {
+          "description": "Maximum rows per row group (default 1,048,576). Smaller groups let\nreaders skip more data and bound the writer's memory.",
+          "type": [
+            "integer",
+            "string"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": 1048576
+        },
+        "schema": {
+          "description": "An explicit schema, in column order. Without it the schema is\ninferred from the records and widened when a later page adds a field.\nWith it the file has exactly these columns: a record field the schema\ndoes not name fails the write, and a value that does not fit its\ncolumn's type fails naming the column.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/sink_sftp__ParquetField"
           }
         }
       },
