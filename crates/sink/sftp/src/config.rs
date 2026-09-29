@@ -297,6 +297,7 @@ mod tests {
             .csv(faucet_core::CsvOptions {
                 delimiter: ";".into(),
                 has_headers: false,
+                ..Default::default()
             })
             .excel(faucet_core::ExcelOptions {
                 sheet: Some("Data".into()),

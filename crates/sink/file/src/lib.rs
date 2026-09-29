@@ -10,15 +10,11 @@
 //! whole output set only when the run succeeds.
 
 pub mod config;
-mod layout;
-#[cfg(feature = "file-format-parquet")]
-mod parquet;
 mod sink;
-mod writer;
 
 pub use config::{
-    FileMode, FileSinkConfig, FileSinkFormat, FileWriteMode, PART_TOKEN, ParquetCodec,
-    ParquetOptions,
+    FileMode, FileSinkConfig, FileSinkFormat, FileWriteMode, JsonLinesOptions, PART_TOKEN,
+    ParquetCodec, ParquetField, ParquetOptions, ParquetType,
 };
 pub use faucet_core::{FaucetError, Sink};
 pub use sink::FileSink;
