@@ -35,6 +35,9 @@ struct OpenObject {
     /// for JSON Lines, which streams through `acc`.
     pending: faucet_core::object_rollover::PageAccumulator,
     upload: Option<(String, Box<dyn object_store::MultipartUpload>)>,
+    /// The open Parquet object when `format: parquet` (#777).
+    #[cfg(feature = "arrow")]
+    parquet: Option<faucet_core::ParquetObjects>,
 }
 
 /// Part size for the streaming multipart upload (#618).
@@ -50,6 +53,7 @@ impl AzureBlobSink {
     /// across calls.
     pub async fn new(config: AzureBlobSinkConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        config.parquet.validate()?;
         let store = build_store(&config.connection)?;
         let open = tokio::sync::Mutex::new(OpenObject {
             pending: faucet_core::object_rollover::PageAccumulator::new(
@@ -62,6 +66,15 @@ impl AzureBlobSink {
             )
             .with_part_size(PART_BYTES),
             upload: None,
+            #[cfg(feature = "arrow")]
+            parquet: match config.format {
+                crate::config::AzureSinkFormat::Parquet => Some(faucet_core::ParquetObjects::new(
+                    &config.parquet,
+                    Some(resolve_effective_chunk_size(&config)),
+                    config.max_bytes_per_file,
+                )?),
+                _ => None,
+            },
         });
         Ok(Self {
             config,
@@ -164,6 +177,10 @@ impl AzureBlobSink {
 
     async fn upload_file(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
         let body = self.encode_body(body)?;
+        self.put(key, body).await
+    }
+
+    async fn put(&self, key: &str, body: Vec<u8>) -> Result<(), FaucetError> {
         let path = ObjectPath::from(key);
         let payload = bytes::Bytes::from(body);
         self.store.put(&path, payload.into()).await.map_err(|e| {
@@ -171,6 +188,38 @@ impl AzureBlobSink {
         })?;
         tracing::debug!(key = %key, "Uploaded Azure object");
         Ok(())
+    }
+}
+
+impl AzureBlobSink {
+    /// Run `f` against the open Parquet object, then upload every object it
+    /// finished — also when `f` failed, so nothing already closed is lost.
+    /// Parquet compresses its own columns, so `compression` is not applied.
+    #[cfg(feature = "arrow")]
+    async fn push_parquet(
+        &self,
+        open: &mut OpenObject,
+        f: impl FnOnce(&mut faucet_core::ParquetObjects) -> Result<(), FaucetError>,
+    ) -> Result<(), FaucetError> {
+        let Some(pq) = open.parquet.as_mut() else {
+            return Ok(());
+        };
+        let pushed = f(pq);
+        let ready = pq.take_ready();
+        let concurrency = self.config.concurrency.max(1);
+        futures::stream::iter(ready)
+            .map(|body| async move {
+                let key = self.generate_key();
+                self.put(&key, body).await?;
+                tracing::info!(key = %key, "Azure parquet object written");
+                Ok::<(), FaucetError>(())
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<()>, _>>()?;
+        pushed
     }
 }
 
@@ -198,6 +247,8 @@ impl faucet_core::Sink for AzureBlobSink {
         if let Some(group) = open.pending.finish() {
             self.write_encoded_object(group).await?;
         }
+        #[cfg(feature = "arrow")]
+        self.push_parquet(&mut open, |pq| pq.finish()).await?;
         Ok(())
     }
 
@@ -219,6 +270,13 @@ impl faucet_core::Sink for AzureBlobSink {
         // before any byte is final, so records are buffered and encoded
         // together. The same row/byte caps decide the rollover, so object
         // sizing means the same thing whatever the format.
+        #[cfg(feature = "arrow")]
+        if matches!(self.config.format, crate::config::AzureSinkFormat::Parquet) {
+            let mut open = self.open.lock().await;
+            self.push_parquet(&mut open, |pq| pq.push_records(records))
+                .await?;
+            return Ok(records.len());
+        }
         if !self.config.format.appends_per_record() {
             let mut open = self.open.lock().await;
             if let Some(group) = open.pending.push_page(records) {
@@ -245,6 +303,31 @@ impl faucet_core::Sink for AzureBlobSink {
 
         tracing::info!(records = written, files, "Azure batch write complete");
         Ok(written)
+    }
+
+    #[cfg(feature = "arrow")]
+    fn supports_columnar(&self) -> bool {
+        matches!(self.config.format, crate::config::AzureSinkFormat::Parquet)
+    }
+
+    /// Write an Arrow batch into the open Parquet object; any other format
+    /// takes the row path.
+    #[cfg(feature = "arrow")]
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        if batch.num_rows() == 0 {
+            return Ok(0);
+        }
+        if !self.supports_columnar() {
+            let rows = faucet_core::columnar::record_batch_to_values(batch)?;
+            return self.write_batch(&rows).await;
+        }
+        let mut open = self.open.lock().await;
+        self.push_parquet(&mut open, |pq| pq.push_batch(batch))
+            .await?;
+        Ok(batch.num_rows())
     }
 
     fn config_schema(&self) -> Value {
@@ -317,6 +400,14 @@ mod tests {
             Ok(_) => panic!("expected a batch_size Config error, got Ok(sink)"),
             Err(e) => panic!("expected a batch_size Config error, got {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn new_rejects_a_bad_parquet_option() {
+        let mut config = AzureBlobSinkConfig::new("cont");
+        config.parquet.row_group_size = 0;
+        let err = AzureBlobSink::new(config).await.err().unwrap().to_string();
+        assert!(err.contains("row_group_size"), "{err}");
     }
 
     #[tokio::test]
