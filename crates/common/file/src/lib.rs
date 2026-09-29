@@ -1,6 +1,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 //! Config types shared by the local file source and sink, and the shared
-//! file-writing layer ([`write`]) every file-writing sink builds on.
+//! file-writing layer ([`write`](mod@write)) every file-writing sink builds on.
 
 use faucet_core::compression::{Compression, CompressionConfig};
 use faucet_core::{FaucetError, FileFormat};
