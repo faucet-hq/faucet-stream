@@ -380,6 +380,24 @@ it through its own Arrow path so a `parquet → parquet` chain never materialize
 `serde_json::Value`. Routing it through the record encoder would work and would
 silently cost that fast path, so the shared helper refuses it.
 
+The object-store sources (`s3`, `gcs`, `azure-blob`) read `file_format: parquet`
+with column projection — the equivalent of the Parquet source's `columns` for
+objects in a bucket or container:
+
+```yaml
+source:
+  type: s3
+  config:
+    bucket: my-data-lake
+    prefix: events/2026/
+    file_format: parquet
+    parquet:
+      columns: [id, amount]   # decoded before any row group is read
+```
+
+A column an object does not have fails the run with an error naming the object
+and its columns.
+
 ## See also
 
 - [Compression](./compression.md) — gzip / zstd, independent of format

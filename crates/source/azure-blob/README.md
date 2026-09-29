@@ -67,6 +67,7 @@ sources.
 - **`json_array`** — the whole object is a JSON array; buffered then chunked.
 - **`raw_text`** — each object becomes one record `{ "key", "content" }`.
 - **`csv` / `xml` / `xlsx`** — decoded through `faucet_core::file_format` (below); buffered then chunked.
+- **`parquet`** — Apache Parquet, buffered then decoded; see [Parquet](#parquet-777).
 
 Beyond JSON Lines, JSON array and raw text, this source reads **CSV**, **XML**
 and **Excel** through `faucet_core::file_format`, so the records it produces
@@ -125,6 +126,21 @@ columnar path (`avro → parquet` never builds JSON rows). Enable with
 `file-format-avro` / `file-format-orc` (ORC turns on `arrow`), or with
 `file-formats`. Details: the
 [file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
+
+## Parquet (#777)
+
+`file_format: parquet` (the `arrow` feature) reads Apache Parquet blobs. Each
+blob is fetched whole (the footer is at the end) and decoded on a blocking
+thread; `parquet.columns` projects top-level columns before any row group is
+decoded, and a name a blob does not have fails the run naming the blob and its
+columns. With `arrow` the format joins the columnar path, where every blob in
+the listing must share the first blob's schema.
+
+```yaml
+file_format: parquet
+parquet:
+  columns: [id, amount]
+```
 
 ## Example
 
