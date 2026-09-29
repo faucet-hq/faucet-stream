@@ -51,6 +51,10 @@ async-stream.workspace = true
 async-trait.workspace = true
 arrow.workspace = true
 parquet.workspace = true
+flate2.workspace = true
+faucet-sink-csv = { workspace = true, features = ["compression"] }
+faucet-sink-jsonl = { workspace = true, features = ["compression", "encryption"] }
+faucet-sink-parquet.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
