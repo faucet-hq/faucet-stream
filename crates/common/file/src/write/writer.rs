@@ -35,6 +35,11 @@ pub struct WriteSettings {
     /// Encrypt the output at rest.
     #[cfg(feature = "encryption")]
     pub encryption: Option<faucet_core::EncryptionSpec>,
+    /// Close the open file at every [`flush`](FileWriter::flush) and start
+    /// the next part, instead of keeping it open to extend later. For remote
+    /// stores, where extending a published object means downloading it
+    /// again. Only takes effect with a numbered (`{part}`) template.
+    pub object_per_flush: bool,
 }
 
 impl WriteSettings {
@@ -53,6 +58,7 @@ impl WriteSettings {
             max_bytes_per_file: None,
             #[cfg(feature = "encryption")]
             encryption: None,
+            object_per_flush: false,
         }
     }
 
@@ -417,6 +423,12 @@ impl FileWriter {
     /// Publish the open file so it holds everything written so far.
     pub fn flush(&self) -> Result<(), FaucetError> {
         let mut st = self.lock();
+        if self.settings.object_per_flush && self.template.numbered() {
+            if st.current.is_some() {
+                self.roll(&mut st)?;
+            }
+            return Ok(());
+        }
         if let Some(f) = st.current.as_mut() {
             f.finalize(&self.ctx())?;
         }
