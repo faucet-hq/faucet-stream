@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! CSV → SQLite — full builder showcase for both connectors.
 //!
 //! CSV source uses a TSV-like config (tab delimiter, no headers). SQLite
@@ -7,21 +6,24 @@
 //! Run:
 //! ```bash
 //! cargo run -p faucet-stream --example csv_to_sqlite \
-//!     --features "source-csv sink-sqlite"
+//!     --features "source-file file-format-csv sink-sqlite"
 //! ```
 
+use faucet_stream::CsvOptions;
 use faucet_stream::Pipeline;
 use faucet_stream::sink::sqlite::{SqliteColumnMapping, SqliteSink, SqliteSinkConfig};
-use faucet_stream::source::csv::{CsvSource, CsvSourceConfig};
+use faucet_stream::source::file::{FileSource, FileSourceConfig, FileSourceFormat};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = CsvSource::new(
-        CsvSourceConfig::new("inventory.tsv")
-            .has_headers(false)
-            .delimiter(b'\t')
-            .quote(b'\''),
-    );
+    let mut config = FileSourceConfig::new("inventory.tsv").format(FileSourceFormat::Csv);
+    config.csv = CsvOptions {
+        has_headers: false,
+        delimiter: "\t".into(),
+        quote: "'".into(),
+        ..CsvOptions::default()
+    };
+    let source = FileSource::new(config)?;
 
     let sink = SqliteSink::new(
         SqliteSinkConfig::new("sqlite:./inventory.db", "inventory")

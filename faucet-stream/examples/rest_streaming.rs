@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! REST API → JSONL via `run_stream` — page-by-page, bounded memory.
 //!
 //! Same parameter showcase as `rest_to_jsonl`, but pages are written to the
@@ -9,12 +8,12 @@
 //! Run:
 //! ```bash
 //! cargo run -p faucet-stream --example rest_streaming \
-//!     --features "source-rest sink-jsonl transforms"
+//!     --features "source-rest sink-file transforms"
 //! ```
 
 use std::time::Duration;
 
-use faucet_stream::sink::jsonl::{JsonlSink, JsonlSinkConfig};
+use faucet_stream::sink::file::{FileSink, FileSinkConfig};
 use faucet_stream::{
     Auth, DEFAULT_BATCH_SIZE, Labels, PaginationStyle, RecordTransform, RestStream,
     RestStreamConfig, RunStreamOptions, Source, TransformStage, TransformingSource, run_stream,
@@ -47,11 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Labels::for_named("rest"),
     )?;
 
-    let sink = JsonlSink::new(
-        JsonlSinkConfig::new("comments.jsonl")
-            .append(false)
-            .pretty(false),
-    );
+    let sink = FileSink::new(FileSinkConfig::new("comments.jsonl"))?;
 
     // Drive Source::stream_pages directly. Pipeline::run does this internally;
     // we use run_stream here to show how to drive the streaming primitive by

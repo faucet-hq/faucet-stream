@@ -533,11 +533,11 @@ reqwest = { version = "0.13", default-features = false }
 
 [[example]]
 name = "rest_to_jsonl"
-required-features = ["source-rest", "sink-jsonl"]
+required-features = ["source-rest", "sink-file"]
 
 [[example]]
 name = "rest_streaming"
-required-features = ["source-rest", "sink-jsonl"]
+required-features = ["source-rest", "sink-file"]
 
 [[example]]
 name = "rest_to_bigquery"
@@ -585,11 +585,11 @@ required-features = ["source-mysql", "sink-snowflake"]
 
 [[example]]
 name = "sqlite_to_csv"
-required-features = ["source-sqlite", "sink-csv"]
+required-features = ["source-sqlite", "sink-file", "file-format-csv"]
 
 [[example]]
 name = "sqlite_to_jsonl"
-required-features = ["source-sqlite", "sink-jsonl"]
+required-features = ["source-sqlite", "sink-file"]
 
 [[example]]
 name = "s3_to_postgres"
@@ -621,15 +621,15 @@ required-features = ["source-webhook", "sink-http"]
 
 [[example]]
 name = "webhook_to_csv"
-required-features = ["source-webhook", "sink-csv"]
+required-features = ["source-webhook", "sink-file", "file-format-csv"]
 
 [[example]]
 name = "csv_to_mysql"
-required-features = ["source-csv", "sink-mysql"]
+required-features = ["source-file", "file-format-csv", "sink-mysql"]
 
 [[example]]
 name = "csv_to_sqlite"
-required-features = ["source-csv", "sink-sqlite"]
+required-features = ["source-file", "file-format-csv", "sink-sqlite"]
 
 [[example]]
 name = "elasticsearch_to_s3"
@@ -677,7 +677,7 @@ required-features = ["source-mongodb", "sink-postgres"]
 
 [[example]]
 name = "csv_to_bigquery"
-required-features = ["source-csv", "sink-bigquery"]
+required-features = ["source-file", "file-format-csv", "sink-bigquery"]
 
 [package.metadata.docs.rs]
 all-features = true
