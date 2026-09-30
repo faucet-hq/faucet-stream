@@ -7,6 +7,13 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.1.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-sftp-v1.1.0...faucet-sink-sftp-v1.1.1) - 2026-09-30
+
+### Bug Fixes
+
+- Post-merge review of #782 — data-loss fixes, async cancellable writer, streaming uploads, one shared sink, finished migration ([#788](https://github.com/faucet-hq/faucet-stream/pull/788))
+- *(release)* Move cross-connector tests into an unpublished crate so connectors never depend on each other ([#785](https://github.com/faucet-hq/faucet-stream/pull/785))
+
 ## [1.1.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-sftp-v1.0.5...faucet-sink-sftp-v1.1.0) - 2026-09-29
 
 ### Features

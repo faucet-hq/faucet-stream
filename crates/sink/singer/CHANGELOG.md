@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.0.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-singer-v1.0.0...faucet-sink-singer-v1.0.1) - 2026-09-30
+
+### Bug Fixes
+
+- *(release)* Move cross-connector tests into an unpublished crate so connectors never depend on each other ([#785](https://github.com/faucet-hq/faucet-stream/pull/785))
+
 ## [1.0.0](https://github.com/faucet-hq/faucet-stream/releases/tag/faucet-sink-singer-v1.0.0) - 2026-09-29
 
 ### Features

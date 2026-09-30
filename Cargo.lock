@@ -4484,7 +4484,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "assert_cmd",
  "async-stream",
@@ -4730,7 +4730,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-file"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "base64 0.22.1",
@@ -4750,7 +4750,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-gcs"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "faucet-core",
  "google-cloud-auth",
@@ -4912,7 +4912,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-common-sftp"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "async-trait",
  "faucet-core",
@@ -4996,7 +4996,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-core"
-version = "1.13.0"
+version = "1.13.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "apache-avro 0.22.0",
@@ -5140,7 +5140,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-azure-blob"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-delta"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -5324,7 +5324,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-file"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -5347,7 +5347,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-gcs"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5423,7 +5423,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-jsonl"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5641,7 +5641,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-rabbitmq"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "faucet-common-rabbitmq",
@@ -5699,7 +5699,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-s3"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5725,7 +5725,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-sftp"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5747,7 +5747,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-singer"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "faucet-common-singer",
@@ -5809,7 +5809,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-sink-sqlite"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5862,7 +5862,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-azure-blob"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -5932,7 +5932,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-csv"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6053,7 +6053,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-file"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -6081,7 +6081,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-gcs"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -6155,7 +6155,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-iceberg"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -6264,7 +6264,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-mssql"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6455,7 +6455,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-postgres-cdc"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6564,7 +6564,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-rest"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -6598,7 +6598,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-s3"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -6625,7 +6625,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-sftp"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arrow",
  "async-stream",
@@ -6838,7 +6838,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-stream"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "faucet-auth",
  "faucet-common-azure",
