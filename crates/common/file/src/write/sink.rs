@@ -23,8 +23,10 @@ pub trait SinkIdentity: Send + Sync {
     fn config_schema(&self) -> Value;
     /// The dataset the sink writes, for lineage.
     fn dataset_uri(&self) -> String;
-    /// A non-mutating preflight probe.
-    async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError>;
+    /// A non-mutating preflight probe. Default: not implemented.
+    async fn check(&self, _ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
+        Ok(CheckReport::not_implemented())
+    }
     /// A `(kind, config)` source that reads the output back. Default: none.
     fn readback_source(&self) -> Option<(String, Value)> {
         None

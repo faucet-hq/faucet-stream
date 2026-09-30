@@ -2,27 +2,31 @@
 
 use crate::config::S3SinkConfig;
 use crate::object::{PART_BYTES, S3Objects};
-use async_trait::async_trait;
 use aws_sdk_s3::Client;
-use faucet_common_file::write::{FileWriter, RemoteBackend, blocking, object_layout, run};
-use faucet_core::{FaucetError, FileFormat, WriteMode};
+use aws_sdk_s3::error::DisplayErrorContext;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use faucet_common_file::write::{
+    BoxFuture, FileWriter, MultipartClient, MultipartUpload, RemoteBackend, SinkIdentity,
+    WriterSink, content_type,
+};
+use faucet_core::{FaucetError, FileFormat};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// A sink that writes records to S3 objects in any format the local file
 /// sink writes — JSON Lines, JSON, CSV, XML, Excel, Avro, Parquet or raw
 /// text — through the shared file writer.
 ///
-/// Each object is built in a local scratch file and published with one
+/// JSON Lines and raw text go up as a multipart upload while they are
+/// written, so neither memory nor local disk grows with the object; every
+/// other format is built in a local scratch file and published with one
 /// upload (multipart past 8 MiB) when it closes: at the row / byte cap or at
-/// `flush`. Uploads run in the background, up to `concurrency` at a time,
-/// while the next object is encoded; `flush` waits for all of them, so a
+/// `flush`. Up to `concurrency` uploads (objects and parts) run at once,
+/// while the next data is encoded; `flush` waits for all of them, so a
 /// bookmark never advances past an object that is not in the bucket.
 pub struct S3Sink {
-    config: S3SinkConfig,
-    client: Client,
-    writer: FileWriter,
-    roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    inner: WriterSink,
 }
 
 impl S3Sink {
@@ -36,16 +40,9 @@ impl S3Sink {
     }
 
     fn with_client(config: S3SinkConfig, client: Client) -> Result<Self, FaucetError> {
-        let settings = config.settings()?;
-        let (base, template) = object_layout(
-            &config.prefix,
-            config.path.as_deref(),
-            &config.file_extension,
-            settings.format,
-            settings.codec,
-            settings.rolls_over(),
-        )
-        .map_err(|e| faucet_common_file::config_context("S3 sink", e))?;
+        let write = config.write_config();
+        let settings = write.settings()?;
+        let (base, template) = write.object_layout(&settings)?;
         let roundtrips = Arc::new(faucet_core::observability::RecorderSlot::new());
         let objects = Arc::new(S3Objects {
             client: client.clone(),
@@ -54,14 +51,23 @@ impl S3Sink {
             part_bytes: PART_BYTES,
             roundtrips: roundtrips.clone(),
         });
-        let backend = RemoteBackend::new(objects, base, &template.staging_name())?
-            .with_upload_concurrency(config.concurrency);
+        let backend = RemoteBackend::new(
+            objects.clone(),
+            base,
+            &template,
+            config.scratch_dir.as_deref().map(std::path::Path::new),
+        )?
+        .with_upload_concurrency(config.concurrency)
+        .with_multipart(Arc::new(S3Parts(objects)));
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
-        Ok(Self {
-            config,
+        let identity = S3Identity {
             client,
-            writer,
+            bucket: config.bucket.clone(),
+            prefix: config.prefix.clone(),
             roundtrips,
+        };
+        Ok(Self {
+            inner: WriterSink::new(writer, identity),
         })
     }
 
@@ -80,68 +86,36 @@ impl S3Sink {
 
     /// The format objects are written in.
     pub fn format(&self) -> FileFormat {
-        self.writer.settings().format
-    }
-
-    fn overwriting(&self) -> bool {
-        self.config.write_mode == faucet_common_file::write::FileWriteMode::Overwrite
+        self.inner.format()
     }
 }
 
-#[async_trait]
-impl faucet_core::Sink for S3Sink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.writer.settings().batch_atomicity()
-    }
+faucet_common_file::delegate_sink!(S3Sink, inner);
 
-    fn set_roundtrip_recorder(
-        &self,
-        recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
-    ) {
-        self.roundtrips.install(recorder);
-    }
+/// What the S3 sink supplies to the shared sink.
+struct S3Identity {
+    client: Client,
+    bucket: String,
+    prefix: String,
+    roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+}
 
-    /// Publish the open object (#618): the pipeline calls `flush` at every
-    /// bookmark-carrying page and at the end, so a bookmark never advances
-    /// past records that are not in the bucket.
-    async fn flush(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.flush())
-    }
-
+#[faucet_core::async_trait]
+impl SinkIdentity for S3Identity {
     fn connector_name(&self) -> &'static str {
         "s3"
     }
 
-    fn config_schema(&self) -> serde_json::Value {
+    fn config_schema(&self) -> Value {
         serde_json::to_value(faucet_core::schema_for!(S3SinkConfig)).expect("schema serialization")
     }
 
     fn dataset_uri(&self) -> String {
-        format!("s3://{}/{}", self.config.bucket, self.config.prefix)
+        format!("s3://{}/{}", self.bucket, self.prefix)
     }
 
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
-        &[WriteMode::Append, WriteMode::Overwrite]
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.overwriting()
-    }
-
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.begin_overwrite())
-    }
-
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.commit_overwrite())
-    }
-
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.abort_overwrite())
-    }
-
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.complete())
+    fn set_roundtrip_recorder(&self, recorder: Arc<faucet_core::observability::RoundtripRecorder>) {
+        self.roundtrips.install(recorder);
     }
 
     /// Preflight probe: confirm the configured bucket is reachable and the
@@ -151,55 +125,136 @@ impl faucet_core::Sink for S3Sink {
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
-
         let started = std::time::Instant::now();
-        let request = self.client.head_bucket().bucket(&self.config.bucket);
-        let timeout = ctx.timeout;
-        // Through the same runtime as every upload, so a pooled connection is
-        // never driven by a runtime the writer later blocks.
-        let probe = blocking(|| {
-            run(async move {
-                Ok(match tokio::time::timeout(timeout, request.send()).await {
-                    Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
-                    Ok(Err(e)) => Probe::fail_hint(
-                        "auth",
-                        started.elapsed(),
-                        e.to_string(),
-                        "check bucket name, credentials, and network",
-                    ),
-                    Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
-                })
-            })
-        })?;
+        let request = self.client.head_bucket().bucket(&self.bucket);
+        let probe = match tokio::time::timeout(ctx.timeout, request.send()).await {
+            Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
+            Ok(Err(e)) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                e.to_string(),
+                "check bucket name, credentials, and network",
+            ),
+            Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
+        };
         Ok(CheckReport::single(probe))
     }
+}
 
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        blocking(|| self.writer.write_rows(records))
+/// S3 multipart uploads for objects written in parts (#783).
+struct S3Parts(Arc<S3Objects>);
+
+fn s3_err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
+    FaucetError::Sink(format!("S3 {what} error for key '{key}': {e}"))
+}
+
+#[faucet_core::async_trait]
+impl MultipartClient for S3Parts {
+    fn part_size(&self) -> usize {
+        self.0.part_bytes
     }
 
-    /// Arrow `RecordBatch`es go straight into a Parquet object; other formats
-    /// take the row path.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.format() == FileFormat::Parquet
+    async fn start(&self, key: &str) -> Result<Box<dyn MultipartUpload>, FaucetError> {
+        let o = &self.0;
+        o.roundtrips.record("put");
+        let created = o
+            .client
+            .create_multipart_upload()
+            .bucket(&o.bucket)
+            .key(key)
+            .content_type(content_type(key))
+            .send()
+            .await
+            .map_err(|e| s3_err("start multipart", key, DisplayErrorContext(e)))?;
+        let upload_id = created
+            .upload_id()
+            .ok_or_else(|| s3_err("start multipart", key, "no upload id"))?
+            .to_string();
+        Ok(Box::new(S3Upload {
+            objects: o.clone(),
+            key: key.to_string(),
+            upload_id,
+            parts: Arc::new(Mutex::new(Vec::new())),
+        }))
+    }
+}
+
+struct S3Upload {
+    objects: Arc<S3Objects>,
+    key: String,
+    upload_id: String,
+    parts: Arc<Mutex<Vec<CompletedPart>>>,
+}
+
+impl MultipartUpload for S3Upload {
+    fn put_part(&self, number: u32, body: Vec<u8>) -> BoxFuture<Result<(), FaucetError>> {
+        let (o, key, id, parts) = (
+            self.objects.clone(),
+            self.key.clone(),
+            self.upload_id.clone(),
+            self.parts.clone(),
+        );
+        Box::pin(async move {
+            let number =
+                i32::try_from(number).map_err(|_| s3_err("upload part", &key, "too many parts"))?;
+            o.roundtrips.record("put");
+            let out = o
+                .client
+                .upload_part()
+                .bucket(&o.bucket)
+                .key(&key)
+                .upload_id(&id)
+                .part_number(number)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+                .map_err(|e| s3_err("upload part", &key, DisplayErrorContext(e)))?;
+            parts.lock().unwrap_or_else(|p| p.into_inner()).push(
+                CompletedPart::builder()
+                    .part_number(number)
+                    .set_e_tag(out.e_tag().map(str::to_string))
+                    .build(),
+            );
+            Ok(())
+        })
     }
 
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
-        &self,
-        batch: &arrow::array::RecordBatch,
-    ) -> Result<usize, FaucetError> {
-        if batch.num_rows() == 0 {
-            return Ok(0);
-        }
-        if self.format() == FileFormat::Parquet {
-            return blocking(|| self.writer.write_batch(batch));
-        }
-        let rows = faucet_core::columnar::record_batch_to_values(batch)?;
-        self.write_batch(&rows).await
+    fn complete(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
+        Box::pin(async move {
+            let mut parts =
+                std::mem::take(&mut *self.parts.lock().unwrap_or_else(|p| p.into_inner()));
+            parts.sort_by_key(|p| p.part_number());
+            let o = &self.objects;
+            o.roundtrips.record("put");
+            o.client
+                .complete_multipart_upload()
+                .bucket(&o.bucket)
+                .key(&self.key)
+                .upload_id(&self.upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| s3_err("complete multipart", &self.key, DisplayErrorContext(e)))?;
+            Ok(())
+        })
+    }
+
+    fn abort(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
+        Box::pin(async move {
+            let o = &self.objects;
+            o.client
+                .abort_multipart_upload()
+                .bucket(&o.bucket)
+                .key(&self.key)
+                .upload_id(&self.upload_id)
+                .send()
+                .await
+                .map_err(|e| s3_err("abort multipart", &self.key, DisplayErrorContext(e)))?;
+            Ok(())
+        })
     }
 }

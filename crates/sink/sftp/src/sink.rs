@@ -8,114 +8,70 @@
 
 use crate::config::SftpSinkConfig;
 use crate::object::SftpObjects;
-use async_trait::async_trait;
-use faucet_common_file::write::{FileWriter, RemoteBackend, blocking, object_layout};
-use faucet_core::{FaucetError, FileFormat, WriteMode};
+use faucet_common_file::write::{FileWriter, RemoteBackend, SinkIdentity, WriterSink};
+use faucet_core::{FaucetError, FileFormat};
 use serde_json::Value;
 use std::sync::Arc;
 
 /// A sink that writes records to files on an SFTP server in any format the
 /// local file sink writes — JSON Lines, JSON, CSV, XML, Excel, Avro, Parquet
-/// or raw text.
+/// or raw text. Each file is built in a local scratch file (see
+/// `scratch_dir`) before it is uploaded.
 pub struct SftpSink {
-    config: SftpSinkConfig,
-    writer: FileWriter,
+    inner: WriterSink,
 }
 
 impl SftpSink {
     /// Build the sink. Validates the config; opens no connection.
     pub fn new(config: SftpSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let settings = config.settings()?;
-        let (base, template) = object_layout(
-            &config.dir_prefix(),
-            config.file_name.as_deref(),
-            &config.file_extension,
-            settings.format,
-            settings.codec,
-            settings.rolls_over(),
-        )
-        .map_err(|e| faucet_common_file::config_context("SFTP sink", e))?;
+        let write = config.write_config();
+        let settings = write.settings()?;
+        let (base, template) = write.object_layout(&settings)?;
         let base = if config.path.starts_with('/') && !base.starts_with('/') {
             format!("/{base}")
         } else {
             base
         };
         let objects = Arc::new(SftpObjects::new(config.connection.clone()));
-        let backend = RemoteBackend::new(objects, base, &template.staging_name())?
-            .with_upload_concurrency(config.concurrency);
+        let backend = RemoteBackend::new(
+            objects,
+            base,
+            &template,
+            config.scratch_dir.as_deref().map(std::path::Path::new),
+        )?
+        .with_upload_concurrency(config.concurrency);
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
-        Ok(Self { config, writer })
+        let identity = SftpIdentity {
+            dataset_uri: format!(
+                "sftp://{}:{}/{}",
+                config.connection.host,
+                config.connection.port,
+                config.path.trim_start_matches('/')
+            ),
+        };
+        Ok(Self {
+            inner: WriterSink::new(writer, identity),
+        })
     }
 
     /// The format files are written in.
     pub fn format(&self) -> FileFormat {
-        self.writer.settings().format
+        self.inner.format()
     }
 }
 
-#[async_trait]
-impl faucet_core::Sink for SftpSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.writer.settings().batch_atomicity()
-    }
+faucet_common_file::delegate_sink!(SftpSink, inner);
 
-    /// Publish the open file before the bookmark advances.
-    async fn flush(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.flush())
-    }
+/// What the SFTP sink supplies to the shared sink.
+struct SftpIdentity {
+    dataset_uri: String,
+}
 
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
-        &[WriteMode::Append, WriteMode::Overwrite]
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.config.write_mode == faucet_common_file::write::FileWriteMode::Overwrite
-    }
-
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.begin_overwrite())
-    }
-
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.commit_overwrite())
-    }
-
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.abort_overwrite())
-    }
-
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.complete())
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        blocking(|| self.writer.write_rows(records))
-    }
-
-    /// Arrow `RecordBatch`es go straight into a Parquet file; other formats
-    /// take the row path.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.format() == FileFormat::Parquet
-    }
-
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
-        &self,
-        batch: &arrow::array::RecordBatch,
-    ) -> Result<usize, FaucetError> {
-        if batch.num_rows() == 0 {
-            return Ok(0);
-        }
-        if self.format() == FileFormat::Parquet {
-            return blocking(|| self.writer.write_batch(batch));
-        }
-        let rows = faucet_core::columnar::record_batch_to_values(batch)?;
-        self.write_batch(&rows).await
+#[faucet_core::async_trait]
+impl SinkIdentity for SftpIdentity {
+    fn connector_name(&self) -> &'static str {
+        "sftp"
     }
 
     fn config_schema(&self) -> Value {
@@ -123,17 +79,8 @@ impl faucet_core::Sink for SftpSink {
             .expect("schema serialization")
     }
 
-    fn connector_name(&self) -> &'static str {
-        "sftp"
-    }
-
     fn dataset_uri(&self) -> String {
-        format!(
-            "sftp://{}:{}/{}",
-            self.config.connection.host,
-            self.config.connection.port,
-            self.config.path.trim_start_matches('/')
-        )
+        self.dataset_uri.clone()
     }
 }
 
@@ -141,7 +88,7 @@ impl faucet_core::Sink for SftpSink {
 mod tests {
     use super::*;
     use faucet_common_sftp::SftpConnectionConfig;
-    use faucet_core::Sink;
+    use faucet_core::{Sink, WriteMode};
 
     fn cfg() -> SftpSinkConfig {
         SftpSinkConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/out")
@@ -158,7 +105,8 @@ mod tests {
     fn files_land_under_the_directory() {
         let sink = SftpSink::new(cfg()).unwrap();
         let key = sink
-            .writer
+            .inner
+            .writer()
             .backend()
             .describe(faucet_common_file::write::Area::Destination, "f.jsonl");
         assert_eq!(key, "sftp://h:22/out/f.jsonl");
@@ -170,7 +118,8 @@ mod tests {
             let sink = SftpSink::new(c).unwrap();
             assert_eq!(sink.format(), FileFormat::Csv);
             let d = sink
-                .writer
+                .inner
+                .writer()
                 .backend()
                 .describe(faucet_common_file::write::Area::Destination, "x");
             assert_eq!(d, "sftp://h:22/out/dt/x");

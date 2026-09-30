@@ -1,14 +1,17 @@
 //! Azure Blob sink executor: the shared file writer (#777) over an Azure
 //! Blob backend.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use faucet_common_azure::build_store;
-use faucet_common_file::write::{FileWriter, RemoteBackend, blocking, object_layout, run};
-use faucet_core::{FaucetError, FileFormat, WriteMode};
+use faucet_common_file::write::{
+    BoxFuture, FileWriter, MultipartClient, MultipartUpload, RemoteBackend, SinkIdentity,
+    WriterSink,
+};
+use faucet_core::{FaucetError, FileFormat};
 use futures::stream::StreamExt;
-use object_store::ObjectStore;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::Value;
 
 use crate::config::AzureBlobSinkConfig;
@@ -18,15 +21,15 @@ use crate::object::{AzureObjects, PART_BYTES};
 /// sink writes — JSON Lines, JSON, CSV, XML, Excel, Avro, Parquet or raw
 /// text — through the shared file writer.
 ///
-/// Each blob is built in a local scratch file and published with one upload
-/// (a committed block list past 8 MiB) when it closes: at the row / byte cap
-/// or at `flush`. Uploads run in the background, up to `concurrency` at a
-/// time, while the next blob is encoded; `flush` waits for all of them, so a
+/// JSON Lines and raw text go up as blocks while they are written, so
+/// neither memory nor local disk grows with the blob; every other format is
+/// built in a local scratch file and published with one upload (a committed
+/// block list past 8 MiB) when it closes: at the row / byte cap or at
+/// `flush`. Up to `concurrency` uploads (blobs and blocks) run at once,
+/// while the next data is encoded; `flush` waits for all of them, so a
 /// bookmark never advances past a blob that is not in the container.
 pub struct AzureBlobSink {
-    config: AzureBlobSinkConfig,
-    store: Arc<dyn ObjectStore>,
-    writer: FileWriter,
+    inner: WriterSink,
 }
 
 impl AzureBlobSink {
@@ -35,104 +38,56 @@ impl AzureBlobSink {
     pub async fn new(config: AzureBlobSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let store = build_store(&config.connection)?;
-        let settings = config.settings()?;
-        let (base, template) = object_layout(
-            &config.prefix,
-            config.path.as_deref(),
-            &config.file_extension,
-            settings.format,
-            settings.codec,
-            settings.rolls_over(),
-        )
-        .map_err(|e| faucet_common_file::config_context("azure-blob sink", e))?;
+        let write = config.write_config();
+        let settings = write.settings()?;
+        let (base, template) = write.object_layout(&settings)?;
         let objects = Arc::new(AzureObjects {
             store: store.clone(),
             container: config.container().to_string(),
             part_bytes: PART_BYTES,
             concurrency: config.concurrency,
         });
-        let backend = RemoteBackend::new(objects, base, &template.staging_name())?
-            .with_upload_concurrency(config.concurrency);
+        let backend = RemoteBackend::new(
+            objects,
+            base,
+            &template,
+            config.scratch_dir.as_deref().map(std::path::Path::new),
+        )?
+        .with_upload_concurrency(config.concurrency)
+        .with_multipart(Arc::new(AzureBlocks {
+            store: store.clone(),
+            part_bytes: PART_BYTES,
+        }));
         let writer = FileWriter::new(settings, template, Arc::new(backend))?;
-        Ok(Self {
-            config,
+        let identity = AzureIdentity {
             store,
-            writer,
+            container: config.container().to_string(),
+            prefix: config.prefix.clone(),
+        };
+        Ok(Self {
+            inner: WriterSink::new(writer, identity),
         })
     }
 
     /// The format blobs are written in.
     pub fn format(&self) -> FileFormat {
-        self.writer.settings().format
+        self.inner.format()
     }
 }
 
-#[async_trait]
-impl faucet_core::Sink for AzureBlobSink {
-    fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        self.writer.settings().batch_atomicity()
-    }
+faucet_common_file::delegate_sink!(AzureBlobSink, inner);
 
-    fn dataset_uri(&self) -> String {
-        format!("az://{}/{}", self.config.container(), self.config.prefix)
-    }
+/// What the Azure Blob sink supplies to the shared sink.
+struct AzureIdentity {
+    store: Arc<dyn ObjectStore>,
+    container: String,
+    prefix: String,
+}
 
-    /// Publish the open blob (#618) before the bookmark advances.
-    async fn flush(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.flush())
-    }
-
-    fn supported_write_modes(&self) -> &'static [WriteMode] {
-        &[WriteMode::Append, WriteMode::Overwrite]
-    }
-
-    fn is_overwrite(&self) -> bool {
-        self.config.write_mode == faucet_common_file::write::FileWriteMode::Overwrite
-    }
-
-    async fn begin_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.begin_overwrite())
-    }
-
-    async fn commit_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.commit_overwrite())
-    }
-
-    async fn abort_overwrite(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.abort_overwrite())
-    }
-
-    async fn complete_run(&self) -> Result<(), FaucetError> {
-        blocking(|| self.writer.complete())
-    }
-
-    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        blocking(|| self.writer.write_rows(records))
-    }
-
-    /// Arrow `RecordBatch`es go straight into a Parquet blob; other formats
-    /// take the row path.
-    #[cfg(feature = "arrow")]
-    fn supports_columnar(&self) -> bool {
-        self.format() == FileFormat::Parquet
-    }
-
-    #[cfg(feature = "arrow")]
-    async fn write_batch_columnar(
-        &self,
-        batch: &arrow::array::RecordBatch,
-    ) -> Result<usize, FaucetError> {
-        if batch.num_rows() == 0 {
-            return Ok(0);
-        }
-        if self.format() == FileFormat::Parquet {
-            return blocking(|| self.writer.write_batch(batch));
-        }
-        let rows = faucet_core::columnar::record_batch_to_values(batch)?;
-        self.write_batch(&rows).await
+#[faucet_core::async_trait]
+impl SinkIdentity for AzureIdentity {
+    fn connector_name(&self) -> &'static str {
+        "azure-blob"
     }
 
     fn config_schema(&self) -> Value {
@@ -140,8 +95,8 @@ impl faucet_core::Sink for AzureBlobSink {
             .expect("schema serialization")
     }
 
-    fn connector_name(&self) -> &'static str {
-        "azure-blob"
+    fn dataset_uri(&self) -> String {
+        format!("az://{}/{}", self.container, self.prefix)
     }
 
     async fn check(
@@ -149,30 +104,96 @@ impl faucet_core::Sink for AzureBlobSink {
         ctx: &faucet_core::check::CheckContext,
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
-
         let started = std::time::Instant::now();
-        let store = self.store.clone();
-        let timeout = ctx.timeout;
-        let probe = blocking(|| {
-            run(async move {
-                let listed = tokio::time::timeout(timeout, async {
-                    let mut listing = store.list(None);
-                    listing.next().await
-                })
-                .await;
-                Ok(match listed {
-                    Ok(None) | Ok(Some(Ok(_))) => Probe::pass("auth", started.elapsed()),
-                    Ok(Some(Err(e))) => Probe::fail_hint(
-                        "auth",
-                        started.elapsed(),
-                        e.to_string(),
-                        "check account, container, credentials, and network",
-                    ),
-                    Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
-                })
-            })
-        })?;
+        let listed = tokio::time::timeout(ctx.timeout, async {
+            let mut listing = self.store.list(None);
+            listing.next().await
+        })
+        .await;
+        let probe = match listed {
+            Ok(None) | Ok(Some(Ok(_))) => Probe::pass("auth", started.elapsed()),
+            Ok(Some(Err(e))) => Probe::fail_hint(
+                "auth",
+                started.elapsed(),
+                e.to_string(),
+                "check account, container, credentials, and network",
+            ),
+            Err(_) => Probe::fail("network", started.elapsed(), "timed out"),
+        };
         Ok(CheckReport::single(probe))
+    }
+}
+
+/// Azure block uploads for blobs written in parts (#783).
+struct AzureBlocks {
+    store: Arc<dyn ObjectStore>,
+    part_bytes: usize,
+}
+
+fn azure_err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
+    FaucetError::Sink(format!("azure {what} error for key '{key}': {e}"))
+}
+
+#[faucet_core::async_trait]
+impl MultipartClient for AzureBlocks {
+    fn part_size(&self) -> usize {
+        self.part_bytes
+    }
+
+    async fn start(&self, key: &str) -> Result<Box<dyn MultipartUpload>, FaucetError> {
+        let upload = self
+            .store
+            .put_multipart(&ObjectPath::from(key))
+            .await
+            .map_err(|e| azure_err("start multipart", key, e))?;
+        Ok(Box::new(AzureUpload {
+            key: key.to_string(),
+            upload: Arc::new(Mutex::new(upload)),
+        }))
+    }
+}
+
+struct AzureUpload {
+    key: String,
+    upload: Arc<Mutex<Box<dyn object_store::MultipartUpload>>>,
+}
+
+impl MultipartUpload for AzureUpload {
+    fn put_part(&self, _number: u32, body: Vec<u8>) -> BoxFuture<Result<(), FaucetError>> {
+        let part = self
+            .upload
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .put_part(bytes::Bytes::from(body).into());
+        let key = self.key.clone();
+        Box::pin(async move { part.await.map_err(|e| azure_err("put part", &key, e)) })
+    }
+
+    fn complete(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
+        Box::pin(async move {
+            let mut upload = Arc::try_unwrap(self.upload)
+                .map_err(|_| azure_err("complete multipart", &self.key, "a part is still open"))?
+                .into_inner()
+                .unwrap_or_else(|p| p.into_inner());
+            upload
+                .complete()
+                .await
+                .map(|_| ())
+                .map_err(|e| azure_err("complete multipart", &self.key, e))
+        })
+    }
+
+    fn abort(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
+        Box::pin(async move {
+            let Ok(upload) = Arc::try_unwrap(self.upload) else {
+                return Ok(());
+            };
+            let mut upload = upload.into_inner().unwrap_or_else(|p| p.into_inner());
+            upload
+                .abort()
+                .await
+                .map_err(|e| azure_err("abort multipart", &self.key, e))
+        })
     }
 }
 
@@ -210,6 +231,7 @@ mod tests {
             .allow_http(true);
         let sink = AzureBlobSink::new(config).await.unwrap();
         assert_eq!(sink.connector_name(), "azure-blob");
+        assert_eq!(sink.format(), FileFormat::JsonLines);
         assert_eq!(sink.dataset_uri(), "az://cont/out/");
     }
 }
