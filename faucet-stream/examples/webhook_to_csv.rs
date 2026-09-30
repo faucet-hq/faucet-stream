@@ -1,7 +1,7 @@
 //! Webhook receiver → CSV — full builder showcase for both connectors.
 //!
 //! Webhook source uses listen-addr, path, max-payloads, and timeout knobs.
-//! CSV sink shows delimiter, header toggle, and append mode.
+//! The file sink writes CSV with a delimiter, a header row, and append mode.
 //!
 //! Run:
 //! ```bash

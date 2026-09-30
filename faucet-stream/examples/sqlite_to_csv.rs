@@ -1,7 +1,7 @@
 //! SQLite → CSV — full builder showcase for both connectors.
 //!
-//! SQLite source uses a tuned pool. CSV sink demonstrates delimiter,
-//! header toggle, and append mode.
+//! SQLite source uses a tuned pool. The file sink writes CSV with an
+//! explicit delimiter and a header row.
 //!
 //! Run:
 //! ```bash
@@ -11,7 +11,7 @@
 
 use faucet_stream::CsvOptions;
 use faucet_stream::Pipeline;
-use faucet_stream::sink::file::{FileMode, FileSink, FileSinkConfig};
+use faucet_stream::sink::file::{FileSink, FileSinkConfig};
 use faucet_stream::source::sqlite::{SqliteSource, SqliteSourceConfig};
 
 #[tokio::main]
@@ -25,15 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let sink = FileSink::new(
-        FileSinkConfig::new("products.csv")
-            .mode(FileMode::Overwrite)
-            .csv(CsvOptions {
-                delimiter: ",".into(),
-                has_headers: true,
-                ..CsvOptions::default()
-            }),
-    )?;
+    let sink = FileSink::new(FileSinkConfig::new("products.csv").csv(CsvOptions {
+        delimiter: ",".into(),
+        has_headers: true,
+        ..CsvOptions::default()
+    }))?;
 
     let result = Pipeline::new(&source, &sink).run().await?;
     println!(

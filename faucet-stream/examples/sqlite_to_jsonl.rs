@@ -1,7 +1,6 @@
 //! SQLite → JSONL — full builder showcase for both connectors.
 //!
-//! SQLite source uses a tuned pool. JSONL sink demonstrates append and
-//! pretty-printing modes.
+//! SQLite source uses a tuned pool. The file sink appends JSON Lines.
 //!
 //! Run:
 //! ```bash
