@@ -116,6 +116,8 @@ jobs:
         run: bash scripts/check-doc-counts.sh
       - name: Check no third-party vendor names in the engine (#780)
         run: python3 scripts/vendor-names.py
+      - name: Check no connector crate depends on another connector (#784)
+        run: python3 scripts/connector-deps.py
 
   clippy:
     name: Clippy
