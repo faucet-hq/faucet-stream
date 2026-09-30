@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the CSV file sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
+#[deprecated(
+    since = "1.3.0",
+    note = "use faucet-sink-file: FileSinkConfig with `format: csv`, CSV options under `csv:`"
+)]
 pub struct CsvSinkConfig {
     /// Path to the output CSV file.
     pub path: String,
@@ -58,6 +61,10 @@ pub struct CsvSinkConfig {
 /// determined) therefore cannot become a column, so its value would be lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[deprecated(
+    since = "1.3.0",
+    note = "use faucet-sink-file: FileSinkConfig with `format: csv`, CSV options under `csv:`"
+)]
 pub enum OnUnknownField {
     /// Emit a one-shot `tracing::warn!` naming the dropped field(s) and keep
     /// writing — the unknown field's value is dropped from the output. This is

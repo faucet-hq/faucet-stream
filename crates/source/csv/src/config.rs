@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the CSV file source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
+#[deprecated(
+    since = "1.5.0",
+    note = "use faucet-source-file: FileSourceConfig with `format: csv`, CSV options under `csv:`"
+)]
 pub struct CsvSourceConfig {
     /// Path to the CSV file.
     pub path: String,
