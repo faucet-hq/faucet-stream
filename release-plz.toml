@@ -83,6 +83,15 @@ release_always = false
 # crates.io and no `faucet-cli-v1.5.0` tag, release-plz opened no new PR. This
 # trivial `release-plz-*` PR re-fires the idempotent publish job to ship the
 # missing `faucet-cli` 1.5.0.
+# Recovery log (2026-09-30): the release after #782 stalled on a versioned
+# dev-dependency again — `faucet-sink-oracle` needed `faucet-source-oracle` on
+# crates.io first (#784). #785 moved every cross-connector test into the
+# unpublished `crates/interop-tests` and added `scripts/connector-deps.py` to
+# CI so a connector crate can no longer depend on another connector. This
+# trivial `release-plz-*` PR re-fires the idempotent publish job for the crates
+# still missing: faucet-source-oracle, faucet-source-oracle-cdc,
+# faucet-sink-oracle, faucet-source-dynamodb, faucet-source-iceberg,
+# faucet-cli 1.13.0 and faucet-stream 1.9.0.
 
 # Disable cargo-semver-checks for all packages. Semver-checks compiles each
 # crate's local and registry sources to compare API surface — for a 47-crate
