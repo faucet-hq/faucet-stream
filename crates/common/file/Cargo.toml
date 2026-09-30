@@ -17,12 +17,13 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "fs"] }
+futures.workspace = true
 csv = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-# The remote backend (#777): scratch files for uploads, run ids for object keys.
+# The remote backend (#777): the private scratch directory, run ids for object keys.
 tempfile.workspace = true
 uuid.workspace = true
 

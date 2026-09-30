@@ -4737,6 +4737,7 @@ dependencies = [
  "bytes",
  "csv",
  "faucet-core",
+ "futures",
  "parquet",
  "schemars 1.2.1",
  "serde",

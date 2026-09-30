@@ -1,6 +1,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 //! Config types shared by the local file source and sink, and the shared
 //! file-writing layer ([`write`](mod@write)) every file-writing sink builds on.
+//!
+//! **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+//! minor release; any change is called out in the changelog.
 
 use faucet_core::compression::{Compression, CompressionConfig};
 use faucet_core::{FaucetError, FileFormat};
@@ -8,6 +11,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub mod write;
+
+#[doc(hidden)]
+pub mod __private {
+    pub use faucet_core::async_trait;
+    pub use faucet_core::check::{CheckContext, CheckReport};
+    pub use faucet_core::observability::RoundtripRecorder;
+    pub use faucet_core::{BatchAtomicity, FaucetError, LocalOutput, Sink, WriteMode};
+    pub use serde_json::Value;
+}
 
 /// Which format a file is in: resolved from its extension (`auto`) or fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
