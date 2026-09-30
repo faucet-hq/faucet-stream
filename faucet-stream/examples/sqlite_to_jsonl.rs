@@ -9,7 +9,7 @@
 //! ```
 
 use faucet_stream::Pipeline;
-use faucet_stream::sink::file::{FileMode, FileSink, FileSinkConfig};
+use faucet_stream::sink::file::{FileSink, FileSinkConfig, IfExists};
 use faucet_stream::source::sqlite::{SqliteSource, SqliteSourceConfig};
 
 #[tokio::main]
@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let sink = FileSink::new(FileSinkConfig::new("events.jsonl").mode(FileMode::Append))?;
+    let sink = FileSink::new(FileSinkConfig::new("events.jsonl").if_exists(IfExists::Append))?;
 
     let result = Pipeline::new(&source, &sink).run().await?;
     println!("dumped {} events to events.jsonl", result.records_written);

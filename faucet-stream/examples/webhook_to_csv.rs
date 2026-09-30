@@ -11,7 +11,7 @@
 
 use faucet_stream::CsvOptions;
 use faucet_stream::Pipeline;
-use faucet_stream::sink::file::{FileMode, FileSink, FileSinkConfig};
+use faucet_stream::sink::file::{FileSink, FileSinkConfig, IfExists};
 use faucet_stream::source::webhook::{WebhookSource, WebhookSourceConfig};
 
 #[tokio::main]
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sink = FileSink::new(
         FileSinkConfig::new("webhooks.csv")
-            .mode(FileMode::Append)
+            .if_exists(IfExists::Append)
             .csv(CsvOptions {
                 delimiter: ";".into(),
                 has_headers: true,

@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use faucet_stream::sink::file::{FileMode, FileSink, FileSinkConfig};
+use faucet_stream::sink::file::{FileSink, FileSinkConfig, IfExists};
 use faucet_stream::{
     Auth, KeyCaseMode, Labels, PaginationStyle, Pipeline, RecordTransform, ReplicationMethod,
     RestStream, RestStreamConfig, Source, TransformStage, TransformingSource, json,
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Labels::for_named("rest"),
     )?;
 
-    let sink = FileSink::new(FileSinkConfig::new("orders.jsonl").mode(FileMode::Append))?;
+    let sink = FileSink::new(FileSinkConfig::new("orders.jsonl").if_exists(IfExists::Append))?;
 
     let result = Pipeline::new(&source, &sink).run().await?;
     println!(
