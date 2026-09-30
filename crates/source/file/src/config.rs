@@ -238,11 +238,7 @@ impl FileSourceConfig {
         #[cfg(feature = "file-format-avro")]
         self.avro.parsed_schema()?;
         self.csv.validate()?;
-        if self.parquet.columns.as_ref().is_some_and(Vec::is_empty) {
-            return Err(FaucetError::Config(
-                "file source: `parquet.columns` must name at least one column".into(),
-            ));
-        }
+        self.parquet.validate()?;
         #[cfg(feature = "encryption")]
         if let Some(spec) = &self.encryption {
             faucet_core::CompiledEncryption::compile(spec)?;
