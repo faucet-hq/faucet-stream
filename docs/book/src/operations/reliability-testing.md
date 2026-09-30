@@ -169,7 +169,7 @@ Two guarantees about state crossing a boundary, both asserted through a real
   mixed-version cluster) store the bare bookmark and refuse a source past
   schema 0.
 
-### Drift policies (`sink/sqlite/tests/drift_policy_matrix`)
+### Drift policies (`sink/sqlite/tests/drift_policy_matrix`, `interop-tests/tests/sqlite_drift_policy_matrix`)
 
 All five `on_drift` arms driven through the real pipeline against a destination
 that genuinely evolves. Each has a different silent wrong answer — `warn`
@@ -281,6 +281,11 @@ Two pairs exist as references:
   `1`/`0`; negative zero loses its sign through a TEXT-affinity column) and pins
   the observed values so a future change that drops those columns entirely
   cannot hide behind the tolerance.
+
+A pair that reads the destination back through the matching **source**
+connector (for example `crates/interop-tests/tests/oracle_fidelity.rs`) lives in
+`crates/interop-tests`: a connector crate never depends on another connector,
+not even for a test.
 
 Use the shared corpus so the pair cannot quietly pick easier data:
 

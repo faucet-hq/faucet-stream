@@ -17,6 +17,13 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
   use [`wiremock`](https://docs.rs/wiremock); database/queue connectors use
   [`testcontainers`](https://docs.rs/testcontainers) (these need Docker and are
   CI-gated).
+- **Cross-connector tests** (a source↔sink round trip, a parity check against
+  an older connector, a sink test that reads its output back with a source)
+  live in `crates/interop-tests/tests/`, which is never published. A connector
+  crate (`faucet-source-*`, `faucet-sink-*`, `faucet-common-*`) never depends
+  on another connector, not even as a dev-dependency: a versioned edge makes
+  `cargo publish` need the other crate on crates.io first. CI enforces this
+  with `scripts/connector-deps.py`.
 
 There is a third kind that is neither: the **engine guarantee suites** in
 `crates/conformance/tests/reliability_*.rs`. A guarantee like "the bookmark is
