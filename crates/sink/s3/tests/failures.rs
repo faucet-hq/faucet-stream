@@ -206,7 +206,7 @@ async fn continuing_an_object_that_cannot_be_read_back_is_an_error() {
 }
 
 fn overwrite() -> Value {
-    json!({"path": "d/", "mode": "overwrite", "write_mode": "overwrite"})
+    json!({"path": "d/", "if_exists": "replace", "write_mode": "overwrite"})
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -217,7 +217,7 @@ async fn a_refused_listing_fails_the_overwrite_start() {
     assert!(s.is_overwrite());
     let e = s.begin_overwrite().await.unwrap_err().to_string();
     assert!(
-        e.contains("S3 list error for key 'd/.faucet-overwrite-"),
+        e.contains("S3 head object error for key 'd/.faucet-overwrite-"),
         "{e}"
     );
 }
@@ -244,12 +244,18 @@ async fn a_refused_delete_fails_the_overwrite_abort() {
     let s = sink(&server, overwrite()).await;
     let e = s.abort_overwrite().await.unwrap_err().to_string();
     assert!(e.contains("S3 delete object error for key"), "{e}");
-    assert!(e.contains(".faucet-staging"), "{e}");
+    assert!(e.contains(".faucet-swap"), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_copy_fails_the_overwrite_commit() {
     let server = MockServer::start().await;
+    mount(
+        &server,
+        |r: &Request| r.method.as_str() == "HEAD" && r.url.path().ends_with(".faucet-commit"),
+        ResponseTemplate::new(404),
+    )
+    .await;
     mount(&server, is("HEAD"), ResponseTemplate::new(200)).await;
     Mock::given(is("GET"))
         .respond_with(|r: &Request| {
@@ -258,6 +264,12 @@ async fn a_refused_copy_fails_the_overwrite_commit() {
         })
         .mount(&server)
         .await;
+    mount(
+        &server,
+        |r: &Request| r.method.as_str() == "PUT" && r.url.path().ends_with(".faucet-commit"),
+        ResponseTemplate::new(200),
+    )
+    .await;
     mount(&server, is("PUT"), denied()).await;
     let s = sink(&server, overwrite()).await;
     let e = s.commit_overwrite().await.unwrap_err().to_string();

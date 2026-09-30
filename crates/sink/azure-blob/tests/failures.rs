@@ -51,13 +51,13 @@ async fn a_refused_listing_fails_the_overwrite_abort() {
     refuse_everything(&server).await;
     let s = sink(
         &server,
-        json!({"path": "d/", "mode": "overwrite", "write_mode": "overwrite"}),
+        json!({"path": "d/", "if_exists": "replace", "write_mode": "overwrite"}),
     )
     .await;
     assert!(s.is_overwrite());
     let e = s.abort_overwrite().await.unwrap_err().to_string();
     assert!(
-        e.contains("azure list error for key 'd/.faucet-overwrite-"),
+        e.contains("azure head error for key 'd/.faucet-overwrite-"),
         "{e}"
     );
 }

@@ -229,7 +229,7 @@ pub async fn case<R: Remote>(
         Run::Append => {
             let res = write(
                 r,
-                &with(&cfg, "mode", json!("append")),
+                &with(&cfg, "if_exists", json!("append")),
                 std::slice::from_ref(&second),
             )
             .await;
@@ -246,7 +246,7 @@ pub async fn case<R: Remote>(
         Run::ErrorIfExists => {
             let res = write(
                 r,
-                &with(&cfg, "mode", json!("error_if_exists")),
+                &with(&cfg, "if_exists", json!("error")),
                 std::slice::from_ref(&second),
             )
             .await;
