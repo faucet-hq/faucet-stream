@@ -2,8 +2,9 @@
 
 > **Deprecated.** Use [`faucet-sink-file`](https://crates.io/crates/faucet-sink-file) instead.
 > This crate gets security fixes only until the next major release. In a
-> pipeline config, `type: csv` still works: the CLI builds it as
-> `type: file` with `format: csv` and warns. The migration table is in
+> pipeline config, `type: csv` keeps working on this crate, unchanged — it is
+> not an alias of `type: file` — and the CLI prints a one-line notice naming the
+> replacement (`type: file` with `format: csv`). The migration table is in
 > the [`faucet-sink-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/sink/file/README.md).
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-csv.svg)](https://crates.io/crates/faucet-sink-csv)
