@@ -78,6 +78,7 @@ impl S3Source {
     ///
     /// Builds the S3 client eagerly so it is reused across calls.
     pub async fn new(config: S3SourceConfig) -> Result<Self, FaucetError> {
+        config.parquet.validate()?;
         let client = Self::build_client(&config).await?;
         Ok(Self {
             config,
@@ -1230,6 +1231,17 @@ mod tests {
     use crate::config::S3SourceConfig;
     use faucet_core::Source;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn new_refuses_an_empty_parquet_projection() {
+        let mut config = S3SourceConfig::new("b");
+        config.parquet.columns = Some(vec![]);
+        match S3Source::new(config).await {
+            Err(FaucetError::Config(m)) => assert!(m.contains("parquet.columns"), "{m}"),
+            Err(e) => panic!("expected a Config error, got {e}"),
+            Ok(_) => panic!("an empty projection must be refused"),
+        }
+    }
 
     /// Helper to build an S3Source synchronously for parse-only tests.
     /// We construct it directly to avoid needing an async runtime for unit tests

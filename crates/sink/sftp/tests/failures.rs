@@ -77,7 +77,7 @@ async fn refused_server_calls_name_the_operation_and_the_path() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.contains("SFTP list '/data/f' failed"), "{e}");
+    assert!(e.contains("SFTP create directory '/data/f' failed"), "{e}");
 
     let s = sink(port, "/data/one/", json!({"file_name": "one.jsonl"}));
     write_and_flush(&s, &[json!({"a": 1})]).await.unwrap();

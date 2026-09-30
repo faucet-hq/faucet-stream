@@ -67,7 +67,7 @@ sources.
 - **`json_array`** — the whole object is a JSON array; buffered then chunked.
 - **`raw_text`** — each object becomes one record `{ "key", "content" }`.
 - **`csv` / `xml` / `xlsx`** — decoded through `faucet_core::file_format` (below); buffered then chunked.
-- **`parquet`** — Apache Parquet, buffered then decoded; see [Parquet](#parquet-777).
+- **`parquet`** — Apache Parquet, read over byte ranges one row group at a time; see [Parquet](#parquet-777).
 
 Beyond JSON Lines, JSON array and raw text, this source reads **CSV**, **XML**
 and **Excel** through `faucet_core::file_format`, so the records it produces
@@ -129,12 +129,22 @@ columnar path (`avro → parquet` never builds JSON rows). Enable with
 
 ## Parquet (#777)
 
-`file_format: parquet` (the `arrow` feature) reads Apache Parquet blobs. Each
-blob is fetched whole (the footer is at the end) and decoded on a blocking
-thread; `parquet.columns` projects top-level columns before any row group is
-decoded, and a name a blob does not have fails the run naming the blob and its
-columns. With `arrow` the format joins the columnar path, where every blob in
-the listing must share the first blob's schema.
+`file_format: parquet` (the `arrow` feature) reads Apache Parquet blobs over
+byte ranges (#783): the footer locates every row group, so each blob is decoded
+one row group at a time into Arrow batches of at most `batch_size` rows and is
+never buffered whole. Peak memory is one row group plus one batch, not the
+blob — a 213 MiB blob streams in under 10 MiB on the row path and the columnar
+path alike. A blob whose resolved `compression` is a codec is not randomly
+addressable, so it is the one case still fetched whole and decoded on a
+blocking thread. A short range read is an error naming the blob, never a
+truncated decode.
+
+`parquet.columns` projects top-level columns before any row group is read, so
+unread columns are never transferred; an empty list is refused at
+construction, and a name a blob does not have fails the run naming the blob
+and its columns. With `arrow` the format joins the columnar path, where every
+blob in the listing must share the first blob's schema; while one blob's row
+groups decode, the next `concurrency` blobs' footers are fetched ahead.
 
 ```yaml
 file_format: parquet

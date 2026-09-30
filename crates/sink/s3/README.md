@@ -83,7 +83,7 @@ This writes `s3://my-data-lake/events/raw/<uuid>.jsonl` objects, each holding up
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_records_per_file` | int | *(unset)* | Maximum records per object. When unset, all records in a `write_batch` call go to one object. |
-| `concurrency` | int | `10` | Maximum uploads in flight (objects, and a large object's multipart parts). See [Streaming & batching](#streaming--batching). |
+| `concurrency` | int | `10` | Maximum uploads in flight: up to `concurrency` objects, each sending up to `concurrency` multipart parts, so at most `concurrency²` part requests (100 at the default). See [Streaming & batching](#streaming--batching). |
 | `batch_size` | int | `1000` | Records per object when `max_records_per_file` is unset (without `path`). `0` = no record cap: one object per `flush` (Parquet: one per `write_batch`) — see [Streaming & batching](#streaming--batching). |
 
 ### Format (compression feature)
@@ -492,7 +492,27 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 
 ## Usage signals (#704)
 
-Every `PutObject` (`put`) is reported to faucet's usage meter as a sink round
-trip and priced as an S3 write request
-(`usage.pricing.object_storage.write_per_1k_requests`); see the
-[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+Every request is reported to faucet's usage meter as a sink round trip, by op:
+
+| Op | Requests | Priced as |
+|---|---|---|
+| `put` | `PutObject`, and each multipart create / part / complete | write (`usage.pricing.object_storage.write_per_1k_requests`) |
+| `copy` | `CopyObject`, and each multipart-copy create / `UploadPartCopy` (an overwrite commit's promote) | write |
+| `list` | each `ListObjectsV2` page (append, overwrite pruning and commit) | read (`read_per_1k_requests`) |
+| `head` | `HeadObject` (existence checks, and the size probe before a promote) | read |
+| `delete` | `DeleteObject` | free (S3 does not bill deletes) |
+
+See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+
+## Server-side copies and retries (#783)
+
+An overwrite commit promotes each staged object with a server-side copy and a
+delete. `CopyObject` copies at most 5 GiB, so a larger object is copied with a
+multipart `UploadPartCopy` in 512 MiB ranges (grown so no copy exceeds 10 000
+parts), `concurrency` at a time, completed only after every part landed and
+aborted on any failure.
+
+A request that fails with HTTP 429 or a 5xx (`SlowDown`,
+`ServiceUnavailable`, …) is reported as a typed `HttpStatus` error, so a
+pipeline [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
+policy retries it; any other failure is a plain sink error.

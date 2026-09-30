@@ -8,10 +8,21 @@ directory. Append-only.
 
 ## Atomic writes
 
-Each object is uploaded to a hidden temporary name (`<uuid>.jsonl.tmp`) and then
-**renamed** to its final name (`<uuid>.jsonl`). A consumer watching the
-directory therefore never observes a partially-written file — a downstream
-reader either sees the complete object or does not see it at all.
+Each object is uploaded to a hidden temporary name beside its destination
+(`<name>.faucet-tmp-<uuid>`) and then **renamed** to its final name. A
+consumer watching the directory therefore never observes a partially-written
+file — a downstream reader either sees the complete object or does not see it
+at all. On a server with the `posix-rename@openssh.com` extension (OpenSSH
+has it) the rename also replaces an existing file atomically; on a plain
+SFTP v3 server an existing file of that name is removed first (#783).
+
+Only the server's typed "no such file" status counts as a missing file. Any
+other failed stat, listing or remove (a permission error, a path that cannot
+be traversed) fails the operation that needed it, so an overwrite commit
+never mistakes an unreadable staging directory for an empty one (#783).
+
+Uploads copy the local file in 1 MiB reads, so each SFTP `WRITE` carries a
+full packet, and a directory created or seen once is not stat'ed again.
 
 Connection, authentication, and host-key verification come from
 [`faucet-common-sftp`](https://crates.io/crates/faucet-common-sftp).
