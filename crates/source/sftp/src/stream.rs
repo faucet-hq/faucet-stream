@@ -62,6 +62,7 @@ impl SftpSource {
     /// The batch size is validated up front so a bad config fails fast.
     pub fn new(config: SftpSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        config.parquet.validate()?;
         Ok(Self { config })
     }
 
@@ -616,6 +617,13 @@ mod tests {
         // Out-of-range batch size is rejected up front.
         let bad = cfg().with_batch_size(faucet_core::MAX_BATCH_SIZE + 1);
         assert!(matches!(SftpSource::new(bad), Err(FaucetError::Config(_))));
+        let mut empty = cfg();
+        empty.parquet.columns = Some(vec![]);
+        match SftpSource::new(empty) {
+            Err(FaucetError::Config(m)) => assert!(m.contains("parquet.columns"), "{m}"),
+            Err(e) => panic!("expected a Config error, got {e}"),
+            Ok(_) => panic!("an empty projection must be refused"),
+        }
     }
 
     #[test]

@@ -307,6 +307,7 @@ impl GcsSourceConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
+        self.parquet.validate()?;
         Ok(())
     }
 }
@@ -455,6 +456,16 @@ mod tests {
             config.validate(),
             Err(faucet_core::FaucetError::Config(_))
         ));
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_parquet_projection() {
+        let mut c = GcsSourceConfig::new("b");
+        c.parquet.columns = Some(vec![]);
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("parquet.columns"), "{e}");
+        c.parquet.columns = Some(vec!["a".into()]);
+        assert!(c.validate().is_ok());
     }
 
     #[test]
