@@ -175,7 +175,10 @@ mod tests {
     fn counts_a_json_lines_file_dlq() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dlq.jsonl");
-        let lines = [envelope("orders", "a", 3_000), envelope("orders", "a", 2_500)];
+        let lines = [
+            envelope("orders", "a", 3_000),
+            envelope("orders", "a", 2_500),
+        ];
         std::fs::write(&path, lines.join("\n")).unwrap();
         for config in [
             json!({"path": path.to_str().unwrap()}),

@@ -255,7 +255,10 @@ mod tests {
         let notes = deprecated_spellings(&doc);
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0].starts_with("connector kind `csv`"), "{notes:?}");
-        assert!(notes[1].starts_with("connector kind `parquet`"), "{notes:?}");
+        assert!(
+            notes[1].starts_with("connector kind `parquet`"),
+            "{notes:?}"
+        );
     }
 
     #[test]

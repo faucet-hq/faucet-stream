@@ -396,7 +396,10 @@ mod tests {
         assert_eq!(dlq_encryption_value(Some(&d)), Some(&key));
         for (kind, config) in [
             ("file", json!({"path": "dlq.csv", "encryption": key})),
-            ("file", json!({"path": "dlq.jsonl", "format": "csv", "encryption": key})),
+            (
+                "file",
+                json!({"path": "dlq.jsonl", "format": "csv", "encryption": key}),
+            ),
             ("file", json!({"path": "dlq.jsonl.gz", "encryption": key})),
             ("s3", json!({"path": "dlq.jsonl", "encryption": key})),
         ] {
@@ -423,7 +426,10 @@ mod tests {
         for (kind, config) in [
             ("file", json!({"path": "dlq.jsonl", "encryption": key})),
             ("file", json!({"path": "dlq.jsonl.gz"})),
-            ("file", json!({"path": "dlq.jsonl.gz", "compression": "none", "encryption": key})),
+            (
+                "file",
+                json!({"path": "dlq.jsonl.gz", "compression": "none", "encryption": key}),
+            ),
             ("file", json!({"path": "dlq.jsonl.gz", "encryption": null})),
             ("jsonl", json!({"path": "dlq.jsonl.gz", "encryption": key})),
         ] {
