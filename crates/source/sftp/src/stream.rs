@@ -35,8 +35,7 @@ enum Fetched {
         feature = "file-format-xml",
         feature = "file-format-excel",
         feature = "file-format-avro",
-        feature = "file-format-orc",
-        feature = "arrow"
+        feature = "file-format-orc"
     ))]
     Records(Vec<Value>),
     /// A whole Avro or ORC file (#719). Decoded in listing order by the page
@@ -45,6 +44,51 @@ enum Fetched {
     /// schema and prefetch completes out of order.
     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
     Container(Vec<u8>),
+    /// A Parquet file as Arrow batches, read over byte ranges one row group
+    /// at a time (#783).
+    #[cfg(feature = "arrow")]
+    Parquet(faucet_core::file_format::parquet_io::BatchStream),
+}
+
+/// Byte ranges of one open remote file, for the shared ranged Parquet
+/// reader (#783).
+#[cfg(feature = "arrow")]
+struct FileRange {
+    file: SftpFile,
+    path: String,
+}
+
+#[cfg(feature = "arrow")]
+impl faucet_core::file_format::parquet_io::RangeRead for FileRange {
+    fn read_range(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>>
+    {
+        use futures::FutureExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        async move {
+            let failed =
+                |e: std::io::Error| FaucetError::Source(format!("SFTP read '{}' failed: {e}", self.path));
+            self.file
+                .seek(std::io::SeekFrom::Start(range.start))
+                .await
+                .map_err(failed)?;
+            let wanted = (range.end - range.start) as usize;
+            let mut buf = vec![0u8; wanted];
+            let mut filled = 0;
+            while filled < wanted {
+                let n = self.file.read(&mut buf[filled..]).await.map_err(failed)?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            buf.truncate(filled);
+            Ok(buf.into())
+        }
+        .boxed()
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -142,6 +186,7 @@ impl SftpSource {
         opts: &faucet_core::FormatOptions,
         #[cfg_attr(not(feature = "arrow"), allow(unused_variables))]
         parquet: &faucet_core::ParquetReadOptions,
+        #[cfg_attr(not(feature = "arrow"), allow(unused_variables))] batch_size: usize,
     ) -> Result<Fetched, FaucetError> {
         Ok(match format {
             SftpFormat::Jsonl => Fetched::Lines(
@@ -163,12 +208,7 @@ impl SftpSource {
             SftpFormat::Orc => Fetched::Container(Self::read_file(sftp, path).await?),
             #[cfg(feature = "arrow")]
             SftpFormat::Parquet => {
-                let (_, batches) = Self::read_parquet(sftp, path, parquet, 0).await?;
-                let mut records = Vec::new();
-                for b in &batches {
-                    records.extend(faucet_core::columnar::record_batch_to_values(b)?);
-                }
-                Fetched::Records(records)
+                Fetched::Parquet(Self::open_parquet(sftp, path, parquet, batch_size).await?.1)
             }
         })
     }
@@ -179,8 +219,7 @@ impl SftpSource {
         feature = "file-format-xml",
         feature = "file-format-excel",
         feature = "file-format-avro",
-        feature = "file-format-orc",
-        feature = "arrow"
+        feature = "file-format-orc"
     ))]
     async fn read_file(sftp: &SftpSession, path: &str) -> Result<Vec<u8>, FaucetError> {
         sftp.read(path)
@@ -188,30 +227,47 @@ impl SftpSource {
             .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))
     }
 
-    /// Read one Parquet file whole and decode it (projected by `parquet`) on
-    /// a blocking thread.
+    /// Open one Parquet file, projected by `parquet`, as its Arrow schema and
+    /// a stream of batches of at most `batch_size` rows, read over byte
+    /// ranges one row group at a time so memory stays bounded by a row group
+    /// rather than the file (#783).
     #[cfg(feature = "arrow")]
-    async fn read_parquet(
+    async fn open_parquet(
         sftp: &SftpSession,
         path: &str,
         parquet: &faucet_core::ParquetReadOptions,
         batch_size: usize,
-    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>), FaucetError> {
-        let bytes = Self::read_file(sftp, path).await?;
-        let opts = parquet.clone();
-        let display = path.to_string();
-        tokio::task::spawn_blocking(move || {
-            faucet_core::file_format::parquet_io::read_bytes(
-                bytes.into(),
-                &opts,
-                batch_size,
-                &display,
-            )
-        })
-        .await
-        .map_err(|e| {
-            FaucetError::Source(format!("SFTP parquet decode for '{path}' panicked: {e}"))
-        })?
+    ) -> Result<
+        (
+            arrow::datatypes::SchemaRef,
+            faucet_core::file_format::parquet_io::BatchStream,
+        ),
+        FaucetError,
+    > {
+        let file = sftp
+            .open(path)
+            .await
+            .map_err(|e| FaucetError::Source(format!("SFTP open '{path}' failed: {e}")))?;
+        let len = file
+            .metadata()
+            .await
+            .map_err(|e| FaucetError::Source(format!("SFTP stat '{path}' failed: {e}")))?
+            .size
+            .ok_or_else(|| {
+                FaucetError::Source(format!(
+                    "SFTP server reports no size for '{path}', so its Parquet footer cannot be \
+                     located"
+                ))
+            })?;
+        let reader = faucet_core::file_format::parquet_io::RangedParquetReader::new(
+            FileRange {
+                file,
+                path: path.to_string(),
+            },
+            len,
+            path,
+        );
+        faucet_core::file_format::parquet_io::open_ranged(reader, parquet, batch_size).await
     }
 
     /// Avro / ORC files as Arrow batches, each resolved against the first
@@ -356,7 +412,8 @@ impl faucet_core::Source for SftpSource {
                 .map(|file| {
                     let sftp = &sftp;
                     async move {
-                        let payload = Self::fetch(sftp, &file, format, opts, parquet).await;
+                        let payload =
+                            Self::fetch(sftp, &file, format, opts, parquet, batch_size).await;
                         (file, payload)
                     }
                 })
@@ -459,6 +516,27 @@ impl faucet_core::Source for SftpSource {
                             }
                         }
                     }
+                    #[cfg(feature = "arrow")]
+                    Fetched::Parquet(mut batches) => {
+                        while let Some(batch) = batches.next().await {
+                            for record in faucet_core::columnar::record_batch_to_values(&batch?)? {
+                                buffer.push(record);
+                                if batch_size != 0 && buffer.len() >= chunk {
+                                    let page = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(initial_capacity),
+                                    );
+                                    total += page.len();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                        }
+                        if batch_size == 0 && !buffer.is_empty() {
+                            let page = std::mem::take(&mut buffer);
+                            total += page.len();
+                            yield StreamPage { records: page, bookmark: None };
+                        }
+                    }
                     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                     Fetched::Container(_) => unreachable!("decoded above"),
                     #[cfg(any(
@@ -466,8 +544,7 @@ impl faucet_core::Source for SftpSource {
                         feature = "file-format-xml",
                         feature = "file-format-excel",
                         feature = "file-format-avro",
-                        feature = "file-format-orc",
-                        feature = "arrow"
+                        feature = "file-format-orc"
                     ))]
                     Fetched::Records(records) => {
                         // CSV / XML / Excel (#604): already decoded at fetch
@@ -552,9 +629,21 @@ impl faucet_core::Source for SftpSource {
             let files = self.resolve_files(&sftp, &path).await?;
             if matches!(self.config.format, SftpFormat::Parquet) {
                 let mut first: Option<arrow::datatypes::SchemaRef> = None;
-                for file in files {
-                    let (schema, batches) =
-                        Self::read_parquet(&sftp, &file, &self.config.parquet, self.config.batch_size).await?;
+                // Prefetch the next files' footers while this one's row
+                // groups decode; bodies are never buffered (#783).
+                let parquet = &self.config.parquet;
+                let batch_size = self.config.batch_size;
+                let mut opened = futures::stream::iter(files)
+                    .map(|file| {
+                        let sftp = &sftp;
+                        async move {
+                            let opened = Self::open_parquet(sftp, &file, parquet, batch_size).await;
+                            (file, opened)
+                        }
+                    })
+                    .buffered(self.config.concurrency.max(1));
+                while let Some((file, opened)) = opened.next().await {
+                    let (schema, mut batches) = opened?;
                     match &first {
                         Some(f) if !faucet_core::columnar::schema_eq(f, &schema) => {
                             Err(FaucetError::Source(format!(
@@ -565,8 +654,11 @@ impl faucet_core::Source for SftpSource {
                         Some(_) => {}
                         None => first = Some(schema),
                     }
-                    for batch in batches {
-                        yield faucet_core::columnar::ColumnarPage::new(batch, None);
+                    while let Some(batch) = batches.next().await {
+                        let batch = batch?;
+                        if batch.num_rows() > 0 {
+                            yield faucet_core::columnar::ColumnarPage::new(batch, None);
+                        }
                     }
                 }
                 return;

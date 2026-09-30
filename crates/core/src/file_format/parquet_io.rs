@@ -45,8 +45,15 @@ impl ParquetReadOptions {
     }
 }
 
+/// The byte buffer a [`RangeRead`] returns, re-exported so a connector
+/// needs no direct `bytes` dependency.
 #[cfg(feature = "file-format-parquet")]
-pub use imp::{RangeRead, RangedParquetReader, projection_mask, range_stream, read_bytes};
+pub use bytes::Bytes;
+#[cfg(feature = "file-format-parquet")]
+pub use imp::{
+    BatchStream, RangeRead, RangedParquetReader, open_ranged, projection_mask, range_stream,
+    read_bytes,
+};
 
 #[cfg(feature = "file-format-parquet")]
 mod imp {
@@ -213,6 +220,29 @@ mod imp {
                 "parquet: failed to build a reader for '{display}': {e}"
             ))
         })
+    }
+
+    /// A boxed stream of Arrow batches, the shape [`open_ranged`] returns.
+    pub type BatchStream = futures::stream::BoxStream<'static, Result<RecordBatch, FaucetError>>;
+
+    /// [`range_stream`] as the object's Arrow schema and a boxed batch stream
+    /// whose decode errors name the object — the one shape a source's row and
+    /// columnar paths both consume.
+    pub async fn open_ranged<R: RangeRead>(
+        reader: RangedParquetReader<R>,
+        opts: &ParquetReadOptions,
+        batch_size: usize,
+    ) -> Result<(SchemaRef, BatchStream), FaucetError> {
+        use futures::{StreamExt, TryStreamExt};
+        let display = reader.display.clone();
+        let stream = range_stream(reader, opts, batch_size).await?;
+        let schema = stream.schema().clone();
+        let batches = stream
+            .map_err(move |e| {
+                FaucetError::Source(format!("parquet: failed to decode '{display}': {e}"))
+            })
+            .boxed();
+        Ok((schema, batches))
     }
 
     /// Decode a whole in-memory Parquet object (projected by `opts`) into its
@@ -400,6 +430,22 @@ mod tests {
         assert!(batches.iter().all(|b| b.num_columns() == 1));
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
         assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+
+        let mem = Mem {
+            data: data.clone(),
+            truncate: false,
+            reads: reads.clone(),
+        };
+        let (schema, batches) = open_ranged(
+            RangedParquetReader::new(mem, data.len() as u64, "o"),
+            &ParquetReadOptions::default(),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(schema.fields().len(), 2);
+        let batches: Vec<_> = batches.try_collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
 
     #[cfg(feature = "file-format-parquet")]

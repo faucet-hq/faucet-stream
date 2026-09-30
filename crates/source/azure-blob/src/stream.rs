@@ -36,8 +36,7 @@ enum Fetched {
         feature = "file-format-xml",
         feature = "file-format-excel",
         feature = "file-format-avro",
-        feature = "file-format-orc",
-        feature = "arrow"
+        feature = "file-format-orc"
     ))]
     Records(Vec<Value>),
     /// A whole Avro or ORC blob (#719). Decoded in listing order by the page
@@ -46,6 +45,35 @@ enum Fetched {
     /// schema and prefetch completes out of order.
     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
     Container(Vec<u8>),
+    /// A Parquet blob as Arrow batches — read over byte ranges one row group
+    /// at a time, or decoded whole when a compression codec makes it
+    /// unaddressable (#783).
+    #[cfg(feature = "arrow")]
+    Parquet(faucet_core::file_format::parquet_io::BatchStream),
+}
+
+/// Byte ranges of one blob, for the shared ranged Parquet reader (#783).
+#[cfg(feature = "arrow")]
+struct BlobRange {
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+}
+
+#[cfg(feature = "arrow")]
+impl faucet_core::file_format::parquet_io::RangeRead for BlobRange {
+    fn read_range(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>> {
+        use futures::FutureExt as _;
+        async move {
+            self.store
+                .get_range(&self.path, range)
+                .await
+                .map_err(|e| FaucetError::Source(format!("azure get range error: {e}")))
+        }
+        .boxed()
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -124,7 +152,9 @@ impl AzureBlobSource {
             #[cfg(feature = "file-format-orc")]
             AzureFileFormat::Orc => Fetched::Container(self.read_object_all(key).await?),
             #[cfg(feature = "arrow")]
-            AzureFileFormat::Parquet => Fetched::Records(self.fetch_parquet_records(key).await?),
+            AzureFileFormat::Parquet => {
+                Fetched::Parquet(self.open_parquet(key, self.config.batch_size).await?.1)
+            }
         })
     }
 
@@ -135,7 +165,7 @@ impl AzureBlobSource {
         feature = "file-format-excel",
         feature = "file-format-avro",
         feature = "file-format-orc",
-        feature = "arrow"
+        all(feature = "arrow", feature = "compression")
     ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
         use tokio::io::AsyncReadExt as _;
@@ -148,20 +178,49 @@ impl AzureBlobSource {
         Ok(bytes)
     }
 
-    /// Decode one Parquet blob, projected by `parquet.columns`, into records
-    /// (on a blocking thread: the decode is CPU-bound). **Buffered whole** —
-    /// the footer sits at the end of the object.
+    /// Open one Parquet blob, projected by `parquet.columns`, as its Arrow
+    /// schema and a stream of batches of at most `batch_size` rows. The blob
+    /// is read over byte ranges, one row group at a time, so memory stays
+    /// bounded by a row group rather than the blob (#783). A blob the
+    /// configured `compression` resolves to a codec for is not randomly
+    /// addressable, so it is decoded whole on a blocking thread instead.
     #[cfg(feature = "arrow")]
-    async fn fetch_parquet_records(&self, key: &str) -> Result<Vec<Value>, FaucetError> {
-        let (_, batches) = self.read_parquet(key, 0).await?;
-        let mut out = Vec::new();
-        for b in &batches {
-            out.extend(faucet_core::columnar::record_batch_to_values(b)?);
+    async fn open_parquet(
+        &self,
+        key: &str,
+        batch_size: usize,
+    ) -> Result<
+        (
+            arrow::datatypes::SchemaRef,
+            faucet_core::file_format::parquet_io::BatchStream,
+        ),
+        FaucetError,
+    > {
+        #[cfg(feature = "compression")]
+        if self.config.compression.resolve(key) != faucet_core::compression::Compression::None {
+            let (schema, batches) = self.read_parquet(key, batch_size).await?;
+            return Ok((schema, stream::iter(batches.into_iter().map(Ok)).boxed()));
         }
-        Ok(out)
+        let path = ObjectPath::from(key);
+        let meta = self.store.head(&path).await.map_err(|e| {
+            FaucetError::Source(format!(
+                "azure head error for container '{}' key '{key}': {e}",
+                self.config.container()
+            ))
+        })?;
+        let reader = faucet_core::file_format::parquet_io::RangedParquetReader::new(
+            BlobRange {
+                store: self.store.clone(),
+                path,
+            },
+            meta.size,
+            key,
+        );
+        faucet_core::file_format::parquet_io::open_ranged(reader, &self.config.parquet, batch_size)
+            .await
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(all(feature = "arrow", feature = "compression"))]
     async fn read_parquet(
         &self,
         key: &str,
@@ -664,13 +723,33 @@ impl faucet_core::Source for AzureBlobSource {
                     }
                     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                     Fetched::Container(_) => unreachable!("decoded above"),
+                    #[cfg(feature = "arrow")]
+                    Fetched::Parquet(mut batches) => {
+                        while let Some(batch) = batches.next().await {
+                            for record in faucet_core::columnar::record_batch_to_values(&batch?)? {
+                                buffer.push(record);
+                                if batch_size != 0 && buffer.len() >= chunk {
+                                    let page = std::mem::replace(
+                                        &mut buffer,
+                                        Vec::with_capacity(initial_capacity),
+                                    );
+                                    total += page.len();
+                                    yield StreamPage { records: page, bookmark: None };
+                                }
+                            }
+                        }
+                        if batch_size == 0 && !buffer.is_empty() {
+                            let page = std::mem::take(&mut buffer);
+                            total += page.len();
+                            yield StreamPage { records: page, bookmark: None };
+                        }
+                    }
                     #[cfg(any(
                         feature = "file-format-csv",
                         feature = "file-format-xml",
                         feature = "file-format-excel",
                         feature = "file-format-avro",
-                        feature = "file-format-orc",
-                        feature = "arrow"
+                        feature = "file-format-orc"
                     ))]
                     Fetched::Records(records) => {
                         // CSV / XML / Excel (#604): already decoded at fetch
@@ -756,8 +835,17 @@ impl faucet_core::Source for AzureBlobSource {
             if matches!(self.config.file_format, AzureFileFormat::Parquet) {
                 let keys = self.list_object_names(prefix.as_deref()).await?;
                 let mut first: Option<arrow::datatypes::SchemaRef> = None;
-                for key in keys {
-                    let (schema, batches) = self.read_parquet(&key, self.config.batch_size).await?;
+                // Prefetch the next blobs' footers while this one's row
+                // groups decode; bodies are never buffered (#783).
+                let batch_size = self.config.batch_size;
+                let mut opened = stream::iter(keys)
+                    .map(|key| async move {
+                        let opened = self.open_parquet(&key, batch_size).await;
+                        (key, opened)
+                    })
+                    .buffered(self.config.concurrency.max(1));
+                while let Some((key, opened)) = opened.next().await {
+                    let (schema, mut batches) = opened?;
                     match &first {
                         Some(f) if !faucet_core::columnar::schema_eq(f, &schema) => {
                             Err(FaucetError::Source(format!(
@@ -768,8 +856,11 @@ impl faucet_core::Source for AzureBlobSource {
                         Some(_) => {}
                         None => first = Some(schema),
                     }
-                    for batch in batches {
-                        yield faucet_core::columnar::ColumnarPage::new(batch, None);
+                    while let Some(batch) = batches.next().await {
+                        let batch = batch?;
+                        if batch.num_rows() > 0 {
+                            yield faucet_core::columnar::ColumnarPage::new(batch, None);
+                        }
                     }
                 }
                 return;
