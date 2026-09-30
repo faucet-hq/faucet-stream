@@ -458,11 +458,10 @@ mod tests {
             reads: Default::default(),
         };
         let reader = RangedParquetReader::new(mem, data.len() as u64, "obj.parquet");
-        let err = range_stream(reader, &ParquetReadOptions::default(), 0)
-            .await
-            .err()
-            .expect("a short read fails")
-            .to_string();
+        let Err(err) = range_stream(reader, &ParquetReadOptions::default(), 0).await else {
+            panic!("a short read fails");
+        };
+        let err = err.to_string();
         assert!(
             err.contains("obj.parquet") && err.contains("truncated"),
             "{err}"
