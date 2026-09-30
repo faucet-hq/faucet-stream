@@ -51,7 +51,7 @@ async fn csv_output_matches_the_csv_sink() {
             faucet_sink_csv::CsvSinkConfig::new(p(dir.path(), "old2.csv"))
                 .delimiter(b';')
                 .write_headers(false),
-            json!({"path": p(dir.path(), "new2.csv"), "csv": {"delimiter": ";", "write_headers": false}}),
+            json!({"path": p(dir.path(), "new2.csv"), "csv": {"delimiter": ";", "has_headers": false}}),
         ),
     ] {
         let old_path = old_cfg.path.clone();
@@ -257,7 +257,7 @@ async fn parquet_output_matches_the_parquet_sink() {
 
     let none = p(dir.path(), "u.parquet");
     pages(
-        &sink(json!({"path": none, "parquet": {"compression": "uncompressed"}})),
+        &sink(json!({"path": none, "parquet": {"compression": "none"}})),
         &[metrics(2)],
     )
     .await

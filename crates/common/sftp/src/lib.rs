@@ -285,6 +285,107 @@ impl russh::client::Handler for ClientHandler {
 /// Returns [`FaucetError::Auth`] when authentication or host-key verification
 /// fails, and [`FaucetError::Custom`] for transport / subsystem errors.
 pub async fn connect(cfg: &SftpConnectionConfig) -> Result<SftpSession, FaucetError> {
+    let session = authenticate(cfg).await?;
+    // The `Handle` (`session`) can be dropped once the subsystem is open: the
+    // `SftpSession` holds its own clone of the session message sender, so the
+    // SSH session task stays alive as long as the returned session is held.
+    open_session(&session).await
+}
+
+/// `posix-rename@openssh.com`: a rename that replaces an existing target
+/// atomically (plain SFTP v3 `RENAME` refuses an existing target).
+pub const POSIX_RENAME: &str = "posix-rename@openssh.com";
+
+/// An [`SftpSession`] plus the server extensions the high-level session does
+/// not expose, opened by [`connect_with_extensions`].
+pub struct SftpConnection {
+    session: SftpSession,
+    raw: Option<russh_sftp::client::RawSftpSession>,
+}
+
+impl SftpConnection {
+    /// The SFTP session.
+    pub fn session(&self) -> &SftpSession {
+        &self.session
+    }
+
+    /// Whether the server supports [`POSIX_RENAME`].
+    pub fn supports_posix_rename(&self) -> bool {
+        self.raw.is_some()
+    }
+
+    /// Rename `from` to `to`, atomically replacing `to` when it exists.
+    /// Fails with [`StatusCode::OpUnsupported`] when the server lacks
+    /// [`POSIX_RENAME`] (see [`supports_posix_rename`](Self::supports_posix_rename)).
+    pub async fn posix_rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
+        let Some(raw) = &self.raw else {
+            return Err(SftpError::Status(russh_sftp::protocol::Status {
+                id: 0,
+                status_code: StatusCode::OpUnsupported,
+                error_message: format!("{POSIX_RENAME} is not supported by the server"),
+                language_tag: "en-US".into(),
+            }));
+        };
+        let data = russh_sftp::extensions::HardlinkExtension {
+            oldpath: from.to_string(),
+            newpath: to.to_string(),
+        }
+        .try_into()?;
+        match raw.extended(POSIX_RENAME, data).await? {
+            russh_sftp::protocol::Packet::Status(s) if s.status_code == StatusCode::Ok => Ok(()),
+            russh_sftp::protocol::Packet::Status(s) => Err(SftpError::Status(s)),
+            _ => Err(SftpError::UnexpectedPacket),
+        }
+    }
+}
+
+/// The error an SFTP request returns, re-exported so connector crates can
+/// match on it (a [`StatusCode::NoSuchFile`] status means "missing").
+pub use russh_sftp::client::error::Error as SftpError;
+/// The status code of an [`SftpError::Status`].
+pub use russh_sftp::protocol::StatusCode;
+
+/// Whether `e` is the server's typed "no such file" status.
+pub fn is_no_such_file(e: &SftpError) -> bool {
+    matches!(e, SftpError::Status(s) if s.status_code == StatusCode::NoSuchFile)
+}
+
+/// Like [`connect`], also probing for [`POSIX_RENAME`] on a second channel of
+/// the same SSH connection. A server that refuses the second channel or lacks
+/// the extension yields a connection without it, never an error.
+pub async fn connect_with_extensions(
+    cfg: &SftpConnectionConfig,
+) -> Result<SftpConnection, FaucetError> {
+    let handle = authenticate(cfg).await?;
+    let session = open_session(&handle).await?;
+    let raw = match probe_posix_rename(&handle).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::debug!(error = %e, "SFTP extension probe failed; using plain RENAME");
+            None
+        }
+    };
+    Ok(SftpConnection { session, raw })
+}
+
+async fn probe_posix_rename(
+    handle: &russh::client::Handle<ClientHandler>,
+) -> Result<Option<russh_sftp::client::RawSftpSession>, FaucetError> {
+    let raw = russh_sftp::client::RawSftpSession::new(open_subsystem(handle).await?);
+    let version = raw
+        .init()
+        .await
+        .map_err(|e| FaucetError::Custom(format!("SFTP extension probe failed: {e}").into()))?;
+    Ok(version
+        .extensions
+        .get(POSIX_RENAME)
+        .is_some_and(|v| v == "1")
+        .then_some(raw))
+}
+
+async fn authenticate(
+    cfg: &SftpConnectionConfig,
+) -> Result<russh::client::Handle<ClientHandler>, FaucetError> {
     let config = Arc::new(russh::client::Config::default());
     let handler = ClientHandler {
         policy: cfg.known_hosts.clone(),
@@ -319,21 +420,26 @@ pub async fn connect(cfg: &SftpConnectionConfig) -> Result<SftpSession, FaucetEr
             cfg.username, cfg.host, cfg.port
         )));
     }
+    Ok(session)
+}
 
-    let channel = session.channel_open_session().await.map_err(map_ssh_err)?;
+async fn open_subsystem(
+    handle: &russh::client::Handle<ClientHandler>,
+) -> Result<russh::ChannelStream<russh::client::Msg>, FaucetError> {
+    let channel = handle.channel_open_session().await.map_err(map_ssh_err)?;
     channel
         .request_subsystem(true, "sftp")
         .await
         .map_err(map_ssh_err)?;
+    Ok(channel.into_stream())
+}
 
-    let sftp = SftpSession::new(channel.into_stream())
+async fn open_session(
+    handle: &russh::client::Handle<ClientHandler>,
+) -> Result<SftpSession, FaucetError> {
+    SftpSession::new(open_subsystem(handle).await?)
         .await
-        .map_err(|e| FaucetError::Custom(format!("failed to start SFTP subsystem: {e}").into()))?;
-
-    // The `Handle` (`session`) can now be dropped: the `SftpSession` holds its
-    // own clone of the session message sender, so the SSH session task stays
-    // alive as long as the returned session is held.
-    Ok(sftp)
+        .map_err(|e| FaucetError::Custom(format!("failed to start SFTP subsystem: {e}").into()))
 }
 
 fn map_handler_err(e: HandlerError) -> FaucetError {

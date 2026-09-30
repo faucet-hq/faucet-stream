@@ -11,7 +11,10 @@ use std::pin::Pin;
 /// Each row is returned as a JSON object. If the file has headers, the header
 /// names are used as keys. Otherwise, generated names (`column_0`, `column_1`,
 /// etc.) are used.
-#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
+#[deprecated(
+    since = "1.5.0",
+    note = "use faucet-source-file: FileSourceConfig with `format: csv`, CSV options under `csv:`"
+)]
 pub struct CsvSource {
     config: CsvSourceConfig,
 }

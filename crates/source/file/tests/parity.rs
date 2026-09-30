@@ -65,7 +65,14 @@ fn a_bad_csv_dialect_fails_at_construction() {
     let err = FileSource::new(cfg).err().expect("rejected").to_string();
     assert!(err.contains("csv.quote"), "{err}");
     let cfg = FileSourceConfig::new("x.parquet").parquet_columns(Vec::<String>::new());
-    assert!(FileSource::new(cfg).is_err());
+    let err = FileSource::new(cfg).err().expect("rejected").to_string();
+    assert!(
+        err.contains("parquet.columns must name at least one column"),
+        "{err}"
+    );
+    let cfg = FileSourceConfig::new("x.parquet").parquet_columns(["id", " "]);
+    let err = FileSource::new(cfg).err().expect("rejected").to_string();
+    assert!(err.contains("empty column name"), "{err}");
 }
 
 fn put_parquet(path: &Path, ids: Vec<i64>, names: Vec<Option<&str>>) {

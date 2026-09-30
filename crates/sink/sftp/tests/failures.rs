@@ -71,13 +71,13 @@ async fn refused_server_calls_name_the_operation_and_the_path() {
     let s = sink(
         port,
         "/data/f/",
-        json!({"mode": "append", "file_name": "part-{part}.jsonl"}),
+        json!({"if_exists": "append", "file_name": "part-{part}.jsonl"}),
     );
     let e = write_and_flush(&s, &[json!({"a": 1})])
         .await
         .unwrap_err()
         .to_string();
-    assert!(e.contains("SFTP list '/data/f' failed"), "{e}");
+    assert!(e.contains("SFTP create directory '/data/f' failed"), "{e}");
 
     let s = sink(port, "/data/one/", json!({"file_name": "one.jsonl"}));
     write_and_flush(&s, &[json!({"a": 1})]).await.unwrap();
@@ -89,22 +89,21 @@ async fn refused_server_calls_name_the_operation_and_the_path() {
         .to_string();
     assert!(e.contains("'/data/one/one.jsonl' failed"), "{e}");
 
-    let overwrite =
-        json!({"mode": "overwrite", "write_mode": "overwrite", "file_name": "part-{part}.jsonl"});
+    let overwrite = json!({"if_exists": "replace", "write_mode": "overwrite", "file_name": "part-{part}.jsonl"});
     admin.create_dir("/data/o").await.unwrap();
     admin
         .create_dir("/data/o/.faucet-overwrite-part-_part_.jsonl")
         .await
         .unwrap();
     admin
-        .create_dir("/data/o/.faucet-overwrite-part-_part_.jsonl/.faucet-staging")
+        .create_dir("/data/o/.faucet-overwrite-part-_part_.jsonl/.faucet-swap")
         .await
         .unwrap();
     let s = sink(port, "/data/o/", overwrite.clone());
     assert!(s.is_overwrite());
     let e = s.abort_overwrite().await.unwrap_err().to_string();
     assert!(e.contains("SFTP delete '"), "{e}");
-    assert!(e.contains(".faucet-staging' failed"), "{e}");
+    assert!(e.contains(".faucet-swap' failed"), "{e}");
 
     let s = sink(port, "/data/r/", overwrite);
     s.begin_overwrite().await.unwrap();
@@ -123,7 +122,7 @@ async fn an_unreachable_server_fails_the_overwrite_abort() {
     let s = sink(
         1,
         "/data/o/",
-        json!({"mode": "overwrite", "write_mode": "overwrite", "file_name": "x.jsonl"}),
+        json!({"if_exists": "replace", "write_mode": "overwrite", "file_name": "x.jsonl"}),
     );
     assert!(s.abort_overwrite().await.is_err());
 }

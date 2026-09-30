@@ -124,12 +124,20 @@ columnar path (`avro → parquet` never builds JSON rows). Enable with
 
 ## Parquet (#777)
 
-`format: parquet` (the `arrow` feature) reads Apache Parquet files. Each file
-is fetched whole (the footer is at the end) and decoded on a blocking thread;
-`parquet.columns` projects top-level columns before any row group is decoded,
-and a name a file does not have fails the run naming the file and its
-columns. With `arrow` the format joins the columnar path, where every file in
-the listing must share the first file's schema.
+`format: parquet` (the `arrow` feature) reads Apache Parquet files over byte
+ranges (#783): the file is opened once, its footer locates every row group,
+and each row group is read and decoded in turn into Arrow batches of at most
+`batch_size` rows, so a file is never buffered whole. Peak memory is one row
+group plus one batch, not the file — a 213 MiB file streams in under 10 MiB on
+the row path and the columnar path alike. A short read is an error naming the
+file, never a truncated decode.
+
+`parquet.columns` projects top-level columns before any row group is read, so
+unread columns are never transferred; an empty list is refused at
+construction, and a name a file does not have fails the run naming the file
+and its columns. With `arrow` the format joins the columnar path, where every
+file in the listing must share the first file's schema; while one file's row
+groups decode, the next `concurrency` files' footers are fetched ahead.
 
 ```yaml
 format: parquet

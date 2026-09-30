@@ -180,9 +180,12 @@ object-store sinks — `s3`, `gcs`, `azure-blob`, `sftp` — **accumulate across
 Before this each upstream page became its own object, so a small `batch_size`
 produced a swarm of tiny objects: the small-files problem that dominates read
 time on S3/Athena/Spark. With no cap set the whole run lands in one object,
-closed at `flush`. The byte cap is what bounds buffered memory (rows are a poor
-proxy for size), and `s3`/`azure-blob` additionally stream large objects
-through **multipart** so peak memory is O(part size), not O(object size).
+closed at `flush`. `s3` and `azure-blob` stream JSON Lines and raw text
+straight into **multipart** parts (block lists on Azure), so memory is about
+`concurrency` × part size and nothing touches local disk; every other format,
+and every format on `gcs` and `sftp`, is built in a scratch file (`scratch_dir`,
+default the system temp directory) and uploaded when the object closes, so peak
+disk is the object's size — the byte cap bounds it.
 
 **Commit accumulation (`commit_rows` / `commit_bytes`, #617).** The warehouse
 sinks — `snowflake`, `clickhouse`, `redshift` — accumulate records across
@@ -245,11 +248,11 @@ config this project treats as a defect.
 | AWS SQS | T2 | `sink-sqs` | ✓ | ✗ | ✗ | ✗ | best-effort | batched SendMessageBatch (10/req), per-entry partial-failure retry; FIFO group/dedup |
 | NATS | T2 | `sink-nats` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to a subject (optional subject-per-record), flush per batch |
 | RabbitMQ | T2 | `sink-rabbitmq` | ✓ | ✗ | ✗ | ✗ | best-effort | publish to an exchange with a static / field / JSONPath routing key; publisher confirms per batch; `mandatory` returns surface as per-row (DLQ-routable) errors |
-| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | atomic (no rollover cap) | files over SSH, temp-then-rename upload; every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `file_name` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption |
+| SFTP | T2 | `sink-sftp` | ✓ | ✗ | ✗ | ✗ | atomic (no rollover cap) | files over SSH, temp-then-rename upload; every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `file_name` templates, rollover, `if_exists` / `write_mode: overwrite`, compression and encryption; each file built on scratch disk |
 | Singer bridge ⚠️ | T2 ⚠️ | `sink-singer` | no-op | ✗ | `key_properties` | ✗ | best-effort | runs an external Singer target; `SCHEMA`/`RECORD` over stdin with back-pressure, bookmarks advance only after the target confirms (echoed `STATE` or clean exit, `flush_on`); `write_mode: overwrite` → `ACTIVATE_VERSION`. **Tier-2 / experimental** |
-| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | objects in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption; multipart upload past 8 MiB |
-| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | objects in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption; resumable upload for large objects |
-| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | blobs (object_store) in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `mode` / `write_mode: overwrite`, compression and encryption; block-list upload past 8 MiB |
+| AWS S3 | T1 ✅ | `sink-s3` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | objects in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `if_exists` / `write_mode: overwrite`, compression and encryption; JSON Lines / raw text streamed as multipart parts, other formats built on scratch disk then uploaded |
+| Google Cloud Storage | T2 | `sink-gcs` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | objects in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `if_exists` / `write_mode: overwrite`, compression and encryption; each object built on scratch disk, then a resumable upload |
+| Azure Blob / ADLS Gen2 | T1 ✅ᵉ | `sink-azure-blob` | ✓ | ✓ | ✗ | ✗ | atomic (no rollover cap) | blobs (object_store) in every [file format](../cookbook/file-formats.md) the `file` sink writes (JSONL, JSON array, CSV, XML, Excel, Avro, Parquet, raw text) through the shared file writer, with `path` templates, rollover, `if_exists` / `write_mode: overwrite`, compression and encryption; JSON Lines / raw text streamed as blocks, other formats built on scratch disk; block-list upload past 8 MiB |
 | MongoDB | T1 ✅ | `sink-mongodb` | ✓ | ✗ | **✓** | **✓** | best-effort | `insert_many`; multi-document transaction for effectively-once (replica set required) |
 | Redis | T1 ✅ | `sink-redis` | ✓ | ✗ | ✗ | **✓** | best-effort | streams, lists, key-value (pipelined); `MULTI`/`EXEC` transaction for effectively-once |
 | CSV *(deprecated: use `file`)* | T1 ✅ | `sink-csv` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file rows; column set frozen from first batch (`on_unknown_field: warn`/`error`) |

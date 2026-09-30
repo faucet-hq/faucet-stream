@@ -19,7 +19,7 @@ To build a slim binary with only the connectors you need:
 
 ```bash
 cargo install faucet-cli --no-default-features \
-    --features source-rest,sink-jsonl,sink-stdout,transforms
+    --features source-rest,sink-file,sink-stdout,transforms
 ```
 
 ## Commands
@@ -525,10 +525,10 @@ connector, and yield no suggestions when no config is present.
 `faucet init` writes a starter `pipeline.yaml` by walking each selected connector's JSON Schema. Required fields are surfaced with a `# REQUIRED` comment and a typed placeholder (`""`, `0`, `false`, `[]`, `{}`); optional fields are commented out so connector-level defaults stay in force. Enum-typed fields list valid values in the trailing comment. Tagged-enum blocks (the `#[serde(tag = "type")]` shape used by `auth:`, `pagination:`, BigQuery `credentials:`, etc.) inline the chosen variant and emit every other variant as a commented-out "Alternative variants" block right below it — so users can switch auth modes (or pagination, or credentials) without leaving the file to consult `faucet schema`. Run `faucet init --interactive` (requires `--features cli-interactive`) to be prompted for each variant up front.
 
 ```bash
-faucet init                                              # rest → jsonl, name = my-pipeline
-faucet init my-job                                       # rest → jsonl, name = my-job
+faucet init                                              # rest → file, name = my-pipeline
+faucet init my-job                                       # rest → file, name = my-job
 faucet init my-job --source postgres --sink bigquery     # postgres → bigquery
-faucet init --source rest --sink jsonl -o config.yaml    # custom output path
+faucet init --source rest --sink file -o config.yaml     # custom output path
 faucet init --force                                      # overwrite pipeline.yaml in cwd
 faucet init --interactive                                # TTY prompts (requires --features cli-interactive)
 ```
@@ -539,7 +539,7 @@ Flags:
 |------|---------|
 | `name` (positional) | Pipeline name written to the generated file's `name:`. Defaults to `my-pipeline`. |
 | `--source <kind>` | Source connector to scaffold (e.g. `rest`, `postgres`, `s3`). Defaults to `rest`. |
-| `--sink <kind>` | Sink connector to scaffold (e.g. `jsonl`, `bigquery`). Defaults to `jsonl`. |
+| `--sink <kind>` | Sink connector to scaffold (e.g. `file`, `bigquery`). Defaults to `file`. |
 | `--output, -o <path>` | Output file path. Defaults to `pipeline.yaml`. |
 | `--force` | Overwrite an existing file at the output path. |
 | `--interactive` | Prompt for kinds via `inquire` on a TTY; falls back to `--source`/`--sink` otherwise. Requires the `cli-interactive` build feature. |

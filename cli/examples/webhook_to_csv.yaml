@@ -19,4 +19,4 @@ pipeline:
       csv:
         delimiter: ";"
         has_headers: true
-      mode: append
+      if_exists: append

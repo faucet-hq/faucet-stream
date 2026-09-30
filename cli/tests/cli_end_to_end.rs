@@ -221,7 +221,7 @@ fn init_refuses_to_overwrite_existing_file() {
 }
 
 #[test]
-fn init_no_args_uses_rest_jsonl_defaults() {
+fn init_no_args_uses_rest_file_defaults() {
     let dir = TempDir::new().unwrap();
     let out = dir.path().join("pipeline.yaml");
     Command::cargo_bin("faucet")
@@ -233,7 +233,7 @@ fn init_no_args_uses_rest_jsonl_defaults() {
     let body = fs::read_to_string(&out).unwrap();
     assert!(body.contains("name: my-pipeline"));
     assert!(body.contains("type: rest"));
-    assert!(body.contains("type: jsonl"));
+    assert!(body.contains("type: file"));
 }
 
 #[test]

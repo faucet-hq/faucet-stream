@@ -33,13 +33,13 @@ async fn offset_pagination_stops_cleanly_on_204() {
     let server = MockServer::start().await;
     let hits = Arc::new(AtomicUsize::new(0));
     Mock::given(method("GET"))
-        .and(path("/adp/workers"))
+        .and(path("/hr/workers"))
         .respond_with(RowsThen204(hits.clone()))
         .mount(&server)
         .await;
 
     let stream = RestStream::new(
-        RestStreamConfig::new(&server.uri(), "/adp/workers")
+        RestStreamConfig::new(&server.uri(), "/hr/workers")
             .records_path("$.data[*]")
             .pagination(PaginationStyle::Offset {
                 offset_param: "$skip".into(),

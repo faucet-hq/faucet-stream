@@ -1,14 +1,25 @@
 //! The S3 [`ObjectClient`] behind the shared file writer (#777).
 //!
 //! A file up to [`PART_BYTES`] is one `PutObject`; a larger one is a
-//! multipart upload of `PART_BYTES` parts (up to `concurrency` in flight),
-//! completed only after every part landed and aborted on any failure, so an
-//! object is either wholly published or not at all.
+//! multipart upload of `PART_BYTES` parts (up to `concurrency` in flight per
+//! object), completed only after every part landed and aborted on any
+//! failure, so an object is either wholly published or not at all. The
+//! writer uploads up to `concurrency` objects at once, so at most
+//! `concurrency × concurrency` parts are in flight.
+//!
+//! A rename is a server-side copy and a delete: one `CopyObject` up to
+//! [`MAX_COPY_BYTES`], a multipart `UploadPartCopy` above it (#783). Copied
+//! parts share the sink's part budget with uploaded ones. Several keys are
+//! deleted with `DeleteObjects`, 1,000 keys per request.
+//!
+//! A failure that carries an HTTP status of 429 or 5xx (`SlowDown`,
+//! `ServiceUnavailable`, …) is a typed [`FaucetError::HttpStatus`], so the
+//! pipeline's resilience policy retries it.
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use faucet_common_file::write::{ObjectClient, content_type};
 use faucet_core::FaucetError;
 use futures::stream::{StreamExt, TryStreamExt};
@@ -19,16 +30,52 @@ use std::sync::Arc;
 /// S3 requires every part but the last to be at least 5 MiB.
 pub const PART_BYTES: usize = 8 * 1024 * 1024;
 
+/// The largest object one `CopyObject` copies; larger ones are copied in
+/// parts.
+pub const MAX_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Part size of a multipart copy, grown for very large objects so a copy
+/// never needs more than [`MAX_PARTS`] parts.
+const COPY_PART_BYTES: u64 = 512 * 1024 * 1024;
+
+/// S3's limit on the parts of one multipart upload.
+const MAX_PARTS: u64 = 10_000;
+
+/// S3's limit on the keys of one `DeleteObjects` request.
+const MAX_DELETE_KEYS: usize = 1_000;
+
+/// The HTTP status a per-key `DeleteObjects` error code stands for, when it
+/// is one the store also returns for a whole request that should be retried.
+fn delete_error_status(code: &str) -> Option<u16> {
+    match code {
+        "SlowDown" | "ServiceUnavailable" => Some(503),
+        "InternalError" => Some(500),
+        _ => None,
+    }
+}
+
+type SdkError<E> = aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>;
+
 pub(crate) struct S3Objects {
     pub client: Client,
     pub bucket: String,
     pub concurrency: usize,
     pub part_bytes: usize,
     pub roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    /// Part requests in flight across every upload of this sink.
+    pub part_slots: Arc<tokio::sync::Semaphore>,
 }
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Sink(format!("S3 {what} error for key '{key}': {e}"))
+}
+
+/// The byte ranges (`start..end`) a multipart copy of `len` bytes copies.
+fn copy_ranges(len: u64) -> Vec<std::ops::Range<u64>> {
+    let part = COPY_PART_BYTES.max(len.div_ceil(MAX_PARTS));
+    (0..len.div_ceil(part))
+        .map(|i| i * part..((i + 1) * part).min(len))
+        .collect()
 }
 
 /// `bucket/key` for `CopySource`, percent-encoding everything but the
@@ -46,6 +93,22 @@ fn copy_source(bucket: &str, key: &str) -> String {
 }
 
 impl S3Objects {
+    /// An SDK failure, typed by its HTTP status (see the module docs).
+    fn sdk_err<E>(&self, what: &str, key: &str, e: SdkError<E>) -> FaucetError
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let status = e.raw_response().map(|r| r.status().as_u16());
+        FaucetError::sink_status(
+            status,
+            self.describe(key),
+            format!(
+                "S3 {what} error for key '{key}': {}",
+                aws_sdk_s3::error::DisplayErrorContext(&e)
+            ),
+        )
+    }
+
     async fn put_single(&self, body: Vec<u8>, key: &str) -> Result<(), FaucetError> {
         self.roundtrips.record("put");
         self.client
@@ -56,7 +119,7 @@ impl S3Objects {
             .body(ByteStream::from(body))
             .send()
             .await
-            .map_err(|e| err("put object", key, aws_sdk_s3::error::DisplayErrorContext(e)))?;
+            .map_err(|e| self.sdk_err("put object", key, e))?;
         Ok(())
     }
 
@@ -70,54 +133,13 @@ impl S3Objects {
             .content_type(content_type(key))
             .send()
             .await
-            .map_err(|e| {
-                err(
-                    "start multipart",
-                    key,
-                    aws_sdk_s3::error::DisplayErrorContext(e),
-                )
-            })?;
+            .map_err(|e| self.sdk_err("start multipart", key, e))?;
         let upload_id = created
             .upload_id()
             .ok_or_else(|| err("start multipart", key, "no upload id"))?
             .to_string();
-        let result = self.upload_parts(from, key, &upload_id, len).await;
-        match result {
-            Ok(parts) => {
-                self.roundtrips.record("put");
-                self.client
-                    .complete_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .multipart_upload(
-                        CompletedMultipartUpload::builder()
-                            .set_parts(Some(parts))
-                            .build(),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        err(
-                            "complete multipart",
-                            key,
-                            aws_sdk_s3::error::DisplayErrorContext(e),
-                        )
-                    })?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await;
-                Err(e)
-            }
-        }
+        let parts = self.upload_parts(from, key, &upload_id, len).await;
+        self.finish_multipart(key, &upload_id, parts).await
     }
 
     async fn upload_parts(
@@ -128,8 +150,13 @@ impl S3Objects {
         len: usize,
     ) -> Result<Vec<CompletedPart>, FaucetError> {
         let count = len.div_ceil(self.part_bytes);
-        let mut parts: Vec<CompletedPart> = futures::stream::iter(0..count)
+        let parts: Vec<CompletedPart> = futures::stream::iter(0..count)
             .map(|i| async move {
+                let _slot = self
+                    .part_slots
+                    .acquire()
+                    .await
+                    .map_err(|e| err("upload part", key, e))?;
                 let offset = i * self.part_bytes;
                 let size = self.part_bytes.min(len - offset);
                 let body = ByteStream::read_from()
@@ -151,13 +178,7 @@ impl S3Objects {
                     .body(body)
                     .send()
                     .await
-                    .map_err(|e| {
-                        err(
-                            "upload part",
-                            key,
-                            aws_sdk_s3::error::DisplayErrorContext(e),
-                        )
-                    })?;
+                    .map_err(|e| self.sdk_err("upload part", key, e))?;
                 Ok::<_, FaucetError>(
                     CompletedPart::builder()
                         .part_number(number)
@@ -168,7 +189,6 @@ impl S3Objects {
             .buffer_unordered(self.concurrency.max(1))
             .try_collect()
             .await?;
-        parts.sort_by_key(|p| p.part_number());
         Ok(parts)
     }
 }
@@ -192,7 +212,7 @@ impl ObjectClient for S3Objects {
                 .set_continuation_token(token.take())
                 .send()
                 .await
-                .map_err(|e| err("list", prefix, aws_sdk_s3::error::DisplayErrorContext(e)))?;
+                .map_err(|e| self.sdk_err("list", prefix, e))?;
             keys.extend(
                 page.contents()
                     .iter()
@@ -218,11 +238,7 @@ impl ObjectClient for S3Objects {
             Ok(_) => Ok(true),
             Err(e) => match e.as_service_error() {
                 Some(se) if se.is_not_found() => Ok(false),
-                _ => Err(err(
-                    "head object",
-                    key,
-                    aws_sdk_s3::error::DisplayErrorContext(e),
-                )),
+                _ => Err(self.sdk_err("head object", key, e)),
             },
         }
     }
@@ -236,7 +252,7 @@ impl ObjectClient for S3Objects {
             .key(key)
             .send()
             .await
-            .map_err(|e| err("get object", key, aws_sdk_s3::error::DisplayErrorContext(e)))?;
+            .map_err(|e| self.sdk_err("get object", key, e))?;
         let mut reader = out.body.into_async_read();
         let mut file = tokio::fs::File::create(to)
             .await
@@ -272,27 +288,191 @@ impl ObjectClient for S3Objects {
             .key(key)
             .send()
             .await
-            .map_err(|e| {
-                err(
-                    "delete object",
-                    key,
-                    aws_sdk_s3::error::DisplayErrorContext(e),
-                )
-            })?;
+            .map_err(|e| self.sdk_err("delete object", key, e))?;
         Ok(())
     }
 
+    async fn delete_many(&self, keys: &[String]) -> Result<(), FaucetError> {
+        let batches: Vec<_> = keys
+            .chunks(MAX_DELETE_KEYS)
+            .map(|batch| self.delete_batch(batch))
+            .collect();
+        futures::stream::iter(batches)
+            .buffer_unordered(self.concurrency.max(1))
+            .try_collect::<()>()
+            .await
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<(), FaucetError> {
-        self.roundtrips.record("copy");
-        self.client
-            .copy_object()
+        self.roundtrips.record("head");
+        let head = self
+            .client
+            .head_object()
             .bucket(&self.bucket)
-            .key(to)
-            .copy_source(copy_source(&self.bucket, from))
+            .key(from)
             .send()
             .await
-            .map_err(|e| err("copy object", to, aws_sdk_s3::error::DisplayErrorContext(e)))?;
+            .map_err(|e| self.sdk_err("head object", from, e))?;
+        let len = head.content_length().and_then(|l| u64::try_from(l).ok());
+        if let Some(len) = len.filter(|&l| l > MAX_COPY_BYTES) {
+            self.copy_multipart(from, to, len).await?;
+        } else {
+            self.roundtrips.record("copy");
+            self.client
+                .copy_object()
+                .bucket(&self.bucket)
+                .key(to)
+                .copy_source(copy_source(&self.bucket, from))
+                .send()
+                .await
+                .map_err(|e| self.sdk_err("copy object", to, e))?;
+        }
         self.delete(from).await
+    }
+}
+
+impl S3Objects {
+    /// One `DeleteObjects` request for up to [`MAX_DELETE_KEYS`] keys. A key
+    /// the store failed to delete fails the batch, typed like a request
+    /// failure so a throttled key is retried.
+    async fn delete_batch(&self, keys: &[String]) -> Result<(), FaucetError> {
+        let Some(first) = keys.first() else {
+            return Ok(());
+        };
+        let objects = keys
+            .iter()
+            .map(|k| ObjectIdentifier::builder().key(k).build())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| err("delete objects", first, e))?;
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(true)
+            .build()
+            .map_err(|e| err("delete objects", first, e))?;
+        self.roundtrips.record("delete");
+        let out = self
+            .client
+            .delete_objects()
+            .bucket(&self.bucket)
+            .delete(delete)
+            .send()
+            .await
+            .map_err(|e| self.sdk_err("delete objects", first, e))?;
+        let Some(failed) = out.errors().first() else {
+            return Ok(());
+        };
+        let key = failed.key().unwrap_or(first);
+        let code = failed.code().unwrap_or("unknown");
+        Err(FaucetError::sink_status(
+            delete_error_status(code),
+            self.describe(key),
+            format!(
+                "S3 delete objects error for key '{key}': {code}: {} ({} of {} keys not deleted)",
+                failed.message().unwrap_or(""),
+                out.errors().len(),
+                keys.len()
+            ),
+        ))
+    }
+
+    /// Copy an object above [`MAX_COPY_BYTES`] with `UploadPartCopy`, up to
+    /// `concurrency` parts at once; aborted on any failure, so `to` is either
+    /// the whole copy or untouched.
+    async fn copy_multipart(&self, from: &str, to: &str, len: u64) -> Result<(), FaucetError> {
+        self.roundtrips.record("copy");
+        let created = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(to)
+            .content_type(content_type(to))
+            .send()
+            .await
+            .map_err(|e| self.sdk_err("start multipart copy", to, e))?;
+        let upload_id = created
+            .upload_id()
+            .ok_or_else(|| err("start multipart copy", to, "no upload id"))?
+            .to_string();
+        let source = copy_source(&self.bucket, from);
+        let parts: Result<Vec<CompletedPart>, FaucetError> =
+            futures::stream::iter(copy_ranges(len).into_iter().enumerate())
+                .map(|(i, range)| {
+                    let (source, upload_id) = (&source, &upload_id);
+                    async move {
+                        let _slot = self
+                            .part_slots
+                            .acquire()
+                            .await
+                            .map_err(|e| err("copy part", to, e))?;
+                        let number = i as i32 + 1;
+                        self.roundtrips.record("copy");
+                        let out = self
+                            .client
+                            .upload_part_copy()
+                            .bucket(&self.bucket)
+                            .key(to)
+                            .upload_id(upload_id)
+                            .part_number(number)
+                            .copy_source(source)
+                            .copy_source_range(format!("bytes={}-{}", range.start, range.end - 1))
+                            .send()
+                            .await
+                            .map_err(|e| self.sdk_err("copy part", to, e))?;
+                        Ok(CompletedPart::builder()
+                            .part_number(number)
+                            .set_e_tag(
+                                out.copy_part_result()
+                                    .and_then(|r| r.e_tag())
+                                    .map(str::to_string),
+                            )
+                            .build())
+                    }
+                })
+                .buffer_unordered(self.concurrency.max(1))
+                .try_collect()
+                .await;
+        self.finish_multipart(to, &upload_id, parts).await
+    }
+
+    /// Complete a multipart upload with `parts`, or abort it when they
+    /// failed.
+    async fn finish_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: Result<Vec<CompletedPart>, FaucetError>,
+    ) -> Result<(), FaucetError> {
+        match parts {
+            Ok(mut parts) => {
+                parts.sort_by_key(|p| p.part_number());
+                self.roundtrips.record("put");
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(parts))
+                            .build(),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| self.sdk_err("complete multipart", key, e))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self
+                    .client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -314,6 +494,7 @@ mod tests {
                 "k", "s", None, None, "test",
             ))
             .force_path_style(true)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .build();
         S3Objects {
             client: Client::from_conf(conf),
@@ -321,6 +502,7 @@ mod tests {
             concurrency: 1,
             part_bytes: PART_BYTES,
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            part_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -353,5 +535,351 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("S3 create local copy error for key 'k'"), "{e}");
+    }
+
+    #[test]
+    fn copy_ranges_are_contiguous_and_bounded() {
+        let six = 6 * 1024 * 1024 * 1024_u64;
+        let r = copy_ranges(six);
+        assert_eq!(r.len(), 12);
+        assert_eq!(r[0], 0..COPY_PART_BYTES);
+        assert_eq!(r.last().unwrap().end, six);
+        assert!(r.windows(2).all(|w| w[0].end == w[1].start));
+        let huge = 50 * 1024 * 1024 * 1024 * 1024_u64;
+        let r = copy_ranges(huge);
+        assert!(r.len() as u64 <= MAX_PARTS);
+        assert_eq!(r.last().unwrap().end, huge);
+    }
+
+    fn xml(body: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "application/xml")
+            .set_body_string(body.to_string())
+    }
+
+    /// C5 (#783): a promote of an object above 5 GiB — which one `CopyObject`
+    /// refuses — is a multipart `UploadPartCopy` of 512 MiB ranges.
+    #[tokio::test]
+    async fn an_object_above_five_gib_is_copied_in_parts() {
+        use wiremock::matchers::{header_exists, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/b/stage/big"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "6442450944"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/b/out/big"))
+            .and(query_param("uploads", ""))
+            .respond_with(xml(
+                "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>out/big</Key>\
+                 <UploadId>u1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/out/big"))
+            .and(query_param("uploadId", "u1"))
+            .and(header_exists("x-amz-copy-source-range"))
+            .respond_with(xml("<CopyPartResult><ETag>\"e\"</ETag></CopyPartResult>"))
+            .expect(12)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/b/out/big"))
+            .and(query_param("uploadId", "u1"))
+            .respond_with(xml(
+                "<CompleteMultipartUploadResult><Key>out/big</Key></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/b/stage/big"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        o.rename("stage/big", "out/big").await.unwrap();
+        let ranges: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.headers.get("x-amz-copy-source-range"))
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ranges.contains(&"bytes=0-536870911".to_string()),
+            "{ranges:?}"
+        );
+        assert!(
+            ranges.contains(&"bytes=5905580032-6442450943".to_string()),
+            "{ranges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_part_copy_aborts_and_small_objects_use_one_copy() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/b/big"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "6442450944"))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/b/small"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "10"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/b/dst"))
+            .and(query_param("uploads", ""))
+            .respond_with(xml(
+                "<InitiateMultipartUploadResult><UploadId>u2</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/dst"))
+            .and(query_param("uploadId", "u2"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/b/dst"))
+            .and(query_param("uploadId", "u2"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/dst2"))
+            .respond_with(xml(
+                "<CopyObjectResult><ETag>\"e\"</ETag></CopyObjectResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/b/small"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        let e = o.rename("big", "dst").await.unwrap_err();
+        assert!(
+            matches!(e, FaucetError::Sink(ref m) if m.contains("copy part")),
+            "{e}"
+        );
+        o.rename("small", "dst2").await.unwrap();
+    }
+
+    /// M5 (#783): a 503 `SlowDown` is a typed `HttpStatus`, which the
+    /// resilience policy retries; a 403 stays a plain sink error.
+    #[tokio::test]
+    async fn throttling_is_a_typed_retryable_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/b/slow"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(
+                "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/denied"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("f");
+        std::fs::write(&src, b"x").unwrap();
+        let e = o.upload(&src, "slow").await.unwrap_err();
+        match &e {
+            FaucetError::HttpStatus { status, url, body } => {
+                assert_eq!(*status, 503);
+                assert_eq!(url, "s3://b/slow");
+                assert!(
+                    body.contains("S3 put object error for key 'slow'"),
+                    "{body}"
+                );
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+        assert_eq!(
+            faucet_core::resilience::classify(&e),
+            Some(faucet_core::resilience::RetryClass::Http5xx)
+        );
+        let e = o.upload(&src, "denied").await.unwrap_err();
+        assert!(matches!(e, FaucetError::Sink(_)), "{e:?}");
+    }
+
+    /// #783: `delete_many` sends one `DeleteObjects` per 1,000 keys.
+    #[tokio::test]
+    async fn deletes_are_batched_a_thousand_keys_per_request() {
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("^/b/?$"))
+            .and(query_param("delete", ""))
+            .respond_with(xml("<DeleteResult></DeleteResult>"))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        let keys: Vec<String> = (0..2_500).map(|i| format!("p/{i}.jsonl")).collect();
+        o.delete_many(&keys).await.unwrap();
+        let mut sizes: Vec<usize> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).matches("<Key>").count())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![500, 1_000, 1_000]);
+        o.delete_many(&[]).await.unwrap();
+        o.delete_batch(&[]).await.unwrap();
+    }
+
+    /// #783: a key `DeleteObjects` did not delete fails the call; a throttled
+    /// key is a typed retryable status, a denied one a plain sink error.
+    #[tokio::test]
+    async fn a_key_that_was_not_deleted_is_an_error() {
+        use wiremock::matchers::{body_string_contains, method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("^/b/?$"))
+            .and(query_param("delete", ""))
+            .and(body_string_contains("slow"))
+            .respond_with(xml(
+                "<DeleteResult><Error><Key>slow</Key><Code>SlowDown</Code>\
+                 <Message>Reduce your request rate.</Message></Error></DeleteResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("^/b/?$"))
+            .and(query_param("delete", ""))
+            .and(body_string_contains("denied"))
+            .respond_with(xml(
+                "<DeleteResult><Error><Key>denied</Key><Code>AccessDenied</Code>\
+                 <Message>Access Denied</Message></Error></DeleteResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("^/b/?$"))
+            .and(query_param("delete", ""))
+            .and(body_string_contains("broken"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        let e = o
+            .delete_many(&["a".into(), "slow".into()])
+            .await
+            .unwrap_err();
+        match &e {
+            FaucetError::HttpStatus { status, url, body } => {
+                assert_eq!(*status, 503);
+                assert_eq!(url, "s3://b/slow");
+                assert!(body.contains("SlowDown"), "{body}");
+                assert!(body.contains("1 of 2 keys not deleted"), "{body}");
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+        let e = o.delete_many(&["denied".into()]).await.unwrap_err();
+        assert!(
+            matches!(e, FaucetError::Sink(ref m) if m.contains("AccessDenied")),
+            "{e:?}"
+        );
+        let e = o.delete_many(&["broken".into()]).await.unwrap_err();
+        assert!(
+            matches!(e, FaucetError::HttpStatus { status: 500, .. }),
+            "{e:?}"
+        );
+        assert_eq!(delete_error_status("InternalError"), Some(500));
+        assert_eq!(delete_error_status("ServiceUnavailable"), Some(503));
+    }
+
+    /// #783: every `UploadPartCopy` takes a permit from the sink's part
+    /// budget, so no part is copied while the budget is spent.
+    #[tokio::test]
+    async fn a_multipart_copy_waits_for_the_part_budget() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/b/big"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "6442450944"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/b/dst"))
+            .and(query_param("uploads", ""))
+            .respond_with(xml(
+                "<InitiateMultipartUploadResult><UploadId>u3</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/dst"))
+            .and(query_param("uploadId", "u3"))
+            .respond_with(xml("<CopyPartResult><ETag>\"e\"</ETag></CopyPartResult>"))
+            .expect(12)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/b/dst"))
+            .and(query_param("uploadId", "u3"))
+            .respond_with(xml(
+                "<CompleteMultipartUploadResult><Key>dst</Key></CompleteMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/b/big"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let mut o = objects(&server.uri());
+        o.concurrency = 4;
+        let o = Arc::new(o);
+        let held = o.part_slots.clone().acquire_owned().await.unwrap();
+        let task = tokio::spawn({
+            let o = o.clone();
+            async move { o.rename("big", "dst").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let copied = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.headers.contains_key("x-amz-copy-source-range"))
+            .count();
+        assert_eq!(copied, 0, "a part was copied without a permit");
+        assert!(!task.is_finished());
+        drop(held);
+        task.await.unwrap().unwrap();
+        o.part_slots.close();
+        let e = o
+            .copy_multipart("big", "dst", 6_442_450_944)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("copy part"), "{e}");
     }
 }

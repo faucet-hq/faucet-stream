@@ -138,7 +138,7 @@ only a sink that dedups by key can honour them.
 
 A child stream (`parent:`) runs once **per parent record** into the same
 destination. On a sink that replaces its output on every invocation — a
-`file` sink in `mode: overwrite` (its default) writing one fixed path — every
+`file` sink in `if_exists: replace` (its default) writing one fixed path — every
 parent's invocation would wipe the previous one's
 rows, leaving only the last parent's. So the composer refuses:
 
@@ -160,7 +160,7 @@ each parent invocation would replace the output, keeping only the last parent's 
 `faucet validate` / `run` apply the same rule to hand-written configs and to
 deployment overlays: a `parent:` or `fan_out:` row whose truncating file sink
 writes one fixed path (no `${parent.*}`-style token; `${now.*}` does not count)
-is refused. Set `mode: append`, or put a per-parent token in the path.
+is refused. Set `if_exists: append`, or put a per-parent token in the path.
 
 ## Composition and the compatibility matrix
 

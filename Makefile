@@ -4,7 +4,7 @@
 COMPOSE := docker compose -f examples/docker-compose.yml
 # Slim feature set for the demo so it builds fast and needs no native libs
 # (avoids the Kafka/librdkafka cmake dependency in the full build).
-DEMO_FEATURES := source-csv,sink-jsonl,sink-stdout,transforms
+DEMO_FEATURES := source-file,sink-file,file-format-csv,sink-stdout,transforms
 FAUCET_DEMO := cargo run -q -p faucet-cli --no-default-features --features "$(DEMO_FEATURES)" --
 
 .DEFAULT_GOAL := help
@@ -29,7 +29,7 @@ demo: ## Run a no-infrastructure smoke test (CSV -> JSONL)
 	@cat target/demo/out.jsonl
 
 bench-build: ## Build the release faucet binary used by the benchmark harness
-	cargo build -p faucet-cli --release --no-default-features --features "source-csv,sink-jsonl,source-postgres,sink-postgres"
+	cargo build -p faucet-cli --release --no-default-features --features "source-file,sink-file,file-format-csv,source-postgres,sink-postgres"
 
 bench: bench-build ## Run the Meltano comparison benchmark (1M rows, CSV->JSONL) — see BENCHMARKS.md
 	scripts/run-bench.sh

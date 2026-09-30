@@ -133,13 +133,18 @@ jobs:
       # skips already-published crates — so the cure is to retry it with a
       # cool-down between attempts, letting the limit refill so each attempt
       # resumes where the last stopped. Because the NEW-crate limit is the
-      # binding one (~1 / 10 min), each cool-down is ~11 minutes and there are
-      # FOUR attempts total — enough to clear a burst of 5 new crates plus ~3
-      # more. The common case (a handful of crates, no new names) publishes on
-      # attempt 1 and never sleeps. A release adding more than ~8 new crates at
-      # once could still exhaust every attempt; if so the job fails loudly and a
-      # maintainer re-runs it (idempotent) or uses the manual `release.yml`.
-      - name: Publish to crates.io (attempt 1)
+      # binding one (~1 / 10 min), each cool-down is ~11 minutes, and the job
+      # keeps retrying until the publish succeeds or ~2 hours have passed —
+      # enough for a burst of 5 new crates plus ~10 more. The common case (a
+      # handful of crates, no new names) publishes on the first attempt and
+      # never sleeps. If the cap is hit the job fails loudly; a maintainer
+      # re-runs it (idempotent) or uses the manual `release.yml`.
+      - name: Record the publish start time
+        run: echo "PUBLISH_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      # The action installs release-plz and configures git; the retry loop
+      # below reuses both.
+      - name: Publish to crates.io (first attempt)
         id: publish1
         continue-on-error: true
         uses: release-plz/action@v0.5
@@ -155,64 +160,26 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Cool-down for crates.io rate-limit refill (before attempt 2)
+      - name: Publish to crates.io (retry until done, ~2h cap)
         if: steps.publish1.outcome == 'failure'
-        run: |
-          echo "::warning::release-plz publish exited non-zero (commonly a crates.io 429). Waiting 11m for the new-crate rate-limit window (~1 new crate / 10 min) to refill, then retrying idempotently."
-          sleep 660
-
-      - name: Publish to crates.io (attempt 2)
-        id: publish2
-        if: steps.publish1.outcome == 'failure'
-        continue-on-error: true
-        uses: release-plz/action@v0.5
-        with:
-          command: release
-          config: release-plz.toml
-        env:
-          # Prefer the RELEASE_PLZ_TOKEN PAT when configured: refs (per-crate
-          # tags) pushed with the default GITHUB_TOKEN do NOT trigger other
-          # workflows, so release-binaries.yml never fires automatically after
-          # a publish. A PAT-pushed tag triggers it normally. Falls back to
-          # GITHUB_TOKEN (today's behavior: trigger release-binaries manually).
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Cool-down for crates.io rate-limit refill (before attempt 3)
-        if: steps.publish1.outcome == 'failure' && steps.publish2.outcome == 'failure'
-        run: |
-          echo "::warning::publish still incomplete after 2 attempts. Waiting 11m for another new-crate rate-limit window to refill, then retrying idempotently."
-          sleep 660
-
-      - name: Publish to crates.io (attempt 3)
-        id: publish3
-        if: steps.publish1.outcome == 'failure' && steps.publish2.outcome == 'failure'
-        continue-on-error: true
-        uses: release-plz/action@v0.5
-        with:
-          command: release
-          config: release-plz.toml
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Cool-down for crates.io rate-limit refill (before final attempt)
-        if: steps.publish1.outcome == 'failure' && steps.publish2.outcome == 'failure' && steps.publish3.outcome == 'failure'
+          COOL_DOWN_SECS: "660"
+          CAP_SECS: "7200"
         run: |
-          echo "::warning::publish still incomplete after 3 attempts. Waiting 11m for a final new-crate rate-limit window to refill, then making a final idempotent attempt."
-          sleep 660
-
-      - name: Publish to crates.io (final attempt)
-        if: steps.publish1.outcome == 'failure' && steps.publish2.outcome == 'failure' && steps.publish3.outcome == 'failure'
-        uses: release-plz/action@v0.5
-        with:
-          command: release
-          config: release-plz.toml
-        env:
-          # Prefer the RELEASE_PLZ_TOKEN PAT when configured: refs (per-crate
-          # tags) pushed with the default GITHUB_TOKEN do NOT trigger other
-          # workflows, so release-binaries.yml never fires automatically after
-          # a publish. A PAT-pushed tag triggers it normally. Falls back to
-          # GITHUB_TOKEN (today's behavior: trigger release-binaries manually).
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          deadline=$(( PUBLISH_STARTED + CAP_SECS ))
+          attempt=2
+          while true; do
+            if (( $(date +%s) + COOL_DOWN_SECS > deadline )); then
+              echo "::error::crates.io publish still incomplete after $((attempt - 1)) attempts and the ~2h cap; re-run this job (idempotent) or use the manual release.yml."
+              exit 1
+            fi
+            echo "::warning::publish attempt $((attempt - 1)) exited non-zero (commonly a crates.io 429). Waiting ${COOL_DOWN_SECS}s for the new-crate rate-limit window to refill, then retrying idempotently."
+            sleep "$COOL_DOWN_SECS"
+            if release-plz release --git-token "$GITHUB_TOKEN" --config release-plz.toml -o json; then
+              echo "publish completed on attempt $attempt"
+              exit 0
+            fi
+            attempt=$(( attempt + 1 ))
+          done

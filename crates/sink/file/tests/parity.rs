@@ -33,15 +33,6 @@ async fn pages(s: &dyn Sink, pages: &[Vec<Value>]) -> Result<(), String> {
     s.flush().await.map_err(|e| e.to_string())
 }
 
-#[tokio::test]
-async fn max_rows_per_file_is_accepted_for_max_records_per_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg: faucet_sink_file::FileSinkConfig =
-        serde_json::from_value(json!({"path": p(dir.path(), "a.jsonl"), "max_rows_per_file": 2}))
-            .unwrap();
-    assert_eq!(cfg.max_records_per_file, Some(2));
-}
-
 fn read_parquet(path: &str) -> (Vec<Value>, parquet::file::metadata::ParquetMetaData) {
     let file = std::fs::File::open(path).unwrap();
     let builder =

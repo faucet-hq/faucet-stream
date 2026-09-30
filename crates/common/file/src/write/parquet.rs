@@ -5,9 +5,8 @@
 //! under the wider schema, with the new column null. A field that changes type
 //! is an error naming the field.
 
-use super::backend::Area;
-use super::encode::Ctx;
-use super::layout::{io_err, tmp_path};
+use super::encode::{Ctx, Failure, create_scratch, remove_fetched};
+use super::layout::{OLD_ROLE, io_err, tmp_path};
 use super::options::{ParquetCodec, ParquetField, ParquetOptions, ParquetType};
 use arrow::array::{RecordBatch, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -65,76 +64,101 @@ impl ParquetState {
         faucet_core::columnar::values_to_record_batch(records, schema)
     }
 
+    /// Whether a writer is open (the file has rows not yet closed).
+    pub fn is_open(&self) -> bool {
+        self.writer.is_some()
+    }
+
     /// Append `batch`. When the file's schema must widen, or the file was
-    /// finalised and is being continued, the rows already written are copied
-    /// into a new writer first.
+    /// published and is being continued from the local copy at `existing`,
+    /// the rows already written are copied into a new writer first. A batch
+    /// that does not fit the schema is refused before anything is written.
     pub fn write(
         &mut self,
         ctx: &Ctx<'_>,
-        area: Area,
-        name: &str,
+        label: &str,
         tmp: &Path,
-        finalized: bool,
+        existing: Option<&Path>,
         batch: &RecordBatch,
-    ) -> Result<(), FaucetError> {
+    ) -> Result<(), Failure> {
         let target = match (&ctx.parquet.schema, &self.schema) {
             (Some(fields), _) => {
                 let schema = explicit_schema(fields);
-                reject_unknown(&schema, batch.schema().fields().iter().map(|f| f.name()))?;
+                reject_unknown(&schema, batch.schema().fields().iter().map(|f| f.name()))
+                    .map_err(Failure::Clean)?;
                 schema
             }
-            (None, Some(current)) => merge(current, batch.schema_ref())?,
+            (None, Some(current)) => merge(current, batch.schema_ref()).map_err(Failure::Clean)?,
             (None, None) => nullable(batch.schema_ref()),
         };
+        let batch = project(batch, &target).map_err(Failure::Clean)?;
         let widened = self
             .schema
             .as_ref()
             .is_some_and(|s| s.fields() != target.fields());
         if self.writer.is_none() || widened {
-            let old = tmp_path(tmp, ".old");
-            let carried = match self.writer.take() {
-                Some(w) => {
-                    w.close().map_err(|e| pq_err(tmp, e))?;
-                    std::fs::rename(tmp, &old).map_err(|e| io_err("renaming", tmp, e))?;
-                    Some(None)
-                }
-                None if finalized && ctx.backend.exists(area, name)? => {
-                    Some(Some(ctx.decompress(ctx.read_existing(area, name, &old)?)?))
-                }
-                None => None,
-            };
-            let mut writer = open_writer(tmp, &target, ctx.parquet)?;
-            match carried {
-                Some(None) => {
-                    let file = File::open(&old).map_err(|e| io_err("opening", &old, e))?;
-                    let r = copy_into(&old, file, &target, &mut writer);
-                    let _ = std::fs::remove_file(&old);
-                    r?;
-                }
-                Some(Some(bytes)) => {
-                    copy_into(tmp, bytes::Bytes::from(bytes), &target, &mut writer)?
-                }
-                None => {}
-            }
-            self.writer = Some(writer);
-            self.schema = Some(target.clone());
+            self.reopen(ctx, label, tmp, existing, &target)
+                .map_err(Failure::Dirty)?;
         }
-        let batch = project(batch, &target)?;
         self.writer
             .as_mut()
             .expect("writer opened above")
             .write(&batch)
-            .map_err(|e| pq_err(tmp, e))
+            .map_err(|e| Failure::Dirty(pq_err(tmp, e)))
     }
 
-    /// Finish the file at `tmp`, syncing it when `sync`. `false` when nothing
-    /// is open.
-    pub fn close(&mut self, tmp: &Path, sync: bool) -> Result<bool, FaucetError> {
+    /// Open a writer for `target` at `tmp`, carrying over the rows of the
+    /// open writer or of the stored file at `existing`.
+    fn reopen(
+        &mut self,
+        ctx: &Ctx<'_>,
+        label: &str,
+        tmp: &Path,
+        existing: Option<&Path>,
+        target: &SchemaRef,
+    ) -> Result<(), FaucetError> {
+        let old = tmp_path(tmp, OLD_ROLE);
+        let carried = match self.writer.take() {
+            Some(w) => {
+                w.close().map_err(|e| pq_err(tmp, e))?;
+                std::fs::rename(tmp, &old).map_err(|e| io_err("renaming", tmp, e))?;
+                Carry::File(old.clone())
+            }
+            None => match existing {
+                Some(path) => {
+                    let stored = ctx.read_stored(path, label);
+                    remove_fetched(path);
+                    Carry::Bytes(ctx.decompress(stored?)?)
+                }
+                None => Carry::Nothing,
+            },
+        };
+        let result = (|| -> Result<ArrowWriter<File>, FaucetError> {
+            let mut writer = open_writer(tmp, target, ctx)?;
+            match carried {
+                Carry::File(path) => {
+                    let file = File::open(&path).map_err(|e| io_err("opening", &path, e))?;
+                    copy_into(&path, file, target, &mut writer)?;
+                }
+                Carry::Bytes(bytes) => {
+                    copy_into(tmp, bytes::Bytes::from(bytes), target, &mut writer)?
+                }
+                Carry::Nothing => {}
+            }
+            Ok(writer)
+        })();
+        let _ = std::fs::remove_file(&old);
+        self.writer = Some(result?);
+        self.schema = Some(target.clone());
+        Ok(())
+    }
+
+    /// Finish the file at `tmp`. `false` when nothing is open.
+    pub fn close(&mut self, tmp: &Path) -> Result<bool, FaucetError> {
         let Some(writer) = self.writer.take() else {
             return Ok(false);
         };
-        let file = writer.into_inner().map_err(|e| pq_err(tmp, e))?;
-        super::encode::sync_if(&file, tmp, sync)?;
+        writer.into_inner().map_err(|e| pq_err(tmp, e))?;
         Ok(true)
     }
 
@@ -144,12 +168,19 @@ impl ParquetState {
     }
 }
 
+/// Rows a new writer starts from.
+enum Carry {
+    Nothing,
+    File(std::path::PathBuf),
+    Bytes(Vec<u8>),
+}
+
 fn open_writer(
     tmp: &Path,
     schema: &SchemaRef,
-    opts: &ParquetOptions,
+    ctx: &Ctx<'_>,
 ) -> Result<ArrowWriter<File>, FaucetError> {
-    let compression = match opts.compression {
+    let compression = match ctx.parquet_codec {
         ParquetCodec::None => Compression::UNCOMPRESSED,
         ParquetCodec::Snappy => Compression::SNAPPY,
         ParquetCodec::Gzip => Compression::GZIP(GzipLevel::default()),
@@ -158,9 +189,9 @@ fn open_writer(
     };
     let props = WriterProperties::builder()
         .set_compression(compression)
-        .set_max_row_group_row_count(Some(opts.row_group_size))
+        .set_max_row_group_row_count(Some(ctx.parquet.row_group_size))
         .build();
-    let file = File::create(tmp).map_err(|e| io_err("creating", tmp, e))?;
+    let file = create_scratch(tmp, ctx.private())?;
     ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| pq_err(tmp, e))
 }
 
@@ -220,7 +251,6 @@ fn merge(current: &SchemaRef, incoming: &Schema) -> Result<SchemaRef, FaucetErro
     Ok(nullable(&merged))
 }
 
-/// Every field, recursively, made nullable.
 /// The Arrow schema an explicit `parquet.schema` declares.
 pub(crate) fn explicit_schema(fields: &[ParquetField]) -> SchemaRef {
     use arrow::datatypes::TimeUnit;
@@ -271,6 +301,7 @@ fn reject_unknown<'a>(
     )))
 }
 
+/// Every field, recursively, made nullable.
 fn nullable(schema: &Schema) -> SchemaRef {
     fn field(f: &Field) -> Field {
         let dt = match f.data_type() {

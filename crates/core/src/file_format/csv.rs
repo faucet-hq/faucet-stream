@@ -57,7 +57,7 @@ pub struct CsvRowReader<R> {
     has_headers: bool,
     flexible: bool,
     null_values: Vec<String>,
-    line: usize,
+    records: usize,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin + Send> CsvRowReader<R> {
@@ -86,14 +86,14 @@ impl<R: tokio::io::AsyncRead + Unpin + Send> CsvRowReader<R> {
             has_headers: opts.has_headers,
             flexible,
             null_values: opts.null_values.clone(),
-            line: 0,
+            records: 0,
         })
     }
 
     /// The next row, or `None` at the end of the input.
     pub async fn next_record(&mut self) -> Result<Option<Value>, FaucetError> {
         loop {
-            self.line += 1;
+            self.records += 1;
             let more = self
                 .inner
                 .read_record(&mut self.record)
@@ -114,16 +114,26 @@ impl<R: tokio::io::AsyncRead + Unpin + Send> CsvRowReader<R> {
         }
     }
 
+    /// Where a failed read was: the physical line when the parser knows it
+    /// (a quoted field can span lines, so records are not lines), else the
+    /// record number.
+    fn location(&self, e: &csv_async::Error) -> String {
+        match e.position() {
+            Some(p) => format!("line {}", p.line()),
+            None => format!("record {}", self.records),
+        }
+    }
+
     fn parse_error(&self, e: csv_async::Error) -> FaucetError {
+        let at = self.location(&e);
         if !self.flexible && matches!(e.kind(), csv_async::ErrorKind::UnequalLengths { .. }) {
             FaucetError::Source(format!(
-                "csv: ragged row at line {}: {e} — a short or long row is a structural defect \
+                "csv: ragged row at {at}: {e} — a short or long row is a structural defect \
                  that would silently misalign fields; fix the file or set `csv.flexible: true` \
-                 to accept uneven rows",
-                self.line
+                 to accept uneven rows"
             ))
         } else {
-            FaucetError::Source(format!("csv: parse error at line {}: {e}", self.line))
+            FaucetError::Source(format!("csv: parse error at {at}: {e}"))
         }
     }
 }
@@ -313,6 +323,14 @@ mod tests {
         let err = decode_with(b"a,b\n1,2\n3\n", &o, true).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ragged row at line 3"), "{msg}");
+        let multi = decode_with(b"a,b\n\"x\ny\",2\n3\n", &o, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            multi.contains("ragged row at line 4"),
+            "the physical line: {multi}"
+        );
         assert!(msg.contains("csv.flexible"), "{msg}");
         let lenient = decode_with(b"a,b\n1,2\n3\n", &CsvOptions::default(), false)
             .await
@@ -372,9 +390,10 @@ mod tests {
     }
 
     #[test]
-    fn write_headers_is_another_name_for_has_headers() {
-        let o: CsvOptions = serde_json::from_value(json!({"write_headers": false})).unwrap();
+    fn has_headers_has_one_name() {
+        let o: CsvOptions = serde_json::from_value(json!({"has_headers": false})).unwrap();
         assert!(!o.has_headers);
         assert_eq!(o.on_unknown_field, super::super::CsvUnknownField::Widen);
+        assert!(serde_json::from_value::<CsvOptions>(json!({"write_headers": false})).is_err());
     }
 }

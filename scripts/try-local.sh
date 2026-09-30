@@ -54,7 +54,7 @@ SERVE_PORT=8899
 # console + persistent history + lineage + catalog. Pure-Rust deps only, so it
 # builds in a few minutes with no cmake / DuckDB / librdkafka. `--full` swaps in
 # the everything build (Kafka, gRPC, cloud, DuckDB SQL — needs cmake, ~15-30min).
-LIGHT_FEATURES="source-csv,source-sqlite,source-parquet,sink-jsonl,sink-csv,sink-stdout,sink-sqlite,sink-parquet,transforms,quality,contract,masking,serve,serve-ui,serve-history-sqlite,lineage,catalog,schedule,triggers,templates,tenants"
+LIGHT_FEATURES="source-file,sink-file,file-format-csv,file-format-parquet,source-sqlite,sink-stdout,sink-sqlite,transforms,quality,contract,masking,serve,serve-ui,serve-history-sqlite,lineage,catalog,schedule,triggers,templates,tenants"
 BUILD_FEATURES="$LIGHT_FEATURES"
 
 while [ $# -gt 0 ]; do

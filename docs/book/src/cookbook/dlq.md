@@ -231,8 +231,9 @@ else, including non-envelope lines, is left untouched.
 
 DLQ envelopes carry failed records **verbatim** — on a shared or
 compliance-scoped host that can be a plaintext-at-rest gap. When the DLQ sink
-is `jsonl`, seal every envelope line with AES-256-GCM (requires a build with
-the `encryption` feature — included in `--features full`):
+is a `file` sink writing JSON Lines (or the deprecated `jsonl` sink), seal every
+envelope line with AES-256-GCM (requires a build with the `encryption` feature —
+included in `--features full`):
 
 ```yaml
 dlq:
@@ -246,9 +247,11 @@ dlq:
 ```
 
 Each record line is encrypted individually and written base64-encoded, so the
-file stays line-oriented and append-safe. `encryption` is mutually exclusive
-with the jsonl sink's `compression` (per-line sealed records cannot form a
-valid gzip/zstd stream).
+file stays line-oriented and append-safe. Keep the DLQ uncompressed: with
+`compression` (or a `.gz` / `.zst` path) the file sink seals the whole file
+instead of each line, which `faucet dlq` and `faucet status` cannot read line by
+line — so a `file` DLQ with both `compression` and `encryption` is refused when
+the config loads. (The jsonl sink refuses the combination outright.)
 
 The `faucet dlq` verbs handle sealed files transparently:
 
@@ -256,7 +259,8 @@ The `faucet dlq` verbs handle sealed files transparently:
   also try rotated keys). Without a key, sealed lines are counted and reported
   as *encrypted* — never mistaken for malformed lines, never mangled.
 - `replay` — picks the key up **automatically** from the config's own
-  `dlq:` jsonl `encryption` block; `--encryption-key` overrides.
+  `dlq:` block's `encryption` (a JSON Lines `file` sink or a `jsonl` sink);
+  `--encryption-key` overrides.
 - `discard` keeps and archives lines **verbatim** (still sealed) — filtering
   decrypts only in memory; nothing is ever re-written in plaintext.
 

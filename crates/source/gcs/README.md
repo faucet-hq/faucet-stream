@@ -304,9 +304,10 @@ pipeline:
 `parquet.columns` decodes only the named top-level columns. The projection is
 applied from the footer before any row group is read, on the ranged path and on
 the whole-object path alike, so unread columns are never transferred or
-decoded. A name an object does not have fails the run with an error naming the
-object and its columns. Names containing dots are matched as whole column
-names.
+decoded. An empty list is refused when the source is built (it would decode no
+column at all). A name an object does not have fails the run with an error
+naming the object and its columns. Names containing dots are matched as whole
+column names.
 
 ```yaml
 file_format: parquet

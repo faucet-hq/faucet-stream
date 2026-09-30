@@ -50,7 +50,7 @@ async fn sink(server: &MockServer, fields: Value) -> GcsSink {
 }
 
 fn overwrite() -> Value {
-    json!({"path": "d/", "mode": "overwrite", "write_mode": "overwrite"})
+    json!({"path": "d/", "if_exists": "replace", "write_mode": "overwrite"})
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -68,7 +68,7 @@ async fn a_refused_listing_fails_the_overwrite_abort() {
     );
     let e = s.abort_overwrite().await.unwrap_err().to_string();
     assert!(
-        e.contains("GCS list error for key 'd/.faucet-overwrite-"),
+        e.contains("GCS get metadata error for key 'd/.faucet-overwrite-"),
         "{e}"
     );
 }
@@ -76,6 +76,12 @@ async fn a_refused_listing_fails_the_overwrite_abort() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_delete_fails_the_overwrite_abort() {
     let server = MockServer::start().await;
+    mount(
+        &server,
+        |r: &Request| r.url.path().ends_with(".faucet-commit"),
+        ResponseTemplate::new(404),
+    )
+    .await;
     mount(
         &server,
         is("GET"),
@@ -86,12 +92,18 @@ async fn a_refused_delete_fails_the_overwrite_abort() {
     let s = sink(&server, overwrite()).await;
     let e = s.abort_overwrite().await.unwrap_err().to_string();
     assert!(e.contains("GCS delete error for key"), "{e}");
-    assert!(e.contains(".faucet-staging"), "{e}");
+    assert!(e.contains(".faucet-swap"), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn aborting_an_overwrite_deletes_the_staging_marker() {
+async fn aborting_an_overwrite_deletes_the_swap_marker() {
     let server = MockServer::start().await;
+    mount(
+        &server,
+        |r: &Request| r.url.path().ends_with(".faucet-commit"),
+        ResponseTemplate::new(404),
+    )
+    .await;
     mount(
         &server,
         is("GET"),
@@ -111,6 +123,21 @@ async fn aborting_an_overwrite_deletes_the_staging_marker() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_rewrite_fails_the_overwrite_commit() {
     let server = MockServer::start().await;
+    mount(
+        &server,
+        |r: &Request| r.url.path().ends_with(".faucet-commit"),
+        ResponseTemplate::new(404),
+    )
+    .await;
+    mount(
+        &server,
+        |r: &Request| r.method.as_str() == "POST" && r.url.path().starts_with("/upload/"),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "name": "d/x/.faucet-commit", "bucket": BUCKET, "generation": "1",
+            "metageneration": "1", "size": "0"
+        })),
+    )
+    .await;
     Mock::given(|r: &Request| r.method.as_str() == "GET" && r.url.path().ends_with("/o"))
         .respond_with(|r: &Request| {
             let prefix = query(r, "prefix").unwrap_or_default();
@@ -122,7 +149,7 @@ async fn a_refused_rewrite_fails_the_overwrite_commit() {
     mount(
         &server,
         is("GET"),
-        ResponseTemplate::new(200).set_body_json(json!({"name": "d/x/.faucet-staging"})),
+        ResponseTemplate::new(200).set_body_json(json!({"name": "d/x/.faucet-swap"})),
     )
     .await;
     mount(&server, is("POST"), denied()).await;
@@ -173,8 +200,10 @@ async fn a_part_token_in_the_directory_is_a_config_error() {
     assert!(e.contains("may appear only in the file name"), "{e}");
 }
 
+/// #783 L7: an object extended after a flush is continued from the local
+/// copy of what was published, not downloaded again.
 #[tokio::test(flavor = "multi_thread")]
-async fn continuing_an_object_that_cannot_be_read_back_is_an_error() {
+async fn continuing_an_object_needs_no_download() {
     let server = MockServer::start().await;
     mount(
         &server,
@@ -194,12 +223,16 @@ async fn continuing_an_object_that_cannot_be_read_back_is_an_error() {
     let s = sink(&server, json!({"path": "one.jsonl"})).await;
     s.write_batch(&[json!({"a": 1})]).await.unwrap();
     s.flush().await.expect("first object published");
-    let e = match s.write_batch(&[json!({"a": 2})]).await {
-        Ok(_) => s.flush().await.unwrap_err(),
-        Err(e) => e,
-    }
-    .to_string();
-    assert!(e.contains("GCS get error for key 'one.jsonl'"), "{e}");
+    s.write_batch(&[json!({"a": 2})]).await.unwrap();
+    s.flush().await.expect("extended without a download");
+    let downloads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| query(r, "alt").as_deref() == Some("media"))
+        .count();
+    assert_eq!(downloads, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

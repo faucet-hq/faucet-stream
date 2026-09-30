@@ -83,7 +83,7 @@ This writes `s3://my-data-lake/events/raw/<uuid>.jsonl` objects, each holding up
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_records_per_file` | int | *(unset)* | Maximum records per object. When unset, all records in a `write_batch` call go to one object. |
-| `concurrency` | int | `10` | Maximum uploads in flight (objects, and a large object's multipart parts). See [Streaming & batching](#streaming--batching). |
+| `concurrency` | int | `10` | Maximum uploads in flight: up to `concurrency` objects, each sending up to `concurrency` multipart parts, so at most `concurrency²` part requests (100 at the default). See [Streaming & batching](#streaming--batching). |
 | `batch_size` | int | `1000` | Records per object when `max_records_per_file` is unset (without `path`). `0` = no record cap: one object per `flush` (Parquet: one per `write_batch`) — see [Streaming & batching](#streaming--batching). |
 
 ### Format (compression feature)
@@ -440,21 +440,24 @@ This sink writes through the same file-writing layer as the local
 [`file` sink](https://crates.io/crates/faucet-sink-file), so it takes every
 format and option the file sink does, with the same field names:
 
+**Experimental** (PRINCIPLES.md §3): this block's shape may change in a minor release; any change is called out in the changelog.
+
 | Field | Values | Notes |
 |---|---|---|
 | `format` | `json_lines` (default), `json_array`, `csv`, `xml`, `xlsx`, `avro`, `parquet`, `raw_text`, `auto` | `auto` takes the format from `path`'s extension (else `file_extension`), looking through `.gz` / `.zst`. `parquet` needs the `arrow` feature; the other shared formats their `file-format-*` feature. |
 | `path` | a name template | object name template: `{part}` numbers the objects, `${now.*}` tokens work, a trailing `/` is a directory of `part-{part}<extension>` objects. |
-| `mode` | `overwrite` (default), `append`, `error_if_exists` | What happens when an object of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. |
-| `write_mode` | `append` (default), `overwrite` | `overwrite` stages the run's objects under a hidden `.faucet-overwrite-…/` prefix and swaps them in only after a successful run; a failed run leaves the old output untouched. |
+| `if_exists` | `replace` (default), `append`, `error` | What happens when an object of the same name exists. `append` works for JSON Lines, CSV and raw text, or with `{part}` for every format. `mode` is accepted as another name for this key, and `overwrite` / `error_if_exists` for its values. |
+| `write_mode` | `append` (default), `overwrite` | `overwrite` writes the run's objects under a hidden `.faucet-overwrite-…/` prefix and moves them into place only after a successful run; a failed run leaves the old output untouched. The move is one object at a time: a reader listing the prefix while it runs can see new objects beside old ones, and a move that stops half-way is finished by the next run. |
 | `parquet` | `compression` (`none`/`snappy`/`gzip`/`zstd`/`lz4`, default **`zstd`** — the local `file` sink defaults to `snappy`), `row_group_size`, `schema` (explicit fields) | The schema is inferred from each object's first page and widened by later pages. |
 | `json_lines` | `pretty` | |
 | `encryption` | `{ key: … }` | Encrypt at rest (the `encryption` feature); read back by the `file` source. |
+| `scratch_dir` | a local directory | Where objects are built before upload (default: the system temporary directory; a private subdirectory is created in it). JSON Lines and raw text go up as a multipart upload while they are written and need no scratch space; other formats need room for each object being built (up to `concurrency` of them). Scratch files are not encrypted while the run is in progress. |
 
-`mode` and `write_mode: overwrite` need `path`: without it every run
+`if_exists: append` / `error` and `write_mode: overwrite` need `path`: without it every run
 writes new, uniquely named objects (`<run id>-<part><file_extension>`), so
 there is nothing to replace or append to.
 
-**Publishing.** Each object is built in a local scratch file and published
+**Publishing.** JSON Lines and raw text go up as a multipart upload while they are written — memory holds at most `concurrency` parts, and no scratch file is written — and the object becomes visible when it closes. Every other object is built in a local scratch file and published
 with one upload (multipart past 8 MiB, parts in parallel up to `concurrency`, completed only after every part landed and aborted on failure) when it closes — at `max_records_per_file` /
 `max_bytes_per_file` (encoded bytes) or at `flush` — so a reader never sees a
 partial object, and a bookmark never advances past records that are not
@@ -489,7 +492,27 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 
 ## Usage signals (#704)
 
-Every `PutObject` (`put`) is reported to faucet's usage meter as a sink round
-trip and priced as an S3 write request
-(`usage.pricing.object_storage.write_per_1k_requests`); see the
-[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+Every request is reported to faucet's usage meter as a sink round trip, by op:
+
+| Op | Requests | Priced as |
+|---|---|---|
+| `put` | `PutObject`, and each multipart create / part / complete | write (`usage.pricing.object_storage.write_per_1k_requests`) |
+| `copy` | `CopyObject`, and each multipart-copy create / `UploadPartCopy` (an overwrite commit's promote) | write |
+| `list` | each `ListObjectsV2` page (append, overwrite pruning and commit) | read (`read_per_1k_requests`) |
+| `head` | `HeadObject` (existence checks, and the size probe before a promote) | read |
+| `delete` | `DeleteObject` | free (S3 does not bill deletes) |
+
+See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+
+## Server-side copies and retries (#783)
+
+An overwrite commit promotes each staged object with a server-side copy and a
+delete. `CopyObject` copies at most 5 GiB, so a larger object is copied with a
+multipart `UploadPartCopy` in 512 MiB ranges (grown so no copy exceeds 10 000
+parts), `concurrency` at a time, completed only after every part landed and
+aborted on any failure.
+
+A request that fails with HTTP 429 or a 5xx (`SlowDown`,
+`ServiceUnavailable`, …) is reported as a typed `HttpStatus` error, so a
+pipeline [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
+policy retries it; any other failure is a plain sink error.

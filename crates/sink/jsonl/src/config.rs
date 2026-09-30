@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the JSON Lines file sink.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
+#[deprecated(
+    since = "1.4.0",
+    note = "use faucet-sink-file: FileSinkConfig writing a `.jsonl` path"
+)]
 pub struct JsonlSinkConfig {
     /// Path to the output file.
     pub path: PathBuf,

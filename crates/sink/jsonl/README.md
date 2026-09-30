@@ -2,8 +2,9 @@
 
 > **Deprecated.** Use [`faucet-sink-file`](https://crates.io/crates/faucet-sink-file) instead.
 > This crate gets security fixes only until the next major release. In a
-> pipeline config, `type: jsonl` still works: the CLI builds it as
-> `type: file` with `format: json_lines` and warns. The migration table is in
+> pipeline config, `type: jsonl` keeps working on this crate, unchanged — it is
+> not an alias of `type: file` — and the CLI prints a one-line notice naming the
+> replacement (`type: file` with a `.jsonl` path). The migration table is in
 > the [`faucet-sink-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/sink/file/README.md).
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-jsonl.svg)](https://crates.io/crates/faucet-sink-jsonl)

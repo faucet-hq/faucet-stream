@@ -4,15 +4,53 @@ use super::options::PART_TOKEN;
 use faucet_core::{Compression, FaucetError, FileFormat};
 use std::path::{Path, PathBuf};
 
-/// Suffix of a file that is still being written.
+/// Suffix of a file that is still being written. Every other scratch file
+/// the writer makes for the same output adds one of [`SCRATCH_ROLES`] to it.
 pub const TMP_SUFFIX: &str = ".faucet-tmp";
 /// Suffix of a CSV body that is waiting for its header.
 pub const BODY_SUFFIX: &str = ".faucet-tmp-body";
-/// Prefix of the staging area an overwrite run writes into.
-pub const STAGING_PREFIX: &str = ".faucet-overwrite-";
+/// What follows [`TMP_SUFFIX`] on a scratch file's siblings: the CSV body
+/// waiting for its header, the earlier contents while a Parquet file is
+/// rewritten under a wider schema or an existing file is read back, the
+/// sealed copy being written, and the copy of the last published version
+/// kept to continue from.
+pub const SCRATCH_ROLES: &[&str] = &[BODY_ROLE, OLD_ROLE, SEAL_ROLE, PREV_ROLE];
+pub(crate) const BODY_ROLE: &str = "-body";
+pub(crate) const OLD_ROLE: &str = "-old";
+pub(crate) const SEAL_ROLE: &str = "-seal";
+pub(crate) const PREV_ROLE: &str = "-prev";
+/// Prefix of the swap area an overwrite run (`write_mode: overwrite`) writes
+/// into before its files are moved into place.
+pub const SWAP_PREFIX: &str = ".faucet-overwrite-";
+/// Digits in a part number (`00001`).
+pub const PART_WIDTH: usize = 5;
+
+/// Whether `name` (a file name, no directory) is a scratch file of the
+/// shared writer: a file still being written, or one of its siblings. A
+/// reader of the output directory must skip it.
+pub fn is_scratch_name(name: &str) -> bool {
+    scratch_base(name).is_some()
+}
+
+/// Whether `name` (a directory name) is the swap area of an overwrite run,
+/// whose files are not part of the output until the run commits.
+pub fn is_swap_dir_name(name: &str) -> bool {
+    name.starts_with(SWAP_PREFIX)
+}
+
+/// The output file a scratch file belongs to, or `None` when `name` is not a
+/// scratch file.
+fn scratch_base(name: &str) -> Option<&str> {
+    let i = name.rfind(TMP_SUFFIX)?;
+    let role = &name[i + TMP_SUFFIX.len()..];
+    (role.is_empty() || SCRATCH_ROLES.contains(&role)).then_some(&name[..i])
+}
 
 /// The file-name template of one output set. `{part}` is present when the
 /// output is numbered.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameTemplate {
     /// The template, e.g. `part-{part}.jsonl.gz` or `export.csv`.
@@ -71,7 +109,8 @@ impl NameTemplate {
 
     /// The file name of part `n` (1-based).
     pub fn file_name(&self, n: u64) -> String {
-        self.name.replace(PART_TOKEN, &format!("{n:05}"))
+        self.name
+            .replace(PART_TOKEN, &format!("{n:0width$}", width = PART_WIDTH))
     }
 
     /// The part number `name` carries, or `None` when it is not one of this
@@ -91,14 +130,12 @@ impl NameTemplate {
 
     /// Whether `name` is a scratch file of one of this template's files.
     pub fn owns_scratch(&self, name: &str) -> bool {
-        name.strip_suffix(BODY_SUFFIX)
-            .or_else(|| name.strip_suffix(TMP_SUFFIX))
-            .is_some_and(|base| self.part_of(base).is_some())
+        scratch_base(name).is_some_and(|base| self.part_of(base).is_some())
     }
 
-    /// The staging area's name for an overwrite run of this template: hidden
+    /// The swap area's name for an overwrite run of this template: hidden
     /// and made of path-safe characters.
-    pub fn staging_name(&self) -> String {
+    pub fn swap_dir_name(&self) -> String {
         let tag: String = self
             .name
             .chars()
@@ -110,7 +147,7 @@ impl NameTemplate {
                 }
             })
             .collect();
-        format!("{STAGING_PREFIX}{tag}")
+        format!("{SWAP_PREFIX}{tag}")
     }
 
     /// `(part, name)` of every name in `names` that belongs to this template,
@@ -145,14 +182,14 @@ fn codec_suffix(codec: Compression) -> &'static str {
 }
 
 /// `path` with `suffix` appended to its last component.
-pub fn tmp_path(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn tmp_path(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
 }
 
 /// An I/O error on `path`, as a typed sink error.
-pub fn io_err(what: &str, path: &Path, e: std::io::Error) -> FaucetError {
+pub(crate) fn io_err(what: &str, path: &Path, e: std::io::Error) -> FaucetError {
     FaucetError::Sink(format!("file sink: {what} '{}': {e}", path.display()))
 }
 
@@ -224,13 +261,23 @@ mod tests {
     }
 
     #[test]
-    fn staging_names_scratch_and_selection() {
+    fn swap_names_scratch_and_selection() {
         let (_, l) = t("out/x y-{part}.jsonl", false);
-        assert_eq!(l.staging_name(), ".faucet-overwrite-x_y-_part_.jsonl");
-        assert!(l.owns_scratch("x y-00003.jsonl.faucet-tmp"));
-        assert!(l.owns_scratch("x y-00004.jsonl.faucet-tmp-body"));
+        assert_eq!(l.swap_dir_name(), ".faucet-overwrite-x_y-_part_.jsonl");
+        assert!(is_swap_dir_name(&l.swap_dir_name()));
+        assert!(!is_swap_dir_name("x y-00001.jsonl"));
+        for role in ["", "-body", "-old", "-seal", "-prev"] {
+            let n = format!("x y-00003.jsonl.faucet-tmp{role}");
+            assert!(l.owns_scratch(&n), "{n}");
+            assert!(is_scratch_name(&n), "{n}");
+        }
+        assert!(!l.owns_scratch("x y-00003.jsonl.faucet-tmp-other"));
+        assert!(!is_scratch_name("x y-00003.jsonl.faucet-tmp-other"));
         assert!(!l.owns_scratch("q.jsonl.faucet-tmp"));
+        assert!(is_scratch_name("q.jsonl.faucet-tmp"));
         assert!(!l.owns_scratch("x y-00001.jsonl"));
+        assert!(!is_scratch_name("x y-00001.jsonl"));
+        assert!(is_scratch_name(BODY_SUFFIX));
         let got = l.select(vec![
             "x y-00002.jsonl".into(),
             "x y-00001.jsonl".into(),

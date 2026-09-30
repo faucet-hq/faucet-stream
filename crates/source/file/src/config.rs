@@ -47,6 +47,9 @@ fn default_http_retries() -> u32 {
 }
 
 /// Configuration for the local (and `http(s)://`) file source.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileSourceConfig {
@@ -115,24 +118,18 @@ pub struct FileSourceConfig {
     #[serde(default)]
     pub parquet: ParquetReadOptions,
     /// Decrypt files sealed by the file or jsonl sink's `encryption` block
-    /// (AES-256-GCM). JSON Lines and raw text written line by line are
-    /// opened one line at a time; every other file is opened whole. A file
-    /// that is not sealed fails the read.
+    /// (AES-256-GCM). An encrypted file is read into memory whole: JSON Lines
+    /// and raw text written line by line are then opened one line at a time,
+    /// every other file as one sealed body. A file that is not sealed fails
+    /// the read.
     #[cfg(feature = "encryption")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<faucet_core::EncryptionSpec>,
 }
 
-/// Parquet read options.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ParquetReadOptions {
-    /// Top-level columns to read. Only these column chunks are decoded.
-    /// Default: every column. A name a file does not have is an error, not
-    /// an empty column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub columns: Option<Vec<String>>,
-}
+/// Parquet read options: the same `parquet:` block as the object-store
+/// sources.
+pub use faucet_core::ParquetReadOptions;
 
 impl FileSourceConfig {
     /// A config reading `path` with every default.
@@ -241,11 +238,7 @@ impl FileSourceConfig {
         #[cfg(feature = "file-format-avro")]
         self.avro.parsed_schema()?;
         self.csv.validate()?;
-        if self.parquet.columns.as_ref().is_some_and(Vec::is_empty) {
-            return Err(FaucetError::Config(
-                "file source: `parquet.columns` must name at least one column".into(),
-            ));
-        }
+        self.parquet.validate()?;
         #[cfg(feature = "encryption")]
         if let Some(spec) = &self.encryption {
             faucet_core::CompiledEncryption::compile(spec)?;

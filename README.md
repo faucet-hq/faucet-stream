@@ -284,7 +284,7 @@ connector depends only on `faucet-core`, so any source works with any sink.
 | **Databases** | PostgreSQL, MySQL, SQL Server, Oracle, MongoDB, SQLite, DuckDB, Redis, DynamoDB, Spanner | PostgreSQL, MySQL, SQL Server, Oracle, MongoDB, SQLite, DuckDB, Redis, DynamoDB, Spanner |
 | **CDC** | PostgreSQL, MySQL, SQL Server, MongoDB, Oracle, DynamoDB Streams | Applied through `write_mode: upsert` / `delete` on keyed sinks |
 | **Warehouses and lakehouses** | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg |
-| **Object stores and files** | S3, GCS, Azure Blob, SFTP, local files (path, glob or URL), CSV, Parquet | S3, GCS, Azure Blob, SFTP, local files, CSV, Parquet, JSONL |
+| **Object stores and files** | S3, GCS, Azure Blob, SFTP, local files (path, glob or URL); CSV and Parquet *(deprecated: use local files)* | S3, GCS, Azure Blob, SFTP, local files; CSV, Parquet and JSONL *(deprecated: use local files)* |
 | **Streams and queues** | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS |
 | **APIs** | REST, GraphQL, gRPC, XML, Webhook, WebSocket | HTTP |
 | **Search** | Elasticsearch | Elasticsearch |
@@ -299,7 +299,8 @@ connector depends only on `faucet-core`, so any source works with any sink.
 
 These numbers are reproducible, and the [methodology](BENCHMARKS.md) includes the caveats.
 Each workload moves 1M rows on one machine, compared with Meltano running the equivalent
-Singer pipeline:
+Singer pipeline. The two JSONL workloads were measured with the `csv` source and `jsonl`
+sink, now deprecated in favour of the `file` connectors, and have not been re-measured:
 
 | Workload | Bottleneck | faucet | Meltano | Speed-up |
 |---|---|---:|---:|---:|

@@ -180,9 +180,28 @@ fn io_err(path: &Path, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Source(format!("file source: '{}': {e}", path.display()))
 }
 
+/// Whether `path` is unfinished output of a file sink: one of its scratch
+/// files, or a file in the swap area of an overwrite run that has not
+/// committed. A directory or glob listing skips it.
+fn unfinished_output(path: &Path) -> bool {
+    use faucet_common_file::write::{is_scratch_name, is_swap_dir_name};
+    let name = |c: std::path::Component<'_>| c.as_os_str().to_str().map(str::to_string);
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_scratch_name)
+        || path
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .filter_map(name)
+            .any(|c| is_swap_dir_name(&c))
+}
+
 /// List the regular files `path` names: itself, a directory's files
 /// (recursively when asked), or a glob's matches. Symlinks are followed; an
-/// unreadable entry fails the listing with its path.
+/// unreadable entry fails the listing with its path. A directory or glob
+/// listing skips a file sink's unfinished output (scratch files and the
+/// swap area of an uncommitted overwrite).
 pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetError> {
     let mut out = Vec::new();
     if is_glob(path) {
@@ -190,6 +209,9 @@ pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetE
             .map_err(|e| FaucetError::Config(format!("file source: bad glob {path:?}: {e}")))?;
         for entry in matches {
             let p = entry.map_err(|e| io_err(e.path(), e.error()))?;
+            if unfinished_output(&p) {
+                continue;
+            }
             let meta = std::fs::metadata(&p).map_err(|e| io_err(&p, e))?;
             if meta.is_file() {
                 out.push(Candidate {
@@ -216,6 +238,9 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<Candidate>) -> Result<(), Fau
     for entry in std::fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
         let entry = entry.map_err(|e| io_err(dir, e))?;
         let p = entry.path();
+        if unfinished_output(&p) {
+            continue;
+        }
         let meta = std::fs::metadata(&p).map_err(|e| io_err(&p, e))?;
         if meta.is_dir() {
             if recursive {

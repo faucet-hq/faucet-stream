@@ -128,8 +128,8 @@ Or point at a PKCS#12 (`.p12`/`.pfx`) bundle instead of the PEM pair:
 
 ```yaml
     tls:
-      client_identity_pkcs12: ./adp-identity.p12
-      pkcs12_password: ${env:ADP_P12_PASSWORD}
+      client_identity_pkcs12: ./client-identity.p12
+      pkcs12_password: ${env:CLIENT_P12_PASSWORD}
 ```
 
 Supply **either** the PEM pair **or** the PKCS#12 file, not both. Key material is

@@ -1,12 +1,11 @@
 # faucet-sink-parquet
 
-> **Deprecated.** Use [`faucet-sink-file`](https://crates.io/crates/faucet-sink-file) instead.
+> **Deprecated.** Use [`faucet-sink-file`](https://crates.io/crates/faucet-sink-file) (or [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3) for an S3 location) instead.
 > This crate gets security fixes only until the next major release. In a
-> pipeline config, `type: parquet` still works: the CLI builds it as
-> `type: file` with `format: parquet` and warns. The migration table is in
-> the [`faucet-sink-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/sink/file/README.md). An S3
-> location is still built by this crate until the file connector gains object
-> stores.
+> pipeline config, `type: parquet` keeps working on this crate, unchanged — it is
+> not an alias of `type: file` — and the CLI prints a one-line notice naming the
+> replacement (`type: file` with `format: parquet`, or `type: s3` for an S3 location). The migration table is in
+> the [`faucet-sink-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/sink/file/README.md).
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-parquet.svg)](https://crates.io/crates/faucet-sink-parquet)
 [![Docs.rs](https://docs.rs/faucet-sink-parquet/badge.svg)](https://docs.rs/faucet-sink-parquet)

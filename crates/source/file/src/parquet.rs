@@ -3,7 +3,6 @@
 use crate::stream::Decoders;
 use arrow::array::RecordBatch;
 use faucet_core::{FaucetError, FileInput};
-use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Stream one Parquet file's batches (at most `batch_size` rows; `0` = the
@@ -68,23 +67,19 @@ fn open<R: parquet::file::reader::ChunkReader + 'static>(
     let Some(columns) = columns else {
         return Ok(builder);
     };
-    let available: Vec<&str> = builder
-        .parquet_schema()
-        .root_schema()
-        .get_fields()
-        .iter()
-        .map(|f| f.name())
-        .collect();
-    if let Some(missing) = columns.iter().find(|c| !available.contains(&c.as_str())) {
-        return Err(FaucetError::Source(format!(
-            "file source: parquet '{path}': column '{missing}' in `parquet.columns` is not in the \
-             file (available: {})",
-            available.join(", ")
-        )));
-    }
-    let mask =
-        ProjectionMask::columns(builder.parquet_schema(), columns.iter().map(String::as_str));
-    Ok(builder.with_projection(mask))
+    let opts = faucet_core::ParquetReadOptions {
+        columns: Some(columns.to_vec()),
+    };
+    Ok(
+        match faucet_core::file_format::parquet_io::projection_mask(
+            &opts,
+            builder.parquet_schema(),
+            path,
+        )? {
+            Some(mask) => builder.with_projection(mask),
+            None => builder,
+        },
+    )
 }
 
 /// Read every file's footer and fail, naming both files, when two schemas

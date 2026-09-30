@@ -115,7 +115,9 @@ jobs:
       - name: Check connector counts in docs match connector crates
         run: bash scripts/check-doc-counts.sh
       - name: Check no third-party vendor names in the engine (#780)
-        run: python3 scripts/vendor-names.py
+        run: |
+          python3 scripts/test_vendor_names.py
+          python3 scripts/vendor-names.py
       - name: Check no connector crate depends on another connector (#784)
         run: python3 scripts/connector-deps.py
 
@@ -568,9 +570,9 @@ jobs:
         # because the full aggregate now includes observability).
         features:
           - "full"
-          - "source-rest,sink-jsonl,sink-stdout,transforms"
-          - "observability,source-rest,sink-jsonl,sink-stdout,transforms"
-          - "otel,source-rest,sink-jsonl,sink-stdout,transforms"
+          - "source-rest,sink-file,sink-stdout,transforms"
+          - "observability,source-rest,sink-file,sink-stdout,transforms"
+          - "otel,source-rest,sink-file,sink-stdout,transforms"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
