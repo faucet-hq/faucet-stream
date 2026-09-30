@@ -1067,8 +1067,8 @@ pub fn sink_supports_overwrite(kind: &str) -> bool {
 /// File sinks that replace their output every time an invocation writes to it
 /// (#752), outside the grouped `write_mode: overwrite` lifecycle: `jsonl` /
 /// `csv` with `append: false` (the default), `parquet` writing one fixed
-/// `*.parquet` file (no rollover), and `file` in `mode: overwrite` (the
-/// default) without `write_mode: overwrite`. Run once per parent record at one
+/// `*.parquet` file (no rollover), and `file` in `if_exists: replace` (the
+/// default; formerly `mode: overwrite`) without `write_mode: overwrite`. Run once per parent record at one
 /// path, each invocation wipes the previous one's rows.
 pub const TRUNCATING_FILE_SINK_KINDS: &[&str] = &["jsonl", "csv", "parquet", "file"];
 
@@ -1091,12 +1091,13 @@ pub fn sink_truncating_path<'a>(kind: &str, cfg: &'a Value) -> Option<&'a str> {
                 .then_some(path)
         }
         "file" => {
-            let mode = cfg
-                .get("mode")
+            let if_exists = cfg
+                .get("if_exists")
+                .or_else(|| cfg.get("mode"))
                 .and_then(Value::as_str)
-                .unwrap_or("overwrite");
+                .unwrap_or("replace");
             let staged = cfg.get("write_mode").and_then(Value::as_str) == Some("overwrite");
-            if mode == "overwrite" && !staged {
+            if matches!(if_exists, "replace" | "overwrite") && !staged {
                 text(cfg.get("path"))
             } else {
                 None
@@ -3867,6 +3868,22 @@ mod truncating_tests {
             p("file", json!({"path": "a.jsonl", "mode": "append"})),
             None
         );
+        assert_eq!(
+            p("file", json!({"path": "a.jsonl", "if_exists": "append"})),
+            None
+        );
+        assert_eq!(
+            p("file", json!({"path": "a.jsonl", "if_exists": "error"})),
+            None
+        );
+        for replace in [
+            json!({"if_exists": "replace"}),
+            json!({"mode": "overwrite"}),
+        ] {
+            let mut cfg = replace;
+            cfg["path"] = json!("b.jsonl");
+            assert_eq!(p("file", cfg).as_deref(), Some("b.jsonl"));
+        }
         assert_eq!(
             p(
                 "file",
