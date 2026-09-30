@@ -35,6 +35,9 @@ pub(crate) struct SftpObjects {
     /// Directories known to exist, so an upload does not stat its parents
     /// again.
     dirs: Mutex<HashSet<String>>,
+    /// Use `posix-rename` when the server has it (off only in tests, to
+    /// cover the plain-`RENAME` fallback against a server that has it).
+    posix_rename: bool,
 }
 
 fn err(what: &str, path: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -91,6 +94,7 @@ impl SftpObjects {
             connection,
             session: Mutex::new(None),
             dirs: Mutex::new(HashSet::new()),
+            posix_rename: true,
         }
     }
 
@@ -138,7 +142,7 @@ impl SftpObjects {
     /// Move `from` over `to`: one atomic `posix-rename` when the server has
     /// it, else remove `to` (a missing one is fine) and `RENAME`.
     async fn replace(&self, conn: &SftpConnection, from: &str, to: &str) -> Result<(), FaucetError> {
-        if conn.supports_posix_rename() {
+        if self.posix_rename && conn.supports_posix_rename() {
             return conn
                 .posix_rename(from, to)
                 .await
@@ -373,5 +377,21 @@ mod tests {
         let out = dir.path().join("out");
         o.download("/data/moved/deep/f", &out).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"x\n");
+        assert!(conn.supports_posix_rename());
+
+        let mut plain = SftpObjects::new(o.connection.clone());
+        plain.posix_rename = false;
+        std::fs::write(&src, b"y\n").unwrap();
+        plain.upload(&src, "/data/moved/deep/f").await.unwrap();
+        plain.upload(&src, "/data/moved/deep/h").await.unwrap();
+        plain.rename("/data/moved/deep/h", "/data/moved/deep/f").await.unwrap();
+        plain.download("/data/moved/deep/f", &out).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"y\n");
+        let e = plain
+            .rename("/data/moved/deep/none", "/data/moved/deep/f")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rename into place"), "{e}");
     }
 }
