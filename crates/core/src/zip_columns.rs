@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_zip_ga4_rows() {
+    fn groups_zipped_report_rows() {
         let out = grouped_report()
             .compile()
             .unwrap()

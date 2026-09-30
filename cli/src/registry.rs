@@ -1067,8 +1067,8 @@ pub fn sink_supports_overwrite(kind: &str) -> bool {
 /// File sinks that replace their output every time an invocation writes to it
 /// (#752), outside the grouped `write_mode: overwrite` lifecycle: `jsonl` /
 /// `csv` with `append: false` (the default), `parquet` writing one fixed
-/// `*.parquet` file (no rollover), and `file` in `mode: overwrite` (the
-/// default) without `write_mode: overwrite`. Run once per parent record at one
+/// `*.parquet` file (no rollover), and `file` in `if_exists: replace` (the
+/// default; formerly `mode: overwrite`) without `write_mode: overwrite`. Run once per parent record at one
 /// path, each invocation wipes the previous one's rows.
 pub const TRUNCATING_FILE_SINK_KINDS: &[&str] = &["jsonl", "csv", "parquet", "file"];
 
@@ -1091,12 +1091,13 @@ pub fn sink_truncating_path<'a>(kind: &str, cfg: &'a Value) -> Option<&'a str> {
                 .then_some(path)
         }
         "file" => {
-            let mode = cfg
-                .get("mode")
+            let if_exists = cfg
+                .get("if_exists")
+                .or_else(|| cfg.get("mode"))
                 .and_then(Value::as_str)
-                .unwrap_or("overwrite");
+                .unwrap_or("replace");
             let staged = cfg.get("write_mode").and_then(Value::as_str) == Some("overwrite");
-            if mode == "overwrite" && !staged {
+            if matches!(if_exists, "replace" | "overwrite") && !staged {
                 text(cfg.get("path"))
             } else {
                 None
@@ -2307,6 +2308,12 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
 /// One-line summary of every source connector — the compiled-in built-ins plus
 /// any third-party connectors registered via [`PluginRegistry`]. Used by
 /// `faucet list`.
+/// The shared description of a deprecated file kind (`crate::vocabulary`).
+#[allow(dead_code)]
+fn deprecated(kind: &str) -> &'static str {
+    crate::vocabulary::deprecated_kind_description(kind).unwrap_or("Deprecated connector.")
+}
+
 pub fn source_descriptions() -> Vec<(&'static str, &'static str)> {
     let mut v = builtin_source_descriptions();
     v.extend(global().custom_source_descriptions());
@@ -2411,7 +2418,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
         "WebSocket streaming source — connects, subscribes, streams each message as a record",
     ));
     #[cfg(feature = "source-csv")]
-    v.push(("csv", "Deprecated: use `file`. CSV file source"));
+    v.push(("csv", deprecated("csv")));
     #[cfg(feature = "source-singer")]
     v.push((
         "singer",
@@ -2426,7 +2433,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "source-spanner")]
     v.push(("spanner", "Google Cloud Spanner query source. Streaming SQL reads with incremental replication bookmarks, stale reads, and PK-range sharding."));
     #[cfg(feature = "source-parquet")]
-    v.push(("parquet", "Deprecated: use `file` (or `s3` for S3). Apache Parquet file source (local path, glob, or S3)."));
+    v.push(("parquet", deprecated("parquet")));
     #[cfg(feature = "source-delta")]
     v.push(("delta", "Apache Delta Lake source (local FS or S3/Azure/GCS). Streams active data files with time travel and projection pushdown."));
     #[cfg(feature = "source-databricks")]
@@ -2480,7 +2487,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-postgres")]
     v.push(("postgres", "PostgreSQL sink (JSONB or auto-mapped columns)"));
     #[cfg(feature = "sink-jsonl")]
-    v.push(("jsonl", "Deprecated: use `file`. JSON Lines file sink"));
+    v.push(("jsonl", deprecated("jsonl")));
     #[cfg(feature = "sink-snowflake")]
     v.push(("snowflake", "Snowflake SQL REST API sink"));
     #[cfg(feature = "sink-mysql")]
@@ -2529,7 +2536,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-redis")]
     v.push(("redis", "Redis (streams, lists, key-value) sink"));
     #[cfg(feature = "sink-csv")]
-    v.push(("csv", "Deprecated: use `file`. CSV file sink"));
+    v.push(("csv", deprecated("csv")));
     #[cfg(feature = "sink-elasticsearch")]
     v.push(("elasticsearch", "Elasticsearch bulk index sink"));
     #[cfg(feature = "sink-kafka")]
@@ -2543,10 +2550,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-stdout")]
     v.push(("stdout", "Stdout / stderr sink (JSON Lines, pretty, TSV)"));
     #[cfg(feature = "sink-parquet")]
-    v.push((
-        "parquet",
-        "Deprecated: use `file` (or `s3` for S3). Apache Parquet file sink (local path or S3).",
-    ));
+    v.push(("parquet", deprecated("parquet")));
     #[cfg(feature = "sink-file")]
     v.push(("file", "Local file sink. JSONL, JSON, CSV, XML, Excel, Avro or Parquet by extension; rollover, compression, temp-then-rename finalisation, atomic overwrite."));
     #[cfg(feature = "sink-delta")]
@@ -3864,6 +3868,22 @@ mod truncating_tests {
             p("file", json!({"path": "a.jsonl", "mode": "append"})),
             None
         );
+        assert_eq!(
+            p("file", json!({"path": "a.jsonl", "if_exists": "append"})),
+            None
+        );
+        assert_eq!(
+            p("file", json!({"path": "a.jsonl", "if_exists": "error"})),
+            None
+        );
+        for replace in [
+            json!({"if_exists": "replace"}),
+            json!({"mode": "overwrite"}),
+        ] {
+            let mut cfg = replace;
+            cfg["path"] = json!("b.jsonl");
+            assert_eq!(p("file", cfg).as_deref(), Some("b.jsonl"));
+        }
         assert_eq!(
             p(
                 "file",

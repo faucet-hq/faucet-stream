@@ -49,8 +49,9 @@ For the full feature grid see the [connector catalog](./connectors.md).
   bucket, in the same formats.
 
 **Rule of thumb:** on disk or behind a URL → file source; in a bucket → the
-object-store source. (`source-csv` and `source-parquet` are deprecated aliases
-of the file source.)
+object-store source. (`source-csv` and `source-parquet` are deprecated: they
+keep working on their own crates, unchanged, until the next major release, and
+are not aliases of the file source.)
 
 ## Live feeds: WebSocket vs. Webhook vs. Kafka/Redis
 
@@ -142,7 +143,8 @@ query with SQL → mapped columns.
 
 **Rule of thumb:** machine-to-machine JSON → `.jsonl`; tabular for humans →
 `.csv`; analytics at scale → `.parquet`. (`sink-jsonl`, `sink-csv` and
-`sink-parquet` are deprecated aliases of the file sink.)
+`sink-parquet` are deprecated: they keep working on their own crates, unchanged,
+until the next major release, and are not aliases of the file sink.)
 
 ## Parquet files vs. Iceberg sink
 

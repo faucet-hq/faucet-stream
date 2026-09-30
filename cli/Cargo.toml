@@ -65,9 +65,10 @@ masking = ["faucet-core/masking"]
 policy = ["faucet-core/policy", "masking", "lineage", "dep:regex"]
 
 # Encryption at rest (#207): the `encryption:` block on the `file` state store
-# (AES-256-GCM bookmark files) and on the jsonl sink (per-line sealing — the
-# file-DLQ-at-rest shape), plus decryption support in `faucet dlq
-# inspect/replay/discard`. Opt-in; included in `full`.
+# (AES-256-GCM bookmark files) and on the file-writing sinks (`file`, `s3`,
+# `gcs`, `azure-blob`, `sftp`, the deprecated `jsonl`; per-line sealing for
+# uncompressed JSON Lines — the encrypted DLQ shape), plus decryption on the
+# `file` source and in `faucet dlq inspect/replay/discard`. Opt-in; in `full`.
 encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "faucet-sink-s3?/encryption", "faucet-sink-gcs?/encryption", "faucet-sink-azure-blob?/encryption", "faucet-sink-sftp?/encryption", "dep:base64"]
 
 source = [
@@ -370,7 +371,7 @@ rabbitmq-tls = [
     "faucet-sink-rabbitmq?/tls",
 ]
 
-# OAuth1 (HMAC-SHA256) request-signing auth provider (#496), e.g. NetSuite TBA.
+# OAuth1 (HMAC-SHA256) request-signing auth provider (#496), e.g. token-based auth on ERP APIs.
 # `cargo install faucet-cli --features oauth1`.
 oauth1 = ["faucet-auth/oauth1"]
 

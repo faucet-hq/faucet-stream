@@ -35,7 +35,7 @@ export async function renderSubmit(container) {
         <textarea id="cfg" class="code" spellcheck="false" placeholder="version: 1
 pipeline:
   source: { type: rest, config: { ... } }
-  sink: { type: jsonl, config: { ... } }"></textarea>
+  sink: { type: file, config: { ... } }"></textarea>
       </div>
       <fieldset class="submit-opts">
         <label>name <input id="o-name" /></label>
@@ -183,7 +183,7 @@ pipeline:
     sinkWrap.appendChild(sinkHost);
     host.appendChild(sinkWrap);
     const sel = sinkWrap.querySelector("select");
-    const preferred = catalog.sinks.find((k) => k.name === "jsonl");
+    const preferred = catalog.sinks.find((k) => k.name === "file") || catalog.sinks.find((k) => k.name === "jsonl");
     if (preferred) sel.value = preferred.name;
     let sinkForm = null;
     const load = () => loadForm("sink", sel.value, sinkHost, (f) => (sinkForm = f));

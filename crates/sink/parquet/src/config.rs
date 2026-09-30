@@ -13,7 +13,10 @@ pub const DEFAULT_ROW_GROUP_SIZE: usize = 1024 * 1024;
 /// Configuration for the Parquet sink connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
+#[deprecated(
+    since = "1.3.0",
+    note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
+)]
 pub struct ParquetSinkConfig {
     /// Where to write the Parquet files (local filesystem or S3).
     pub destination: ParquetDestination,
@@ -167,6 +170,10 @@ impl ParquetSinkConfig {
 /// Where the sink writes Parquet files.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[deprecated(
+    since = "1.3.0",
+    note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
+)]
 pub enum ParquetDestination {
     /// Local filesystem. `path` is either a file path ending in `.parquet`
     /// (single-file mode — only valid without rollover) or a directory; in
@@ -179,6 +186,10 @@ pub enum ParquetDestination {
 /// S3 destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[deprecated(
+    since = "1.3.0",
+    note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
+)]
 pub struct ParquetS3Destination {
     /// S3 bucket name.
     pub bucket: String,
@@ -200,6 +211,10 @@ pub struct ParquetS3Destination {
 /// How the sink obtains its Arrow schema.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[deprecated(
+    since = "1.3.0",
+    note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
+)]
 pub enum SchemaSource {
     /// Infer from the first batch using up to `sample_size` records.
     Inferred { sample_size: usize },
@@ -210,6 +225,10 @@ pub enum SchemaSource {
 /// Parquet compression codec.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[deprecated(
+    since = "1.3.0",
+    note = "use faucet-sink-file (FileSinkConfig with `format: parquet`), or faucet-sink-s3 for S3 locations"
+)]
 pub enum ParquetCompression {
     Uncompressed,
     #[default]

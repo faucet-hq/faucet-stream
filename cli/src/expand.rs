@@ -867,6 +867,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     context: format!("row `{row_id}`"),
                 });
             }
+            crate::dlq_replay::plan::check_dlq_sink(&d.sink, &format!("row `{row_id}` dlq"))?;
         }
 
         // A transform's config may reference `${now.*}` and `${<parent-row>.*}`
@@ -2855,6 +2856,25 @@ pipeline:
         let cfg = parse_with_extension(yaml, "yaml").unwrap();
         let err = expand(&cfg).unwrap_err();
         assert!(matches!(err, CliError::UnknownDlqSinkKind { .. }));
+    }
+
+    #[cfg(feature = "sink-file")]
+    #[test]
+    fn expand_rejects_a_compressed_encrypted_file_dlq() {
+        let yaml = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: {} }
+  sink:   { type: file, config: { path: ./o.jsonl } }
+  dlq:
+    sink: { type: file, config: { path: ./dlq.jsonl.gz, encryption: { key: abc } } }
+"#;
+        let cfg = parse_with_extension(yaml, "yaml").unwrap();
+        let err = expand(&cfg).unwrap_err();
+        assert!(
+            matches!(&err, CliError::Config(m) if m.contains("dlq") && m.contains("encryption")),
+            "{err}"
+        );
     }
 
     #[cfg(feature = "quality")]

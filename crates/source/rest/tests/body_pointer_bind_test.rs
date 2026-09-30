@@ -161,7 +161,7 @@ fn invalid_pointer_configs_fail_at_load() {
 }
 
 #[tokio::test]
-async fn ga4_window_binds_land_in_date_ranges() {
+async fn report_window_binds_land_in_date_ranges() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1beta/properties/1:runReport"))
@@ -309,7 +309,7 @@ async fn number_value_type_rejects_a_non_numeric_render() {
 }
 
 #[tokio::test]
-async fn combined_window_bind_renders_a_gaql_between_per_window() {
+async fn combined_window_bind_renders_a_query_between_per_window() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/search"))

@@ -1,8 +1,9 @@
 //! DLQ backlog for `faucet status`: how many envelopes a row's DLQ holds and
-//! how old the oldest is — read from a local `jsonl` DLQ sink's files.
+//! how old the oldest is — read from a local JSON Lines DLQ sink's files
+//! (`file` writing uncompressed JSON Lines, or the deprecated `jsonl`).
 
 use crate::config::DlqSpec;
-use crate::dlq_replay::plan::dlq_encryption_value;
+use crate::dlq_replay::plan::{dlq_encryption_value, writes_json_lines};
 use crate::dlq_replay::reader::{DlqDecryptor, expand_location, scan_files};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -11,7 +12,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DlqStatus {
     pub configured: bool,
-    /// Whether the backlog could be read (local `jsonl` DLQs only).
+    /// Whether the backlog could be read (local JSON Lines DLQs only).
     pub readable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
@@ -61,9 +62,10 @@ pub fn backlog(spec: Option<&DlqSpec>, pipeline: &str, row: &str) -> DlqStatus {
         ..Default::default()
     };
     let path = spec.sink.config.get("path").and_then(|p| p.as_str());
-    let (true, Some(path)) = (spec.sink.kind == "jsonl", path) else {
+    let (true, Some(path)) = (writes_json_lines(&spec.sink), path) else {
         out.note = Some(format!(
-            "backlog not readable for a `{}` DLQ sink — only local jsonl DLQs are counted; \
+            "backlog not readable for a `{}` DLQ sink — only local JSON Lines DLQs \
+             (`file` writing uncompressed JSON Lines, or `jsonl`) are counted; \
              inspect it at its destination",
             spec.sink.kind
         ));
@@ -167,6 +169,34 @@ mod tests {
         assert_eq!(st.count, 2);
         assert_eq!(st.oldest.unwrap().timestamp_millis(), 1_000);
         assert_eq!(st.unreadable_lines, 1);
+    }
+
+    #[test]
+    fn counts_a_json_lines_file_dlq() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dlq.jsonl");
+        let lines = [
+            envelope("orders", "a", 3_000),
+            envelope("orders", "a", 2_500),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        for config in [
+            json!({"path": path.to_str().unwrap()}),
+            json!({"path": path.to_str().unwrap(), "format": "json_lines"}),
+        ] {
+            let st = backlog(Some(&spec("file", config)), "orders", "a");
+            assert!(st.configured && st.readable, "{:?}", st.note);
+            assert_eq!(st.count, 2);
+            assert_eq!(st.oldest.unwrap().timestamp_millis(), 2_500);
+        }
+        let csv = dir.path().join("dlq.csv");
+        let st = backlog(
+            Some(&spec("file", json!({"path": csv.to_str().unwrap()}))),
+            "orders",
+            "a",
+        );
+        assert!(!st.readable);
+        assert!(st.note.unwrap().contains("`file`"));
     }
 
     #[test]

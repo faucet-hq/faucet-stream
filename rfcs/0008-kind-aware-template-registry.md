@@ -36,7 +36,7 @@ disconnected in the worst way: to put a hub template in the registry you
 compose it first (`faucet hub compose --out f.yaml && faucet template register
 f.yaml`), which bakes one sink into it — exactly the coupling the hub exists to
 remove. A registry of `acme-billing-to-bigquery`, `acme-billing-to-postgres`,
-… is the `netsuite-to-bigquery` problem again, one level up.
+… is the `acme-erp-to-bigquery` problem again, one level up.
 
 The registry also could not tell the documents apart. `register` parsed
 everything as a `PipelineConfig`, so a hub document was a validation error

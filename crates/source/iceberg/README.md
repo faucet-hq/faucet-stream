@@ -77,7 +77,7 @@ pipeline:
       on_rewrite: full_refresh
   sink:
     type: file
-    config: { path: ./events.jsonl, mode: append }
+    config: { path: ./events.jsonl, if_exists: append }
   state:
     type: file
     config: { path: ./state }

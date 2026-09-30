@@ -637,7 +637,7 @@ with a sample.
 |------|--------|
 | `--reason <r>` | Only include envelopes with this reason (`partial` / `dlq_all` / `quality` / `schema_drift` / `contract`). |
 | `--limit <n>` | Sample size. Default: 5. |
-| `--encryption-key <k>` | Key for a DLQ sealed at rest by the jsonl sink's `encryption` block; repeat for rotated keys. Sealed lines without a matching key are counted as *encrypted*, never mistaken for malformed. Requires an `encryption`-feature build. |
+| `--encryption-key <k>` | Key for a DLQ sealed at rest by its sink's `encryption` block (a `file` sink writing uncompressed JSON Lines, or the deprecated `jsonl` sink); repeat for rotated keys. Sealed lines without a matching key are counted as *encrypted*, never mistaken for malformed. Requires an `encryption`-feature build. |
 | `--json` | Emit a JSON summary. |
 
 **`faucet dlq replay <config> --from <location>`** — re-feed the quarantined
@@ -648,7 +648,7 @@ fail again go to a *fresh* DLQ, never back to the source.
 |------|--------|
 | `--from <location>` | DLQ location to replay from (required). |
 | `--reason <r>` | Replay only envelopes with this reason. |
-| `--encryption-key <k>` | Key for a sealed DLQ (repeatable). When omitted, the config's own `dlq:` jsonl `encryption` block is used automatically. |
+| `--encryption-key <k>` | Key for a sealed DLQ (repeatable). When omitted, the `encryption` block of the config's own `dlq:` sink (JSON Lines `file`, or `jsonl`) is used automatically. |
 | `--failed-dlq <path>` | Where re-failed rows go. Default: a `replay-failed.jsonl` sibling of the source. |
 | `--row <id>` | Which root of the config to replay through. Default: the first root. |
 | `--dry-run` | Report what would be replayed without writing. |
@@ -805,7 +805,8 @@ last succeed, how far behind is it, what failed, and where does the next run
 resume* — without running anything. It reads the run-outcome marker and run
 lease every real run keeps in the `state:` store, the SLA and profiling
 histories, the rollback markers, a `catalog:` store's run history when the
-config has one, and the backlog of a local `jsonl` DLQ.
+config has one, and the backlog of a local JSON Lines DLQ (a `file` sink writing
+uncompressed JSON Lines, or the deprecated `jsonl` sink).
 
 ```text
 pipeline shop (3 rows) — FAILED    state: file
@@ -1348,13 +1349,14 @@ On-demand cleanup is available three ways:
 "12 records written" and "here are the 12 records" are different pieces of
 information, and only one of them tells you whether the transform did what you
 meant. With `--preview-local-outputs`, the console's **Datasets → Local outputs**
-panel grows a *Preview* control on each tracked jsonl / csv / parquet file: it
+panel grows a *Preview* control on each tracked file / jsonl / csv / parquet output: it
 reads the first N rows back and renders them as a table, so a local iteration loop
 never leaves the browser.
 
 It is a **source-backed capped read**, not a file reader. The server builds the
-matching *source* connector for the output's kind (`csv` → `source-csv`,
-`parquet` → `source-parquet`, `jsonl` → its JSON Lines reader), pulls one page,
+matching *source* connector for the output's kind (`file` → `source-file`,
+`csv` → `source-csv`, `parquet` → `source-parquet`, `jsonl` → its JSON Lines
+reader), pulls one page,
 and stops — so previewing a 4 GiB `out.jsonl` reads its first few kilobytes.
 Rows past the cap are never decoded, and a preview always says when it capped.
 Each source is given the connector's defaults, which are the matching sink's

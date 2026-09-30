@@ -1,12 +1,11 @@
 # faucet-source-parquet
 
-> **Deprecated.** Use [`faucet-source-file`](https://crates.io/crates/faucet-source-file) instead.
+> **Deprecated.** Use [`faucet-source-file`](https://crates.io/crates/faucet-source-file) (or [`faucet-source-s3`](https://crates.io/crates/faucet-source-s3) for an S3 location) instead.
 > This crate gets security fixes only until the next major release. In a
-> pipeline config, `type: parquet` still works: the CLI builds it as
-> `type: file` with `format: parquet` and warns. The migration table is in
-> the [`faucet-source-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/source/file/README.md). An S3
-> location is still built by this crate until the file connector gains object
-> stores.
+> pipeline config, `type: parquet` keeps working on this crate, unchanged — it is
+> not an alias of `type: file` — and the CLI prints a one-line notice naming the
+> replacement (`type: file` with `format: parquet`, or `type: s3` for an S3 location). The migration table is in
+> the [`faucet-source-file` README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/source/file/README.md).
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-parquet.svg)](https://crates.io/crates/faucet-source-parquet)
 [![Docs.rs](https://docs.rs/faucet-source-parquet/badge.svg)](https://docs.rs/faucet-source-parquet)

@@ -1,19 +1,18 @@
-#![allow(deprecated)]
 //! REST API → JSONL — full builder showcase for both connectors.
 //!
 //! Exercises most of the knobs on `RestStreamConfig` (auth, pagination,
 //! retries, throttling, transforms, schema, replication) and the full
-//! surface of `JsonlSinkConfig` (append + pretty-printing).
+//! file sink writing JSON Lines in append mode.
 //!
 //! Run:
 //! ```bash
 //! cargo run -p faucet-stream --example rest_to_jsonl \
-//!     --features "source-rest sink-jsonl transforms"
+//!     --features "source-rest sink-file transforms"
 //! ```
 
 use std::time::Duration;
 
-use faucet_stream::sink::jsonl::{JsonlSink, JsonlSinkConfig};
+use faucet_stream::sink::file::{FileMode, FileSink, FileSinkConfig};
 use faucet_stream::{
     Auth, KeyCaseMode, Labels, PaginationStyle, Pipeline, RecordTransform, ReplicationMethod,
     RestStream, RestStreamConfig, Source, TransformStage, TransformingSource, json,
@@ -56,11 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Labels::for_named("rest"),
     )?;
 
-    let sink = JsonlSink::new(
-        JsonlSinkConfig::new("orders.jsonl")
-            .append(true)
-            .pretty(false),
-    );
+    let sink = FileSink::new(FileSinkConfig::new("orders.jsonl").mode(FileMode::Append))?;
 
     let result = Pipeline::new(&source, &sink).run().await?;
     println!(

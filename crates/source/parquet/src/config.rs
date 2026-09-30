@@ -23,7 +23,10 @@ fn default_concurrency() -> usize {
 /// Configuration for the Parquet source connector.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[deprecated(note = "use faucet-source-file / faucet-sink-file")]
+#[deprecated(
+    since = "1.4.0",
+    note = "use faucet-source-file (FileSourceConfig with `format: parquet`), or faucet-source-s3 for S3 locations"
+)]
 pub struct ParquetSourceConfig {
     /// Where to read Parquet from — a local file, a local glob pattern, or S3.
     pub source: ParquetLocation,
@@ -127,6 +130,10 @@ impl ParquetSourceConfig {
 /// Where to read Parquet data from.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[deprecated(
+    since = "1.4.0",
+    note = "use faucet-source-file (FileSourceConfig with `format: parquet`), or faucet-source-s3 for S3 locations"
+)]
 pub enum ParquetLocation {
     /// A single local file path.
     LocalPath { path: String },
@@ -145,6 +152,10 @@ pub enum ParquetLocation {
 /// Exactly one of `key` or `prefix` must be set.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[deprecated(
+    since = "1.4.0",
+    note = "use faucet-source-file (FileSourceConfig with `format: parquet`), or faucet-source-s3 for S3 locations"
+)]
 pub struct ParquetS3Config {
     /// S3 bucket name.
     pub bucket: String,

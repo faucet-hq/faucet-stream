@@ -1,17 +1,17 @@
-#![allow(deprecated)]
 //! Webhook receiver → CSV — full builder showcase for both connectors.
 //!
 //! Webhook source uses listen-addr, path, max-payloads, and timeout knobs.
-//! CSV sink shows delimiter, header toggle, and append mode.
+//! The file sink writes CSV with a delimiter, a header row, and append mode.
 //!
 //! Run:
 //! ```bash
 //! cargo run -p faucet-stream --example webhook_to_csv \
-//!     --features "source-webhook sink-csv"
+//!     --features "source-webhook sink-file file-format-csv"
 //! ```
 
+use faucet_stream::CsvOptions;
 use faucet_stream::Pipeline;
-use faucet_stream::sink::csv::{CsvSink, CsvSinkConfig};
+use faucet_stream::sink::file::{FileMode, FileSink, FileSinkConfig};
 use faucet_stream::source::webhook::{WebhookSource, WebhookSourceConfig};
 
 #[tokio::main]
@@ -24,12 +24,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .timeout_secs(120),
     );
 
-    let sink = CsvSink::new(
-        CsvSinkConfig::new("webhooks.csv")
-            .delimiter(b';')
-            .write_headers(true)
-            .append(true),
-    );
+    let sink = FileSink::new(
+        FileSinkConfig::new("webhooks.csv")
+            .mode(FileMode::Append)
+            .csv(CsvOptions {
+                delimiter: ";".into(),
+                has_headers: true,
+                ..CsvOptions::default()
+            }),
+    )?;
 
     let result = Pipeline::new(&source, &sink).run().await?;
     println!(

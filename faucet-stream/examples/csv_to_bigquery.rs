@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! CSV → BigQuery — full builder showcase for both connectors.
 //!
 //! CSV source uses non-default delimiter + quote. BigQuery sink shows the
@@ -7,21 +6,24 @@
 //! Run:
 //! ```bash
 //! cargo run -p faucet-stream --example csv_to_bigquery \
-//!     --features "source-csv sink-bigquery"
+//!     --features "source-file file-format-csv sink-bigquery"
 //! ```
 
+use faucet_stream::CsvOptions;
 use faucet_stream::Pipeline;
 use faucet_stream::sink::bigquery::{BigQueryCredentials, BigQuerySink, BigQuerySinkConfig};
-use faucet_stream::source::csv::{CsvSource, CsvSourceConfig};
+use faucet_stream::source::file::{FileSource, FileSourceConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = CsvSource::new(
-        CsvSourceConfig::new("transactions.csv")
-            .has_headers(true)
-            .delimiter(b',')
-            .quote(b'"'),
-    );
+    let mut config = FileSourceConfig::new("transactions.csv");
+    config.csv = CsvOptions {
+        has_headers: true,
+        delimiter: ",".into(),
+        quote: "\"".into(),
+        ..CsvOptions::default()
+    };
+    let source = FileSource::new(config)?;
 
     let sink = BigQuerySink::new(
         BigQuerySinkConfig::new(

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn jira_server() -> MockServer {
+async fn issue_tracker_server() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/rest/api/3/search"))
@@ -64,7 +64,7 @@ async fn nested_key_filters_advances_and_counts_missing() {
     let snap = recorder.snapshotter();
     metrics::set_global_recorder(recorder).expect("only recorder in this test binary");
 
-    let server = jira_server().await;
+    let server = issue_tracker_server().await;
     let stream = RestStream::new(config(&server.uri(), "fields.updated")).unwrap();
     stream.set_roundtrip_recorder(Arc::new(RoundtripRecorder::new(
         RoundtripSide::Source,
@@ -94,7 +94,7 @@ async fn nested_key_filters_advances_and_counts_missing() {
 
 #[tokio::test]
 async fn json_pointer_key_resolves_the_same_value() {
-    let server = jira_server().await;
+    let server = issue_tracker_server().await;
     let stream = RestStream::new(config(&server.uri(), "/fields/updated")).unwrap();
     let (records, bookmark) = run(&stream).await.unwrap();
     assert_eq!(records.len(), 4);
@@ -103,7 +103,7 @@ async fn json_pointer_key_resolves_the_same_value() {
 
 #[tokio::test]
 async fn on_missing_key_drop_and_fail() {
-    let server = jira_server().await;
+    let server = issue_tracker_server().await;
     let mut c = config(&server.uri(), "fields.updated");
     c.on_missing_key = OnMissingKey::Drop;
     let (records, _) = run(&RestStream::new(c).unwrap()).await.unwrap();
@@ -117,7 +117,7 @@ async fn on_missing_key_drop_and_fail() {
 
 #[tokio::test]
 async fn first_run_without_bookmark_keeps_everything_and_advances() {
-    let server = jira_server().await;
+    let server = issue_tracker_server().await;
     let mut c = config(&server.uri(), "fields.updated");
     c.start_replication_value = None;
     let (records, bookmark) = run(&RestStream::new(c).unwrap()).await.unwrap();
@@ -127,7 +127,7 @@ async fn first_run_without_bookmark_keeps_everything_and_advances() {
 
 #[tokio::test]
 async fn fetch_all_incremental_uses_the_nested_key() {
-    let server = jira_server().await;
+    let server = issue_tracker_server().await;
     let mut c = config(&server.uri(), "fields.updated");
     c.start_replication_value = None;
     let (records, bookmark) = RestStream::new(c)

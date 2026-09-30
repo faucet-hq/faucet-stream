@@ -59,9 +59,9 @@ cargo add faucet-stream --features full
 | `source-redis` | no | Redis — streams, lists, or key patterns |
 | `source-webhook` | no | Webhook — temporary HTTP server collecting POSTs |
 | `source-websocket` | no | WebSocket — live streaming, subscription frames, reconnect |
-| `source-csv` | no | Deprecated: enables `source-file` (read CSV with the file source) and the old `faucet-source-csv` crate |
+| `source-csv` | no | Deprecated (use `source-file`): the old `faucet-source-csv` crate, unchanged until the next major release |
 | `source-elasticsearch` | no | Elasticsearch — search / scroll API |
-| `source-parquet` | no | Deprecated: enables `source-file` (read Parquet with the file source) and the old `faucet-source-parquet` crate |
+| `source-parquet` | no | Deprecated (use `source-file`, or `source-s3` for S3): the old `faucet-source-parquet` crate, unchanged until the next major release |
 | `source-kafka` | no | Kafka consumer — subscribe, drain with idle / max-message termination |
 | `source-bigquery` | no | BigQuery query source — `jobs.query` + pagination |
 | `source-snowflake` | no | Snowflake query source — SQL REST API, JWT / OAuth |
@@ -82,10 +82,10 @@ cargo add faucet-stream --features full
 | `sink-elasticsearch` | no | Elasticsearch — bulk index API |
 | `sink-s3` | no | AWS S3 — JSONL files |
 | `sink-gcs` | no | Google Cloud Storage — JSONL files |
-| `sink-parquet` | no | Deprecated: enables `sink-file` (write Parquet with the file sink) and the old `faucet-sink-parquet` crate |
+| `sink-parquet` | no | Deprecated (use `sink-file`, or `sink-s3` for S3): the old `faucet-sink-parquet` crate, unchanged until the next major release |
 | `sink-kafka` | no | Kafka producer — batched sends, multi-topic routing |
-| `sink-csv` | no | Deprecated: enables `sink-file` (write CSV with the file sink) and the old `faucet-sink-csv` crate |
-| `sink-jsonl` | no | Deprecated: enables `sink-file` (write JSON Lines with the file sink) and the old `faucet-sink-jsonl` crate |
+| `sink-csv` | no | Deprecated (use `sink-file`): the old `faucet-sink-csv` crate, unchanged until the next major release |
+| `sink-jsonl` | no | Deprecated (use `sink-file`): the old `faucet-sink-jsonl` crate, unchanged until the next major release |
 | `sink-http` | no | HTTP — POST records to any endpoint |
 | `sink-stdout` | no | Stdout/stderr — JSON Lines, pretty JSON, or TSV |
 
@@ -120,7 +120,7 @@ The `memory` and `file` state stores are always available via `faucet-core`. The
 | `compression` | gzip/zstd on every opted-in file-shaped connector (see below) |
 | `kafka-schema-registry` | Confluent Schema Registry support (Avro / Protobuf / JSON Schema) for the Kafka pair |
 
-> `compression` uses optional-dependency forwarding (`faucet-source-csv?/compression`, …): it turns on gzip/zstd **only** for the file-shaped connectors you have already enabled (`source-csv`, `source-s3`, `source-gcs`, `sink-jsonl`, `sink-csv`, `sink-s3`, `sink-gcs`). It does not pull connectors you haven't requested.
+> `compression` uses optional-dependency forwarding (`faucet-source-csv?/compression`, …): it turns on gzip/zstd **only** for the object-store and deprecated file connectors you have already enabled (`source-s3`, `source-gcs`, `source-azure-blob`, `sink-s3`, `sink-gcs`, `sink-azure-blob`, `sink-sftp`, `source-csv`, `sink-jsonl`, `sink-csv`). `source-file` / `sink-file` always support compression. It does not pull connectors you haven't requested.
 
 ### Transforms
 
@@ -172,7 +172,7 @@ cargo add faucet-stream --features source-s3,sink-bigquery
 cargo add faucet-stream --features source-postgres-cdc,sink-postgres,state-postgres,transform-cdc-unwrap
 
 # Kafka with Schema Registry → Parquet on S3
-cargo add faucet-stream --features source-kafka,sink-file,file-format-parquet,kafka-schema-registry
+cargo add faucet-stream --features source-kafka,sink-s3,file-format-parquet,kafka-schema-registry
 
 # Everything, for prototyping
 cargo add faucet-stream --features full
@@ -229,7 +229,7 @@ Plus the config + connector types from each enabled feature (e.g. `RestStream` /
 Runnable examples live in [`examples/`](examples/); each declares its required features at the top of the file. The `rest_to_jsonl` and `rest_streaming` examples run end-to-end against a public test API; the rest are compile-only source→sink pairings that need real infrastructure to run.
 
 ```bash
-cargo run -p faucet-stream --example rest_to_jsonl --features "source-rest sink-jsonl"
+cargo run -p faucet-stream --example rest_to_jsonl --features "source-rest sink-file"
 cargo run -p faucet-stream --example postgres_to_bigquery --features "source-postgres sink-bigquery"
 ```
 
@@ -251,7 +251,7 @@ If you are **building your own connector**, depend only on `faucet-core` — it 
 |---------|-------------|
 | `cannot find type RestStream` (or any connector type) | The connector's feature isn't enabled. Add it, e.g. `cargo add faucet-stream --features source-rest`. The default build only enables `source-rest`. |
 | `transform-select`/`transform-cast`/etc. has no effect | The built-in transforms are forwarded to the REST source. Enable the specific `transform-*` feature (or `transforms` for all). The default build includes only `transform-flatten`, `transform-rename-keys`, `transform-keys-case`. |
-| Compression flag enabled but files aren't compressed | `compression` only activates for file-shaped connectors you've **also** enabled (`source-csv`, `source-s3`, `source-gcs`, `sink-jsonl`, `sink-csv`, `sink-s3`, `sink-gcs`). Confirm both features are on, and the path suffix is `.gz`/`.zst` (under `Auto`). |
+| Compression flag enabled but files aren't compressed | `compression` only activates for the object-store / deprecated file connectors you've **also** enabled (`source-s3`, `source-gcs`, `source-azure-blob`, `sink-s3`, `sink-gcs`, `sink-azure-blob`, `sink-sftp`, `source-csv`, `sink-jsonl`, `sink-csv`); `file` always has it. Confirm both features are on, and the path suffix is `.gz`/`.zst` (under `Auto`). |
 | Kafka Avro/Protobuf decode fails | Schema-Registry formats need `kafka-schema-registry` in addition to `source-kafka`/`sink-kafka`. |
 | `auth: { ref }` errors / shared OAuth provider not found | The shared-auth catalog needs the `auth` feature (`faucet-auth`). Library callers build providers directly and pass them via `Source::with_auth_provider`. |
 | Iceberg catalog (Glue/SQL/HMS) not recognized | Enable the matching add-on: `sink-iceberg-glue`, `sink-iceberg-sql`, or `sink-iceberg-hms`. The bare `sink-iceberg` only ships the REST catalog. |

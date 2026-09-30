@@ -55,12 +55,20 @@ pub fn default_failed_dlq_path(from_files: &[PathBuf]) -> PathBuf {
     }
 }
 
-/// Build a fresh JSONL DLQ spec pointing at `path`, inheriting the batching
+/// The sink kind a replay's fresh failure DLQ is written with: the `file`
+/// sink when compiled in, else the deprecated `jsonl` sink.
+pub const FAILED_DLQ_KIND: &str = if cfg!(feature = "sink-file") {
+    "file"
+} else {
+    "jsonl"
+};
+
+/// Build a fresh JSON Lines DLQ spec pointing at `path`, inheriting the batching
 /// policy of the original node's DLQ (if any) so replay behaves like the
 /// original run — only the destination changes.
 pub fn failed_dlq_spec(path: &Path, original: Option<&DlqSpec>) -> DlqSpec {
     let sink = ConnectorSpec {
-        kind: "jsonl".to_string(),
+        kind: FAILED_DLQ_KIND.to_string(),
         config: json!({ "path": path.to_string_lossy() }),
         transforms: None,
         inherit_transforms: true,
@@ -179,14 +187,74 @@ pub fn build_replay_node(
     Ok(node)
 }
 
-/// The raw `encryption` value of a config's dlq **jsonl** sink, if any —
-/// the key that sealed the DLQ file a replay reads back.
+/// The raw `encryption` value of a config's local JSON Lines DLQ sink (a
+/// `jsonl` sink, or a `file` sink writing JSON Lines), if any — the key that
+/// sealed the DLQ file a replay reads back.
 pub fn dlq_encryption_value(dlq: Option<&DlqSpec>) -> Option<&serde_json::Value> {
     let dlq = dlq?;
-    if dlq.sink.kind != "jsonl" {
+    if !writes_json_lines(&dlq.sink) {
         return None;
     }
     dlq.sink.config.get("encryption")
+}
+
+/// Whether a DLQ sink writes local JSON Lines files the DLQ tooling reads
+/// back line by line: any `jsonl` sink, or an uncompressed `file` sink whose
+/// `format` (or, under `auto`, whose path's extension) is JSON Lines.
+pub fn writes_json_lines(sink: &ConnectorSpec) -> bool {
+    match sink.kind.as_str() {
+        "jsonl" => true,
+        "file" => {
+            file_sink_format(&sink.config) == Some(faucet_core::FileFormat::JsonLines)
+                && !file_sink_compresses(&sink.config)
+        }
+        _ => false,
+    }
+}
+
+fn file_sink_format(config: &serde_json::Value) -> Option<faucet_core::FileFormat> {
+    match config.get("format").and_then(|f| f.as_str()) {
+        None | Some("auto") => config
+            .get("path")
+            .and_then(|p| p.as_str())
+            .and_then(faucet_core::FileFormat::from_path),
+        Some("json_lines") => Some(faucet_core::FileFormat::JsonLines),
+        Some(_) => None,
+    }
+}
+
+/// Whether a `file` sink config compresses its output: an explicit
+/// `gzip`/`zstd`, or `auto` (the default) with a `.gz`/`.zst` path.
+fn file_sink_compresses(config: &serde_json::Value) -> bool {
+    match config.get("compression").and_then(|c| c.as_str()) {
+        Some("gzip" | "zstd") => true,
+        None | Some("auto") => config
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| {
+                let p = p.to_ascii_lowercase();
+                p.ends_with(".gz") || p.ends_with(".zst")
+            })
+            .unwrap_or(false),
+        Some(_) => false,
+    }
+}
+
+/// Refuse a `file` DLQ sink that is both compressed and encrypted: the file
+/// sink seals such a file whole, so neither `faucet dlq` nor `faucet status`
+/// could read it back envelope by envelope.
+pub fn check_dlq_sink(sink: &ConnectorSpec, context: &str) -> CliResult<()> {
+    if sink.kind == "file"
+        && sink.config.get("encryption").is_some_and(|e| !e.is_null())
+        && file_sink_compresses(&sink.config)
+    {
+        return Err(CliError::Config(format!(
+            "{context}: a `file` DLQ sink cannot combine `compression` with `encryption` — \
+             the whole file is sealed, so `faucet dlq` and `faucet status` cannot read it \
+             line by line; drop the compression (a sealed JSON Lines DLQ stays per-line)"
+        )));
+    }
+    Ok(())
 }
 
 /// Two paths refer to the same file. Uses canonicalization when both exist,
@@ -286,6 +354,90 @@ mod tests {
     }
 
     #[test]
+    fn failed_dlq_is_written_with_the_file_sink() {
+        let spec = failed_dlq_spec(Path::new("failed.jsonl"), None);
+        #[cfg(feature = "sink-file")]
+        assert_eq!(spec.sink.kind, "file");
+        assert!(writes_json_lines(&spec.sink));
+    }
+
+    fn dlq_sink(kind: &str, config: serde_json::Value) -> DlqSpec {
+        DlqSpec {
+            sink: ConnectorSpec {
+                kind: kind.into(),
+                config,
+                transforms: None,
+                inherit_transforms: true,
+                status: None,
+                tags: Vec::new(),
+                complete_for: None,
+                attributes: Default::default(),
+            },
+            on_batch_error: OnBatchErrorSpec::Propagate,
+            max_failures_per_page: None,
+            max_failures_total: None,
+            include_original_payload: false,
+            allow_duplicates_on_dlq_all: false,
+        }
+    }
+
+    #[test]
+    fn encryption_key_is_picked_up_from_a_json_lines_file_dlq() {
+        let key = json!({"key": "k"});
+        for config in [
+            json!({"path": "dlq.jsonl", "encryption": key}),
+            json!({"path": "dlq.ndjson", "format": "auto", "encryption": key}),
+            json!({"path": "dlq/", "format": "json_lines", "encryption": key}),
+        ] {
+            let d = dlq_sink("file", config);
+            assert_eq!(dlq_encryption_value(Some(&d)), Some(&key));
+        }
+        let d = dlq_sink("jsonl", json!({"path": "dlq.jsonl", "encryption": key}));
+        assert_eq!(dlq_encryption_value(Some(&d)), Some(&key));
+        for (kind, config) in [
+            ("file", json!({"path": "dlq.csv", "encryption": key})),
+            (
+                "file",
+                json!({"path": "dlq.jsonl", "format": "csv", "encryption": key}),
+            ),
+            ("file", json!({"path": "dlq.jsonl.gz", "encryption": key})),
+            ("s3", json!({"path": "dlq.jsonl", "encryption": key})),
+        ] {
+            assert_eq!(dlq_encryption_value(Some(&dlq_sink(kind, config))), None);
+        }
+        assert_eq!(dlq_encryption_value(None), None);
+    }
+
+    #[test]
+    fn a_compressed_encrypted_file_dlq_is_refused() {
+        let key = json!({"key": "k"});
+        for config in [
+            json!({"path": "dlq.jsonl.gz", "encryption": key}),
+            json!({"path": "dlq.jsonl.zst", "compression": "auto", "encryption": key}),
+            json!({"path": "dlq.jsonl", "compression": "gzip", "encryption": key}),
+            json!({"path": "dlq.jsonl", "compression": "zstd", "encryption": key}),
+        ] {
+            let err = check_dlq_sink(&dlq_sink("file", config).sink, "row `r` dlq").unwrap_err();
+            assert!(
+                matches!(&err, CliError::Config(m) if m.contains("row `r` dlq") && m.contains("compression")),
+                "{err}"
+            );
+        }
+        for (kind, config) in [
+            ("file", json!({"path": "dlq.jsonl", "encryption": key})),
+            ("file", json!({"path": "dlq.jsonl.gz"})),
+            (
+                "file",
+                json!({"path": "dlq.jsonl.gz", "compression": "none", "encryption": key}),
+            ),
+            ("file", json!({"path": "dlq.jsonl.gz", "encryption": null})),
+            ("jsonl", json!({"path": "dlq.jsonl.gz", "encryption": key})),
+        ] {
+            check_dlq_sink(&dlq_sink(kind, config).sink, "ctx").unwrap();
+        }
+    }
+
+    #[test]
     fn failed_dlq_spec_inherits_budgets() {
         let orig = DlqSpec {
             sink: ConnectorSpec {
@@ -305,7 +457,7 @@ mod tests {
             allow_duplicates_on_dlq_all: false,
         };
         let spec = failed_dlq_spec(Path::new("failed.jsonl"), Some(&orig));
-        assert_eq!(spec.sink.kind, "jsonl");
+        assert_eq!(spec.sink.kind, FAILED_DLQ_KIND);
         assert_eq!(spec.sink.config["path"], "failed.jsonl");
         assert_eq!(spec.on_batch_error, OnBatchErrorSpec::DlqAll);
         assert_eq!(spec.max_failures_per_page, Some(5));

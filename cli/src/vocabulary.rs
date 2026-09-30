@@ -91,30 +91,166 @@ pub fn deprecated_spellings(doc: &Value) -> Vec<String> {
             );
         }
     }
+    file_sink_spellings(doc, &mut out);
     deprecated_kinds(doc, &mut out);
     out.into_iter().collect()
+}
+
+/// Sink kinds on the shared file writer, whose `mode` became `if_exists`.
+const FILE_WRITER_SINK_KINDS: &[&str] = &["file", "s3", "gcs", "azure-blob", "sftp"];
+
+/// `if_exists` values renamed with it: `(old, new)`.
+const IF_EXISTS_RENAMES: &[(&str, &str)] =
+    &[("overwrite", "replace"), ("error_if_exists", "error")];
+
+/// `mode:` (now `if_exists:`) and its old values on file-writing sinks.
+fn file_sink_spellings(doc: &Value, out: &mut BTreeSet<String>) {
+    let pipeline = doc.get("pipeline");
+    let template = |name: &str| -> Option<&Value> {
+        let p = pipeline?;
+        if name == "default"
+            && let Some(s) = p.get("sink")
+        {
+            return Some(s);
+        }
+        p.get("sinks")?.get(name)
+    };
+    let kind_of = |sink: &Value| -> Option<String> {
+        if let Some(t) = sink.get("type").and_then(Value::as_str) {
+            return Some(t.to_string());
+        }
+        let r = sink.get("ref").and_then(Value::as_str).unwrap_or("default");
+        template(r)?
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+
+    let mut sinks: Vec<&Value> = Vec::new();
+    let mut dlq_sinks: Vec<&Value> = Vec::new();
+    if let Some(p) = pipeline {
+        sinks.extend(p.get("sink"));
+        if let Some(m) = p.get("sinks").and_then(Value::as_object) {
+            sinks.extend(m.values());
+        }
+        dlq_sinks.extend(p.get("dlq").and_then(|d| d.get("sink")));
+    }
+    if let Some(rows) = doc.get("matrix").and_then(Value::as_array) {
+        sinks.extend(rows.iter().filter_map(|r| r.get("sink")));
+        dlq_sinks.extend(
+            rows.iter()
+                .filter_map(|r| r.get("dlq").and_then(|d| d.get("sink"))),
+        );
+    }
+
+    let kinds = sinks
+        .into_iter()
+        .map(|s| (s, kind_of(s)))
+        .chain(dlq_sinks.into_iter().map(|s| {
+            let kind = s.get("type").and_then(Value::as_str).map(str::to_string);
+            (s, kind)
+        }));
+    for (sink, kind) in kinds {
+        let Some(kind) = kind.filter(|k| FILE_WRITER_SINK_KINDS.contains(&k.as_str())) else {
+            continue;
+        };
+        let Some(cfg) = sink.get("config").and_then(Value::as_object) else {
+            continue;
+        };
+        if cfg.contains_key("mode") {
+            out.insert(format!(
+                "{kind} sink: `mode` is now `if_exists` (the old key still works)"
+            ));
+        }
+        let value = cfg
+            .get("if_exists")
+            .or_else(|| cfg.get("mode"))
+            .and_then(Value::as_str);
+        if let Some((old, new)) = IF_EXISTS_RENAMES.iter().find(|(o, _)| Some(*o) == value) {
+            out.insert(format!(
+                "{kind} sink: `if_exists: {old}` is now `if_exists: {new}` (the old value still works)"
+            ));
+        }
+    }
 }
 
 /// Connector kinds replaced by `type: file` (#779).
 pub const DEPRECATED_FILE_KINDS: &[&str] = &["csv", "jsonl", "parquet"];
 
-/// Connector blocks (`{type, config}`) anywhere in the document that use a
-/// deprecated kind.
+/// Per deprecated kind: what it reads or writes, and what replaces it. The one
+/// source of the deprecation wording on every CLI surface.
+const FILE_KIND_REPLACEMENTS: &[(&str, &str, &str)] = &[
+    (
+        "csv",
+        "CSV file",
+        "`type: file` with `format: csv` (dialect options under `csv:`)",
+    ),
+    (
+        "jsonl",
+        "JSON Lines file",
+        "`type: file` with a `.jsonl` path (or `format: json_lines`)",
+    ),
+    (
+        "parquet",
+        "Parquet file",
+        "`type: file` with `format: parquet`, or `type: s3` for an S3 location",
+    ),
+];
+
+/// What replaces a deprecated file kind, or `None` for any other kind.
+pub fn file_kind_replacement(kind: &str) -> Option<&'static str> {
+    FILE_KIND_REPLACEMENTS
+        .iter()
+        .find(|(k, _, _)| *k == kind)
+        .map(|(_, _, r)| *r)
+}
+
+/// The load-time warning for a deprecated file kind.
+pub fn deprecated_kind_warning(kind: &str) -> Option<String> {
+    file_kind_replacement(kind).map(|r| {
+        format!(
+            "connector kind `{kind}` is deprecated: use {r}. It keeps working on its own \
+             crate, unchanged, until the next major release"
+        )
+    })
+}
+
+/// The `faucet list` / schema-catalog description of a deprecated file kind.
+pub fn deprecated_kind_description(kind: &str) -> Option<&'static str> {
+    static LABELS: std::sync::LazyLock<Vec<(&'static str, String)>> =
+        std::sync::LazyLock::new(|| {
+            FILE_KIND_REPLACEMENTS
+                .iter()
+                .map(|(k, what, r)| (*k, format!("Deprecated {what} connector: use {r}.")))
+                .collect()
+        });
+    LABELS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, l)| l.as_str())
+}
+
+/// Connector blocks anywhere in the document that use a deprecated kind: an
+/// object with a `type` and a `config`, or a bare `{ type }` override under a
+/// `source` / `sink` key (a matrix row switching kind without new config).
 fn deprecated_kinds(v: &Value, out: &mut BTreeSet<String>) {
+    walk_kinds(v, None, out);
+}
+
+fn walk_kinds(v: &Value, parent: Option<&str>, out: &mut BTreeSet<String>) {
     match v {
         Value::Object(m) => {
-            if m.contains_key("config")
+            let connector = m.contains_key("config") || matches!(parent, Some("source" | "sink"));
+            if connector
                 && let Some(kind) = m.get("type").and_then(Value::as_str)
-                && DEPRECATED_FILE_KINDS.contains(&kind)
+                && let Some(w) = deprecated_kind_warning(kind)
             {
-                out.insert(format!(
-                    "connector kind `{kind}` is deprecated: use `type: file` \
-                     (it still works until the next major release)"
-                ));
+                out.insert(w);
             }
-            m.values().for_each(|c| deprecated_kinds(c, out));
+            m.iter()
+                .for_each(|(k, c)| walk_kinds(c, Some(k.as_str()), out));
         }
-        Value::Array(a) => a.iter().for_each(|c| deprecated_kinds(c, out)),
+        Value::Array(a) => a.iter().for_each(|c| walk_kinds(c, None, out)),
         _ => {}
     }
 }
@@ -184,6 +320,74 @@ mod tests {
             );
         }
         assert!(deprecated_spellings(&json!({"a": {"type": "csv"}})).is_empty());
+    }
+
+    #[test]
+    fn the_file_sinks_old_mode_spellings_warn() {
+        let doc = json!({
+            "pipeline": {
+                "sink": { "type": "file", "config": { "path": "a.jsonl", "mode": "append" } },
+                "sinks": {
+                    "lake": { "type": "s3", "config": { "if_exists": "overwrite" } },
+                    "db": { "type": "postgres", "config": { "mode": "overwrite" } }
+                },
+                "dlq": { "sink": { "type": "sftp", "config": { "mode": "error_if_exists" } } }
+            },
+            "matrix": [
+                { "id": "a", "sink": { "config": { "if_exists": "replace" } } },
+                { "id": "b", "sink": { "ref": "lake", "config": { "mode": "append" } } },
+                { "id": "c", "dlq": { "sink": { "type": "gcs", "config": { "if_exists": "error" } } } }
+            ]
+        });
+        assert_eq!(
+            deprecated_spellings(&doc),
+            vec![
+                "file sink: `mode` is now `if_exists` (the old key still works)",
+                "s3 sink: `if_exists: overwrite` is now `if_exists: replace` (the old value still works)",
+                "s3 sink: `mode` is now `if_exists` (the old key still works)",
+                "sftp sink: `if_exists: error_if_exists` is now `if_exists: error` (the old value still works)",
+                "sftp sink: `mode` is now `if_exists` (the old key still works)",
+            ]
+        );
+        let current = json!({
+            "pipeline": { "sink": { "type": "file", "config": { "if_exists": "append" } } }
+        });
+        assert!(deprecated_spellings(&current).is_empty());
+    }
+
+    #[test]
+    fn a_bare_kind_override_on_a_matrix_row_warns() {
+        let doc = json!({
+            "matrix": [
+                { "id": "x", "sink": { "type": "csv" } },
+                { "id": "y", "source": { "type": "parquet", "ref": "t" } },
+                { "id": "z", "sink": { "type": "file" } }
+            ]
+        });
+        let notes = deprecated_spellings(&doc);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].starts_with("connector kind `csv`"), "{notes:?}");
+        assert!(
+            notes[1].starts_with("connector kind `parquet`"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn every_surface_shares_one_replacement_per_kind() {
+        for kind in DEPRECATED_FILE_KINDS {
+            let r = file_kind_replacement(kind).unwrap();
+            assert!(deprecated_kind_warning(kind).unwrap().contains(r));
+            assert!(deprecated_kind_description(kind).unwrap().contains(r));
+        }
+        assert!(
+            deprecated_kind_description("parquet")
+                .unwrap()
+                .contains("`type: s3`")
+        );
+        assert!(file_kind_replacement("file").is_none());
+        assert!(deprecated_kind_warning("file").is_none());
+        assert!(deprecated_kind_description("file").is_none());
     }
 
     #[test]

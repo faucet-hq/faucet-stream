@@ -60,6 +60,15 @@ edit to an exhaustive surface.
   the full contract above. Graduation (removing the marker) is a deliberate,
   reviewed act once the shape has survived real use; an experimental marker is
   never a license for sloppiness — the block still meets every other principle.
+  The semver mechanics:
+  - An **Experimental crate** stays in the `exclude:` list of CI's
+    `cargo-semver-checks` job until it graduates, so its Rust API may change
+    in a minor release.
+  - An **Experimental block inside a stable crate** changes only its YAML: a
+    renamed key or value keeps the old spelling as a serde alias (listed under
+    `x-faucet-aliases`, warned about on load), and its Rust signature — field
+    names, types, public methods — does not change. The stable crate's semver
+    check keeps running.
 
 ## 4. Config is an API — design the YAML like one
 

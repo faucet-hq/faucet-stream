@@ -178,7 +178,18 @@ file-format-orc = [
     "faucet-source-sftp?/file-format-orc",
     "faucet-source-file?/file-format-orc",
 ]
-file-format-parquet = ["faucet-source-file?/file-format-parquet", "faucet-sink-file?/file-format-parquet"]
+file-format-parquet = [
+    "faucet-source-file?/file-format-parquet",
+    "faucet-sink-file?/file-format-parquet",
+    "faucet-source-s3?/arrow",
+    "faucet-sink-s3?/arrow",
+    "faucet-source-gcs?/arrow",
+    "faucet-sink-gcs?/arrow",
+    "faucet-source-azure-blob?/arrow",
+    "faucet-sink-azure-blob?/arrow",
+    "faucet-source-sftp?/arrow",
+    "faucet-sink-sftp?/arrow",
+]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc", "file-format-parquet"]
 ## Enable mutual-TLS client-certificate auth (#495) on whichever HTTP sources
 ## have been opted in. Forwards through to each source's `mtls` feature using
@@ -257,11 +268,12 @@ transform-sql = ["dep:faucet-transform-sql"]
 ## record (issue #124). Loads via wasmtime; any language that compiles to core
 ## wasm can express arbitrary per-record logic.
 transform-wasm = ["dep:faucet-transform-wasm"]
-## Encryption at rest (#207): AES-256-GCM for FileStateStore bookmarks and,
-## when `sink-jsonl` is also enabled, per-line JSONL output (the file DLQ
-## shape). Forwarded to `faucet-core` (and the jsonl sink via optional-dep
-## syntax, so this flag never pulls the connector itself).
-encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption"]
+## Encryption at rest (#207): AES-256-GCM for FileStateStore bookmarks and the
+## `encryption:` block on whichever file-writing sinks are enabled (`file`,
+## `s3`, `gcs`, `azure-blob`, `sftp`, and the deprecated `jsonl`), plus
+## decryption on the `file` source. Optional-dep forwarding, so this flag never
+## pulls a connector itself.
+encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "faucet-sink-s3?/encryption", "faucet-sink-gcs?/encryption", "faucet-sink-azure-blob?/encryption", "faucet-sink-sftp?/encryption"]
 ## Every connector and state backend.
 full = ["source", "sink", "state", "auth", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "google-sa", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-xml-excel", "file-formats"]
 
@@ -521,11 +533,11 @@ reqwest = { version = "0.13", default-features = false }
 
 [[example]]
 name = "rest_to_jsonl"
-required-features = ["source-rest", "sink-jsonl"]
+required-features = ["source-rest", "sink-file"]
 
 [[example]]
 name = "rest_streaming"
-required-features = ["source-rest", "sink-jsonl"]
+required-features = ["source-rest", "sink-file"]
 
 [[example]]
 name = "rest_to_bigquery"
@@ -573,11 +585,11 @@ required-features = ["source-mysql", "sink-snowflake"]
 
 [[example]]
 name = "sqlite_to_csv"
-required-features = ["source-sqlite", "sink-csv"]
+required-features = ["source-sqlite", "sink-file", "file-format-csv"]
 
 [[example]]
 name = "sqlite_to_jsonl"
-required-features = ["source-sqlite", "sink-jsonl"]
+required-features = ["source-sqlite", "sink-file"]
 
 [[example]]
 name = "s3_to_postgres"
@@ -609,15 +621,15 @@ required-features = ["source-webhook", "sink-http"]
 
 [[example]]
 name = "webhook_to_csv"
-required-features = ["source-webhook", "sink-csv"]
+required-features = ["source-webhook", "sink-file", "file-format-csv"]
 
 [[example]]
 name = "csv_to_mysql"
-required-features = ["source-csv", "sink-mysql"]
+required-features = ["source-file", "file-format-csv", "sink-mysql"]
 
 [[example]]
 name = "csv_to_sqlite"
-required-features = ["source-csv", "sink-sqlite"]
+required-features = ["source-file", "file-format-csv", "sink-sqlite"]
 
 [[example]]
 name = "elasticsearch_to_s3"
@@ -665,7 +677,7 @@ required-features = ["source-mongodb", "sink-postgres"]
 
 [[example]]
 name = "csv_to_bigquery"
-required-features = ["source-csv", "sink-bigquery"]
+required-features = ["source-file", "file-format-csv", "sink-bigquery"]
 
 [package.metadata.docs.rs]
 all-features = true

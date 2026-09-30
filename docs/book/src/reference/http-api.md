@@ -597,8 +597,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
 `GET /v1/local-outputs/{id}/preview` reads a tracked output back and returns its
 first rows — the other half of "N records written". It is a **source-backed capped
 read**: the server builds the matching *source* connector for the output's kind
-(`csv` → `source-csv`, `parquet` → `source-parquet`, `jsonl` → its JSON Lines
-reader), pulls one page, and stops. A 100-row preview of a 4 GiB file reads its
+(`file` → `source-file`, `csv` → `source-csv`, `parquet` → `source-parquet`,
+`jsonl` → its JSON Lines reader), pulls one page, and stops. A 100-row preview of a 4 GiB file reads its
 first few kilobytes; nothing past the cap is decoded.
 
 **It is off by default.** Without `--preview-local-outputs`
