@@ -327,7 +327,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(multi.contains("ragged row at line 4"), "the physical line: {multi}");
+        assert!(
+            multi.contains("ragged row at line 4"),
+            "the physical line: {multi}"
+        );
         assert!(msg.contains("csv.flexible"), "{msg}");
         let lenient = decode_with(b"a,b\n1,2\n3\n", &CsvOptions::default(), false)
             .await
