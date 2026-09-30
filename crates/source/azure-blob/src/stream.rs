@@ -64,7 +64,10 @@ impl faucet_core::file_format::parquet_io::RangeRead for BlobRange {
     fn read_range(
         &mut self,
         range: std::ops::Range<u64>,
-    ) -> futures::future::BoxFuture<'_, Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>> {
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>,
+    > {
         use futures::FutureExt as _;
         async move {
             self.store

@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use faucet_core::Source;
 use faucet_common_sftp::{OpenFlags, SftpConnectionConfig, connect};
+use faucet_core::Source;
 use faucet_source_sftp::{SftpFormat, SftpSource, SftpSourceConfig};
 use futures::StreamExt;
 use serde_json::Value;
@@ -170,7 +170,10 @@ async fn a_parquet_file_streams_in_bounded_memory() {
         row_peak >> 20,
         columnar_peak >> 20
     );
-    assert!(row_peak < size / 2, "row path peaked at {row_peak} for a {size}-byte file");
+    assert!(
+        row_peak < size / 2,
+        "row path peaked at {row_peak} for a {size}-byte file"
+    );
     assert!(
         columnar_peak < size / 2,
         "columnar path peaked at {columnar_peak} for a {size}-byte file"

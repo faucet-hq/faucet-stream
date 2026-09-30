@@ -530,8 +530,14 @@ mod tests {
             .filter_map(|r| r.headers.get("x-amz-copy-source-range"))
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
-        assert!(ranges.contains(&"bytes=0-536870911".to_string()), "{ranges:?}");
-        assert!(ranges.contains(&"bytes=5905580032-6442450943".to_string()), "{ranges:?}");
+        assert!(
+            ranges.contains(&"bytes=0-536870911".to_string()),
+            "{ranges:?}"
+        );
+        assert!(
+            ranges.contains(&"bytes=5905580032-6442450943".to_string()),
+            "{ranges:?}"
+        );
     }
 
     #[tokio::test]
@@ -572,7 +578,9 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/b/dst2"))
-            .respond_with(xml("<CopyObjectResult><ETag>\"e\"</ETag></CopyObjectResult>"))
+            .respond_with(xml(
+                "<CopyObjectResult><ETag>\"e\"</ETag></CopyObjectResult>",
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -584,7 +592,10 @@ mod tests {
             .await;
         let o = objects(&server.uri());
         let e = o.rename("big", "dst").await.unwrap_err();
-        assert!(matches!(e, FaucetError::Sink(ref m) if m.contains("copy part")), "{e}");
+        assert!(
+            matches!(e, FaucetError::Sink(ref m) if m.contains("copy part")),
+            "{e}"
+        );
         o.rename("small", "dst2").await.unwrap();
     }
 
@@ -616,7 +627,10 @@ mod tests {
             FaucetError::HttpStatus { status, url, body } => {
                 assert_eq!(*status, 503);
                 assert_eq!(url, "s3://b/slow");
-                assert!(body.contains("S3 put object error for key 'slow'"), "{body}");
+                assert!(
+                    body.contains("S3 put object error for key 'slow'"),
+                    "{body}"
+                );
             }
             other => panic!("expected HttpStatus, got {other:?}"),
         }

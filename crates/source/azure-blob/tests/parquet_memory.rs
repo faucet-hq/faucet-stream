@@ -208,7 +208,10 @@ async fn a_parquet_blob_streams_in_bounded_memory() {
         row_peak >> 20,
         columnar_peak >> 20
     );
-    assert!(row_peak < size / 2, "row path peaked at {row_peak} for a {size}-byte blob");
+    assert!(
+        row_peak < size / 2,
+        "row path peaked at {row_peak} for a {size}-byte blob"
+    );
     assert!(
         columnar_peak < size / 2,
         "columnar path peaked at {columnar_peak} for a {size}-byte blob"

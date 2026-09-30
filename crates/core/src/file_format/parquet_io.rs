@@ -59,19 +59,19 @@ pub use imp::{
 mod imp {
     use super::ParquetReadOptions;
     use crate::FaucetError;
+    use ::parquet::arrow::ParquetRecordBatchStreamBuilder;
     use ::parquet::arrow::ProjectionMask;
+    use ::parquet::arrow::arrow_reader::ArrowReaderOptions;
     use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use ::parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStream};
+    use ::parquet::errors::ParquetError;
+    use ::parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
     use ::parquet::schema::types::SchemaDescriptor;
     use arrow::array::RecordBatch;
     use arrow::datatypes::SchemaRef;
     use bytes::Bytes;
     use futures::FutureExt;
     use futures::future::BoxFuture;
-    use ::parquet::arrow::ParquetRecordBatchStreamBuilder;
-    use ::parquet::arrow::arrow_reader::ArrowReaderOptions;
-    use ::parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStream};
-    use ::parquet::errors::ParquetError;
-    use ::parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
     use std::ops::Range;
     use std::sync::Arc;
 
@@ -463,7 +463,10 @@ mod tests {
             .err()
             .expect("a short read fails")
             .to_string();
-        assert!(err.contains("obj.parquet") && err.contains("truncated"), "{err}");
+        assert!(
+            err.contains("obj.parquet") && err.contains("truncated"),
+            "{err}"
+        );
     }
 
     #[cfg(feature = "file-format-parquet")]
@@ -499,11 +502,15 @@ mod tests {
         let opts = ParquetReadOptions {
             columns: Some(vec!["nope".into()]),
         };
-        let e = range_stream(RangedParquetReader::new(mem, data.len() as u64, "o"), &opts, 0)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
+        let e = range_stream(
+            RangedParquetReader::new(mem, data.len() as u64, "o"),
+            &opts,
+            0,
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
         assert!(e.contains("`nope`"), "{e}");
         let empty = RangedParquetReader::new(Failing, 0, "e");
         assert!(empty.is_empty());

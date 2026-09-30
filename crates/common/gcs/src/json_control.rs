@@ -341,7 +341,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/storage/v1/b/b/o/x/rewriteTo/b/b/o/y"))
             .and(query_param("rewriteToken", "t/1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})),
+            )
             .expect(1)
             .mount(&server)
             .await;

@@ -141,7 +141,12 @@ impl SftpObjects {
 
     /// Move `from` over `to`: one atomic `posix-rename` when the server has
     /// it, else remove `to` (a missing one is fine) and `RENAME`.
-    async fn replace(&self, conn: &SftpConnection, from: &str, to: &str) -> Result<(), FaucetError> {
+    async fn replace(
+        &self,
+        conn: &SftpConnection,
+        from: &str,
+        to: &str,
+    ) -> Result<(), FaucetError> {
         if self.posix_rename && conn.supports_posix_rename() {
             return conn
                 .posix_rename(from, to)
@@ -345,7 +350,10 @@ mod tests {
         let src = dir.path().join("f");
         std::fs::write(&src, b"x\n").unwrap();
         o.upload(&src, "/data/locked/sub/f").await.unwrap();
-        assert_eq!(o.list("/data/locked/sub/").await.unwrap(), ["/data/locked/sub/f"]);
+        assert_eq!(
+            o.list("/data/locked/sub/").await.unwrap(),
+            ["/data/locked/sub/f"]
+        );
         assert!(o.list("/data/nope/").await.unwrap().is_empty());
         o.delete("/data/nope/f").await.unwrap();
 
@@ -355,7 +363,11 @@ mod tests {
 
         let e = o.list("/data/locked/sub/").await.unwrap_err().to_string();
         assert!(e.contains("SFTP list '/data/locked/sub' failed"), "{e}");
-        let e = o.delete("/data/locked/sub/f").await.unwrap_err().to_string();
+        let e = o
+            .delete("/data/locked/sub/f")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("SFTP delete '/data/locked/sub/f' failed"), "{e}");
         assert!(o.exists("/data/locked/sub/f").await.is_err());
         let e = o
@@ -369,11 +381,15 @@ mod tests {
         attrs.permissions = Some(0o040755);
         sftp.set_metadata("/data/locked", attrs).await.unwrap();
         o.upload(&src, "/data/locked/sub/f").await.unwrap();
-        o.rename("/data/locked/sub/f", "/data/moved/deep/f").await.unwrap();
+        o.rename("/data/locked/sub/f", "/data/moved/deep/f")
+            .await
+            .unwrap();
         assert!(o.exists("/data/moved/deep/f").await.unwrap());
         assert!(!o.exists("/data/locked/sub/f").await.unwrap());
         o.upload(&src, "/data/moved/deep/g").await.unwrap();
-        o.rename("/data/moved/deep/g", "/data/moved/deep/f").await.unwrap();
+        o.rename("/data/moved/deep/g", "/data/moved/deep/f")
+            .await
+            .unwrap();
         let out = dir.path().join("out");
         o.download("/data/moved/deep/f", &out).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"x\n");
@@ -384,7 +400,10 @@ mod tests {
         std::fs::write(&src, b"y\n").unwrap();
         plain.upload(&src, "/data/moved/deep/f").await.unwrap();
         plain.upload(&src, "/data/moved/deep/h").await.unwrap();
-        plain.rename("/data/moved/deep/h", "/data/moved/deep/f").await.unwrap();
+        plain
+            .rename("/data/moved/deep/h", "/data/moved/deep/f")
+            .await
+            .unwrap();
         plain.download("/data/moved/deep/f", &out).await.unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"y\n");
         let e = plain

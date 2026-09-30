@@ -63,13 +63,16 @@ impl faucet_core::file_format::parquet_io::RangeRead for FileRange {
     fn read_range(
         &mut self,
         range: std::ops::Range<u64>,
-    ) -> futures::future::BoxFuture<'_, Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>>
-    {
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<faucet_core::file_format::parquet_io::Bytes, FaucetError>,
+    > {
         use futures::FutureExt as _;
         use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
         async move {
-            let failed =
-                |e: std::io::Error| FaucetError::Source(format!("SFTP read '{}' failed: {e}", self.path));
+            let failed = |e: std::io::Error| {
+                FaucetError::Source(format!("SFTP read '{}' failed: {e}", self.path))
+            };
             self.file
                 .seek(std::io::SeekFrom::Start(range.start))
                 .await
