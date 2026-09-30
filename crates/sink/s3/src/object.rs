@@ -280,11 +280,8 @@ impl ObjectClient for S3Objects {
             .send()
             .await
             .map_err(|e| self.sdk_err("head object", from, e))?;
-        let len = head
-            .content_length()
-            .and_then(|l| u64::try_from(l).ok())
-            .ok_or_else(|| err("copy object", from, "no Content-Length on the source"))?;
-        if len > MAX_COPY_BYTES {
+        let len = head.content_length().and_then(|l| u64::try_from(l).ok());
+        if let Some(len) = len.filter(|&l| l > MAX_COPY_BYTES) {
             self.copy_multipart(from, to, len).await?;
         } else {
             self.roundtrips.record("copy");

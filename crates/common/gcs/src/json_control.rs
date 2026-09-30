@@ -131,7 +131,7 @@ impl google_cloud_storage::stub::StorageControl for JsonApiControl {
     ) -> google_cloud_gax::Result<Response<RewriteResponse>> {
         let src = bucket_from_parent(&req.source_bucket)?;
         let dst = bucket_from_parent(&req.destination_bucket)?;
-        let url = format!(
+        let mut url = format!(
             "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
             self.endpoint,
             urlencoding::encode(src),
@@ -139,6 +139,12 @@ impl google_cloud_storage::stub::StorageControl for JsonApiControl {
             urlencoding::encode(dst),
             urlencoding::encode(&req.destination_name)
         );
+        // A rewrite that did not finish in one call resumes from its token;
+        // without it every call would restart the copy from the beginning.
+        if !req.rewrite_token.is_empty() {
+            url.push_str("?rewriteToken=");
+            url.push_str(&urlencoding::encode(&req.rewrite_token));
+        }
         let resp = self.http.post(&url).send().await.map_err(Error::io)?;
         let status = resp.status();
         let headers = resp.headers().clone();
@@ -323,6 +329,38 @@ mod tests {
             .into_body();
         assert!(!r.done);
         assert_eq!(r.rewrite_token, "t1");
+    }
+
+    /// L6 (#783): a resumed rewrite sends its token, so it continues instead
+    /// of restarting the copy.
+    #[tokio::test]
+    async fn a_resumed_rewrite_sends_its_token() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/storage/v1/b/b/o/x/rewriteTo/b/b/o/y"))
+            .and(query_param("rewriteToken", "t/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = JsonApiControl::new(&server.uri());
+        let bucket = "projects/_/buckets/b";
+        let r = c
+            .rewrite_object(
+                RewriteObjectRequest::new()
+                    .set_source_bucket(bucket)
+                    .set_source_object("x")
+                    .set_destination_bucket(bucket)
+                    .set_destination_name("y")
+                    .set_rewrite_token("t/1"),
+                RequestOptions::default(),
+            )
+            .await
+            .unwrap()
+            .into_body();
+        assert!(r.done);
     }
 
     #[test]
