@@ -114,6 +114,19 @@ pub trait StorageBackend: Send + Sync {
     /// the last file of the swap area may remove the area itself.
     async fn delete(&self, area: Area, name: &str) -> Result<(), FaucetError>;
 
+    /// Delete every file in `names` from `area`. Default: up to eight
+    /// [`delete`](Self::delete)s at a time; a backend over a store with a
+    /// batch delete overrides it.
+    async fn delete_many(&self, area: Area, names: &[String]) -> Result<(), FaucetError> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        stream::iter(names.iter().cloned())
+            .map(|name| async move { self.delete(area, &name).await })
+            .buffer_unordered(8)
+            .try_collect::<Vec<()>>()
+            .await
+            .map(|_| ())
+    }
+
     /// Move `name` from the swap area to the destination, replacing any file
     /// of that name.
     async fn promote(&self, name: &str) -> Result<(), FaucetError>;

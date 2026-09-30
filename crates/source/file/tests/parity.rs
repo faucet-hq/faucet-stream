@@ -283,7 +283,7 @@ async fn parquet_projection_matches_the_parquet_source() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("'nope'") && err.contains("available: id, name, score"),
+        err.contains("`nope`") && err.contains("columns: id, name, score"),
         "{err}"
     );
 }

@@ -25,6 +25,8 @@ pub(crate) struct S3Objects {
     pub concurrency: usize,
     pub part_bytes: usize,
     pub roundtrips: Arc<faucet_core::observability::RecorderSlot>,
+    /// Part requests in flight across every upload of this sink.
+    pub part_slots: Arc<tokio::sync::Semaphore>,
 }
 
 fn err(what: &str, key: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -130,6 +132,11 @@ impl S3Objects {
         let count = len.div_ceil(self.part_bytes);
         let mut parts: Vec<CompletedPart> = futures::stream::iter(0..count)
             .map(|i| async move {
+                let _slot = self
+                    .part_slots
+                    .acquire()
+                    .await
+                    .map_err(|e| err("upload part", key, e))?;
                 let offset = i * self.part_bytes;
                 let size = self.part_bytes.min(len - offset);
                 let body = ByteStream::read_from()
@@ -321,6 +328,7 @@ mod tests {
             concurrency: 1,
             part_bytes: PART_BYTES,
             roundtrips: Arc::new(faucet_core::observability::RecorderSlot::new()),
+            part_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 

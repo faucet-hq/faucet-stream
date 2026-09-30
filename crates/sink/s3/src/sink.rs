@@ -50,6 +50,7 @@ impl S3Sink {
             concurrency: config.concurrency,
             part_bytes: PART_BYTES,
             roundtrips: roundtrips.clone(),
+            part_slots: Arc::new(tokio::sync::Semaphore::new(config.concurrency.max(1))),
         });
         let backend = RemoteBackend::new(
             objects.clone(),
@@ -197,6 +198,11 @@ impl MultipartUpload for S3Upload {
         Box::pin(async move {
             let number =
                 i32::try_from(number).map_err(|_| s3_err("upload part", &key, "too many parts"))?;
+            let _slot = o
+                .part_slots
+                .acquire()
+                .await
+                .map_err(|e| s3_err("upload part", &key, e))?;
             o.roundtrips.record("put");
             let out = o
                 .client

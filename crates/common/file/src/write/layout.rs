@@ -48,6 +48,9 @@ fn scratch_base(name: &str) -> Option<&str> {
 
 /// The file-name template of one output set. `{part}` is present when the
 /// output is numbered.
+///
+/// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
+/// minor release; any change is called out in the changelog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameTemplate {
     /// The template, e.g. `part-{part}.jsonl.gz` or `export.csv`.

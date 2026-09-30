@@ -49,6 +49,15 @@ pub trait ObjectClient: Send + Sync {
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError>;
     /// Delete `key`. A missing key is not an error.
     async fn delete(&self, key: &str) -> Result<(), FaucetError>;
+    /// Delete every key in `keys`; a missing key is not an error. Default:
+    /// one [`delete`](Self::delete) each; a store with a batch delete
+    /// overrides it.
+    async fn delete_many(&self, keys: &[String]) -> Result<(), FaucetError> {
+        for key in keys {
+            self.delete(key).await?;
+        }
+        Ok(())
+    }
     /// Move `from` to `to`, replacing `to`. Default: a server-side copy is
     /// not assumed, so the object is downloaded and re-uploaded, then
     /// `from` deleted; stores with a copy or rename override it.
@@ -357,13 +366,18 @@ impl StorageBackend for RemoteBackend {
     async fn cancel(&self) {
         let all = std::mem::take(&mut *self.pending());
         let (_, landed) = join_all(all).await;
-        for key in landed {
-            let _ = self.client.delete(&key).await;
+        if !landed.is_empty() {
+            let _ = self.client.delete_many(&landed).await;
         }
     }
 
     async fn delete(&self, area: Area, name: &str) -> Result<(), FaucetError> {
         self.client.delete(&self.key(area, name)).await
+    }
+
+    async fn delete_many(&self, area: Area, names: &[String]) -> Result<(), FaucetError> {
+        let keys: Vec<String> = names.iter().map(|n| self.key(area, n)).collect();
+        self.client.delete_many(&keys).await
     }
 
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {

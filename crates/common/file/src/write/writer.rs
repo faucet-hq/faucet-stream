@@ -892,14 +892,10 @@ impl FileWriter {
     }
 
     async fn delete_all(&self, area: Area, names: Vec<String>) -> Result<(), FaucetError> {
-        stream::iter(names)
-            .map(|name| async move { self.backend.delete(area, &name).await })
-            .buffer_unordered(SWAP_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<()>, _>>()
-            .map(|_| ())
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.backend.delete_many(area, &names).await
     }
 }
 

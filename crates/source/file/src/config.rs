@@ -127,16 +127,9 @@ pub struct FileSourceConfig {
     pub encryption: Option<faucet_core::EncryptionSpec>,
 }
 
-/// Parquet read options.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ParquetReadOptions {
-    /// Top-level columns to read. Only these column chunks are decoded.
-    /// Default: every column. A name a file does not have is an error, not
-    /// an empty column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub columns: Option<Vec<String>>,
-}
+/// Parquet read options: the same `parquet:` block as the object-store
+/// sources.
+pub use faucet_core::ParquetReadOptions;
 
 impl FileSourceConfig {
     /// A config reading `path` with every default.
