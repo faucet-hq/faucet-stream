@@ -3,6 +3,7 @@
 //! snapshots are committed by hand because iceberg-rust has no row-delta
 //! transaction yet.
 
+#[path = "iceberg_common/mod.rs"]
 mod common;
 
 use std::collections::HashMap;

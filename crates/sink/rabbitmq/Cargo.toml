@@ -34,7 +34,6 @@ serde_json.workspace = true
 futures.workspace = true
 faucet-conformance.workspace = true
 testcontainers = "0.27"
-faucet-source-rabbitmq.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

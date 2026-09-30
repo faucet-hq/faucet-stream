@@ -58,20 +58,8 @@ testcontainers-modules = { version = "0.15", features = ["minio"] }
 # For the arrow-gated round-trip test (`bytes::Bytes` implements parquet's
 # `ChunkReader`); harmless when the `arrow` feature is off.
 bytes = { workspace = true }
-# The MinIO Parquet round-trip integration test writes via this sink and reads
-# back via the S3 source, and builds a RecordBatch via the core columnar shim.
-faucet-source-s3 = { workspace = true, features = [
-    "arrow",
-    "compression",
-    "file-format-csv",
-    "file-format-xml",
-] }
 faucet-core = { workspace = true, features = ["arrow", "file-format-parquet"] }
-# The shared format × option matrix reads what landed back with the file source.
-faucet-source-file = { workspace = true, features = ["file-formats", "encryption"] }
 tempfile.workspace = true
-# Golden parity test: the same records written by the Parquet sink to S3.
-faucet-sink-parquet = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 

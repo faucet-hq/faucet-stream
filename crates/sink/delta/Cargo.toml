@@ -36,9 +36,6 @@ arrow-json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
 faucet-conformance.workspace = true
-# `arrow` on the source dev-dep so the columnar round-trip test can read the
-# table back via `stream_batches` (gated on the source's own `arrow` feature).
-faucet-source-delta = { workspace = true, features = ["arrow"] }
 futures.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
