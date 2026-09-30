@@ -98,23 +98,80 @@ pub fn deprecated_spellings(doc: &Value) -> Vec<String> {
 /// Connector kinds replaced by `type: file` (#779).
 pub const DEPRECATED_FILE_KINDS: &[&str] = &["csv", "jsonl", "parquet"];
 
-/// Connector blocks (`{type, config}`) anywhere in the document that use a
-/// deprecated kind.
+/// Per deprecated kind: what it reads or writes, and what replaces it. The one
+/// source of the deprecation wording on every CLI surface.
+const FILE_KIND_REPLACEMENTS: &[(&str, &str, &str)] = &[
+    (
+        "csv",
+        "CSV file",
+        "`type: file` with `format: csv` (dialect options under `csv:`)",
+    ),
+    (
+        "jsonl",
+        "JSON Lines file",
+        "`type: file` with a `.jsonl` path (or `format: json_lines`)",
+    ),
+    (
+        "parquet",
+        "Parquet file",
+        "`type: file` with `format: parquet`, or `type: s3` for an S3 location",
+    ),
+];
+
+/// What replaces a deprecated file kind, or `None` for any other kind.
+pub fn file_kind_replacement(kind: &str) -> Option<&'static str> {
+    FILE_KIND_REPLACEMENTS
+        .iter()
+        .find(|(k, _, _)| *k == kind)
+        .map(|(_, _, r)| *r)
+}
+
+/// The load-time warning for a deprecated file kind.
+pub fn deprecated_kind_warning(kind: &str) -> Option<String> {
+    file_kind_replacement(kind).map(|r| {
+        format!(
+            "connector kind `{kind}` is deprecated: use {r}. It keeps working on its own \
+             crate, unchanged, until the next major release"
+        )
+    })
+}
+
+/// The `faucet list` / schema-catalog description of a deprecated file kind.
+pub fn deprecated_kind_description(kind: &str) -> Option<&'static str> {
+    static LABELS: std::sync::LazyLock<Vec<(&'static str, String)>> =
+        std::sync::LazyLock::new(|| {
+            FILE_KIND_REPLACEMENTS
+                .iter()
+                .map(|(k, what, r)| (*k, format!("Deprecated {what} connector: use {r}.")))
+                .collect()
+        });
+    LABELS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, l)| l.as_str())
+}
+
+/// Connector blocks anywhere in the document that use a deprecated kind: an
+/// object with a `type` and a `config`, or a bare `{ type }` override under a
+/// `source` / `sink` key (a matrix row switching kind without new config).
 fn deprecated_kinds(v: &Value, out: &mut BTreeSet<String>) {
+    walk_kinds(v, None, out);
+}
+
+fn walk_kinds(v: &Value, parent: Option<&str>, out: &mut BTreeSet<String>) {
     match v {
         Value::Object(m) => {
-            if m.contains_key("config")
+            let connector = m.contains_key("config") || matches!(parent, Some("source" | "sink"));
+            if connector
                 && let Some(kind) = m.get("type").and_then(Value::as_str)
-                && DEPRECATED_FILE_KINDS.contains(&kind)
+                && let Some(w) = deprecated_kind_warning(kind)
             {
-                out.insert(format!(
-                    "connector kind `{kind}` is deprecated: use `type: file` \
-                     (it still works until the next major release)"
-                ));
+                out.insert(w);
             }
-            m.values().for_each(|c| deprecated_kinds(c, out));
+            m.iter()
+                .for_each(|(k, c)| walk_kinds(c, Some(k.as_str()), out));
         }
-        Value::Array(a) => a.iter().for_each(|c| deprecated_kinds(c, out)),
+        Value::Array(a) => a.iter().for_each(|c| walk_kinds(c, None, out)),
         _ => {}
     }
 }
@@ -184,6 +241,38 @@ mod tests {
             );
         }
         assert!(deprecated_spellings(&json!({"a": {"type": "csv"}})).is_empty());
+    }
+
+    #[test]
+    fn a_bare_kind_override_on_a_matrix_row_warns() {
+        let doc = json!({
+            "matrix": [
+                { "id": "x", "sink": { "type": "csv" } },
+                { "id": "y", "source": { "type": "parquet", "ref": "t" } },
+                { "id": "z", "sink": { "type": "file" } }
+            ]
+        });
+        let notes = deprecated_spellings(&doc);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].starts_with("connector kind `csv`"), "{notes:?}");
+        assert!(notes[1].starts_with("connector kind `parquet`"), "{notes:?}");
+    }
+
+    #[test]
+    fn every_surface_shares_one_replacement_per_kind() {
+        for kind in DEPRECATED_FILE_KINDS {
+            let r = file_kind_replacement(kind).unwrap();
+            assert!(deprecated_kind_warning(kind).unwrap().contains(r));
+            assert!(deprecated_kind_description(kind).unwrap().contains(r));
+        }
+        assert!(
+            deprecated_kind_description("parquet")
+                .unwrap()
+                .contains("`type: s3`")
+        );
+        assert!(file_kind_replacement("file").is_none());
+        assert!(deprecated_kind_warning("file").is_none());
+        assert!(deprecated_kind_description("file").is_none());
     }
 
     #[test]

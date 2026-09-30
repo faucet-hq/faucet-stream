@@ -2307,6 +2307,12 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
 /// One-line summary of every source connector — the compiled-in built-ins plus
 /// any third-party connectors registered via [`PluginRegistry`]. Used by
 /// `faucet list`.
+/// The shared description of a deprecated file kind (`crate::vocabulary`).
+#[allow(dead_code)]
+fn deprecated(kind: &str) -> &'static str {
+    crate::vocabulary::deprecated_kind_description(kind).unwrap_or("Deprecated connector.")
+}
+
 pub fn source_descriptions() -> Vec<(&'static str, &'static str)> {
     let mut v = builtin_source_descriptions();
     v.extend(global().custom_source_descriptions());
@@ -2411,7 +2417,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
         "WebSocket streaming source — connects, subscribes, streams each message as a record",
     ));
     #[cfg(feature = "source-csv")]
-    v.push(("csv", "Deprecated: use `file`. CSV file source"));
+    v.push(("csv", deprecated("csv")));
     #[cfg(feature = "source-singer")]
     v.push((
         "singer",
@@ -2426,7 +2432,7 @@ fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "source-spanner")]
     v.push(("spanner", "Google Cloud Spanner query source. Streaming SQL reads with incremental replication bookmarks, stale reads, and PK-range sharding."));
     #[cfg(feature = "source-parquet")]
-    v.push(("parquet", "Deprecated: use `file` (or `s3` for S3). Apache Parquet file source (local path, glob, or S3)."));
+    v.push(("parquet", deprecated("parquet")));
     #[cfg(feature = "source-delta")]
     v.push(("delta", "Apache Delta Lake source (local FS or S3/Azure/GCS). Streams active data files with time travel and projection pushdown."));
     #[cfg(feature = "source-databricks")]
@@ -2480,7 +2486,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-postgres")]
     v.push(("postgres", "PostgreSQL sink (JSONB or auto-mapped columns)"));
     #[cfg(feature = "sink-jsonl")]
-    v.push(("jsonl", "Deprecated: use `file`. JSON Lines file sink"));
+    v.push(("jsonl", deprecated("jsonl")));
     #[cfg(feature = "sink-snowflake")]
     v.push(("snowflake", "Snowflake SQL REST API sink"));
     #[cfg(feature = "sink-mysql")]
@@ -2529,7 +2535,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-redis")]
     v.push(("redis", "Redis (streams, lists, key-value) sink"));
     #[cfg(feature = "sink-csv")]
-    v.push(("csv", "Deprecated: use `file`. CSV file sink"));
+    v.push(("csv", deprecated("csv")));
     #[cfg(feature = "sink-elasticsearch")]
     v.push(("elasticsearch", "Elasticsearch bulk index sink"));
     #[cfg(feature = "sink-kafka")]
@@ -2543,10 +2549,7 @@ fn builtin_sink_descriptions() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "sink-stdout")]
     v.push(("stdout", "Stdout / stderr sink (JSON Lines, pretty, TSV)"));
     #[cfg(feature = "sink-parquet")]
-    v.push((
-        "parquet",
-        "Deprecated: use `file` (or `s3` for S3). Apache Parquet file sink (local path or S3).",
-    ));
+    v.push(("parquet", deprecated("parquet")));
     #[cfg(feature = "sink-file")]
     v.push(("file", "Local file sink. JSONL, JSON, CSV, XML, Excel, Avro or Parquet by extension; rollover, compression, temp-then-rename finalisation, atomic overwrite."));
     #[cfg(feature = "sink-delta")]

@@ -469,11 +469,12 @@ and its columns.
 ## Moving from the csv, jsonl and parquet connectors
 
 `type: csv`, `type: jsonl` and `type: parquet` are deprecated. They keep
-working exactly as before until the next major release, and `faucet validate`
-/ `faucet run` print one line naming the replacement:
+working on their own crates, unchanged, until the next major release — they are
+not aliases of `type: file` — and `faucet validate` / `faucet run` print one
+line naming the replacement:
 
 ```text
-connector kind `jsonl` is deprecated: use `type: file` (it still works until the next major release)
+connector kind `jsonl` is deprecated: use `type: file` with a `.jsonl` path (or `format: json_lines`). It keeps working on its own crate, unchanged, until the next major release
 ```
 
 The `file` connector does everything they did. To move a config, change the
@@ -481,8 +482,8 @@ kind and move these fields:
 
 | Old | `type: file` |
 |---|---|
-| csv source `has_headers`, `delimiter`, `quote`, `flexible`, `null_values` | `csv.has_headers`, `csv.delimiter` (a one-character string, `";"` rather than `59`), `csv.quote`, `csv.flexible`, `csv.null_values` |
-| csv sink `delimiter`, `write_headers` | `csv.delimiter`, `csv.has_headers` |
+| csv source `has_headers`, `delimiter`, `quote`, `flexible`, `null_values` | `csv.has_headers`, `csv.delimiter` and `csv.quote` (one-character strings: `";"` rather than `59`, `"'"` rather than `39`), `csv.flexible`, `csv.null_values` |
+| csv sink `delimiter` (a byte), `write_headers` | `csv.delimiter` (a one-character string), `csv.has_headers` |
 | csv sink `on_unknown_field` (default `warn`) | `csv.on_unknown_field` (default `widen`: a later field becomes a new column instead of being dropped) |
 | csv / jsonl sink `append: true` | `mode: append` |
 | jsonl sink `pretty` | `json_lines.pretty` |
@@ -494,7 +495,10 @@ kind and move these fields:
 | parquet sink `max_rows_per_file` | `max_records_per_file` |
 | parquet sink `schema: {type: inferred, sample_size}` | drop it: the file sink infers from every record |
 
-`path`, `batch_size`, `compression` and `concurrency` keep their names. Set
+`path`, `batch_size` and `concurrency` keep their names, and so does the
+file-level `compression` (gzip / zstd) of the csv and jsonl connectors. The
+parquet sink's `compression` is the Parquet codec, which moves to
+`parquet.compression`. Set
 `format:` when the extension does not say it: a `jsonl` sink writing
 `out.json` needs `format: json_lines`, or the file sink writes a JSON array.
 A Parquet location on S3 moves to the `s3` source or sink with
