@@ -308,14 +308,18 @@ impl Write for LineOut {
         match self {
             Self::File(f) => f.write(data),
             Self::Spool { size, buf, parts } => {
-                buf.extend_from_slice(data);
-                if buf.len() >= *size {
-                    let mut full = Vec::new();
-                    while buf.len() >= *size {
-                        let rest = buf.split_off(*size);
-                        full.push(std::mem::replace(buf, rest));
+                let mut rest = data;
+                while !rest.is_empty() {
+                    if buf.capacity() < *size {
+                        buf.reserve_exact(*size - buf.len());
                     }
-                    parts.lock().unwrap_or_else(|p| p.into_inner()).extend(full);
+                    let take = (*size - buf.len()).min(rest.len());
+                    buf.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    if buf.len() == *size {
+                        let full = std::mem::replace(buf, Vec::with_capacity(*size));
+                        parts.lock().unwrap_or_else(|p| p.into_inner()).push(full);
+                    }
                 }
                 Ok(data.len())
             }
