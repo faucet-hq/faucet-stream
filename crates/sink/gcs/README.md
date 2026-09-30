@@ -437,7 +437,28 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 
 ## Usage signals (#704)
 
-Every object upload (`put`) is reported to faucet's usage meter as a sink
-round trip and priced as a GCS class-A request
-(`usage.pricing.object_storage.write_per_1k_requests`); see the
-[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+Every request is reported to faucet's usage meter as a sink round trip, by op:
+
+| Op | Requests | Priced as |
+|---|---|---|
+| `put` | each object upload | class A (`usage.pricing.object_storage.write_per_1k_requests`) |
+| `copy` | each `rewrite` call of an overwrite commit's promote | class A |
+| `list` | each object listing (append, overwrite pruning and commit) | read (`read_per_1k_requests`) |
+| `head` | each metadata read (existence checks) | read |
+| `delete` | each object delete | free (GCS does not bill deletes) |
+
+See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+
+## Server-side copies and retries (#783)
+
+An overwrite commit promotes each staged object with a server-side `rewrite`
+and a delete. A rewrite that does not finish in one call is resumed with the
+token GCS returns (on the JSON API used for plaintext emulator endpoints too),
+and one that still has not finished after 1000 calls fails the commit rather
+than looping.
+
+A request that fails with HTTP 429 or a 5xx — or the gRPC
+`RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `INTERNAL` codes — is reported as a
+typed `HttpStatus` error, so a pipeline
+[`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
+policy retries it; any other failure is a plain sink error.

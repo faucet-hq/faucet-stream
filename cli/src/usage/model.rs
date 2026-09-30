@@ -111,12 +111,18 @@ pub fn estimate(
             .filter(|(op, _)| matches!(op.as_str(), "list" | "get" | "head"))
             .map(|(_, n)| n)
             .sum();
+        // A server-side copy is billed like a put; a delete is free.
         let writes: u64 = trips
             .iter()
-            .filter(|(op, _)| matches!(op.as_str(), "put" | "post"))
+            .filter(|(op, _)| matches!(op.as_str(), "put" | "post" | "copy"))
             .map(|(_, n)| n)
             .sum();
-        if reads > 0 || writes > 0 {
+        let deletes: u64 = trips
+            .iter()
+            .filter(|(op, _)| op.as_str() == "delete")
+            .map(|(_, n)| n)
+            .sum();
+        if reads > 0 || writes > 0 || deletes > 0 {
             reported_kinds.push(kind);
         }
         push(
@@ -576,5 +582,33 @@ mod tests {
         ] {
             assert_eq!(GroupBy::parse(by.as_str()), Some(by));
         }
+    }
+
+    #[test]
+    fn sink_object_store_ops_are_priced_by_class() {
+        let p = PricingSpec::default();
+        let mut s = snap(10, 1000);
+        s.sink_roundtrips.insert("put".into(), 400);
+        s.sink_roundtrips.insert("copy".into(), 600);
+        s.sink_roundtrips.insert("list".into(), 200);
+        s.sink_roundtrips.insert("head".into(), 800);
+        s.sink_roundtrips.insert("delete".into(), 5000);
+        let e = estimate(&s, "csv", "s3", &p);
+        let item = |name: &str| e.lines.iter().find(|l| l.item == name).cloned();
+        let writes = item("s3_requests_write_sink").unwrap();
+        assert_eq!(writes.quantity, 1.0, "put + copy");
+        assert!((writes.amount - 0.005).abs() < 1e-9);
+        let reads = item("s3_requests_read_sink").unwrap();
+        assert_eq!(reads.quantity, 1.0, "list + head");
+        assert!(!e.not_reported.contains(&"s3".to_string()), "{e:?}");
+
+        let mut only_deletes = snap(10, 1000);
+        only_deletes.sink_roundtrips.insert("delete".into(), 3);
+        let e = estimate(&only_deletes, "csv", "gcs", &p);
+        assert!(
+            !e.not_reported.contains(&"gcs".to_string()),
+            "deletes are free but still reported: {e:?}"
+        );
+        assert!(e.lines.iter().all(|l| l.amount == 0.0), "{e:?}");
     }
 }

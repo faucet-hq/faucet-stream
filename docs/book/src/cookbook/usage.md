@@ -86,7 +86,7 @@ usage:
     egress_per_gb: 0.09                # bytes read, when source and sink are not both local files
     object_storage:
       read_per_1k_requests: 0.0004     # S3 / GCS list + get + head
-      write_per_1k_requests: 0.005     # put
+      write_per_1k_requests: 0.005     # put + copy (deletes are free)
     warehouse:
       bigquery_per_tib_scanned: 6.25   # bytes billed / processed
       bigquery_streaming_per_gib: 0.05 # bytes streamed

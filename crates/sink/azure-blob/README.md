@@ -191,6 +191,14 @@ is refused on a best-effort configuration unless the `dlq:` block sets
 already landed a second time). See
 [batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
 
+## Retries
+
+The blob client retries throttling (429) and server errors (5xx) itself,
+with exponential backoff, up to 10 times within 3 minutes per request. A
+request that still fails after that is a sink error; the client does not
+expose the final status, so a pipeline `resilience:` policy does not retry
+it again.
+
 ## License
 
 MIT
