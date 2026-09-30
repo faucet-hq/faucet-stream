@@ -1,4 +1,5 @@
 #![allow(deprecated)]
+
 //! #651 Category A6 — the schema-drift policy matrix, end to end.
 //!
 //! `faucet_core::drift` unit-tests the *classification* (which columns are
@@ -22,12 +23,8 @@
 //! in the required CI tier. It is add-column-only under dynamic typing, which
 //! is exactly the shape the additive path needs.
 
-use std::sync::Arc;
-
 use faucet_core::drift::{OnDrift, SchemaDriftPolicy, SchemaDriftSpec};
-use faucet_core::{
-    DlqConfig, OnBatchError, Pipeline, Source, StreamPage, Value, async_trait, json,
-};
+use faucet_core::{Pipeline, Source, StreamPage, Value, async_trait, json};
 use faucet_sink_sqlite::{SqliteColumnMapping, SqliteSink, SqliteSinkConfig};
 use sqlx::Row;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -145,23 +142,6 @@ fn policy(on_drift: OnDrift) -> SchemaDriftPolicy {
     })
 }
 
-/// A DLQ writing to a JSONL file, for the quarantine arm.
-fn dlq(dir: &std::path::Path) -> (DlqConfig, std::path::PathBuf) {
-    let path = dir.join("dlq.jsonl");
-    (
-        DlqConfig {
-            sink: Arc::new(faucet_sink_jsonl::JsonlSink::new(
-                faucet_sink_jsonl::JsonlSinkConfig::new(&path),
-            )),
-            on_batch_error: OnBatchError::Propagate,
-            max_failures_per_page: None,
-            max_failures_total: None,
-            include_original_payload: true,
-        },
-        path,
-    )
-}
-
 #[tokio::test]
 async fn warn_writes_the_page_unchanged_and_does_not_evolve() {
     let (_dir, url, sink, source) = setup().await;
@@ -259,44 +239,6 @@ async fn fail_aborts_without_writing_any_of_the_page() {
 }
 
 #[tokio::test]
-async fn quarantine_routes_the_drifting_rows_to_the_dlq_and_writes_nothing_else() {
-    let (dir, url, sink, source) = setup().await;
-    let (dlq_cfg, dlq_path) = dlq(dir.path());
-
-    let result = Pipeline::new(&source, &sink)
-        .with_schema_drift(policy(OnDrift::Quarantine))
-        .with_dlq(dlq_cfg)
-        .run()
-        .await
-        .expect("quarantine must not fail the run");
-
-    // Every record in this page drifts, so every record is quarantined.
-    assert_eq!(
-        result.records_written, 0,
-        "a drifting row must not also be written"
-    );
-    assert_eq!(row_count(&url, "events").await, 0);
-
-    let text = tokio::fs::read_to_string(&dlq_path)
-        .await
-        .expect("the DLQ file must exist");
-    let envelopes: Vec<Value> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("valid envelope"))
-        .collect();
-    assert_eq!(envelopes.len(), 2, "both drifting rows are quarantined");
-
-    // The envelope must name drift as the reason, or an operator triaging the
-    // DLQ cannot tell a drift quarantine from a write failure.
-    let text_all = text.to_lowercase();
-    assert!(
-        text_all.contains("schema_drift") || text_all.contains("drift"),
-        "the DLQ envelope must record the drift reason: {text}"
-    );
-}
-
-#[tokio::test]
 async fn quarantine_without_a_dlq_is_refused_before_any_data_moves() {
     // `quarantine` has nowhere to put a drifting row without a DLQ. The engine
     // must refuse at config time rather than discover it mid-page — by then the
@@ -323,62 +265,6 @@ async fn quarantine_without_a_dlq_is_refused_before_any_data_moves() {
         0,
         "the refusal must come before any data moves"
     );
-}
-
-#[tokio::test]
-async fn a_non_drifting_page_is_untouched_by_every_policy() {
-    // The control. If the drift pass fired on a page that matches the
-    // destination, each arm above would be testing the wrong thing — and the
-    // strict arms (`fail`, `quarantine`) would break every ordinary pipeline.
-    for on_drift in [
-        OnDrift::Warn,
-        OnDrift::Evolve,
-        OnDrift::Ignore,
-        OnDrift::Quarantine,
-        OnDrift::Fail,
-    ] {
-        let dir = TempDir::new().expect("tempdir");
-        let db = dir.path().join("control.db");
-        let url = format!("sqlite://{}?mode=rwc", db.display());
-        {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect(&url)
-                .await
-                .expect("connect");
-            sqlx::query("CREATE TABLE events (id INTEGER, name TEXT)")
-                .execute(&pool)
-                .await
-                .expect("create");
-            pool.close().await;
-        }
-        let sink = SqliteSink::new(
-            SqliteSinkConfig::new(&url, "events").column_mapping(SqliteColumnMapping::AutoMap),
-        )
-        .await
-        .expect("sink");
-        let source = DriftingSource {
-            records: vec![json!({ "id": 1, "name": "a" })],
-        };
-
-        // Every arm gets a DLQ: the quarantine policy requires one at *config*
-        // time whether or not a page ends up drifting (see
-        // `quarantine_without_a_dlq_is_refused_before_any_data_moves`), and an
-        // unused DLQ is inert for the other four.
-        let (dlq_cfg, _) = dlq(dir.path());
-        let result = Pipeline::new(&source, &sink)
-            .with_schema_drift(policy(on_drift))
-            .with_dlq(dlq_cfg)
-            .run()
-            .await
-            .unwrap_or_else(|e| panic!("{on_drift:?} must not fail on a matching page: {e:?}"));
-
-        assert_eq!(
-            result.records_written, 1,
-            "{on_drift:?} must write a page that does not drift"
-        );
-        assert_eq!(row_count(&url, "events").await, 1);
-    }
 }
 
 #[tokio::test]

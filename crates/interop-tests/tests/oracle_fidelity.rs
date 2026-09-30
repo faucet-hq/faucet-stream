@@ -8,6 +8,7 @@
 //!   as `1` / `0`;
 //! - Oracle does not distinguish negative zero: `-0.0` is stored as `0`.
 
+#[path = "../../sink/oracle/tests/common/mod.rs"]
 mod common;
 
 use faucet_conformance::fidelity::{self, Tolerance};

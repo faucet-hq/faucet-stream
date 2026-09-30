@@ -173,7 +173,7 @@ does that), so all state lives on the filesystem.
 | parquet `row_group_size`, `max_rows_per_file`, `max_bytes_per_file`, `batch_size` | `parquet.row_group_size`, `max_records_per_file`, `max_bytes_per_file`, `batch_size` |
 | parquet `schema: {type: inferred, sample_size}` | inference is the default and reads every record, so nothing is sampled |
 
-Golden tests (`tests/parity.rs`) write the same records through the old sink
+Golden tests (`crates/interop-tests/tests/file_sink_parity.rs`) write the same records through the old sink
 and the file sink and compare the output.
 
 ## Shared writer

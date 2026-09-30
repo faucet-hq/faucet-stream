@@ -119,7 +119,7 @@ trusted as plaintext.
 | parquet `source: {type: local_path, path}` / `{type: glob, pattern}` | `path` (a file, directory or glob) |
 | parquet `columns`, `batch_size`, `concurrency` | `parquet.columns`, `batch_size`, `concurrency` |
 
-Golden tests (`tests/parity.rs`) read the same fixtures through the old sources
+Golden tests (`crates/interop-tests/tests/file_source_parity.rs`) read the same fixtures through the old sources
 and the file source and compare the records.
 
 ## Columnar path

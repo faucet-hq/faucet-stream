@@ -45,7 +45,6 @@ tempfile = "3"
 serde_json.workspace = true
 schemars.workspace = true
 faucet-conformance.workspace = true
-faucet-sink-iceberg = { workspace = true, features = ["catalog-sql"] }
 iceberg-catalog-sql = "0.10.0"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "any"] }
 parquet = { version = "58", features = ["async"] }

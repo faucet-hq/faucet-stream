@@ -114,6 +114,7 @@ members = [
     "crates/sink/dynamodb",
     "crates/common/databricks",
     "crates/sink/databricks",
+    "crates/interop-tests",
 ]
 # The reference WASM transform modules target `wasm32-unknown-unknown` with
 # their own release profile and are built out-of-band (see their README); they

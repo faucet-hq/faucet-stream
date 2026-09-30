@@ -47,11 +47,15 @@ def counts() -> dict[str, int]:
     sources = dirs("crates/source")
     sinks = dirs("crates/sink")
     common = dirs("crates/common")
-    # Every crate in the workspace = one Cargo.toml under crates/** plus the
-    # umbrella (faucet-stream) and the CLI (cli).
+    # Every published crate in the workspace = one Cargo.toml under crates/**
+    # (minus `publish = false` test crates) plus the umbrella (faucet-stream)
+    # and the CLI (cli).
     crate_manifests = 0
     for dirpath, dirnames, filenames in os.walk(os.path.join(ROOT, "crates")):
         if "Cargo.toml" in filenames:
+            with open(os.path.join(dirpath, "Cargo.toml")) as f:
+                if re.search(r"^publish\s*=\s*false", f.read(), re.M):
+                    continue
             crate_manifests += 1
     crates = crate_manifests + 2  # + faucet-stream + cli
     return {

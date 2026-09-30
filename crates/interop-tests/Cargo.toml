@@ -1,0 +1,84 @@
+[package]
+name = "faucet-interop-tests"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross-connector tests for the faucet-stream workspace (not published)"
+publish = false
+
+# Tests that need two connectors live here, so no published connector crate
+# depends on another connector (#784). The features below only keep the moved
+# tests' `cfg(feature = ...)` gates meaningful; every connector feature they
+# need is enabled on the dependencies directly.
+[features]
+default = ["arrow", "compression", "encryption", "file-formats", "file-format-csv", "file-format-xml"]
+arrow = []
+compression = []
+encryption = []
+file-formats = []
+file-format-csv = []
+file-format-xml = []
+
+[dev-dependencies]
+faucet-core = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
+faucet-conformance.workspace = true
+faucet-common-oracle.workspace = true
+faucet-common-sftp.workspace = true
+faucet-common-iceberg = { workspace = true, features = ["catalog-sql"] }
+
+faucet-source-csv = { workspace = true, features = ["compression"] }
+faucet-source-delta = { workspace = true, features = ["arrow"] }
+faucet-source-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
+faucet-source-gcs = { workspace = true, features = ["arrow", "compression", "file-formats"] }
+faucet-source-iceberg = { workspace = true, features = ["arrow", "catalog-sql"] }
+faucet-source-oracle.workspace = true
+faucet-source-parquet = { workspace = true, features = ["arrow"] }
+faucet-source-rabbitmq.workspace = true
+faucet-source-rest.workspace = true
+faucet-source-s3 = { workspace = true, features = ["arrow", "compression", "file-formats"] }
+
+faucet-sink-azure-blob = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
+faucet-sink-csv = { workspace = true, features = ["compression"] }
+faucet-sink-delta = { workspace = true, features = ["arrow"] }
+faucet-sink-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
+faucet-sink-gcs = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
+faucet-sink-iceberg = { workspace = true, features = ["catalog-sql"] }
+faucet-sink-jsonl = { workspace = true, features = ["compression", "encryption"] }
+faucet-sink-oracle.workspace = true
+faucet-sink-parquet = { workspace = true, features = ["arrow"] }
+faucet-sink-rabbitmq.workspace = true
+faucet-sink-s3 = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
+faucet-sink-sftp = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
+faucet-sink-singer.workspace = true
+faucet-sink-sqlite.workspace = true
+
+arrow.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+azure_storage = "0.21"
+azure_storage_blobs = "0.21"
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+futures.workspace = true
+iceberg = "0.10.0"
+iceberg-catalog-sql = "0.10.0"
+lapin.workspace = true
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
+parquet.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "any", "json"] }
+tempfile.workspace = true
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["azurite", "minio"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+urlencoding.workspace = true
+uuid.workspace = true
+wiremock = "0.6"

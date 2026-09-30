@@ -52,8 +52,6 @@ schemars.workspace = true
 futures = { workspace = true }
 testcontainers = "0.27"
 tempfile = "3"
-# The shared format × option matrix reads what landed back with the file source.
-faucet-source-file = { workspace = true, features = ["file-formats", "encryption"] }
 
 [package.metadata.docs.rs]
 all-features = true
