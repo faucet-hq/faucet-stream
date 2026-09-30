@@ -89,8 +89,7 @@ async fn refused_server_calls_name_the_operation_and_the_path() {
         .to_string();
     assert!(e.contains("'/data/one/one.jsonl' failed"), "{e}");
 
-    let overwrite =
-        json!({"if_exists": "replace", "write_mode": "overwrite", "file_name": "part-{part}.jsonl"});
+    let overwrite = json!({"if_exists": "replace", "write_mode": "overwrite", "file_name": "part-{part}.jsonl"});
     admin.create_dir("/data/o").await.unwrap();
     admin
         .create_dir("/data/o/.faucet-overwrite-part-_part_.jsonl")
