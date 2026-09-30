@@ -1,6 +1,6 @@
 # RFC 0012 — Multi-tenant embedded integrations
 
-*Let a SaaS product run faucet as the engine behind "connect your Salesforce / HubSpot / NetSuite" for its own customers: tenants, an encrypted per-tenant connection vault, a hosted OAuth connect flow, tenant-scoped runs, state and schedules, and per-tenant isolation in the control plane (#709).*
+*Let a SaaS product run faucet as the engine behind "connect your CRM / ERP / billing system" for its own customers: tenants, an encrypted per-tenant connection vault, a hosted OAuth connect flow, tenant-scoped runs, state and schedules, and per-tenant isolation in the control plane (#709).*
 
 | | |
 |---|---|

@@ -371,7 +371,7 @@ rabbitmq-tls = [
     "faucet-sink-rabbitmq?/tls",
 ]
 
-# OAuth1 (HMAC-SHA256) request-signing auth provider (#496), e.g. NetSuite TBA.
+# OAuth1 (HMAC-SHA256) request-signing auth provider (#496), e.g. token-based auth on ERP APIs.
 # `cargo install faucet-cli --features oauth1`.
 oauth1 = ["faucet-auth/oauth1"]
 

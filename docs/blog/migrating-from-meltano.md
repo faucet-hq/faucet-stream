@@ -50,7 +50,7 @@ If you're doing EL→dbt today, note faucet doesn't replace dbt either — see t
 | plugin config / env | `${env:VAR}`, `${file:...}`, `${secret:...}` interpolation |
 | `meltano run tap target` | `faucet run pipeline.yaml` |
 
-## Before / after: Stripe charges → Postgres
+## Before / after: a payments API's charges → Postgres
 
 ### Before — Meltano
 
@@ -58,9 +58,9 @@ If you're doing EL→dbt today, note faucet doesn't replace dbt either — see t
 # meltano.yml
 plugins:
   extractors:
-    - name: tap-stripe
+    - name: tap-payments
       config:
-        client_secret: ${STRIPE_TOKEN}
+        client_secret: ${PAYMENTS_TOKEN}
       select:
         - charges.*
       metadata:
@@ -77,7 +77,7 @@ plugins:
 
 ```bash
 # plus: a virtualenv, `meltano install`, plugin resolution, then:
-meltano run tap-stripe target-postgres
+meltano run tap-payments target-postgres
 ```
 
 ### After — faucet
@@ -85,17 +85,17 @@ meltano run tap-stripe target-postgres
 ```yaml
 # faucet.yaml
 version: 1
-name: stripe_charges_to_postgres
+name: payments_charges_to_postgres
 
 pipeline:
   source:
     type: rest
     config:
-      base_url: https://api.stripe.com/v1
+      base_url: https://api.payments.example.com/v1
       path: /charges
       auth:
         type: bearer
-        config: { token: ${env:STRIPE_TOKEN} }
+        config: { token: ${env:PAYMENTS_TOKEN} }
       pagination:
         type: Cursor
         next_token_path: $.next_page
@@ -103,7 +103,7 @@ pipeline:
       replication_method: { type: Incremental }
       replication_key: created
       primary_keys: ["id"]
-      state_key: stripe:charges
+      state_key: payments:charges
 
   transforms:
     - type: keys_case
@@ -113,7 +113,7 @@ pipeline:
     type: postgres
     config:
       connection_url: ${env:PG_URL}
-      table_name: stripe_charges
+      table_name: payments_charges
       column_mapping: { type: jsonb, column: data }
 
   state:
@@ -133,7 +133,7 @@ This is a real, runnable config —
 
 1. **Inventory your taps and targets.** For each, check the
    [connector catalog](https://faucet-hq.github.io/faucet-stream/reference/connectors.html).
-   Native SaaS taps (Stripe, Shopify, …) usually map onto faucet's generic
+   Native SaaS taps usually map onto faucet's generic
    `rest` / `graphql` source pointed at the same API. Databases, warehouses,
    files, and streaming systems map to dedicated connectors.
 2. **Translate one pipeline** using the table above. Keep the raw-JSONB landing
