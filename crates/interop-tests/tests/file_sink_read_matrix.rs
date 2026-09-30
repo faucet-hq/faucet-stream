@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
 
-const ORC: &[u8] = include_bytes!("../../../core/tests/fixtures/orc/people.orc");
+const ORC: &[u8] = include_bytes!("../../core/tests/fixtures/orc/people.orc");
 
 const FORMATS: &[(&str, &str)] = &[
     ("json_lines", "jsonl"),

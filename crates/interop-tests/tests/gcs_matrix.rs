@@ -8,7 +8,6 @@
     feature = "encryption"
 ))]
 
-#[path = "../../../common/file/tests/support/remote_matrix.rs"]
 mod remote_matrix;
 
 use faucet_core::{FaucetError, Sink};

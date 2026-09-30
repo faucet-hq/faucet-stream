@@ -4,11 +4,9 @@
 
 #![cfg(not(target_os = "windows"))]
 
-use faucet_core::{Sink, Source};
+use faucet_core::Sink;
 use faucet_sink_gcs::{GcsCredentials, GcsSink, GcsSinkConfig};
-use faucet_source_gcs::{GcsSource, GcsSourceConfig};
 use serde_json::json;
-use std::collections::HashMap;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -50,114 +48,6 @@ async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, Strin
     // testcontainers-rs has no reaper — a forgotten handle is a leaked
     // container, one per test, forever.
     Some((container, host, bucket))
-}
-
-#[tokio::test]
-async fn sink_writes_and_source_reads_them_back() {
-    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
-        return;
-    };
-
-    let sink = GcsSink::new(
-        GcsSinkConfig::new(&bucket)
-            .prefix("rt/")
-            .auth(GcsCredentials::Anonymous)
-            .storage_host(&host),
-    )
-    .await
-    .unwrap();
-
-    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
-    sink.set_roundtrip_recorder(std::sync::Arc::new(
-        faucet_core::observability::RoundtripRecorder::new(
-            faucet_core::observability::RoundtripSide::Sink,
-            "p",
-            "r",
-            "gcs",
-        )
-        .with_meter(meter.clone()),
-    ));
-    let records: Vec<_> = (0..50).map(|i| json!({"i": i})).collect();
-    let n = sink.write_batch(&records).await.unwrap();
-    assert_eq!(n, 50);
-    sink.flush().await.unwrap();
-    assert!(
-        meter
-            .snapshot()
-            .sink_roundtrips
-            .get("put")
-            .is_some_and(|n| *n >= 1)
-    );
-
-    let source = GcsSource::new(
-        GcsSourceConfig::new(&bucket)
-            .prefix("rt/")
-            .auth(faucet_source_gcs::GcsCredentials::Anonymous)
-            .storage_host(&host),
-    )
-    .await
-    .unwrap();
-    source.set_roundtrip_recorder(std::sync::Arc::new(
-        faucet_core::observability::RoundtripRecorder::new(
-            faucet_core::observability::RoundtripSide::Source,
-            "p",
-            "r",
-            "gcs",
-        )
-        .with_meter(meter.clone()),
-    ));
-    let read = source.fetch_with_context(&HashMap::new()).await.unwrap();
-    assert_eq!(read.len(), 50);
-    let ops = meter.snapshot().source_roundtrips;
-    assert!(
-        ops.contains_key("list") && ops.contains_key("get"),
-        "{ops:?}"
-    );
-    let mut got: Vec<i64> = read.iter().map(|r| r["i"].as_i64().unwrap()).collect();
-    got.sort();
-    let want: Vec<i64> = (0..50).collect();
-    assert_eq!(got, want);
-}
-
-#[tokio::test]
-async fn sink_rolls_files_per_max_records_per_file() {
-    use futures::StreamExt;
-    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
-        return;
-    };
-
-    let sink = GcsSink::new(
-        GcsSinkConfig::new(&bucket)
-            .prefix("roll/")
-            .auth(GcsCredentials::Anonymous)
-            .max_records_per_file(10)
-            .with_batch_size(0)
-            .storage_host(&host),
-    )
-    .await
-    .unwrap();
-    let records: Vec<_> = (0..25).map(|i| json!({"i": i})).collect();
-    sink.write_batch(&records).await.unwrap();
-    sink.flush().await.unwrap();
-
-    // Listing via the source confirms 3 files were written
-    // (ceil(25 / 10) == 3).
-    let source = GcsSource::new(
-        GcsSourceConfig::new(&bucket)
-            .prefix("roll/")
-            .auth(faucet_source_gcs::GcsCredentials::Anonymous)
-            .with_batch_size(0)
-            .storage_host(&host),
-    )
-    .await
-    .unwrap();
-    let ctx = HashMap::new();
-    let mut stream = source.stream_pages(&ctx, 0);
-    let mut pages = Vec::new();
-    while let Some(p) = stream.next().await {
-        pages.push(p.unwrap());
-    }
-    assert_eq!(pages.len(), 3, "expected 3 rolled files");
 }
 
 /// The preflight probe lists the bucket, so against the emulator it passes, and

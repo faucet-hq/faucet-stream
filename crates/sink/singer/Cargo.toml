@@ -27,7 +27,6 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile.workspace = true
-faucet-source-csv = { path = "../../source/csv" }
 faucet-conformance = { path = "../../conformance" }
 
 [package.metadata.docs.rs]

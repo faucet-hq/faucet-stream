@@ -54,10 +54,6 @@ flate2.workspace = true
 async-trait.workspace = true
 arrow.workspace = true
 parquet.workspace = true
-faucet-sink-parquet = { workspace = true, features = ["arrow"] }
-faucet-source-csv = { workspace = true, features = ["compression"] }
-faucet-source-parquet.workspace = true
-faucet-sink-jsonl = { workspace = true, features = ["encryption"] }
 base64.workspace = true
 
 [package.metadata.docs.rs]
