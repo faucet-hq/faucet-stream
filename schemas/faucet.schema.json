@@ -9366,9 +9366,11 @@
               "const": "s3"
             }
           },
-          "additionalProperties": true
+          "additionalProperties": true,
+          "deprecated": true
         }
-      ]
+      ],
+      "deprecated": true
     },
     "source_delta__DeltaCredentials": {
       "description": "Object-store credentials for reading/writing a Delta table.\n\nUses the project-wide adjacently-tagged `{ type, config }` shape\n(snake_case discriminators): e.g. `credentials: { type: aws, config: { … } }`.\nThe default is [`DeltaCredentials::Default`], which resolves credentials from\nthe ambient environment / instance metadata via the object-store default\nprovider chain — nothing is injected into `storage_options`.",
@@ -12098,7 +12100,8 @@
           "type": "string",
           "const": "error"
         }
-      ]
+      ],
+      "deprecated": true
     },
     "sink_csv__CompressionConfig": {
       "description": "User-facing compression config. Defaults to [`Auto`](Self::Auto).",
@@ -13301,9 +13304,11 @@
               "const": "s3"
             }
           },
-          "additionalProperties": true
+          "additionalProperties": true,
+          "deprecated": true
         }
-      ]
+      ],
+      "deprecated": true
     },
     "sink_parquet__SchemaSource": {
       "description": "How the sink obtains its Arrow schema.",
@@ -13336,7 +13341,8 @@
             }
           }
         }
-      ]
+      ],
+      "deprecated": true
     },
     "sink_parquet__ParquetCompression": {
       "description": "Parquet compression codec.",
@@ -13347,7 +13353,8 @@
         "gzip",
         "zstd",
         "lz4"
-      ]
+      ],
+      "deprecated": true
     },
     "sink_delta__DeltaCredentials": {
       "description": "Object-store credentials for reading/writing a Delta table.\n\nUses the project-wide adjacently-tagged `{ type, config }` shape\n(snake_case discriminators): e.g. `credentials: { type: aws, config: { … } }`.\nThe default is [`DeltaCredentials::Default`], which resolves credentials from\nthe ambient environment / instance metadata via the object-store default\nprovider chain — nothing is injected into `storage_options`.",
