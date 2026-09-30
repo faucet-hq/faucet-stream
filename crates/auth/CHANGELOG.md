@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-auth-v1.2.0...faucet-auth-v1.3.0) - 2026-09-29
+
+### Features
+
+- One shared file writer for local, S3, GCS, Azure and SFTP; deprecate the csv, jsonl and parquet connectors ([#782](https://github.com/faucet-hq/faucet-stream/pull/782))
+- REST/GraphQL source gaps, silent-data-loss fixes and Google service-account auth ([#760](https://github.com/faucet-hq/faucet-stream/pull/760))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-auth-v1.1.0...faucet-auth-v1.2.0) - 2026-08-24
 
 ### Features

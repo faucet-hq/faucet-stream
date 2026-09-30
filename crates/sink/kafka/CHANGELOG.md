@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-kafka-v1.4.1...faucet-sink-kafka-v1.5.0) - 2026-09-29
+
+### Bug Fixes
+
+- Three reliability bugs — overwrite bookmark ordering, kafka headers, source error typing ([#664](https://github.com/faucet-hq/faucet-stream/pull/664))
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Features
+
+- One shared file writer for local, S3, GCS, Azure and SFTP; deprecate the csv, jsonl and parquet connectors ([#782](https://github.com/faucet-hq/faucet-stream/pull/782))
+- Pipeline status, source lag, state management, versioned state and safe partial batches ([#742](https://github.com/faucet-hq/faucet-stream/pull/742))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.4.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-kafka-v1.4.0...faucet-sink-kafka-v1.4.1) - 2026-08-23
 
 ### Miscellaneous

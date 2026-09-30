@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.1.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-kinesis-v1.0.6...faucet-source-kinesis-v1.1.0) - 2026-09-29
+
+### Bug Fixes
+
+- Replace every message-grep classification with a typed one, and close the core retry gate ([#656](https://github.com/faucet-hq/faucet-stream/pull/656))
+
+### Features
+
+- Pipeline status, source lag, state management, versioned state and safe partial batches ([#742](https://github.com/faucet-hq/faucet-stream/pull/742))
+- File formats, template test suites, auto-create tables, strict config keys + the ≥580 throughput pass ([#668](https://github.com/faucet-hq/faucet-stream/pull/668))
+
 ## [1.0.6](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-kinesis-v1.0.5...faucet-source-kinesis-v1.0.6) - 2026-08-23
 
 ### Miscellaneous
